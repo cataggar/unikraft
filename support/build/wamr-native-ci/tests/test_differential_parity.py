@@ -1335,11 +1335,14 @@ def build_failure_details(results, snapshots):
         elif classification.startswith("failed_stage:"):
             marker = re.search(
                 r"(?m)^WAMR_CI_FAILED_STAGE: [a-z0-9-]+; "
+                r"(?:operation: ([a-z][a-z0-9-]{0,39}); )?"
                 r"cause: ([A-Za-z][A-Za-z0-9_]{0,79}); "
                 r"bounded private logs retained\.$",
                 result.stderr.decode("utf-8", "replace"))
             if marker:
-                reason = " cause:" + marker.group(1)
+                if marker.group(1):
+                    reason = " operation:" + marker.group(1)
+                reason += " cause:" + marker.group(2)
         details.append(
             f"{label}=exit:{result.returncode} category:{classification}{reason} "
             f"evidence:{','.join(files['order'])} "
@@ -2087,7 +2090,8 @@ class DeterministicContracts(unittest.TestCase):
             "native": subprocess.CompletedProcess(
                 [], 1, b"",
                 b"WAMR_CI_FAILED_STAGE: dependency-restore; "
-                b"cause: BootstrapCommandFailed; bounded private logs retained.\n"
+                b"operation: bind-bootstrap-inputs; cause: UnsafeFile; "
+                b"bounded private logs retained.\n"
                 b"error: /private/secret\n"),
         }
         snapshots = {
@@ -2096,13 +2100,41 @@ class DeterministicContracts(unittest.TestCase):
         }
         details = build_failure_details(results, snapshots)
         self.assertIn("native=exit:1 category:failed_stage:dependency-restore "
-                      "cause:BootstrapCommandFailed", details)
+                      "operation:bind-bootstrap-inputs cause:UnsafeFile", details)
         self.assertNotIn("/private/secret", details)
         results["native"] = subprocess.CompletedProcess(
             [], 1, b"",
             b"WAMR_CI_FAILED_STAGE: dependency-restore; "
-            b"cause: /private/secret; bounded private logs retained.\n")
+            b"operation: /private/secret; cause: UnsafeFile; "
+            b"bounded private logs retained.\n")
+        self.assertNotIn("operation:", build_failure_details(results, snapshots))
         self.assertNotIn("cause:", build_failure_details(results, snapshots))
+
+    def test_matrix_driver_refuses_unreviewed_cases_and_jobs(self):
+        scripts = PROJECT / ".github/scripts"
+        environment = {
+            "PATH": "/usr/bin:/bin",
+            "GITHUB_ACTIONS": "true",
+            "GITHUB_JOB": "wamr-differential-parity",
+        }
+        for name, arguments, job, marker in (
+                ("wamr-native-differential-ci.sh", ("/d", "success"),
+                 "wamr-differential-parity", b"refused: case"),
+                ("hyperv-qemu-candidate-runtime.sh",
+                 ("/d", "differential", "success"),
+                 "wamr-differential-parity",
+                 b"Invalid differential driver selection"),
+                ("hyperv-qemu-candidate-runtime.sh",
+                 ("/d", "differential", "missing-build"),
+                 "wamr-native-compute",
+                 b"Invalid differential driver selection")):
+            with self.subTest(script=name, arguments=arguments, job=job):
+                result = subprocess.run(
+                    ["/usr/bin/bash", str(scripts / name), *arguments],
+                    cwd=PROJECT, env=dict(environment, GITHUB_JOB=job),
+                    capture_output=True, timeout=10, check=False)
+                self.assertEqual(result.returncode, 2, result.stderr[:300])
+                self.assertIn(marker, result.stderr)
 
     def test_prior_build_output_requires_startup_failure_and_no_acceptance(self):
         class Exit:

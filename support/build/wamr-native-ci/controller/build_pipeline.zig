@@ -39,6 +39,7 @@ pub const Context = struct {
     fixture_report: ?physical.File = null,
     test_before_publication: ?*const fn (*Context) void = null,
     failed_stage: []const u8 = "startup",
+    failed_operation: []const u8 = "",
 };
 
 pub const Invocation = struct { context: *Context };
@@ -299,24 +300,28 @@ fn requireBootstrapInputs(context: *Context) !void {
 fn restoreDependencies(context: *Context) !void {
     const a = context.allocator;
     const io = context.io;
+    context.failed_operation = "create-restore";
     const restore_root = try subpath(context, "dependencies");
     const work = try files.openDirectory(io, context.compute, .private);
     defer work.close(io);
     try work.createDir(io, "dependencies", .fromMode(0o700));
     const dir = try files.openDirectory(io, restore_root, .private);
     defer dir.close(io);
+    context.failed_operation = "tracked-manifests";
     const manifests = try dependencies.sourceManifests(a, io, context.repository, context.git);
     defer for (manifests) |manifest| manifest.deinit(a);
     for (manifests, [_][]const u8{ "build.zig", "build.zig.zon" }) |manifest, name|
         try create(io, dir, name, manifest.content);
     try dependencies.pinnedManifest(a, manifests[1].content);
     try dir.createDir(io, "zig-pkg", .fromMode(0o700));
+    context.failed_operation = "fetch-pinned-package";
     _ = try runBootstrap(context, "dependency-restore", &.{
         context.roots.zig,                    "build",       "--build-file",                try join(context, &.{ restore_root, "build.zig" }),
         "--fetch=all",                        "--cache-dir", try subpath(context, "cache"), "--global-cache-dir",
         try subpath(context, "global-cache"), "-j2",
     }, restore_root, 900, 8 * limits.mib);
     const packages = try join(context, &.{ restore_root, "zig-pkg" });
+    context.failed_operation = "inventory-packages";
     var listing = try dependencies.packageSet(a, io, packages);
     defer listing.deinit(a);
     const hash_work = try subpath(context, "dependency-hash-work");
@@ -327,6 +332,7 @@ fn restoreDependencies(context: *Context) !void {
     try create(io, hash_dir, "build.zig.zon", manifests[1].content);
     try hash_dir.createDir(io, "zig-pkg", .fromMode(0o700));
     try work.createDir(io, "dependency-hash-cache", .fromMode(0o700));
+    context.failed_operation = "verify-package-hashes";
     for (listing.packages, 0..) |package, index| {
         const name = try std.fmt.allocPrint(a, "dependency-hash-{d:0>3}", .{index});
         const raw = try runBootstrap(context, name, &.{
@@ -336,14 +342,17 @@ fn restoreDependencies(context: *Context) !void {
         if (!std.mem.eql(u8, raw, try std.fmt.allocPrint(a, "{s}\n", .{package.name})))
             return error.PackageHashMismatch;
     }
+    context.failed_operation = "record-dependencies";
     context.dependency = try dependencies.capture(a, io, context.repository, context.git, context.compute);
 }
 
 pub fn restore(state: WamrArchiveSealed) !DependenciesRestored {
     const context = state.context;
     context.failed_stage = "dependency-restore";
+    context.failed_operation = "bind-bootstrap-inputs";
     try freezeBootstrapInputs(context);
     try restoreDependencies(context);
+    context.failed_operation = "verify-bootstrap-inputs";
     try requireBootstrapInputs(context);
     return next(state, DependenciesRestored);
 }

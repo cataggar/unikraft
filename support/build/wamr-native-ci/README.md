@@ -96,8 +96,9 @@ remains the independent full-size source-boundary oracle until cutover.
 `build --runtime ABS --wamr-source ABS`, `boot --runtime ABS`, and
 `diagnostics --runtime ABS` are available only through the installed
 native controller. Native stage failures report only a static Zig error name
-alongside the failed stage; command output and private paths remain in bounded
-private logs. Production workflow callers continue using the Python controller;
+alongside the failed stage; dependency restoration also reports a static
+operation label. Command output and private paths remain in bounded private
+logs. Production workflow callers continue using the Python controller;
 there is no fallback, boot cutover, or change in acceptance authority before
 the later parity and cutover PRs. The closed
 `tiny_exact_v2` production type has six ordered raw/QCOW2/VPC modes;
@@ -598,14 +599,18 @@ controller from its isolated fixture worktree into a separate private root,
 then runs one paired six-mode success case after the Python production boot
 within the same managed, non-root KVM process. An unexplained difference fails
 the job before the public bundle is published. Passing this one case does not
-establish the full success/fault matrix, grant
-native production authority, or invoke Azure.
+grant native production authority or invoke Azure. Once the production job
+passes, four separate bounded, credential-free x86/KVM matrix jobs run paired
+`build-start-tamper`, `missing-build`, `occupied-boot-slot`, and
+`prior-build-output` cases from fresh worktrees. Each retains strict fault
+and evidence parity; there is no TCG or successful-skip fallback.
 The different Python/native supervised build commands, controller closures,
 local-boot installation paths, and native-only boot-input validator role are
 checked against their own exact physical contracts; each QCOW2 acceptance
 binds its own boot-input record rather than treating different hashes as equal.
 Failed paired builds report only per-side exit classes, evidence and artifact
-names, and a path-free refusal marker; private command logs remain local.
+names, and path-free refusal or static native error markers; private command
+logs remain local.
 
 ## Private final-image handoff
 

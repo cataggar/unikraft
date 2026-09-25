@@ -40,7 +40,7 @@ pub fn main(init: std.process.Init) void {
         .signal = &signal,
     };
     switch (command.action) {
-        .build => _ = controller.build_pipeline.run(&context) catch |err| failed(init.io, context.failed_stage, err),
+        .build => _ = controller.build_pipeline.run(&context) catch |err| failed(init.io, context.failed_stage, context.failed_operation, err),
         .boot => {
             var boot_context: controller.boot_pipeline.Context = .{
                 .build_context = &context,
@@ -48,7 +48,7 @@ pub fn main(init: std.process.Init) void {
             };
             _ = controller.boot_pipeline.run(&boot_context) catch |err| {
                 if (err == error.KvmUnavailable) refusedWithMessage(init.io, "x86 KVM unavailable");
-                failed(init.io, context.failed_stage, err);
+                failed(init.io, context.failed_stage, context.failed_operation, err);
             };
         },
         .diagnostics => {
@@ -56,7 +56,7 @@ pub fn main(init: std.process.Init) void {
                 .build_context = &context,
                 .pinned = std.StringHashMap(controller.custody_files.File).init(allocator),
             };
-            controller.boot_pipeline.diagnostics(&boot_context) catch |err| failed(init.io, "diagnostics", err);
+            controller.boot_pipeline.diagnostics(&boot_context) catch |err| failed(init.io, "diagnostics", "", err);
         },
         .describe => unreachable,
     }
@@ -82,11 +82,18 @@ fn refusedWithMessage(io: std.Io, message: []const u8) noreturn {
     std.process.exit(1);
 }
 
-fn failed(io: std.Io, stage: []const u8, reason: anyerror) noreturn {
+fn failed(io: std.Io, stage: []const u8, operation: []const u8, reason: anyerror) noreturn {
     var stderr = std.Io.File.stderr().writerStreaming(io, &.{});
-    stderr.interface.print(
-        "WAMR_CI_FAILED_STAGE: {s}; cause: {s}; bounded private logs retained.\n",
-        .{ stage, @errorName(reason) },
-    ) catch {};
+    if (std.mem.eql(u8, stage, "dependency-restore")) {
+        stderr.interface.print(
+            "WAMR_CI_FAILED_STAGE: {s}; operation: {s}; cause: {s}; bounded private logs retained.\n",
+            .{ stage, operation, @errorName(reason) },
+        ) catch {};
+    } else {
+        stderr.interface.print(
+            "WAMR_CI_FAILED_STAGE: {s}; cause: {s}; bounded private logs retained.\n",
+            .{ stage, @errorName(reason) },
+        ) catch {};
+    }
     std.process.exit(1);
 }

@@ -5,9 +5,9 @@ unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT QEMU_MODULE_DIR
 failure_stage=invocation
 trap 'status=$?; echo "Native runtime wrapper refused: ${failure_stage}" >&2; exit "${status}"' ERR
 
-if [[ ( $# != 1 && $# != 2 && $# != 4 ) || "${1:-}" != /* ||
+if [[ ( $# != 1 && $# != 2 && $# != 3 && $# != 4 ) || "${1:-}" != /* ||
       "${GITHUB_ACTIONS:-}" != true || "$(id -u)" -eq 0 ]]; then
-  echo "usage: hyperv-qemu-candidate-runtime.sh ROOT [compute | integration CI_ROOT NETWORK_APPLICATION] on an ordinary-user GitHub runner" >&2
+  echo "usage: hyperv-qemu-candidate-runtime.sh ROOT [compute | differential CASE | integration CI_ROOT NETWORK_APPLICATION] on an ordinary-user GitHub runner" >&2
   exit 2
 fi
 root="$(readlink -f "$1")"
@@ -18,6 +18,15 @@ if [[ $# == 2 ]]; then
   fi
   driver="$(readlink -f .github/scripts/wamr-native-ci.sh)"
   driver_args=("${root}")
+elif [[ $# == 3 ]]; then
+  if [[ "$2" != differential || "${GITHUB_JOB:-}" != wamr-differential-parity ||
+        ( "$3" != build-start-tamper && "$3" != missing-build &&
+          "$3" != occupied-boot-slot && "$3" != prior-build-output ) ]]; then
+    echo "Invalid differential driver selection." >&2
+    exit 2
+  fi
+  driver="$(readlink -f .github/scripts/wamr-native-differential-ci.sh)"
+  driver_args=("${root}" "$3")
 elif [[ $# == 4 ]]; then
   if [[ "$2" != integration || "$3" != /* || ( "$4" != true && "$4" != false ) ]]; then
     echo "Invalid native integration driver selection." >&2
