@@ -1565,6 +1565,52 @@ test "direct shared supervisor retains bounded native success and failure eviden
     try directSharedSupervisorFixtures();
 }
 
+test "accepted build records replay at the 4 MiB boundary, not the tracked-file limit" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "build-record-replay-{d}", .{std.os.linux.getpid()});
+    defer a.free(name);
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("build record fixture cleanup failed");
+    const work = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    defer a.free(work);
+    const slot = try parent.openDir(io, name, .{ .iterate = true });
+    defer slot.close(io);
+    try slot.createDir(io, "evidence", .fromMode(0o700));
+    const evidence = try slot.openDir(io, "evidence", .{ .iterate = true });
+    defer evidence.close(io);
+    const boundary = 4 * 1024 * 1024;
+    const content = try a.alloc(u8, boundary + 1);
+    defer a.free(content);
+    @memset(content, 'x');
+    for ([_][]const u8{ "build-start.json", "build.json" }, 0..) |record, index| {
+        const file = try evidence.createFile(io, record, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+        defer file.close(io);
+        try file.writePositionalAll(io, content[0 .. boundary + index], 0);
+    }
+    var signal = try controller.build_pipeline.installCancellation();
+    defer signal.deinit();
+    var context: controller.build_pipeline.Context = .{
+        .allocator = a,
+        .io = io,
+        .environ = undefined,
+        .runtime = work,
+        .repository = options.repository_root,
+        .wamr = work,
+        .compute = work,
+        .git = undefined,
+        .tools = undefined,
+        .roots = undefined,
+        .signal = &signal,
+    };
+    const accepted = try controller.build_pipeline.readAcceptedRecord(&context, "build-start.json");
+    defer a.free(accepted);
+    try std.testing.expectEqualSlices(u8, content[0..boundary], accepted);
+    try std.testing.expectError(error.FileTooLarge, controller.build_pipeline.readAcceptedRecord(&context, "build.json"));
+}
+
 test "late cancellation refuses final build publication after record preparation" {
     const a = std.testing.allocator;
     const io = std.testing.io;

@@ -99,6 +99,14 @@ fn read(context: *Context, path: []const u8, max: usize, private: bool) ![]const
     return context.allocator.dupe(u8, data.bytes());
 }
 
+pub fn readAcceptedRecord(context: *Context, name: []const u8) ![]const u8 {
+    const relative = try std.fs.path.join(context.allocator, &.{ "evidence", name });
+    defer context.allocator.free(relative);
+    const path = try subpath(context, relative);
+    defer context.allocator.free(path);
+    return read(context, path, records.max_record_bytes, true);
+}
+
 fn evidence(context: *Context, name: []const u8, value: anytype) !void {
     try cancelled(context);
     const raw = try std.json.Stringify.valueAlloc(context.allocator, value, .{});
@@ -794,7 +802,7 @@ pub fn loadAccepted(context: *Context) !void {
     const a = context.allocator;
     const io = context.io;
     try cancelled(context);
-    const expected = try read(context, try subpath(context, "evidence/build-start.json"), limits.tracked_file, true);
+    const expected = try readAcceptedRecord(context, "build-start.json");
     const document = try core.contracts.Document.parse(a, expected, .{ .bytes = records.max_record_bytes, .items = 4096, .tokens = 65536, .depth = 32 });
     defer document.deinit();
     try document.requireCanonical(a, expected);
@@ -854,7 +862,7 @@ pub fn loadAccepted(context: *Context) !void {
 }
 
 pub fn revalidateAccepted(context: *Context) !void {
-    const actual = try read(context, try subpath(context, "evidence/build.json"), limits.tracked_file, true);
+    const actual = try readAcceptedRecord(context, "build.json");
     const value = try buildValue(context);
     const encoded = try std.json.Stringify.valueAlloc(context.allocator, value, .{});
     if (!std.mem.eql(u8, actual, try records.canonicalAlloc(context.allocator, encoded)))
