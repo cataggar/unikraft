@@ -241,6 +241,11 @@ test "fixture parent rejects missing, noncanonical, source-tree and nonprivate r
     try std.testing.expectError(error.FixtureRootUnavailable, openFixtureRoot(missing));
     try safe.createDir(io, name, .fromMode(0o755));
     defer safe.deleteTree(io, name) catch @panic("unsafe fixture cleanup failed");
+    // The managed CI umask would otherwise turn the requested 0755 into 0700.
+    const terminated = try a.dupeZ(u8, name);
+    defer a.free(terminated);
+    if (linux.errno(linux.fchmodat(safe.handle, terminated, 0o755)) != .SUCCESS)
+        return error.ChmodFixtureFailed;
     try std.testing.expectError(error.UnsafeFixtureRoot, openFixtureRoot(missing));
 }
 

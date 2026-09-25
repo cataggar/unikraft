@@ -588,8 +588,9 @@ compares actual Python and native controller CLI refusals in separate private
 roots. Its three documented legacy-CLI exceptions require exact refusal
 versus closed-grammar usage outcomes; they do not make a failed controller
 run successful. The `full` action requires separate clean worktrees, real
-pinned tools and WAMR source, an owner-only runtime template and portable
-controller, and accessible x86 KVM. The protected x86 job installs that
+pinned tools and WAMR source, an empty private `.d` output role in each
+worktree, an owner-only runtime template and portable controller, and
+accessible x86 KVM. The protected x86 job installs that
 controller from its isolated fixture worktree into a separate private root,
 then runs one paired six-mode success case after the Python production boot
 within the same managed, non-root KVM process. An unexplained difference fails

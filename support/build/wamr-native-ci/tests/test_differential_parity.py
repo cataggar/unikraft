@@ -1262,8 +1262,10 @@ def checked_repository(path):
     for relative in (".zig-cache", "support/apps/wamr-aot/.config",
                      "support/apps/wamr-aot/build"):
         check(not (path / relative).exists(), "prior source output refused")
-    if (path / ".d").exists():
-        private(path / ".d", empty=True)
+    output_root = path / ".d"
+    check(output_root.is_dir() and not output_root.is_symlink(),
+          "precreated empty .d source output role required")
+    private(output_root, empty=True)
     return head.stdout.strip(), tree.stdout.strip()
 
 
@@ -1470,6 +1472,36 @@ def full(args):
 
 
 class DeterministicContracts(unittest.TestCase):
+    def test_full_requires_fresh_precreated_source_output_roots(self):
+        parent = fresh(fixture_parent(), f"differential-source-role-{os.getpid()}")
+        try:
+            repository = fresh(parent, "repository")
+            (repository / ".gitignore").write_text(".d/\n")
+            for args in (
+                    ("init", "-q"),
+                    ("add", ".gitignore"),
+                    ("-c", "user.name=Fixture", "-c",
+                     "user.email=fixture@example.invalid", "commit", "-qm",
+                     "tracked source")):
+                result = command(["git", "-C", str(repository), *args],
+                                 repository, seconds=30)
+                self.assertEqual(result.returncode, 0, result.stderr[:300])
+            with self.assertRaisesRegex(ParityError, "precreated empty .d"):
+                checked_repository(repository)
+            output = repository / ".d"
+            output.mkdir(mode=0o700)
+            output.chmod(0o755)
+            with self.assertRaisesRegex(ParityError, "owner-only 0700"):
+                checked_repository(repository)
+            output.chmod(0o700)
+            (output / "prior").write_bytes(b"prior")
+            with self.assertRaisesRegex(ParityError, "fresh empty root"):
+                checked_repository(repository)
+            (output / "prior").unlink()
+            self.assertEqual(len(checked_repository(repository)), 2)
+        finally:
+            shutil.rmtree(parent)
+
     def test_build_start_compares_shared_identities_after_side_specific_proof(self):
         reference = oracle()
         custody = {

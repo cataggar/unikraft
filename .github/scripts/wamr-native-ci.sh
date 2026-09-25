@@ -46,6 +46,7 @@ cleanup() {
 trap cleanup EXIT
 git worktree add --detach "${python_source}" HEAD
 git worktree add --detach "${native_source}" HEAD
+mkdir -m 0700 -- "${python_source}/.d" "${native_source}/.d"
 PYTHONDONTWRITEBYTECODE=1 python3 -B \
   support/build/wamr-native-ci/tests/test_differential_parity.py full \
   --case success --root "${comparison_root}" \
