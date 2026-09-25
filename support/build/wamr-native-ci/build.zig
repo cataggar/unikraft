@@ -254,6 +254,7 @@ pub fn build(b: *std.Build) void {
     });
     fault_parity_tests.root_module.addOptions("test_options", controller_options);
     const fault_parity_run = b.addRunArtifact(fault_parity_tests);
+    fault_parity_run.step.dependOn(&controller_run.step);
     b.step("test-controller-fault-parity", "Run native physical custody parity faults")
         .dependOn(&fault_parity_run.step);
     controller_step.dependOn(&fault_parity_run.step);
