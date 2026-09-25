@@ -424,7 +424,10 @@ URL/revision/package hash, and only then performs the bounded fetch. Before
 reading package content it enumerates and snapshots the complete bounded
 directory set, including `zig-pkg`, then requires the exact set and metadata
 after traversal. The restored tree rejects links, nonregular entries, unsafe
-names, extra/missing/duplicate roots and incomplete transitive manifests. Zig 0.16
+names, extra/missing/duplicate roots and incomplete transitive manifests.
+Under its owner-only `0700` root, descriptor-relative native custody admits
+and records upstream package file/directory modes (including `0777`) without
+relaxing the general host-artifact policy. Zig 0.16
 `fetch PATH` independently recomputes every package hash, including Miz rather
 than trusting its directory name. `build-start.json` embeds
 `uk.wamr.zig-dependency-custody` version 1: request and source/copy manifest

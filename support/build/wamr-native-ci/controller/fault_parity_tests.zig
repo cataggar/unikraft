@@ -287,6 +287,36 @@ test "package custody rejects symlink and FIFO entries, unexpected roots and mis
     try expectPackageError(path, error.MissingDependency);
 }
 
+test "pinned package custody accepts writable archive members only beneath its private root" {
+    var fixture = try Fixture.init("package-modes");
+    defer fixture.deinit();
+    try fixture.root.createDir(io, "zig-pkg", .fromMode(0o700));
+    const packages = try fixture.root.openDir(io, "zig-pkg", .{ .iterate = true });
+    defer packages.close(io);
+    const path = try fixture.child("zig-pkg");
+    defer a.free(path);
+    try packages.createDir(io, controller.custody_limits.miz_package_hash, .fromMode(0o700));
+    const miz = try packages.openDir(io, controller.custody_limits.miz_package_hash, .{ .iterate = true });
+    defer miz.close(io);
+    try package(miz);
+    const source = try miz.openFile(io, "source.zig", .{});
+    defer source.close(io);
+    try chmod(source, 0o777);
+    try miz.createDir(io, "scripts", .fromMode(0o700));
+    const scripts = try miz.openDir(io, "scripts", .{ .iterate = true });
+    defer scripts.close(io);
+    try write(scripts, "build.sh", "#!/bin/sh\n", 0o600);
+    try chmod(.{ .handle = scripts.handle, .flags = .{ .nonblocking = false } }, 0o777);
+    var admitted = try controller.dependency_custody.packageSet(a, io, path);
+    defer admitted.deinit(a);
+    try controller.dependency_custody.requireSame(a, io, path, admitted);
+    try chmod(source, 0o600);
+    try std.testing.expectError(error.DependencyChanged,
+        controller.dependency_custody.requireSame(a, io, path, admitted));
+    try chmod(.{ .handle = packages.handle, .flags = .{ .nonblocking = false } }, 0o755);
+    try expectPackageError(path, error.UnsafeFile);
+}
+
 test "identical-content package root replacement breaks retained physical dependency custody" {
     var fixture = try Fixture.init("dependency-replace");
     defer fixture.deinit();
