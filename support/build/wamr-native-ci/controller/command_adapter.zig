@@ -205,7 +205,16 @@ fn create(io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: []const u8) !voi
 }
 
 pub fn openPinnedTool(io: std.Io, path: []const u8, role: []const u8) !files.RetainedFile {
-    if (!std.mem.eql(u8, role, "tool:zig"))
+    const large_roles = [_][]const u8{
+        "tool:zig",        "tool:llvm-nm",      "tool:llvm-objcopy",
+        "tool:llvm-objdump", "tool:llvm-readelf", "tool:llvm-strip",
+    };
+    var large = false;
+    for (large_roles) |name| if (std.mem.eql(u8, name, role)) {
+        large = true;
+        break;
+    };
+    if (!large)
         return files.RetainedFile.open(io, path, .tool);
     var retained = try files.RetainedFile.open(io, path, .artifact);
     errdefer retained.close(io);

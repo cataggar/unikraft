@@ -225,7 +225,7 @@ test "consumer retains the original executable but rejects same-byte inode repla
     try std.testing.expectError(error.InputChanged, controller.input_custody.requireSame(a, io, expected, &files, &trees));
 }
 
-test "only the pinned Zig role admits a large executable under retained custody" {
+test "only pinned Zig and LLVM roles admit large executables under retained custody" {
     var fixture = try Fixture.init("zig-tool-bound");
     defer fixture.deinit();
     const file = try fixture.root.createFile(io, "zig", .{
@@ -238,9 +238,14 @@ test "only the pinned Zig role admits a large executable under retained custody"
         return error.FixtureTruncateFailed;
     try std.testing.expectError(error.UnsafeFile,
         controller.command_adapter.openPinnedTool(io, path, "tool:git"));
+    try std.testing.expectError(error.UnsafeFile,
+        controller.command_adapter.openPinnedTool(io, path, "tool:llvm-other"));
     var retained = try controller.command_adapter.openPinnedTool(io, path, "tool:zig");
     defer retained.close(io);
     try retained.verify(io);
+    var llvm = try controller.command_adapter.openPinnedTool(io, path, "tool:llvm-nm");
+    defer llvm.close(io);
+    try llvm.verify(io);
 
     try chmod(file, 0o722);
     try std.testing.expectError(error.UnsafeFile,
@@ -250,6 +255,8 @@ test "only the pinned Zig role admits a large executable under retained custody"
         return error.FixtureTruncateFailed;
     try std.testing.expectError(error.UnsafeFile,
         controller.command_adapter.openPinnedTool(io, path, "tool:zig"));
+    try std.testing.expectError(error.UnsafeFile,
+        controller.command_adapter.openPinnedTool(io, path, "tool:llvm-objdump"));
 }
 
 test "consumer tree permits a directory alias inside its root but refuses external directory" {
