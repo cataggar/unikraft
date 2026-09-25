@@ -1332,6 +1332,14 @@ def build_failure_details(results, snapshots):
                 result.stderr.decode("utf-8", "replace"))
             if marker:
                 reason = " reason:" + marker.group(1)
+        elif classification.startswith("failed_stage:"):
+            marker = re.search(
+                r"(?m)^WAMR_CI_FAILED_STAGE: [a-z0-9-]+; "
+                r"cause: ([A-Za-z][A-Za-z0-9_]{0,79}); "
+                r"bounded private logs retained\.$",
+                result.stderr.decode("utf-8", "replace"))
+            if marker:
+                reason = " cause:" + marker.group(1)
         details.append(
             f"{label}=exit:{result.returncode} category:{classification}{reason} "
             f"evidence:{','.join(files['order'])} "
@@ -2071,6 +2079,30 @@ class DeterministicContracts(unittest.TestCase):
         self.assertIn("native=exit:1 category:refused evidence: artifacts:",
                       details)
         self.assertNotIn("/private/secret", details)
+
+    def test_failed_build_summary_reports_only_static_native_error_names(self):
+        results = {
+            "python": subprocess.CompletedProcess(
+                [], 0, b"", b""),
+            "native": subprocess.CompletedProcess(
+                [], 1, b"",
+                b"WAMR_CI_FAILED_STAGE: dependency-restore; "
+                b"cause: BootstrapCommandFailed; bounded private logs retained.\n"
+                b"error: /private/secret\n"),
+        }
+        snapshots = {
+            label: {"files": {"order": (), "artifacts": {}}}
+            for label in results
+        }
+        details = build_failure_details(results, snapshots)
+        self.assertIn("native=exit:1 category:failed_stage:dependency-restore "
+                      "cause:BootstrapCommandFailed", details)
+        self.assertNotIn("/private/secret", details)
+        results["native"] = subprocess.CompletedProcess(
+            [], 1, b"",
+            b"WAMR_CI_FAILED_STAGE: dependency-restore; "
+            b"cause: /private/secret; bounded private logs retained.\n")
+        self.assertNotIn("cause:", build_failure_details(results, snapshots))
 
     def test_prior_build_output_requires_startup_failure_and_no_acceptance(self):
         class Exit:

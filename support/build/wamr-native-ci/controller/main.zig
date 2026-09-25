@@ -40,7 +40,7 @@ pub fn main(init: std.process.Init) void {
         .signal = &signal,
     };
     switch (command.action) {
-        .build => _ = controller.build_pipeline.run(&context) catch failed(init.io, context.failed_stage),
+        .build => _ = controller.build_pipeline.run(&context) catch |err| failed(init.io, context.failed_stage, err),
         .boot => {
             var boot_context: controller.boot_pipeline.Context = .{
                 .build_context = &context,
@@ -48,7 +48,7 @@ pub fn main(init: std.process.Init) void {
             };
             _ = controller.boot_pipeline.run(&boot_context) catch |err| {
                 if (err == error.KvmUnavailable) refusedWithMessage(init.io, "x86 KVM unavailable");
-                failed(init.io, context.failed_stage);
+                failed(init.io, context.failed_stage, err);
             };
         },
         .diagnostics => {
@@ -56,7 +56,7 @@ pub fn main(init: std.process.Init) void {
                 .build_context = &context,
                 .pinned = std.StringHashMap(controller.custody_files.File).init(allocator),
             };
-            controller.boot_pipeline.diagnostics(&boot_context) catch failed(init.io, "diagnostics");
+            controller.boot_pipeline.diagnostics(&boot_context) catch |err| failed(init.io, "diagnostics", err);
         },
         .describe => unreachable,
     }
@@ -82,11 +82,11 @@ fn refusedWithMessage(io: std.Io, message: []const u8) noreturn {
     std.process.exit(1);
 }
 
-fn failed(io: std.Io, stage: []const u8) noreturn {
+fn failed(io: std.Io, stage: []const u8, reason: anyerror) noreturn {
     var stderr = std.Io.File.stderr().writerStreaming(io, &.{});
     stderr.interface.print(
-        "WAMR_CI_FAILED_STAGE: {s}; bounded private logs retained.\n",
-        .{stage},
+        "WAMR_CI_FAILED_STAGE: {s}; cause: {s}; bounded private logs retained.\n",
+        .{ stage, @errorName(reason) },
     ) catch {};
     std.process.exit(1);
 }

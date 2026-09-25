@@ -95,7 +95,9 @@ remains the independent full-size source-boundary oracle until cutover.
 
 `build --runtime ABS --wamr-source ABS`, `boot --runtime ABS`, and
 `diagnostics --runtime ABS` are available only through the installed
-native controller. Production workflow callers continue using the Python controller;
+native controller. Native stage failures report only a static Zig error name
+alongside the failed stage; command output and private paths remain in bounded
+private logs. Production workflow callers continue using the Python controller;
 there is no fallback, boot cutover, or change in acceptance authority before
 the later parity and cutover PRs. The closed
 `tiny_exact_v2` production type has six ordered raw/QCOW2/VPC modes;
