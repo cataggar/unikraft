@@ -20,6 +20,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -1074,6 +1075,21 @@ REVIEWED_BUILD_COMMANDS = (
 )
 
 
+def source_root_only_config(left, right):
+    normalized = []
+    for side in (left, right):
+        repository = side["roots"][1]
+        raw = checked_file(repository / "support/apps/wamr-aot/.config", 1024 * 1024)
+        recorded = side["files"]["artifacts"]["config"]
+        check(len(raw) == recorded[0] and sha(raw) == recorded[1],
+              "config changed during comparison")
+        source_root = os.fsencode(repository)
+        if source_root not in raw:
+            return False
+        normalized.append(raw.replace(source_root, b"<source-root>"))
+    return normalized[0] == normalized[1]
+
+
 def compare_observations(left, right, reviewed_build_compat=False):
     failures = []
     for key in ("returncode",):
@@ -1139,6 +1155,10 @@ def compare_observations(left, right, reviewed_build_compat=False):
         for index, field in enumerate(("bytes", "sha256", "mode")):
             if one[index] != two[index]:
                 failures.append(f"artifacts:{role}.{field}")
+        if (role == "config" and one[1] != two[1]
+                and len(left["roots"]) == len(right["roots"]) == 2
+                and source_root_only_config(left, right)):
+            failures.append("artifacts:config.source-root-dependent")
     if l_records.keys() != r_records.keys():
         failures.append("evidence_membership")
     left_normalizer, right_normalizer = Normalizer(left["roots"]), Normalizer(right["roots"])
@@ -2082,6 +2102,34 @@ class DeterministicContracts(unittest.TestCase):
         changed["files"]["artifacts"] = {"unexpected": (123, "a" * 64, 0o600)}
         with self.assertRaisesRegex(ParityError, "invalid artifact comparison roles"):
             compare_observations(original, changed)
+
+    def test_config_source_root_diagnostic_does_not_normalize_artifact_parity(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            observations = []
+            for side in ("python", "native"):
+                repository = Path(scratch) / ("source-" + side)
+                config = repository / "support/apps/wamr-aot/.config"
+                config.parent.mkdir(parents=True)
+                raw = b"CONFIG_SOURCE=" + os.fsencode(repository) + b"\n"
+                config.write_bytes(raw)
+                config.chmod(0o600)
+                observations.append({
+                    "exit": subprocess.CompletedProcess([], 0, b"", b""),
+                    "files": {"order": (), "records": {}, "retained": {},
+                              "artifacts": {"config": (len(raw), sha(raw), 0o600)}},
+                    "roots": (Path(scratch) / ("runtime-" + side), repository),
+                })
+            self.assertEqual(compare_observations(*observations), [
+                "artifacts:config.sha256",
+                "artifacts:config.source-root-dependent",
+            ])
+            config.write_bytes(raw + b"other=1\n")
+            changed = config.read_bytes()
+            observations[1]["files"]["artifacts"]["config"] = (
+                len(changed), sha(changed), 0o600)
+            self.assertEqual(compare_observations(*observations), [
+                "artifacts:config.bytes", "artifacts:config.sha256",
+            ])
 
     def test_only_three_invalid_cli_vectors_have_exact_declared_exits(self):
         class Exit:

@@ -187,9 +187,34 @@ pub fn gitOutput(
 pub fn requireGitOutcome(result: process.CommandResult, limit: usize) !void {
     if (result.primary_deadline_reached) return error.GitTimedOut;
     if (!result.succeeded()) {
-        if (result.primary == .output_overflow) return error.GitOutputOverflow;
-        if (result.primary == .signal) return error.GitSignaled;
-        if (result.primary == .exited and result.primary.exited != 0) return error.GitExited;
+        switch (result.primary) {
+            .exited => |code| if (code != 0) return error.GitExited,
+            .signal => return error.GitSignaled,
+            .timeout => return error.GitTimedOut,
+            .cancelled => return error.GitCancelled,
+            .output_overflow => return error.GitOutputOverflow,
+            .exec_failed => return error.GitExecFailed,
+            .snapshot_unsupported => return error.GitSnapshotUnsupported,
+            .event_limit => return error.GitEventLimit,
+            .local_io => return error.GitLocalIo,
+            .executable_changed => return error.GitExecutableChanged,
+            .unknown => return error.GitUnknownTermination,
+        }
+        if (!result.cleanup_complete or result.cleanup != .complete) return switch (result.cleanup) {
+            .deadline => error.GitCleanupTimedOut,
+            .event_limit => error.GitCleanupEventLimit,
+            .descendant_untracked => error.GitCleanupDescendantUntracked,
+            .identity_changed => error.GitCleanupIdentityChanged,
+            .signal_failed => error.GitCleanupSignalFailed,
+            .reap_failed => error.GitCleanupReapFailed,
+            .proc_unavailable => error.GitCleanupProcUnavailable,
+            .local_io => error.GitCleanupLocalIo,
+            .complete, .not_required => error.GitCleanupIncomplete,
+        };
+        if (result.descendants.limit_exceeded) return error.GitDescendantLimit;
+        if (result.stdout_status != .complete or result.stderr_status != .complete)
+            return error.GitStreamIncomplete;
+        if (!result.executable_stable) return error.GitExecutableChanged;
         return error.GitRefused;
     }
     if (result.stderr.len != 0) return error.GitDiagnostic;

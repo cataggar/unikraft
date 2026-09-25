@@ -469,7 +469,7 @@ exhaustion or uncertain ownership poisons the one-shot supervisor result and
 cannot become success. This is cleanup for cooperative or accidentally
 detached owned descendants, not a hostile same-UID or PID-namespace ownership
 claim. Git bootstrap/custody probes have a 120-second primary deadline and report
-distinct static deadline, output-overflow, signal, exit, and stderr refusal
+distinct static primary, cleanup, stream, output-overflow, and stderr refusal
 categories; raw Git output stays private. They run with
 system/global configuration, hooks, repository fsmonitor helpers, credential
 helpers, replacement objects, terminal prompts and pagers disabled where
@@ -635,7 +635,9 @@ labels to identify which of the four real controller invocations has exhausted
 the bounded step deadline. Failed paired builds and boots report only per-side
 exit classes, evidence and artifact names, and path-free refusal or static
 native error markers. Artifact differences identify only the fixed role and
-changed size, hash or mode field; private command logs remain local.
+changed size, hash or mode field; a config hash mismatch is additionally marked
+when rechecked config bytes differ only by the source-root path, without
+normalizing acceptance. Private command logs remain local.
 
 ## Private final-image handoff
 
