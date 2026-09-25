@@ -1026,7 +1026,7 @@ test "native clean Git custody, stable physical identities and pinned archive re
     const exact_version = try controller.source_custody.gitOutput(allocator, io, path, options.git_executable, &.{"version"}, version.len, null);
     defer allocator.free(exact_version);
     try std.testing.expectEqualStrings(version, exact_version);
-    try std.testing.expectError(error.GitRefused, controller.source_custody.gitOutput(
+    try std.testing.expectError(error.GitOutputOverflow, controller.source_custody.gitOutput(
         allocator,
         io,
         path,
@@ -1088,7 +1088,7 @@ test "native clean Git custody, stable physical identities and pinned archive re
     try limited_dir.createDir(io, "custody", .fromMode(0o700));
     const limited_path = try std.fs.path.join(allocator, &.{ path, ".d/runtime-limited" });
     defer allocator.free(limited_path);
-    try std.testing.expectError(error.GitRefused, controller.source_custody.Fixture.sealLimited(
+    if (controller.source_custody.Fixture.sealLimited(
         allocator,
         io,
         path,
@@ -1096,7 +1096,8 @@ test "native clean Git custody, stable physical identities and pinned archive re
         options.git_executable,
         captured.revision,
         1024,
-    ));
+    )) |_| return error.OversizedArchiveAccepted else |err|
+        try std.testing.expect(err == error.GitExited or err == error.GitOutputOverflow);
     const limited_archive = try std.fs.path.join(allocator, &.{ limited_path, "custody/wamr-source.tar" });
     defer allocator.free(limited_archive);
     try std.testing.expect((try controller.custody_files.readFile(io, limited_archive, 1024, true)).bytes <= 1024);

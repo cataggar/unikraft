@@ -2,6 +2,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const files = @import("hyperv_core").private_files;
+const process = @import("hyperv_core").process;
 const options = @import("test_options");
 const limits = @import("custody_limits.zig");
 const source = @import("source_custody.zig");
@@ -13,6 +14,39 @@ const inventory_args = &[_][]const u8{
 };
 const output_ignore =
     "/.d/\n/.zig-cache/\n/support/apps/wamr-aot/.config\n/support/apps/wamr-aot/build/\n";
+
+test "Git custody remains bounded and reports static supervised failure classes" {
+    try std.testing.expectEqual(@as(u64, 120_000), source.git_probe_deadline_ms);
+    var empty: [0]u8 = .{};
+    var result: process.CommandResult = .{
+        .storage = &empty,
+        .started_ns = 0,
+        .primary_completed_ns = 0,
+        .completed_ns = 0,
+        .executable = undefined,
+        .primary = .timeout,
+        .primary_deadline_reached = true,
+    };
+    try std.testing.expectError(error.GitTimedOut, source.requireGitOutcome(result, 2));
+    result.primary_deadline_reached = false;
+    result.primary = .output_overflow;
+    try std.testing.expectError(error.GitOutputOverflow, source.requireGitOutcome(result, 2));
+    result.primary = .{ .signal = .KILL };
+    try std.testing.expectError(error.GitSignaled, source.requireGitOutcome(result, 2));
+    result.primary = .{ .exited = 1 };
+    try std.testing.expectError(error.GitExited, source.requireGitOutcome(result, 2));
+    result.primary = .{ .exited = 0 };
+    try std.testing.expectError(error.GitRefused, source.requireGitOutcome(result, 2));
+    result.cleanup = .complete;
+    result.stdout_status = .complete;
+    result.stderr_status = .complete;
+    result.stderr = "diagnostic content remains private";
+    try std.testing.expectError(error.GitDiagnostic, source.requireGitOutcome(result, 2));
+    result.stderr = "";
+    result.stdout = "abc";
+    try std.testing.expectError(error.GitOutputOverflow, source.requireGitOutcome(result, 2));
+    try source.requireGitOutcome(result, 3);
+}
 
 fn write(dir: std.Io.Dir, name: []const u8, contents: []const u8) !void {
     const file = try dir.createFile(io, name, .{ .exclusive = true, .permissions = .fromMode(0o600) });
@@ -396,7 +430,7 @@ test "real ignored Git inventory accepts eight MiB and refuses the next byte" {
     const excess = try repo.gitOutput(inventory_args, limits.ignored_git_output + 2);
     defer a.free(excess);
     try std.testing.expectEqual(limits.ignored_git_output + 1, excess.len);
-    try std.testing.expectError(error.GitRefused, source.gitOutput(
+    try std.testing.expectError(error.GitOutputOverflow, source.gitOutput(
         a,
         io,
         repo.path,

@@ -468,7 +468,9 @@ Cleanup has its own absolute deadline and bounded scan/signal/reap budgets;
 exhaustion or uncertain ownership poisons the one-shot supervisor result and
 cannot become success. This is cleanup for cooperative or accidentally
 detached owned descendants, not a hostile same-UID or PID-namespace ownership
-claim. Git bootstrap/custody probes run with
+claim. Git bootstrap/custody probes have a 120-second primary deadline and report
+distinct static deadline, output-overflow, signal, exit, and stderr refusal
+categories; raw Git output stays private. They run with
 system/global configuration, hooks, repository fsmonitor helpers, credential
 helpers, replacement objects, terminal prompts and pagers disabled where
 applicable.
@@ -632,7 +634,8 @@ Protected paired runs print only closed stage-start and stage-completion
 labels to identify which of the four real controller invocations has exhausted
 the bounded step deadline. Failed paired builds and boots report only per-side
 exit classes, evidence and artifact names, and path-free refusal or static
-native error markers; private command logs remain local.
+native error markers. Artifact differences identify only the fixed role and
+changed size, hash or mode field; private command logs remain local.
 
 ## Private final-image handoff
 

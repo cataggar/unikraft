@@ -95,6 +95,8 @@ const git_prefix = [_][]const u8{
     "core.pager=cat",
 };
 
+pub const git_probe_deadline_ms = 120_000;
+
 pub fn gitOutput(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -145,7 +147,7 @@ pub fn gitOutput(
     defer {
         if (bounded_fd) |fd| _ = linux.close(fd);
     }
-    const primary = try process.Deadline.afterMilliseconds(60_000);
+    const primary = try process.Deadline.afterMilliseconds(git_probe_deadline_ms);
     const cleanup: process.Deadline = .{ .expires_ns = try std.math.add(u64, primary.expires_ns, 10 * std.time.ns_per_s) };
     var result = try process.runCommand(allocator, io, .{
         .executable = executable,
@@ -159,7 +161,7 @@ pub fn gitOutput(
         .limits = .{ .stdout_bytes = if (output != null) 1024 else @max(1, @min(limit, 8 * limits.mib)), .stderr_bytes = 4096 },
     });
     defer result.deinit(allocator);
-    if (!result.succeeded() or result.stderr.len != 0 or result.stdout.len > limit) return error.GitRefused;
+    try requireGitOutcome(result, limit);
     if (bounded_fd) |fd| {
         const length = linux.lseek(fd, 0, 1);
         if (linux.errno(length) != .SUCCESS or length == 0 or length > limit)
@@ -180,6 +182,18 @@ pub fn gitOutput(
     if (!files.sameSnapshot(before, try files.snapshot(.{ .handle = after.handle, .flags = .{ .nonblocking = false } })))
         return error.SourceChanged;
     return allocator.dupe(u8, result.stdout);
+}
+
+pub fn requireGitOutcome(result: process.CommandResult, limit: usize) !void {
+    if (result.primary_deadline_reached) return error.GitTimedOut;
+    if (!result.succeeded()) {
+        if (result.primary == .output_overflow) return error.GitOutputOverflow;
+        if (result.primary == .signal) return error.GitSignaled;
+        if (result.primary == .exited and result.primary.exited != 0) return error.GitExited;
+        return error.GitRefused;
+    }
+    if (result.stderr.len != 0) return error.GitDiagnostic;
+    if (result.stdout.len > limit) return error.GitOutputOverflow;
 }
 
 fn gitLine(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: []const u8, args: []const []const u8) ![]u8 {

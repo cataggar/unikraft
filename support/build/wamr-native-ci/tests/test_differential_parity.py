@@ -1108,7 +1108,7 @@ def compare_observations(left, right, reviewed_build_compat=False):
                     and "qcow2-acceptance.json" in r_records):
                 failures.extend(compare_qcow2_acceptance(left, right))
                 checked_acceptance = True
-    for key in ("order", "retained", "artifacts"):
+    for key in ("order", "retained"):
         left_value, right_value = left["files"][key], right["files"][key]
         if key == "retained" and checked_commands:
             def verified_log_slots(side):
@@ -1124,6 +1124,21 @@ def compare_observations(left, right, reviewed_build_compat=False):
             left_value, right_value = verified_log_slots(left), verified_log_slots(right)
         if left_value != right_value:
             failures.append(key)
+    left_artifacts = left["files"]["artifacts"]
+    right_artifacts = right["files"]["artifacts"]
+    roles = {"config", "efi", "raw", "qcow2", "vhd"}
+    check(left_artifacts.keys() <= roles and right_artifacts.keys() <= roles,
+          "invalid artifact comparison roles")
+    if left_artifacts.keys() != right_artifacts.keys():
+        failures.append("artifacts:membership")
+    for role in ("config", "efi", "raw", "qcow2", "vhd"):
+        if role not in left_artifacts or role not in right_artifacts:
+            continue
+        one, two = left_artifacts[role], right_artifacts[role]
+        check(len(one) == len(two) == 3, "invalid artifact comparison shape")
+        for index, field in enumerate(("bytes", "sha256", "mode")):
+            if one[index] != two[index]:
+                failures.append(f"artifacts:{role}.{field}")
     if l_records.keys() != r_records.keys():
         failures.append("evidence_membership")
     left_normalizer, right_normalizer = Normalizer(left["roots"]), Normalizer(right["roots"])
@@ -2048,6 +2063,25 @@ class DeterministicContracts(unittest.TestCase):
         native = {"exit": Exit(1, b"WAMR_CI_FAILED_STAGE: boot-platform; logs retained.\n"),
                   "files": python["files"], "roots": (Path("/native"),)}
         self.assertEqual(compare_observations(python, native), ["refusal_category"])
+
+    def test_artifact_differences_name_only_fixed_roles_and_fields(self):
+        exit_ok = subprocess.CompletedProcess([], 0, b"", b"")
+        original = {"exit": exit_ok, "files": {
+            "order": (), "records": {}, "retained": {},
+            "artifacts": {"efi": (123, "a" * 64, 0o600)},
+        }, "roots": (Path("/python"),)}
+        changed = copy.deepcopy(original)
+        changed["roots"] = (Path("/native"),)
+        changed["files"]["artifacts"]["efi"] = (124, "b" * 64, 0o700)
+        self.assertEqual(compare_observations(original, changed), [
+            "artifacts:efi.bytes", "artifacts:efi.sha256", "artifacts:efi.mode",
+        ])
+        changed["files"]["artifacts"] = {}
+        self.assertEqual(compare_observations(original, changed),
+                         ["artifacts:membership"])
+        changed["files"]["artifacts"] = {"unexpected": (123, "a" * 64, 0o600)}
+        with self.assertRaisesRegex(ParityError, "invalid artifact comparison roles"):
+            compare_observations(original, changed)
 
     def test_only_three_invalid_cli_vectors_have_exact_declared_exits(self):
         class Exit:
