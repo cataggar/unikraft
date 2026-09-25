@@ -69,6 +69,24 @@ pub const Source = struct {
         physical_sha256: [64]u8,
         role_excluded_outputs: [limits.roles.len][]const u8 = limits.roles,
     },
+
+    pub fn same(a: Source, b: Source) bool {
+        const first = a.custody;
+        const second = b.custody;
+        if (!std.mem.eql(u8, a.revision, b.revision) or
+            !std.mem.eql(u8, a.tree, b.tree) or
+            !std.mem.eql(u8, first.schema, second.schema) or
+            first.version != second.version or
+            !std.mem.eql(u8, first.object_format, second.object_format) or
+            first.files != second.files or first.directories != second.directories or
+            first.bytes != second.bytes or
+            !std.meta.eql(first.content_sha256, second.content_sha256) or
+            !std.meta.eql(first.physical_sha256, second.physical_sha256))
+            return false;
+        for (first.role_excluded_outputs, second.role_excluded_outputs) |left, right|
+            if (!std.mem.eql(u8, left, right)) return false;
+        return true;
+    }
 };
 
 const git_prefix = [_][]const u8{

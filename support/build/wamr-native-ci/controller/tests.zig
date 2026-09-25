@@ -839,6 +839,43 @@ test "embedded tracked source closure and physical/no-follow checks" {
     try std.testing.expectError(error.FileNotFound, source.verifyPhysical(std.testing.io, std.testing.allocator, "/d/does-not-exist-controller"));
 }
 
+test "recaptured source custody compares content, not allocated string addresses" {
+    const allocator = std.testing.allocator;
+    const source = controller.source_custody;
+    const before: source.Source = .{
+        .revision = "revision",
+        .tree = "tree",
+        .custody = .{
+            .object_format = "sha1",
+            .files = 4,
+            .directories = 2,
+            .bytes = 128,
+            .content_sha256 = [_]u8{'a'} ** 64,
+            .physical_sha256 = [_]u8{'b'} ** 64,
+        },
+    };
+    const revision = try allocator.dupe(u8, before.revision);
+    defer allocator.free(revision);
+    const tree = try allocator.dupe(u8, before.tree);
+    defer allocator.free(tree);
+    const format = try allocator.dupe(u8, before.custody.object_format);
+    defer allocator.free(format);
+    var actual = before;
+    actual.revision = revision;
+    actual.tree = tree;
+    actual.custody.object_format = format;
+    try std.testing.expect(before.same(actual));
+
+    actual.custody.physical_sha256[0] = 'c';
+    try std.testing.expect(!before.same(actual));
+    actual.custody = before.custody;
+    actual.custody.object_format = "sha256";
+    try std.testing.expect(!before.same(actual));
+    actual.custody = before.custody;
+    actual.custody.role_excluded_outputs[0] = "unexpected";
+    try std.testing.expect(!before.same(actual));
+}
+
 test "frozen custody limits, component-bound roles and first excess" {
     const l = controller.custody_limits;
     try std.testing.expectEqual(@as(usize, 40_000), l.tracked_entries);

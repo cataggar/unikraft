@@ -372,9 +372,7 @@ pub fn requireSource(context: *Context) !void {
     const actual = try custody.source(context.allocator, context.io, context.repository, context.git);
     try cancelled(context);
     const before = context.source.?;
-    if (!std.mem.eql(u8, actual.revision, before.revision) or
-        !std.mem.eql(u8, actual.tree, before.tree) or
-        !std.meta.eql(actual.custody, before.custody)) return error.SourceChanged;
+    if (!before.same(actual)) return error.SourceChanged;
 }
 
 fn runStage(state: anytype, selected: plan.Stage, check_consumer: bool) !void {

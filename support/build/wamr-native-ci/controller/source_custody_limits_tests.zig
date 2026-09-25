@@ -193,6 +193,25 @@ fn refuseSource(repo: Repo, expected: anyerror) !void {
     try std.testing.expectError(expected, source.source(arena.allocator(), io, repo.path, repo.fixture.git));
 }
 
+test "two real Git source captures agree until tracked physical metadata changes" {
+    var fixture = try Fixture.init("source-recapture");
+    defer fixture.deinit();
+    var repo = try Repo.withOutputs(&fixture, "stable", output_ignore);
+    defer repo.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const before = try source.source(arena.allocator(), io, repo.path, repo.fixture.git);
+    const unchanged = try source.source(arena.allocator(), io, repo.path, repo.fixture.git);
+    try std.testing.expect(before.same(unchanged));
+
+    const file = try repo.dir.openFile(io, "support/apps/wamr-aot/defconfig", .{});
+    defer file.close(io);
+    if (linux.errno(linux.fchmod(file.handle, 0o640)) != .SUCCESS)
+        return error.ChmodFixtureFailed;
+    const changed = try source.source(arena.allocator(), io, repo.path, repo.fixture.git);
+    try std.testing.expect(!before.same(changed));
+}
+
 fn addIgnored(repo: Repo, path: []const u8) !void {
     const slash = std.mem.lastIndexOfScalar(u8, path, '/').?;
     try repo.dir.createDirPath(io, path[0..slash]);

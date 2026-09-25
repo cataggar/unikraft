@@ -185,8 +185,11 @@ The source must be clean and committed before building. The source record
 independently hashes every tracked blob/symlink target against its Git object
 ID and binds every tracked parent directory's device/inode/type, ownership,
 links, size, mtime and ctime. Its bounded summary records file, directory and
-byte counts plus content and physical SHA256 values. The only role-excluded
-output roots are exactly `.d`, the fail-closed precreated `.zig-cache`,
+byte counts plus content and physical SHA256 values. Native rechecks compare
+these source fields by value, including independently allocated Git
+object-format strings, while still rejecting changed hashes, counts, revisions
+and excluded-output roles. The only role-excluded output roots are exactly
+`.d`, the fail-closed precreated `.zig-cache`,
 `support/apps/wamr-aot/build`, and the precreated
 `support/apps/wamr-aot/.config`. `.d` alone may already contain the workflow's
 pinned WAMR checkout and acquired runtime; those consumed inputs are separately
