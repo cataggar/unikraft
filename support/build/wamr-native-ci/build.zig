@@ -241,6 +241,22 @@ pub fn build(b: *std.Build) void {
     b.step("test-controller-limits", "Run native source-custody production boundary fixtures")
         .dependOn(&source_limits_run.step);
     controller_step.dependOn(&source_limits_run.step);
+    const fault_parity_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("controller/fault_parity_tests.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wamr_controller", .module = host_controller },
+                .{ .name = "hyperv_core", .module = host_core },
+            },
+        }),
+    });
+    fault_parity_tests.root_module.addOptions("test_options", controller_options);
+    const fault_parity_run = b.addRunArtifact(fault_parity_tests);
+    b.step("test-controller-fault-parity", "Run native physical custody parity faults")
+        .dependOn(&fault_parity_run.step);
+    controller_step.dependOn(&fault_parity_run.step);
     const record_goldens = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/differential_records.zig"),
@@ -305,5 +321,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&pipeline_run.step);
     test_step.dependOn(&controller_run.step);
     test_step.dependOn(&source_limits_run.step);
+    test_step.dependOn(&fault_parity_run.step);
     test_step.dependOn(&record_goldens_run.step);
 }

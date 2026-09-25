@@ -21,6 +21,7 @@ import stat
 import subprocess
 import sys
 import unittest
+from unittest import mock
 
 
 HERE = Path(__file__).resolve().parent
@@ -58,6 +59,54 @@ FROZEN_HOST_TOOLS = (
     "uname", "zig", "make", "llvm-nm", "llvm-objcopy", "llvm-objdump",
     "llvm-readelf", "llvm-strip", "bison", "flex", "m4",
 )
+NATIVE_SOURCE_FILES = (
+    "support/build/wamr-native-ci/build.zig",
+    "support/build/wamr-native-ci/build.zig.zon",
+    "support/build/wamr-native-ci/controller/boot_pipeline.zig",
+    "support/build/wamr-native-ci/controller/build_pipeline.zig",
+    "support/build/wamr-native-ci/controller/cli.zig",
+    "support/build/wamr-native-ci/controller/command_adapter.zig",
+    "support/build/wamr-native-ci/controller/command_plan.zig",
+    "support/build/wamr-native-ci/controller/custody_files.zig",
+    "support/build/wamr-native-ci/controller/custody_limits.zig",
+    "support/build/wamr-native-ci/controller/dependency_custody.zig",
+    "support/build/wamr-native-ci/controller/fixture_contract.zig",
+    "support/build/wamr-native-ci/controller/fixture_runner.zig",
+    "support/build/wamr-native-ci/controller/input_custody.zig",
+    "support/build/wamr-native-ci/controller/install.zig",
+    "support/build/wamr-native-ci/controller/install_target_tests.zig",
+    "support/build/wamr-native-ci/controller/layout.zig",
+    "support/build/wamr-native-ci/controller/main.zig",
+    "support/build/wamr-native-ci/controller/portable_main.zig",
+    "support/build/wamr-native-ci/controller/profile.zig",
+    "support/build/wamr-native-ci/controller/records.zig",
+    "support/build/wamr-native-ci/controller/root.zig",
+    "support/build/wamr-native-ci/controller/source_custody.zig",
+    "support/build/wamr-native-ci/controller/target.zig",
+    "support/build/wamr-native-ci/controller/test_command.zig",
+    "support/build/wamr-native-ci/controller/tests.zig",
+    "support/build/wamr-native-ci/tests/native_command_oracle.py",
+    "support/controller_source_closure.zig",
+    "support/tools/hyperv/contracts.zig",
+    "support/tools/hyperv/core.zig",
+    "support/tools/hyperv/diagnostics.zig",
+    "support/tools/hyperv/private_files.zig",
+    "support/tools/hyperv/process-command-v1.json",
+    "support/tools/hyperv/process.zig",
+    "support/tools/hyperv/sensitive.zig",
+    "support/tools/hyperv/sha256.zig",
+    "support/tools/hyperv/sha256_clear_upper.S",
+)
+NATIVE_CONSUMER_ROLES = {
+    "command-supervisor": "controller/bin/uk-wamr-native-ci",
+    "wamr-source-archive": "custody/wamr-source.tar",
+    "native:wamr-aot-build": "compute/tools/bin/uk-wamr-aot-build",
+    "native:wamr-log-validate": "compute/tools/bin/uk-wamr-log-validate",
+    "native:wamr-native-ci-fixtures": "compute/tools/bin/wamr-native-ci-fixtures",
+    "native:wamr-ci-package": "compute/tools/bin/wamr-ci-package",
+    "native:wamr-ci-supervisor-fixture":
+        "compute/tools/bin/wamr-ci-supervisor-fixture",
+}
 
 
 class ParityError(AssertionError):
@@ -468,50 +517,102 @@ def native_fixture_contract(reference):
     }
 
 
-def fixture_stage(record, log, side, reference, seen=None):
-    check(side in ("python", "native"), "unknown fixtures-stage side")
-    contract = (reference.production_command_contract("fixtures")
-                if side == "python" else native_fixture_contract(reference))
+def native_build_command_contract(reference, stage):
+    check(stage in ("adapter", "local-boot-tool"),
+          "unknown native build command stage")
+    fixture = native_fixture_contract(reference)
+    path, literal = reference.command_path, reference.command_literal
+    build_file = ("support/build/wamr-native-ci/build.zig"
+                  if stage == "adapter" else
+                  "support/tools/hyperv/local_boot/build.zig")
+    prefix = "tools" if stage == "adapter" else "local-boot-tools"
+    environment = {
+        item["name"]: item["value"] for item in fixture["environment"]
+        if item["name"] not in (
+            "WAMR_CI_PACKAGE", "WAMR_CI_PYTHON", "WAMR_CI_LOG_VALIDATE",
+            "WAMR_CI_SUPERVISOR_FIXTURE")
+    }
+    environment["WAMR_CI_LAUNCH_EXECUTABLE"] = path("tool:zig")
+    retained = {
+        "M4", "WAMR_CI_GIT", "WAMR_CI_SUPERVISOR",
+        "WAMR_CI_LAUNCH_EXECUTABLE",
+        *("WAMR_CI_TOOL_" + name.upper().replace("-", "_")
+          for name in FROZEN_HOST_TOOLS),
+    }
+    argv = [
+        path("tool:zig"), literal("build"), literal("--build-file"),
+        path("source", build_file), literal("--system"),
+        path("work", "dependencies/zig-pkg"), literal("--prefix"),
+        path("work", prefix), literal("-Doptimize=ReleaseSafe"),
+        literal("-j2"),
+    ]
+    if stage == "adapter":
+        argv.append(literal("test-unit"))
+    argv.append(literal("install"))
+    return {
+        "kind": "build-base", "seconds": 900,
+        "output_limit": 8 * 1024 * 1024,
+        "command_executable": path("tool:zig"),
+        "native_executable": path("tool:zig"),
+        "interpreter": None, "argv": argv,
+        "environment": [
+            {"name": name, "value": environment[name]}
+            for name in sorted(environment)
+        ],
+        "retained_names": sorted(retained), "cwd": path("source"),
+        "limits": fixture["limits"],
+    }
+
+
+def checked_stage(record, log, side, reference, stage, seen=None):
+    check(side in ("python", "native")
+          and stage in ("adapter", "local-boot-tool", "fixtures"),
+          "unknown supervised build-stage side")
+    contract = (reference.production_command_contract(stage)
+                if side == "python" else
+                native_fixture_contract(reference) if stage == "fixtures" else
+                native_build_command_contract(reference, stage))
+    label = f"{stage} {side}"
     check(record["scope"] == "command_diagnostic_not_acceptance"
-          and record["stage"] == "fixtures", "fixtures stage/scope changed")
+          and record["stage"] == stage, f"{label} stage/scope changed")
     check(record["exit_code"] == 0 and record["over_limit"] is False
           and record["known_error_markers"] == [],
-          "fixtures stage outcome changed")
+          f"{label} stage outcome changed")
     check(record["bytes"] == len(log) and record["sha256"] == sha(log)
           and record["sha256_scope"] == reference.command_digest_scope(len(log)),
-          "fixtures private log hash/size changed")
+          f"{label} private log hash/size changed")
     request = record["supervisor"]["request"]
     for field in ("argv", "environment", "cwd"):
         check(request[field] == contract[field],
-              f"fixtures {side} {field} changed")
+              f"{label} {field} changed")
     for field in ("command_executable", "native_executable"):
         check(request[field]["path"] == contract[field],
-              f"fixtures {side} {field} role changed")
+              f"{label} {field} role changed")
     check((request["interpreter"] is None if contract["interpreter"] is None
            else request["interpreter"]["path"] == contract["interpreter"]),
-          f"fixtures {side} interpreter changed")
-    check(request["stage"] == "fixtures"
+          f"{label} interpreter changed")
+    check(request["stage"] == stage
           and request["supervisor"]["path"] == reference.command_path(
               "command-supervisor")
           and request["timeout_ns"] == contract["seconds"] * 1_000_000_000
           and request["limits"] == contract["limits"],
-          f"fixtures {side} stage/deadline/limits changed")
+          f"{label} stage/deadline/limits changed")
     check([item["name"] for item in request["retained_executables"]]
           == contract["retained_names"],
-          f"fixtures {side} retained executable roles changed")
+          f"{label} retained executable roles changed")
     command_result = record["supervisor"]["result"]["command"]
     stdout, stderr = command_result["stdout"], command_result["stderr"]
     check(command_result["output"]["commitment_sha256"] ==
           reference.command_output_commitment(
               stdout["bytes"], stdout["sha256"],
               stderr["bytes"], stderr["sha256"]),
-          f"fixtures {side} output commitment changed")
+          f"{label} output commitment changed")
     check(command_result["output"]["bytes"] == len(log)
           and command_result["output"]["combined_sha256"] == sha(log)
           and command_result["cleanup"] == "complete"
           and command_result["cleanup_complete"] is True
           and command_result["poisoned"] is False,
-          f"fixtures {side} output/cleanup changed")
+          f"{label} output/cleanup changed")
     role_identities = None
     if seen is not None:
         runtime = seen["roots"][0]
@@ -526,40 +627,40 @@ def fixture_stage(record, log, side, reference, seen=None):
         role_identities = {}
         for binding in roles:
             role = binding["path"]["role"]
-            check(role in pinned, f"fixtures {side} missing pinned role: {role}")
+            check(role in pinned, f"{label} missing pinned role: {role}")
             captured = pinned[role]
             physical, _ = reference.physical_file_record(Path(captured["path"]))
             check(physical == captured
                   and binding["identity"] ==
                   reference.native_executable_identity(captured),
-                  f"fixtures {side} executable identity changed: {role}")
+                  f"{label} executable identity changed: {role}")
             role_identities[role] = binding["identity"]
         supervisor_path = (runtime / "compute/supervisor/bin/wamr-ci-supervisor"
                            if side == "python" else
                            runtime / "controller/bin/uk-wamr-native-ci")
         check(pinned["command-supervisor"]["path"] == str(supervisor_path),
-              f"fixtures {side} supervisor location changed")
-        if side == "native":
+              f"{label} supervisor location changed")
+        if side == "native" and stage == "fixtures":
             check(pinned["native:wamr-native-ci-fixtures"]["path"] ==
                   str(runtime / "compute/tools/bin/wamr-native-ci-fixtures"),
                   "fixtures native executable location changed")
     try:
         if side == "python":
             reference.validate_supervised_command_binding(
-                record, "fixtures", role_identities)
+                record, stage, role_identities)
         else:
             original = reference.production_command_contract
             reference.production_command_contract = (
                 lambda stage, profile=reference.CURRENT_PROFILE:
-                contract if stage == "fixtures" else original(stage, profile))
+                contract if stage == record["stage"] else original(stage, profile))
             try:
                 reference.validate_supervised_command_binding(
-                    record, "fixtures", role_identities)
+                    record, stage, role_identities)
             finally:
                 reference.production_command_contract = original
     except reference.Refusal as error:
         raise ParityError(
-            f"fixtures {side} supervised binding refused: {error}") from error
+            f"{label} supervised binding refused: {error}") from error
     return {
         "scope": record["scope"],
         "stage": record["stage"],
@@ -578,47 +679,455 @@ def fixture_stage(record, log, side, reference, seen=None):
     }
 
 
-def compare_observations(left, right, fixtures_stage_compat=False):
+def fixture_stage(record, log, side, reference, seen=None):
+    return checked_stage(record, log, side, reference, "fixtures", seen)
+
+
+def verified_supervisor_source_map(reference, value, side):
+    names = (reference.SUPERVISOR_SOURCE_FILES if side == "python"
+             else NATIVE_SOURCE_FILES)
+    if side == "native":
+        embedded = (reference.REPO / "support/controller_source_closure.zig"
+                    ).read_text()
+        declared = re.findall(r'\.name = "([^"]+)", \.content = @embedFile\(',
+                              embedded)
+        check(tuple(declared) == NATIVE_SOURCE_FILES,
+              "build-start native controller source closure membership changed")
+    records = {}
+    for name in names:
+        pinned, _ = reference.tracked_manifest(name)
+        records[name] = {
+            "bytes": pinned["bytes"], "sha256": pinned["sha256"],
+            "metadata": pinned["metadata"],
+        }
+    expected = reference.guarded_record_map(
+        "uk.wamr.command-supervisor-source-v1", records)
+    check(value == expected,
+          f"build-start {side} supervisor source closure/record changed")
+    return records
+
+
+def verified_supervisor_runtime_map(reference, value, side, runtime, files):
+    executable = (runtime / "compute/supervisor/bin/wamr-ci-supervisor"
+                  if side == "python" else
+                  runtime / NATIVE_CONSUMER_ROLES["command-supervisor"])
+    check(files["command-supervisor"]["path"] == str(executable),
+          f"build-start {side} supervisor executable path changed")
+    paths = {"executable": files["command-supervisor"]}
+    for physical_path in reference.executable_runtime_paths(executable):
+        role = "runtime:" + str(physical_path)
+        check(role in files,
+              f"build-start {side} supervisor loader role missing: {role}")
+        paths[role] = files[role]
+    records = {
+        name: {
+            "bytes": item["metadata"][6], "sha256": item["sha256"],
+            "metadata": item["metadata"],
+        }
+        for name, item in paths.items()
+    }
+    expected = reference.guarded_record_map(
+        "uk.wamr.command-supervisor-runtime-v1", records)
+    check(value == expected,
+          f"build-start {side} supervisor runtime closure/record changed")
+    return records
+
+
+def verified_consumer_inputs(reference, value, side, runtime):
+    file_paths, tree_paths = reference.discover_consumer_input_paths(runtime)
+    if side == "python":
+        check(file_paths.get("command-supervisor") ==
+              runtime / "compute/supervisor/bin/wamr-ci-supervisor",
+              "build-start python supervisor role missing")
+    else:
+        check("command-supervisor" not in file_paths,
+              "build-start native substituted Python supervisor")
+        for role, relative in NATIVE_CONSUMER_ROLES.items():
+            path = runtime / relative
+            check(role not in file_paths or file_paths[role] == path,
+                  f"build-start native role substituted: {role}")
+            file_paths[role] = path
+            if role != "wamr-source-archive":
+                for dependency in reference.executable_runtime_paths(path):
+                    file_paths["runtime:" + str(dependency)] = dependency
+    check(set(value) == {
+        "schema", "version", "files", "trees", "directories", "aggregate_sha256",
+    }, f"build-start {side} consumer input shape changed")
+    check(value == reference.record_input_paths(
+        file_paths, tree_paths, expected=value),
+        f"build-start {side} consumer physical custody changed")
+    return value["files"], value["trees"]
+
+
+def verified_build_start_side(seen, side):
+    reference = seen["reference"]
+    runtime, repository = seen["roots"]
+    check(reference.REPO == repository and side in ("python", "native"),
+          "build-start reference/source mismatch")
+    value = seen["files"]["records"]["build-start.json"][1]
+    check(set(value) == {
+        "source", "source_custody", "tools", "bison_data",
+        "dependencies", "consumer_inputs", "command_supervisor",
+    }, f"build-start {side} top-level fields changed")
+    source = reference.source(repository)
+    check(value["source"] == {
+        "revision": source["revision"], "tree": source["tree"]}
+          and value["source_custody"] == source["custody"],
+          f"build-start {side} source custody changed")
+    check(tuple(reference.HOST_TOOLS) == FROZEN_HOST_TOOLS
+          and set(value["tools"]) == set(FROZEN_HOST_TOOLS),
+          f"build-start {side} tool roles changed")
+    for name in FROZEN_HOST_TOOLS:
+        check(value["tools"][name] == reference.digest(
+            Path(reference.tool(name))),
+            f"build-start {side} tool content changed: {name}")
+    check(value["bison_data"] == reference.bison_inputs(runtime / "bison"),
+          f"build-start {side} Bison content changed")
+    check(value["dependencies"] == reference.dependency_custody(
+        runtime / "compute"), f"build-start {side} dependency custody changed")
+    files, trees = verified_consumer_inputs(
+        reference, value["consumer_inputs"], side, runtime)
+    supervisor = value["command_supervisor"]
+    check(set(supervisor) == {
+        "schema", "version", "protocol", "source_map", "runtime_map",
+    } and supervisor["schema"] == "uk.wamr.command-supervisor"
+          and supervisor["version"] == 1
+          and supervisor["protocol"] ==
+          "uk.wamr.command-supervisor/1 process-command/1",
+          f"build-start {side} supervisor contract changed")
+    sources = verified_supervisor_source_map(
+        reference, supervisor["source_map"], side)
+    runtimes = verified_supervisor_runtime_map(
+        reference, supervisor["runtime_map"], side, runtime, files)
+    return {
+        "record": value, "files": files, "trees": trees,
+        "source_files": sources, "runtime_files": runtimes,
+    }
+
+
+def compare_build_start(left, right):
+    python = verified_build_start_side(left, "python")
+    native = verified_build_start_side(right, "native")
+    a, b = python["record"], native["record"]
+    failures = []
+
+    def equal(field, first, second):
+        if first != second:
+            failures.append("record_content:build-start.json." + field)
+
+    equal("source", a["source"], b["source"])
+    for field in ("schema", "version", "object_format", "files", "directories",
+                  "bytes", "content_sha256", "role_excluded_outputs"):
+        equal("source_custody." + field,
+              a["source_custody"][field], b["source_custody"][field])
+    equal("tools", a["tools"], b["tools"])
+    equal("bison_data", a["bison_data"], b["bison_data"])
+    a_dep, b_dep = a["dependencies"], b["dependencies"]
+    check(set(a_dep) == set(b_dep) == {
+        "schema", "version", "request", "source_manifests",
+        "restore_directory", "restore", "packages",
+    }, "build-start dependency field membership changed")
+    for field in ("schema", "version", "request", "restore"):
+        equal("dependencies." + field, a_dep[field], b_dep[field])
+    equal("dependencies.source_manifests.membership",
+          sorted(a_dep["source_manifests"]),
+          sorted(b_dep["source_manifests"]))
+    for name in a_dep["source_manifests"].keys() & b_dep["source_manifests"].keys():
+        one, two = (item["source_manifests"][name] for item in (a_dep, b_dep))
+        for field in ("path", "mode", "bytes", "sha256", "git_oid"):
+            equal(f"dependencies.source_manifests.{name}.source.{field}",
+                  one["source"][field], two["source"][field])
+        for field in ("bytes", "sha256"):
+            equal(f"dependencies.source_manifests.{name}.copy.{field}",
+                  one["copy"][field], two["copy"][field])
+    equal("dependencies.packages.roots",
+          a_dep["packages"]["roots"], b_dep["packages"]["roots"])
+    for key in ("files", "directories", "bytes", "manifests",
+                "hash_verification"):
+        equal("dependencies.packages." + key,
+              a_dep["packages"][key], b_dep["packages"][key])
+    a_packages = a_dep["packages"]["records"]
+    b_packages = b_dep["packages"]["records"]
+    equal("dependencies.packages.package_hashes",
+          [item["package_hash"] for item in a_packages],
+          [item["package_hash"] for item in b_packages])
+    for index, (one, two) in enumerate(zip(a_packages, b_packages)):
+        for field in ("tree_sha256", "files", "directories", "bytes"):
+            equal(f"dependencies.packages.records[{index}].content.{field}",
+                  one["content"][field], two["content"][field])
+        equal(f"dependencies.packages.records[{index}].manifest",
+              one["manifest"], two["manifest"])
+    for role in sorted(python["files"].keys() & native["files"].keys()):
+        if role == "command-supervisor":
+            continue
+        one, two = python["files"][role], native["files"][role]
+        equal("consumer_inputs.files." + role + ".sha256",
+              one["sha256"], two["sha256"])
+        equal("consumer_inputs.files." + role + ".stable_metadata",
+              one["metadata"][2:7], two["metadata"][2:7])
+        if one["path"] != two["path"]:
+            equal("consumer_inputs.files." + role + ".path",
+                  Normalizer(left["roots"]).normalize({"path": one["path"]}),
+                  Normalizer(right["roots"]).normalize({"path": two["path"]}))
+    for role in sorted(python["trees"].keys() & native["trees"].keys()):
+        one, two = python["trees"][role], native["trees"][role]
+        for field in ("content_sha256", "files", "directories",
+                      "symlinks", "bytes"):
+            equal("consumer_inputs.trees." + role + "." + field,
+                  one[field], two[field])
+        equal("consumer_inputs.trees." + role + ".path",
+              Normalizer(left["roots"]).normalize({"path": one["path"]}),
+              Normalizer(right["roots"]).normalize({"path": two["path"]}))
+    for name in sorted(python["source_files"].keys() &
+                       native["source_files"].keys()):
+        equal("command_supervisor.source_map.records." + name + ".sha256",
+              python["source_files"][name]["sha256"],
+              native["source_files"][name]["sha256"])
+    for name in sorted(python["runtime_files"].keys() &
+                       native["runtime_files"].keys()):
+        if name != "executable":
+            equal("command_supervisor.runtime_map.records." + name + ".sha256",
+                  python["runtime_files"][name]["sha256"],
+                  native["runtime_files"][name]["sha256"])
+    return failures
+
+
+LOCAL_BOOT_TOOL = "uk-hyperv-local-boot"
+
+
+def local_boot_install_path(runtime, side):
+    check(side in ("python", "native"), "unknown local-boot install side")
+    prefix = "tools" if side == "python" else "local-boot-tools"
+    return runtime / "compute" / prefix / "bin" / LOCAL_BOOT_TOOL
+
+
+def verified_local_boot_install(seen, side):
+    reference = seen["reference"]
+    runtime, repository = seen["roots"]
+    check(reference.REPO == repository, "local-boot source binding changed")
+    path = local_boot_install_path(runtime, side)
+    other = local_boot_install_path(
+        runtime, "native" if side == "python" else "python")
+    check(not other.exists() and not other.is_symlink(),
+          f"{side} local-boot executable substituted")
+    record, _ = reference.physical_file_record(path)
+    metadata = record["metadata"]
+    check(record["path"] == str(path)
+          and metadata[3] == os.getuid()
+          and stat.S_ISREG(metadata[2]) and metadata[2] & 0o111,
+          f"{side} local-boot executable location/mode changed")
+    return record
+
+
+def compare_local_boot_installs(left, right):
+    installs = (
+        verified_local_boot_install(left, "python"),
+        verified_local_boot_install(right, "native"),
+    )
+    failures = []
+    if installs[0]["sha256"] != installs[1]["sha256"]:
+        failures.append("local_boot_install:sha256")
+    if installs[0]["metadata"][2:7] != installs[1]["metadata"][2:7]:
+        failures.append("local_boot_install:stable_metadata")
+    return installs, failures
+
+
+def verified_log_validator(seen):
+    reference = seen["reference"]
+    runtime, repository = seen["roots"]
+    path = runtime / "compute/tools/bin/uk-wamr-log-validate"
+    pinned = seen["files"]["records"]["build-start.json"][1][
+        "consumer_inputs"]["files"].get("native:wamr-log-validate")
+    physical, _ = reference.physical_file_record(path)
+    check(reference.REPO == repository and isinstance(pinned, dict)
+          and pinned == physical
+          and pinned["path"] == str(path)
+          and stat.S_ISREG(pinned["metadata"][2])
+          and pinned["metadata"][2] & 0o111
+          and pinned["metadata"][3] == os.getuid(),
+          "boot log validator physical role/path/identity changed")
+    return physical
+
+
+def verified_boot_inputs(seen, side, local_boot):
+    reference = seen["reference"]
+    runtime, repository = seen["roots"]
+    value = seen["files"]["records"]["boot-inputs.json"][1]
+    paths = {
+        "package_tool": runtime / "compute/tools/bin/wamr-ci-package",
+        "local_boot_tool": local_boot_install_path(runtime, side),
+        "qemu": runtime / "bin/qemu-system-x86_64",
+        "ovmf_code": runtime / "firmware/code.fd",
+        "ovmf_vars": runtime / "firmware/vars.fd",
+        "efi": reference.APP / "build" / reference.EFI,
+    }
+    if side == "native":
+        paths["log_validator"] = (
+            runtime / "compute/tools/bin/uk-wamr-log-validate")
+    check(reference.REPO == repository
+          and value["files"]["local_boot_tool"] == local_boot,
+          f"{side} boot local-boot executable custody changed")
+    if side == "native":
+        check(value["files"].get("log_validator") == verified_log_validator(seen),
+              "native boot log validator role/identity changed")
+    else:
+        check("log_validator" not in value["files"],
+              "Python boot gained native log validator role")
+    check(reference.boot_input_state(runtime, paths, expected=value) == value,
+          f"{side} boot input physical custody changed")
+    return value
+
+
+def compare_boot_inputs(left, right, local_boots):
+    first = verified_boot_inputs(left, "python", local_boots[0])
+    second = verified_boot_inputs(right, "native", local_boots[1])
+    failures = []
+
+    def equal(field, a, b):
+        if a != b:
+            failures.append("record_content:boot-inputs.json." + field)
+
+    for field in ("schema", "version"):
+        equal(field, first[field], second[field])
+    first_files, second_files = first["files"], second["files"]
+    equal("files.membership", sorted(first_files),
+          sorted(second_files.keys() - {"log_validator"}))
+    python_validator = verified_log_validator(left)
+    native_validator = verified_log_validator(right)
+    equal("files.log_validator.sha256",
+          python_validator["sha256"], native_validator["sha256"])
+    equal("files.log_validator.stable_metadata",
+          python_validator["metadata"][2:7],
+          native_validator["metadata"][2:7])
+    for role in sorted(first_files.keys() & second_files.keys()):
+        a, b = first_files[role], second_files[role]
+        equal("files." + role + ".sha256", a["sha256"], b["sha256"])
+        equal("files." + role + ".stable_metadata",
+              a["metadata"][2:7], b["metadata"][2:7])
+        if role != "local_boot_tool":
+            equal("files." + role + ".path",
+                  Normalizer(left["roots"]).normalize({"path": a["path"]}),
+                  Normalizer(right["roots"]).normalize({"path": b["path"]}))
+    first_trees, second_trees = first["trees"], second["trees"]
+    equal("trees.membership", sorted(first_trees), sorted(second_trees))
+    for role in sorted(first_trees.keys() & second_trees.keys()):
+        a, b = first_trees[role], second_trees[role]
+        for field in ("files", "directories", "symlinks", "bytes",
+                      "content_sha256"):
+            equal("trees." + role + "." + field, a[field], b[field])
+        equal("trees." + role + ".path",
+              Normalizer(left["roots"]).normalize({"path": a["path"]}),
+              Normalizer(right["roots"]).normalize({"path": b["path"]}))
+    return failures
+
+
+ACCEPTANCE_FIELDS = frozenset({
+    "schema", "schema_version", "profile", "status", "source",
+    "accepted_qcow2", "finalization_sha256", "modes", "boots",
+    "build_sha256", "boot_inputs_sha256",
+})
+
+
+def verified_qcow2_acceptance(seen):
+    reference = seen["reference"]
+    records = seen["files"]["records"]
+    raw, value = records["qcow2-acceptance.json"]
+    boot_raw, boot = records["boot-inputs.json"]
+    check(parsed(raw, reference) == value
+          and set(value) == ACCEPTANCE_FIELDS
+          and value["schema"] == "uk.wamr.compute-qcow2-acceptance"
+          and value["schema_version"] == 1
+          and value["profile"] == reference.CURRENT_PROFILE
+          and value["status"] == "accepted"
+          and value["modes"] == list(reference.SIX_MODES[:4]),
+          "qcow2 acceptance field/shape changed")
+    check(parsed(boot_raw, reference) == boot
+          and value["boot_inputs_sha256"] == sha(boot_raw),
+          "qcow2 acceptance boot-input byte commitment changed")
+    return value
+
+
+def compare_qcow2_acceptance(left, right):
+    first = verified_qcow2_acceptance(left)
+    second = verified_qcow2_acceptance(right)
+    first = dict(first, boot_inputs_sha256="<verified-own-boot-input-bytes>")
+    second = dict(second, boot_inputs_sha256="<verified-own-boot-input-bytes>")
+    a = Normalizer(left["roots"]).normalize(first)
+    b = Normalizer(right["roots"]).normalize(second)
+    return [
+        "record_content:qcow2-acceptance.json." + field
+        for field in sorted(ACCEPTANCE_FIELDS - {"boot_inputs_sha256"})
+        if a[field] != b[field]
+    ]
+
+
+REVIEWED_BUILD_COMMANDS = ("adapter", "local-boot-tool", "fixtures")
+
+
+def compare_observations(left, right, reviewed_build_compat=False):
     failures = []
     for key in ("returncode",):
         if getattr(left["exit"], key) != getattr(right["exit"], key):
             failures.append(key)
     if category(left["exit"]) != category(right["exit"]):
         failures.append("refusal_category")
-    compatible_fixture = (
-        fixtures_stage_compat
-        and "command-fixtures.json" in left["files"]["records"]
-        and "command-fixtures.json" in right["files"]["records"]
-    )
+    l_records, r_records = left["files"]["records"], right["files"]["records"]
+    proven = (reviewed_build_compat
+              and "build-start.json" in l_records
+              and "build-start.json" in r_records)
+    if proven:
+        failures.extend(compare_build_start(left, right))
+    checked_commands = {}
+    for stage in REVIEWED_BUILD_COMMANDS:
+        name = f"command-{stage}.json"
+        if proven and name in l_records and name in r_records:
+            checked_commands[stage] = (
+                checked_stage(l_records[name][1], left["files"]["command_logs"][stage],
+                              "python", left["reference"], stage, left),
+                checked_stage(r_records[name][1], right["files"]["command_logs"][stage],
+                              "native", right["reference"], stage, right),
+            )
+    local_boots = None
+    checked_acceptance = False
+    if "local-boot-tool" in checked_commands:
+        local_boots, install_failures = compare_local_boot_installs(left, right)
+        failures.extend(install_failures)
+        if "boot-inputs.json" in l_records and "boot-inputs.json" in r_records:
+            failures.extend(compare_boot_inputs(left, right, local_boots))
+            if ("qcow2-acceptance.json" in l_records
+                    and "qcow2-acceptance.json" in r_records):
+                failures.extend(compare_qcow2_acceptance(left, right))
+                checked_acceptance = True
     for key in ("order", "retained", "artifacts"):
         left_value, right_value = left["files"][key], right["files"][key]
-        if key == "retained" and compatible_fixture:
-            def verified_log_slot(side):
+        if key == "retained" and checked_commands:
+            def verified_log_slots(side):
                 entries = dict(side["files"]["retained"])
-                name = "private/fixtures.log"
-                check(name in entries and entries[name][:2] == ("file", 0o600)
-                      and entries[name][2] == len(side["files"]["fixtures_log"]),
-                      "fixtures private log slot changed")
-                entries[name] = ("file", 0o600, "<verified-fixtures-log-size>")
+                for stage in checked_commands:
+                    name = f"private/{stage}.log"
+                    check(name in entries and entries[name][:2] == ("file", 0o600)
+                          and entries[name][2] ==
+                          len(side["files"]["command_logs"][stage]),
+                          f"{stage} private log slot changed")
+                    entries[name] = ("file", 0o600, "<verified-stage-log-size>")
                 return entries
-            left_value, right_value = verified_log_slot(left), verified_log_slot(right)
+            left_value, right_value = verified_log_slots(left), verified_log_slots(right)
         if left_value != right_value:
             failures.append(key)
-    l_records, r_records = left["files"]["records"], right["files"]["records"]
     if l_records.keys() != r_records.keys():
         failures.append("evidence_membership")
     left_normalizer, right_normalizer = Normalizer(left["roots"]), Normalizer(right["roots"])
     for name in (record for record in ORDER if record in l_records and record in r_records):
-        if name == "command-fixtures.json" and compatible_fixture:
-            python = fixture_stage(
-                l_records[name][1], left["files"]["fixtures_log"], "python",
-                left["reference"], left)
-            native = fixture_stage(
-                r_records[name][1], right["files"]["fixtures_log"], "native",
-                right["reference"], right)
+        if ((name == "build-start.json" and proven)
+                or (name == "boot-inputs.json" and local_boots is not None)
+                or (name == "qcow2-acceptance.json" and checked_acceptance)):
+            continue
+        stage = name.removeprefix("command-").removesuffix(".json")
+        if name == f"command-{stage}.json" and stage in checked_commands:
+            python, native = checked_commands[stage]
             for field in python:
                 if python[field] != native[field]:
-                    failures.append("fixture_outcome:" + field)
+                    failures.append(f"{stage}_outcome:" + field)
             continue
         a, b = l_records[name], r_records[name]
         a_value, b_value = a[1], b[1]
@@ -637,18 +1146,20 @@ def compare_observations(left, right, fixtures_stage_compat=False):
 def observed(result, runtime, repository):
     reference = oracle(repository)
     files = phase_snapshot(runtime, reference)
-    if "command-fixtures.json" in files["records"]:
-        files["fixtures_log"] = checked_file(
-            runtime / "compute/private/fixtures.log", 8 * 1024 * 1024)
+    files["command_logs"] = {}
+    for stage in REVIEWED_BUILD_COMMANDS:
+        if f"command-{stage}.json" in files["records"]:
+            files["command_logs"][stage] = checked_file(
+                runtime / "compute/private" / f"{stage}.log", 8 * 1024 * 1024)
     return {"exit": result, "files": files, "roots": (runtime, repository),
             "reference": reference}
 
 
 def compare_pair(python, native, py_runtime, native_runtime, py_repo, native_repo,
-                 fixtures_stage_compat=False):
+                 reviewed_build_compat=False):
     failures = compare_observations(
         observed(python, py_runtime, py_repo),
-        observed(native, native_runtime, native_repo), fixtures_stage_compat)
+        observed(native, native_runtime, native_repo), reviewed_build_compat)
     return failures
 
 
@@ -793,6 +1304,19 @@ def manifest(root):
     return entries
 
 
+def require_prior_build_output_refusal(python, native, py_runtime, native_runtime):
+    for label, result, runtime in (
+            ("python", python, py_runtime), ("native", native, native_runtime)):
+        actual = category(result)
+        check(result.returncode == 1 and actual == "failed_stage:startup",
+              f"{label} occupied build root: expected failed_stage:startup/1, "
+              f"got {actual}/{result.returncode}")
+        for name in ("build.json", "result.json"):
+            path = runtime / "compute/evidence" / name
+            check(not path.exists() and not path.is_symlink(),
+                  f"{label} occupied build root published {name}")
+
+
 def full(args):
     check(platform.machine() == "x86_64"
           and Path("/dev/kvm").is_char_device()
@@ -876,8 +1400,11 @@ def full(args):
     py, native = (results[name] for name in ("python", "native"))
     failures = ["build:" + name for name in compare_pair(
         py, native, py_runtime, native_runtime, py_repo, native_repo,
-        fixtures_stage_compat=True)]
-    if args.case != "prior-build-output":
+        reviewed_build_compat=True)]
+    if args.case == "prior-build-output":
+        require_prior_build_output_refusal(
+            py, native, py_runtime, native_runtime)
+    else:
         check(py.returncode == native.returncode == 0,
               "build did not reach accepted state; " + ", ".join(failures))
         for repo, runtime, _, _ in executions.values():
@@ -903,7 +1430,7 @@ def full(args):
         py, native = (results[name] for name in ("python", "native"))
         failures.extend("boot:" + name for name in compare_pair(
             py, native, py_runtime, native_runtime, py_repo, native_repo,
-            fixtures_stage_compat=True))
+            reviewed_build_compat=True))
         check((py.returncode == native.returncode == 0) == (args.case == "success"),
               "unexpected full-chain outcome; " + ", ".join(failures))
         if args.case == "success":
@@ -918,13 +1445,215 @@ def full(args):
 
 
 class DeterministicContracts(unittest.TestCase):
+    def test_build_start_compares_shared_identities_after_side_specific_proof(self):
+        reference = oracle()
+        custody = {
+            "schema": "synthetic", "version": 1, "object_format": "sha1",
+            "files": {"common": {"sha256": "a" * 64}},
+            "directories": {}, "bytes": 42,
+            "content_sha256": "b" * 64, "role_excluded_outputs": [],
+        }
+        dependencies = {
+            "schema": "synthetic", "version": 1, "request": {},
+            "source_manifests": {}, "restore_directory": {},
+            "restore": {}, "packages": {
+                "roots": [], "files": 0, "directories": 0, "bytes": 0,
+                "manifests": [], "hash_verification": True, "records": [],
+            },
+        }
+        record = {
+            "source": {"revision": "r", "tree": "t"},
+            "source_custody": custody,
+            "tools": {"zig": {"sha256": "c" * 64}},
+            "bison_data": {}, "dependencies": dependencies,
+            "consumer_inputs": {}, "command_supervisor": {},
+        }
+        common_file = {
+            "path": "/usr/bin/zig", "sha256": "d" * 64,
+            "metadata": [1, 2, 3, 4, 5, 1, 42, 7, 8],
+        }
+        controller = copy.deepcopy(common_file)
+        controller["path"] = "/python/supervisor"
+        native_controller = copy.deepcopy(controller)
+        native_controller.update(path="/native/controller", sha256="e" * 64)
+        shared_source = {
+            "bytes": 42, "sha256": "f" * 64,
+            "metadata": [1, 2, 3, 4, 5, 1, 42, 7, 8],
+        }
+        first = {
+            "record": copy.deepcopy(record),
+            "files": {
+                "tool:zig": common_file, "command-supervisor": controller,
+            },
+            "trees": {}, "source_files": {"shared": copy.deepcopy(shared_source)},
+            "runtime_files": {
+                "executable": copy.deepcopy(shared_source),
+                "runtime:/lib": copy.deepcopy(shared_source),
+            },
+        }
+        second = copy.deepcopy(first)
+        second["files"]["command-supervisor"] = native_controller
+        second["source_files"]["native-only"] = copy.deepcopy(shared_source)
+        second["runtime_files"]["executable"]["sha256"] = "e" * 64
+        observations = ({"roots": (Path("/python"), PROJECT)},
+                        {"roots": (Path("/native"), PROJECT)})
+
+        def compared():
+            with mock.patch.dict(compare_build_start.__globals__, {
+                    "verified_build_start_side": lambda seen, side: (
+                        first if side == "python" else second)}):
+                return compare_build_start(*observations)
+
+        self.assertEqual(compared(), [])
+        for kind, field in (
+                ("source", "source_custody.files"),
+                ("tool", "tools"),
+                ("consumer", "consumer_inputs.files.tool:zig.sha256"),
+                ("closure", "command_supervisor.source_map.records.shared.sha256"),
+                ("loader", "command_supervisor.runtime_map.records.runtime:/lib.sha256"),
+        ):
+            with self.subTest(kind=kind):
+                altered = copy.deepcopy(second)
+                if kind == "source":
+                    altered["record"]["source_custody"]["files"]["common"][
+                        "sha256"] = "0" * 64
+                    altered["record"]["source_custody"]["content_sha256"] = (
+                        reference.record_digest(
+                            altered["record"]["source_custody"]["files"]))
+                elif kind == "tool":
+                    altered["record"]["tools"]["zig"]["sha256"] = "0" * 64
+                elif kind == "consumer":
+                    altered["files"]["tool:zig"]["sha256"] = "0" * 64
+                elif kind == "closure":
+                    altered["source_files"]["shared"]["sha256"] = "0" * 64
+                else:
+                    altered["runtime_files"]["runtime:/lib"]["sha256"] = (
+                        "0" * 64)
+                with mock.patch.dict(compare_build_start.__globals__, {
+                        "verified_build_start_side": lambda seen, side: (
+                            first if side == "python" else altered)}):
+                    failures = compare_build_start(*observations)
+                self.assertIn("record_content:build-start.json." + field,
+                              failures)
+
+    def test_pinned_supervisor_closure_rejects_rehashed_source_mutations(self):
+        reference = oracle()
+        domain = "uk.wamr.command-supervisor-source-v1"
+        for side in ("python", "native"):
+            with self.subTest(side=side):
+                names = (reference.SUPERVISOR_SOURCE_FILES if side == "python"
+                         else NATIVE_SOURCE_FILES)
+                records = {}
+                for name in names:
+                    pinned, _ = reference.tracked_manifest(name)
+                    records[name] = {
+                        "bytes": pinned["bytes"], "sha256": pinned["sha256"],
+                        "metadata": pinned["metadata"],
+                    }
+                baseline = reference.guarded_record_map(domain, records)
+                self.assertEqual(
+                    verified_supervisor_source_map(reference, baseline, side),
+                    records)
+                for kind in ("content", "physical", "omitted"):
+                    with self.subTest(side=side, kind=kind):
+                        changed = copy.deepcopy(records)
+                        first = names[0]
+                        if kind == "content":
+                            changed[first]["sha256"] = "0" * 64
+                        elif kind == "physical":
+                            changed[first]["metadata"][7] += 1
+                        else:
+                            del changed[first]
+                        rehashed = reference.guarded_record_map(domain, changed)
+                        with self.assertRaisesRegex(
+                                ParityError, "source closure/record changed"):
+                            verified_supervisor_source_map(
+                                reference, rehashed, side)
+
+    def test_physical_consumer_roles_and_runtime_closure_reject_rehashed_mutations(self):
+        reference = oracle()
+        runtime = fresh(fixture_parent(), f"differential-roles-{os.getpid()}")
+        reference.executable_runtime_paths = lambda path: ()
+        try:
+            paths = {}
+            for role, relative in NATIVE_CONSUMER_ROLES.items():
+                path = runtime / relative
+                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                path.write_bytes(("synthetic role: " + role).encode())
+                path.chmod(0o600)
+                paths[role] = path
+            reference.discover_consumer_input_paths = lambda root: ({}, {})
+            baseline = reference.record_input_paths(paths, {})
+            files, _ = verified_consumer_inputs(
+                reference, baseline, "native", runtime)
+            self.assertEqual(set(files), set(NATIVE_CONSUMER_ROLES))
+            for kind in ("content", "role", "runtime-content"):
+                with self.subTest(kind=kind):
+                    changed = copy.deepcopy(baseline)
+                    if kind == "role":
+                        changed["files"]["native:counterfeit"] = (
+                            changed["files"].pop("native:wamr-ci-package"))
+                    else:
+                        key = ("command-supervisor" if kind == "runtime-content"
+                               else "native:wamr-ci-package")
+                        changed["files"][key]["sha256"] = "0" * 64
+                    changed["aggregate_sha256"] = reference.record_digest({
+                        key: value for key, value in changed.items()
+                        if key != "aggregate_sha256"
+                    })
+                    with self.assertRaises((ParityError, reference.Refusal)):
+                        verified_consumer_inputs(
+                            reference, changed, "native", runtime)
+            for side in ("native", "python"):
+                with self.subTest(side=side):
+                    if side == "python":
+                        path = runtime / "compute/supervisor/bin/wamr-ci-supervisor"
+                        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                        path.write_bytes(b"synthetic Python supervisor")
+                        path.chmod(0o600)
+                        reference.discover_consumer_input_paths = (
+                            lambda root: ({"command-supervisor": path}, {}))
+                        consumer = reference.record_input_paths(
+                            {"command-supervisor": path}, {})
+                        files, _ = verified_consumer_inputs(
+                            reference, consumer, "python", runtime)
+                    role = files["command-supervisor"]
+                    record = {
+                        "executable": {
+                            "bytes": role["metadata"][6], "sha256": role["sha256"],
+                            "metadata": role["metadata"],
+                        },
+                    }
+                    domain = "uk.wamr.command-supervisor-runtime-v1"
+                    closure = reference.guarded_record_map(domain, record)
+                    self.assertEqual(
+                        verified_supervisor_runtime_map(
+                            reference, closure, side, runtime, files), record)
+                    for field in ("sha256", "metadata"):
+                        with self.subTest(side=side, field=field):
+                            changed = copy.deepcopy(record)
+                            if field == "sha256":
+                                changed["executable"]["sha256"] = "0" * 64
+                            else:
+                                changed["executable"]["metadata"][7] += 1
+                            with self.assertRaisesRegex(
+                                    ParityError, "runtime closure/record changed"):
+                                verified_supervisor_runtime_map(
+                                    reference, reference.guarded_record_map(
+                                        domain, changed), side, runtime, files)
+        finally:
+            shutil.rmtree(runtime)
+
     def test_fixtures_stage_side_specific_exact_contract_and_tamper(self):
         reference = oracle()
         empty = sha(b"")
 
-        def synthetic(side, log):
-            contract = (reference.production_command_contract("fixtures")
-                        if side == "python" else native_fixture_contract(reference))
+        def synthetic(side, log, stage="fixtures"):
+            contract = (
+                reference.production_command_contract(stage)
+                if side == "python" else native_fixture_contract(reference)
+                if stage == "fixtures" else
+                native_build_command_contract(reference, stage))
             executable = {
                 "content_sha256": sha(b"synthetic-fixture-only"),
                 "ctime_nanoseconds": 0, "ctime_seconds": 1,
@@ -946,7 +1675,7 @@ class DeterministicContracts(unittest.TestCase):
                 "version": 1,
                 "binding_schema": "uk.wamr.supervised-command-binding",
                 "binding_version": 1,
-                "stage": "fixtures",
+                "stage": stage,
                 "argv": contract["argv"],
                 "environment": contract["environment"],
                 "cwd": contract["cwd"],
@@ -958,9 +1687,10 @@ class DeterministicContracts(unittest.TestCase):
                                 else identified(contract["interpreter"])),
                 "retained_executables": retained,
                 "issued_ns": issued,
-                "primary_deadline_ns": issued + 600 * 1_000_000_000,
-                "cleanup_deadline_ns": issued + 610 * 1_000_000_000,
-                "timeout_ns": 600 * 1_000_000_000,
+                "primary_deadline_ns": issued + contract["seconds"] * 1_000_000_000,
+                "cleanup_deadline_ns": issued + (
+                    contract["seconds"] + 10) * 1_000_000_000,
+                "timeout_ns": contract["seconds"] * 1_000_000_000,
                 "limits": contract["limits"],
             }
             for key, payload in (
@@ -1024,7 +1754,7 @@ class DeterministicContracts(unittest.TestCase):
             }
             result["canonical_sha256"] = reference.command_binding_digest(result)
             return {
-                "scope": "command_diagnostic_not_acceptance", "stage": "fixtures",
+                "scope": "command_diagnostic_not_acceptance", "stage": stage,
                 "exit_code": 0, "bytes": len(log), "sha256": sha(log),
                 "sha256_scope": reference.command_digest_scope(len(log)),
                 "over_limit": False, "known_error_markers": [],
@@ -1087,6 +1817,56 @@ class DeterministicContracts(unittest.TestCase):
                         fixture_stage(
                             altered, log + b"tampered" if change == "log" else log,
                             side, reference)
+        for stage in ("adapter", "local-boot-tool"):
+            python = synthetic("python", b"synthetic-python-build-ok\n", stage)
+            native = synthetic("native", b"synthetic-native-build-ok\n", stage)
+            with self.subTest(stage=stage):
+                self.assertNotEqual(python["supervisor"]["request"]["argv"],
+                                    native["supervisor"]["request"]["argv"])
+                self.assertEqual(checked_stage(
+                    python, b"synthetic-python-build-ok\n", "python",
+                    reference, stage), checked_stage(
+                        native, b"synthetic-native-build-ok\n", "native",
+                        reference, stage))
+            for side, record, log in (
+                    ("python", python, b"synthetic-python-build-ok\n"),
+                    ("native", native, b"synthetic-native-build-ok\n")):
+                for field in ("argv", "environment", "limits",
+                              "commitment_sha256"):
+                    with self.subTest(stage=stage, side=side, field=field):
+                        altered = copy.deepcopy(record)
+                        request = altered["supervisor"]["request"]
+                        result = altered["supervisor"]["result"]
+                        if field in ("argv", "environment"):
+                            payload = request[field]
+                            if field == "argv":
+                                payload[1] = reference.command_literal("altered")
+                            else:
+                                payload[0]["value"] = reference.command_literal(
+                                    "altered")
+                            request[field + "_sha256"] = (
+                                reference.command_binding_digest(payload))
+                        elif field == "limits":
+                            request["limits"]["stdout_bytes"] -= 1
+                        else:
+                            result["command"]["output"][field] = "0" * 64
+                        request["canonical_sha256"] = (
+                            reference.command_binding_digest({
+                                name: value for name, value in request.items()
+                                if name not in (
+                                    "canonical_sha256", "argv_sha256",
+                                    "environment_sha256", "cwd_sha256")
+                            }))
+                        result["request_canonical_sha256"] = request["canonical_sha256"]
+                        result["canonical_sha256"] = (
+                            reference.command_binding_digest({
+                                name: value for name, value in result.items()
+                                if name != "canonical_sha256"
+                            }))
+                        expected = "output commitment" if field == "commitment_sha256" else (
+                            "stage/deadline/limits" if field == "limits" else field)
+                        with self.assertRaisesRegex(ParityError, expected):
+                            checked_stage(altered, log, side, reference, stage)
 
     def test_v1_read_only_and_v2_acceptance_parser_fixtures(self):
         reference = oracle()
@@ -1214,6 +1994,58 @@ class DeterministicContracts(unittest.TestCase):
         with self.assertRaisesRegex(ParityError, "unknown CLI compatibility"):
             cli_vector_failures("different-vector", refused, usage)
 
+    def test_prior_build_output_requires_startup_failure_and_no_acceptance(self):
+        class Exit:
+            def __init__(self, code, stderr):
+                self.returncode, self.stderr = code, stderr
+
+        startup = Exit(1, b"WAMR_CI_FAILED_STAGE: startup; logs retained.\n")
+        root = fresh(fixture_parent(), f"differential-prior-{os.getpid()}")
+        try:
+            py_runtime, native_runtime = (
+                fresh(root, label) for label in ("python", "native"))
+            for runtime in (py_runtime, native_runtime):
+                (runtime / "compute").mkdir(mode=0o700)
+
+            def require(python, native):
+                require_prior_build_output_refusal(
+                    python, native, py_runtime, native_runtime)
+
+            require(startup, startup)
+            for side in ("python", "native"):
+                for code, stderr in (
+                        (0, b""),
+                        (1, b"WAMR_CI_REFUSED: prior output\n"),
+                        (1, b"WAMR_CI_FAILED_STAGE: build; logs retained.\n"),
+                        (2, b"usage: build --runtime ABS\n")):
+                    with self.subTest(side=side, code=code, stderr=stderr):
+                        one = Exit(code, stderr)
+                        pair = (one, startup) if side == "python" else (startup, one)
+                        with self.assertRaisesRegex(
+                                ParityError, "expected failed_stage:startup/1"):
+                            require(*pair)
+                runtime = py_runtime if side == "python" else native_runtime
+                evidence = runtime / "compute/evidence"
+                evidence.mkdir(mode=0o700)
+                for name in ("build.json", "result.json"):
+                    with self.subTest(side=side, published=name):
+                        publication = evidence / name
+                        publication.write_bytes(b"synthetic fixture, not evidence\n")
+                        publication.chmod(0o600)
+                        with self.assertRaisesRegex(
+                                ParityError, side + " occupied build root published "
+                                + re.escape(name)):
+                            require(startup, startup)
+                        publication.unlink()
+                dangling = evidence / "result.json"
+                dangling.symlink_to("missing-synthetic-fixture")
+                with self.assertRaisesRegex(
+                        ParityError, side + " occupied build root published result.json"):
+                    require(startup, startup)
+                dangling.unlink()
+        finally:
+            shutil.rmtree(root)
+
     def test_differential_record_hash_mutation_is_not_a_success(self):
         class Exit:
             returncode = 0
@@ -1235,6 +2067,295 @@ class DeterministicContracts(unittest.TestCase):
         self.assertNotEqual(source.normalize({"stage": "prepare", "sha256": "a" * 64}),
                             source.normalize({"stage": "prepare", "sha256": "b" * 64}))
         self.assertEqual(len(ORDER), len(set(ORDER)))
+
+    def test_local_boot_install_and_boot_custody_prove_distinct_paths(self):
+        reference = oracle()
+        self.assertEqual(
+            reference.production_command_contract("local-boot-tool")["argv"][9],
+            reference.command_path("work", "tools"))
+        self.assertEqual(
+            native_build_command_contract(reference, "local-boot-tool")["argv"][7],
+            reference.command_path("work", "local-boot-tools"))
+        root = fresh(fixture_parent(), f"differential-local-boot-{os.getpid()}")
+        original_app = reference.APP
+        original_runtime_paths = reference.executable_runtime_paths
+        reference.APP = root / "synthetic-app"
+        reference.executable_runtime_paths = lambda path: ()
+
+        def write(path, data, mode=0o600):
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            path.write_bytes(data)
+            path.chmod(mode)
+
+        try:
+            efi = reference.APP / "build" / reference.EFI
+            write(efi, b"synthetic EFI identity")
+            prepared = {}
+            observations = {}
+            for side in ("python", "native"):
+                runtime = fresh(root, side)
+                local = local_boot_install_path(runtime, side)
+                write(local, b"synthetic shared local boot executable", 0o700)
+                common = {
+                    "package_tool": runtime / "compute/tools/bin/wamr-ci-package",
+                    "qemu": runtime / "bin/qemu-system-x86_64",
+                    "ovmf_code": runtime / "firmware/code.fd",
+                    "ovmf_vars": runtime / "firmware/vars.fd",
+                }
+                for role, path in common.items():
+                    write(path, ("synthetic " + role).encode(),
+                          0o700 if role in ("package_tool", "qemu") else 0o600)
+                validator = runtime / "compute/tools/bin/uk-wamr-log-validate"
+                write(validator, b"synthetic log validator", 0o700)
+                if side == "native":
+                    common["log_validator"] = validator
+                write(runtime / "bin/share/fixture-data", b"synthetic QEMU data")
+                paths = {**common, "local_boot_tool": local, "efi": efi}
+                prepared[side] = (runtime, paths, validator)
+            for side, (runtime, paths, validator) in prepared.items():
+                record = reference.boot_input_state(runtime, paths)
+                validator_record, _ = reference.physical_file_record(validator)
+                observations[side] = {
+                    "reference": reference, "roots": (runtime, reference.REPO),
+                    "files": {
+                        "records": {
+                            "boot-inputs.json": (
+                                reference.compact_json(record, newline=True),
+                                record),
+                            "build-start.json": (
+                                b"synthetic build-start fixture\n",
+                                {"consumer_inputs": {"files": {
+                                    "native:wamr-log-validate":
+                                        validator_record,
+                                }}}),
+                        },
+                    },
+                }
+            python, native = observations["python"], observations["native"]
+            installed, failures = compare_local_boot_installs(python, native)
+            self.assertEqual(failures, [])
+            self.assertEqual(installed[0]["sha256"], installed[1]["sha256"])
+            self.assertNotEqual(installed[0]["path"], installed[1]["path"])
+            self.assertEqual(compare_boot_inputs(python, native, installed), [])
+            native_record = native["files"]["records"]["boot-inputs.json"][1]
+
+            def mutated_boot(value):
+                changed = {
+                    **native, "files": {
+                        "records": {
+                            **native["files"]["records"],
+                            "boot-inputs.json": (
+                                reference.compact_json(value, newline=True), value),
+                        },
+                    },
+                }
+                return changed
+
+            for kind in ("missing-validator", "altered-role",
+                         "bad-validator-hash", "substituted-validator-path",
+                         "extra-field"):
+                with self.subTest(kind=kind):
+                    changed_record = copy.deepcopy(native_record)
+                    bindings = changed_record["files"]
+                    if kind == "missing-validator":
+                        del bindings["log_validator"]
+                    elif kind == "altered-role":
+                        bindings["validator-unreviewed"] = bindings.pop(
+                            "log_validator")
+                    elif kind == "bad-validator-hash":
+                        bindings["log_validator"]["sha256"] = "0" * 64
+                    elif kind == "substituted-validator-path":
+                        bindings["log_validator"] = copy.deepcopy(
+                            bindings["package_tool"])
+                    else:
+                        changed_record["unreviewed"] = True
+                    changed_record["aggregate_sha256"] = reference.record_digest({
+                        key: value for key, value in changed_record.items()
+                        if key != "aggregate_sha256"
+                    })
+                    with self.assertRaises((ParityError, reference.Refusal)):
+                        compare_boot_inputs(
+                            python, mutated_boot(changed_record), installed)
+
+            for seen in observations.values():
+                boot_raw = seen["files"]["records"]["boot-inputs.json"][0]
+                value = {
+                    "schema": "uk.wamr.compute-qcow2-acceptance",
+                    "schema_version": 1,
+                    "profile": reference.CURRENT_PROFILE,
+                    "status": "accepted",
+                    "source": {"revision": "synthetic"},
+                    "accepted_qcow2": {"sha256": "a" * 64},
+                    "finalization_sha256": "b" * 64,
+                    "modes": list(reference.SIX_MODES[:4]),
+                    "boots": {}, "build_sha256": "c" * 64,
+                    "boot_inputs_sha256": sha(boot_raw),
+                }
+                seen["files"]["records"]["qcow2-acceptance.json"] = (
+                    reference.compact_json(value, newline=True), value)
+            self.assertNotEqual(
+                python["files"]["records"]["qcow2-acceptance.json"][1][
+                    "boot_inputs_sha256"],
+                native["files"]["records"]["qcow2-acceptance.json"][1][
+                    "boot_inputs_sha256"])
+            self.assertEqual(compare_qcow2_acceptance(python, native), [])
+
+            def mutated_acceptance(side, value):
+                seen = observations[side]
+                return {
+                    **seen, "files": {
+                        "records": {
+                            **seen["files"]["records"],
+                            "qcow2-acceptance.json": (
+                                reference.compact_json(value, newline=True),
+                                value),
+                        },
+                    },
+                }
+
+            for side in ("python", "native"):
+                for kind in ("wrong-boot-hash", "extra-field", "other-field"):
+                    with self.subTest(side=side, kind=kind):
+                        changed = copy.deepcopy(
+                            observations[side]["files"]["records"][
+                                "qcow2-acceptance.json"][1])
+                        if kind == "wrong-boot-hash":
+                            changed["boot_inputs_sha256"] = "0" * 64
+                        elif kind == "extra-field":
+                            changed["unreviewed"] = True
+                        else:
+                            changed["source"]["revision"] = "altered"
+                        tampered = mutated_acceptance(side, changed)
+                        pair = ((tampered, native) if side == "python"
+                                else (python, tampered))
+                        if kind == "other-field":
+                            self.assertEqual(
+                                compare_qcow2_acceptance(*pair),
+                                ["record_content:qcow2-acceptance.json.source"])
+                        else:
+                            with self.assertRaisesRegex(
+                                    ParityError,
+                                    "acceptance.*(commitment|field/shape)"):
+                                compare_qcow2_acceptance(*pair)
+            accepted = copy.deepcopy(
+                native["files"]["records"]["qcow2-acceptance.json"][1])
+            forged_boot = dict(native_record, unreviewed=True)
+            forged_raw = reference.compact_json(forged_boot, newline=True)
+            accepted["boot_inputs_sha256"] = sha(forged_raw)
+            stale = {
+                **native, "files": {
+                    "records": {
+                        **native["files"]["records"],
+                        "boot-inputs.json": (forged_raw, native_record),
+                        "qcow2-acceptance.json": (
+                            reference.compact_json(accepted, newline=True),
+                            accepted),
+                    },
+                },
+            }
+            with self.assertRaisesRegex(
+                    ParityError, "acceptance boot-input byte commitment changed"):
+                verified_qcow2_acceptance(stale)
+
+            for kind in ("path", "sha256", "metadata"):
+                with self.subTest(kind=kind):
+                    altered = copy.deepcopy(native_record)
+                    role = altered["files"]["local_boot_tool"]
+                    if kind == "path":
+                        role.update(altered["files"]["package_tool"])
+                    elif kind == "sha256":
+                        role["sha256"] = "0" * 64
+                    else:
+                        role["metadata"][7] += 1
+                    altered["aggregate_sha256"] = reference.record_digest({
+                        key: value for key, value in altered.items()
+                        if key != "aggregate_sha256"
+                    })
+                    changed = {
+                        **native, "files": {
+                            "records": {
+                                **native["files"]["records"],
+                                "boot-inputs.json": (
+                                    b"synthetic rehashed fixture\n", altered),
+                            },
+                        },
+                    }
+                    with self.assertRaisesRegex(
+                            ParityError, "boot local-boot executable custody changed"):
+                        compare_boot_inputs(python, changed, installed)
+            altered = copy.deepcopy(native_record)
+            altered["files"]["package_tool"] = copy.deepcopy(
+                altered["files"]["local_boot_tool"])
+            altered["aggregate_sha256"] = reference.record_digest({
+                key: value for key, value in altered.items()
+                if key != "aggregate_sha256"
+            })
+            changed = {
+                **native, "files": {
+                    "records": {
+                        **native["files"]["records"],
+                        "boot-inputs.json": (
+                            b"synthetic rehashed unrelated role\n", altered),
+                    },
+                },
+            }
+            with self.assertRaises(reference.Refusal):
+                compare_boot_inputs(python, changed, installed)
+            wrong_path = local_boot_install_path(
+                native["roots"][0], "python")
+            write(wrong_path, b"synthetic shared local boot executable", 0o700)
+            substituted, _ = reference.physical_file_record(wrong_path)
+            changed_record = copy.deepcopy(native_record)
+            changed_record["files"]["local_boot_tool"] = substituted
+            changed_record["aggregate_sha256"] = reference.record_digest({
+                key: value for key, value in changed_record.items()
+                if key != "aggregate_sha256"
+            })
+            changed = {
+                **native, "files": {
+                    "records": {
+                        **native["files"]["records"],
+                        "boot-inputs.json": (
+                            b"synthetic rehashed substitution\n", changed_record),
+                    },
+                },
+            }
+            with self.assertRaisesRegex(
+                    ParityError, "boot local-boot executable custody changed"):
+                verified_boot_inputs(changed, "native", installed[1])
+            with self.assertRaisesRegex(
+                    ParityError, "native local-boot executable substituted"):
+                verified_local_boot_install(native, "native")
+            wrong_path.unlink()
+            local_boot_install_path(native["roots"][0], "native").write_bytes(
+                b"synthetic substituted executable")
+            self.assertIn("local_boot_install:sha256",
+                          compare_local_boot_installs(python, native)[1])
+        finally:
+            reference.APP = original_app
+            reference.executable_runtime_paths = original_runtime_paths
+            shutil.rmtree(root)
+
+    def test_unreviewed_retained_paths_remain_strict(self):
+
+        class Exit:
+            returncode = 0
+            stderr = b""
+
+        def seen(prefix):
+            return {
+                "exit": Exit(), "roots": (Path("/private/" + prefix),),
+                "files": {
+                    "order": (), "records": {}, "artifacts": {},
+                    "retained": {
+                        "private/" + prefix + ".log": ("file", 0o600, 123),
+                    },
+                },
+            }
+
+        self.assertEqual(
+            compare_observations(seen("unreviewed-a"), seen("unreviewed-b")),
+            ["retained"])
 
 
 def main():

@@ -114,6 +114,14 @@ jobs:
               PYTHONPATH="${source_root}/support/build/wamr-native-ci/tests:${source_root}/support/build/wamr-native-ci" \
               python3 -B -m unittest -q test_differential_parity.DeterministicContracts
           )
+          controller_root=/d/wamr-ci/wamr-differential-controller
+          test ! -e "${controller_root}"
+          mkdir -m 0700 -- "${controller_root}"
+          ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
+            zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
+              -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=ReleaseSafe \
+              -Dcontroller-runtime="${controller_root}" -j2 install-controller
+          test -x "${controller_root}/controller/bin/uk-wamr-native-ci"
 
       - name: Record the runner CPU and portable executable target
         run: |
@@ -195,8 +203,8 @@ jobs:
           python3 support/build/wamr-native-ci/run.py build --runtime "${root}" \
             --wamr-source "${GITHUB_WORKSPACE}/.d/wamr-source"
 
-      - name: Run raw QCOW2 and derived fixed VHD under both APIC configurations
-        timeout-minutes: 15
+      - name: Run six Python boots and paired native success in the managed KVM process
+        timeout-minutes: 40
         env:
           QUALIFICATION_REPOSITORY_ID: ${{ github.repository_id }}
           QUALIFICATION_SOURCE_JOB: wamr-native-compute

@@ -30,7 +30,8 @@ without self-hashing. Historical four-mode v1 is read-only; there is no
 caller-selected downgrade. `diagnostics --runtime ABS` emits allowlisted
 redacted observations only, never acceptance. `run.py` remains the
 authoritative production caller and differential reference until the later
-parity/bridge/cutover PRs; workflows, wrappers and authority are unchanged.
+parity/bridge/cutover PRs; production callers, wrappers and authority are
+unchanged.
 
 ## Native controller preparation (unpublished build path)
 
@@ -571,9 +572,11 @@ establishes the first local tiny-compute observation.
 
 ## Differential parity preparation
 
-`test-controller` now includes native source-custody production limits and
-frozen v1/v2 result-parser goldens. `test-controller-limits` and
-`test-differential-records` run those suites separately. The matching Python
+`test-controller` now includes native source-custody production limits, twelve
+physical Bison/consumer/dependency/supervision fault fixtures, and frozen v1/v2
+result-parser goldens. `test-controller-limits`,
+`test-controller-fault-parity`, and `test-differential-records` run those
+suites separately. The matching Python
 parser fixtures run with
 `python3 -B -m unittest test_differential_parity.DeterministicContracts`
 from the tests directory. These goldens contain synthetic records, not guest
@@ -586,10 +589,17 @@ roots. Its three documented legacy-CLI exceptions require exact refusal
 versus closed-grammar usage outcomes; they do not make a failed controller
 run successful. The `full` action requires separate clean worktrees, real
 pinned tools and WAMR source, an owner-only runtime template and portable
-controller, and accessible x86 KVM. It remains a diagnostic until every
-deliberate command-binding difference is checked against both production
-contracts and the full success/fault matrix passes; it is not a guest-boot
-release gate or an Azure invocation.
+controller, and accessible x86 KVM. The protected x86 job installs that
+controller from its isolated fixture worktree into a separate private root,
+then runs one paired six-mode success case after the Python production boot
+within the same managed, non-root KVM process. An unexplained difference fails
+the job before the public bundle is published. Passing this one case does not
+establish the full success/fault matrix, grant
+native production authority, or invoke Azure.
+The different Python/native supervised build commands, controller closures,
+local-boot installation paths, and native-only boot-input validator role are
+checked against their own exact physical contracts; each QCOW2 acceptance
+binds its own boot-input record rather than treating different hashes as equal.
 
 ## Private final-image handoff
 
