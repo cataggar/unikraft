@@ -69,7 +69,10 @@ fn dependencyNode(allocator: std.mem.Allocator, bytes: []const u8) !struct {
         if (found != null) return error.InvalidManifest;
         found = root.struct_literal.vals.at(@intCast(i)).get(zoir);
     }
-    if (found) |node| if (node != .struct_literal) return error.InvalidManifest;
+    if (found) |node| switch (node) {
+        .struct_literal, .empty_literal => {},
+        else => return error.InvalidManifest,
+    };
     return .{ .source_bytes = zero, .ast = ast, .zoir = zoir, .node = found };
 }
 
@@ -79,7 +82,7 @@ pub fn pinnedManifest(allocator: std.mem.Allocator, bytes: []const u8) !void {
     defer parsed.ast.deinit(allocator);
     defer parsed.zoir.deinit(allocator);
     const dependencies = parsed.node orelse return error.UnpinnedDependency;
-    if (dependencies.struct_literal.names.len != 1 or
+    if (dependencies != .struct_literal or dependencies.struct_literal.names.len != 1 or
         !std.mem.eql(u8, dependencies.struct_literal.names[0].get(parsed.zoir), "miz_source"))
         return error.UnpinnedDependency;
     const index = dependencies.struct_literal.vals.at(0);
@@ -99,6 +102,7 @@ pub fn packageDependencies(allocator: std.mem.Allocator, bytes: []const u8) ![][
     defer parsed.ast.deinit(allocator);
     defer parsed.zoir.deinit(allocator);
     const dependencies = parsed.node orelse return allocator.alloc([]const u8, 0);
+    if (dependencies == .empty_literal) return allocator.alloc([]const u8, 0);
     const result = try allocator.alloc([]const u8, dependencies.struct_literal.names.len);
     errdefer allocator.free(result);
     for (dependencies.struct_literal.names, 0..) |_, i| {

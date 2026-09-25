@@ -260,7 +260,8 @@ test "package custody rejects symlink and FIFO entries, unexpected roots and mis
     try packages.createDir(io, miz_name, .fromMode(0o700));
     const miz = try packages.openDir(io, miz_name, .{ .iterate = true });
     defer miz.close(io);
-    try package(miz);
+    try write(miz, "build.zig.zon", ".{ .name = .miz_fixture, .dependencies = .{}, }\n", 0o600);
+    try write(miz, "source.zig", "pub const answer = 42;\n", 0o600);
     var admitted = try controller.dependency_custody.packageSet(a, io, path);
     defer admitted.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), admitted.roots);
@@ -315,6 +316,15 @@ test "pinned package custody accepts writable archive members only beneath its p
         controller.dependency_custody.requireSame(a, io, path, admitted));
     try chmod(.{ .handle = packages.handle, .flags = .{ .nonblocking = false } }, 0o755);
     try expectPackageError(path, error.UnsafeFile);
+}
+
+test "empty package dependencies do not unpin the root manifest" {
+    const manifest = ".{ .dependencies = .{}, }\n";
+    const hashes = try controller.dependency_custody.packageDependencies(a, manifest);
+    defer a.free(hashes);
+    try std.testing.expectEqual(@as(usize, 0), hashes.len);
+    try std.testing.expectError(error.UnpinnedDependency,
+        controller.dependency_custody.pinnedManifest(a, manifest));
 }
 
 test "identical-content package root replacement breaks retained physical dependency custody" {
