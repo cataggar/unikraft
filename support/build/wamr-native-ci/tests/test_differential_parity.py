@@ -1317,6 +1317,26 @@ def require_prior_build_output_refusal(python, native, py_runtime, native_runtim
                   f"{label} occupied build root published {name}")
 
 
+def build_failure_details(results, snapshots):
+    details = []
+    for label in ("python", "native"):
+        result = results[label]
+        files = snapshots[label]["files"]
+        classification = category(result)
+        reason = ""
+        if classification == "refused":
+            marker = re.search(
+                r"(?m)^WAMR_CI_REFUSED: ([A-Za-z0-9 .:_-]{1,120})$",
+                result.stderr.decode("utf-8", "replace"))
+            if marker:
+                reason = " reason:" + marker.group(1)
+        details.append(
+            f"{label}=exit:{result.returncode} category:{classification}{reason} "
+            f"evidence:{','.join(files['order'])} "
+            f"artifacts:{','.join(sorted(files['artifacts']))}")
+    return "; ".join(details)
+
+
 def full(args):
     check(platform.machine() == "x86_64"
           and Path("/dev/kvm").is_char_device()
@@ -1398,15 +1418,20 @@ def full(args):
                                   "--wamr-source", str(args.wamr_source)],
                                  repo, environment, seconds=7200)
     py, native = (results[name] for name in ("python", "native"))
-    failures = ["build:" + name for name in compare_pair(
-        py, native, py_runtime, native_runtime, py_repo, native_repo,
-        reviewed_build_compat=True)]
+    snapshots = {
+        label: observed(results[label], runtime, repo)
+        for label, (repo, runtime, _, _) in executions.items()
+    }
+    failures = ["build:" + name for name in compare_observations(
+        snapshots["python"], snapshots["native"], reviewed_build_compat=True)]
     if args.case == "prior-build-output":
         require_prior_build_output_refusal(
             py, native, py_runtime, native_runtime)
     else:
         check(py.returncode == native.returncode == 0,
-              "build did not reach accepted state; " + ", ".join(failures))
+              "build did not reach accepted state; " +
+              build_failure_details(results, snapshots) + "; " +
+              ", ".join(failures))
         for repo, runtime, _, _ in executions.values():
             compute = runtime / "compute"
             if args.case == "build-start-tamper":
@@ -1993,6 +2018,27 @@ class DeterministicContracts(unittest.TestCase):
             "unknown-profile", usage, usage), [])
         with self.assertRaisesRegex(ParityError, "unknown CLI compatibility"):
             cli_vector_failures("different-vector", refused, usage)
+
+    def test_failed_build_summary_is_bounded_and_redacts_paths(self):
+        results = {
+            "python": subprocess.CompletedProcess(
+                [], 1, b"", b"WAMR_CI_REFUSED: source custody changed\n"),
+            "native": subprocess.CompletedProcess(
+                [], 1, b"", b"WAMR_CI_REFUSED: /private/secret\n"),
+        }
+        snapshots = {
+            "python": {"files": {
+                "order": ("command-adapter.json",),
+                "artifacts": {"config": ("private",)},
+            }},
+            "native": {"files": {"order": (), "artifacts": {}}},
+        }
+        details = build_failure_details(results, snapshots)
+        self.assertIn("python=exit:1 category:refused reason:source custody changed "
+                      "evidence:command-adapter.json artifacts:config", details)
+        self.assertIn("native=exit:1 category:refused evidence: artifacts:",
+                      details)
+        self.assertNotIn("/private/secret", details)
 
     def test_prior_build_output_requires_startup_failure_and_no_acceptance(self):
         class Exit:
