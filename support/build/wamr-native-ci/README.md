@@ -217,9 +217,12 @@ include the exact indirect shell/coreutils executables used by the native build
 graph (`dash`, `cp`, `env`, `mkdir`, `readlink` and `uname`) rather than
 unrelated `/usr/bin` members. Selected executable invocations use retained
 descriptor paths for Zig, Python, compiler/binutils and the recorded helper
-tools. Data trees, package paths and other pathname inputs remain path-based
-and are protected by their physical/content snapshots immediately before and
-after consumption; custody does not claim arbitrary pathname data is read
+tools. The pinned Zig executable alone admits up to the existing 256 MiB
+process-executable limit under no-follow, owner, mode and single-link checks;
+other retained tools retain their generic 64 MiB limit. Data trees, package
+paths and other pathname inputs remain path-based and are protected by their
+physical/content snapshots immediately before and after consumption; custody
+does not claim arbitrary pathname data is read
 through retained descriptors. The post-processing graph uses the objcopy
 interface for descriptor-safe stripping. The hosted workflow first materializes the pinned Zig distribution
 create-only beneath the owned ignored `.d` tool root, avoiding mutable

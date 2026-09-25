@@ -225,6 +225,33 @@ test "consumer retains the original executable but rejects same-byte inode repla
     try std.testing.expectError(error.InputChanged, controller.input_custody.requireSame(a, io, expected, &files, &trees));
 }
 
+test "only the pinned Zig role admits a large executable under retained custody" {
+    var fixture = try Fixture.init("zig-tool-bound");
+    defer fixture.deinit();
+    const file = try fixture.root.createFile(io, "zig", .{
+        .exclusive = true, .permissions = .fromMode(0o700),
+    });
+    defer file.close(io);
+    const path = try fixture.child("zig");
+    defer a.free(path);
+    if (linux.errno(linux.ftruncate(file.handle, 65 * 1024 * 1024)) != .SUCCESS)
+        return error.FixtureTruncateFailed;
+    try std.testing.expectError(error.UnsafeFile,
+        controller.command_adapter.openPinnedTool(io, path, "tool:git"));
+    var retained = try controller.command_adapter.openPinnedTool(io, path, "tool:zig");
+    defer retained.close(io);
+    try retained.verify(io);
+
+    try chmod(file, 0o722);
+    try std.testing.expectError(error.UnsafeFile,
+        controller.command_adapter.openPinnedTool(io, path, "tool:zig"));
+    try chmod(file, 0o700);
+    if (linux.errno(linux.ftruncate(file.handle, 256 * 1024 * 1024 + 1)) != .SUCCESS)
+        return error.FixtureTruncateFailed;
+    try std.testing.expectError(error.UnsafeFile,
+        controller.command_adapter.openPinnedTool(io, path, "tool:zig"));
+}
+
 test "consumer tree permits a directory alias inside its root but refuses external directory" {
     var fixture = try Fixture.init("directory-link");
     defer fixture.deinit();
