@@ -622,9 +622,9 @@ The different Python/native supervised build commands, controller closures,
 local-boot installation paths, and native-only boot-input validator role are
 checked against their own exact physical contracts; each QCOW2 acceptance
 binds its own boot-input record rather than treating different hashes as equal.
-Failed paired builds report only per-side exit classes, evidence and artifact
-names, and path-free refusal or static native error markers; private command
-logs remain local.
+Failed paired builds and boots report only per-side exit classes, evidence
+and artifact names, and path-free refusal or static native error markers;
+private command logs remain local.
 
 ## Private final-image handoff
 

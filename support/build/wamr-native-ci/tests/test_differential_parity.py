@@ -1319,7 +1319,7 @@ def require_prior_build_output_refusal(python, native, py_runtime, native_runtim
                   f"{label} occupied build root published {name}")
 
 
-def build_failure_details(results, snapshots):
+def outcome_details(results, snapshots):
     details = []
     for label in ("python", "native"):
         result = results[label]
@@ -1443,7 +1443,7 @@ def full(args):
     else:
         check(py.returncode == native.returncode == 0,
               "build did not reach accepted state; " +
-              build_failure_details(results, snapshots) + "; " +
+              outcome_details(results, snapshots) + "; " +
               ", ".join(failures))
         for repo, runtime, _, _ in executions.values():
             compute = runtime / "compute"
@@ -1466,11 +1466,17 @@ def full(args):
             results[label] = command([*executable, "boot", "--runtime", str(runtime)],
                                      repo, environment, seconds=3600)
         py, native = (results[name] for name in ("python", "native"))
-        failures.extend("boot:" + name for name in compare_pair(
-            py, native, py_runtime, native_runtime, py_repo, native_repo,
+        boot_snapshots = {
+            label: observed(results[label], runtime, repo)
+            for label, (repo, runtime, _, _) in executions.items()
+        }
+        failures.extend("boot:" + name for name in compare_observations(
+            boot_snapshots["python"], boot_snapshots["native"],
             reviewed_build_compat=True))
         check((py.returncode == native.returncode == 0) == (args.case == "success"),
-              "unexpected full-chain outcome; " + ", ".join(failures))
+              "unexpected full-chain outcome; " +
+              outcome_details(results, boot_snapshots) + "; " +
+              ", ".join(failures))
         if args.case == "success":
             for runtime in (py_runtime, native_runtime):
                 check((runtime / "compute/evidence/result.json").is_file(),
@@ -2062,7 +2068,7 @@ class DeterministicContracts(unittest.TestCase):
         with self.assertRaisesRegex(ParityError, "unknown CLI compatibility"):
             cli_vector_failures("different-vector", refused, usage)
 
-    def test_failed_build_summary_is_bounded_and_redacts_paths(self):
+    def test_failed_outcome_summary_is_bounded_and_redacts_paths(self):
         results = {
             "python": subprocess.CompletedProcess(
                 [], 1, b"", b"WAMR_CI_REFUSED: source custody changed\n"),
@@ -2076,11 +2082,28 @@ class DeterministicContracts(unittest.TestCase):
             }},
             "native": {"files": {"order": (), "artifacts": {}}},
         }
-        details = build_failure_details(results, snapshots)
+        details = outcome_details(results, snapshots)
         self.assertIn("python=exit:1 category:refused reason:source custody changed "
                       "evidence:command-adapter.json artifacts:config", details)
         self.assertIn("native=exit:1 category:refused evidence: artifacts:",
                       details)
+        self.assertNotIn("/private/secret", details)
+
+    def test_failed_boot_summary_reports_only_path_free_refusal(self):
+        results = {
+            "python": subprocess.CompletedProcess(
+                [], 1, b"", b"WAMR_CI_REFUSED: producer inputs changed\n"
+                             b"private: /private/secret\n"),
+            "native": subprocess.CompletedProcess([], 0, b"", b""),
+        }
+        snapshots = {
+            label: {"files": {"order": ("build-start.json",), "artifacts": {}}}
+            for label in results
+        }
+        details = outcome_details(results, snapshots)
+        self.assertIn("python=exit:1 category:refused "
+                      "reason:producer inputs changed", details)
+        self.assertIn("native=exit:0 category:success", details)
         self.assertNotIn("/private/secret", details)
 
     def test_failed_build_summary_reports_only_static_native_error_names(self):
@@ -2098,7 +2121,7 @@ class DeterministicContracts(unittest.TestCase):
             label: {"files": {"order": (), "artifacts": {}}}
             for label in results
         }
-        details = build_failure_details(results, snapshots)
+        details = outcome_details(results, snapshots)
         self.assertIn("native=exit:1 category:failed_stage:dependency-restore "
                       "operation:bind-bootstrap-inputs cause:UnsafeFile", details)
         self.assertNotIn("/private/secret", details)
@@ -2107,8 +2130,8 @@ class DeterministicContracts(unittest.TestCase):
             b"WAMR_CI_FAILED_STAGE: dependency-restore; "
             b"operation: /private/secret; cause: UnsafeFile; "
             b"bounded private logs retained.\n")
-        self.assertNotIn("operation:", build_failure_details(results, snapshots))
-        self.assertNotIn("cause:", build_failure_details(results, snapshots))
+        self.assertNotIn("operation:", outcome_details(results, snapshots))
+        self.assertNotIn("cause:", outcome_details(results, snapshots))
 
     def test_matrix_driver_refuses_unreviewed_cases_and_jobs(self):
         scripts = PROJECT / ".github/scripts"
