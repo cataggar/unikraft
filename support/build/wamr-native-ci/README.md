@@ -469,7 +469,8 @@ claim. Git bootstrap/custody probes run with
 system/global configuration, hooks, repository fsmonitor helpers, credential
 helpers, replacement objects, terminal prompts and pagers disabled where
 applicable.
-Build commands use `-j2`; the workflow has a 60-minute ceiling. Each build
+Build commands use `-j2`; the production and fault-matrix jobs each have a
+120-minute ceiling and their paired KVM steps a 90-minute ceiling. Each build
 command has an absolute deadline, 4-MiB limits per native stream and an
 8-MiB combined private-log limit (one extra byte detects overflow), followed
 by an independent ten-second supervisor cleanup deadline. The native packaging
