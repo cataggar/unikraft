@@ -1360,6 +1360,13 @@ def outcome_details(results, snapshots):
     return "; ".join(details)
 
 
+def report_progress(side, phase):
+    check(side in ("python", "native")
+          and phase in ("build-start", "build-done", "boot-start", "boot-done"),
+          "invalid differential progress label")
+    print(f"DIFFERENTIAL_PROGRESS: {side}:{phase}", file=sys.stderr, flush=True)
+
+
 def full(args):
     check(platform.machine() == "x86_64"
           and Path("/dev/kvm").is_char_device()
@@ -1437,9 +1444,11 @@ def full(args):
             (runtime / "compute").mkdir(mode=0o700)
     results = {}
     for label, (repo, runtime, executable, environment) in executions.items():
+        report_progress(label, "build-start")
         results[label] = command([*executable, "build", "--runtime", str(runtime),
                                   "--wamr-source", str(args.wamr_source)],
                                  repo, environment, seconds=7200)
+        report_progress(label, "build-done")
     py, native = (results[name] for name in ("python", "native"))
     snapshots = {
         label: observed(results[label], runtime, repo)
@@ -1473,8 +1482,10 @@ def full(args):
                 path.chmod(0o600)
         results = {}
         for label, (repo, runtime, executable, environment) in executions.items():
+            report_progress(label, "boot-start")
             results[label] = command([*executable, "boot", "--runtime", str(runtime)],
                                      repo, environment, seconds=3600)
+            report_progress(label, "boot-done")
         py, native = (results[name] for name in ("python", "native"))
         boot_snapshots = {
             label: observed(results[label], runtime, repo)
@@ -2117,6 +2128,18 @@ class DeterministicContracts(unittest.TestCase):
                       "reason:producer inputs changed", details)
         self.assertIn("native=exit:0 category:success", details)
         self.assertNotIn("/private/secret", details)
+
+    def test_protected_progress_labels_are_closed_and_path_free(self):
+        with mock.patch("builtins.print") as emit:
+            report_progress("native", "boot-start")
+            emit.assert_called_once_with(
+                "DIFFERENTIAL_PROGRESS: native:boot-start",
+                file=sys.stderr, flush=True)
+            with self.assertRaisesRegex(ParityError, "invalid differential progress"):
+                report_progress("/private/secret", "boot-start")
+            with self.assertRaisesRegex(ParityError, "invalid differential progress"):
+                report_progress("native", "/private/secret")
+            emit.assert_called_once()
 
     def test_failed_build_summary_reports_only_static_native_error_names(self):
         results = {

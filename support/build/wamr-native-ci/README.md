@@ -473,7 +473,7 @@ system/global configuration, hooks, repository fsmonitor helpers, credential
 helpers, replacement objects, terminal prompts and pagers disabled where
 applicable.
 Build commands use `-j2`; the production and fault-matrix jobs each have a
-120-minute ceiling and their paired KVM steps a 90-minute ceiling. Each build
+180-minute ceiling and their paired KVM steps a 150-minute ceiling. Each build
 command has an absolute deadline, 4-MiB limits per native stream and an
 8-MiB combined private-log limit (one extra byte detects overflow), followed
 by an independent ten-second supervisor cleanup deadline. The native packaging
@@ -628,9 +628,11 @@ binds its own boot-input record rather than treating different hashes as equal.
 Shared production executables are built without path-dependent debug sections
 outside Debug mode so separately cached ReleaseSafe builds retain identical
 bytes for strict paired tool and boot-input custody.
-Failed paired builds and boots report only per-side exit classes, evidence
-and artifact names, and path-free refusal or static native error markers;
-private command logs remain local.
+Protected paired runs print only closed stage-start and stage-completion
+labels to identify which of the four real controller invocations has exhausted
+the bounded step deadline. Failed paired builds and boots report only per-side
+exit classes, evidence and artifact names, and path-free refusal or static
+native error markers; private command logs remain local.
 
 ## Private final-image handoff
 

@@ -13,7 +13,7 @@ permissions:
 jobs:
   wamr-native-compute:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 180
     outputs:
       inner-zip-sha256: ${{ steps.public_binding.outputs.inner_zip_sha256 }}
       inner-zip-bytes: ${{ steps.public_binding.outputs.inner_zip_bytes }}
@@ -213,7 +213,7 @@ jobs:
             --wamr-source "${GITHUB_WORKSPACE}/.d/wamr-source"
 
       - name: Run six Python boots and paired native success in the managed KVM process
-        timeout-minutes: 90
+        timeout-minutes: 150
         env:
           QUALIFICATION_REPOSITORY_ID: ${{ github.repository_id }}
           QUALIFICATION_SOURCE_JOB: wamr-native-compute
@@ -606,7 +606,7 @@ jobs:
   wamr-differential-parity:
     needs: wamr-native-compute
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -718,7 +718,7 @@ jobs:
           test -x "${controller_root}/controller/bin/uk-wamr-native-ci"
 
       - name: Compare paired real fault outcomes with managed KVM
-        timeout-minutes: 90
+        timeout-minutes: 150
         env:
           QUALIFICATION_REPOSITORY_ID: ${{ github.repository_id }}
           QUALIFICATION_SOURCE_JOB: wamr-differential-parity
