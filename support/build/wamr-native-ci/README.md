@@ -645,7 +645,10 @@ the two source roots, even when the compiled workload is identical.
 The native static runtime archive is passed through the pinned LLVM objcopy
 `--strip-debug` in a supervised, recorded producer command before publication;
 its separately built ELF members otherwise retain checkout-dependent DWARF
-strings and line tables. Symbols and relocations required for linking remain.
+strings and line tables. The single checked Zig object member is then extracted
+and repacked by pinned `zig ar` under a stable basename: the original archive's
+long-name table embeds the absolute, checkout-dependent Zig cache path. Symbols
+and relocations required for linking remain.
 The CI production build commands set `WAMR_CI_PORTABLE_CONFIG=1` for the Python
 and native controllers. The native image builder forwards it to the root Zig facade,
 which gives both Kconfig solvers the same inert defaults for `CONFIG_UK_BASE`

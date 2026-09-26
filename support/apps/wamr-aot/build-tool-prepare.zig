@@ -173,6 +173,9 @@ const Stage = enum {
     runtime_build,
     compiler_build,
     runtime_strip,
+    runtime_archive_members,
+    runtime_archive_extract,
+    runtime_archive_repack,
     snapshot_compute,
     snapshot_memory,
     matched_wasm,
@@ -191,6 +194,9 @@ const Stage = enum {
             .runtime_build => "runtime-build",
             .compiler_build => "compiler-build",
             .runtime_strip => "runtime-strip",
+            .runtime_archive_members => "runtime-archive-members",
+            .runtime_archive_extract => "runtime-archive-extract",
+            .runtime_archive_repack => "runtime-archive-repack",
             .snapshot_compute => "snapshot-compute",
             .snapshot_memory => "snapshot-memory",
             .matched_wasm => "matched-wasm",
@@ -853,14 +859,100 @@ fn buildWorkload(
         );
         defer result.deinit(allocator);
     }
+    const archive_members_path = try std.fs.path.join(
+        a,
+        &.{ build_path, "scratch", "runtime-archive" },
+    );
+    const scratch = try contract.files.PrivateDirectory.open(
+        io,
+        try std.fs.path.join(a, &.{ build_path, "scratch" }),
+    );
+    defer scratch.close(io);
+    const archive_members = try contract.files.createPrivateDirectory(
+        io,
+        scratch.dir,
+        "runtime-archive",
+    );
+    defer archive_members.close(io);
+    {
+        var result = try runner.run(
+            zig,
+            .runtime_archive_members,
+            &.{ zig.path, "ar", "t", stripped },
+            work.dir,
+            work.path,
+            true,
+            null,
+        );
+        defer result.deinit(allocator);
+        try requireRuntimeArchiveMember(a, result.stdout, build_path);
+    }
+    const output_option = try std.fmt.allocPrint(
+        a,
+        "--output={s}",
+        .{archive_members_path},
+    );
+    {
+        var result = try runner.run(
+            zig,
+            .runtime_archive_extract,
+            &.{ zig.path, "ar", "x", output_option, stripped },
+            work.dir,
+            work.path,
+            true,
+            null,
+        );
+        defer result.deinit(allocator);
+    }
+    const object = try std.fs.path.join(
+        a,
+        &.{ archive_members_path, "libwamr-aot_zcu.o" },
+    );
+    _ = try digestAbsolute(io, object, maximum_artifact_bytes);
+    const canonical = try std.fs.path.join(
+        a,
+        &.{ archive_members_path, "libwamr-aot.a" },
+    );
+    {
+        var result = try runner.run(
+            zig,
+            .runtime_archive_repack,
+            &.{ zig.path, "ar", "rcsD", canonical, "libwamr-aot_zcu.o" },
+            archive_members,
+            archive_members_path,
+            true,
+            null,
+        );
+        defer result.deinit(allocator);
+    }
     try copyAbsoluteFile(
         allocator,
         io,
-        stripped,
+        canonical,
         artifacts,
         "libwamr-aot.a",
         0o600,
     );
+}
+
+fn requireRuntimeArchiveMember(
+    allocator: std.mem.Allocator,
+    output: []const u8,
+    build_path: []const u8,
+) !void {
+    const prefix = try std.fmt.allocPrint(
+        allocator,
+        "{s}/native-environment/zig_local_cache/o/",
+        .{build_path},
+    );
+    const suffix = "/libwamr-aot_zcu.o\n";
+    if (output.len != prefix.len + 32 + suffix.len or
+        !std.mem.startsWith(u8, output, prefix) or
+        !std.mem.endsWith(u8, output, suffix))
+        return error.UnexpectedArchiveMember;
+    for (output[prefix.len .. prefix.len + 32]) |byte|
+        if (!((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f')))
+            return error.UnexpectedArchiveMember;
 }
 
 fn buildTinyAndCoremark(
@@ -1883,6 +1975,31 @@ fn verifyCommands(
     try nextCommand(identity.commands.items, &index, &.{
         strip_argv[0], "--strip-debug", library, stripped,
     }, work_path);
+    const archive_members = try std.fs.path.join(
+        allocator,
+        &.{ build_path, "scratch", "runtime-archive" },
+    );
+    defer allocator.free(archive_members);
+    const output_option = try std.fmt.allocPrint(
+        allocator,
+        "--output={s}",
+        .{archive_members},
+    );
+    defer allocator.free(output_option);
+    const canonical = try std.fs.path.join(
+        allocator,
+        &.{ archive_members, "libwamr-aot.a" },
+    );
+    defer allocator.free(canonical);
+    try nextCommand(identity.commands.items, &index, &.{
+        zig, "ar", "t", stripped,
+    }, work_path);
+    try nextCommand(identity.commands.items, &index, &.{
+        zig, "ar", "x", output_option, stripped,
+    }, work_path);
+    try nextCommand(identity.commands.items, &index, &.{
+        zig, "ar", "rcsD", canonical, "libwamr-aot_zcu.o",
+    }, archive_members);
     const fixture = try std.fs.path.join(allocator, &.{ app_path, "fixture.zig" });
     defer allocator.free(fixture);
     const tiny = try std.fs.path.join(allocator, &.{ artifacts_path, "tiny.wasm" });
@@ -2251,7 +2368,9 @@ fn portableAppPath(
         (value.len != app_path.len and value[app_path.len] != '/'))
         return null;
     const portable: []const u8 = try std.fmt.allocPrint(
-        allocator, "<app>{s}", .{value[app_path.len..]},
+        allocator,
+        "<app>{s}",
+        .{value[app_path.len..]},
     );
     return portable;
 }
@@ -2278,7 +2397,8 @@ fn writeCommands(
     objcopy_path: []const u8,
 ) !void {
     const compiler_path = try std.fs.path.join(
-        allocator, &.{ app_path, "build", "artifacts", "wamrc" },
+        allocator,
+        &.{ app_path, "build", "artifacts", "wamrc" },
     );
     try writer.writeByte('[');
     for (commands, 0..) |command, index| {
@@ -2291,16 +2411,14 @@ fn writeCommands(
                 const expected = switch (command.stage) {
                     .git_revision, .git_archive => "git",
                     .runtime_strip => objcopy_path,
-                    .snapshot_compute, .snapshot_memory, .matched_aot, .tiny_aot,
-                    .coremark_aot, .coremark_nofp_aot => compiler_path,
+                    .snapshot_compute, .snapshot_memory, .matched_aot, .tiny_aot, .coremark_aot, .coremark_nofp_aot => compiler_path,
                     else => zig_path,
                 };
                 if (!std.mem.eql(u8, argument, expected)) return error.InvalidCommandPlan;
                 break :tool switch (command.stage) {
                     .git_revision, .git_archive => "git",
                     .runtime_strip => "<objcopy>",
-                    .snapshot_compute, .snapshot_memory, .matched_aot, .tiny_aot,
-                    .coremark_aot, .coremark_nofp_aot => "<app>/build/artifacts/wamrc",
+                    .snapshot_compute, .snapshot_memory, .matched_aot, .tiny_aot, .coremark_aot, .coremark_nofp_aot => "<app>/build/artifacts/wamrc",
                     else => "<zig>",
                 };
             } else try portableCommandValue(allocator, argument, app_path);
@@ -2464,6 +2582,9 @@ fn commandFailure(stage: Stage) anyerror {
         .runtime_build => error.RuntimeBuildCommandFailed,
         .compiler_build => error.CompilerBuildCommandFailed,
         .runtime_strip => error.RuntimeStripCommandFailed,
+        .runtime_archive_members => error.RuntimeArchiveMembersCommandFailed,
+        .runtime_archive_extract => error.RuntimeArchiveExtractCommandFailed,
+        .runtime_archive_repack => error.RuntimeArchiveRepackCommandFailed,
         .snapshot_compute => error.SnapshotComputeCommandFailed,
         .snapshot_memory => error.SnapshotMemoryCommandFailed,
         .matched_wasm => error.MatchedWasmCommandFailed,

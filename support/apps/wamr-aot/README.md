@@ -40,9 +40,11 @@ database into this application's ignored `build/wamr-source/`. It never
 builds in, changes, or inherits uncommitted files from the source checkout.
 It builds that revision's host `wamrc`, its freestanding library audit,
 then the integration archive. `prepare` requires `llvm-objcopy` to remove
-checkout-dependent debug sections from the static runtime archive before
-publishing it; the supervised command retains its linkable symbols and is
-included in the verified producer plan. The tiny wasm is genuinely generated from
+checkout-dependent debug sections, then checks the single Zig object member
+and uses pinned `zig ar` to repack it with a stable basename. The original
+archive's long-name table otherwise records an absolute, checkout-dependent
+cache path. These supervised commands retain linkable symbols and are included
+in the verified producer plan. The tiny wasm is genuinely generated from
 `fixture.zig` and compiled with `--target=x86_64
 --profile=unikraft-x86_64`. Hosted artifacts are not renamed or relabelled.
 Only trusted output of this pinned producer is admissible. The adapter installs

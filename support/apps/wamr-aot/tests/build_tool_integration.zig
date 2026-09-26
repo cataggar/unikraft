@@ -190,7 +190,9 @@ test "runtime identity is byte-identical across separate source roots" {
     const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
     defer allocator.free(cli);
     const fixture = try std.Io.Dir.cwd().realPathFileAlloc(
-        io, options.prepare_fixture, allocator,
+        io,
+        options.prepare_fixture,
+        allocator,
     );
     defer allocator.free(fixture);
     var temporary = testing.tmpDir(.{ .iterate = true });
@@ -200,29 +202,58 @@ test "runtime identity is byte-identical across separate source roots" {
     defer allocator.free(archive);
     var first: ?[]u8 = null;
     defer if (first) |bytes| allocator.free(bytes);
+    var first_raw_library: ?[]u8 = null;
+    defer if (first_raw_library) |bytes| allocator.free(bytes);
     inline for (.{ "source-python", "source-native" }) |name| {
         const repository = try fixtureRepository(&temporary, name);
         defer allocator.free(repository);
         var environment = try fixtureEnvironment(fixture);
         defer environment.deinit();
+        try environment.put("WAMR_PREPARE_FIXTURE_ARCHIVE_PATH_DEPENDENT", "1");
         const prepared = try runPrepare(
-            cli, repository, archive, .{ .name = name }, &environment,
+            cli,
+            repository,
+            archive,
+            .{ .name = name },
+            &environment,
         );
         defer allocator.free(prepared.stdout);
         defer allocator.free(prepared.stderr);
         try expectExit(prepared.term, 0);
         const verified = try runCli(
-            cli, &.{ cli, "verify", "--repository", repository }, &environment,
+            cli,
+            &.{ cli, "verify", "--repository", repository },
+            &environment,
         );
         defer allocator.free(verified.stdout);
         defer allocator.free(verified.stderr);
         try expectExit(verified.term, 0);
+        const raw_path = try std.fs.path.join(allocator, &.{
+            repository,
+            "support/apps/wamr-aot/build/workload-consumer/out/lib/libwamr-aot.a",
+        });
+        defer allocator.free(raw_path);
+        const raw_library = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            raw_path,
+            allocator,
+            .limited(1024 * 1024),
+        );
+        if (first_raw_library) |original| {
+            defer allocator.free(raw_library);
+            try testing.expect(!std.mem.eql(u8, original, raw_library));
+        } else {
+            first_raw_library = raw_library;
+        }
         const identity_path = try std.fs.path.join(allocator, &.{
             repository, "support/apps/wamr-aot/build/artifacts/identity.json",
         });
         defer allocator.free(identity_path);
         const identity = try std.Io.Dir.cwd().readFileAlloc(
-            io, identity_path, allocator, .limited(1024 * 1024),
+            io,
+            identity_path,
+            allocator,
+            .limited(1024 * 1024),
         );
         try testing.expect(std.mem.indexOf(u8, identity, repository) == null);
         try testing.expect(std.mem.indexOf(u8, identity, "\"<zig>\"") != null);
@@ -255,6 +286,10 @@ test "prepare failures retain private diagnostics without a success identity" {
     inline for (.{
         .{ "child-failure", "workload-build", false },
         .{ "runtime-strip-failure", "runtime-strip", false },
+        .{ "runtime-members-failure", "runtime-archive-members", false },
+        .{ "runtime-extract-failure", "runtime-archive-extract", false },
+        .{ "runtime-repack-failure", "runtime-archive-repack", false },
+        .{ "runtime-member-invalid", "", false },
         .{ "matched-mismatch", "", true },
     }) |case| {
         const repository = try fixtureRepository(&temporary, case[0]);
@@ -265,6 +300,8 @@ test "prepare failures retain private diagnostics without a success identity" {
             try environment.put("WAMR_PREPARE_FIXTURE_FAIL", case[1]);
         if (case[2])
             try environment.put("WAMR_PREPARE_FIXTURE_MISMATCH", "1");
+        if (std.mem.eql(u8, case[0], "runtime-member-invalid"))
+            try environment.put("WAMR_PREPARE_FIXTURE_INVALID_MEMBER", "1");
         const result = try runPrepare(
             cli,
             repository,
@@ -275,7 +312,7 @@ test "prepare failures retain private diagnostics without a success identity" {
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
         try expectExit(result.term, 2);
-        if (std.mem.eql(u8, case[1], "runtime-strip"))
+        if (std.mem.startsWith(u8, case[1], "runtime-"))
             try testing.expectEqualStrings(
                 "wamr_aot_build_failed category=command_failed\n",
                 result.stderr,
@@ -1566,8 +1603,8 @@ fn tamperRefusals(
         .{ "\"-j2\"", "\"-j3\"" },
         .{ "\"<zig>\"", "\"zig\"" },
         .{ "\"<objcopy>\"", "\"objcopy\"" },
-        .{ "\"<app>/build/scratch/libwamr-aot.stripped.a\"",
-            "\"<app>/build/scratch/other.a\"" },
+        .{ "\"rcsD\"", "\"rcsU\"" },
+        .{ "\"<app>/build/scratch/libwamr-aot.stripped.a\"", "\"<app>/build/scratch/other.a\"" },
         .{ "\"-fPIC\"", "\"-fBAD\"" },
         .{ "\"wamrc\":", "\"../x?\":" },
     }) |mutation| {
