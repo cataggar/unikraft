@@ -619,6 +619,7 @@ fn buildRuntimeAndCompiler(
                 "build",
                 "native-aot-fixture",
                 "-Doptimize=ReleaseSafe",
+                "-Dstrip=true",
                 "--prefix",
                 host_prefix,
                 "-j2",
@@ -1131,7 +1132,7 @@ fn identityManifestAlloc(
     try jsonFieldName(&raw.writer, "commands", true);
     try writeCommands(&raw.writer, commands);
     try jsonFieldName(&raw.writer, "compiler_options", true);
-    try writeStringArray(&raw.writer, &.{"optimize=ReleaseSafe"});
+    try writeStringArray(&raw.writer, &.{ "optimize=ReleaseSafe", "strip=true" });
     try jsonFieldName(&raw.writer, "minimal_wasi", true);
     try raw.writer.writeAll(if (arguments.coremark) "true" else "false");
     try jsonFieldName(&raw.writer, "wasi_bridge_sha256", true);
@@ -1266,7 +1267,7 @@ fn verifyIdentityBytes(
         ))
         return error.UnsupportedProducerIdentity;
     try expectStringArray(identity.fields.get("runtime_options").?, &contract.native_flags);
-    try expectStringArray(identity.fields.get("compiler_options").?, &.{"optimize=ReleaseSafe"});
+    try expectStringArray(identity.fields.get("compiler_options").?, &.{ "optimize=ReleaseSafe", "strip=true" });
 
     const build_path = try std.fs.path.join(allocator, &.{ repository.app.path, "build" });
     defer allocator.free(build_path);
@@ -1761,6 +1762,7 @@ fn verifyCommands(
         "build",
         "native-aot-fixture",
         "-Doptimize=ReleaseSafe",
+        "-Dstrip=true",
         "--prefix",
         host,
         "-j2",

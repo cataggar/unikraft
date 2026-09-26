@@ -638,7 +638,10 @@ checked against their own exact physical contracts; each QCOW2 acceptance
 binds its own boot-input record rather than treating different hashes as equal.
 Shared production executables are built without path-dependent debug sections
 outside Debug mode so separately cached ReleaseSafe builds retain identical
-bytes for strict paired tool and boot-input custody.
+bytes for strict paired tool and boot-input custody. The pinned upstream WAMR
+compiler is also built with its supported `-Dstrip=true` option: otherwise its
+debug sections change the compiler and generated runtime-identity bytes across
+the two source roots, even when the compiled workload is identical.
 Protected paired runs print only closed stage-start and stage-completion
 labels to identify which of the four real controller invocations has exhausted
 the bounded step deadline. Failed paired builds and boots report only per-side
