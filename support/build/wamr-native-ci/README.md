@@ -653,14 +653,12 @@ The CI production build commands set `WAMR_CI_PORTABLE_CONFIG=1` for the Python
 and native controllers. The native image builder forwards it to the root Zig facade,
 which gives both Kconfig solvers the same inert defaults for `CONFIG_UK_BASE`
 and `CONFIG_UK_APP`; Make still uses the actual checkout and application paths
-for source discovery and compilation. The native producer also seeds both
-paired Make `build/.config` inputs with
-`CONFIG_LIBUKLIBID_INFO_COMPILEDATE=n`, rather than embedding each separately
-built image's wall-clock time in its loadable
-`.uk_libinfo` section. An existing dated config is refused in this mode;
-ordinary builds retain their path and metadata defaults. The paired comparison
-still requires identical raw `.config` bytes and matching image hashes; it does
-not normalize either artifact.
+for source discovery and compilation. Make also derives paired `HOSTUTC` from
+the verified source commit's UTC timestamp, rather than embedding each
+separately built image's wall-clock time in its loadable `.uk_libinfo`
+section. Ordinary builds retain their path and build-time metadata defaults.
+The paired comparison still requires identical raw `.config` bytes and
+matching image hashes; it does not normalize either artifact.
 Protected paired runs print only closed stage-start and stage-completion
 labels to identify which of the four real controller invocations has exhausted
 the bounded step deadline. Failed paired builds and boots report only per-side

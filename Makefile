@@ -464,7 +464,18 @@ HOSTRANLIB	:= $(shell which $(HOSTRANLIB) || type -p $(HOSTRANLIB) || echo ranli
 HOSTCC_VERSION	:= $(shell $(HOSTCC_NOCCACHE) --version | \
 		   $(SED) -n -r 's/^.* ([0-9]*)\.([0-9]*)\.([0-9]*)[ ]*.*/\1 \2/p')
 # UTC time in ISO 8601 format:
+ifeq ($(WAMR_CI_PORTABLE_CONFIG),1)
+HOSTEPOCH	:= $(shell git -C "$(CONFIG_UK_BASE)" show -s --format=%ct HEAD)
+ifeq ($(HOSTEPOCH),)
+$(error Portable CI requires a source commit timestamp)
+endif
+HOSTUTC		:= $(shell date -Iseconds -u -d "@$(HOSTEPOCH)")
+ifeq ($(HOSTUTC),)
+$(error Portable CI could not format the source commit timestamp)
+endif
+else
 HOSTUTC		:= $(shell date -Iseconds -u)
+endif
 HOSTNAME	:= $(shell hostname -s)
 HOSTUSER	:= $(shell whoami)
 
