@@ -33,6 +33,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("../../apps/wamr-aot/validator/main.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = optimize != .Debug,
         .imports = &.{
             .{ .name = "wamr_log_validator", .module = log_validator },
             .{ .name = "hyperv_core", .module = core },
@@ -60,6 +61,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("package.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = optimize != .Debug,
         .imports = &.{.{ .name = "public_image", .module = image }},
     });
     const cli = b.addExecutable(.{ .name = "wamr-ci-package", .root_module = root });
@@ -213,6 +215,10 @@ pub fn build(b: *std.Build) void {
     });
     controller_options.addOptionPath("command_fixture", command_fixture.getEmittedBin());
     const controller_run = b.addRunArtifact(controller_tests);
+    const controller_direct = b.addSystemCommand(&.{"/usr/bin/env"});
+    controller_direct.addFileArg(controller_tests.getEmittedBin());
+    b.step("test-controller-direct", "Run host controller tests with direct failure output")
+        .dependOn(&controller_direct.step);
     const install_target_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("controller/install_target_tests.zig"),
@@ -223,8 +229,57 @@ pub fn build(b: *std.Build) void {
     install_target_tests.root_module.addOptions("test_options", controller_options);
     const install_target_run = b.addRunArtifact(install_target_tests);
     install_target_run.step.dependOn(&controller_run.step);
-    b.step("test-controller", "Run controller foundation unit, golden, and fault fixtures")
-        .dependOn(&install_target_run.step);
+    const controller_step = b.step("test-controller", "Run controller foundation unit, golden, and fault fixtures");
+    controller_step.dependOn(&install_target_run.step);
+    const source_limits_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("controller/source_custody_limits_tests.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "hyperv_core", .module = host_core },
+                .{ .name = "controller_source_closure", .module = host_closure },
+            },
+        }),
+    });
+    source_limits_tests.root_module.addOptions("test_options", controller_options);
+    const source_limits_run = b.addRunArtifact(source_limits_tests);
+    b.step("test-controller-limits", "Run native source-custody production boundary fixtures")
+        .dependOn(&source_limits_run.step);
+    controller_step.dependOn(&source_limits_run.step);
+    const fault_parity_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("controller/fault_parity_tests.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wamr_controller", .module = host_controller },
+                .{ .name = "hyperv_core", .module = host_core },
+            },
+        }),
+    });
+    fault_parity_tests.root_module.addOptions("test_options", controller_options);
+    controller_run.step.dependOn(&fault_parity_tests.step);
+    const fault_parity_run = b.addRunArtifact(fault_parity_tests);
+    fault_parity_run.step.dependOn(&controller_run.step);
+    b.step("test-controller-fault-parity", "Run native physical custody parity faults")
+        .dependOn(&fault_parity_run.step);
+    controller_step.dependOn(&fault_parity_run.step);
+    const record_goldens = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/differential_records.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wamr_controller", .module = host_controller },
+                .{ .name = "hyperv_core", .module = host_core },
+            },
+        }),
+    });
+    const record_goldens_run = b.addRunArtifact(record_goldens);
+    b.step("test-differential-records", "Run frozen v1/v2 native record goldens")
+        .dependOn(&record_goldens_run.step);
+    controller_step.dependOn(&record_goldens_run.step);
     const tests = b.addTest(.{ .root_module = root });
     const unit_tests = b.addRunArtifact(tests);
     const unit_step = b.step("test-unit", "Test the compute packaging adapter command boundary");
@@ -273,4 +328,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&unit_tests.step);
     test_step.dependOn(&pipeline_run.step);
     test_step.dependOn(&controller_run.step);
+    test_step.dependOn(&source_limits_run.step);
+    test_step.dependOn(&fault_parity_run.step);
+    test_step.dependOn(&record_goldens_run.step);
 }

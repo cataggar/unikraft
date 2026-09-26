@@ -94,6 +94,7 @@ const MakeOptions = struct {
     host_cxx: ?[]const u8,
     host_cflags: ?[]const u8,
     forwarded: []const []const u8,
+    ci_portable_config: bool = false,
     native_environment: ?native_make_environment.Contract = null,
 };
 
@@ -248,6 +249,7 @@ pub fn build(b: *std.Build) void {
         .host_cxx = b.option([]const u8, "host-cxx", "Host C++ compiler command (Make HOSTCXX=)"),
         .host_cflags = b.option([]const u8, "host-cflags", "Host compiler flags (Make HOSTCFLAGS=)"),
         .forwarded = b.option([]const []const u8, "make-arg", "Allowlisted NAME=VALUE tool/flag assignment; may be repeated") orelse &.{},
+        .ci_portable_config = b.option(bool, "ci-portable-config", "Use checkout-independent Kconfig path defaults (paired CI only)") orelse false,
         .native_environment = if (selected_environment) |selected| selected.value else null,
     };
 
@@ -309,6 +311,8 @@ pub fn build(b: *std.Build) void {
     ) catch @panic("out of memory");
     const metadata_input = std.Build.LazyPath{ .cwd_relative = metadata_path };
     const export_config_metadata = b.addRunArtifact(metadata_tool);
+    if (options.ci_portable_config)
+        export_config_metadata.setEnvironmentVariable("WAMR_CI_PORTABLE_CONFIG", "1");
     export_config_metadata.addArgs(&.{
         "--base",
         context.base,
@@ -3150,6 +3154,8 @@ fn makeArguments(
     appendOptionalAssignment(allocator, &argv, "HOSTCC", options.host_cc);
     appendOptionalAssignment(allocator, &argv, "HOSTCXX", options.host_cxx);
     appendOptionalAssignment(allocator, &argv, "HOSTCFLAGS", options.host_cflags);
+    if (options.ci_portable_config)
+        appendAssignment(allocator, &argv, "WAMR_CI_PORTABLE_CONFIG", "1");
 
     for (options.forwarded) |assignment| {
         argv.append(assignment) catch @panic("out of memory");
@@ -3321,6 +3327,13 @@ test "Make assignments remain single arguments" {
     for (expected, actual) |expected_argument, actual_argument| {
         try std.testing.expectEqualStrings(expected_argument, actual_argument);
     }
+    options.ci_portable_config = true;
+    var portable_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer portable_arena.deinit();
+    const portable = makeArguments(portable_arena.allocator(), "images", options);
+    try std.testing.expectEqual(actual.len + 1, portable.len);
+    try std.testing.expectEqualStrings("WAMR_CI_PORTABLE_CONFIG=1", portable[portable.len - 2]);
+    options.ci_portable_config = false;
     options.native_environment = .{
         .bison_data = "/native/share/bison",
         .m4 = "/native/bin/m4",

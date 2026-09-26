@@ -1905,6 +1905,14 @@ class Evidence(unittest.TestCase):
             }
 
         def command(runtime, expected, root, stage, args, *unused):
+            self.assertEqual(ci.COMMAND_ENVIRONMENT["WAMR_CI_PORTABLE_CONFIG"], "1")
+            self.assertEqual(os.environ["WAMR_CI_PORTABLE_CONFIG"], "1")
+            planned = {
+                item["name"]: item["value"]
+                for item in ci.production_command_contract(stage)["environment"]
+            }
+            self.assertEqual(
+                planned["WAMR_CI_PORTABLE_CONFIG"], ci.command_literal("1"))
             fixture_only = (
                 "WAMR_CI_PACKAGE",
                 "WAMR_CI_PYTHON",

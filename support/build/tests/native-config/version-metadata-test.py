@@ -3,8 +3,10 @@
 
 import argparse
 import importlib.util
+import os
 import subprocess
 from pathlib import Path
+from unittest import mock
 
 
 def arguments():
@@ -64,6 +66,40 @@ def fake_case(module, work_dir, name, extra, suffix, expected):
         )
 
 
+def config_path_defaults(module, base, work_dir):
+    args = argparse.Namespace(
+        image_name=None, exclude=[], external_library=[], external_platform=[],
+    )
+    app = work_dir / "separate-app"
+    config = base / "support/apps/wamr-aot/defconfig"
+    output = work_dir / "config-defaults"
+    for flag, defaults in (
+        (None, (str(base), str(app))),
+        ("1", ("/wamr-ci/source", "/wamr-ci/app")),
+    ):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("WAMR_CI_PORTABLE_CONFIG", None)
+            if flag is not None:
+                os.environ["WAMR_CI_PORTABLE_CONFIG"] = flag
+            module.configure_environment(
+                args, base, app, output, config, {"ARCH_X86_64": "y"},
+            )
+            actual = (os.environ["UK_CONFIG_BASE"], os.environ["UK_CONFIG_APP"])
+            if actual != defaults:
+                raise AssertionError(f"config path defaults differ: {actual!r}")
+            if (os.environ["UK_BASE"], os.environ["UK_APP"]) != (str(base), str(app)):
+                raise AssertionError("real Kconfig input paths changed")
+    with mock.patch.dict(os.environ, {"WAMR_CI_PORTABLE_CONFIG": "invalid"}):
+        try:
+            module.configure_environment(
+                args, base, app, output, config, {"ARCH_X86_64": "y"},
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid portable Kconfig selection accepted")
+
+
 def main():
     args = arguments()
     base = Path(args.base).resolve()
@@ -72,6 +108,7 @@ def main():
     work_dir.mkdir(parents=True, exist_ok=True)
 
     module = load_exporter(base)
+    config_path_defaults(module, base, work_dir)
     fake_case(module, work_dir, "release-clean", "0", "~abc123", "1.2.0~abc123")
     fake_case(
         module,

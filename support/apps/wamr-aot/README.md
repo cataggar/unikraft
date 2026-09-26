@@ -39,7 +39,12 @@ tool="$tool_root/bin/uk-wamr-aot-build"
 database into this application's ignored `build/wamr-source/`. It never
 builds in, changes, or inherits uncommitted files from the source checkout.
 It builds that revision's host `wamrc`, its freestanding library audit,
-then the integration archive. The tiny wasm is genuinely generated from
+then the integration archive. `prepare` requires `llvm-objcopy` to remove
+checkout-dependent debug sections, then checks the single Zig object member
+and uses pinned `zig ar` to repack it with a stable basename. The original
+archive's long-name table otherwise records an absolute, checkout-dependent
+cache path. These supervised commands retain linkable symbols and are included
+in the verified producer plan. The tiny wasm is genuinely generated from
 `fixture.zig` and compiled with `--target=x86_64
 --profile=unikraft-x86_64`. Hosted artifacts are not renamed or relabelled.
 Only trusted output of this pinned producer is admissible. The adapter installs
@@ -80,8 +85,11 @@ and storage/network-probe configurations are refused.
 
 `build/source-files.json` holds the sorted compact source-file byte-count/hash
 map, with one final LF. `build/artifacts/identity.json` is pretty schema 1 and
-retains source/tool/wasm/cwasm/library identities, exact command arrays and
-options. Its `prepare_source_sha256` hashes tracked `build-tool-prepare.zig`.
+retains source/wasm/cwasm/library identities, options and a verified command
+plan with portable `<app>`, `<source>`, `<zig>` and `<objcopy>` roles. The
+supervised physical commands and working directories remain in owner-private
+diagnostics; the image record separately pins tool bytes. Its
+`prepare_source_sha256` hashes tracked `build-tool-prepare.zig`.
 Make verifies the generated artifacts before compiling.
 `build/image-identity.json` is pretty schema 1 and binds complete EFI, debug
 ELF and bootinfo bytes, solved config, application/build-tool source hashes,
@@ -102,6 +110,13 @@ not publish a new success identity.
 directory. The existing native Make environment guard still validates it;
 an invalid override never falls back to ambient data. Hosted CI reuses the
 authenticated package-data acquisition rather than writable `/usr/share`.
+When `WAMR_CI_PORTABLE_CONFIG=1` is selected for paired CI, Make derives
+`HOSTUTC` from the verified source commit's UTC timestamp instead of each
+image build's wall clock. This keeps the loadable `.uk_libinfo` metadata
+reproducible across source worktrees without changing Kconfig or the
+application's ordinary build-time metadata. Portable builds also map the
+source checkout root to `/wamr-ci/source` in compiler DWARF paths, retaining
+debug information without embedding different worktree names.
 For supervised config and image builds, `WAMR_CI_EXECUTABLE_PATH` names the
 supervisor's physical installed executable. The producer binds its physical
 identity to the supervisor's retained descriptor and its bytes to the

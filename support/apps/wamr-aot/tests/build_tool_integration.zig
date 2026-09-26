@@ -186,6 +186,88 @@ test "native prepare and verify cover every variant with create-only output" {
     }
 }
 
+test "runtime identity is byte-identical across separate source roots" {
+    const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
+    defer allocator.free(cli);
+    const fixture = try std.Io.Dir.cwd().realPathFileAlloc(
+        io,
+        options.prepare_fixture,
+        allocator,
+    );
+    defer allocator.free(fixture);
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    try temporary.dir.setPermissions(io, .fromMode(0o700));
+    const archive = try sourceArchive(&temporary);
+    defer allocator.free(archive);
+    var first: ?[]u8 = null;
+    defer if (first) |bytes| allocator.free(bytes);
+    var first_raw_library: ?[]u8 = null;
+    defer if (first_raw_library) |bytes| allocator.free(bytes);
+    inline for (.{ "source-python", "source-native" }) |name| {
+        const repository = try fixtureRepository(&temporary, name);
+        defer allocator.free(repository);
+        var environment = try fixtureEnvironment(fixture);
+        defer environment.deinit();
+        try environment.put("WAMR_PREPARE_FIXTURE_ARCHIVE_PATH_DEPENDENT", "1");
+        const prepared = try runPrepare(
+            cli,
+            repository,
+            archive,
+            .{ .name = name },
+            &environment,
+        );
+        defer allocator.free(prepared.stdout);
+        defer allocator.free(prepared.stderr);
+        try expectExit(prepared.term, 0);
+        const verified = try runCli(
+            cli,
+            &.{ cli, "verify", "--repository", repository },
+            &environment,
+        );
+        defer allocator.free(verified.stdout);
+        defer allocator.free(verified.stderr);
+        try expectExit(verified.term, 0);
+        const raw_path = try std.fs.path.join(allocator, &.{
+            repository,
+            "support/apps/wamr-aot/build/workload-consumer/out/lib/libwamr-aot.a",
+        });
+        defer allocator.free(raw_path);
+        const raw_library = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            raw_path,
+            allocator,
+            .limited(1024 * 1024),
+        );
+        if (first_raw_library) |original| {
+            defer allocator.free(raw_library);
+            try testing.expect(!std.mem.eql(u8, original, raw_library));
+        } else {
+            first_raw_library = raw_library;
+        }
+        const identity_path = try std.fs.path.join(allocator, &.{
+            repository, "support/apps/wamr-aot/build/artifacts/identity.json",
+        });
+        defer allocator.free(identity_path);
+        const identity = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            identity_path,
+            allocator,
+            .limited(1024 * 1024),
+        );
+        try testing.expect(std.mem.indexOf(u8, identity, repository) == null);
+        try testing.expect(std.mem.indexOf(u8, identity, "\"<zig>\"") != null);
+        try testing.expect(std.mem.indexOf(u8, identity, "\"<objcopy>\"") != null);
+        try testing.expect(std.mem.indexOf(u8, identity, "\"<app>\"") != null);
+        if (first) |original| {
+            defer allocator.free(identity);
+            try testing.expect(std.mem.eql(u8, original, identity));
+        } else {
+            first = identity;
+        }
+    }
+}
+
 test "prepare failures retain private diagnostics without a success identity" {
     const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
     defer allocator.free(cli);
@@ -203,6 +285,11 @@ test "prepare failures retain private diagnostics without a success identity" {
 
     inline for (.{
         .{ "child-failure", "workload-build", false },
+        .{ "runtime-strip-failure", "runtime-strip", false },
+        .{ "runtime-members-failure", "runtime-archive-members", false },
+        .{ "runtime-extract-failure", "runtime-archive-extract", false },
+        .{ "runtime-repack-failure", "runtime-archive-repack", false },
+        .{ "runtime-member-invalid", "", false },
         .{ "matched-mismatch", "", true },
     }) |case| {
         const repository = try fixtureRepository(&temporary, case[0]);
@@ -213,6 +300,8 @@ test "prepare failures retain private diagnostics without a success identity" {
             try environment.put("WAMR_PREPARE_FIXTURE_FAIL", case[1]);
         if (case[2])
             try environment.put("WAMR_PREPARE_FIXTURE_MISMATCH", "1");
+        if (std.mem.eql(u8, case[0], "runtime-member-invalid"))
+            try environment.put("WAMR_PREPARE_FIXTURE_INVALID_MEMBER", "1");
         const result = try runPrepare(
             cli,
             repository,
@@ -223,6 +312,11 @@ test "prepare failures retain private diagnostics without a success identity" {
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
         try expectExit(result.term, 2);
+        if (std.mem.startsWith(u8, case[1], "runtime-"))
+            try testing.expectEqualStrings(
+                "wamr_aot_build_failed category=command_failed\n",
+                result.stderr,
+            );
         const identity_path = try std.fs.path.join(
             allocator,
             &.{ repository, "support/apps/wamr-aot/build/artifacts/identity.json" },
@@ -333,6 +427,62 @@ test "development checkout selection is explicit and cannot masquerade as suppor
     defer allocator.free(verified.stdout);
     defer allocator.free(verified.stderr);
     try expectExit(verified.term, 0);
+}
+
+test "portable CI config reaches only opted-in image builds" {
+    const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
+    defer allocator.free(cli);
+    const fixture = try std.Io.Dir.cwd().realPathFileAlloc(io, options.image_fixture, allocator);
+    defer allocator.free(fixture);
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    try temporary.dir.setPermissions(io, .fromMode(0o700));
+    const repository = try imageRepository(&temporary, "image");
+    defer allocator.free(repository);
+    try temporary.dir.createDir(io, "bison-data", .fromMode(0o700));
+    const bison_data = try temporary.dir.realPathFileAlloc(io, "bison-data", allocator);
+    defer allocator.free(bison_data);
+    const log = try temporary.dir.createFile(io, "image.log", .{
+        .exclusive = true,
+        .permissions = .fromMode(0o600),
+    });
+    log.close(io);
+    const log_path = try temporary.dir.realPathFileAlloc(io, "image.log", allocator);
+    defer allocator.free(log_path);
+    var environment = try imageEnvironment(fixture, bison_data, log_path);
+    defer environment.deinit();
+    try environment.put("WAMR_CI_EXECUTABLE_PATH", cli);
+
+    const argv = &.{ cli, "olddefconfig", "--repository", repository };
+    const ordinary = try runCli(cli, argv, &environment);
+    defer allocator.free(ordinary.stdout);
+    defer allocator.free(ordinary.stderr);
+    try expectExit(ordinary.term, 0);
+    const ordinary_log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(ordinary_log);
+    try testing.expect(std.mem.indexOf(u8, ordinary_log, "-Dci-portable-config=true") == null);
+
+    try environment.put("WAMR_CI_PORTABLE_CONFIG", "1");
+    const portable = try runCli(cli, argv, &environment);
+    defer allocator.free(portable.stdout);
+    defer allocator.free(portable.stderr);
+    try expectExit(portable.term, 0);
+    const portable_log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(portable_log);
+    try testing.expect(std.mem.indexOf(u8, portable_log, "\t-Dci-portable-config=true\t") != null);
+
+    try environment.put("WAMR_CI_PORTABLE_CONFIG", "invalid");
+    const invalid = try runCli(cli, argv, &environment);
+    defer allocator.free(invalid.stdout);
+    defer allocator.free(invalid.stderr);
+    try testing.expect(invalid.term == .exited and invalid.term.exited != 0);
+    const failure_path = try std.fs.path.join(allocator, &.{
+        repository, "support/apps/wamr-aot/build/native-environment/failure-error-name.txt",
+    });
+    defer allocator.free(failure_path);
+    const failure = try std.Io.Dir.cwd().readFileAlloc(io, failure_path, allocator, .limited(128));
+    defer allocator.free(failure);
+    try testing.expectEqualStrings("InvalidPortableConfig", failure);
 }
 
 test "native image commands preserve config plans identities and failed publication" {
@@ -1231,6 +1381,7 @@ fn fixtureEnvironment(fixture: []const u8) !std.process.Environ.Map {
     var environment = std.process.Environ.Map.init(allocator);
     errdefer environment.deinit();
     try environment.put("WAMR_CI_TOOL_ZIG", fixture);
+    try environment.put("WAMR_CI_TOOL_LLVM_OBJCOPY", fixture);
     try environment.put("ZIG_LIB_DIR", options.zig_lib_dir);
     try environment.put("PATH", "/usr/bin:/bin");
     return environment;
@@ -1450,6 +1601,10 @@ fn tamperRefusals(
         .{ "\"schema_version\": 1", "\"schema_version\": 2" },
         .{ "\"variant\": \"tiny\"", "\"variant\": \"xxxx\"" },
         .{ "\"-j2\"", "\"-j3\"" },
+        .{ "\"<zig>\"", "\"zig\"" },
+        .{ "\"<objcopy>\"", "\"objcopy\"" },
+        .{ "\"rcsD\"", "\"rcsU\"" },
+        .{ "\"<app>/build/scratch/libwamr-aot.stripped.a\"", "\"<app>/build/scratch/other.a\"" },
         .{ "\"-fPIC\"", "\"-fBAD\"" },
         .{ "\"wamrc\":", "\"../x?\":" },
     }) |mutation| {

@@ -13,7 +13,7 @@ permissions:
 jobs:
   wamr-native-compute:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 180
     outputs:
       inner-zip-sha256: ${{ steps.public_binding.outputs.inner_zip_sha256 }}
       inner-zip-bytes: ${{ steps.public_binding.outputs.inner_zip_bytes }}
@@ -90,7 +90,7 @@ jobs:
           ghr-version: v0.8.0
           tools: cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
-      - name: Exercise native controller and package-boot fixtures in an isolated x86 worktree
+      - name: Exercise native controller, custody limits, and package-boot fixtures in an isolated x86 worktree
         timeout-minutes: 15
         run: |
           set -euo pipefail
@@ -101,13 +101,36 @@ jobs:
           trap cleanup EXIT
           mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-controller-fixture-cache"
           mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-controller-pipeline-root"
-          ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
+          if ! ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
             zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
-            -Doptimize=ReleaseSafe -j2 test-controller
+            -Doptimize=ReleaseSafe -j2 test-controller; then
+            if ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
+              zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
+              -Doptimize=ReleaseSafe -j1 test-controller-direct; then
+              echo "Direct controller diagnostic passed after the gate failed" >&2
+            else
+              echo "Direct controller diagnostic also failed" >&2
+            fi
+            exit 1
+          fi
           ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
             zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
             -Doptimize=ReleaseSafe -Dtest-root="${RUNNER_TEMP}/wamr-controller-pipeline-root" \
             -j2 test-pipeline
+          (
+            cd "${source_root}"
+            PYTHONDONTWRITEBYTECODE=1 \
+              PYTHONPATH="${source_root}/support/build/wamr-native-ci/tests:${source_root}/support/build/wamr-native-ci" \
+              python3 -B -m unittest -q test_differential_parity.DeterministicContracts
+          )
+          controller_root=/d/wamr-ci/wamr-differential-controller
+          test ! -e "${controller_root}"
+          mkdir -m 0700 -- "${controller_root}"
+          ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
+            zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
+              -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=ReleaseSafe \
+              -Dcontroller-runtime="${controller_root}" -j2 install-controller
+          test -x "${controller_root}/controller/bin/uk-wamr-native-ci"
 
       - name: Record the runner CPU and portable executable target
         run: |
@@ -189,8 +212,8 @@ jobs:
           python3 support/build/wamr-native-ci/run.py build --runtime "${root}" \
             --wamr-source "${GITHUB_WORKSPACE}/.d/wamr-source"
 
-      - name: Run raw QCOW2 and derived fixed VHD under both APIC configurations
-        timeout-minutes: 15
+      - name: Run six Python boots and paired native success in the managed KVM process
+        timeout-minutes: 150
         env:
           QUALIFICATION_REPOSITORY_ID: ${{ github.repository_id }}
           QUALIFICATION_SOURCE_JOB: wamr-native-compute
@@ -579,3 +602,136 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
+
+  wamr-differential-parity:
+    needs: wamr-native-compute
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [build-start-tamper, missing-build, occupied-boot-slot, prior-build-output]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: cataggar/wamr
+          ref: a53205d77be3b880eb8f8b96679512ba58e2331a
+          path: .d/wamr-source
+          persist-credentials: false
+
+      - name: Check the x86 KVM runner and build prerequisites
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          test -c /dev/kvm
+          sudo install -d -o root -g root -m 755 /d
+          sudo install -d -o "$(id -u)" -g "$(id -g)" -m 700 /d/wamr-ci
+          export PATH="/usr/bin:/bin:${PATH}"
+          if ! (
+            for name in bash make bison yacc flex lex m4 python3 getfacl; do
+              test -x "/usr/bin/${name}" || exit 1
+            done
+            test -r /usr/share/OVMF/OVMF_CODE_4M.fd
+            test -r /usr/share/OVMF/OVMF_VARS_4M.fd
+          ); then
+            sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources \
+              -o Dir::Etc::sourceparts=- update -qq
+            sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources \
+              -o Dir::Etc::sourceparts=- install -y --no-install-recommends \
+              make bison flex m4 python3 acl ovmf
+          fi
+          mkdir -p .d
+
+      - name: Set up the pinned native downloader
+        uses: cataggar/ghr/actions/setup@114926d37d3825e63bede2ccc7ce56b67eda7495
+        with:
+          ghr-version: v0.8.0
+          cache: 'false'
+
+      - name: Acquire the pinned QEMU runtime and private Bison data
+        run: |
+          set -euo pipefail
+          bash .github/scripts/hyperv-native-qemu-acquire.sh /d/wamr-ci/wamr-native-runtime
+          export PATH="/usr/bin:/bin:${PATH}"
+          bash .github/scripts/hyperv-native-bison-acquire.sh /d/wamr-ci/wamr-native-runtime
+
+      - name: Install the pinned Zig compiler
+        uses: cataggar/ghr/actions/install@114926d37d3825e63bede2ccc7ce56b67eda7495
+        with:
+          ghr-version: v0.8.0
+          tools: cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Acquire the pinned LLVM distribution
+        uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495
+        with:
+          ghr-version: v0.8.0
+          tools: cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
+          dest: /d/wamr-ci/wamr-native-runtime/llvm
+          extract: 'true'
+          strip-components: '1'
+          cache: 'false'
+
+      - name: Install the portable controller and complete private runtime inputs
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          umask 077
+          root=/d/wamr-ci/wamr-native-runtime
+          zig_source="$(dirname "$(readlink -f "$(command -v zig)")")"
+          zig_dir=/d/wamr-ci/wamr-native-tools/zig-0.16.0
+          test ! -e "${zig_dir}"
+          mkdir -p -m 700 "${zig_dir}"
+          cp -a -- "${zig_source}/." "${zig_dir}/"
+          chmod -R u=rwX,go= "${zig_dir}"
+          mkdir -m 700 "${root}/firmware"
+          cp --no-preserve=mode,ownership \
+            "$(readlink -f /usr/share/OVMF/OVMF_CODE_4M.fd)" "${root}/firmware/code.fd"
+          cp --no-preserve=mode,ownership \
+            "$(readlink -f /usr/share/OVMF/OVMF_VARS_4M.fd)" "${root}/firmware/vars.fd"
+          for name in llvm-readelf llvm-strip; do
+            alias="${root}/llvm/bin/${name}"
+            target="$(readlink -f "${alias}")"
+            test -f "${target}"
+            temporary="${alias}.materialized"
+            test ! -e "${temporary}"
+            cp --no-preserve=mode,ownership -- "${target}" "${temporary}"
+            chmod 500 "${temporary}"
+            rm -- "${alias}"
+            mv -- "${temporary}" "${alias}"
+          done
+          export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
+          controller_root=/d/wamr-ci/wamr-differential-controller
+          test ! -e "${controller_root}"
+          mkdir -m 0700 -- "${controller_root}"
+          mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-differential-controller-cache"
+          ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-differential-controller-cache" \
+            zig build --build-file support/build/wamr-native-ci/build.zig \
+              -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=ReleaseSafe \
+              -Dcontroller-runtime="${controller_root}" -j2 install-controller
+          test -x "${controller_root}/controller/bin/uk-wamr-native-ci"
+
+      - name: Compare paired real fault outcomes with managed KVM
+        timeout-minutes: 150
+        env:
+          QUALIFICATION_REPOSITORY_ID: ${{ github.repository_id }}
+          QUALIFICATION_SOURCE_JOB: wamr-differential-parity
+          DIFFERENTIAL_CASE: ${{ matrix.case }}
+        run: |
+          set -euo pipefail
+          root=/d/wamr-ci/wamr-native-runtime
+          zig_dir="$(dirname "$(readlink -f "$(command -v zig)")")"
+          export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
+          bash .github/scripts/hyperv-qemu-candidate-runtime.sh \
+            "${root}" differential "${DIFFERENTIAL_CASE}"
+
+      - name: Remove only the managed QEMU dynamic runtime
+        if: always()
+        run: |
+          bash .github/scripts/hyperv-native-libfdt-cleanup.sh /d/wamr-ci/wamr-native-runtime
