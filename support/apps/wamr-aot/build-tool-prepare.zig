@@ -161,6 +161,7 @@ pub fn jitModeName(mode: ?contract.JitMode) ?[]const u8 {
 }
 
 const CommandRecord = struct {
+    stage: Stage,
     argv: []const []const u8,
     cwd: []const u8,
 };
@@ -171,6 +172,7 @@ const Stage = enum {
     git_archive,
     runtime_build,
     compiler_build,
+    runtime_strip,
     snapshot_compute,
     snapshot_memory,
     matched_wasm,
@@ -188,6 +190,7 @@ const Stage = enum {
             .git_archive => "git-archive",
             .runtime_build => "runtime-build",
             .compiler_build => "compiler-build",
+            .runtime_strip => "runtime-strip",
             .snapshot_compute => "snapshot-compute",
             .snapshot_memory => "snapshot-memory",
             .matched_wasm => "matched-wasm",
@@ -308,6 +311,7 @@ const Runner = struct {
         for (argv, 0..) |argument, index|
             recorded_argv[index] = try self.record_allocator.dupe(u8, argument);
         try self.commands.append(self.record_allocator, .{
+            .stage = stage,
             .argv = recorded_argv,
             .cwd = try self.record_allocator.dupe(u8, cwd_path),
         });
@@ -396,6 +400,8 @@ fn prepareRepository(
 
     var zig = try contract.process.resolveTool(allocator, io, inherited, "zig");
     defer zig.close(allocator, io);
+    var objcopy = try contract.process.resolveTool(allocator, io, inherited, "llvm-objcopy");
+    defer objcopy.close(allocator, io);
     try configureZigLibrary(allocator, io, zig.path, &build_environment);
     {
         var version = try runner.run(
@@ -518,6 +524,7 @@ fn prepareRepository(
         arguments.coremark,
         &runner,
         zig,
+        objcopy,
         artifacts,
     );
     try buildTinyAndCoremark(
@@ -556,6 +563,8 @@ fn prepareRepository(
         revision,
         source_identity.sha256[0..],
         runner.commands.items,
+        zig.path,
+        objcopy.path,
     );
     defer allocator.free(identity_bytes);
     try contract.files.writePrivateCreate(
@@ -650,6 +659,7 @@ fn buildWorkload(
     coremark: bool,
     runner: *Runner,
     zig: contract.process.Tool,
+    objcopy: contract.process.Tool,
     artifacts: std.Io.Dir,
 ) !void {
     const build = try contract.files.PrivateDirectory.open(io, build_path);
@@ -826,10 +836,27 @@ fn buildWorkload(
             &(try digestAbsolute(io, selected, maximum_artifact_bytes)),
         )) return error.MatchedWorkloadMismatch;
     }
+    const library = try std.fs.path.join(a, &.{ output, "lib", "libwamr-aot.a" });
+    const stripped = try std.fs.path.join(
+        a,
+        &.{ build_path, "scratch", "libwamr-aot.stripped.a" },
+    );
+    {
+        var result = try runner.run(
+            objcopy,
+            .runtime_strip,
+            &.{ objcopy.path, "--strip-debug", library, stripped },
+            work.dir,
+            work.path,
+            true,
+            null,
+        );
+        defer result.deinit(allocator);
+    }
     try copyAbsoluteFile(
         allocator,
         io,
-        try std.fs.path.join(a, &.{ output, "lib", "libwamr-aot.a" }),
+        stripped,
         artifacts,
         "libwamr-aot.a",
         0o600,
@@ -1050,6 +1077,8 @@ fn identityManifestAlloc(
     revision: []const u8,
     source_tree_sha256: []const u8,
     commands: []const CommandRecord,
+    zig_path: []const u8,
+    objcopy_path: []const u8,
 ) ![]u8 {
     var artifact_identities: std.ArrayList(ArtifactIdentity) = .empty;
     defer artifact_identities.deinit(allocator);
@@ -1130,7 +1159,7 @@ fn identityManifestAlloc(
     try jsonFieldName(&raw.writer, "compiler_runtime_provider", true);
     try contract.json.writeString(&raw.writer, contract.compiler_runtime_provider);
     try jsonFieldName(&raw.writer, "commands", true);
-    try writeCommands(&raw.writer, commands);
+    try writeCommands(a, &raw.writer, commands, repository.app.path, zig_path, objcopy_path);
     try jsonFieldName(&raw.writer, "compiler_options", true);
     try writeStringArray(&raw.writer, &.{ "optimize=ReleaseSafe", "strip=true" });
     try jsonFieldName(&raw.writer, "minimal_wasi", true);
@@ -1373,14 +1402,7 @@ fn verifyIdentityBytes(
         return error.UnsupportedProducerIdentity;
     }
 
-    try verifyCommands(
-        allocator,
-        identity,
-        repository.app.path,
-        work_path,
-        artifacts_path,
-        try std.fs.path.join(allocator, &.{ build_path, "workload-consumer" }),
-    );
+    try verifyCommands(allocator, identity);
     try verifyGeneratedContracts(allocator, io, identity, artifacts_path);
 }
 
@@ -1702,19 +1724,18 @@ fn verifyGeneratedContracts(
 fn verifyCommands(
     allocator: std.mem.Allocator,
     identity: IdentityView,
-    app_path: []const u8,
-    work_path: []const u8,
-    artifacts_path: []const u8,
-    consumer_path: []u8,
 ) !void {
-    defer allocator.free(consumer_path);
+    const app_path = "<app>";
+    const work_path = "<app>/build/wamr-source";
+    const artifacts_path = "<app>/build/artifacts";
+    const consumer_path = "<app>/build/workload-consumer";
     if (identity.commands.items.len == 0) return error.InvalidCommandPlan;
     var index: usize = 0;
     const first = try jsonCommand(identity.commands.items[index]);
     index += 1;
     const first_argv = first.argv();
     if (first_argv.len != 2 or !std.mem.eql(u8, first_argv[1], "version") or
-        !std.fs.path.isAbsolute(first_argv[0]) or !std.mem.eql(u8, first.cwd, app_path))
+        !std.mem.eql(u8, first_argv[0], "<zig>") or !std.mem.eql(u8, first.cwd, app_path))
         return error.InvalidCommandPlan;
     const zig = first_argv[0];
     if (index < identity.commands.items.len) {
@@ -1732,7 +1753,8 @@ fn verifyCommands(
                 &.{ "git", "rev-parse", revision_spec },
                 candidate.cwd,
             );
-            try contract.absolute(candidate.cwd);
+            if (!std.mem.eql(u8, candidate.cwd, "<source>"))
+                return error.InvalidCommandPlan;
             index += 1;
             if (index >= identity.commands.items.len) return error.InvalidCommandPlan;
             try expectCommand(
@@ -1846,6 +1868,21 @@ fn verifyCommands(
         "--prefix",
         output,
     }, consumer_path);
+    const library = try std.fs.path.join(allocator, &.{ output, "lib", "libwamr-aot.a" });
+    defer allocator.free(library);
+    const stripped = try std.fs.path.join(
+        allocator,
+        &.{ build_path, "scratch", "libwamr-aot.stripped.a" },
+    );
+    defer allocator.free(stripped);
+    if (index >= identity.commands.items.len) return error.InvalidCommandPlan;
+    const strip = try jsonCommand(identity.commands.items[index]);
+    const strip_argv = strip.argv();
+    if (strip_argv.len != 4 or !std.mem.eql(u8, strip_argv[0], "<objcopy>"))
+        return error.InvalidCommandPlan;
+    try nextCommand(identity.commands.items, &index, &.{
+        strip_argv[0], "--strip-debug", library, stripped,
+    }, work_path);
     const fixture = try std.fs.path.join(allocator, &.{ app_path, "fixture.zig" });
     defer allocator.free(fixture);
     const tiny = try std.fs.path.join(allocator, &.{ artifacts_path, "tiny.wasm" });
@@ -2205,14 +2242,79 @@ fn writeStringArray(writer: *std.Io.Writer, values: []const []const u8) !void {
     try writer.writeByte(']');
 }
 
-fn writeCommands(writer: *std.Io.Writer, commands: []const CommandRecord) !void {
+fn portableAppPath(
+    allocator: std.mem.Allocator,
+    value: []const u8,
+    app_path: []const u8,
+) !?[]const u8 {
+    if (!std.mem.startsWith(u8, value, app_path) or
+        (value.len != app_path.len and value[app_path.len] != '/'))
+        return null;
+    const portable: []const u8 = try std.fmt.allocPrint(
+        allocator, "<app>{s}", .{value[app_path.len..]},
+    );
+    return portable;
+}
+
+fn portableCommandValue(
+    allocator: std.mem.Allocator,
+    value: []const u8,
+    app_path: []const u8,
+) ![]const u8 {
+    if (try portableAppPath(allocator, value, app_path)) |portable| return portable;
+    if (std.mem.indexOfScalar(u8, value, '=')) |separator| {
+        if (try portableAppPath(allocator, value[separator + 1 ..], app_path)) |portable|
+            return std.fmt.allocPrint(allocator, "{s}={s}", .{ value[0..separator], portable });
+    }
+    return value;
+}
+
+fn writeCommands(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    commands: []const CommandRecord,
+    app_path: []const u8,
+    zig_path: []const u8,
+    objcopy_path: []const u8,
+) !void {
+    const compiler_path = try std.fs.path.join(
+        allocator, &.{ app_path, "build", "artifacts", "wamrc" },
+    );
     try writer.writeByte('[');
     for (commands, 0..) |command, index| {
         if (index != 0) try writer.writeByte(',');
         try writer.writeAll("{\"argv\":");
-        try writeStringArray(writer, command.argv);
+        try writer.writeByte('[');
+        for (command.argv, 0..) |argument, argument_index| {
+            if (argument_index != 0) try writer.writeByte(',');
+            const portable = if (argument_index == 0) tool: {
+                const expected = switch (command.stage) {
+                    .git_revision, .git_archive => "git",
+                    .runtime_strip => objcopy_path,
+                    .snapshot_compute, .snapshot_memory, .matched_aot, .tiny_aot,
+                    .coremark_aot, .coremark_nofp_aot => compiler_path,
+                    else => zig_path,
+                };
+                if (!std.mem.eql(u8, argument, expected)) return error.InvalidCommandPlan;
+                break :tool switch (command.stage) {
+                    .git_revision, .git_archive => "git",
+                    .runtime_strip => "<objcopy>",
+                    .snapshot_compute, .snapshot_memory, .matched_aot, .tiny_aot,
+                    .coremark_aot, .coremark_nofp_aot => "<app>/build/artifacts/wamrc",
+                    else => "<zig>",
+                };
+            } else try portableCommandValue(allocator, argument, app_path);
+            try contract.json.writeString(writer, portable);
+        }
+        try writer.writeByte(']');
         try writer.writeAll(",\"cwd\":");
-        try contract.json.writeString(writer, command.cwd);
+        try contract.json.writeString(
+            writer,
+            if (command.stage == .git_revision or command.stage == .git_archive)
+                "<source>"
+            else
+                try portableCommandValue(allocator, command.cwd, app_path),
+        );
         try writer.writeByte('}');
     }
     try writer.writeByte(']');
@@ -2361,6 +2463,7 @@ fn commandFailure(stage: Stage) anyerror {
         .git_archive => error.GitArchiveCommandFailed,
         .runtime_build => error.RuntimeBuildCommandFailed,
         .compiler_build => error.CompilerBuildCommandFailed,
+        .runtime_strip => error.RuntimeStripCommandFailed,
         .snapshot_compute => error.SnapshotComputeCommandFailed,
         .snapshot_memory => error.SnapshotMemoryCommandFailed,
         .matched_wasm => error.MatchedWasmCommandFailed,

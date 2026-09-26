@@ -15,6 +15,14 @@ fn run(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const arguments = try init.minimal.args.toSlice(allocator);
     try recordEnvironment(init, allocator, arguments);
+    if (arguments.len == 4 and std.mem.eql(u8, arguments[1], "--strip-debug")) {
+        try failIfSelected(init, "runtime-strip");
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(
+            init.io, arguments[2], allocator, .limited(1024 * 1024),
+        );
+        try writeFile(init.io, arguments[3], bytes, 0o600);
+        return;
+    }
     if (arguments.len >= 2 and std.mem.eql(u8, arguments[1], "version")) {
         try failIfSelected(init, "version");
         var stdout = std.Io.File.stdout().writer(init.io, &.{});
@@ -120,6 +128,8 @@ fn recordEnvironment(
 }
 
 fn stageName(arguments: []const []const u8) []const u8 {
+    if (arguments.len >= 2 and std.mem.eql(u8, arguments[1], "--strip-debug"))
+        return "runtime-strip";
     if (arguments.len >= 2 and std.mem.eql(u8, arguments[1], "version"))
         return "version";
     if (arguments.len >= 2 and std.mem.eql(u8, arguments[1], "compile"))

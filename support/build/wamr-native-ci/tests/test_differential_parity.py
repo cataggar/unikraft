@@ -1091,6 +1091,52 @@ def source_root_only_config(left, right):
     return normalized[0] == normalized[1]
 
 
+RUNTIME_FILE_ROLES = {
+    "embedded.c": "embedded",
+    "identity.h": "identity",
+    "libwamr-aot.a": "library",
+    "tiny.cwasm": "aot",
+    "tiny.wasm": "wasm",
+    "wamr_aot.h": "header",
+    "wamrc": "compiler",
+}
+
+
+def runtime_input_differences(left, right):
+    identities = []
+    for side in (left, right):
+        repository = side["roots"][1]
+        raw = checked_file(
+            repository / "support/apps/wamr-aot/build/artifacts/identity.json",
+            4 * 1024 * 1024)
+        committed = side["files"]["records"]["build.json"][1]["image"][
+            "runtime_inputs_sha256"]
+        check(sha(raw) == committed, "runtime identity changed during comparison")
+        identity = json.loads(raw)
+        check(isinstance(identity, dict) and identity.get("schema_version") == 1
+              and identity.get("variant") == "tiny"
+              and isinstance(identity.get("files"), dict)
+              and identity["files"].keys() == RUNTIME_FILE_ROLES.keys()
+              and isinstance(identity.get("commands"), list),
+              "runtime identity diagnostic shape changed")
+        identities.append(identity)
+    first, second = identities
+    failures = [
+        "record_content:build.json.image.runtime_inputs.files." + role
+        for name, role in RUNTIME_FILE_ROLES.items()
+        if first["files"][name] != second["files"][name]
+    ]
+    if first["commands"] != second["commands"]:
+        failures.append("record_content:build.json.image.runtime_inputs.commands")
+    first_metadata = {key: value for key, value in first.items()
+                      if key not in ("files", "commands")}
+    second_metadata = {key: value for key, value in second.items()
+                       if key not in ("files", "commands")}
+    if first_metadata != second_metadata:
+        failures.append("record_content:build.json.image.runtime_inputs.metadata")
+    return failures or ["record_content:build.json.image.runtime_inputs.bytes"]
+
+
 def build_image_differences(left, right):
     first = left["files"]["records"]["build.json"][1]["image"]
     second = right["files"]["records"]["build.json"][1]["image"]
@@ -1102,6 +1148,8 @@ def build_image_differences(left, right):
         check(field in first, "missing build image field")
         if first[field] != second[field]:
             failures.append("record_content:build.json.image." + field)
+            if field == "runtime_inputs_sha256":
+                failures.extend(runtime_input_differences(left, right))
     files = (left["reference"].EFI, left["reference"].EFI + ".dbg",
              left["reference"].EFI + ".bootinfo")
     check(right["reference"].EFI == files[0]
@@ -2153,6 +2201,41 @@ class DeterministicContracts(unittest.TestCase):
         del changed_image["files"][reference.EFI]
         with self.assertRaisesRegex(ParityError, "file membership"):
             build_image_differences(original, changed)
+
+    def test_runtime_input_diagnostics_name_only_fixed_roles(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            observations = []
+            for side in ("python", "native"):
+                repository = Path(scratch) / side
+                identity_path = (repository /
+                    "support/apps/wamr-aot/build/artifacts/identity.json")
+                identity_path.parent.mkdir(parents=True)
+                files = {name: "a" * 64 for name in RUNTIME_FILE_ROLES}
+                if side == "native":
+                    files["libwamr-aot.a"] = "b" * 64
+                    files["identity.h"] = "c" * 64
+                identity_path.write_text(json.dumps({
+                    "variant": "tiny", "files": files,
+                    "commands": [{"argv": [side], "cwd": side}],
+                    "schema_version": 1,
+                }) + "\n")
+                identity_path.chmod(0o600)
+                observations.append({
+                    "roots": (Path(scratch), repository),
+                    "files": {"records": {"build.json": (b"", {
+                        "image": {"runtime_inputs_sha256":
+                                  sha(identity_path.read_bytes())}})}},
+                })
+            expected = [
+                "record_content:build.json.image.runtime_inputs.files.identity",
+                "record_content:build.json.image.runtime_inputs.files.library",
+                "record_content:build.json.image.runtime_inputs.commands",
+            ]
+            self.assertEqual(runtime_input_differences(*observations), expected)
+            identity_path.write_text("{}\n")
+            with self.assertRaisesRegex(
+                    ParityError, "runtime identity changed during comparison"):
+                runtime_input_differences(*observations)
 
     def test_config_source_root_diagnostic_does_not_normalize_artifact_parity(self):
         with tempfile.TemporaryDirectory() as scratch:

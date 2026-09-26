@@ -186,6 +186,57 @@ test "native prepare and verify cover every variant with create-only output" {
     }
 }
 
+test "runtime identity is byte-identical across separate source roots" {
+    const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
+    defer allocator.free(cli);
+    const fixture = try std.Io.Dir.cwd().realPathFileAlloc(
+        io, options.prepare_fixture, allocator,
+    );
+    defer allocator.free(fixture);
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    try temporary.dir.setPermissions(io, .fromMode(0o700));
+    const archive = try sourceArchive(&temporary);
+    defer allocator.free(archive);
+    var first: ?[]u8 = null;
+    defer if (first) |bytes| allocator.free(bytes);
+    inline for (.{ "source-python", "source-native" }) |name| {
+        const repository = try fixtureRepository(&temporary, name);
+        defer allocator.free(repository);
+        var environment = try fixtureEnvironment(fixture);
+        defer environment.deinit();
+        const prepared = try runPrepare(
+            cli, repository, archive, .{ .name = name }, &environment,
+        );
+        defer allocator.free(prepared.stdout);
+        defer allocator.free(prepared.stderr);
+        try expectExit(prepared.term, 0);
+        const verified = try runCli(
+            cli, &.{ cli, "verify", "--repository", repository }, &environment,
+        );
+        defer allocator.free(verified.stdout);
+        defer allocator.free(verified.stderr);
+        try expectExit(verified.term, 0);
+        const identity_path = try std.fs.path.join(allocator, &.{
+            repository, "support/apps/wamr-aot/build/artifacts/identity.json",
+        });
+        defer allocator.free(identity_path);
+        const identity = try std.Io.Dir.cwd().readFileAlloc(
+            io, identity_path, allocator, .limited(1024 * 1024),
+        );
+        try testing.expect(std.mem.indexOf(u8, identity, repository) == null);
+        try testing.expect(std.mem.indexOf(u8, identity, "\"<zig>\"") != null);
+        try testing.expect(std.mem.indexOf(u8, identity, "\"<objcopy>\"") != null);
+        try testing.expect(std.mem.indexOf(u8, identity, "\"<app>\"") != null);
+        if (first) |original| {
+            defer allocator.free(identity);
+            try testing.expect(std.mem.eql(u8, original, identity));
+        } else {
+            first = identity;
+        }
+    }
+}
+
 test "prepare failures retain private diagnostics without a success identity" {
     const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
     defer allocator.free(cli);
@@ -203,6 +254,7 @@ test "prepare failures retain private diagnostics without a success identity" {
 
     inline for (.{
         .{ "child-failure", "workload-build", false },
+        .{ "runtime-strip-failure", "runtime-strip", false },
         .{ "matched-mismatch", "", true },
     }) |case| {
         const repository = try fixtureRepository(&temporary, case[0]);
@@ -223,6 +275,11 @@ test "prepare failures retain private diagnostics without a success identity" {
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
         try expectExit(result.term, 2);
+        if (std.mem.eql(u8, case[1], "runtime-strip"))
+            try testing.expectEqualStrings(
+                "wamr_aot_build_failed category=command_failed\n",
+                result.stderr,
+            );
         const identity_path = try std.fs.path.join(
             allocator,
             &.{ repository, "support/apps/wamr-aot/build/artifacts/identity.json" },
@@ -1287,6 +1344,7 @@ fn fixtureEnvironment(fixture: []const u8) !std.process.Environ.Map {
     var environment = std.process.Environ.Map.init(allocator);
     errdefer environment.deinit();
     try environment.put("WAMR_CI_TOOL_ZIG", fixture);
+    try environment.put("WAMR_CI_TOOL_LLVM_OBJCOPY", fixture);
     try environment.put("ZIG_LIB_DIR", options.zig_lib_dir);
     try environment.put("PATH", "/usr/bin:/bin");
     return environment;
@@ -1506,6 +1564,10 @@ fn tamperRefusals(
         .{ "\"schema_version\": 1", "\"schema_version\": 2" },
         .{ "\"variant\": \"tiny\"", "\"variant\": \"xxxx\"" },
         .{ "\"-j2\"", "\"-j3\"" },
+        .{ "\"<zig>\"", "\"zig\"" },
+        .{ "\"<objcopy>\"", "\"objcopy\"" },
+        .{ "\"<app>/build/scratch/libwamr-aot.stripped.a\"",
+            "\"<app>/build/scratch/other.a\"" },
         .{ "\"-fPIC\"", "\"-fBAD\"" },
         .{ "\"wamrc\":", "\"../x?\":" },
     }) |mutation| {

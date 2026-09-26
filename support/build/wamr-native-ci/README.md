@@ -642,8 +642,12 @@ bytes for strict paired tool and boot-input custody. The pinned upstream WAMR
 compiler is also built with its supported `-Dstrip=true` option: otherwise its
 debug sections change the compiler and generated runtime-identity bytes across
 the two source roots, even when the compiled workload is identical.
-Only paired CI sets `WAMR_CI_PORTABLE_CONFIG=1` for the Python and native
-build commands. The native image builder forwards it to the root Zig facade,
+The native static runtime archive is passed through the pinned LLVM objcopy
+`--strip-debug` in a supervised, recorded producer command before publication;
+its separately built ELF members otherwise retain checkout-dependent DWARF
+strings and line tables. Symbols and relocations required for linking remain.
+The CI production build commands set `WAMR_CI_PORTABLE_CONFIG=1` for the Python
+and native controllers. The native image builder forwards it to the root Zig facade,
 which gives both Kconfig solvers the same inert defaults for `CONFIG_UK_BASE`
 and `CONFIG_UK_APP`; Make still uses the actual checkout and application paths
 for source discovery and compilation. Ordinary builds retain their path
@@ -658,7 +662,10 @@ changed size, hash or mode field; a config hash mismatch is additionally marked
 when rechecked config bytes differ only by the source-root path, without
 normalizing acceptance. A changed build image record also identifies only
 fixed config, input, tool or image-file roles, without exposing their values
-or relaxing the byte comparison. Private command logs remain local.
+or relaxing the byte comparison. A differing runtime identity is diagnosed
+using only fixed artifact roles and whether its commands or other metadata
+differ; the diagnostic first rechecks the original identity-file hash against
+the build record. Private command logs remain local.
 
 ## Private final-image handoff
 

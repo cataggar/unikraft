@@ -39,7 +39,10 @@ tool="$tool_root/bin/uk-wamr-aot-build"
 database into this application's ignored `build/wamr-source/`. It never
 builds in, changes, or inherits uncommitted files from the source checkout.
 It builds that revision's host `wamrc`, its freestanding library audit,
-then the integration archive. The tiny wasm is genuinely generated from
+then the integration archive. `prepare` requires `llvm-objcopy` to remove
+checkout-dependent debug sections from the static runtime archive before
+publishing it; the supervised command retains its linkable symbols and is
+included in the verified producer plan. The tiny wasm is genuinely generated from
 `fixture.zig` and compiled with `--target=x86_64
 --profile=unikraft-x86_64`. Hosted artifacts are not renamed or relabelled.
 Only trusted output of this pinned producer is admissible. The adapter installs
@@ -80,8 +83,11 @@ and storage/network-probe configurations are refused.
 
 `build/source-files.json` holds the sorted compact source-file byte-count/hash
 map, with one final LF. `build/artifacts/identity.json` is pretty schema 1 and
-retains source/tool/wasm/cwasm/library identities, exact command arrays and
-options. Its `prepare_source_sha256` hashes tracked `build-tool-prepare.zig`.
+retains source/wasm/cwasm/library identities, options and a verified command
+plan with portable `<app>`, `<source>`, `<zig>` and `<objcopy>` roles. The
+supervised physical commands and working directories remain in owner-private
+diagnostics; the image record separately pins tool bytes. Its
+`prepare_source_sha256` hashes tracked `build-tool-prepare.zig`.
 Make verifies the generated artifacts before compiling.
 `build/image-identity.json` is pretty schema 1 and binds complete EFI, debug
 ELF and bootinfo bytes, solved config, application/build-tool source hashes,

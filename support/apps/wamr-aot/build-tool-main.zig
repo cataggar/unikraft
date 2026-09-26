@@ -66,6 +66,7 @@ fn category(err: anyerror) []const u8 {
         error.GitArchiveCommandFailed,
         error.RuntimeBuildCommandFailed,
         error.CompilerBuildCommandFailed,
+        error.RuntimeStripCommandFailed,
         error.SnapshotComputeCommandFailed,
         error.SnapshotMemoryCommandFailed,
         error.MatchedWasmCommandFailed,
