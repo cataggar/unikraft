@@ -1090,6 +1090,30 @@ def source_root_only_config(left, right):
     return normalized[0] == normalized[1]
 
 
+def build_image_differences(left, right):
+    first = left["files"]["records"]["build.json"][1]["image"]
+    second = right["files"]["records"]["build.json"][1]["image"]
+    check(isinstance(first, dict) and isinstance(second, dict)
+          and first.keys() == second.keys(), "build image field membership changed")
+    failures = []
+    for field in ("runtime_inputs_sha256", "solved_config_sha256",
+                  "application_sources", "tools"):
+        check(field in first, "missing build image field")
+        if first[field] != second[field]:
+            failures.append("record_content:build.json.image." + field)
+    files = (left["reference"].EFI, left["reference"].EFI + ".dbg",
+             left["reference"].EFI + ".bootinfo")
+    check(right["reference"].EFI == files[0]
+          and isinstance(first.get("files"), dict)
+          and isinstance(second.get("files"), dict)
+          and first["files"].keys() == second["files"].keys() == set(files),
+          "build image file membership changed")
+    for role, name in zip(("efi", "debug", "bootinfo"), files):
+        if first["files"][name] != second["files"][name]:
+            failures.append("record_content:build.json.image.files." + role)
+    return failures
+
+
 def compare_observations(left, right, reviewed_build_compat=False):
     failures = []
     for key in ("returncode",):
@@ -1183,6 +1207,8 @@ def compare_observations(left, right, reviewed_build_compat=False):
                                              for record in b_value["records"]})
         if left_normalizer.normalize(a_value) != right_normalizer.normalize(b_value):
             failures.append("record_content:" + name)
+            if name == "build.json":
+                failures.extend(build_image_differences(left, right))
         if a[0] != b[0] and a[1] == b[1]:
             failures.append("record_bytes:" + name)
     return failures
@@ -2102,6 +2128,30 @@ class DeterministicContracts(unittest.TestCase):
         changed["files"]["artifacts"] = {"unexpected": (123, "a" * 64, 0o600)}
         with self.assertRaisesRegex(ParityError, "invalid artifact comparison roles"):
             compare_observations(original, changed)
+
+    def test_build_image_diagnostics_name_fixed_fields_without_hashes(self):
+        reference = oracle()
+        image = {"runtime_inputs_sha256": "a" * 64,
+                 "solved_config_sha256": "b" * 64,
+                 "application_sources": {}, "tools": {},
+                 "files": {reference.EFI: "c" * 64,
+                           reference.EFI + ".dbg": "d" * 64,
+                           reference.EFI + ".bootinfo": "e" * 64}}
+        original = {"files": {"records": {"build.json": (b"{}\n", {"image": image})}},
+                    "reference": reference}
+        changed = {"files": {"records": {"build.json": (
+            b"{}\n", {"image": copy.deepcopy(image)})}}, "reference": reference}
+        changed_image = changed["files"]["records"]["build.json"][1]["image"]
+        changed_image["solved_config_sha256"] = "f" * 64
+        changed_image["files"][reference.EFI + ".dbg"] = "0" * 64
+        self.assertEqual(build_image_differences(original, changed), [
+            "record_content:build.json.image.solved_config_sha256",
+            "record_content:build.json.image.files.debug",
+        ])
+        self.assertEqual(build_image_differences(original, original), [])
+        del changed_image["files"][reference.EFI]
+        with self.assertRaisesRegex(ParityError, "file membership"):
+            build_image_differences(original, changed)
 
     def test_config_source_root_diagnostic_does_not_normalize_artifact_parity(self):
         with tempfile.TemporaryDirectory() as scratch:

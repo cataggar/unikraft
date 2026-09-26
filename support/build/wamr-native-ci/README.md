@@ -646,7 +646,9 @@ exit classes, evidence and artifact names, and path-free refusal or static
 native error markers. Artifact differences identify only the fixed role and
 changed size, hash or mode field; a config hash mismatch is additionally marked
 when rechecked config bytes differ only by the source-root path, without
-normalizing acceptance. Private command logs remain local.
+normalizing acceptance. A changed build image record also identifies only
+fixed config, input, tool or image-file roles, without exposing their values
+or relaxing the byte comparison. Private command logs remain local.
 
 ## Private final-image handoff
 

@@ -73,9 +73,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "327817dae5294145314a1821c804c5bd85230f83e64e80d9f3f1dca7f0b2591a"
+            "d3b8ebe67aff3a84e161a45d89259fd336f0430a501316d7c5b973587810a470"
         ),
-        "size": 3199076,
+        "size": 3201957,
         "files": 261,
     },
     "support/kconfig": {
