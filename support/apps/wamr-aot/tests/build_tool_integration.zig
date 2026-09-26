@@ -559,7 +559,7 @@ test "portable CI config reaches only opted-in image builds" {
         .limited(128),
     );
     defer allocator.free(dated_failure);
-    try testing.expectEqualStrings("InvalidPortableConfig", dated_failure);
+    try testing.expectEqualStrings("PortableBuildCompileDate", dated_failure);
 
     const incompatible_repository = try imageRepository(&temporary, "dated-image");
     defer allocator.free(incompatible_repository);
@@ -599,7 +599,7 @@ test "portable CI config reaches only opted-in image builds" {
         .limited(128),
     );
     defer allocator.free(incompatible_failure);
-    try testing.expectEqualStrings("InvalidPortableConfig", incompatible_failure);
+    try testing.expectEqualStrings("PortableAppCompileDate", incompatible_failure);
 
     try environment.put("WAMR_CI_PORTABLE_CONFIG", "invalid");
     const invalid = try runCli(cli, argv, &environment);

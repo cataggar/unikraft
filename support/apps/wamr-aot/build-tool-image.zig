@@ -1039,7 +1039,7 @@ fn ensureAppConfig(
                 .source,
             );
             defer allocator.free(contents);
-            if (hasCompileDate(contents)) return error.InvalidPortableConfig;
+            if (hasCompileDate(contents)) return error.PortableAppCompileDate;
         }
         return;
     } else |err| switch (err) {
@@ -1151,14 +1151,14 @@ fn ensurePortableBuildConfig(
             maximum_identity_bytes,
         );
         defer allocator.free(contents);
-        if (hasCompileDate(contents)) return error.InvalidPortableConfig;
+        if (hasCompileDate(contents)) return error.PortableBuildCompileDate;
         try existing.verify(io);
         return;
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     }
-    if (command != .olddefconfig) return error.InvalidPortableConfig;
+    if (command != .olddefconfig) return error.PortableBuildConfigMissing;
     const contents = try repository.app.read(
         allocator,
         io,
