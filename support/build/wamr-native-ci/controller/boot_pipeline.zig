@@ -148,12 +148,8 @@ pub const Context = struct {
         var transient = self.*;
         transient.build_context = &transient_build;
         try transient.checkPins();
-        try build.requireBuildEvidence(&transient_build);
-        try build.requireSource(&transient_build);
-        try build.requireConsumer(&transient_build);
         try build.revalidateAccepted(&transient_build);
         const context = &transient_build;
-        try dependencies.requireDocument(context.allocator, context.io, context.repository, context.git, context.compute, context.dependency.?);
         if (self.boot_inputs) |expected|
             try inputs.requireSame(context.allocator, context.io, expected, self.file_bindings, self.tree_bindings);
         try self.cancelled();

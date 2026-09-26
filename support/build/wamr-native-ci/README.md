@@ -475,6 +475,10 @@ release their per-call scratch rather than retaining whole-tree file bytes
 in the controller's lifetime arena. Boot-stage rechecks also release the
 temporary evidence, dependency, and tool-custody snapshots after each stage;
 their accepted identities and pinned evidence remain in the lifetime arena.
+Each recheck compares one fresh snapshot of each pinned source, dependency,
+consumer input, and build record rather than capturing the same inputs again
+while reconstructing the accepted build. Production consumer-input comparison
+uses the freshly captured identities without repeating the full tree walk.
 They run with
 system/global configuration, hooks, repository fsmonitor helpers, credential
 helpers, replacement objects, terminal prompts and pagers disabled where
