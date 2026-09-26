@@ -515,6 +515,51 @@ test "portable CI config reaches only opted-in image builds" {
         portable_config,
         "# CONFIG_LIBUKLIBID_INFO_LIB_COMPILEDATE is not set\n",
     ) != null);
+    const portable_solved_path = try std.fs.path.join(
+        allocator,
+        &.{ portable_repository, "support/apps/wamr-aot/build/.config" },
+    );
+    defer allocator.free(portable_solved_path);
+    const portable_solved = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        portable_solved_path,
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(portable_solved);
+    try testing.expectEqualStrings(portable_config, portable_solved);
+    {
+        const dated_solved = try std.Io.Dir.openFileAbsolute(
+            io,
+            portable_solved_path,
+            .{ .mode = .read_write, .follow_symlinks = false },
+        );
+        defer dated_solved.close(io);
+        const dated = "CONFIG_LIBUKLIBID_INFO_COMPILEDATE=y\n";
+        try dated_solved.writePositionalAll(io, dated, 0);
+        try dated_solved.setLength(io, dated.len);
+    }
+    const dated_image = try runCli(
+        cli,
+        &.{ cli, "native-images", "--repository", portable_repository },
+        &environment,
+    );
+    defer allocator.free(dated_image.stdout);
+    defer allocator.free(dated_image.stderr);
+    try testing.expect(dated_image.term == .exited and dated_image.term.exited != 0);
+    const dated_failure_path = try std.fs.path.join(allocator, &.{
+        portable_repository,
+        "support/apps/wamr-aot/build/native-environment/failure-error-name.txt",
+    });
+    defer allocator.free(dated_failure_path);
+    const dated_failure = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        dated_failure_path,
+        allocator,
+        .limited(128),
+    );
+    defer allocator.free(dated_failure);
+    try testing.expectEqualStrings("InvalidPortableConfig", dated_failure);
 
     const incompatible_repository = try imageRepository(&temporary, "dated-image");
     defer allocator.free(incompatible_repository);

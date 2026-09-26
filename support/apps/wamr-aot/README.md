@@ -110,11 +110,12 @@ not publish a new success identity.
 directory. The existing native Make environment guard still validates it;
 an invalid override never falls back to ambient data. Hosted CI reuses the
 authenticated package-data acquisition rather than writable `/usr/share`.
-When `WAMR_CI_PORTABLE_CONFIG=1` is selected for paired CI, a fresh application
-config disables global and per-library `uklibid` compile timestamps before
-`olddefconfig`, so separate image builds cannot embed different wall-clock
-values in `.uk_libinfo`. An existing config with either timestamp enabled is
-refused rather than rewritten; ordinary builds retain their timestamp defaults.
+When `WAMR_CI_PORTABLE_CONFIG=1` is selected for paired CI, the application
+config and the actual `build/.config` Make input disable global and per-library
+`uklibid` compile timestamps before `olddefconfig`, so separate image builds
+cannot embed different wall-clock values in `.uk_libinfo`. An existing config
+with either timestamp enabled is refused rather than rewritten; ordinary builds
+retain their timestamp defaults.
 For supervised config and image builds, `WAMR_CI_EXECUTABLE_PATH` names the
 supervisor's physical installed executable. The producer binds its physical
 identity to the supervisor's retained descriptor and its bytes to the

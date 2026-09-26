@@ -57,6 +57,19 @@ fn run(init: std.process.Init) !void {
                 allocator,
                 .limited(1024 * 1024),
             );
+            if (contains(arguments, "-Dci-portable-config=true")) {
+                const seed = try std.Io.Dir.cwd().readFileAlloc(
+                    init.io,
+                    config,
+                    allocator,
+                    .limited(1024 * 1024),
+                );
+                if (std.mem.indexOf(
+                    u8,
+                    seed,
+                    "# CONFIG_LIBUKLIBID_INFO_COMPILEDATE is not set\n",
+                ) == null) return error.MissingPortableSeed;
+            }
             try writeFile(init.io, config, bytes, 0o600, true);
             return;
         }

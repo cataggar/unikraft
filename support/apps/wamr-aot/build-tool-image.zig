@@ -662,6 +662,14 @@ fn executeOpen(
         a,
         &.{ repository.app.path, "build", ".config" },
     );
+    if (portable_config) try ensurePortableBuildConfig(
+        allocator,
+        io,
+        repository,
+        build,
+        config_path,
+        command,
+    );
     const root_arguments = try rootCommand(
         a,
         command,
@@ -1031,12 +1039,7 @@ fn ensureAppConfig(
                 .source,
             );
             defer allocator.free(contents);
-            var lines = std.mem.splitScalar(u8, contents, '\n');
-            while (lines.next()) |line| {
-                if (std.mem.eql(u8, line, "CONFIG_LIBUKLIBID_INFO_COMPILEDATE=y") or
-                    std.mem.eql(u8, line, "CONFIG_LIBUKLIBID_INFO_LIB_COMPILEDATE=y"))
-                    return error.InvalidPortableConfig;
-            }
+            if (hasCompileDate(contents)) return error.InvalidPortableConfig;
         }
         return;
     } else |err| switch (err) {
@@ -1117,6 +1120,54 @@ fn ensureAppConfig(
         contents.written(),
     );
     try identity.verify(io);
+}
+
+fn hasCompileDate(contents: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.eql(u8, line, "CONFIG_LIBUKLIBID_INFO_COMPILEDATE=y") or
+            std.mem.eql(u8, line, "CONFIG_LIBUKLIBID_INFO_LIB_COMPILEDATE=y"))
+            return true;
+    }
+    return false;
+}
+
+fn ensurePortableBuildConfig(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repository: contract.files.Repository,
+    build: std.Io.Dir,
+    config_path: []const u8,
+    command: contract.Command,
+) !void {
+    if (build.statFile(io, ".config", .{ .follow_symlinks = false })) |stat| {
+        if (stat.kind != .file) return error.UnsafeConfig;
+        var existing = try contract.files.RetainedFile.open(io, config_path, .private);
+        defer existing.close(io);
+        const contents = try readRetained(
+            allocator,
+            io,
+            existing,
+            maximum_identity_bytes,
+        );
+        defer allocator.free(contents);
+        if (hasCompileDate(contents)) return error.InvalidPortableConfig;
+        try existing.verify(io);
+        return;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+    if (command != .olddefconfig) return error.InvalidPortableConfig;
+    const contents = try repository.app.read(
+        allocator,
+        io,
+        ".config",
+        maximum_identity_bytes,
+        .source,
+    );
+    defer allocator.free(contents);
+    try contract.files.writePrivateCreate(io, build, ".config", contents);
 }
 
 fn rootCommand(
