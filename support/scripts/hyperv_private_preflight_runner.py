@@ -73,9 +73,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "478c2a2cabf9351073c712385f4dc3ae5000235602ce0398e6450aaee2615fe8"
+            "3c36b6e0123d7f7f0fa8eb065270cad15fe04f134819bf610a99cc79b98f84dd"
         ),
-        "size": 3203315,
+        "size": 3205212,
         "files": 261,
     },
     "support/kconfig": {
@@ -296,7 +296,7 @@ GUARDED_PRODUCER_FILES = {
         "d6ae0548d15f54eecbfe333490b648165047e1a63e72a61aafea62aec2b8aeab"
     ),
     "support/build/native-config-metadata.py": (
-        "a8a98d3eaab01e454fc863d07214aea947baafdf512debf55259807ed96998b7"
+        "b6ff513dcfd0cddd55ccd75e3b3c78ddaa286190bfa283621cfe08d9b3fe0ef6"
     ),
     "support/build/native-config-metadata.zig": (
         "12ec5aa6fd3b8d93efa20d861f268010c4b8a7d9bbdf994ad83318d23eacb117"
