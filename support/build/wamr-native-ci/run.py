@@ -5029,6 +5029,7 @@ def build(runtime, wamr):
         "KCONFIG_OVERWRITECONFIG": "1",
         "M4": tool("m4"),
         "MAKEFLAGS": "-j2",
+        "WAMR_CI_PORTABLE_CONFIG": "1",
         "TMPDIR": str(root / "scratch"),
         "ZIG_GLOBAL_CACHE_DIR": str(root / "global-cache"),
         "ZIG_LIB_DIR": str(Path(tool("zig")).parent / "lib"),
