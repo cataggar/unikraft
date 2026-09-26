@@ -668,7 +668,10 @@ fixed config, input, tool or image-file roles, without exposing their values
 or relaxing the byte comparison. A differing runtime identity is diagnosed
 using only fixed artifact roles and whether its commands or other metadata
 differ; the diagnostic first rechecks the original identity-file hash against
-the build record. Private command logs remain local.
+the build record. Differing EFI and debug images are likewise rehashed against
+their build records before reporting only PE header/section or ELF
+header/alloc/nonalloc section indices with allowlisted section names; byte
+comparison remains strict. Private command logs remain local.
 
 ## Private final-image handoff
 

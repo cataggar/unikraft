@@ -18,6 +18,7 @@ import platform
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -1101,6 +1102,17 @@ RUNTIME_FILE_ROLES = {
     "wamrc": "compiler",
 }
 
+IMAGE_SECTION_NAMES = {
+    name.encode(): name[1:] for name in (
+        ".text", ".rodata", ".data", ".bss", ".dynamic", ".dynsym",
+        ".dynstr", ".gnu.hash", ".hash", ".rela.dyn", ".rela.plt",
+        ".eh_frame", ".eh_frame_hdr", ".got", ".plt", ".init_array",
+        ".fini_array", ".debug_info", ".debug_abbrev", ".debug_line",
+        ".debug_str", ".debug_ranges", ".debug_rnglists", ".debug_line_str",
+        ".symtab", ".strtab", ".shstrtab",
+    )
+}
+
 
 def runtime_input_differences(left, right):
     identities = []
@@ -1137,6 +1149,116 @@ def runtime_input_differences(left, right):
     return failures or ["record_content:build.json.image.runtime_inputs.bytes"]
 
 
+def image_regions(side, name, committed, kind):
+    path = side["reference"].APP / "build" / name
+    try:
+        before = path.lstat()
+    except OSError:
+        raise ParityError("image diagnostic input unavailable") from None
+    check(stat.S_ISREG(before.st_mode) and before.st_uid == os.getuid()
+          and before.st_nlink == 1 and before.st_size <= 512 * 1024 * 1024,
+          "unsafe image diagnostic input")
+    regions = {}
+    try:
+        handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        raise ParityError("image diagnostic input unavailable") from None
+    with os.fdopen(handle, "rb") as stream:
+        handle = stream.fileno()
+        opened = os.fstat(handle)
+        check((before.st_dev, before.st_ino) == (opened.st_dev, opened.st_ino),
+              "image changed during comparison")
+
+        def read(offset, size):
+            check(offset >= 0 and size >= 0 and offset <= before.st_size
+                  and size <= before.st_size - offset,
+                  "invalid image diagnostic region")
+            try:
+                raw = os.pread(handle, size, offset)
+            except OSError:
+                raise ParityError("image diagnostic read failed") from None
+            check(len(raw) == size, "image changed during comparison")
+            return raw
+
+        def region(label, offset, size):
+            digest = hashlib.sha256()
+            for position in range(offset, offset + size, 1024 * 1024):
+                digest.update(read(position, min(1024 * 1024, offset + size - position)))
+            regions[label] = (size, digest.hexdigest())
+
+        if kind == "efi":
+            header = read(0, 200)
+            check(header[:2] == b"MZ" and header[64:68] == b"PE\0\0",
+                  "invalid EFI diagnostic header")
+            count = struct.unpack_from("<H", header, 70)[0]
+            header_size = struct.unpack_from("<I", header, 148)[0]
+            check(0 < count <= 32 and 200 + 40 * count <= header_size <=
+                  min(before.st_size, 1024 * 1024), "invalid EFI diagnostic sections")
+            region("headers", 0, header_size)
+            for index in range(count):
+                section = read(200 + index * 40, 40)
+                size, offset = struct.unpack_from("<II", section, 16)
+                region(f"section-{index}", offset, size)
+        else:
+            header = read(0, 64)
+            check(header[:6] == b"\x7fELF\x02\x01",
+                  "invalid debug ELF diagnostic header")
+            table = struct.unpack_from("<Q", header, 40)[0]
+            entry_size, count = struct.unpack_from("<HH", header, 58)
+            check(entry_size == 64 and 0 < count <= 512,
+                  "invalid debug ELF diagnostic sections")
+            read(table, entry_size * count)
+            region("headers", 0, 64)
+            region("section-table", table, entry_size * count)
+            names_index = struct.unpack_from("<H", header, 62)[0]
+            names = b""
+            if names_index:
+                check(names_index < count, "invalid debug ELF section names")
+                names_section = read(table + names_index * entry_size, entry_size)
+                names_offset, names_size = struct.unpack_from(
+                    "<QQ", names_section, 24)
+                check(struct.unpack_from("<I", names_section, 4)[0] == 3
+                      and names_size <= 64 * 1024,
+                      "invalid debug ELF section names")
+                names = read(names_offset, names_size)
+            for index in range(count):
+                section = read(table + index * entry_size, entry_size)
+                section_type = struct.unpack_from("<I", section, 4)[0]
+                flags = struct.unpack_from("<Q", section, 8)[0]
+                offset, size = struct.unpack_from("<QQ", section, 24)
+                label = ("alloc" if flags & 2 else "nonalloc") + f"-{index}"
+                name_offset = struct.unpack_from("<I", section)[0]
+                if name_offset < len(names):
+                    end = names.find(b"\0", name_offset)
+                    if end != -1:
+                        known = IMAGE_SECTION_NAMES.get(names[name_offset:end])
+                        if known:
+                            label += "." + known
+                if section_type == 8:
+                    regions[label] = (size, None)
+                else:
+                    region(label, offset, size)
+        digest = hashlib.sha256()
+        for position in range(0, before.st_size, 1024 * 1024):
+            digest.update(read(position, min(1024 * 1024, before.st_size - position)))
+        after = os.fstat(handle)
+        check((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns,
+               before.st_ctime_ns) ==
+              (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+               after.st_ctime_ns) and digest.hexdigest() == committed,
+              "image changed during comparison")
+    return regions
+
+
+def image_region_differences(left, right, name, kind, first_digest, second_digest):
+    first = image_regions(left, name, first_digest, kind)
+    second = image_regions(right, name, second_digest, kind)
+    prefix = "record_content:build.json.image.files." + kind + "."
+    differences = [prefix + key for key in sorted(first.keys() | second.keys())
+                   if first.get(key) != second.get(key)]
+    return differences or [prefix + "outside-sections"]
+
+
 def build_image_differences(left, right):
     first = left["files"]["records"]["build.json"][1]["image"]
     second = right["files"]["records"]["build.json"][1]["image"]
@@ -1160,6 +1282,10 @@ def build_image_differences(left, right):
     for role, name in zip(("efi", "debug", "bootinfo"), files):
         if first["files"][name] != second["files"][name]:
             failures.append("record_content:build.json.image.files." + role)
+            if role in ("efi", "debug"):
+                failures.extend(image_region_differences(
+                    left, right, name, role, first["files"][name],
+                    second["files"][name]))
     return failures
 
 
@@ -2193,14 +2319,73 @@ class DeterministicContracts(unittest.TestCase):
         changed_image = changed["files"]["records"]["build.json"][1]["image"]
         changed_image["solved_config_sha256"] = "f" * 64
         changed_image["files"][reference.EFI + ".dbg"] = "0" * 64
-        self.assertEqual(build_image_differences(original, changed), [
-            "record_content:build.json.image.solved_config_sha256",
-            "record_content:build.json.image.files.debug",
-        ])
+        with mock.patch.object(sys.modules[__name__], "image_region_differences",
+                               return_value=[]):
+            self.assertEqual(build_image_differences(original, changed), [
+                "record_content:build.json.image.solved_config_sha256",
+                "record_content:build.json.image.files.debug",
+            ])
         self.assertEqual(build_image_differences(original, original), [])
         del changed_image["files"][reference.EFI]
         with self.assertRaisesRegex(ParityError, "file membership"):
             build_image_differences(original, changed)
+
+    def test_image_region_diagnostics_bind_images_and_name_fixed_sections(self):
+        reference = oracle()
+        with tempfile.TemporaryDirectory() as scratch:
+            sides = []
+            for role in ("python", "native"):
+                app = Path(scratch) / role / "support/apps/wamr-aot"
+                images = app / "build"
+                images.mkdir(parents=True)
+                efi = bytearray(4104)
+                efi[:2], efi[64:68] = b"MZ", b"PE\0\0"
+                struct.pack_into("<H", efi, 70, 2)
+                struct.pack_into("<I", efi, 148, 4096)
+                struct.pack_into("<II", efi, 216, 4, 4096)
+                struct.pack_into("<II", efi, 256, 4, 4100)
+                efi[4096:4104] = b"ABCDWXYZ" if role == "python" else b"AXCDWXYZ"
+                names = b"\0.text\0.debug_str\0.shstrtab\0"
+                debug = bytearray(329 + len(names))
+                debug[:6] = b"\x7fELF\x02\x01"
+                struct.pack_into("<Q", debug, 40, 64)
+                struct.pack_into("<HHH", debug, 58, 64, 4, 3)
+                for index, (flags, offset, size) in enumerate((
+                        (2, 320, 4), (0, 324, 5), (0, 329, len(names))), 1):
+                    section = 64 + 64 * index
+                    section_name = (b".text", b".debug_str", b".shstrtab")[index - 1]
+                    struct.pack_into("<II", debug, section,
+                                     names.index(section_name), 3 if index == 3 else 1)
+                    struct.pack_into("<Q", debug, section + 8, flags)
+                    struct.pack_into("<QQ", debug, section + 24, offset, size)
+                debug[320:329] = (b"TEXTpaths" if role == "python"
+                                  else b"ZEXTpAths")
+                debug[329:] = names
+                (images / reference.EFI).write_bytes(efi)
+                (images / (reference.EFI + ".dbg")).write_bytes(debug)
+                files = {
+                    reference.EFI: sha(efi),
+                    reference.EFI + ".dbg": sha(debug),
+                    reference.EFI + ".bootinfo": "a" * 64,
+                }
+                image = {"runtime_inputs_sha256": "b" * 64,
+                         "solved_config_sha256": "c" * 64,
+                         "application_sources": {}, "tools": {}, "files": files}
+                sides.append({
+                    "reference": mock.Mock(EFI=reference.EFI, APP=app),
+                    "files": {"records": {"build.json": (b"", {"image": image})}},
+                })
+            self.assertEqual(build_image_differences(*sides), [
+                "record_content:build.json.image.files.efi",
+                "record_content:build.json.image.files.efi.section-0",
+                "record_content:build.json.image.files.debug",
+                "record_content:build.json.image.files.debug.alloc-1.text",
+                "record_content:build.json.image.files.debug.nonalloc-2.debug_str",
+            ])
+            (images / (reference.EFI + ".dbg")).write_bytes(debug[:-1] + b"?")
+            with self.assertRaisesRegex(
+                    ParityError, "image changed during comparison"):
+                build_image_differences(*sides)
 
     def test_runtime_input_diagnostics_name_only_fixed_roles(self):
         with tempfile.TemporaryDirectory() as scratch:
