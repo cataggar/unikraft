@@ -461,15 +461,100 @@ test "portable CI config reaches only opted-in image builds" {
     const ordinary_log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
     defer allocator.free(ordinary_log);
     try testing.expect(std.mem.indexOf(u8, ordinary_log, "-Dci-portable-config=true") == null);
+    const ordinary_config_path = try std.fs.path.join(
+        allocator,
+        &.{ repository, "support/apps/wamr-aot/.config" },
+    );
+    defer allocator.free(ordinary_config_path);
+    const ordinary_config = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        ordinary_config_path,
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(ordinary_config);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        ordinary_config,
+        "CONFIG_LIBUKLIBID_INFO_COMPILEDATE",
+    ) == null);
 
     try environment.put("WAMR_CI_PORTABLE_CONFIG", "1");
-    const portable = try runCli(cli, argv, &environment);
+    const portable_repository = try imageRepository(&temporary, "portable-image");
+    defer allocator.free(portable_repository);
+    const portable = try runCli(
+        cli,
+        &.{ cli, "olddefconfig", "--repository", portable_repository },
+        &environment,
+    );
     defer allocator.free(portable.stdout);
     defer allocator.free(portable.stderr);
     try expectExit(portable.term, 0);
     const portable_log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
     defer allocator.free(portable_log);
     try testing.expect(std.mem.indexOf(u8, portable_log, "\t-Dci-portable-config=true\t") != null);
+    const portable_config_path = try std.fs.path.join(
+        allocator,
+        &.{ portable_repository, "support/apps/wamr-aot/.config" },
+    );
+    defer allocator.free(portable_config_path);
+    const portable_config = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        portable_config_path,
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(portable_config);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        portable_config,
+        "# CONFIG_LIBUKLIBID_INFO_COMPILEDATE is not set\n",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        portable_config,
+        "# CONFIG_LIBUKLIBID_INFO_LIB_COMPILEDATE is not set\n",
+    ) != null);
+
+    const incompatible_repository = try imageRepository(&temporary, "dated-image");
+    defer allocator.free(incompatible_repository);
+    const incompatible_config_path = try std.fs.path.join(
+        allocator,
+        &.{ incompatible_repository, "support/apps/wamr-aot/.config" },
+    );
+    defer allocator.free(incompatible_config_path);
+    const incompatible_config = try std.Io.Dir.cwd().createFile(
+        io,
+        incompatible_config_path,
+        .{ .exclusive = true, .permissions = .fromMode(0o600) },
+    );
+    defer incompatible_config.close(io);
+    try incompatible_config.writePositionalAll(
+        io,
+        "CONFIG_LIBUKLIBID_INFO_COMPILEDATE=y\n",
+        0,
+    );
+    const incompatible = try runCli(
+        cli,
+        &.{ cli, "olddefconfig", "--repository", incompatible_repository },
+        &environment,
+    );
+    defer allocator.free(incompatible.stdout);
+    defer allocator.free(incompatible.stderr);
+    try testing.expect(incompatible.term == .exited and incompatible.term.exited != 0);
+    const incompatible_failure_path = try std.fs.path.join(allocator, &.{
+        incompatible_repository,
+        "support/apps/wamr-aot/build/native-environment/failure-error-name.txt",
+    });
+    defer allocator.free(incompatible_failure_path);
+    const incompatible_failure = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        incompatible_failure_path,
+        allocator,
+        .limited(128),
+    );
+    defer allocator.free(incompatible_failure);
+    try testing.expectEqualStrings("InvalidPortableConfig", incompatible_failure);
 
     try environment.put("WAMR_CI_PORTABLE_CONFIG", "invalid");
     const invalid = try runCli(cli, argv, &environment);

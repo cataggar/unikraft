@@ -1110,6 +1110,7 @@ IMAGE_SECTION_NAMES = {
         ".fini_array", ".debug_info", ".debug_abbrev", ".debug_line",
         ".debug_str", ".debug_ranges", ".debug_rnglists", ".debug_line_str",
         ".symtab", ".strtab", ".shstrtab",
+        ".uk_libinfo",
     )
 }
 
