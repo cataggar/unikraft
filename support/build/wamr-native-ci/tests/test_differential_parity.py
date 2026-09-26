@@ -1276,6 +1276,12 @@ def debug_string_differences(first, second, left, right):
                 categories.add("source-root.recorded-switch")
             for suffix, label in (
                     (b"/support/apps/wamr-aot/build", "app-build"),
+                    (b"/support/apps/wamr-aot/build/artifacts/embedded.c",
+                     "embedded-source"),
+                    (b"/support/apps/wamr-aot/build/libuklibid/",
+                     "libuklibid-output"),
+                    (b"/support/apps/wamr-aot/build/appwamraot/",
+                     "appwamraot-output"),
                     (b"/support/apps/wamr-aot/", "app-source"),
                     (b"/lib/", "lib-source"),
                     (b"/arch/", "arch-source"),
@@ -2477,6 +2483,12 @@ class DeterministicContracts(unittest.TestCase):
                 "record_content:build.json.image.files.debug.debug_str.source-root-remap-equal",
                 "record_content:build.json.image.files.debug.debug_str.source-root-string-set-equal",
             ]))
+        self.assertIn(
+            "record_content:build.json.image.files.debug.debug_str.source-root.embedded-source",
+            debug_string_differences(
+                b"/private/first/support/apps/wamr-aot/build/artifacts/embedded.c\0",
+                b"/private/second/support/apps/wamr-aot/build/artifacts/embedded.c\0",
+                left, right))
 
     def test_runtime_input_diagnostics_name_only_fixed_roles(self):
         with tempfile.TemporaryDirectory() as scratch:
