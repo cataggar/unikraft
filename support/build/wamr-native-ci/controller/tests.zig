@@ -280,6 +280,53 @@ test "result refuses unpinned evidence files and directories before publication"
     try controller.boot_pipeline.testing.checkExactEvidence(&ctx);
 }
 
+test "boot recheck uses transient scratch and refuses changed pinned evidence with no persistent space" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "boot-recheck-{d}", .{std.os.linux.getpid()});
+    defer a.free(name);
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("boot recheck fixture cleanup failed");
+    const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    defer a.free(path);
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    try root.createDir(io, "evidence", .fromMode(0o700));
+    const evidence = try root.openDir(io, "evidence", .{ .iterate = true });
+    defer evidence.close(io);
+    try writeFixtureFile(io, evidence, "build.json", "{}\n");
+    try writeFixtureFile(io, evidence, "build-start.json", "{}\n");
+    const build_path = try std.fs.path.join(a, &.{ path, "evidence/build.json" });
+    defer a.free(build_path);
+    const start_path = try std.fs.path.join(a, &.{ path, "evidence/build-start.json" });
+    defer a.free(start_path);
+    var signal = try controller.build_pipeline.installCancellation();
+    defer signal.deinit();
+    var empty: [0]u8 = .{};
+    var no_growth = std.heap.FixedBufferAllocator.init(&empty);
+    var base: controller.build_pipeline.Context = .{
+        .allocator = no_growth.allocator(), .io = io, .environ = undefined, .runtime = path,
+        .repository = options.repository_root, .wamr = "", .compute = path,
+        .git = undefined, .tools = undefined, .roots = undefined, .signal = &signal,
+        .build_start_record = try controller.custody_files.readFile(io, start_path, 4096, true),
+    };
+    base.build_start_record.?.bytes += 1;
+    var ctx: controller.boot_pipeline.Context = .{
+        .build_context = &base,
+        .pinned = std.StringHashMap(controller.custody_files.File).init(a),
+    };
+    defer ctx.pinned.deinit();
+    try ctx.pinned.put("build.json", try controller.custody_files.readFile(io, build_path, 4096, true));
+    for (0..3) |_| try std.testing.expectError(error.BuildStartChanged,
+        controller.boot_pipeline.testing.revalidateBase(&ctx));
+    try evidence.deleteFile(io, "build.json");
+    try writeFixtureFile(io, evidence, "build.json", "{\"changed\":true}\n");
+    try std.testing.expectError(error.EvidenceChanged,
+        controller.boot_pipeline.testing.revalidateBase(&ctx));
+}
+
 test "changed raw QCOW2 and derived VHD images never publish compute evidence" {
     const a = std.testing.allocator;
     const io = std.testing.io;

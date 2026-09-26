@@ -472,7 +472,10 @@ claim. Git bootstrap/custody probes have a 120-second primary deadline and repor
 distinct static startup/monitor I/O, cleanup, stream, output-overflow, and stderr refusal
 categories; raw Git output stays private. Repeated source-custody rechecks
 release their per-call scratch rather than retaining whole-tree file bytes
-in the controller's lifetime arena. They run with
+in the controller's lifetime arena. Boot-stage rechecks also release the
+temporary evidence, dependency, and tool-custody snapshots after each stage;
+their accepted identities and pinned evidence remain in the lifetime arena.
+They run with
 system/global configuration, hooks, repository fsmonitor helpers, credential
 helpers, replacement objects, terminal prompts and pagers disabled where
 applicable.

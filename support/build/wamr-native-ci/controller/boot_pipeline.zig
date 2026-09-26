@@ -141,15 +141,21 @@ pub const Context = struct {
 
     fn base(self: *Context) !void {
         try self.cancelled();
-        try self.checkPins();
-        try build.requireBuildEvidence(self.build_context);
-        try build.requireSource(self.build_context);
-        try build.requireConsumer(self.build_context);
-        try build.revalidateAccepted(self.build_context);
-        const context = self.build_context;
+        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer scratch.deinit();
+        var transient_build = self.build_context.*;
+        transient_build.allocator = scratch.allocator();
+        var transient = self.*;
+        transient.build_context = &transient_build;
+        try transient.checkPins();
+        try build.requireBuildEvidence(&transient_build);
+        try build.requireSource(&transient_build);
+        try build.requireConsumer(&transient_build);
+        try build.revalidateAccepted(&transient_build);
+        const context = &transient_build;
         try dependencies.requireDocument(context.allocator, context.io, context.repository, context.git, context.compute, context.dependency.?);
         if (self.boot_inputs) |expected|
-            try inputs.requireSame(self.allocator(), self.io(), expected, self.file_bindings, self.tree_bindings);
+            try inputs.requireSame(context.allocator, context.io, expected, self.file_bindings, self.tree_bindings);
         try self.cancelled();
     }
 };
@@ -986,6 +992,10 @@ fn publishAcceptedResult(ctx: *Context) !ResultPublished {
 }
 
 pub const testing = if (builtin.is_test) struct {
+    pub fn revalidateBase(ctx: *Context) !void {
+        return ctx.base();
+    }
+
     pub fn publish(ctx: *Context, name: []const u8, value: Value) !void {
         return ctx.publish(name, value);
     }
