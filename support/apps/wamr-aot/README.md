@@ -114,7 +114,9 @@ When `WAMR_CI_PORTABLE_CONFIG=1` is selected for paired CI, Make derives
 `HOSTUTC` from the verified source commit's UTC timestamp instead of each
 image build's wall clock. This keeps the loadable `.uk_libinfo` metadata
 reproducible across source worktrees without changing Kconfig or the
-application's ordinary build-time metadata.
+application's ordinary build-time metadata. Portable builds also map the
+source checkout root to `/wamr-ci/source` in compiler DWARF paths, retaining
+debug information without embedding different worktree names.
 For supervised config and image builds, `WAMR_CI_EXECUTABLE_PATH` names the
 supervisor's physical installed executable. The producer binds its physical
 identity to the supervisor's retained descriptor and its bytes to the

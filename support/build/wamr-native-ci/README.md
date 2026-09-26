@@ -657,6 +657,9 @@ for source discovery and compilation. Make also derives paired `HOSTUTC` from
 the verified source commit's UTC timestamp, rather than embedding each
 separately built image's wall-clock time in its loadable `.uk_libinfo`
 section. Ordinary builds retain their path and build-time metadata defaults.
+Portable C, C++, and assembly builds map the source checkout root to
+`/wamr-ci/source` in DWARF without stripping the debug ELF; this keeps its
+nonload debug sections comparable across worktrees.
 The paired comparison still requires identical raw `.config` bytes and
 matching image hashes; it does not normalize either artifact.
 Protected paired runs print only closed stage-start and stage-completion
