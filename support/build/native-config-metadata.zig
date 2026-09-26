@@ -312,10 +312,18 @@ fn run(init: std.process.Init, args: []const []const u8) !void {
     const image_name = imageName(opts.image_name, configured_name, opts.app);
     const kconfig_dir = try join(a, opts.output, "native-config/kconfig");
     try std.Io.Dir.cwd().createDirPath(io, kconfig_dir);
+    const portable_config = if (init.environ_map.get("WAMR_CI_PORTABLE_CONFIG")) |flag|
+        if (std.mem.eql(u8, flag, "1"))
+            true
+        else
+            return error.InvalidPortableConfig
+    else
+        false;
     const environment = .{
         .{ "CONFIG_", "CONFIG_" },                                                            .{ "KCONFIG_CONFIG", opts.config },
         .{ "HOST_ARCH", hostArch() },                                                         .{ "BUILD_DIR", opts.output },
         .{ "UK_BASE", opts.base },                                                            .{ "UK_APP", opts.app },
+        .{ "UK_CONFIG_BASE", if (portable_config) "/wamr-ci/source" else opts.base },         .{ "UK_CONFIG_APP", if (portable_config) "/wamr-ci/app" else opts.app },
         .{ "UK_CONFIG", opts.config },                                                        .{ "UK_FULLVERSION", version.full },
         .{ "UK_CODENAME", version.codename },                                                 .{ "UK_ARCH", targetArch(values) },
         .{ "KCONFIG_DIR", kconfig_dir },                                                      .{ "KCONFIG_LIB_BASE", try join(a, opts.base, "lib") },

@@ -73,9 +73,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "ae1b5c532d19b3a500a159a838966e93ffbb93f205a4992eebef9983a8566f20"
+            "478c2a2cabf9351073c712385f4dc3ae5000235602ce0398e6450aaee2615fe8"
         ),
-        "size": 3202208,
+        "size": 3203315,
         "files": 261,
     },
     "support/kconfig": {
@@ -212,16 +212,16 @@ GUARDED_PRODUCER_FILES = {
         "54e350a7d5e2bcc0cc7932bf7713741b18ada4760f2da4a575ebdc2cae646013"
     ),
     "Config.uk": (
-        "31ad9392835d740c86f36c8801dc1d0973ee33c2a40ef6f758ecb8f65cc58d5f"
+        "a7dd02562548fd3d56dbd31a297f9677e2f4a098ff03247ebe9dd1456b5e02c2"
     ),
     "Makefile": (
-        "6dd447ae720971d034a15960511cceaa05e109f7b239529d9568185c62f6e6e0"
+        "bc4c24f395907f8d00271a7f32d1a643c59030ecf34f13d0dd199a62b592ac42"
     ),
     "Makefile.uk": (
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
     ),
     "build.zig": (
-        "064cf3445f3bb531ba10479fd08e1886ae1555b79969b37a3691a5076c60571c"
+        "03f16b73b12a3df33704003dd6201cd0605fcb8e8d3ed07299453a30fce7e65b"
     ),
     "build.zig.zon": (
         "511efb394c90490f52120af26e87c5e0a3ea27a444ab1c197ce04f1b3b709e4e"
@@ -299,7 +299,7 @@ GUARDED_PRODUCER_FILES = {
         "a8a98d3eaab01e454fc863d07214aea947baafdf512debf55259807ed96998b7"
     ),
     "support/build/native-config-metadata.zig": (
-        "aa4d88591d27633eff90c424451782aad753e160d005ecaefc00e99c1f4281e2"
+        "12ec5aa6fd3b8d93efa20d861f268010c4b8a7d9bbdf994ad83318d23eacb117"
     ),
     "support/build/native-config-tool.zig": (
         "30291f034f98c970bbf7879189e9bc4c8bc5aa5a6a19fe1ed247d508641d46a9"

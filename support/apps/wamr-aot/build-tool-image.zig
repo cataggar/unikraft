@@ -644,6 +644,13 @@ fn executeOpen(
 
     try ensureAppConfig(allocator, io, repository, build_path);
 
+    const portable_config = if (inherited.get("WAMR_CI_PORTABLE_CONFIG")) |flag|
+        if (std.mem.eql(u8, flag, "1"))
+            true
+        else
+            return error.InvalidPortableConfig
+    else
+        false;
     var root_environment = try cloneEnvironment(allocator, inherited);
     defer root_environment.deinit();
     try root_environment.put("TMPDIR", make_environment.tmp);
@@ -664,6 +671,7 @@ fn executeOpen(
         config_path,
         make_environment,
         &tools,
+        portable_config,
     );
 
     var config_input: ?contract.files.RetainedFile = null;
@@ -1099,6 +1107,7 @@ fn rootCommand(
     config_path: []const u8,
     make_environment: MakeEnvironment,
     tools: *const SelectedTools,
+    portable_config: bool,
 ) ![]const []const u8 {
     var arguments: std.ArrayList([]const u8) = .empty;
     try arguments.appendSlice(allocator, &.{
@@ -1144,6 +1153,8 @@ fn rootCommand(
         "-Dmake-arg=UK_CFLAGS=-std=gnu17",
         "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt",
     });
+    if (portable_config)
+        try arguments.append(allocator, "-Dci-portable-config=true");
     inline for (.{
         .{ "NM", "llvm_nm" },
         .{ "OBJCOPY", "llvm_objcopy" },

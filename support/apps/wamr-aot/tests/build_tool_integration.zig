@@ -335,6 +335,62 @@ test "development checkout selection is explicit and cannot masquerade as suppor
     try expectExit(verified.term, 0);
 }
 
+test "portable CI config reaches only opted-in image builds" {
+    const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
+    defer allocator.free(cli);
+    const fixture = try std.Io.Dir.cwd().realPathFileAlloc(io, options.image_fixture, allocator);
+    defer allocator.free(fixture);
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    try temporary.dir.setPermissions(io, .fromMode(0o700));
+    const repository = try imageRepository(&temporary, "image");
+    defer allocator.free(repository);
+    try temporary.dir.createDir(io, "bison-data", .fromMode(0o700));
+    const bison_data = try temporary.dir.realPathFileAlloc(io, "bison-data", allocator);
+    defer allocator.free(bison_data);
+    const log = try temporary.dir.createFile(io, "image.log", .{
+        .exclusive = true,
+        .permissions = .fromMode(0o600),
+    });
+    log.close(io);
+    const log_path = try temporary.dir.realPathFileAlloc(io, "image.log", allocator);
+    defer allocator.free(log_path);
+    var environment = try imageEnvironment(fixture, bison_data, log_path);
+    defer environment.deinit();
+    try environment.put("WAMR_CI_EXECUTABLE_PATH", cli);
+
+    const argv = &.{ cli, "olddefconfig", "--repository", repository };
+    const ordinary = try runCli(cli, argv, &environment);
+    defer allocator.free(ordinary.stdout);
+    defer allocator.free(ordinary.stderr);
+    try expectExit(ordinary.term, 0);
+    const ordinary_log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(ordinary_log);
+    try testing.expect(std.mem.indexOf(u8, ordinary_log, "-Dci-portable-config=true") == null);
+
+    try environment.put("WAMR_CI_PORTABLE_CONFIG", "1");
+    const portable = try runCli(cli, argv, &environment);
+    defer allocator.free(portable.stdout);
+    defer allocator.free(portable.stderr);
+    try expectExit(portable.term, 0);
+    const portable_log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(portable_log);
+    try testing.expect(std.mem.indexOf(u8, portable_log, "\t-Dci-portable-config=true\t") != null);
+
+    try environment.put("WAMR_CI_PORTABLE_CONFIG", "invalid");
+    const invalid = try runCli(cli, argv, &environment);
+    defer allocator.free(invalid.stdout);
+    defer allocator.free(invalid.stderr);
+    try testing.expect(invalid.term == .exited and invalid.term.exited != 0);
+    const failure_path = try std.fs.path.join(allocator, &.{
+        repository, "support/apps/wamr-aot/build/native-environment/failure-error-name.txt",
+    });
+    defer allocator.free(failure_path);
+    const failure = try std.Io.Dir.cwd().readFileAlloc(io, failure_path, allocator, .limited(128));
+    defer allocator.free(failure);
+    try testing.expectEqualStrings("InvalidPortableConfig", failure);
+}
+
 test "native image commands preserve config plans identities and failed publication" {
     const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
     defer allocator.free(cli);

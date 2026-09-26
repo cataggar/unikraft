@@ -642,6 +642,13 @@ bytes for strict paired tool and boot-input custody. The pinned upstream WAMR
 compiler is also built with its supported `-Dstrip=true` option: otherwise its
 debug sections change the compiler and generated runtime-identity bytes across
 the two source roots, even when the compiled workload is identical.
+Only paired CI sets `WAMR_CI_PORTABLE_CONFIG=1` for the Python and native
+build commands. The native image builder forwards it to the root Zig facade,
+which gives both Kconfig solvers the same inert defaults for `CONFIG_UK_BASE`
+and `CONFIG_UK_APP`; Make still uses the actual checkout and application paths
+for source discovery and compilation. Ordinary builds retain their path
+defaults. The paired comparison still requires identical raw `.config` bytes
+and matching image hashes; it does not normalize either artifact.
 Protected paired runs print only closed stage-start and stage-completion
 labels to identify which of the four real controller invocations has exhausted
 the bounded step deadline. Failed paired builds and boots report only per-side

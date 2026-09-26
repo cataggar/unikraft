@@ -2522,6 +2522,7 @@ def command_environment_contract(kind):
             "KCONFIG_OVERWRITECONFIG": command_literal("1"),
             "M4": command_path("tool:m4"),
             "MAKEFLAGS": command_literal("-j2"),
+            "WAMR_CI_PORTABLE_CONFIG": command_literal("1"),
             "ZIG_GLOBAL_CACHE_DIR": command_path(
                 "work", "global-cache"),
             "ZIG_LIB_DIR": command_path("tool-tree:zig", "lib"),

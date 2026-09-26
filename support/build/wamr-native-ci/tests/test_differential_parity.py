@@ -470,6 +470,7 @@ def native_fixture_contract(reference):
         "KCONFIG_OVERWRITECONFIG": literal("1"),
         "M4": path("tool:m4"),
         "MAKEFLAGS": literal("-j2"),
+        "WAMR_CI_PORTABLE_CONFIG": literal("1"),
         "ZIG_GLOBAL_CACHE_DIR": path("work", "global-cache"),
         "ZIG_LIB_DIR": path("tool-tree:zig", "lib"),
         "ZIG_LOCAL_CACHE_DIR": path("work", "cache"),
