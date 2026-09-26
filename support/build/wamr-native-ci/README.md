@@ -679,8 +679,9 @@ their build records before reporting only PE header/section or ELF
 header/alloc/nonalloc section indices with allowlisted section names; byte
 comparison remains strict. A changed `.debug_str` additionally reports only
 fixed classes for differing strings (source-root, other-absolute, relative-path
-or other) and whether replacing the checkout roots solely for diagnosis would
-equalize it. Raw DWARF strings and private command logs remain local.
+or other), including fixed source-root roles and whether replacing the checkout
+roots solely for diagnosis would equalize the bytes or string sets. Raw DWARF
+strings and private command logs remain local.
 
 ## Private final-image handoff
 

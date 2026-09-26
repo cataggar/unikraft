@@ -1270,6 +1270,19 @@ def debug_string_differences(first, second, left, right):
         root = first_root if entry in first_entries else second_root
         if root in entry:
             categories.add("source-root")
+            categories.add("source-root.leading" if entry.startswith(root)
+                           else "source-root.embedded")
+            if b"-fdebug-prefix-map=" in entry or b"-ffile-prefix-map=" in entry:
+                categories.add("source-root.recorded-switch")
+            for suffix, label in (
+                    (b"/support/apps/wamr-aot/build", "app-build"),
+                    (b"/support/apps/wamr-aot/", "app-source"),
+                    (b"/lib/", "lib-source"),
+                    (b"/arch/", "arch-source"),
+                    (b"/plat/", "plat-source"),
+                    (b"/.zig-cache/", "zig-cache")):
+                if root + suffix in entry:
+                    categories.add("source-root." + label)
         elif entry.startswith(b"/"):
             categories.add("other-absolute")
         elif b"/" in entry:
@@ -1283,6 +1296,11 @@ def debug_string_differences(first, second, left, right):
     if first.replace(first_root, b"/wamr-ci/source") == second.replace(
             second_root, b"/wamr-ci/source"):
         categories.add("source-root-remap-equal")
+    if {entry.replace(first_root, b"/wamr-ci/source")
+            for entry in first_entries} == {
+            entry.replace(second_root, b"/wamr-ci/source")
+            for entry in second_entries}:
+        categories.add("source-root-string-set-equal")
     return [prefix + category for category in sorted(categories)]
 
 
@@ -2439,13 +2457,26 @@ class DeterministicContracts(unittest.TestCase):
             "record_content:build.json.image.files.debug.debug_str.other-absolute",
             "record_content:build.json.image.files.debug.debug_str.relative-path",
             "record_content:build.json.image.files.debug.debug_str.source-root",
+            "record_content:build.json.image.files.debug.debug_str.source-root.leading",
         ])
         self.assertEqual(debug_string_differences(
             b"/private/first/source.c\0", b"/private/second/source.c\0",
-            left, right), [
+            left, right), sorted([
                 "record_content:build.json.image.files.debug.debug_str.source-root",
+                "record_content:build.json.image.files.debug.debug_str.source-root.leading",
                 "record_content:build.json.image.files.debug.debug_str.source-root-remap-equal",
-            ])
+                "record_content:build.json.image.files.debug.debug_str.source-root-string-set-equal",
+            ]))
+        self.assertEqual(debug_string_differences(
+            b"-fdebug-prefix-map=/private/first=/wamr-ci/source\0",
+            b"-fdebug-prefix-map=/private/second=/wamr-ci/source\0",
+            left, right), sorted([
+                "record_content:build.json.image.files.debug.debug_str.source-root",
+                "record_content:build.json.image.files.debug.debug_str.source-root.embedded",
+                "record_content:build.json.image.files.debug.debug_str.source-root.recorded-switch",
+                "record_content:build.json.image.files.debug.debug_str.source-root-remap-equal",
+                "record_content:build.json.image.files.debug.debug_str.source-root-string-set-equal",
+            ]))
 
     def test_runtime_input_diagnostics_name_only_fixed_roles(self):
         with tempfile.TemporaryDirectory() as scratch:
