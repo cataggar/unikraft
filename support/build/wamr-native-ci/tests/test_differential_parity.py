@@ -1160,6 +1160,7 @@ def image_regions(side, name, committed, kind):
           and before.st_nlink == 1 and before.st_size <= 512 * 1024 * 1024,
           "unsafe image diagnostic input")
     regions = {}
+    debug_strings = None
     try:
         handle = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError:
@@ -1239,6 +1240,9 @@ def image_regions(side, name, committed, kind):
                     regions[label] = (size, None)
                 else:
                     region(label, offset, size)
+                    if kind == "debug" and label.endswith(".debug_str"):
+                        if size <= 64 * 1024 * 1024:
+                            debug_strings = read(offset, size)
         digest = hashlib.sha256()
         for position in range(0, before.st_size, 1024 * 1024):
             digest.update(read(position, min(1024 * 1024, before.st_size - position)))
@@ -1248,15 +1252,51 @@ def image_regions(side, name, committed, kind):
               (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
                after.st_ctime_ns) and digest.hexdigest() == committed,
               "image changed during comparison")
-    return regions
+    return regions, debug_strings
+
+
+def debug_string_differences(first, second, left, right):
+    prefix = "record_content:build.json.image.files.debug.debug_str."
+    if first is None or second is None:
+        return [prefix + "unavailable"]
+    first_root = os.fsencode(str(left["reference"].REPO))
+    second_root = os.fsencode(str(right["reference"].REPO))
+    check(first_root and second_root, "invalid debug diagnostic root")
+    first_entries = set(first.split(b"\0"))
+    second_entries = set(second.split(b"\0"))
+    unique = first_entries ^ second_entries
+    categories = set()
+    for entry in unique:
+        root = first_root if entry in first_entries else second_root
+        if root in entry:
+            categories.add("source-root")
+        elif entry.startswith(b"/"):
+            categories.add("other-absolute")
+        elif b"/" in entry:
+            categories.add("relative-path")
+        else:
+            categories.add("other")
+    if not unique:
+        categories.add("order-or-duplicates")
+    if len(first.split(b"\0")) != len(second.split(b"\0")):
+        categories.add("string-count")
+    if first.replace(first_root, b"/wamr-ci/source") == second.replace(
+            second_root, b"/wamr-ci/source"):
+        categories.add("source-root-remap-equal")
+    return [prefix + category for category in sorted(categories)]
 
 
 def image_region_differences(left, right, name, kind, first_digest, second_digest):
-    first = image_regions(left, name, first_digest, kind)
-    second = image_regions(right, name, second_digest, kind)
+    first, first_strings = image_regions(left, name, first_digest, kind)
+    second, second_strings = image_regions(right, name, second_digest, kind)
     prefix = "record_content:build.json.image.files." + kind + "."
     differences = [prefix + key for key in sorted(first.keys() | second.keys())
                    if first.get(key) != second.get(key)]
+    if kind == "debug" and any(key.endswith(".debug_str")
+                               and first.get(key) != second.get(key)
+                               for key in first.keys() | second.keys()):
+        differences.extend(debug_string_differences(
+            first_strings, second_strings, left, right))
     return differences or [prefix + "outside-sections"]
 
 
@@ -2373,7 +2413,8 @@ class DeterministicContracts(unittest.TestCase):
                          "solved_config_sha256": "c" * 64,
                          "application_sources": {}, "tools": {}, "files": files}
                 sides.append({
-                    "reference": mock.Mock(EFI=reference.EFI, APP=app),
+                    "reference": mock.Mock(EFI=reference.EFI, APP=app,
+                                           REPO=Path(scratch) / role),
                     "files": {"records": {"build.json": (b"", {"image": image})}},
                 })
             self.assertEqual(build_image_differences(*sides), [
@@ -2382,11 +2423,29 @@ class DeterministicContracts(unittest.TestCase):
                 "record_content:build.json.image.files.debug",
                 "record_content:build.json.image.files.debug.alloc-1.text",
                 "record_content:build.json.image.files.debug.nonalloc-2.debug_str",
+                "record_content:build.json.image.files.debug.debug_str.other",
             ])
             (images / (reference.EFI + ".dbg")).write_bytes(debug[:-1] + b"?")
             with self.assertRaisesRegex(
                     ParityError, "image changed during comparison"):
                 build_image_differences(*sides)
+
+    def test_debug_string_diagnostics_classify_paths_without_contents(self):
+        left = {"reference": mock.Mock(REPO=Path("/private/first"))}
+        right = {"reference": mock.Mock(REPO=Path("/private/second"))}
+        first = b"/private/first/source.c\0/elsewhere/first.c\0relative/a.c\0"
+        second = b"/private/second/source.c\0/elsewhere/second.c\0relative/b.c\0"
+        self.assertEqual(debug_string_differences(first, second, left, right), [
+            "record_content:build.json.image.files.debug.debug_str.other-absolute",
+            "record_content:build.json.image.files.debug.debug_str.relative-path",
+            "record_content:build.json.image.files.debug.debug_str.source-root",
+        ])
+        self.assertEqual(debug_string_differences(
+            b"/private/first/source.c\0", b"/private/second/source.c\0",
+            left, right), [
+                "record_content:build.json.image.files.debug.debug_str.source-root",
+                "record_content:build.json.image.files.debug.debug_str.source-root-remap-equal",
+            ])
 
     def test_runtime_input_diagnostics_name_only_fixed_roles(self):
         with tempfile.TemporaryDirectory() as scratch:
