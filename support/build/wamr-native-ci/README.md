@@ -692,12 +692,14 @@ strings and private command logs remain local.
 Image command arguments embedded in the build identity retain their actual
 paths; paired comparison treats only the four reviewed app, config, Make
 environment, and private tool path assignments as equivalent across roots,
-after checking their physical roles. All other arguments remain strict. A
-selected executable passed through a retained `/proc/<pid>/fd/<fd>` path is
-compared by its fixed tool role only after the selected tool identity and
-supervised stage binding are checked on both sides; repeated occurrences of
-that role must use the same descriptor within each command. Other executable
-paths retain exact path or source-root comparison. A remaining build-record
+after checking their physical roles. All other arguments remain strict. Once
+both native-image stages and their pinned tool identities have been verified,
+the selected `/proc/<pid>/fd/<fd>` descriptor used by the Python supervisor
+and the corresponding pinned tool path used by the native supervisor compare
+by their fixed tool role. Repeated occurrences of each role must still use
+the same path within each command; without the verified stage, descriptor
+paths remain strict. Other executable paths retain exact path or source-root
+comparison. A remaining build-record
 difference reports only fixed top-level and image
 argument-position labels. Retained-output differences report only fixed
 private, fixture, package, public-source or boot-slot roles and changed

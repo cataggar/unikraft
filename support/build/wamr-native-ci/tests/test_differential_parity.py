@@ -1379,7 +1379,7 @@ def image_region_differences(left, right, name, kind, first_digest, second_diges
     return differences or [prefix + "outside-sections"]
 
 
-def build_image_differences(left, right):
+def build_image_differences(left, right, verified_tool_roles=False):
     first = left["files"]["records"]["build.json"][1]["image"]
     second = right["files"]["records"]["build.json"][1]["image"]
     check(isinstance(first, dict) and isinstance(second, dict)
@@ -1391,9 +1391,9 @@ def build_image_differences(left, right):
             failures.append("record_content:build.json.image." + field)
     if "command" in first and first["command"] != second["command"]:
         first_command = Normalizer(left["roots"]).normalize(
-            reviewed_image_command(left))
+            reviewed_image_command(left, verified_tool_roles))
         second_command = Normalizer(right["roots"]).normalize(
-            reviewed_image_command(right))
+            reviewed_image_command(right, verified_tool_roles))
         if len(first_command) != len(second_command):
             failures.append("record_content:build.json.image.command.count")
         for index, (one, two) in enumerate(zip(first_command, second_command)):
@@ -1487,7 +1487,7 @@ def image_command_tool_path_class(side, index):
     return role, kind
 
 
-def reviewed_image_command(side):
+def reviewed_image_command(side, verified_tool_roles=False):
     command = side["files"]["records"]["build.json"][1]["image"]["command"]
     check(isinstance(command, list) and 4 <= len(command) <= 128
           and all(isinstance(arg, str) and len(arg) <= 4096 for arg in command)
@@ -1512,6 +1512,8 @@ def reviewed_image_command(side):
     seen_tools = set()
     tool_paths = {}
     roots = tuple(str(root) for root in side["roots"])
+    pinned_tools = (side["files"]["records"]["build-start.json"][1]
+                    ["consumer_inputs"]["files"] if verified_tool_roles else {})
     normalized = []
     def tool_path(role, path):
         check(path.startswith("/"), "image command tool path is not absolute")
@@ -1522,7 +1524,14 @@ def reviewed_image_command(side):
         if path.startswith("/proc/"):
             check(re.fullmatch(r"/proc/(?:self|[1-9][0-9]*)/fd/[0-9]+", path),
                   "image command retained tool path changed")
-            return "<retained-tool:" + role + ">"
+            if not verified_tool_roles:
+                return path
+        if verified_tool_roles:
+            pinned = pinned_tools.get("tool:" + role)
+            check(isinstance(pinned, dict) and isinstance(pinned.get("path"), str),
+                  "image command pinned tool role missing")
+            if path.startswith("/proc/") or path == pinned["path"]:
+                return "<verified-tool:" + role + ">"
         for index, root in sorted(enumerate(roots),
                                   key=lambda item: len(item[1]), reverse=True):
             if path == root or path.startswith(root + "/"):
@@ -1671,6 +1680,7 @@ def compare_observations(left, right, reviewed_build_compat=False):
                 checked_stage(r_records[name][1], right["files"]["command_logs"][stage],
                               "native", right["reference"], stage, right),
             )
+    verified_tool_roles = "native-image" in checked_commands
     local_boots = None
     checked_acceptance = False
     if "local-boot-tool" in checked_commands:
@@ -1743,9 +1753,11 @@ def compare_observations(left, right, reviewed_build_compat=False):
             check(set(a_value) == set(b_value) == {"source", "runtime", "image"},
                   "build record membership changed")
             a_value = dict(a_value, image=dict(
-                a_value["image"], command=reviewed_image_command(left)))
+                a_value["image"], command=reviewed_image_command(
+                    left, verified_tool_roles)))
             b_value = dict(b_value, image=dict(
-                b_value["image"], command=reviewed_image_command(right)))
+                b_value["image"], command=reviewed_image_command(
+                    right, verified_tool_roles)))
         if name == "result.json":
             a_value = dict(a_value, records={record: "<verified-file-sha256>"
                                              for record in a_value["records"]})
@@ -1759,7 +1771,8 @@ def compare_observations(left, right, reviewed_build_compat=False):
                 for field in ("source", "runtime", "image"):
                     if normalized_a[field] != normalized_b[field]:
                         failures.append("record_content:build.json." + field)
-                failures.extend(build_image_differences(left, right))
+                failures.extend(build_image_differences(
+                    left, right, verified_tool_roles))
         if a[0] != b[0] and a[1] == b[1]:
             failures.append("record_bytes:" + name)
     return failures
@@ -2728,6 +2741,7 @@ class DeterministicContracts(unittest.TestCase):
             roles = sorted({"zig", *(role for role, _ in IMAGE_TOOL_OPTIONS.values())})
             tools = {role: f"/proc/{descriptor_pid}/fd/{index + 3}"
                      for index, role in enumerate(roles)}
+            pinned = {role: "/opt/reviewed/" + role for role in roles}
             command = [
                 tools["zig"], "build", "native-images", "-j2",
                 "--cache-dir", str(app / "build/native-environment/zig_local_cache"),
@@ -2758,43 +2772,85 @@ class DeterministicContracts(unittest.TestCase):
                     "exit": subprocess.CompletedProcess([], 0, b"", b""),
                     "files": {"order": ("build.json",),
                               "retained": {}, "artifacts": {},
-                              "records": {"build.json": (b"", {
-                                  "source": {}, "runtime": {},
-                                  "image": image})}}}
+                              "records": {
+                                  "build-start.json": (b"", {
+                                      "consumer_inputs": {"files": {
+                                          "tool:" + role: {"path": path}
+                                          for role, path in pinned.items()}}}),
+                                  "build.json": (b"", {
+                                      "source": {}, "runtime": {},
+                                      "image": image})}}}
 
         first, second = side("python"), side("native")
         first["reference"].EFI = second["reference"].EFI = "fixture-image"
-        one = Normalizer(first["roots"]).normalize(reviewed_image_command(first))
-        two = Normalizer(second["roots"]).normalize(reviewed_image_command(second))
+        one = Normalizer(first["roots"]).normalize(
+            reviewed_image_command(first, verified_tool_roles=True))
+        two = Normalizer(second["roots"]).normalize(
+            reviewed_image_command(second, verified_tool_roles=True))
         self.assertEqual(one, two)
-        self.assertEqual(compare_observations(first, second), [])
+        self.assertIn("record_content:build.json",
+                      compare_observations(first, second))
         second_command = second["files"]["records"]["build.json"][1]["image"]["command"]
+        pinned = second["files"]["records"]["build-start.json"][1][
+            "consumer_inputs"]["files"]
+        second_command[0] = pinned["tool:zig"]["path"]
+        for index, arg in enumerate(second_command):
+            for prefix, (role, suffix) in IMAGE_TOOL_OPTIONS.items():
+                if arg.startswith(prefix):
+                    second_command[index] = prefix + pinned["tool:" + role]["path"] + suffix
+                    break
+        self.assertEqual(one, Normalizer(second["roots"]).normalize(
+            reviewed_image_command(second, verified_tool_roles=True)))
+        self.assertIn("record_content:build.json",
+                      compare_observations(first, second))
+        for side in (first, second):
+            side["files"]["records"]["command-native-image.json"] = (b"", {})
+            side["files"]["command_logs"] = {"native-image": b"checked\n"}
+            side["files"]["retained"]["private/native-image.log"] = (
+                "file", 0o600, len(b"checked\n"))
+        with (mock.patch.object(sys.modules[__name__], "compare_build_start",
+                                return_value=[]),
+              mock.patch.object(sys.modules[__name__], "checked_stage",
+                                return_value={}) as checked,
+              mock.patch.object(sys.modules[__name__],
+                                "reviewed_side_specific_outputs",
+                                side_effect=lambda py, native, left, right:
+                                (left, right))):
+            self.assertEqual(compare_observations(
+                first, second, reviewed_build_compat=True), [])
+            self.assertEqual(checked.call_count, 2)
+            self.assertIn("record_content:build.json",
+                          compare_observations(first, second))
+            second["files"]["records"].pop("command-native-image.json")
+            self.assertIn("record_content:build.json",
+                          compare_observations(
+                              first, second, reviewed_build_compat=True))
+            second["files"]["records"]["command-native-image.json"] = (b"", {})
         original_make = second_command[12]
         second_command[12] = "-Dmake-command=/opt/make"
-        self.assertEqual(compare_observations(first, second), [
-            "record_content:build.json",
-            "record_content:build.json.image",
+        self.assertEqual(build_image_differences(
+            first, second, verified_tool_roles=True), [
             "record_content:build.json.image.command.arg-12",
             "record_content:build.json.image.command.tool.make.retained-to-absolute",
         ])
+        self.assertNotEqual(one, Normalizer(second["roots"]).normalize(
+            reviewed_image_command(second, verified_tool_roles=True)))
         second_command[12] = original_make
         second_command[0] = "/proc/202/fd/999"
         with self.assertRaisesRegex(ParityError, "image command tool role changed"):
-            reviewed_image_command(second)
-        second_command[0] = "/proc/202/fd/" + str(
-            sorted({"zig", *(role for role, _ in IMAGE_TOOL_OPTIONS.values())}).index("zig") + 3)
+            reviewed_image_command(second, verified_tool_roles=True)
+        second_command[0] = pinned["tool:zig"]["path"]
         second_command.append("-Dmake-arg=UNREVIEWED=" +
                               str(second["reference"].REPO / "unreviewed"))
         self.assertNotEqual(one, Normalizer(second["roots"]).normalize(
-            reviewed_image_command(second)))
-        self.assertEqual(compare_observations(first, second), [
-            "record_content:build.json",
-            "record_content:build.json.image",
+            reviewed_image_command(second, verified_tool_roles=True)))
+        self.assertEqual(build_image_differences(
+            first, second, verified_tool_roles=True), [
             "record_content:build.json.image.command.count",
         ])
         second_command[8] = "-Dapp=/unreviewed"
         with self.assertRaisesRegex(ParityError, "image command path changed"):
-            reviewed_image_command(second)
+            reviewed_image_command(second, verified_tool_roles=True)
 
     def test_retained_diagnostics_name_fixed_roles_not_private_files(self):
         first = {"private/secret.log": ("file", 0o600, 42),
