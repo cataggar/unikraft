@@ -1272,6 +1272,14 @@ def debug_string_differences(first, second, left, right):
             categories.add("source-root")
             categories.add("source-root.leading" if entry.startswith(root)
                            else "source-root.embedded")
+            app_build = root + b"/support/apps/wamr-aot/build"
+            if entry == app_build:
+                categories.add("source-root.app-build-directory")
+            elif app_build + b"/" in entry and not any(
+                    app_build + suffix in entry for suffix in (
+                        b"/artifacts/embedded.c", b"/libuklibid/",
+                        b"/appwamraot/")):
+                categories.add("source-root.app-build-other")
             if b"-fdebug-prefix-map=" in entry or b"-ffile-prefix-map=" in entry:
                 categories.add("source-root.recorded-switch")
             for suffix, label in (
@@ -2488,6 +2496,12 @@ class DeterministicContracts(unittest.TestCase):
             debug_string_differences(
                 b"/private/first/support/apps/wamr-aot/build/artifacts/embedded.c\0",
                 b"/private/second/support/apps/wamr-aot/build/artifacts/embedded.c\0",
+                left, right))
+        self.assertIn(
+            "record_content:build.json.image.files.debug.debug_str.source-root.app-build-directory",
+            debug_string_differences(
+                b"/private/first/support/apps/wamr-aot/build\0",
+                b"/private/second/support/apps/wamr-aot/build\0",
                 left, right))
 
     def test_runtime_input_diagnostics_name_only_fixed_roles(self):
