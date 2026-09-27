@@ -626,7 +626,9 @@ accessible x86 KVM. The protected x86 job installs that
 controller from its isolated fixture worktree into a separate private root,
 then runs one paired six-mode success case after the Python production boot
 within the same managed, non-root KVM process. An unexplained difference fails
-the job before the public bundle is published. Passing this one case does not
+the job before the public bundle is published. Unequal build records fail before
+the paired boots; only equal builds proceed to six-mode boot comparison.
+Passing this one case does not
 grant native production authority or invoke Azure. Once the production job
 passes, four separate bounded, credential-free x86/KVM matrix jobs run paired
 `build-start-tamper`, `missing-build`, `occupied-boot-slot`, and
@@ -657,9 +659,10 @@ for source discovery and compilation. Make also derives paired `HOSTUTC` from
 the verified source commit's UTC timestamp, rather than embedding each
 separately built image's wall-clock time in its loadable `.uk_libinfo`
 section. Ordinary builds retain their path and build-time metadata defaults.
-Portable C, C++, and assembly builds map the source checkout root to
-`/wamr-ci/source` in DWARF without stripping the debug ELF; this keeps its
-nonload debug sections comparable across worktrees.
+Portable C, C++, and assembly builds, and the final Zig compiler-driver link,
+map the source checkout root to `/wamr-ci/source` in DWARF without stripping
+the debug ELF; this keeps its nonload debug sections comparable across
+worktrees, including debug information emitted by the linker driver.
 The paired comparison still requires identical raw `.config` bytes and
 matching image hashes; it does not normalize either artifact.
 Protected paired runs print only closed stage-start and stage-completion

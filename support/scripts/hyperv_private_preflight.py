@@ -158,9 +158,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "3a4b5cef34019d6e1f9ebb6ac9826af8917b124fee84352dba5848e83a5d5f6d"
+            "e21aa3adacbe742afe6cd7a31e9f1954448ca48fd6937f38b874915f18a6e513"
         ),
-        "size": 3229893,
+        "size": 3230688,
         "files": 261,
     },
     "support/kconfig": {
@@ -392,7 +392,7 @@ GUARDED_PRODUCER_FILES = {
         "a7dd02562548fd3d56dbd31a297f9677e2f4a098ff03247ebe9dd1456b5e02c2"
     ),
     "Makefile": (
-        "7e89ae8423aa78bce6b8316a6e6fe0eda58de8604f9fb525a30ce016b32abeeb"
+        "a34c595491f68f3c4d59ff5a83320d7df379f00a56ed6f0e215e0dce92a80017"
     ),
     "Makefile.uk": (
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"

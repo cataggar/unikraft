@@ -1706,6 +1706,10 @@ def report_progress(side, phase):
     print(f"DIFFERENTIAL_PROGRESS: {side}:{phase}", file=sys.stderr, flush=True)
 
 
+def require_matching_builds_before_boot(failures):
+    check(not failures, "differential mismatches: " + ", ".join(failures))
+
+
 def full(args):
     check(platform.machine() == "x86_64"
           and Path("/dev/kvm").is_char_device()
@@ -1803,6 +1807,7 @@ def full(args):
               "build did not reach accepted state; " +
               outcome_details(results, snapshots) + "; " +
               ", ".join(failures))
+        require_matching_builds_before_boot(failures)
         for repo, runtime, _, _ in executions.values():
             compute = runtime / "compute"
             if args.case == "build-start-tamper":
@@ -1849,6 +1854,14 @@ def full(args):
 
 
 class DeterministicContracts(unittest.TestCase):
+    def test_build_mismatch_refuses_before_boot(self):
+        self.assertIsNone(require_matching_builds_before_boot([]))
+        with self.assertRaisesRegex(
+                ParityError,
+                r"^differential mismatches: build:record_content:build.json.image.files.debug$"):
+            require_matching_builds_before_boot([
+                "build:record_content:build.json.image.files.debug"])
+
     def test_full_requires_fresh_precreated_source_output_roots(self):
         parent = fresh(fixture_parent(), f"differential-source-role-{os.getpid()}")
         try:

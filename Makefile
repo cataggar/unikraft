@@ -782,6 +782,7 @@ GOCFLAGS	+= -DCC_VERSION=$(CC_VERSION)
 
 ifeq ($(WAMR_CI_PORTABLE_CONFIG),1)
 DBGFLAGS	+= -fdebug-prefix-map=$(CONFIG_UK_BASE)=/wamr-ci/source
+LDFLAGS		+= -fdebug-prefix-map=$(CONFIG_UK_BASE)=/wamr-ci/source
 endif
 
 # Add user supplied flags as the last assignments
