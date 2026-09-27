@@ -1092,6 +1092,10 @@ class Evidence(unittest.TestCase):
                     self.assertRaises((ValueError, ci.Refusal)):
                 public_bundle.accepted_public_build_start(owner, runtime)
             bind.assert_not_called()
+            self.assertEqual(
+                owner.FAILURE_STAGE,
+                "public-build-start-consumer-roles"
+                if case == "missing" else "public-build-start-consumer-custody")
 
     def test_public_context_binds_installed_log_validator_or_refuses(self):
         runtime = self.root / "public-validator-runtime"
@@ -1136,7 +1140,9 @@ class Evidence(unittest.TestCase):
         original_tools = dict(ci.COMMAND_TOOL_PATHS)
         original_environment = dict(ci.COMMAND_ENVIRONMENT)
         try:
-            for case in ("present", "missing", "wrong-path", "extra-role"):
+            for case in (
+                    "present", "missing", "wrong-path", "extra-role",
+                    "wrong-tree"):
                 candidate = copy.deepcopy(start)
                 if case == "missing":
                     del candidate["consumer_inputs"]["files"][
@@ -1147,6 +1153,9 @@ class Evidence(unittest.TestCase):
                 elif case == "extra-role":
                     candidate["consumer_inputs"]["files"][
                         "native:unapproved"] = {"path": "/trusted/other"}
+                elif case == "wrong-tree":
+                    candidate["consumer_inputs"]["trees"]["zig"][
+                        "path"] = "/trusted/other"
                 ci.COMMAND_SUPERVISOR_PATH = None
                 ci.COMMAND_TOOL_PATHS.clear()
                 ci.COMMAND_ENVIRONMENT.clear()
@@ -1193,6 +1202,13 @@ class Evidence(unittest.TestCase):
                             public_bundle.publish_ci(owner)
                         bind.assert_not_called()
                         context.assert_not_called()
+                        self.assertEqual(
+                            owner.FAILURE_STAGE,
+                            "public-build-start-path-binaries"
+                            if case in ("missing", "wrong-path") else
+                            "public-build-start-path-runtime"
+                            if case == "extra-role" else
+                            "public-build-start-path-trees")
         finally:
             ci.COMMAND_SUPERVISOR_PATH = original_supervisor
             ci.COMMAND_TOOL_PATHS.clear()

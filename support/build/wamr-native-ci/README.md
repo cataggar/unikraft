@@ -832,9 +832,10 @@ It uses only the validated recorded Git executable for the source/dependency
 recheck, recomputes the exact source, dependency, Bison, consumer and guarded
 supervisor custody, and only then binds the full recorded tool set and the
 fixed-runtime supervisor. It repeats the full custody check after binding.
-Pre-export refusal names only a fixed result, build-start schema/consumer/
-dependency/custody, or CI environment/source/binding stage; it does not print
-recorded paths, content, hashes, or private runner state.
+Pre-export refusal names only a fixed result, build-start schema/consumer
+role/tree/custody or physical path role/binary/runtime/tree, dependency/custody,
+or CI environment/source/binding stage; it does not print recorded paths,
+content, hashes, or private runner state.
 If the native log validator is installed, the preflight requires its recorded
 role, exact runtime path and executable dependency closure; a missing or
 misbound role refuses publication before tools are bound.

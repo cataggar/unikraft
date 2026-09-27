@@ -622,8 +622,10 @@ def ci_context(handoff, start):
                         wamr_revision=ci.REVISION))
 
 
-def require_public_consumer_paths(ci, runtime, consumer_inputs):
+def require_public_consumer_paths(handoff, runtime, consumer_inputs):
+    ci = handoff.ci
     files = consumer_inputs["files"]
+    handoff.FAILURE_STAGE = "public-build-start-path-roles"
     required_files = (
         {f"tool:{name}" for name in ci.HOST_TOOLS}
         | {
@@ -632,6 +634,7 @@ def require_public_consumer_paths(ci, runtime, consumer_inputs):
             ci.WAMR_AOT_BUILD_ROLE,
         })
     require(required_files <= set(files))
+    handoff.FAILURE_STAGE = "public-build-start-path-binaries"
     supervisor = (
         runtime / "compute/supervisor/bin/wamr-ci-supervisor").resolve(
             strict=True)
@@ -652,6 +655,7 @@ def require_public_consumer_paths(ci, runtime, consumer_inputs):
             and files["wamr-source-archive"]["path"]
             == str((runtime / "custody/wamr-source.tar").resolve(
                 strict=True)))
+    handoff.FAILURE_STAGE = "public-build-start-path-runtime"
     runtime_paths = set()
     for name in ci.HOST_TOOLS:
         runtime_paths.update(ci.executable_runtime_paths(
@@ -665,6 +669,7 @@ def require_public_consumer_paths(ci, runtime, consumer_inputs):
         "runtime:" + str(path) for path in runtime_paths
     }
     require(set(files) == expected_files)
+    handoff.FAILURE_STAGE = "public-build-start-path-trees"
     trees = consumer_inputs["trees"]
     require(set(trees) == {"bison", "python-stdlib", "zig", "llvm"}
             and trees["bison"]["path"]
@@ -696,16 +701,18 @@ def accepted_public_build_start(handoff, runtime):
     source_custody_record(ci, start["source_custody"])
     consumer_input_record(ci, start["consumer_inputs"])
     command_supervisor_record(start["command_supervisor"])
-    handoff.FAILURE_STAGE = "public-build-start-consumer"
+    handoff.FAILURE_STAGE = "public-build-start-consumer-roles"
     files = start["consumer_inputs"]["files"]
     required_files = (
         {f"tool:{name}" for name in ci.HOST_TOOLS}
         | {"wamr-source-archive", "command-supervisor"})
     require(required_files <= set(files))
+    handoff.FAILURE_STAGE = "public-build-start-consumer-trees"
     require_consumer_tree_roles(start["consumer_inputs"], False)
+    handoff.FAILURE_STAGE = "public-build-start-consumer-custody"
     ci.require_recorded_consumer_inputs(
         start["consumer_inputs"], content=True)
-    require_public_consumer_paths(ci, runtime, start["consumer_inputs"])
+    require_public_consumer_paths(handoff, runtime, start["consumer_inputs"])
 
     handoff.FAILURE_STAGE = "public-build-start-dependencies"
     original_tools = dict(ci.COMMAND_TOOL_PATHS)
