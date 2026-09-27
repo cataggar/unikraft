@@ -602,6 +602,7 @@ def ci_runtime(ci):
 
 def ci_context(handoff, start):
     ci = handoff.ci
+    handoff.FAILURE_STAGE = "public-context-environment"
     require(os.environ.get("GITHUB_ACTIONS") == "true"
             and os.environ.get("GITHUB_REPOSITORY") == "cataggar/unikraft"
             and os.environ.get("GITHUB_JOB") == "wamr-native-compute"
@@ -610,9 +611,11 @@ def ci_context(handoff, start):
             and os.environ.get("GITHUB_WORKSPACE") == str(ci.REPO)
             and os.environ.get("GITHUB_WORKFLOW_REF", "").startswith(
                 "cataggar/unikraft/.github/workflows/wamr-native-compute.yaml@"))
+    handoff.FAILURE_STAGE = "public-context-source"
     source = ci.source()
     require(ci.source_identity(source) == start["source"]
             and os.environ.get("GITHUB_SHA") == source["revision"])
+    handoff.FAILURE_STAGE = "public-context-binding"
     return context(dict(repository="cataggar/unikraft", run_id=os.environ["GITHUB_RUN_ID"],
                         run_attempt=os.environ["GITHUB_RUN_ATTEMPT"],
                         source_revision=source["revision"], source_tree=source["tree"],
@@ -678,6 +681,7 @@ def require_public_consumer_paths(ci, runtime, consumer_inputs):
 
 def accepted_public_build_start(handoff, runtime):
     ci = handoff.ci
+    handoff.FAILURE_STAGE = "public-build-start-shape"
     start = ci.document(runtime / "compute/evidence/build-start.json")
     require(set(start) == {
         "source", "source_custody", "tools", "bison_data",
@@ -692,6 +696,7 @@ def accepted_public_build_start(handoff, runtime):
     source_custody_record(ci, start["source_custody"])
     consumer_input_record(ci, start["consumer_inputs"])
     command_supervisor_record(start["command_supervisor"])
+    handoff.FAILURE_STAGE = "public-build-start-consumer"
     files = start["consumer_inputs"]["files"]
     required_files = (
         {f"tool:{name}" for name in ci.HOST_TOOLS}
@@ -702,6 +707,7 @@ def accepted_public_build_start(handoff, runtime):
         start["consumer_inputs"], content=True)
     require_public_consumer_paths(ci, runtime, start["consumer_inputs"])
 
+    handoff.FAILURE_STAGE = "public-build-start-dependencies"
     original_tools = dict(ci.COMMAND_TOOL_PATHS)
     ci.COMMAND_TOOL_PATHS.clear()
     ci.COMMAND_TOOL_PATHS["git"] = files["tool:git"]["path"]
@@ -717,6 +723,7 @@ def accepted_public_build_start(handoff, runtime):
     ci.COMMAND_SUPERVISOR_PATH = None
     ci.COMMAND_ENVIRONMENT.update(
         ci.bind_command_tools(start["consumer_inputs"]))
+    handoff.FAILURE_STAGE = "public-build-start-custody"
     ci.require_recorded_build_custody(runtime, start)
     return start
 
@@ -1654,10 +1661,12 @@ def import_bundle(
 
 def publish_ci(handoff):
     """Only the named public repository lane may select this fixed publication."""
-    handoff.FAILURE_STAGE = "public-context"
+    handoff.FAILURE_STAGE = "public-context-runtime"
     runtime = ci_runtime(handoff.ci)
+    handoff.FAILURE_STAGE = "public-result-records"
     handoff.result_records(runtime / "compute")
     start = accepted_public_build_start(handoff, runtime)
+    handoff.FAILURE_STAGE = "public-context-entry"
     source = ci_context(handoff, start)
     publication = runtime / "compute/public-source"
     stage = publication / "handoff"

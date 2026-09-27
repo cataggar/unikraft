@@ -1185,7 +1185,7 @@ class Evidence(unittest.TestCase):
                             runtime / "compute")
                         context.assert_called_once_with(owner, candidate)
                         bind.assert_called_once_with(consumer)
-                        self.assertEqual(owner.FAILURE_STAGE, "public-context")
+                        self.assertEqual(owner.FAILURE_STAGE, "public-context-entry")
                     else:
                         failure = (
                             ci.Refusal if case == "missing" else ValueError)
