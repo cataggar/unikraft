@@ -724,14 +724,24 @@ and per-mode compute records likewise identify only reviewed nested field
 roles. Finalization and derivation provenance are rechecked against each
 side's canonical intent bytes (including the domain-separated config hash),
 the pinned package tool, and the corresponding source-image commitment;
-different intent paths remain strict but their root-normalized fields can
-be diagnosed. Each differing raw serial is independently rehashed against
-its report before a fixed-class timestamp/first-line diagnostic is emitted;
-the diagnostic also classifies whether UART framing, numeric fields, or the
-first boot phase differ, without revealing any raw serial text. Serial and
-receipt hashes remain strict. Boot command records are checked
+unreviewed intent fields remain strict after normalizing verified source
+roots. Each differing raw serial is independently rehashed against its
+report. At completed paired boots, cross-controller serial comparison removes
+only UART framing accepted by the shared native validator and the
+kernel-log timestamps; every other byte must agree. Each side's original
+serial, request, report, compute, acceptance, derivation gate, and final
+inspection hashes still bind its own unchanged bytes. Differing receipt
+hashes are reviewed only after their per-side commitments, physical boot
+inputs and all six compute results are proved; unreviewed content remains
+strict. If that proof is unavailable, fixed-class timestamp, framing, phase
+and retained-role diagnostics do not grant parity. Boot command records are checked
 against their own supervised stage contracts and physically pinned tool
-identities before their per-side command outcome is compared. No private
+identities before their per-side command outcome is compared. Side-specific
+validator records/logs are rehashed and checked against their pinned
+supervised contract, raw serial and compute output before removing only
+their verified retained slots from membership comparison. Rooted package-job
+sizes are reviewed only after checking each job's source pin, producer,
+intent and ownership roles. No private
 serial data, command logs, hashes, or paths are printed.
 
 ## Private final-image handoff

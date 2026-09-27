@@ -525,6 +525,9 @@ REVIEWED_BOOT_COMMANDS = (
     "package", *MODES[:2], "finalize-qcow2", *MODES[2:4],
     "derive-fixed-vhd", *MODES[4:], "inspect",
 )
+REVIEWED_VALIDATOR_COMMANDS = (
+    "log-validator-x2apic", "log-validator-legacy",
+)
 
 
 def native_build_command_contract(reference, stage):
@@ -575,6 +578,14 @@ def native_build_command_contract(reference, stage):
 
 
 def reviewed_build_command_contract(reference, side, stage):
+    if stage in REVIEWED_VALIDATOR_COMMANDS:
+        contract = reference.production_command_contract(stage)
+        if side == "native":
+            contract = copy.deepcopy(contract)
+            contract["output_limit"] = 64 * 1024
+            contract["limits"]["stdout_bytes"] = 64 * 1024
+            contract["limits"]["stderr_bytes"] = 4 * 1024
+        return contract
     if (side == "python" or stage in SHARED_BUILD_STAGES
             or stage in REVIEWED_BOOT_COMMANDS):
         return reference.production_command_contract(stage)
@@ -585,7 +596,8 @@ def reviewed_build_command_contract(reference, side, stage):
 
 def checked_stage(record, log, side, reference, stage, seen=None):
     check(side in ("python", "native")
-          and stage in (*REVIEWED_BUILD_COMMANDS, *REVIEWED_BOOT_COMMANDS),
+          and stage in (*REVIEWED_BUILD_COMMANDS, *REVIEWED_BOOT_COMMANDS,
+                        *REVIEWED_VALIDATOR_COMMANDS),
           "unknown supervised stage/side")
     contract = reviewed_build_command_contract(reference, side, stage)
     label = f"{stage} {side}"
@@ -629,6 +641,8 @@ def checked_stage(record, log, side, reference, stage, seen=None):
           and command_result["cleanup_complete"] is True
           and command_result["poisoned"] is False,
           f"{label} output/cleanup changed")
+    if stage in REVIEWED_VALIDATOR_COMMANDS:
+        check(stderr["bytes"] == 0, f"{label} validator stderr changed")
     role_identities = None
     if seen is not None:
         runtime = seen["roots"][0]
@@ -1110,11 +1124,25 @@ def verified_qcow2_acceptance(seen):
     return value
 
 
-def compare_qcow2_acceptance(left, right):
+def compare_qcow2_acceptance(left, right, reviewed_modes=None):
     first = verified_qcow2_acceptance(left)
     second = verified_qcow2_acceptance(right)
-    first = dict(first, boot_inputs_sha256="<verified-own-boot-input-bytes>")
-    second = dict(second, boot_inputs_sha256="<verified-own-boot-input-bytes>")
+    first = copy.deepcopy(first)
+    second = copy.deepcopy(second)
+    for side in (first, second):
+        side["boot_inputs_sha256"] = "<verified-own-boot-input-bytes>"
+    if reviewed_modes is not None:
+        check(set(reviewed_modes) == set(MODES[:4]),
+              "unreviewed QCOW2 acceptance boot roles")
+        for side in (first, second):
+            side["build_sha256"] = "<verified-own-build>"
+            side["finalization_sha256"] = "<verified-own-finalization>"
+            for mode in MODES[:4]:
+                side["boots"][mode] = {
+                    field: "<verified-own-" + field + ">"
+                    for field in ("request_sha256", "report_sha256",
+                                  "serial_sha256", "compute_sha256")
+                }
     a = Normalizer(left["roots"]).normalize(first)
     b = Normalizer(right["roots"]).normalize(second)
     failures = [
@@ -1174,6 +1202,21 @@ def verified_image_provenance(seen, name):
     return intent
 
 
+def reviewed_image_provenance(left, right, name):
+    a_intent = verified_image_provenance(left, name)
+    b_intent = verified_image_provenance(right, name)
+    check(Normalizer(left["roots"]).normalize(a_intent) ==
+          Normalizer(right["roots"]).normalize(b_intent),
+          "image intent semantic difference")
+    normalized = []
+    for side in (left, right):
+        record = copy.deepcopy(side["files"]["records"][name][1])
+        record["provenance"]["config_sha256"] = "<verified-root-bound-intent>"
+        normalized.append(Normalizer(side["roots"]).normalize(record))
+    check(normalized[0] == normalized[1],
+          "image finalization semantic difference")
+
+
 SERIAL_TIMESTAMP = re.compile(rb"(?m)^\[\s*[0-9]+\.[0-9]{6}\]")
 SERIAL_ANSI = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
 SERIAL_NUMBER = re.compile(
@@ -1217,6 +1260,78 @@ def verified_serial(seen, mode):
           and record["report"]["serial_sha256"] == sha(serial),
           "boot serial/report commitment changed")
     return serial
+
+
+def verified_mode(seen, mode):
+    reference = seen["reference"]
+    records = seen["files"]["records"]
+    record_raw, record = records[mode + "-compute.json"]
+    runtime = seen["roots"][0]
+    work = runtime / "compute" / ("boot-" + mode)
+    serial = verified_serial(seen, mode)
+    try:
+        request_raw = checked_file(work / "request.json", 64 * 1024)
+    except OSError:
+        raise ParityError("boot request inaccessible") from None
+    request = parsed(request_raw, reference)
+    index = MODES.index(mode)
+    config = reference.config_for(runtime, runtime / "compute", index,
+                                  reference.SIX_MODES)
+    check(set(request) == {"schema_version", "supervisor_pid", "config", "pins"}
+          and request["schema_version"] == 2
+          and type(request["supervisor_pid"]) is int
+          and request["supervisor_pid"] > 0
+          and request["config"] == config
+          and set(record) == {"scope", "report", "input_pins",
+                              "request_sha256", "report_sha256", "compute"}
+          and record["scope"] == "local_native_compute_only"
+          and request["pins"] == record["input_pins"]
+          and record["request_sha256"] == sha(request_raw)
+          and parsed(record_raw, reference) == record,
+          "boot request/compute commitment changed")
+    paths = (config["source"]["path"], config["ovmf_code"],
+             config["ovmf_vars"], config["qemu"])
+    check(len(request["pins"]) == len(paths), "boot physical pin count changed")
+    for pin, path in zip(request["pins"], paths):
+        physical, _ = reference.physical_file_record(Path(path))
+        check(pin == reference.pin_from_record(physical),
+              "boot physical input pin changed")
+    report = record["report"]
+    check(report["passed"] is True and report["consumed"] is True
+          and report["cleanup_complete"] is True
+          and report["input_unchanged"] is True
+          and report["serial_valid"] is True
+          and report["serial_limit_reached"] is False
+          and report["termination"] == {"exited": 0}
+          and report["failures"] == {
+              "primary": None, "cleanup": None, "recording": None,
+          }, "boot report is not a successful local run")
+    return request, record, serial
+
+
+def reviewed_mode(left, right, mode):
+    first, second = verified_mode(left, mode), verified_mode(right, mode)
+    a_request, a_record, a_serial = first
+    b_request, b_record, b_serial = second
+    a_text = SERIAL_TIMESTAMP.sub(b"<time>", diagnostic_serial_text(a_serial))
+    b_text = SERIAL_TIMESTAMP.sub(b"<time>", diagnostic_serial_text(b_serial))
+    check(a_text == b_text, "unreviewed boot serial difference")
+    a_request = dict(a_request, supervisor_pid="<verified-positive-pid>")
+    b_request = dict(b_request, supervisor_pid="<verified-positive-pid>")
+    normalized = lambda side, value: Normalizer(side["roots"]).normalize(value)
+    check(normalized(left, a_request) == normalized(right, b_request),
+          "boot request semantic difference")
+    a_report = dict(a_record["report"], serial_sha256="<verified-serial>")
+    b_report = dict(b_record["report"], serial_sha256="<verified-serial>")
+    a_record = dict(a_record, report=a_report,
+                    request_sha256="<verified-request>",
+                    report_sha256="<verified-report>")
+    b_record = dict(b_record, report=b_report,
+                    request_sha256="<verified-request>",
+                    report_sha256="<verified-report>")
+    check(normalized(left, a_record) == normalized(right, b_record),
+          "boot compute semantic difference")
+    return first, second
 
 
 def serial_differences(left, right):
@@ -1268,6 +1383,79 @@ def serial_differences(left, right):
         if len(a) != len(b):
             failures.append(label + ".bytes")
     return failures
+
+
+BOOT_SUMMARY_FIELDS = {
+    "request_sha256", "report_sha256", "serial_sha256", "compute_sha256",
+}
+
+
+def verified_boot_summaries(seen, boots, modes):
+    records = seen["files"]["records"]
+    check(isinstance(boots, dict) and boots.keys() == set(modes),
+          "boot summary roles changed")
+    for mode in modes:
+        summary = boots[mode]
+        record_raw, record = records[mode + "-compute.json"]
+        _, _, serial = verified_mode(seen, mode)
+        check(set(summary) == BOOT_SUMMARY_FIELDS
+              and summary == {
+                  "request_sha256": record["request_sha256"],
+                  "report_sha256": record["report_sha256"],
+                  "serial_sha256": sha(serial),
+                  "compute_sha256": sha(record_raw),
+              }, "boot summary commitment changed")
+
+
+def reviewed_vhd_gate(left, right):
+    normalized = []
+    for side in (left, right):
+        records = side["files"]["records"]
+        value = copy.deepcopy(records["fixed-vhd-derivation-gate.json"][1])
+        check(set(value) == {
+            "schema", "schema_version", "profile", "status",
+            "accepted_qcow2_sha256", "qcow2_acceptance_sha256",
+            "derivation_intent_sha256", "derived_output_absent",
+        } and value["qcow2_acceptance_sha256"] ==
+            sha(records["qcow2-acceptance.json"][0])
+          and value["derivation_intent_sha256"] ==
+            sha(records["fixed-vhd-derivation-intent.json"][0]),
+            "VHD gate source commitment changed")
+        for field in ("qcow2_acceptance_sha256",
+                      "derivation_intent_sha256"):
+            value[field] = "<verified-own-" + field + ">"
+        normalized.append(Normalizer(side["roots"]).normalize(value))
+    check(normalized[0] == normalized[1], "VHD gate semantic difference")
+
+
+def reviewed_final_inspection(left, right):
+    names = {
+        "build-start.json", "build.json", "boot-inputs.json", "package.json",
+        "qcow2-finalization-intent.json", "qcow2-finalization.json",
+        "qcow2-acceptance.json", "fixed-vhd-derivation-intent.json",
+        "fixed-vhd-derivation-gate.json", "fixed-vhd-derivation.json",
+    }
+    normalized = []
+    for side in (left, right):
+        records = side["files"]["records"]
+        value = copy.deepcopy(records["final-inspection.json"][1])
+        check(set(value) == {
+            "schema", "schema_version", "profile", "status", "source",
+            "artifacts", "records", "modes", "boots",
+        } and value["records"].keys() == names
+          and value["modes"] == list(MODES),
+          "final inspection roles changed")
+        for name in names:
+            check(value["records"][name] == sha(records[name][0]),
+                  "final inspection record commitment changed")
+            value["records"][name] = "<verified-own-record>"
+        verified_boot_summaries(side, value["boots"], MODES)
+        for summary in value["boots"].values():
+            for field in BOOT_SUMMARY_FIELDS:
+                summary[field] = "<verified-own-" + field + ">"
+        normalized.append(Normalizer(side["roots"]).normalize(value))
+    check(normalized[0] == normalized[1],
+          "final inspection semantic difference")
 
 
 REVIEWED_BUILD_COMMANDS = (
@@ -1935,6 +2123,152 @@ def reviewed_side_specific_outputs(python, native, left, right):
     return left, right
 
 
+def verified_image_job(seen, name):
+    reference = seen["reference"]
+    runtime = seen["roots"][0]
+    records = seen["files"]["records"]
+    kind, intent_name, source_name, fields = {
+        "qcow2-job.json": (
+            "qcow2", "qcow2-finalization-intent.json", "unikraft.raw",
+            ("expected_virtual_bytes", "expected_workload_sha256",
+             "expected_workload_bytes"),
+        ),
+        "vhd-job.json": (
+            "vhd", "fixed-vhd-derivation-intent.json", "unikraft.qcow2",
+            ("expected_capacity_bytes",),
+        ),
+    }[name]
+    path = runtime / "compute/package" / name
+    try:
+        job = parsed(checked_file(path, 64 * 1024), reference)
+    except OSError:
+        raise ParityError("image job inaccessible") from None
+    intent_raw, intent = records[intent_name]
+    source_path = runtime / "compute/package" / source_name
+    source, _ = reference.physical_file_record(source_path)
+    package_tool = records["boot-inputs.json"][1]["files"]["package_tool"]
+    parent = ("expected_source_sha256" if kind == "qcow2"
+              else "accepted_qcow2_sha256")
+    check(set(job) == {
+        "schema_version", "supervisor_pid", "state_dir", "attempt",
+        "source", "producer", "limits", "config_sha256", *fields,
+    } and job["schema_version"] == 2
+      and type(job["supervisor_pid"]) is int and job["supervisor_pid"] > 0
+      and job["state_dir"] == str(runtime / "compute/package")
+      and job["source"] == {
+          "artifact": {
+              "path": str(source_path), "size": intent["expected_source_bytes"],
+              "sha256": intent[parent],
+          },
+          "pin": reference.pin_from_record(source),
+      } and source["sha256"] == intent[parent]
+      and job["producer"] == {
+          "path": package_tool["path"], "size": package_tool["metadata"][6],
+          "sha256": package_tool["sha256"],
+      } and job["limits"] == intent["limits"]
+      and job["config_sha256"] == sha(IMAGE_CONFIG_DOMAIN + intent_raw)
+      and all(job[field] == intent[field] for field in fields),
+          "image job source/config commitment changed")
+    attempt = job["attempt"]
+    check(set(attempt) == {"schema", "schema_version", "kind",
+                           "stage", "output", "record"}
+          and attempt["schema"] == "uk.wamr.compute-attempt-ownership"
+          and attempt["schema_version"] == 1
+          and attempt["kind"] == kind,
+          "image job attempt role changed")
+    for role in ("stage", "output", "record"):
+        item = attempt[role]
+        check(set(item) == {"device_major", "device_minor", "inode",
+                            "mode", "uid", "nlink"}
+              and type(item["inode"]) is int and item["inode"] > 0
+              and item["uid"] == os.getuid()
+              and stat.S_IFMT(item["mode"]) == (
+                  stat.S_IFDIR if role == "stage" else stat.S_IFREG)
+              and stat.S_IMODE(item["mode"]) == (
+                  0o700 if role == "stage" else 0o600)
+              and (item["nlink"] >= 2 if role == "stage" else
+                   item["nlink"] == 1),
+              "image job attempt ownership changed")
+    return job
+
+
+def reviewed_validator_outputs(seen, side, entries):
+    reference = seen["reference"]
+    runtime = seen["roots"][0]
+    records = seen["files"]["records"]
+
+    def remove(path, kind, size=None):
+        check(path in entries and entries.pop(path) == (
+            kind, 0o700 if kind == "directory" else 0o600, size),
+            "validator retained slot changed")
+
+    if side == "python":
+        remove("private/log-validation", "directory")
+    for index, mode in enumerate(MODES):
+        stage = ("log-validator-legacy" if index % 2 else
+                 "log-validator-x2apic")
+        serial = verified_serial(seen, mode)
+        count = (3 if index < 4 else 2) if side == "python" else 1
+        for invocation in range(count):
+            if side == "python":
+                base = f"private/log-validation/boot-{mode}-{invocation:02d}"
+                remove(base, "directory")
+                remove(base + "/private", "directory")
+                remove(base + "/evidence", "directory")
+                log = base + "/private/" + stage + ".log"
+                command_name = base + "/evidence/command-" + stage + ".json"
+            else:
+                base = "boot-" + mode
+                log = base + "/" + stage + ".log"
+                command_name = base + "/command-" + stage + ".json"
+            try:
+                log_bytes = checked_file(runtime / "compute" / log, 64 * 1024)
+                command_raw = checked_file(runtime / "compute" /
+                                           command_name)
+            except OSError:
+                raise ParityError("validator retained output inaccessible") from None
+            command_record = parsed(command_raw, reference)
+            checked_stage(command_record, log_bytes, side, reference,
+                          stage, seen)
+            result = parsed(log_bytes, reference)
+            check(set(result) == {
+                "schema", "schema_version", "mode", "raw_serial_bytes",
+                "raw_serial_sha256", "compute",
+            } and result["schema"] == "uk.wamr.log-validation"
+              and result["schema_version"] == 1
+              and result["mode"] == "tiny"
+              and result["raw_serial_bytes"] == len(serial)
+              and result["raw_serial_sha256"] == sha(serial)
+              and result["compute"] == records[mode + "-compute.json"][1]["compute"],
+                  "validator result commitment changed")
+            remove(log, "file", len(log_bytes))
+            remove(command_name, "file", len(command_raw))
+
+
+def reviewed_boot_retained(left, right, first, second):
+    results = []
+    for seen, side, entries in ((left, "python", first),
+                                (right, "native", second)):
+        entries = dict(entries)
+        reviewed_validator_outputs(seen, side, entries)
+        for mode in MODES:
+            path = "boot-" + mode + "/request.json"
+            request = checked_file(seen["roots"][0] / "compute" / path, 64 * 1024)
+            check(entries[path] == ("file", 0o600, len(request)),
+                  "boot request retained size changed")
+            entries[path] = ("file", 0o600, "<verified-request-size>")
+        for job_name in ("qcow2-job.json", "vhd-job.json"):
+            job = verified_image_job(seen, job_name)
+            path = "package/" + job_name
+            raw = checked_file(seen["roots"][0] / "compute" / path, 64 * 1024)
+            check(entries[path] == ("file", 0o600, len(raw))
+                  and job["state_dir"] == str(seen["roots"][0] / "compute/package"),
+                  "image job retained size changed")
+            entries[path] = ("file", 0o600, "<verified-image-job-size>")
+        results.append(entries)
+    return results
+
+
 def compare_observations(left, right, reviewed_build_compat=False):
     failures = []
     for key in ("returncode",):
@@ -1961,6 +2295,7 @@ def compare_observations(left, right, reviewed_build_compat=False):
     verified_tool_roles = "native-image" in checked_commands
     local_boots = None
     checked_acceptance = False
+    reviewed_boots = False
     if "local-boot-tool" in checked_commands:
         local_boots, install_failures = compare_local_boot_installs(left, right)
         failures.extend(install_failures)
@@ -1975,11 +2310,29 @@ def compare_observations(left, right, reviewed_build_compat=False):
                         checked_stage(r_records[name][1], right["files"]["command_logs"][stage],
                                       "native", right["reference"], stage, right),
                     )
+            if (set(REVIEWED_BOOT_COMMANDS) <= checked_commands.keys()
+                    and all(mode + "-compute.json" in records
+                            for records in (l_records, r_records)
+                            for mode in MODES)
+                    and all(name in records for records in (l_records, r_records)
+                            for name in ("qcow2-finalization.json",
+                                         "fixed-vhd-derivation.json"))):
+                for mode in MODES:
+                    reviewed_mode(left, right, mode)
+                for name in ("qcow2-finalization.json",
+                             "fixed-vhd-derivation.json"):
+                    reviewed_image_provenance(left, right, name)
+                reviewed_boots = True
             if ("qcow2-acceptance.json" in l_records
                     and "qcow2-acceptance.json" in r_records):
-                failures.extend(compare_qcow2_acceptance(left, right))
+                failures.extend(compare_qcow2_acceptance(
+                    left, right, MODES[:4] if reviewed_boots else None))
                 checked_acceptance = True
-    if proven and "boot-inputs.json" in l_records and "boot-inputs.json" in r_records:
+            if reviewed_boots:
+                reviewed_vhd_gate(left, right)
+                reviewed_final_inspection(left, right)
+    if (proven and not reviewed_boots
+            and "boot-inputs.json" in l_records and "boot-inputs.json" in r_records):
         for name in ("qcow2-finalization.json", "fixed-vhd-derivation.json"):
             if name in l_records and name in r_records:
                 a_intent = verified_image_provenance(left, name)
@@ -2010,6 +2363,9 @@ def compare_observations(left, right, reviewed_build_compat=False):
             if "build.json" in l_records and "build.json" in r_records:
                 left_value, right_value = reviewed_side_specific_outputs(
                     left, right, left_value, right_value)
+            if reviewed_boots:
+                left_value, right_value = reviewed_boot_retained(
+                    left, right, left_value, right_value)
         if left_value != right_value:
             failures.append(key)
             if key == "retained":
@@ -2039,7 +2395,12 @@ def compare_observations(left, right, reviewed_build_compat=False):
     for name in (record for record in ORDER if record in l_records and record in r_records):
         if ((name == "build-start.json" and proven)
                 or (name == "boot-inputs.json" and local_boots is not None)
-                or (name == "qcow2-acceptance.json" and checked_acceptance)):
+                or (name == "qcow2-acceptance.json" and checked_acceptance)
+                or (reviewed_boots and name in {
+                    *(mode + "-compute.json" for mode in MODES),
+                    "qcow2-finalization.json", "fixed-vhd-derivation.json",
+                    "fixed-vhd-derivation-gate.json", "final-inspection.json",
+                })):
             continue
         stage = name.removeprefix("command-").removesuffix(".json")
         if name == f"command-{stage}.json" and stage in checked_commands:
@@ -2851,7 +3212,7 @@ class DeterministicContracts(unittest.TestCase):
                             altered, log + b"tampered" if change == "log" else log,
                             side, reference)
         for stage in ("adapter", "local-boot-tool", *SHARED_BUILD_STAGES,
-                      *REVIEWED_BOOT_COMMANDS):
+                      *REVIEWED_BOOT_COMMANDS, *REVIEWED_VALIDATOR_COMMANDS):
             python = synthetic("python", b"synthetic-python-build-ok\n", stage)
             native = synthetic("native", b"synthetic-native-build-ok\n", stage)
             with self.subTest(stage=stage):
@@ -2881,6 +3242,11 @@ class DeterministicContracts(unittest.TestCase):
                             payload = request[field]
                             if field == "argv":
                                 payload[1] = reference.command_literal("altered")
+                            elif not payload:
+                                payload.append({
+                                    "name": "UNREVIEWED",
+                                    "value": reference.command_literal("altered"),
+                                })
                             else:
                                 payload[0]["value"] = reference.command_literal(
                                     "altered")
@@ -3295,6 +3661,241 @@ class DeterministicContracts(unittest.TestCase):
             report["report"]["serial_sha256"] = "0" * 64
             with self.assertRaisesRegex(ParityError, "serial/report commitment"):
                 serial_differences(*sides)
+
+    def test_reviewed_mode_requires_physical_pins_and_semantic_serial(self):
+        reference = oracle()
+        with tempfile.TemporaryDirectory() as temp:
+            observations = []
+            for name, pid, stamp in (("python", 123, b"1.000001"),
+                                     ("native", 456, b"9.123456")):
+                runtime = Path(temp) / name
+                work = runtime / "compute/boot-raw-x2apic"
+                for directory in (work, runtime / "compute/package",
+                                  runtime / "firmware", runtime / "bin"):
+                    directory.mkdir(parents=True, exist_ok=True)
+                config = reference.config_for(
+                    runtime, runtime / "compute", 0, reference.SIX_MODES)
+                paths = (config["source"]["path"], config["ovmf_code"],
+                         config["ovmf_vars"], config["qemu"])
+                pins = []
+                for path in paths:
+                    file = Path(path)
+                    file.write_bytes(b"paired physical boot input")
+                    file.chmod(0o600)
+                    record, _ = reference.physical_file_record(file)
+                    pins.append(reference.pin_from_record(record))
+                request = reference.compact_json({
+                    "schema_version": 2, "supervisor_pid": pid,
+                    "config": config, "pins": pins,
+                }, newline=True)
+                serial = (b"Hyper-V Hv#1 hypercall page enabled\n"
+                          b"Hyper-V SynIC:\nPowered by\nCalling main(0, 0)\n"
+                          b"WAMR_NATIVE_AOT_OK answer=42 teardown=0\n[    " +
+                          stamp + b"] Info: [libukboot] main returned 0\n")
+                report = reference.compact_json({
+                    "schema_version": 1, "scope": "public_local_qemu_only",
+                    "acceptance": "not_established",
+                    "passed": True, "consumed": True, "cleanup_complete": True,
+                    "input_unchanged": True, "serial_valid": True,
+                    "serial_limit_reached": False, "serial_bytes": len(serial),
+                    "serial_sha256": sha(serial), "termination": {"exited": 0},
+                    "failures": {
+                        "primary": None, "cleanup": None, "recording": None,
+                    },
+                }, newline=True)
+                for filename, raw in (("request.json", request),
+                                      ("report.json", report),
+                                      ("hyperv-efi-boot.log", serial)):
+                    file = work / filename
+                    file.write_bytes(raw)
+                    file.chmod(0o600)
+                record = {
+                    "scope": "local_native_compute_only",
+                    "report": parsed(report, reference), "input_pins": pins,
+                    "request_sha256": sha(request),
+                    "report_sha256": sha(report),
+                    "compute": {"answer": 42},
+                }
+                observations.append({
+                    "reference": reference, "roots": (runtime, PROJECT),
+                    "files": {"records": {
+                        "raw-x2apic-compute.json": (
+                            reference.compact_json(record, newline=True),
+                            record),
+                    }},
+                })
+            left, right = observations
+            self.assertNotEqual(
+                left["files"]["records"]["raw-x2apic-compute.json"][1][
+                    "request_sha256"],
+                right["files"]["records"]["raw-x2apic-compute.json"][1][
+                    "request_sha256"])
+            self.assertEqual(len(reviewed_mode(left, right, "raw-x2apic")), 2)
+            request = right["roots"][0] / "compute/boot-raw-x2apic/request.json"
+            request.write_bytes(request.read_bytes().replace(
+                b'"supervisor_pid":456', b'"supervisor_pid":457'))
+            with self.assertRaisesRegex(ParityError, "request/compute"):
+                reviewed_mode(left, right, "raw-x2apic")
+
+    def test_image_job_retained_size_requires_own_pins_and_config(self):
+        reference = oracle()
+        with tempfile.TemporaryDirectory() as temp:
+            runtime = Path(temp)
+            package = runtime / "compute/package"
+            package.mkdir(parents=True)
+            raw = package / "unikraft.raw"
+            raw.write_bytes(b"small physical image")
+            raw.chmod(0o600)
+            physical, _ = reference.physical_file_record(raw)
+            tool = {
+                "path": str(runtime / "compute/tools/bin/wamr-ci-package"),
+                "metadata": [0, 0, 0, 0, 0, 1, 42],
+                "sha256": "b" * 64,
+            }
+            intent = {
+                "source_path": str(raw),
+                "expected_source_sha256": physical["sha256"],
+                "expected_source_bytes": raw.stat().st_size,
+                "expected_virtual_bytes": raw.stat().st_size,
+                "expected_workload_sha256": "c" * 64,
+                "expected_workload_bytes": 19,
+                "limits": {"max_input_bytes": 42},
+            }
+            intent_raw = reference.compact_json(intent, newline=True)
+            ownership = {
+                "device_major": 1, "device_minor": 2, "inode": 3,
+                "mode": stat.S_IFREG | 0o600, "uid": os.getuid(), "nlink": 1,
+            }
+            job = {
+                "schema_version": 2, "supervisor_pid": 123,
+                "state_dir": str(package),
+                "attempt": {
+                    "schema": "uk.wamr.compute-attempt-ownership",
+                    "schema_version": 1, "kind": "qcow2",
+                    "stage": {
+                        **ownership, "mode": stat.S_IFDIR | 0o700, "nlink": 2,
+                    },
+                    "output": ownership, "record": ownership,
+                },
+                "source": {
+                    "artifact": {
+                        "path": str(raw), "size": raw.stat().st_size,
+                        "sha256": physical["sha256"],
+                    },
+                    "pin": reference.pin_from_record(physical),
+                },
+                "producer": {
+                    "path": tool["path"], "size": tool["metadata"][6],
+                    "sha256": tool["sha256"],
+                },
+                "expected_virtual_bytes": intent["expected_virtual_bytes"],
+                "expected_workload_sha256": intent["expected_workload_sha256"],
+                "expected_workload_bytes": intent["expected_workload_bytes"],
+                "limits": intent["limits"],
+                "config_sha256": sha(IMAGE_CONFIG_DOMAIN + intent_raw),
+            }
+            job_path = package / "qcow2-job.json"
+            job_path.write_bytes(reference.compact_json(job, newline=True))
+            job_path.chmod(0o600)
+            seen = {
+                "roots": (runtime, PROJECT), "reference": reference,
+                "files": {"records": {
+                    "qcow2-finalization-intent.json": (intent_raw, intent),
+                    "boot-inputs.json": (b"", {"files": {
+                        "package_tool": tool,
+                    }}),
+                }},
+            }
+            self.assertEqual(verified_image_job(seen, job_path.name), job)
+            changed = copy.deepcopy(job)
+            changed["source"]["pin"]["sha256"] = [0] * 32
+            job_path.write_bytes(reference.compact_json(changed, newline=True))
+            with self.assertRaisesRegex(ParityError, "source/config"):
+                verified_image_job(seen, job_path.name)
+
+    def test_validator_retained_slots_bind_each_raw_serial_and_compute(self):
+        reference = oracle()
+        with tempfile.TemporaryDirectory() as temp:
+            for side in ("python", "native"):
+                with self.subTest(side=side):
+                    runtime = Path(temp) / side
+                    entries = {}
+                    records = {}
+
+                    def write(relative, raw):
+                        path = runtime / "compute" / relative
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_bytes(raw)
+                        path.chmod(0o600)
+                        entries[relative] = ("file", 0o600, len(raw))
+                        return path
+
+                    if side == "python":
+                        entries["private/log-validation"] = (
+                            "directory", 0o700, None)
+                    for index, mode in enumerate(MODES):
+                        serial = (mode + "\n").encode()
+                        report = reference.compact_json({
+                            "serial_bytes": len(serial),
+                            "serial_sha256": sha(serial),
+                        }, newline=True)
+                        write("boot-" + mode + "/hyperv-efi-boot.log", serial)
+                        write("boot-" + mode + "/report.json", report)
+                        records[mode + "-compute.json"] = (b"", {
+                            "report": parsed(report, reference),
+                            "report_sha256": sha(report),
+                            "compute": {"answer": 42},
+                        })
+                        stage = ("log-validator-legacy" if index % 2 else
+                                 "log-validator-x2apic")
+                        result = reference.compact_json({
+                            "schema": "uk.wamr.log-validation",
+                            "schema_version": 1, "mode": "tiny",
+                            "raw_serial_bytes": len(serial),
+                            "raw_serial_sha256": sha(serial),
+                            "compute": {"answer": 42},
+                        }, newline=True)
+                        count = (3 if index < 4 else 2) if side == "python" else 1
+                        for invocation in range(count):
+                            if side == "python":
+                                base = (f"private/log-validation/"
+                                        f"boot-{mode}-{invocation:02d}")
+                                for relative in (base, base + "/private",
+                                                 base + "/evidence"):
+                                    entries[relative] = ("directory", 0o700, None)
+                                log = base + "/private/" + stage + ".log"
+                                command_name = (
+                                    base + "/evidence/command-" + stage + ".json")
+                            else:
+                                base = "boot-" + mode
+                                log = base + "/" + stage + ".log"
+                                command_name = base + "/command-" + stage + ".json"
+                            write(log, result)
+                            write(command_name, b"{}\n")
+                    seen = {
+                        "reference": reference, "roots": (runtime, PROJECT),
+                        "files": {"records": records},
+                    }
+                    with mock.patch.dict(
+                            reviewed_validator_outputs.__globals__,
+                            {"checked_stage": lambda *args: None}):
+                        cleaned = dict(entries)
+                        reviewed_validator_outputs(seen, side, cleaned)
+                        self.assertEqual(
+                            set(entries) - set(cleaned),
+                            {name for name in entries if (
+                                name.startswith("private/log-validation") or
+                                name.endswith((".log", ".json")) and
+                                "log-validator" in name)})
+                        if side == "native":
+                            changed = runtime / (
+                                "compute/boot-raw-x2apic/log-validator-x2apic.log")
+                            changed.write_bytes(changed.read_bytes().replace(
+                                b'"answer":42', b'"answer":43'))
+                            with self.assertRaisesRegex(
+                                    ParityError, "validator retained slot changed|"
+                                    "validator result commitment changed"):
+                                reviewed_validator_outputs(seen, side, dict(entries))
 
     def test_side_specific_retained_outputs_require_physical_contracts(self):
         reference = oracle()
@@ -3932,6 +4533,8 @@ class DeterministicContracts(unittest.TestCase):
                   for mode in reference.SIX_MODES[:4]
                   for field in ("request_sha256", "compute_sha256")),
             ])
+            self.assertEqual(
+                compare_qcow2_acceptance(python, native, MODES[:4]), [])
 
             def mutated_acceptance(side, value):
                 seen = observations[side]
