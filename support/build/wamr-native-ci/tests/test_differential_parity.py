@@ -1396,10 +1396,20 @@ def build_image_differences(left, right):
             reviewed_image_command(right))
         if len(first_command) != len(second_command):
             failures.append("record_content:build.json.image.command.count")
-        failures.extend(
-            "record_content:build.json.image.command.arg-" + str(index)
-            for index, (one, two) in enumerate(zip(first_command, second_command))
-            if one != two)
+        for index, (one, two) in enumerate(zip(first_command, second_command)):
+            if one == two:
+                continue
+            failures.append("record_content:build.json.image.command.arg-" +
+                            str(index))
+            first_tool = image_command_tool_path_class(left, index)
+            second_tool = image_command_tool_path_class(right, index)
+            if first_tool is not None and second_tool is not None:
+                check(first_tool[0] == second_tool[0],
+                      "image command tool role changed")
+                failures.append(
+                    "record_content:build.json.image.command.tool." +
+                    first_tool[0] + "." + first_tool[1] + "-to-" +
+                    second_tool[1])
     for field in ("runtime_inputs_sha256", "solved_config_sha256",
                   "application_sources", "tools"):
         check(field in first, "missing build image field")
@@ -1445,6 +1455,36 @@ IMAGE_TOOL_OPTIONS = {
     "-Dmake-arg=READELF=": ("llvm-readelf", ""),
     "-Dmake-arg=STRIP=": ("llvm-strip", ""),
 }
+
+
+def image_command_tool_path_class(side, index):
+    command = side["files"]["records"]["build.json"][1]["image"]["command"]
+    if index == 0:
+        role, path = "zig", command[0]
+    else:
+        for prefix, (role, suffix) in IMAGE_TOOL_OPTIONS.items():
+            arg = command[index]
+            if arg.startswith(prefix) and arg.endswith(suffix):
+                path = arg[len(prefix):len(arg) - len(suffix) if suffix else len(arg)]
+                break
+        else:
+            return None
+    if re.fullmatch(r"/proc/(?:self|[1-9][0-9]*)/fd/[0-9]+", path):
+        kind = "retained"
+    else:
+        records = side["files"]["records"]
+        pinned = records.get("build-start.json", (None, {}))[1].get(
+            "consumer_inputs", {}).get("files", {}).get("tool:" + role, {})
+        if path == pinned.get("path"):
+            kind = "bound"
+        elif any(path == str(root) or path.startswith(str(root) + "/")
+                 for root in side["roots"]):
+            kind = "root"
+        elif path.startswith("/"):
+            kind = "absolute"
+        else:
+            kind = "other"
+    return role, kind
 
 
 def reviewed_image_command(side):
@@ -2729,6 +2769,15 @@ class DeterministicContracts(unittest.TestCase):
         self.assertEqual(one, two)
         self.assertEqual(compare_observations(first, second), [])
         second_command = second["files"]["records"]["build.json"][1]["image"]["command"]
+        original_make = second_command[12]
+        second_command[12] = "-Dmake-command=/opt/make"
+        self.assertEqual(compare_observations(first, second), [
+            "record_content:build.json",
+            "record_content:build.json.image",
+            "record_content:build.json.image.command.arg-12",
+            "record_content:build.json.image.command.tool.make.retained-to-absolute",
+        ])
+        second_command[12] = original_make
         second_command[0] = "/proc/202/fd/999"
         with self.assertRaisesRegex(ParityError, "image command tool role changed"):
             reviewed_image_command(second)

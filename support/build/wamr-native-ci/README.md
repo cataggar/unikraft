@@ -702,6 +702,9 @@ difference reports only fixed top-level and image
 argument-position labels. Retained-output differences report only fixed
 private, fixture, package, public-source or boot-slot roles and changed
 membership, mode, type or size, never raw filenames or log contents.
+Differing selected image-command tool paths additionally report only their
+fixed roles and path classes (retained descriptor, bound producer tool,
+checkout/private root, other absolute path, or other), never path values.
 At completed builds, the Python-only Zig and supervisor version logs must
 match their pinned versions, its supervisor build log must be bounded and
 free of known error markers, and its source-metadata diagnostic must be a
