@@ -190,6 +190,11 @@ jobs:
           mkdir -p -m 700 "${zig_dir}"
           cp -a -- "${zig_source}/." "${zig_dir}/"
           chmod -R u=rwX,go= "${zig_dir}"
+          for output in /d/wamr-ci/wamr-differential-sources /d/wamr-ci/wamr-differential; do
+            test ! -e "${output}"
+            test ! -L "${output}"
+            mkdir -m 700 -- "${output}"
+          done
           mkdir -m 700 "${root}/firmware"
           cp --no-preserve=mode,ownership \
             "$(readlink -f /usr/share/OVMF/OVMF_CODE_4M.fd)" "${root}/firmware/code.fd"

@@ -684,6 +684,30 @@ def require_public_consumer_paths(handoff, runtime, consumer_inputs):
     return consumer_inputs
 
 
+def public_consumer_custody_stage(handoff, kind, role):
+    if kind == "file":
+        if role in {f"tool:{name}" for name in handoff.ci.HOST_TOOLS}:
+            label = role.replace(":", "-")
+        elif role.startswith("runtime:"):
+            label = "runtime"
+        elif role in {
+                "command-supervisor", "wamr-source-archive",
+                handoff.ci.WAMR_AOT_BUILD_ROLE,
+                handoff.ci.WAMR_LOG_VALIDATOR_ROLE}:
+            label = {
+                handoff.ci.WAMR_AOT_BUILD_ROLE: "native-build",
+                handoff.ci.WAMR_LOG_VALIDATOR_ROLE: "native-validator",
+            }.get(role, role)
+        else:
+            label = "other-file"
+    elif kind == "tree":
+        label = role if role in {
+            "bison", "python-stdlib", "zig", "llvm"} else "other-tree"
+    else:
+        label = "aggregate"
+    handoff.FAILURE_STAGE = "public-build-start-consumer-custody-" + label
+
+
 def accepted_public_build_start(handoff, runtime):
     ci = handoff.ci
     handoff.FAILURE_STAGE = "public-build-start-shape"
@@ -711,7 +735,9 @@ def accepted_public_build_start(handoff, runtime):
     require_consumer_tree_roles(start["consumer_inputs"], False)
     handoff.FAILURE_STAGE = "public-build-start-consumer-custody"
     ci.require_recorded_consumer_inputs(
-        start["consumer_inputs"], content=True)
+        start["consumer_inputs"], content=True,
+        on_role=lambda kind, role: public_consumer_custody_stage(
+            handoff, kind, role))
     require_public_consumer_paths(handoff, runtime, start["consumer_inputs"])
 
     handoff.FAILURE_STAGE = "public-build-start-dependencies"

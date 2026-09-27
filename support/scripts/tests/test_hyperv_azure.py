@@ -2767,6 +2767,33 @@ class HypervWorkflowTest(unittest.TestCase):
         ):
             self.assertIn(f"refuse {refusal}", driver)
 
+    def test_wamr_paired_slots_are_reserved_before_build_custody(self):
+        workflow = (
+            SUPPORT.parent / ".github/workflows/wamr-native-compute.yaml"
+        ).read_text()
+        build_step = workflow.split(
+            "      - name: Build the tiny AOT image with the installed native producer and safety graph\n",
+            1,
+        )[1].split("\n      - name: Run six Python boots", 1)[0]
+        slots = (
+            "for output in /d/wamr-ci/wamr-differential-sources "
+            "/d/wamr-ci/wamr-differential; do"
+        )
+        self.assertLess(
+            build_step.index(slots),
+            build_step.index("python3 support/build/wamr-native-ci/run.py build"))
+        driver = (
+            SUPPORT.parent / ".github/scripts/wamr-native-ci.sh"
+        ).read_text()
+        for required in (
+            "shopt -s nullglob dotglob",
+            'entries=("${output}"/*)',
+            'entries=("${source_root}"/*)',
+            'refuse prior-parity-output',
+        ):
+            self.assertIn(required, driver)
+        self.assertNotIn('rmdir -- "${source_root}"', driver)
+
     def test_wamr_cpu_report_preserves_source_without_bytecode_environment(self):
         workflow = (
             SUPPORT.parent / ".github/workflows/wamr-native-compute.yaml"

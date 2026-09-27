@@ -973,9 +973,10 @@ class Evidence(unittest.TestCase):
         owner = type("Handoff", (), {"ci": ci})
         events = []
 
-        def recorded(expected, content=False):
+        def recorded(expected, content=False, on_role=None):
             self.assertIs(expected, consumer)
             self.assertTrue(content)
+            self.assertIsNotNone(on_role)
             self.assertIsNone(ci.COMMAND_SUPERVISOR_PATH)
             events.append("consumer")
 
@@ -1096,6 +1097,64 @@ class Evidence(unittest.TestCase):
                 owner.FAILURE_STAGE,
                 "public-build-start-consumer-roles"
                 if case == "missing" else "public-build-start-consumer-custody")
+
+    def test_public_custody_reports_fixed_role_without_recorded_paths(self):
+        inputs = self.root / "public-custody-roles"
+        tree = inputs / "zig"
+        tree.mkdir(parents=True, mode=0o700)
+        paths = {
+            "native:wamr-aot-build": inputs / "native",
+            "runtime:/private/untrusted-path": inputs / "loader",
+            "tool:git": inputs / "git",
+        }
+        for path in (*paths.values(), tree / "data"):
+            self.put(path, b"baseline")
+        owner = types.SimpleNamespace(ci=ci, FAILURE_STAGE="handoff")
+        for role, path, label in (
+                ("native:wamr-aot-build", paths["native:wamr-aot-build"],
+                 "native-build"),
+                ("runtime:/private/untrusted-path",
+                 paths["runtime:/private/untrusted-path"], "runtime"),
+                ("tool:git", paths["tool:git"], "tool-git"),
+                ("zig", tree / "data", "zig")):
+            with self.subTest(role=label):
+                expected = ci.record_input_paths(paths, {"zig": tree})
+                ci.require_recorded_consumer_inputs(
+                    expected, content=True,
+                    on_role=lambda kind, name:
+                    public_bundle.public_consumer_custody_stage(
+                        owner, kind, name))
+                self.assertEqual(
+                    owner.FAILURE_STAGE,
+                    "public-build-start-consumer-custody-aggregate")
+                path.write_bytes(b"changed")
+                with self.assertRaises(ci.Refusal):
+                    ci.require_recorded_consumer_inputs(
+                        expected, content=True,
+                        on_role=lambda kind, name:
+                        public_bundle.public_consumer_custody_stage(
+                            owner, kind, name))
+                self.assertEqual(
+                    owner.FAILURE_STAGE,
+                    "public-build-start-consumer-custody-" + label)
+
+    def test_precreated_parity_slots_preserve_recorded_runtime_ancestor(self):
+        parent = self.root / "paired-parent"
+        runtime = parent / "runtime"
+        sources = parent / "sources"
+        comparison = parent / "comparison"
+        for directory in (runtime, sources, comparison):
+            directory.mkdir(parents=True, mode=0o700)
+        tool = runtime / "tool"
+        self.put(tool, b"bound")
+        expected = ci.record_input_paths({"tool:git": tool}, {})
+        (sources / "python").mkdir(mode=0o700)
+        (comparison / "result").mkdir(mode=0o700)
+        (sources / "python").rmdir()
+        ci.require_recorded_consumer_inputs(expected, content=True)
+        (parent / "late-slot").mkdir(mode=0o700)
+        with self.assertRaisesRegex(ci.Refusal, "directory custody changed"):
+            ci.require_recorded_consumer_inputs(expected, content=True)
 
     def test_public_context_binds_installed_log_validator_or_refuses(self):
         runtime = self.root / "public-validator-runtime"

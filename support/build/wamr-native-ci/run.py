@@ -1133,7 +1133,7 @@ def canonical_input_paths(paths, reason):
 
 
 def record_input_paths(file_paths, tree_paths, content=True, expected=None,
-                       scope="consumer"):
+                       scope="consumer", on_role=None):
     require(scope in ("consumer", "boot"), "invalid input custody scope")
     file_paths = canonical_input_paths(
         file_paths, "invalid consumer input file discovery")
@@ -1195,6 +1195,8 @@ def record_input_paths(file_paths, tree_paths, content=True, expected=None,
             for name, path in tree_paths.items()
         ), f"{scope} input tree paths changed")
     for name, path in sorted(file_paths.items()):
+        if on_role is not None:
+            on_role("file", name)
         prior = None if expected is None else expected["files"][name]
         record, components = physical_file_record(
             path, content=content,
@@ -1204,8 +1206,12 @@ def record_input_paths(file_paths, tree_paths, content=True, expected=None,
             require_input_directories(
                 components, expected["directories"],
                 input_directory_custody_reason("file", name))
+            if on_role is not None:
+                require(record == prior, f"{scope} input file custody changed")
         merge_directory_records(directories, components)
     for name, path in sorted(tree_paths.items()):
+        if on_role is not None:
+            on_role("tree", name)
         prior = None if expected is None else expected["trees"][name]
         record, components = physical_tree_record(
             path, content=content,
@@ -1216,7 +1222,11 @@ def record_input_paths(file_paths, tree_paths, content=True, expected=None,
             require_input_directories(
                 components, expected["directories"],
                 input_directory_custody_reason("tree", name))
+            if on_role is not None:
+                require(record == prior, f"{scope} input tree custody changed")
         merge_directory_records(directories, components)
+    if on_role is not None:
+        on_role("aggregate", "")
     result = {
         "schema": "uk.wamr.consumer-input-custody",
         "version": 2,
@@ -4398,7 +4408,7 @@ def require_consumer_inputs(runtime, expected, content=False):
         runtime, content=content, expected=expected)
 
 
-def require_recorded_consumer_inputs(expected, content=False):
+def require_recorded_consumer_inputs(expected, content=False, on_role=None):
     record_input_paths(
         {
             name: Path(record["path"])
@@ -4408,7 +4418,7 @@ def require_recorded_consumer_inputs(expected, content=False):
             name: Path(record["path"])
             for name, record in expected["trees"].items()
         },
-        content=content, expected=expected,
+        content=content, expected=expected, on_role=on_role,
     )
 
 

@@ -27,11 +27,15 @@ comparison_root=/d/wamr-ci/wamr-differential
 controller=/d/wamr-ci/wamr-differential-controller/controller/bin/uk-wamr-native-ci
 python_source="${source_root}/python"
 native_source="${source_root}/native"
-[[ ! -e "${source_root}" && ! -L "${source_root}" &&
-   ! -e "${comparison_root}" && ! -L "${comparison_root}" ]] ||
-  refuse prior-parity-output
+shopt -s nullglob dotglob
+for output in "${source_root}" "${comparison_root}"; do
+  [[ -d "${output}" && ! -L "${output}" ]] || refuse prior-parity-output
+  [[ "$(stat -c '%u:%g:%a' "${output}")" == "$(id -u):$(id -g):700" ]] ||
+    refuse prior-parity-output
+  entries=("${output}"/*)
+  (( ${#entries[@]} == 0 )) || refuse prior-parity-output
+done
 [[ -x "${controller}" ]] || refuse native-controller-unavailable
-mkdir -m 0700 -- "${source_root}" "${comparison_root}"
 cleanup() {
   status=$?
   trap - EXIT
@@ -40,7 +44,8 @@ cleanup() {
       git worktree remove --force -- "${source}" || status=1
     fi
   done
-  rmdir -- "${source_root}" || status=1
+  entries=("${source_root}"/*)
+  if (( ${#entries[@]} != 0 )); then status=1; fi
   exit "${status}"
 }
 trap cleanup EXIT

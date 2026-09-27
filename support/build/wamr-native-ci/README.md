@@ -819,7 +819,11 @@ The protected job builds and boots from the fixed private
 `/d/wamr-ci/wamr-native-runtime` root, with the sealed Zig distribution
 beside it under `/d/wamr-ci/wamr-native-tools`; the root-owned `/d` boundary
 and precreated private `wamr-ci` directory avoid mutable hosted-runner home
-ancestors while retaining exact component custody. Its authenticated QEMU
+ancestors while retaining exact component custody. Both paired-comparison
+output slots are created before the build-start baseline and checked empty
+before use. The source slot stays in place after worktree cleanup: creating
+or removing it later would change the recorded `/d/wamr-ci` ancestor metadata
+even if no retained input bytes changed. Its authenticated QEMU
 `libfdt` runtime is established before the build-input baseline and removed
 by exact recorded identity only after final handoff revalidation, so neither
 boot setup nor pre-export cleanup can mutate a recorded system-library
@@ -833,7 +837,8 @@ recheck, recomputes the exact source, dependency, Bison, consumer and guarded
 supervisor custody, and only then binds the full recorded tool set and the
 fixed-runtime supervisor. It repeats the full custody check after binding.
 Pre-export refusal names only a fixed result, build-start schema/consumer
-role/tree/custody or physical path role/binary/runtime/tree, dependency/custody,
+role/tree/custody (with a fixed allowlisted file or tree role when physical
+custody changes), physical path role/binary/runtime/tree, dependency/custody,
 or CI environment/source/binding stage; it does not print recorded paths,
 content, hashes, or private runner state.
 If the native log validator is installed, the preflight requires its recorded
