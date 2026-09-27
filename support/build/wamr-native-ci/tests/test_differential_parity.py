@@ -1280,6 +1280,19 @@ def debug_string_differences(first, second, left, right):
                         b"/artifacts/embedded.c", b"/libuklibid/",
                         b"/appwamraot/")):
                 categories.add("source-root.app-build-other")
+                tail = entry.split(app_build + b"/", 1)[1]
+                categories.add("source-root.app-build.immediate-child"
+                               if b"/" not in tail else
+                               "source-root.app-build.nested-child")
+                for name, label in (
+                        (b"artifacts", "artifacts-dir"),
+                        (b"include", "include-dir"),
+                        (b"native-environment", "native-environment"),
+                        (b"tool", "tool-output"),
+                        (b".zig-cache", "zig-cache"),
+                        (b".d", "dependency-output")):
+                    if tail == name or tail.startswith(name + b"/"):
+                        categories.add("source-root.app-build." + label)
                 for suffix, label in (
                         (b"/include/", "generated-include"),
                         (b"/artifacts/", "generated-artifacts"),
@@ -1294,6 +1307,9 @@ def debug_string_differences(first, second, left, right):
                     categories.add("source-root.app-build.generated-c")
                 elif entry.endswith(b".h"):
                     categories.add("source-root.app-build.generated-header")
+                elif entry.endswith((b".a", b".dbg", b".json", b".cmd",
+                                     b".wasm", b".cwasm", b".ld", b".S")):
+                    categories.add("source-root.app-build.other-file")
             if b"-fdebug-prefix-map=" in entry or b"-ffile-prefix-map=" in entry:
                 categories.add("source-root.recorded-switch")
             for suffix, label in (
@@ -2522,6 +2538,12 @@ class DeterministicContracts(unittest.TestCase):
             debug_string_differences(
                 b"/private/first/support/apps/wamr-aot/build/include/uk/bits/config.h\0",
                 b"/private/second/support/apps/wamr-aot/build/include/uk/bits/config.h\0",
+                left, right))
+        self.assertIn(
+            "record_content:build.json.image.files.debug.debug_str.source-root.app-build.artifacts-dir",
+            debug_string_differences(
+                b"/private/first/support/apps/wamr-aot/build/artifacts\0",
+                b"/private/second/support/apps/wamr-aot/build/artifacts\0",
                 left, right))
 
     def test_runtime_input_diagnostics_name_only_fixed_roles(self):
