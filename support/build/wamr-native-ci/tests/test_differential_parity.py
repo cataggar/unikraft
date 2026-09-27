@@ -1280,6 +1280,20 @@ def debug_string_differences(first, second, left, right):
                         b"/artifacts/embedded.c", b"/libuklibid/",
                         b"/appwamraot/")):
                 categories.add("source-root.app-build-other")
+                for suffix, label in (
+                        (b"/include/", "generated-include"),
+                        (b"/artifacts/", "generated-artifacts"),
+                        (b"/lib", "library-output"),
+                        (b"/plat", "platform-output"),
+                        (b"/kconfig/", "kconfig-output")):
+                    if app_build + suffix in entry:
+                        categories.add("source-root.app-build." + label)
+                if entry.endswith(b".o"):
+                    categories.add("source-root.app-build.object")
+                elif entry.endswith(b".c"):
+                    categories.add("source-root.app-build.generated-c")
+                elif entry.endswith(b".h"):
+                    categories.add("source-root.app-build.generated-header")
             if b"-fdebug-prefix-map=" in entry or b"-ffile-prefix-map=" in entry:
                 categories.add("source-root.recorded-switch")
             for suffix, label in (
@@ -2502,6 +2516,12 @@ class DeterministicContracts(unittest.TestCase):
             debug_string_differences(
                 b"/private/first/support/apps/wamr-aot/build\0",
                 b"/private/second/support/apps/wamr-aot/build\0",
+                left, right))
+        self.assertIn(
+            "record_content:build.json.image.files.debug.debug_str.source-root.app-build.generated-include",
+            debug_string_differences(
+                b"/private/first/support/apps/wamr-aot/build/include/uk/bits/config.h\0",
+                b"/private/second/support/apps/wamr-aot/build/include/uk/bits/config.h\0",
                 left, right))
 
     def test_runtime_input_diagnostics_name_only_fixed_roles(self):
