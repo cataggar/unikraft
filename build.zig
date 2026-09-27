@@ -249,7 +249,7 @@ pub fn build(b: *std.Build) void {
         .host_cxx = b.option([]const u8, "host-cxx", "Host C++ compiler command (Make HOSTCXX=)"),
         .host_cflags = b.option([]const u8, "host-cflags", "Host compiler flags (Make HOSTCFLAGS=)"),
         .forwarded = b.option([]const []const u8, "make-arg", "Allowlisted NAME=VALUE tool/flag assignment; may be repeated") orelse &.{},
-        .ci_portable_config = b.option(bool, "ci-portable-config", "Use checkout-independent Kconfig path defaults (paired CI only)") orelse false,
+        .ci_portable_config = b.option(bool, "ci-portable-config", "Use checkout-independent Kconfig and target Zig objects (paired CI only)") orelse false,
         .native_environment = if (selected_environment) |selected| selected.value else null,
     };
 
@@ -2194,6 +2194,7 @@ fn registerNativePipeline(
 
     const target_objects = native_target_object.execute(b, registered.graph, .{
         .optimize = optimize,
+        .strip = options.ci_portable_config,
         .path_bindings = &.{.{
             .logical_path = std.fs.path.join(
                 b.allocator,

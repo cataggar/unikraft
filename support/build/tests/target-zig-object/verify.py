@@ -13,12 +13,17 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--readelf", required=True)
     parser.add_argument("--nm", required=True)
+    parser.add_argument("--expect-stripped", action="store_true")
     parser.add_argument("object")
     args = parser.parse_args()
 
     header = output(args.readelf, "--file-header", args.object)
     if "ELF64" not in header or "X86-64" not in header or "REL (Relocatable file)" not in header:
         raise SystemExit(f"unexpected target object header:\n{header}")
+    if args.expect_stripped:
+        sections = output(args.readelf, "--sections", args.object)
+        if ".debug_" in sections:
+            raise SystemExit("portable target object retains checkout-dependent DWARF")
 
     symbols = output(args.nm, "--format=posix", args.object)
     if "issue34_zig_target_value" not in symbols:

@@ -662,6 +662,11 @@ section. Ordinary builds retain their path and build-time metadata defaults.
 Portable C, C++, and assembly builds map the source checkout root to
 `/wamr-ci/source` in DWARF without stripping the debug ELF; this keeps its
 nonload debug sections comparable across worktrees.
+For paired portable CI only, Zig-owned target objects omit their debug
+sections: their generated wrapper modules otherwise record each worktree's
+private `native-environment/zig_local_cache/o/` path. The final debug ELF
+still retains the C and assembly DWARF; ordinary builds retain Zig target
+debugging as well.
 The paired comparison still requires identical raw `.config` bytes and
 matching image hashes; it does not normalize either artifact.
 Protected paired runs print only closed stage-start and stage-completion
