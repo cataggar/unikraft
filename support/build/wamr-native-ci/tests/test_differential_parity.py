@@ -1055,6 +1055,47 @@ def verified_qcow2_acceptance(seen):
     check(parsed(boot_raw, reference) == boot
           and value["boot_inputs_sha256"] == sha(boot_raw),
           "qcow2 acceptance boot-input byte commitment changed")
+    check(value["build_sha256"] == sha(records["build.json"][0])
+          and value["finalization_sha256"] ==
+          sha(records["qcow2-finalization.json"][0])
+          and isinstance(value["boots"], dict)
+          and value["boots"].keys() == set(reference.SIX_MODES[:4]),
+          "qcow2 acceptance source commitment changed")
+    for mode in reference.SIX_MODES[:4]:
+        summary = value["boots"][mode]
+        mode_raw, mode_record = records[mode + "-compute.json"]
+        runtime = seen["roots"][0]
+        work = runtime / "compute" / ("boot-" + mode)
+        try:
+            request = checked_file(work / "request.json", 64 * 1024)
+            report = checked_file(work / "report.json", 64 * 1024)
+            serial = checked_file(work / "hyperv-efi-boot.log", MAX_RECORD)
+        except OSError:
+            raise ParityError("qcow2 acceptance boot slot inaccessible") from None
+        request_value = parsed(request, reference)
+        report_value = parsed(report, reference)
+        check(isinstance(summary, dict)
+              and summary.keys() == {
+                  "request_sha256", "report_sha256",
+                  "serial_sha256", "compute_sha256",
+              }
+              and request_value["schema_version"] == 2
+              and type(request_value["supervisor_pid"]) is int
+              and request_value["supervisor_pid"] > 0
+              and request_value["config"] == reference.config_for(
+                  runtime, runtime / "compute",
+                  reference.SIX_MODES.index(mode), reference.SIX_MODES)
+              and mode_record["input_pins"] == request_value["pins"]
+              and mode_record["report"] == report_value
+              and report_value["serial_sha256"] == sha(serial)
+              and report_value["serial_bytes"] == len(serial)
+              and mode_record["request_sha256"] == sha(request)
+              and mode_record["report_sha256"] == sha(report)
+              and summary["request_sha256"] == sha(request)
+              and summary["report_sha256"] == sha(report)
+              and summary["serial_sha256"] == sha(serial)
+              and summary["compute_sha256"] == sha(mode_raw),
+              "qcow2 acceptance boot commitment changed")
     return value
 
 
@@ -1065,11 +1106,20 @@ def compare_qcow2_acceptance(left, right):
     second = dict(second, boot_inputs_sha256="<verified-own-boot-input-bytes>")
     a = Normalizer(left["roots"]).normalize(first)
     b = Normalizer(right["roots"]).normalize(second)
-    return [
+    failures = [
         "record_content:qcow2-acceptance.json." + field
         for field in sorted(ACCEPTANCE_FIELDS - {"boot_inputs_sha256"})
         if a[field] != b[field]
     ]
+    if a["boots"] != b["boots"]:
+        for mode in first["modes"]:
+            for field in ("request_sha256", "report_sha256",
+                          "serial_sha256", "compute_sha256"):
+                if a["boots"][mode][field] != b["boots"][mode][field]:
+                    failures.append(
+                        "record_content:qcow2-acceptance.json.boots." +
+                        mode + "." + field)
+    return failures
 
 
 REVIEWED_BUILD_COMMANDS = (
@@ -1595,6 +1645,55 @@ def retained_differences(first, second):
     return ["retained:" + label for label in sorted(labels)]
 
 
+def boot_record_differences(name, first, second):
+    if name in (mode + "-compute.json" for mode in MODES):
+        fields = ("scope", "report", "input_pins", "request_sha256",
+                  "report_sha256", "compute")
+        nested = {
+            "report": ("serial_bytes", "serial_sha256", "passed", "consumed",
+                       "cleanup_complete", "input_unchanged", "serial_valid",
+                       "serial_limit_reached", "termination", "failures"),
+        }
+    elif name == "qcow2-finalization.json":
+        fields = ("schema", "schema_version", "status", "source_sha256",
+                  "source_bytes", "output", "identity", "profile", "limits",
+                  "provenance")
+        nested = {
+            "output": ("sha256", "file_bytes", "allocated", "virtual_bytes"),
+            "identity": ("workload_sha256", "workload_bytes"),
+        }
+    elif name == "fixed-vhd-derivation.json":
+        fields = ("schema", "schema_version", "status",
+                  "accepted_qcow2", "accepted_qcow2_decoded_sha256",
+                  "accepted_qcow2_profile", "source_identity", "output",
+                  "output_identity", "footer", "relocation", "limits",
+                  "provenance")
+        nested = {
+            "output": ("sha256", "file_bytes", "allocated", "virtual_bytes"),
+            "accepted_qcow2": ("sha256", "file_bytes", "virtual_bytes",
+                               "metadata"),
+        }
+    else:
+        return []
+    check(isinstance(first, dict) and isinstance(second, dict)
+          and first.keys() == second.keys() == set(fields),
+          "boot record diagnostic field membership changed")
+    prefix = "record_content:" + name + "."
+    failures = []
+    for field in fields:
+        if first[field] == second[field]:
+            continue
+        failures.append(prefix + field)
+        if field in nested:
+            check(isinstance(first[field], dict)
+                  and isinstance(second[field], dict),
+                  "boot record diagnostic field shape changed")
+            failures.extend(prefix + field + "." + key
+                            for key in nested[field]
+                            if first[field].get(key) != second[field].get(key))
+    return failures
+
+
 def expected_native_fixture_report(reference):
     scenarios = []
     for name, primary, exit_code, stdout, stderr in (
@@ -1773,6 +1872,9 @@ def compare_observations(left, right, reviewed_build_compat=False):
                         failures.append("record_content:build.json." + field)
                 failures.extend(build_image_differences(
                     left, right, verified_tool_roles))
+            else:
+                failures.extend(boot_record_differences(
+                    name, normalized_a, normalized_b))
         if a[0] != b[0] and a[1] == b[1]:
             failures.append("record_bytes:" + name)
     return failures
@@ -2861,6 +2963,32 @@ class DeterministicContracts(unittest.TestCase):
             "retained:fixtures.membership", "retained:private.log.bytes",
         ])
 
+    def test_boot_diagnostics_name_only_reviewed_fields(self):
+        report = {
+            "serial_bytes": 12, "serial_sha256": "a" * 64,
+            "passed": True, "consumed": True,
+            "cleanup_complete": True, "input_unchanged": True,
+            "serial_valid": True, "serial_limit_reached": False,
+            "termination": {"exited": 0}, "failures": {},
+        }
+        first = {
+            "scope": "local_native_compute_only", "report": report,
+            "input_pins": [], "request_sha256": "a" * 64,
+            "report_sha256": "b" * 64, "compute": {},
+        }
+        second = copy.deepcopy(first)
+        second["request_sha256"] = "c" * 64
+        second["report"]["serial_sha256"] = "d" * 64
+        self.assertEqual(boot_record_differences(
+            "raw-x2apic-compute.json", first, second), [
+            "record_content:raw-x2apic-compute.json.report",
+            "record_content:raw-x2apic-compute.json.report.serial_sha256",
+            "record_content:raw-x2apic-compute.json.request_sha256",
+        ])
+        second["unreviewed"] = True
+        with self.assertRaisesRegex(ParityError, "field membership"):
+            boot_record_differences("raw-x2apic-compute.json", first, second)
+
     def test_side_specific_retained_outputs_require_physical_contracts(self):
         reference = oracle()
         with tempfile.TemporaryDirectory() as scratch:
@@ -3361,6 +3489,9 @@ class DeterministicContracts(unittest.TestCase):
                 if side == "native":
                     common["log_validator"] = validator
                 write(runtime / "bin/share/fixture-data", b"synthetic QEMU data")
+                for mode in reference.SIX_MODES[:4]:
+                    (runtime / "compute" / ("boot-" + mode)).mkdir(
+                        mode=0o700)
                 paths = {**common, "local_boot_tool": local, "efi": efi}
                 prepared[side] = (runtime, paths, validator)
             for side, (runtime, paths, validator) in prepared.items():
@@ -3429,6 +3560,44 @@ class DeterministicContracts(unittest.TestCase):
                             python, mutated_boot(changed_record), installed)
 
             for seen in observations.values():
+                runtime = seen["roots"][0]
+                records = seen["files"]["records"]
+                records["build.json"] = (b"{}\n", {})
+                records["qcow2-finalization.json"] = (b"{}\n", {})
+                summaries = {}
+                for index, mode in enumerate(reference.SIX_MODES[:4]):
+                    work = runtime / "compute" / ("boot-" + mode)
+                    request = reference.compact_json({
+                        "schema_version": 2, "supervisor_pid": index + 1,
+                        "config": reference.config_for(
+                            runtime, runtime / "compute", index,
+                            reference.SIX_MODES),
+                        "pins": [],
+                    }, newline=True)
+                    serial = b"synthetic boot serial\n"
+                    report = reference.compact_json({
+                        "serial_sha256": sha(serial),
+                        "serial_bytes": len(serial),
+                    }, newline=True)
+                    for name, raw in (("request.json", request),
+                                      ("report.json", report),
+                                      ("hyperv-efi-boot.log", serial)):
+                        write(work / name, raw)
+                    mode_record = {
+                        "input_pins": [], "report": parsed(report, reference),
+                        "request_sha256": sha(request),
+                        "report_sha256": sha(report),
+                    }
+                    mode_raw = reference.compact_json(
+                        mode_record, newline=True)
+                    records[mode + "-compute.json"] = (
+                        mode_raw, mode_record)
+                    summaries[mode] = {
+                        "request_sha256": sha(request),
+                        "report_sha256": sha(report),
+                        "serial_sha256": sha(serial),
+                        "compute_sha256": sha(mode_raw),
+                    }
                 boot_raw = seen["files"]["records"]["boot-inputs.json"][0]
                 value = {
                     "schema": "uk.wamr.compute-qcow2-acceptance",
@@ -3437,9 +3606,9 @@ class DeterministicContracts(unittest.TestCase):
                     "status": "accepted",
                     "source": {"revision": "synthetic"},
                     "accepted_qcow2": {"sha256": "a" * 64},
-                    "finalization_sha256": "b" * 64,
+                    "finalization_sha256": sha(b"{}\n"),
                     "modes": list(reference.SIX_MODES[:4]),
-                    "boots": {}, "build_sha256": "c" * 64,
+                    "boots": summaries, "build_sha256": sha(b"{}\n"),
                     "boot_inputs_sha256": sha(boot_raw),
                 }
                 seen["files"]["records"]["qcow2-acceptance.json"] = (
@@ -3449,7 +3618,13 @@ class DeterministicContracts(unittest.TestCase):
                     "boot_inputs_sha256"],
                 native["files"]["records"]["qcow2-acceptance.json"][1][
                     "boot_inputs_sha256"])
-            self.assertEqual(compare_qcow2_acceptance(python, native), [])
+            baseline_failures = compare_qcow2_acceptance(python, native)
+            self.assertEqual(baseline_failures, [
+                "record_content:qcow2-acceptance.json.boots",
+                *(f"record_content:qcow2-acceptance.json.boots.{mode}.{field}"
+                  for mode in reference.SIX_MODES[:4]
+                  for field in ("request_sha256", "compute_sha256")),
+            ])
 
             def mutated_acceptance(side, value):
                 seen = observations[side]
@@ -3465,13 +3640,16 @@ class DeterministicContracts(unittest.TestCase):
                 }
 
             for side in ("python", "native"):
-                for kind in ("wrong-boot-hash", "extra-field", "other-field"):
+                for kind in ("wrong-boot-hash", "wrong-boot-receipt",
+                             "extra-field", "other-field"):
                     with self.subTest(side=side, kind=kind):
                         changed = copy.deepcopy(
                             observations[side]["files"]["records"][
                                 "qcow2-acceptance.json"][1])
                         if kind == "wrong-boot-hash":
                             changed["boot_inputs_sha256"] = "0" * 64
+                        elif kind == "wrong-boot-receipt":
+                            changed["boots"]["raw-x2apic"]["compute_sha256"] = "0" * 64
                         elif kind == "extra-field":
                             changed["unreviewed"] = True
                         else:
@@ -3482,7 +3660,9 @@ class DeterministicContracts(unittest.TestCase):
                         if kind == "other-field":
                             self.assertEqual(
                                 compare_qcow2_acceptance(*pair),
-                                ["record_content:qcow2-acceptance.json.source"])
+                                [baseline_failures[0],
+                                 "record_content:qcow2-acceptance.json.source",
+                                 *baseline_failures[1:]])
                         else:
                             with self.assertRaisesRegex(
                                     ParityError,

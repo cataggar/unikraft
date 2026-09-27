@@ -715,6 +715,11 @@ match the exact canonical seven-scenario contract already verified by the
 native fixture stage. Only these reviewed, physically checked side-specific
 files are removed from cross-controller retained membership comparison;
 unreviewed retained outputs and shared slots remain strict.
+When completed boots differ, comparison rehashes each QCOW2 acceptance's
+own build, finalization, boot-input, boot request, report, serial, and compute
+records before reporting only fixed mode/field labels. Changed finalization
+and per-mode compute records likewise identify only reviewed nested field
+roles; no private serial data, command logs, hashes, or paths are printed.
 
 ## Private final-image handoff
 
