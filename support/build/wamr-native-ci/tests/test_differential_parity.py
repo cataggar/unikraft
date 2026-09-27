@@ -1175,6 +1175,31 @@ def verified_image_provenance(seen, name):
 
 
 SERIAL_TIMESTAMP = re.compile(rb"(?m)^\[\s*[0-9]+\.[0-9]{6}\]")
+SERIAL_ANSI = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
+SERIAL_NUMBER = re.compile(
+    rb"(?<![A-Za-z_])(?:0x[0-9a-fA-F]+|[0-9]+)(?![A-Za-z_])")
+
+
+def diagnostic_serial_text(raw):
+    return SERIAL_ANSI.sub(b"", raw).replace(b"\x00", b"").replace(
+        b"\r\n", b"\n")
+
+
+def serial_first_phase(text, line_index):
+    lines = text.splitlines(keepends=True)
+    position = len(b"".join(lines[:line_index]))
+    for marker, phase in (
+            (b"Hyper-V Hv#1 hypercall page enabled", "before-hyperv"),
+            (b"Powered by", "hyperv-init"),
+            (b"Calling main(", "before-main"),
+            (b"WAMR_NATIVE_AOT_OK answer=42 teardown=0", "guest-main"),
+            (b"main returned 0", "guest-return")):
+        found = text.find(marker)
+        if found < 0:
+            return "unlocated"
+        if position <= found:
+            return phase
+    return "after-return"
 
 
 def verified_serial(seen, mode):
@@ -1204,10 +1229,31 @@ def serial_differences(left, right):
         if a == b:
             continue
         label = "serial:" + mode
-        if SERIAL_TIMESTAMP.sub(b"<time>", a) == SERIAL_TIMESTAMP.sub(b"<time>", b):
+        timestamp_only = (SERIAL_TIMESTAMP.sub(b"<time>", a) ==
+                          SERIAL_TIMESTAMP.sub(b"<time>", b))
+        if timestamp_only:
             failures.append(label + ".kernel-timestamp-only")
         else:
             failures.append(label + ".non-timestamp-difference")
+        clean_a, clean_b = diagnostic_serial_text(a), diagnostic_serial_text(b)
+        if not timestamp_only and clean_a == clean_b:
+            failures.append(label + ".uart-framing-only")
+        elif not timestamp_only and SERIAL_TIMESTAMP.sub(b"<time>", clean_a) == (
+                SERIAL_TIMESTAMP.sub(b"<time>", clean_b)):
+            failures.append(label + ".uart-framing-and-timestamp-only")
+        elif not timestamp_only and SERIAL_NUMBER.sub(b"<number>", clean_a) == (
+                SERIAL_NUMBER.sub(b"<number>", clean_b)):
+            failures.append(label + ".number-fields-only")
+        clean_lines_a = clean_a.splitlines(keepends=True)
+        clean_lines_b = clean_b.splitlines(keepends=True)
+        clean_first = next(
+            (i for i, pair in enumerate(zip(clean_lines_a, clean_lines_b))
+             if pair[0] != pair[1]),
+            min(len(clean_lines_a), len(clean_lines_b)))
+        phases = (serial_first_phase(clean_a, clean_first),
+                  serial_first_phase(clean_b, clean_first))
+        failures.append(label + ".first-phase." +
+                        (phases[0] if phases[0] == phases[1] else "shifted"))
         lines_a, lines_b = a.splitlines(keepends=True), b.splitlines(keepends=True)
         first = next((i for i, pair in enumerate(zip(lines_a, lines_b))
                       if pair[0] != pair[1]), min(len(lines_a), len(lines_b)))
@@ -1730,12 +1776,41 @@ def retained_differences(first, second):
     slots = {"private", "fixtures", "package", "public-source",
              *(f"boot-{mode}" for mode in MODES)}
     fields = ("kind", "mode", "bytes")
+    package_roles = {
+        "package-job.json": "package-job",
+        "package-report.json": "package-report",
+        "qcow2-job.json": "qcow2-job",
+        "qcow2-finalization.json": "qcow2-finalization",
+        "vhd-job.json": "vhd-job",
+        "fixed-vhd-derivation.json": "vhd-derivation",
+        "unikraft.raw": "raw-image",
+        "unikraft.qcow2": "qcow2-image",
+        "unikraft.vhd": "vhd-image",
+        "unikraft-derived.vhd": "derived-vhd-image",
+    }
+    boot_roles = {
+        "request.json": "request",
+        "report.json": "report",
+        "hyperv-efi-boot.log": "serial",
+        "log-validator-x2apic.log": "validator-log",
+        "log-validator-legacy.log": "validator-log",
+        "command-log-validator-x2apic.json": "validator-command",
+        "command-log-validator-legacy.json": "validator-command",
+    }
     labels = set()
     for path in first.keys() | second.keys():
         slot = path.split("/", 1)[0]
         check(slot in slots, "unexpected retained output role")
         role = slot + (".log" if slot == "private" and path.endswith(".log")
                        else "")
+        if slot == "package":
+            role += "." + package_roles.get(path.removeprefix("package/"), "other")
+        elif slot.startswith("boot-"):
+            role += "." + boot_roles.get(path.removeprefix(slot + "/"), "other")
+        elif path == "private/log-validation" or re.fullmatch(
+                r"private/log-validation/(?:boot-)?(?:raw|qcow2|vpc)-(?:x2apic|legacy-apic)-[0-9]{2}(?:/(?:private|evidence)(?:/(?:command-log-validator-(?:x2apic|legacy)\.json|log-validator-(?:x2apic|legacy)\.log))?)?",
+                path):
+            role = "private.validator-output"
         if path not in first or path not in second:
             labels.add(role + ".membership")
             continue
@@ -3090,6 +3165,21 @@ class DeterministicContracts(unittest.TestCase):
         self.assertEqual(retained_differences(first, second), [
             "retained:fixtures.membership", "retained:private.log.bytes",
         ])
+        first = {
+            "package/qcow2-job.json": ("file", 0o600, 120),
+            "boot-raw-x2apic/request.json": ("file", 0o600, 345),
+            "private/log-validation/boot-raw-x2apic-00/private/"
+            "log-validator-x2apic.log": ("file", 0o600, 20),
+        }
+        second = {
+            "package/qcow2-job.json": ("file", 0o600, 121),
+            "boot-raw-x2apic/request.json": ("file", 0o600, 346),
+        }
+        self.assertEqual(retained_differences(first, second), [
+            "retained:boot-raw-x2apic.request.bytes",
+            "retained:package.qcow2-job.bytes",
+            "retained:private.validator-output.membership",
+        ])
 
     def test_boot_diagnostics_name_only_reviewed_fields(self):
         report = {
@@ -3190,8 +3280,17 @@ class DeterministicContracts(unittest.TestCase):
                                         "report_sha256": sha(report)})}}})
             self.assertEqual(serial_differences(*sides), [
                 "serial:raw-x2apic.kernel-timestamp-only",
+                "serial:raw-x2apic.first-phase.unlocated",
                 "serial:raw-x2apic.first-line.kernel-timestamp",
             ])
+            self.assertEqual(
+                diagnostic_serial_text(b"\x1b[0m[    1.000001]\r\n"),
+                b"[    1.000001]\n")
+            self.assertEqual(serial_first_phase(
+                b"UEFI boot\nHyper-V Hv#1 hypercall page enabled\n"
+                b"Powered by\nCalling main(0, 0)\n"
+                b"WAMR_NATIVE_AOT_OK answer=42 teardown=0\n"
+                b"main returned 0\n", 0), "before-hyperv")
             report = sides[1]["files"]["records"]["raw-x2apic-compute.json"][1]
             report["report"]["serial_sha256"] = "0" * 64
             with self.assertRaisesRegex(ParityError, "serial/report commitment"):

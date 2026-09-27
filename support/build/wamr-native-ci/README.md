@@ -704,6 +704,8 @@ difference reports only fixed top-level and image
 argument-position labels. Retained-output differences report only fixed
 private, fixture, package, public-source or boot-slot roles and changed
 membership, mode, type or size, never raw filenames or log contents.
+Known package job/image and boot request/report/validator slots receive more
+specific fixed-role size or membership labels; unknown files remain strict.
 Differing selected image-command tool paths additionally report only their
 fixed roles and path classes (retained descriptor, bound producer tool,
 checkout/private root, other absolute path, or other), never path values.
@@ -725,7 +727,9 @@ the pinned package tool, and the corresponding source-image commitment;
 different intent paths remain strict but their root-normalized fields can
 be diagnosed. Each differing raw serial is independently rehashed against
 its report before a fixed-class timestamp/first-line diagnostic is emitted;
-serial and receipt hashes remain strict. Boot command records are checked
+the diagnostic also classifies whether UART framing, numeric fields, or the
+first boot phase differ, without revealing any raw serial text. Serial and
+receipt hashes remain strict. Boot command records are checked
 against their own supervised stage contracts and physically pinned tool
 identities before their per-side command outcome is compared. No private
 serial data, command logs, hashes, or paths are printed.
