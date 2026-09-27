@@ -689,6 +689,14 @@ fixed classes for differing strings (source-root, other-absolute, relative-path
 or other), including fixed app build/source roles and whether replacing the checkout
 roots solely for diagnosis would equalize the bytes or string sets. Raw DWARF
 strings and private command logs remain local.
+Image command arguments embedded in the build identity retain their actual
+paths; paired comparison treats only the four reviewed app, config, Make
+environment, and private tool path assignments as equivalent across roots,
+after checking their physical roles. All other arguments remain strict. A
+remaining build-record difference reports only fixed top-level and image
+argument-position labels. Retained-output differences report only fixed
+private, fixture, package, public-source or boot-slot roles and changed
+membership, mode, type or size, never raw filenames or log contents.
 
 ## Private final-image handoff
 

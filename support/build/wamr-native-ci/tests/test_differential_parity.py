@@ -1385,6 +1385,21 @@ def build_image_differences(left, right):
     check(isinstance(first, dict) and isinstance(second, dict)
           and first.keys() == second.keys(), "build image field membership changed")
     failures = []
+    for field in ("schema_version", "scope", "unikraft_revision",
+                  "unikraft_diff_sha256"):
+        if first.get(field) != second.get(field):
+            failures.append("record_content:build.json.image." + field)
+    if "command" in first and first["command"] != second["command"]:
+        first_command = Normalizer(left["roots"]).normalize(
+            reviewed_image_command(left))
+        second_command = Normalizer(right["roots"]).normalize(
+            reviewed_image_command(right))
+        if len(first_command) != len(second_command):
+            failures.append("record_content:build.json.image.command.count")
+        failures.extend(
+            "record_content:build.json.image.command.arg-" + str(index)
+            for index, (one, two) in enumerate(zip(first_command, second_command))
+            if one != two)
     for field in ("runtime_inputs_sha256", "solved_config_sha256",
                   "application_sources", "tools"):
         check(field in first, "missing build image field")
@@ -1407,6 +1422,73 @@ def build_image_differences(left, right):
                     left, right, name, role, first["files"][name],
                     second["files"][name]))
     return failures
+
+
+def reviewed_image_command(side):
+    command = side["files"]["records"]["build.json"][1]["image"]["command"]
+    check(isinstance(command, list) and 4 <= len(command) <= 128
+          and all(isinstance(arg, str) and len(arg) <= 4096 for arg in command)
+          and command[1:4] == ["build", "native-images", "-j2"],
+          "image command shape changed")
+    repository = side["reference"].REPO
+    app = side["reference"].APP
+    expected = {
+        "-Dapp=": str(app),
+        "-Dnative-make-environment=":
+            str(app / "build/native-environment/environment.json"),
+        "-Dconfig=": str(app / "build/.config"),
+        "-Dwamr-aot-tool=":
+            str(side["roots"][0] / "compute/tools/bin/uk-wamr-aot-build"),
+    }
+    check(command[4:8] == [
+        "--cache-dir", str(app / "build/native-environment/zig_local_cache"),
+        "--global-cache-dir",
+        str(app / "build/native-environment/zig_global_cache"),
+    ], "image command cache paths changed")
+    seen = set()
+    roots = tuple(str(root) for root in side["roots"])
+    normalized = []
+    for arg in command:
+        for prefix in expected:
+            if not arg.startswith(prefix):
+                continue
+            check(prefix not in seen, "image command repeats a reviewed path")
+            seen.add(prefix)
+            path = arg[len(prefix):]
+            check(path == expected[prefix], "image command path changed")
+            for index, root in sorted(enumerate(roots),
+                                      key=lambda item: len(item[1]), reverse=True):
+                if path == root or path.startswith(root + "/"):
+                    path = f"<root:{index}>" + path[len(root):]
+                    break
+            normalized.append(prefix + path)
+            break
+        else:
+            normalized.append(arg)
+    check(seen == set(expected) and app == repository / "support/apps/wamr-aot",
+          "image command reviewed paths missing")
+    return normalized
+
+
+def retained_differences(first, second):
+    slots = {"private", "fixtures", "package", "public-source",
+             *(f"boot-{mode}" for mode in MODES)}
+    fields = ("kind", "mode", "bytes")
+    labels = set()
+    for path in first.keys() | second.keys():
+        slot = path.split("/", 1)[0]
+        check(slot in slots, "unexpected retained output role")
+        role = slot + (".log" if slot == "private" and path.endswith(".log")
+                       else "")
+        if path not in first or path not in second:
+            labels.add(role + ".membership")
+            continue
+        check(len(first[path]) == len(second[path]) == len(fields),
+              "invalid retained output shape")
+        for field, one, two in zip(fields, first[path], second[path]):
+            if one != two:
+                labels.add(role + "." + field)
+    return ["retained:" + label for label in sorted(labels)]
 
 
 def compare_observations(left, right, reviewed_build_compat=False):
@@ -1459,6 +1541,8 @@ def compare_observations(left, right, reviewed_build_compat=False):
             left_value, right_value = verified_log_slots(left), verified_log_slots(right)
         if left_value != right_value:
             failures.append(key)
+            if key == "retained":
+                failures.extend(retained_differences(left_value, right_value))
     left_artifacts = left["files"]["artifacts"]
     right_artifacts = right["files"]["artifacts"]
     roles = {"config", "efi", "raw", "qcow2", "vhd"}
@@ -1495,14 +1579,26 @@ def compare_observations(left, right, reviewed_build_compat=False):
             continue
         a, b = l_records[name], r_records[name]
         a_value, b_value = a[1], b[1]
+        if name == "build.json":
+            check(set(a_value) == set(b_value) == {"source", "runtime", "image"},
+                  "build record membership changed")
+            a_value = dict(a_value, image=dict(
+                a_value["image"], command=reviewed_image_command(left)))
+            b_value = dict(b_value, image=dict(
+                b_value["image"], command=reviewed_image_command(right)))
         if name == "result.json":
             a_value = dict(a_value, records={record: "<verified-file-sha256>"
                                              for record in a_value["records"]})
             b_value = dict(b_value, records={record: "<verified-file-sha256>"
                                              for record in b_value["records"]})
-        if left_normalizer.normalize(a_value) != right_normalizer.normalize(b_value):
+        normalized_a = left_normalizer.normalize(a_value)
+        normalized_b = right_normalizer.normalize(b_value)
+        if normalized_a != normalized_b:
             failures.append("record_content:" + name)
             if name == "build.json":
+                for field in ("source", "runtime", "image"):
+                    if normalized_a[field] != normalized_b[field]:
+                        failures.append("record_content:build.json." + field)
                 failures.extend(build_image_differences(left, right))
         if a[0] != b[0] and a[1] == b[1]:
             failures.append("record_bytes:" + name)
@@ -2463,6 +2559,71 @@ class DeterministicContracts(unittest.TestCase):
         with self.assertRaisesRegex(ParityError, "file membership"):
             build_image_differences(original, changed)
 
+    def test_image_command_normalizes_only_reviewed_nested_checkout_paths(self):
+        def side(name):
+            repo = Path("/checkout") / name
+            runtime = Path("/private") / name
+            app = repo / "support/apps/wamr-aot"
+            command = [
+                "/usr/bin/zig", "build", "native-images", "-j2",
+                "--cache-dir", str(app / "build/native-environment/zig_local_cache"),
+                "--global-cache-dir",
+                str(app / "build/native-environment/zig_global_cache"),
+                "-Dapp=" + str(app),
+                "-Dnative-make-environment=" +
+                str(app / "build/native-environment/environment.json"),
+                "-Dconfig=" + str(app / "build/.config"),
+                "-Dwamr-aot-tool=" + str(runtime / "compute/tools/bin/uk-wamr-aot-build"),
+            ]
+            image = {
+                "command": command, "schema_version": 1,
+                "scope": "native-build-only-not-boot-or-hardware-qualification",
+                "unikraft_revision": "0" * 40,
+                "unikraft_diff_sha256": sha(b""),
+                "runtime_inputs_sha256": sha(b"runtime"),
+                "solved_config_sha256": sha(b"config"),
+                "application_sources": {}, "tools": {},
+                "files": {"fixture-image": sha(b"efi"),
+                          "fixture-image.dbg": sha(b"debug"),
+                          "fixture-image.bootinfo": sha(b"bootinfo")},
+            }
+            return {"reference": mock.Mock(REPO=repo, APP=app),
+                    "roots": (runtime, repo),
+                    "exit": subprocess.CompletedProcess([], 0, b"", b""),
+                    "files": {"order": ("build.json",),
+                              "retained": {}, "artifacts": {},
+                              "records": {"build.json": (b"", {
+                                  "source": {}, "runtime": {},
+                                  "image": image})}}}
+
+        first, second = side("python"), side("native")
+        first["reference"].EFI = second["reference"].EFI = "fixture-image"
+        one = Normalizer(first["roots"]).normalize(reviewed_image_command(first))
+        two = Normalizer(second["roots"]).normalize(reviewed_image_command(second))
+        self.assertEqual(one, two)
+        self.assertEqual(compare_observations(first, second), [])
+        second_command = second["files"]["records"]["build.json"][1]["image"]["command"]
+        second_command.append("-Dmake-arg=CP=" + str(second["reference"].REPO / "unreviewed"))
+        self.assertNotEqual(one, Normalizer(second["roots"]).normalize(
+            reviewed_image_command(second)))
+        self.assertEqual(compare_observations(first, second), [
+            "record_content:build.json",
+            "record_content:build.json.image",
+            "record_content:build.json.image.command.count",
+        ])
+        second_command[8] = "-Dapp=/unreviewed"
+        with self.assertRaisesRegex(ParityError, "image command path changed"):
+            reviewed_image_command(second)
+
+    def test_retained_diagnostics_name_fixed_roles_not_private_files(self):
+        first = {"private/secret.log": ("file", 0o600, 42),
+                 "fixtures/local": ("file", 0o600, 1)}
+        second = {"private/secret.log": ("file", 0o600, 43),
+                  "fixtures/other": ("file", 0o600, 1)}
+        self.assertEqual(retained_differences(first, second), [
+            "retained:fixtures.membership", "retained:private.log.bytes",
+        ])
+
     def test_image_region_diagnostics_bind_images_and_name_fixed_sections(self):
         reference = oracle()
         with tempfile.TemporaryDirectory() as scratch:
@@ -3156,7 +3317,7 @@ class DeterministicContracts(unittest.TestCase):
 
         self.assertEqual(
             compare_observations(seen("unreviewed-a"), seen("unreviewed-b")),
-            ["retained"])
+            ["retained", "retained:private.log.membership"])
 
 
 def main():
