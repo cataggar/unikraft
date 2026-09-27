@@ -1424,6 +1424,29 @@ def build_image_differences(left, right):
     return failures
 
 
+IMAGE_TOOL_OPTIONS = {
+    "-Dmake-command=": ("make", ""),
+    "-Dbison-command=": ("bison", ""),
+    "-Dflex-command=": ("flex", ""),
+    "-Dcompiler=": ("zig", " cc -target x86_64-freestanding-none"),
+    "-Dhost-cc=": ("zig", " cc"),
+    "-Dhost-cxx=": ("zig", " c++"),
+    "-Dmake-arg=AR=": ("zig", " ar"),
+    "-Dmake-arg=CP=": ("cp", " -f"),
+    "-Dmake-arg=MKDIR=": ("mkdir", ""),
+    "-Dmake-arg=PYTHON=": ("python3", ""),
+    "-Dmake-arg=READLINK=": ("readlink", ""),
+    "-Dmake-arg=ZIG=": ("zig", ""),
+    "-Dmake-arg=YACC=": ("bison", ""),
+    "-Dmake-arg=LEX=": ("flex", ""),
+    "-Dmake-arg=NM=": ("llvm-nm", ""),
+    "-Dmake-arg=OBJCOPY=": ("llvm-objcopy", ""),
+    "-Dmake-arg=OBJDUMP=": ("llvm-objdump", ""),
+    "-Dmake-arg=READELF=": ("llvm-readelf", ""),
+    "-Dmake-arg=STRIP=": ("llvm-strip", ""),
+}
+
+
 def reviewed_image_command(side):
     command = side["files"]["records"]["build.json"][1]["image"]["command"]
     check(isinstance(command, list) and 4 <= len(command) <= 128
@@ -1446,9 +1469,30 @@ def reviewed_image_command(side):
         str(app / "build/native-environment/zig_global_cache"),
     ], "image command cache paths changed")
     seen = set()
+    seen_tools = set()
+    tool_paths = {}
     roots = tuple(str(root) for root in side["roots"])
     normalized = []
-    for arg in command:
+    def tool_path(role, path):
+        check(path.startswith("/"), "image command tool path is not absolute")
+        if role in tool_paths:
+            check(tool_paths[role] == path, "image command tool role changed")
+        else:
+            tool_paths[role] = path
+        if path.startswith("/proc/"):
+            check(re.fullmatch(r"/proc/(?:self|[1-9][0-9]*)/fd/[0-9]+", path),
+                  "image command retained tool path changed")
+            return "<retained-tool:" + role + ">"
+        for index, root in sorted(enumerate(roots),
+                                  key=lambda item: len(item[1]), reverse=True):
+            if path == root or path.startswith(root + "/"):
+                return f"<root:{index}>" + path[len(root):]
+        return path
+
+    for index, arg in enumerate(command):
+        if index == 0:
+            normalized.append(tool_path("zig", arg))
+            continue
         for prefix in expected:
             if not arg.startswith(prefix):
                 continue
@@ -1464,8 +1508,19 @@ def reviewed_image_command(side):
             normalized.append(prefix + path)
             break
         else:
-            normalized.append(arg)
-    check(seen == set(expected) and app == repository / "support/apps/wamr-aot",
+            for prefix, (role, suffix) in IMAGE_TOOL_OPTIONS.items():
+                if not arg.startswith(prefix):
+                    continue
+                check(prefix not in seen_tools and arg.endswith(suffix),
+                      "image command repeats a reviewed tool")
+                seen_tools.add(prefix)
+                path = arg[len(prefix):len(arg) - len(suffix) if suffix else len(arg)]
+                normalized.append(prefix + tool_path(role, path) + suffix)
+                break
+            else:
+                normalized.append(arg)
+    check(seen == set(expected) and seen_tools == set(IMAGE_TOOL_OPTIONS)
+          and app == repository / "support/apps/wamr-aot",
           "image command reviewed paths missing")
     return normalized
 
@@ -1489,6 +1544,68 @@ def retained_differences(first, second):
             if one != two:
                 labels.add(role + "." + field)
     return ["retained:" + label for label in sorted(labels)]
+
+
+def expected_native_fixture_report(reference):
+    scenarios = []
+    for name, primary, exit_code, stdout, stderr in (
+            ("ok", "exited", 0, b"native fixture ok\n", b""),
+            ("nonzero", "exited", 7, b"", b"PermissionDenied /private/secret\n"),
+            ("partial", "exited", 9, b"partial private output\n", b""),
+            ("signal", "signal", -1, b"", b""),
+            ("overflow", "output_overflow", -1, b"X" * 33, b""),
+            ("timeout", "timeout", -1, b"", b""),
+            ("cancelled", "cancelled", -1, b"", b"")):
+        scenarios.append({
+            "name": name, "primary": primary, "exit_code": exit_code,
+            "stdout_bytes": len(stdout), "stdout_sha256": sha(stdout),
+            "stderr_bytes": len(stderr), "stderr_sha256": sha(stderr),
+            "cleanup_complete": True, "executable_stable": True,
+        })
+    return reference.compact_json({
+        "schema": "uk.wamr.native-ci-fixtures", "schema_version": 1,
+        "production_modes": 6, "build_stages": 6, "status": "passed",
+        "scenarios": scenarios,
+    }, newline=True)
+
+
+def reviewed_side_specific_outputs(python, native, left, right):
+    left, right = dict(left), dict(right)
+
+    def require_only(side, entries, other, path, limit, expected=None):
+        check(path in entries and path not in other,
+              "side-specific retained output changed")
+        try:
+            raw = checked_file(side["roots"][0] / "compute" / path, limit)
+        except OSError:
+            raise ParityError("side-specific retained output inaccessible") from None
+        check(entries.pop(path) == ("file", 0o600, len(raw)),
+              "side-specific retained output changed")
+        if expected is not None:
+            check(raw == expected, "side-specific retained content changed")
+        return raw
+
+    reference = python["reference"]
+    require_only(python, left, right, "private/zig-version.log", 64,
+                 b"0.16.0\n")
+    require_only(python, left, right, "private/supervisor-version.log", 127,
+                 (reference.COMMAND_SUPERVISOR_VERSION + "\n").encode("ascii"))
+    supervisor_log = require_only(
+        python, left, right, "private/supervisor-build.log", 8 * 1024 * 1024)
+    check(reference.command_error_markers(supervisor_log) == [],
+          "supervisor build diagnostic changed")
+    metadata_path = "private/source-metadata.json"
+    metadata = require_only(python, left, right, metadata_path, MAX_RECORD)
+    try:
+        baseline = reference.source_metadata_document(
+            python["roots"][0] / "compute" / metadata_path)
+    except (OSError, reference.Refusal):
+        raise ParityError("source metadata diagnostic changed") from None
+    check(parsed(metadata, reference) == baseline and baseline["records"],
+          "source metadata diagnostic changed")
+    require_only(native, right, left, "fixtures/native-scenarios.json", 8192,
+                 expected_native_fixture_report(native["reference"]))
+    return left, right
 
 
 def compare_observations(left, right, reviewed_build_compat=False):
@@ -1539,6 +1656,9 @@ def compare_observations(left, right, reviewed_build_compat=False):
                     entries[name] = ("file", 0o600, "<verified-stage-log-size>")
                 return entries
             left_value, right_value = verified_log_slots(left), verified_log_slots(right)
+            if "build.json" in l_records and "build.json" in r_records:
+                left_value, right_value = reviewed_side_specific_outputs(
+                    left, right, left_value, right_value)
         if left_value != right_value:
             failures.append(key)
             if key == "retained":
@@ -2564,8 +2684,12 @@ class DeterministicContracts(unittest.TestCase):
             repo = Path("/checkout") / name
             runtime = Path("/private") / name
             app = repo / "support/apps/wamr-aot"
+            descriptor_pid = 101 if name == "python" else 202
+            roles = sorted({"zig", *(role for role, _ in IMAGE_TOOL_OPTIONS.values())})
+            tools = {role: f"/proc/{descriptor_pid}/fd/{index + 3}"
+                     for index, role in enumerate(roles)}
             command = [
-                "/usr/bin/zig", "build", "native-images", "-j2",
+                tools["zig"], "build", "native-images", "-j2",
                 "--cache-dir", str(app / "build/native-environment/zig_local_cache"),
                 "--global-cache-dir",
                 str(app / "build/native-environment/zig_global_cache"),
@@ -2575,6 +2699,8 @@ class DeterministicContracts(unittest.TestCase):
                 "-Dconfig=" + str(app / "build/.config"),
                 "-Dwamr-aot-tool=" + str(runtime / "compute/tools/bin/uk-wamr-aot-build"),
             ]
+            command.extend(prefix + tools[role] + suffix
+                           for prefix, (role, suffix) in IMAGE_TOOL_OPTIONS.items())
             image = {
                 "command": command, "schema_version": 1,
                 "scope": "native-build-only-not-boot-or-hardware-qualification",
@@ -2603,7 +2729,13 @@ class DeterministicContracts(unittest.TestCase):
         self.assertEqual(one, two)
         self.assertEqual(compare_observations(first, second), [])
         second_command = second["files"]["records"]["build.json"][1]["image"]["command"]
-        second_command.append("-Dmake-arg=CP=" + str(second["reference"].REPO / "unreviewed"))
+        second_command[0] = "/proc/202/fd/999"
+        with self.assertRaisesRegex(ParityError, "image command tool role changed"):
+            reviewed_image_command(second)
+        second_command[0] = "/proc/202/fd/" + str(
+            sorted({"zig", *(role for role, _ in IMAGE_TOOL_OPTIONS.values())}).index("zig") + 3)
+        second_command.append("-Dmake-arg=UNREVIEWED=" +
+                              str(second["reference"].REPO / "unreviewed"))
         self.assertNotEqual(one, Normalizer(second["roots"]).normalize(
             reviewed_image_command(second)))
         self.assertEqual(compare_observations(first, second), [
@@ -2623,6 +2755,58 @@ class DeterministicContracts(unittest.TestCase):
         self.assertEqual(retained_differences(first, second), [
             "retained:fixtures.membership", "retained:private.log.bytes",
         ])
+
+    def test_side_specific_retained_outputs_require_physical_contracts(self):
+        reference = oracle()
+        with tempfile.TemporaryDirectory() as scratch:
+            sides = []
+            for role in ("python", "native"):
+                runtime = Path(scratch) / role
+                for slot in ("private", "fixtures"):
+                    (runtime / "compute" / slot).mkdir(parents=True)
+                sides.append({"roots": (runtime,), "reference": reference})
+            python, native = sides
+            left = {"private/shared.log": ("file", 0o600, 12)}
+            right = dict(left)
+
+            def retain(side, entries, name, raw):
+                path = side["roots"][0] / "compute" / name
+                path.write_bytes(raw)
+                path.chmod(0o600)
+                entries[name] = ("file", 0o600, len(raw))
+
+            retain(python, left, "private/zig-version.log", b"0.16.0\n")
+            retain(python, left, "private/supervisor-version.log",
+                   (reference.COMMAND_SUPERVISOR_VERSION + "\n").encode("ascii"))
+            retain(python, left, "private/supervisor-build.log", b"build ok\n")
+            retain(python, left, "private/source-metadata.json",
+                   reference.compact_json({
+                       "schema": "uk.wamr.git-physical-source-baseline",
+                       "version": 1,
+                       "records": [["file", "run.py", [0] * 9]],
+                   }, newline=True))
+            retain(native, right, "fixtures/native-scenarios.json",
+                   expected_native_fixture_report(reference))
+            self.assertEqual(
+                reviewed_side_specific_outputs(python, native, left, right),
+                ({"private/shared.log": ("file", 0o600, 12)},
+                 {"private/shared.log": ("file", 0o600, 12)}))
+            path = native["roots"][0] / "compute/fixtures/native-scenarios.json"
+            report = path.read_bytes()
+            path.write_bytes(report.replace(b'"status":"passed"',
+                                            b'"status":"faileD"'))
+            with self.assertRaisesRegex(ParityError, "side-specific retained content"):
+                reviewed_side_specific_outputs(python, native, left, right)
+            path.write_bytes(report)
+            path.unlink()
+            with self.assertRaisesRegex(ParityError, "side-specific retained output"):
+                reviewed_side_specific_outputs(python, native, left, right)
+            retain(native, right, "fixtures/native-scenarios.json", report)
+            left["private/unreviewed.log"] = ("file", 0o600, 2)
+            first, second = reviewed_side_specific_outputs(
+                python, native, left, right)
+            self.assertEqual(retained_differences(first, second),
+                             ["retained:private.log.membership"])
 
     def test_image_region_diagnostics_bind_images_and_name_fixed_sections(self):
         reference = oracle()

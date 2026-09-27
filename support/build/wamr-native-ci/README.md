@@ -693,10 +693,23 @@ Image command arguments embedded in the build identity retain their actual
 paths; paired comparison treats only the four reviewed app, config, Make
 environment, and private tool path assignments as equivalent across roots,
 after checking their physical roles. All other arguments remain strict. A
-remaining build-record difference reports only fixed top-level and image
+selected executable passed through a retained `/proc/<pid>/fd/<fd>` path is
+compared by its fixed tool role only after the selected tool identity and
+supervised stage binding are checked on both sides; repeated occurrences of
+that role must use the same descriptor within each command. Other executable
+paths retain exact path or source-root comparison. A remaining build-record
+difference reports only fixed top-level and image
 argument-position labels. Retained-output differences report only fixed
 private, fixture, package, public-source or boot-slot roles and changed
 membership, mode, type or size, never raw filenames or log contents.
+At completed builds, the Python-only Zig and supervisor version logs must
+match their pinned versions, its supervisor build log must be bounded and
+free of known error markers, and its source-metadata diagnostic must be a
+canonical, valid nonempty baseline. The native-only fixture report must
+match the exact canonical seven-scenario contract already verified by the
+native fixture stage. Only these reviewed, physically checked side-specific
+files are removed from cross-controller retained membership comparison;
+unreviewed retained outputs and shared slots remain strict.
 
 ## Private final-image handoff
 
