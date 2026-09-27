@@ -1293,6 +1293,23 @@ def debug_string_differences(first, second, left, right):
                         (b".d", "dependency-output")):
                     if tail == name or tail.startswith(name + b"/"):
                         categories.add("source-root.app-build." + label)
+                if tail.startswith(b"native-environment/"):
+                    nested = tail[len(b"native-environment/"):]
+                    matched = False
+                    for name in (b"zig_local_cache", b"zig_global_cache",
+                                 b"tmp", b"xdg_cache", b"xdg_config"):
+                        if nested == name or nested.startswith(name + b"/"):
+                            matched = True
+                            categories.add(
+                                "source-root.app-build.native-environment." +
+                                name.decode("ascii"))
+                            if nested.startswith(name + b"/o/"):
+                                categories.add(
+                                    "source-root.app-build.native-environment." +
+                                    name.decode("ascii") + ".object-cache")
+                    if not matched:
+                        categories.add(
+                            "source-root.app-build.native-environment.other")
                 for suffix, label in (
                         (b"/include/", "generated-include"),
                         (b"/artifacts/", "generated-artifacts"),
@@ -2558,6 +2575,17 @@ class DeterministicContracts(unittest.TestCase):
                 b"/private/first/support/apps/wamr-aot/build/artifacts\0",
                 b"/private/second/support/apps/wamr-aot/build/artifacts\0",
                 left, right))
+        cache = (
+            "record_content:build.json.image.files.debug.debug_str."
+            "source-root.app-build.native-environment.zig_local_cache"
+        )
+        self.assertTrue({cache, cache + ".object-cache"} <= set(
+            debug_string_differences(
+                b"/private/first/support/apps/wamr-aot/build/"
+                b"native-environment/zig_local_cache/o/test\0",
+                b"/private/second/support/apps/wamr-aot/build/"
+                b"native-environment/zig_local_cache/o/test\0",
+                left, right)))
 
     def test_runtime_input_diagnostics_name_only_fixed_roles(self):
         with tempfile.TemporaryDirectory() as scratch:
