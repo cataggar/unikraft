@@ -521,6 +521,10 @@ def native_fixture_contract(reference):
 
 
 SHARED_BUILD_STAGES = ("prepare", "config", "native-image")
+REVIEWED_BOOT_COMMANDS = (
+    "package", *MODES[:2], "finalize-qcow2", *MODES[2:4],
+    "derive-fixed-vhd", *MODES[4:], "inspect",
+)
 
 
 def native_build_command_contract(reference, stage):
@@ -571,7 +575,8 @@ def native_build_command_contract(reference, stage):
 
 
 def reviewed_build_command_contract(reference, side, stage):
-    if side == "python" or stage in SHARED_BUILD_STAGES:
+    if (side == "python" or stage in SHARED_BUILD_STAGES
+            or stage in REVIEWED_BOOT_COMMANDS):
         return reference.production_command_contract(stage)
     if stage == "fixtures":
         return native_fixture_contract(reference)
@@ -580,8 +585,8 @@ def reviewed_build_command_contract(reference, side, stage):
 
 def checked_stage(record, log, side, reference, stage, seen=None):
     check(side in ("python", "native")
-          and stage in REVIEWED_BUILD_COMMANDS,
-          "unknown supervised build-stage side")
+          and stage in (*REVIEWED_BUILD_COMMANDS, *REVIEWED_BOOT_COMMANDS),
+          "unknown supervised stage/side")
     contract = reviewed_build_command_contract(reference, side, stage)
     label = f"{stage} {side}"
     check(record["scope"] == "command_diagnostic_not_acceptance"
@@ -628,7 +633,13 @@ def checked_stage(record, log, side, reference, stage, seen=None):
     if seen is not None:
         runtime = seen["roots"][0]
         baseline = seen["files"]["records"]["build-start.json"][1]
-        pinned = baseline["consumer_inputs"]["files"]
+        pinned = dict(baseline["consumer_inputs"]["files"])
+        if stage in REVIEWED_BOOT_COMMANDS:
+            boot_inputs = seen["files"]["records"]["boot-inputs.json"][1]["files"]
+            pinned.update({
+                "input:package_tool": boot_inputs["package_tool"],
+                "input:local_boot_tool": boot_inputs["local_boot_tool"],
+            })
         roles = (
             request["supervisor"], request["native_executable"],
             request["command_executable"],
@@ -1119,6 +1130,97 @@ def compare_qcow2_acceptance(left, right):
                     failures.append(
                         "record_content:qcow2-acceptance.json.boots." +
                         mode + "." + field)
+    return failures
+
+
+IMAGE_CONFIG_DOMAIN = b"uk.wamr.compute-image-config-v1\x00"
+IMAGE_PROVENANCE_FIELDS = (
+    "producer_sha256", "producer_bytes", "miz_revision",
+    "config_sha256", "parent_kind", "parent_sha256",
+)
+
+
+def verified_image_provenance(seen, name):
+    records = seen["files"]["records"]
+    runtime = seen["roots"][0]
+    if name == "qcow2-finalization.json":
+        intent_name = "qcow2-finalization-intent.json"
+        source = "unikraft.raw"
+        parent = records["package.json"][1]["image"]["raw"]["sha256"]
+        kind = "raw"
+        source_field = "expected_source_sha256"
+    else:
+        check(name == "fixed-vhd-derivation.json",
+              "unknown image provenance role")
+        intent_name = "fixed-vhd-derivation-intent.json"
+        source = "unikraft.qcow2"
+        parent = records["qcow2-finalization.json"][1]["output"]["sha256"]
+        kind = "qcow2"
+        source_field = "accepted_qcow2_sha256"
+    intent_raw, intent = records[intent_name]
+    provenance = records[name][1]["provenance"]
+    package_tool = records["boot-inputs.json"][1]["files"]["package_tool"]
+    check(parsed(intent_raw, seen["reference"]) == intent
+          and set(provenance) == set(IMAGE_PROVENANCE_FIELDS)
+          and intent["source_path"] == str(runtime / "compute/package" / source)
+          and intent[source_field] == parent
+          and provenance == {
+              "producer_sha256": package_tool["sha256"],
+              "producer_bytes": package_tool["metadata"][6],
+              "miz_revision": records["package.json"][1]["image"]["miz_revision"],
+              "config_sha256": sha(IMAGE_CONFIG_DOMAIN + intent_raw),
+              "parent_kind": kind, "parent_sha256": parent,
+          }, "image provenance source/config commitment changed")
+    return intent
+
+
+SERIAL_TIMESTAMP = re.compile(rb"(?m)^\[\s*[0-9]+\.[0-9]{6}\]")
+
+
+def verified_serial(seen, mode):
+    reference = seen["reference"]
+    record = seen["files"]["records"][mode + "-compute.json"][1]
+    work = seen["roots"][0] / "compute" / ("boot-" + mode)
+    try:
+        serial = checked_file(work / "hyperv-efi-boot.log", MAX_RECORD)
+        report = checked_file(work / "report.json", 64 * 1024)
+    except OSError:
+        raise ParityError("boot serial/report inaccessible") from None
+    check(parsed(report, reference) == record["report"]
+          and sha(report) == record["report_sha256"]
+          and record["report"]["serial_bytes"] == len(serial)
+          and record["report"]["serial_sha256"] == sha(serial),
+          "boot serial/report commitment changed")
+    return serial
+
+
+def serial_differences(left, right):
+    failures = []
+    for mode in MODES:
+        name = mode + "-compute.json"
+        if name not in left["files"]["records"] or name not in right["files"]["records"]:
+            continue
+        a, b = verified_serial(left, mode), verified_serial(right, mode)
+        if a == b:
+            continue
+        label = "serial:" + mode
+        if SERIAL_TIMESTAMP.sub(b"<time>", a) == SERIAL_TIMESTAMP.sub(b"<time>", b):
+            failures.append(label + ".kernel-timestamp-only")
+        else:
+            failures.append(label + ".non-timestamp-difference")
+        lines_a, lines_b = a.splitlines(keepends=True), b.splitlines(keepends=True)
+        first = next((i for i, pair in enumerate(zip(lines_a, lines_b))
+                      if pair[0] != pair[1]), min(len(lines_a), len(lines_b)))
+        different = (lines_a[first] if first < len(lines_a) else b"",
+                     lines_b[first] if first < len(lines_b) else b"")
+        if all(SERIAL_TIMESTAMP.match(line) for line in different):
+            failures.append(label + ".first-line.kernel-timestamp")
+        elif first == min(len(lines_a), len(lines_b)):
+            failures.append(label + ".first-line.appended-or-missing")
+        else:
+            failures.append(label + ".first-line.other")
+        if len(a) != len(b):
+            failures.append(label + ".bytes")
     return failures
 
 
@@ -1661,6 +1763,7 @@ def boot_record_differences(name, first, second):
         nested = {
             "output": ("sha256", "file_bytes", "allocated", "virtual_bytes"),
             "identity": ("workload_sha256", "workload_bytes"),
+            "provenance": IMAGE_PROVENANCE_FIELDS,
         }
     elif name == "fixed-vhd-derivation.json":
         fields = ("schema", "schema_version", "status",
@@ -1672,6 +1775,7 @@ def boot_record_differences(name, first, second):
             "output": ("sha256", "file_bytes", "allocated", "virtual_bytes"),
             "accepted_qcow2": ("sha256", "file_bytes", "virtual_bytes",
                                "metadata"),
+            "provenance": IMAGE_PROVENANCE_FIELDS,
         }
     else:
         return []
@@ -1787,10 +1891,33 @@ def compare_observations(left, right, reviewed_build_compat=False):
         failures.extend(install_failures)
         if "boot-inputs.json" in l_records and "boot-inputs.json" in r_records:
             failures.extend(compare_boot_inputs(left, right, local_boots))
+            for stage in REVIEWED_BOOT_COMMANDS:
+                name = f"command-{stage}.json"
+                if name in l_records and name in r_records:
+                    checked_commands[stage] = (
+                        checked_stage(l_records[name][1], left["files"]["command_logs"][stage],
+                                      "python", left["reference"], stage, left),
+                        checked_stage(r_records[name][1], right["files"]["command_logs"][stage],
+                                      "native", right["reference"], stage, right),
+                    )
             if ("qcow2-acceptance.json" in l_records
                     and "qcow2-acceptance.json" in r_records):
                 failures.extend(compare_qcow2_acceptance(left, right))
                 checked_acceptance = True
+    if proven and "boot-inputs.json" in l_records and "boot-inputs.json" in r_records:
+        for name in ("qcow2-finalization.json", "fixed-vhd-derivation.json"):
+            if name in l_records and name in r_records:
+                a_intent = verified_image_provenance(left, name)
+                b_intent = verified_image_provenance(right, name)
+                if (Normalizer(left["roots"]).normalize(a_intent) !=
+                        Normalizer(right["roots"]).normalize(b_intent)):
+                    failures.append("record_content:" + name + ".provenance.intent")
+                elif l_records[name][1]["provenance"]["config_sha256"] != (
+                        r_records[name][1]["provenance"]["config_sha256"]):
+                    failures.append(
+                        "record_content:" + name +
+                        ".provenance.config_sha256.root-bound-intent")
+        failures.extend(serial_differences(left, right))
     for key in ("order", "retained"):
         left_value, right_value = left["files"][key], right["files"][key]
         if key == "retained" and checked_commands:
@@ -1884,7 +2011,7 @@ def observed(result, runtime, repository):
     reference = oracle(repository)
     files = phase_snapshot(runtime, reference)
     files["command_logs"] = {}
-    for stage in REVIEWED_BUILD_COMMANDS:
+    for stage in (*REVIEWED_BUILD_COMMANDS, *REVIEWED_BOOT_COMMANDS):
         if f"command-{stage}.json" in files["records"]:
             files["command_logs"][stage] = checked_file(
                 runtime / "compute/private" / f"{stage}.log", 8 * 1024 * 1024)
@@ -2648,7 +2775,8 @@ class DeterministicContracts(unittest.TestCase):
                         fixture_stage(
                             altered, log + b"tampered" if change == "log" else log,
                             side, reference)
-        for stage in ("adapter", "local-boot-tool", *SHARED_BUILD_STAGES):
+        for stage in ("adapter", "local-boot-tool", *SHARED_BUILD_STAGES,
+                      *REVIEWED_BOOT_COMMANDS):
             python = synthetic("python", b"synthetic-python-build-ok\n", stage)
             native = synthetic("native", b"synthetic-native-build-ok\n", stage)
             with self.subTest(stage=stage):
@@ -2988,6 +3116,86 @@ class DeterministicContracts(unittest.TestCase):
         second["unreviewed"] = True
         with self.assertRaisesRegex(ParityError, "field membership"):
             boot_record_differences("raw-x2apic-compute.json", first, second)
+
+    def test_image_provenance_rehashes_own_root_bound_intent(self):
+        reference = oracle()
+        sides = []
+        for root in (Path("/private/python"), Path("/private/native")):
+            records = {
+                "package.json": (b"", {"image": {
+                    "raw": {"sha256": "a" * 64}, "miz_revision": "revision",
+                }}),
+                "boot-inputs.json": (b"", {"files": {
+                    "package_tool": {"sha256": "b" * 64,
+                                     "metadata": [0, 0, 0, 0, 0, 1, 123]},
+                }}),
+                "qcow2-finalization.json": (b"", {
+                    "output": {"sha256": "c" * 64},
+                }),
+            }
+            for name, intent_name, source, parent, kind, field in (
+                    ("qcow2-finalization.json",
+                     "qcow2-finalization-intent.json", "unikraft.raw",
+                     "a" * 64, "raw", "expected_source_sha256"),
+                    ("fixed-vhd-derivation.json",
+                     "fixed-vhd-derivation-intent.json", "unikraft.qcow2",
+                     "c" * 64, "qcow2", "accepted_qcow2_sha256")):
+                intent = {"source_path": str(root / "compute/package" / source),
+                          field: parent}
+                raw = reference.compact_json(intent, newline=True)
+                records[intent_name] = (raw, intent)
+                records[name] = (b"", {
+                    **(records[name][1] if name in records else {}),
+                    "provenance": {
+                        "producer_sha256": "b" * 64, "producer_bytes": 123,
+                        "miz_revision": "revision",
+                        "config_sha256": sha(IMAGE_CONFIG_DOMAIN + raw),
+                        "parent_kind": kind, "parent_sha256": parent,
+                    },
+                })
+            sides.append({"reference": reference, "roots": (root, PROJECT),
+                          "files": {"records": records}})
+        for name in ("qcow2-finalization.json", "fixed-vhd-derivation.json"):
+            left, right = (verified_image_provenance(side, name) for side in sides)
+            self.assertNotEqual(left["source_path"], right["source_path"])
+            self.assertEqual(Normalizer(sides[0]["roots"]).normalize(left),
+                             Normalizer(sides[1]["roots"]).normalize(right))
+            changed = sides[1]["files"]["records"][name][1]["provenance"]
+            expected = changed["config_sha256"]
+            changed["config_sha256"] = "0" * 64
+            with self.assertRaisesRegex(ParityError, "provenance"):
+                verified_image_provenance(sides[1], name)
+            changed["config_sha256"] = expected
+
+    def test_serial_diagnostics_rehash_without_exposing_raw_lines(self):
+        reference = oracle()
+        with tempfile.TemporaryDirectory() as temp:
+            sides = []
+            for name, stamp in (("python", b"1.000001"),
+                                ("native", b"9.123456")):
+                runtime = Path(temp) / name
+                work = runtime / "compute/boot-raw-x2apic"
+                work.mkdir(parents=True)
+                serial = b"[    " + stamp + b"] Info: booted\n"
+                report = reference.compact_json({
+                    "serial_bytes": len(serial), "serial_sha256": sha(serial),
+                }, newline=True)
+                for filename, raw in (("hyperv-efi-boot.log", serial),
+                                      ("report.json", report)):
+                    (work / filename).write_bytes(raw)
+                    (work / filename).chmod(0o600)
+                sides.append({"reference": reference, "roots": (runtime, PROJECT),
+                              "files": {"records": {"raw-x2apic-compute.json": (
+                                  b"", {"report": parsed(report, reference),
+                                        "report_sha256": sha(report)})}}})
+            self.assertEqual(serial_differences(*sides), [
+                "serial:raw-x2apic.kernel-timestamp-only",
+                "serial:raw-x2apic.first-line.kernel-timestamp",
+            ])
+            report = sides[1]["files"]["records"]["raw-x2apic-compute.json"][1]
+            report["report"]["serial_sha256"] = "0" * 64
+            with self.assertRaisesRegex(ParityError, "serial/report commitment"):
+                serial_differences(*sides)
 
     def test_side_specific_retained_outputs_require_physical_contracts(self):
         reference = oracle()

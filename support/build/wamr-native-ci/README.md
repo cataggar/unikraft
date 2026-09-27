@@ -719,7 +719,16 @@ When completed boots differ, comparison rehashes each QCOW2 acceptance's
 own build, finalization, boot-input, boot request, report, serial, and compute
 records before reporting only fixed mode/field labels. Changed finalization
 and per-mode compute records likewise identify only reviewed nested field
-roles; no private serial data, command logs, hashes, or paths are printed.
+roles. Finalization and derivation provenance are rechecked against each
+side's canonical intent bytes (including the domain-separated config hash),
+the pinned package tool, and the corresponding source-image commitment;
+different intent paths remain strict but their root-normalized fields can
+be diagnosed. Each differing raw serial is independently rehashed against
+its report before a fixed-class timestamp/first-line diagnostic is emitted;
+serial and receipt hashes remain strict. Boot command records are checked
+against their own supervised stage contracts and physically pinned tool
+identities before their per-side command outcome is compared. No private
+serial data, command logs, hashes, or paths are printed.
 
 ## Private final-image handoff
 
