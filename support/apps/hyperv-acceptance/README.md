@@ -100,9 +100,10 @@ sh support/apps/hyperv-acceptance/tests/topology-workload-test.sh
 
 The separate
 `support/scripts/hyperv_issue90_topology.py` controller describes offline
-fresh-image and two-seed preparation, but its current `solved_config()` rejects
-the guarded I/O selected by this profile. Do not count its preparation as
-evidence until that mismatch is resolved. Its live run is **not yet safe**:
+fresh-image and two-seed preparation. Its `solved_config()` requires the
+guarded I/O selected by this profile, but preparation still refuses without
+reviewed-source/solved-config-to-EFI build proof; synthetic evidence cannot
+satisfy that gate. Its live run is **not yet safe**:
 if an Azure create response is lost, it cannot prove the original resource
 identity needed for mandatory owner-checked deletion. Do not allocate Azure
 resources through this lane until that failure path is resolved. The

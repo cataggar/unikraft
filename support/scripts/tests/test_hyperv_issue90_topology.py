@@ -504,6 +504,7 @@ class Issue90TopologyTest(unittest.TestCase):
         settings = {
             "APPHYPERVACCEPTANCE_STORAGE_TOPOLOGY": "y",
             "LIBSTORVSC_LUN_DISCOVERY": "y",
+            "LIBSTORVSC_GUARDED_IO": "y",
             "LIBSTORVSC_MAX_DEVICES": "3",
             "LIBSTORVSC_MAX_LUNS": "2",
             "APPHYPERVACCEPTANCE_TOPOLOGY_RUN_ID": f'"{self.state["run_id"]}"',
@@ -522,11 +523,24 @@ class Issue90TopologyTest(unittest.TestCase):
             ).encode()
 
         lane.solved_config(encode(settings), self.state)
+        for guarded in (None, "n"):
+            without_guarded = {
+                key: value for key, value in settings.items()
+                if key != "LIBSTORVSC_GUARDED_IO"
+            }
+            if guarded is not None:
+                without_guarded["LIBSTORVSC_GUARDED_IO"] = guarded
+            with self.subTest(guarded_io=guarded):
+                with self.assertRaisesRegex(ValueError, "Guest configuration"):
+                    lane.solved_config(encode(without_guarded), self.state)
         for key, value in (
+            ("APPHYPERVACCEPTANCE_TOPOLOGY_RUN_ID", '"wrong"'),
             ("APPHYPERVACCEPTANCE_TOPOLOGY_DISK0_ID", '"wrong"'),
+            ("APPHYPERVACCEPTANCE_TOPOLOGY_DISK_NONZERO_ID", '"wrong"'),
             ("APPHYPERVACCEPTANCE_TOPOLOGY_NONZERO_LUN", "6"),
             ("APPHYPERVACCEPTANCE_TOPOLOGY_DISK_NONZERO_SECTORS", "1048576"),
             ("LIBSTORVSC_MAX_DEVICES", "1"),
+            ("LIBSTORVSC_LUN_DISCOVERY", "n"),
             ("APPHYPERVACCEPTANCE_STORAGE_TOPOLOGY", "n"),
             ("APPHYPERVACCEPTANCE_PERSISTENCE", "y"),
             ("APPHYPERVACCEPTANCE_NETWORK_APPLICATION", "y"),
@@ -540,6 +554,7 @@ class Issue90TopologyTest(unittest.TestCase):
         config_path.write_text("\n".join((
             "CONFIG_APPHYPERVACCEPTANCE_STORAGE_TOPOLOGY=y",
             "CONFIG_LIBSTORVSC_LUN_DISCOVERY=y",
+            "CONFIG_LIBSTORVSC_GUARDED_IO=y",
             "CONFIG_LIBSTORVSC_MAX_DEVICES=3",
             "CONFIG_LIBSTORVSC_MAX_LUNS=2",
             f'CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_RUN_ID="{self.state["run_id"]}"',
@@ -622,6 +637,7 @@ class Issue90TopologyTest(unittest.TestCase):
         config.write_text("\n".join((
             "CONFIG_APPHYPERVACCEPTANCE_STORAGE_TOPOLOGY=y",
             "CONFIG_LIBSTORVSC_LUN_DISCOVERY=y",
+            "CONFIG_LIBSTORVSC_GUARDED_IO=y",
             "CONFIG_LIBSTORVSC_MAX_DEVICES=3",
             "CONFIG_LIBSTORVSC_MAX_LUNS=2",
             f'CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_RUN_ID="{self.state["run_id"]}"',

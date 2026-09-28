@@ -303,6 +303,7 @@ def solved_config(raw, state):
     exact = {
         "APPHYPERVACCEPTANCE_STORAGE_TOPOLOGY": "y",
         "LIBSTORVSC_LUN_DISCOVERY": "y",
+        "LIBSTORVSC_GUARDED_IO": "y",
         "APPHYPERVACCEPTANCE_TOPOLOGY_RUN_ID": f'"{state["run_id"]}"',
         "APPHYPERVACCEPTANCE_TOPOLOGY_DISK0_ID": f'"{state["disk_ids"]["data0"]}"',
         "APPHYPERVACCEPTANCE_TOPOLOGY_DISK_NONZERO_ID": f'"{state["disk_ids"]["data7"]}"',
@@ -314,7 +315,6 @@ def solved_config(raw, state):
         raise ValueError("Guest configuration does not match fresh #90 run and both disks")
     if (settings.get("APPHYPERVACCEPTANCE_PERSISTENCE") == "y"
             or settings.get("APPHYPERVACCEPTANCE_NETWORK_APPLICATION") == "y"
-            or settings.get("LIBSTORVSC_GUARDED_IO") == "y"
             or not 3 <= int(settings.get("LIBSTORVSC_MAX_DEVICES", "0")) <= 16
             or not 2 <= int(settings.get("LIBSTORVSC_MAX_LUNS", "0")) <= 16):
         raise ValueError("Guest discovery bounds or read-only workload are invalid")
