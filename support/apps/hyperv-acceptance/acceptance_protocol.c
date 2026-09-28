@@ -3,6 +3,29 @@
 
 #include <string.h>
 
+int hyperv_acceptance_parse_hex_id(const char *text, uint8_t output[16])
+{
+	if (!text || !output || strlen(text) != 32)
+		return -1;
+	for (unsigned int i = 0; i < 16; i++) {
+		unsigned int high;
+		unsigned int low;
+		char a = text[i * 2];
+		char b = text[i * 2 + 1];
+
+		high = a >= '0' && a <= '9' ? (unsigned int)(a - '0') :
+		       a >= 'a' && a <= 'f' ?
+			       (unsigned int)(a - 'a' + 10) : 16;
+		low = b >= '0' && b <= '9' ? (unsigned int)(b - '0') :
+		      b >= 'a' && b <= 'f' ?
+			      (unsigned int)(b - 'a' + 10) : 16;
+		if (high > 15 || low > 15)
+			return -1;
+		output[i] = (uint8_t)(high << 4 | low);
+	}
+	return 0;
+}
+
 #define ETH_HEADER_SIZE 14U
 #define IPV4_HEADER_SIZE 20U
 #define UDP_HEADER_SIZE 8U

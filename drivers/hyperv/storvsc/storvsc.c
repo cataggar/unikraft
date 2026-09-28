@@ -3083,8 +3083,11 @@ static int storvsc_add_device(struct vmbus_device *vmbus_device)
 			if (!first_error)
 				first_error = -ENOSPC;
 			uk_pr_err(DRIVER_NAME
-				  ": controller%u LUN pool exhausted\n",
-				  device->index);
+				  ": controller%u relid=%"PRIu32
+				  " %u:%u:%u LUN pool exhausted (max %u)\n",
+				  device->index, vmbus_device->channel_id,
+				  address->path_id, address->target_id,
+				  address->lun, CONFIG_LIBSTORVSC_MAX_LUNS);
 			continue;
 		}
 		rc = storvsc_discover_lun(device, address, &capacity, &mode,

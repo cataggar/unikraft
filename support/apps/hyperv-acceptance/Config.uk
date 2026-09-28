@@ -37,6 +37,14 @@ config APPHYPERVACCEPTANCE_PERSISTENCE
 	  manifest-gated two-boot persistence workload. This may write only
 	  the uniquely matched disposable disk described below.
 
+config APPHYPERVACCEPTANCE_STORAGE_TOPOLOGY
+	bool "Read-only OS and two seeded data-disk topology acceptance"
+	select LIBSTORVSC_LUN_DISCOVERY
+	help
+	  Inventory coherent StorVSC mappings, read the OS boot signatures,
+	  and verify two independent policy-2 seed manifests. No block writes,
+	  flushes, or network operations are performed by this workload.
+
 endchoice
 
 config APPHYPERVACCEPTANCE_PEER_IPV4
@@ -108,6 +116,35 @@ config APPHYPERVACCEPTANCE_PERSISTENCE_LUN
 	int "Expected StorVSC LUN"
 	range 0 255
 	default 0
+endif
+
+if APPHYPERVACCEPTANCE_STORAGE_TOPOLOGY
+
+config APPHYPERVACCEPTANCE_TOPOLOGY_RUN_ID
+	string "Private 128-bit topology run ID (32 lowercase hex digits)"
+	default ""
+
+config APPHYPERVACCEPTANCE_TOPOLOGY_DISK0_ID
+	string "Private 128-bit LUN 0 data disk ID (32 lowercase hex digits)"
+	default ""
+
+config APPHYPERVACCEPTANCE_TOPOLOGY_DISK_NONZERO_ID
+	string "Private 128-bit nonzero-LUN data disk ID (32 lowercase hex digits)"
+	default ""
+
+config APPHYPERVACCEPTANCE_TOPOLOGY_DISK0_SECTORS
+	int "Exact LUN 0 data disk sector count"
+	default 0
+
+config APPHYPERVACCEPTANCE_TOPOLOGY_DISK_NONZERO_SECTORS
+	int "Exact nonzero-LUN data disk sector count"
+	default 0
+
+config APPHYPERVACCEPTANCE_TOPOLOGY_NONZERO_LUN
+	int "Expected nonzero data disk LUN"
+	range 1 255
+	default 7
+
 endif
 
 endif

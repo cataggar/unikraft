@@ -45,6 +45,46 @@ The default probe never writes to a block device. An environment without
 StorVSC or NetVSC returns 2 (`UNAVAILABLE`); a present device that cannot bind,
 configure, complete I/O, or meet the timeout returns 1.
 
+## Read-only storage topology profile
+
+Select `CONFIG_APPHYPERVACCEPTANCE_STORAGE_TOPOLOGY=y` for a separate,
+default-off storage-only workload. Configure the 32-lowercase-hex-digit
+`CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_RUN_ID`, distinct
+`CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_DISK0_ID` and
+`CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_DISK_NONZERO_ID`, exact positive
+`CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_DISK0_SECTORS` and
+`CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_DISK_NONZERO_SECTORS`, and
+`CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_NONZERO_LUN=7`. The approved
+two-4-GiB-disk configuration uses 8,388,608 sectors of 512 bytes for
+**each** data disk, `CONFIG_LIBSTORVSC_MAX_DEVICES>=3`, and
+`CONFIG_LIBSTORVSC_MAX_LUNS=4`. Invalid or unset IDs and geometry fail
+before storage I/O.
+
+The workload waits for complete discovery, inventories a coherent generation,
+and reads LBAs 0-1 from each target. Exactly one LUN-0 target must have both
+MBR and primary GPT signatures. Independently on the two selected data disks,
+it reads LBAs 8-9 and compares **both complete 512-byte sectors** against the
+expected policy-2 seed manifest (run ID, distinct disk ID, LUN, exact
+capacity, CRC, and layout). It validates each read session and the final
+inventory; unexpected unseeded LUNs are reported but cannot substitute for
+either required data disk. Only `UK_HYPERV_TOPOLOGY_READ_OK` with
+`HYPERV_TOPOLOGY FINAL PASS` means all three reads and mappings passed.
+Serial evidence contains controller/channel/SCSI mappings and diagnostic
+CRC32 fingerprints, not raw run IDs, disk IDs, VPD IDs, or instance GUIDs.
+These CRC32 values are correlation hints, not security identities.
+
+This profile never issues block writes or flushes, does not run the DHCP/network
+workload, and cannot be used as the persistence two-boot workload. Its
+production-backed hosted fixture verifies reverse controller offers, two
+distinct seed reads, wrong-disk and corrupt-copy seed rejection, duplicate
+boot-disk rejection, and zero write/flush commands. The separate
+`support/scripts/hyperv_issue90_topology.py` controller can prepare a fresh
+image and two seeded disks offline, but its live run is **not yet safe**:
+if an Azure create response is lost, it cannot prove the original resource
+identity needed for mandatory owner-checked deletion. Do not allocate Azure
+resources through this lane until that failure path is resolved. The
+one-data-disk runner is not a substitute.
+
 The default private peer inputs are:
 
 | Input | Value |

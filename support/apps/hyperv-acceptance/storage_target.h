@@ -2,6 +2,8 @@
 #ifndef HYPERV_ACCEPTANCE_STORAGE_TARGET_H
 #define HYPERV_ACCEPTANCE_STORAGE_TARGET_H
 
+#include "acceptance_protocol.h"
+
 #include <uk/blkdev.h>
 #include <uk/storvsc.h>
 
@@ -19,5 +21,8 @@ int hyperv_acceptance_storage_target_validate(
 	const struct hyperv_acceptance_storage_target *target);
 int hyperv_acceptance_storage_target_release(
 	struct hyperv_acceptance_storage_target *target);
+
+enum hyperv_acceptance_result hyperv_acceptance_storage_topology_probe(
+	unsigned int storage_offers, int binding_ready, int discovery_error);
 
 #endif

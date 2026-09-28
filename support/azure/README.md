@@ -834,7 +834,14 @@ scheduled SMP workload or real-host reconnect result.
 `zig build test-storvsc-regression -j2` runs the StorVSC core, C/C++ public
 mapping ABI, native export metadata, and production topology/lifetime fixtures
 on either host architecture. It includes mixed polling/interrupt LUNs and
-retained-client interrupt restoration after same-controller rebind.
+retained-client interrupt restoration after same-controller rebind. The
+storage-binding fixtures also exercise reverse controller offers with shared
+LUN numbers, out-of-order and failed completions, per-controller request-pool
+exhaustion without blocking another controller, and continued reads from
+healthy disks after controller/LUN pool exhaustion. The optional read-only
+topology profile additionally checks distinct policy-2 seeds on two data LUNs
+under either controller-offer order, rejecting a swapped seed or duplicate OS
+boot signatures without issuing writes or flushes.
 
 `state.json` retains `local_platform_boot_modes` for the raw and fixed-VHD
 x2APIC/legacy-APIC boots, while `image_sha256` remains the deployment identity.
@@ -859,7 +866,10 @@ CONFIG_LIBSTORVSC_MAX_LUNS=4
 Each LUN has independent capacity, access mode, queue, and completion routing.
 The limits reserve controller/LUN identities for the boot; removed identities
 are not recycled into different devices. Pool exhaustion is reported without
-discarding healthy attached LUNs.
+discarding healthy attached LUNs; LUN diagnostics identify the controller,
+channel, and SCSI address. An incomplete inventory remains unavailable for
+guarded write authorization even when its known disks can still be read in
+ordinary, unguarded builds.
 
 `<uk/storvsc.h>` exposes `uk_storvsc_mapping_count`, `uk_storvsc_mapping_get`,
 and `uk_storvsc_mapping_find` to C and C++ callers. Active snapshots include
@@ -868,9 +878,22 @@ properties, and any supported LU-associated VPD designator. A missing VPD
 designator is explicit, not a fabricated stable identity. Snapshots do not
 pin a disk across removal and are not authorization to write.
 
-This driver support does not extend the existing smoke controller into a
-multi-disk or write-persistence acceptance lane. Those still require a
-run-owned data-disk guard and separate real-host evidence.
+The default smoke controller still selects a unique LUN-0 OS disk; it is not
+valid when an additional data disk occupies LUN 0. The opt-in read-only
+topology guest profile described in the
+[application README](../apps/hyperv-acceptance/README.md#read-only-storage-topology-profile)
+uses two independent policy-2 seeds instead. The existing Azure controller
+still provisions only one disk. Do not use it for #90 live acceptance: a
+separate two-data-disk controller (`support/scripts/hyperv_issue90_topology.py`)
+provides offline planning, four-boot image verification, distinct seed
+preparation, and an exact resource envelope. Its live run remains **blocked**:
+if a create response is lost, the original Azure-assigned disk/VM identity
+cannot be recovered safely from a currently tagged resource, so mandatory
+owner-checked deletion cannot be guaranteed. Do not allocate Azure resources
+with this controller or reuse the one-disk lane until that failure path is
+resolved and its Azure response shapes are verified. Local QEMU boots without
+StorVSC devices are `UNAVAILABLE`, not real-host read evidence. Write/flush
+persistence remains a separate workload.
 
 ## Private application-network peer
 
