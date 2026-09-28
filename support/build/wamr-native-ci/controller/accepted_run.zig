@@ -525,6 +525,31 @@ pub fn validateCommandBinding(
     return command.validate(a, document.value(), stage, context);
 }
 
+pub fn validateLocalHandoffCommand(self: *AcceptedRun, raw: []const u8) !ValidatedCommand {
+    if (self.context != .local_runtime or self.repository == null)
+        return error.InvalidContext;
+    const a = self.allocator();
+    var document = try contracts.Document.parse(a, raw, .{
+        .bytes = records.max_record_bytes,
+        .depth = 32,
+        .items = 4096,
+        .tokens = 65536,
+    });
+    defer document.deinit();
+    try document.requireCanonical(a, raw);
+    const record = document.value();
+    const checked = try command.validate(a, record, .@"handoff-inspect", .local_runtime);
+    const request = try get(try get(record, "supervisor"), "request");
+    const start = try canonicalFile(self, try recordPath(self, "build-start.json"), records.max_record_bytes);
+    const boot_inputs = try canonicalFile(self, try recordPath(self, "boot-inputs.json"), records.max_record_bytes);
+    for ([_][]const u8{ "supervisor", "native_executable", "command_executable" }) |key|
+        try checkRoleIdentity(try get(request, key), start, boot_inputs);
+    const retained = try get(request, "retained_executables");
+    for (retained.array.items) |binding|
+        try checkRoleIdentity(binding, start, boot_inputs);
+    return checked;
+}
+
 fn validateCommands(self: *AcceptedRun, legacy: bool) !void {
     const start = if (legacy) std.json.Value.null else try canonicalFile(self, try recordPath(self, "build-start.json"), records.max_record_bytes);
     const boot_inputs = if (legacy) std.json.Value.null else try canonicalFile(self, try recordPath(self, "boot-inputs.json"), records.max_record_bytes);

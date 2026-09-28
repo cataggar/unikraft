@@ -10,6 +10,7 @@ pub const custody_files = @import("custody_files.zig");
 pub const custody_limits = @import("custody_limits.zig");
 pub const dependency_custody = @import("dependency_custody.zig");
 pub const fixture_contract = @import("fixture_contract.zig");
+pub const handoff_inspect = @import("handoff_inspect.zig");
 pub const input_custody = @import("input_custody.zig");
 pub const layout = @import("layout.zig");
 pub const profile = @import("profile.zig");

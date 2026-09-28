@@ -90,31 +90,81 @@ def _decode(raw, context):
     elif value["compatibility"] != "tiny-v1" or value["profile"] is not None:
         _refuse()
     if (type(value["modes"]) is not list or not value["modes"]
-            or type(value["records"]) is not list or not value["records"]
-            or type(value["artifacts"]) is not list or not value["artifacts"]
+            or type(value["records"]) is not list
+            or not 1 <= len(value["records"]) <= 64
+            or type(value["artifacts"]) is not list
+            or not 1 <= len(value["artifacts"]) <= 64
             or type(value["runtime_inputs"]) is not list
+            or len(value["runtime_inputs"]) > 512
             or (context == "trusted-inner-zip" and value["runtime_inputs"])):
         _refuse()
-    if not _entry(value["result"], ("relative_path", "bytes", "sha256")):
+    result = value["result"]
+    if (not _entry(result, ("relative_path", "bytes", "sha256"))
+            or result["relative_path"] != (
+                "runtime/compute/evidence/result.json"
+                if context == "local-runtime" else "artifacts/local_result")
+            or type(result["bytes"]) is not int or result["bytes"] < 1
+            or not _digest(result["sha256"], 64)):
         _refuse()
+    names = set()
     for record in value["records"]:
         if (not _entry(record, ("name", "relative_path", "bytes", "sha256"))
+                or type(record["name"]) is not str
+                or Path(record["name"]).name != record["name"]
+                or not record["name"].endswith(".json")
+                or record["name"] in names
+                or record["relative_path"] != (
+                    ("runtime/compute/evidence/" if context == "local-runtime"
+                     else "evidence/") + record["name"])
                 or not _digest(record["sha256"], 64)
                 or type(record["bytes"]) is not int
                 or record["bytes"] < 1):
             _refuse()
+        names.add(record["name"])
+    for artifact in value["artifacts"]:
+        if (not _entry(artifact, (
+                "role", "relative_path", "bytes", "sha256", "snapshot"))
+                or type(artifact["role"]) is not str or not artifact["role"]
+                or type(artifact["relative_path"]) is not str
+                or not artifact["relative_path"]
+                or type(artifact["bytes"]) is not int or artifact["bytes"] < 1
+                or not _digest(artifact["sha256"], 64)
+                or type(artifact["snapshot"]) is not list
+                or len(artifact["snapshot"]) != 9
+                or any(type(item) is not int for item in artifact["snapshot"])):
+            _refuse()
+    for item in value["runtime_inputs"]:
+        if (not _entry(item, ("role", "path", "snapshot"))
+                or type(item["role"]) is not str or not item["role"]
+                or type(item["path"]) is not str
+                or not item["path"].startswith("/")
+                or not _entry(item["snapshot"], (
+                    "bytes", "sha256", "metadata", "tree"))):
+            _refuse()
+        snapshot = item["snapshot"]
+        if (type(snapshot["bytes"]) is not int or snapshot["bytes"] < 0
+                or not _digest(snapshot["sha256"], 64)
+                or type(snapshot["metadata"]) is not list
+                or len(snapshot["metadata"]) != 9
+                or any(type(part) is not int for part in snapshot["metadata"])):
+            _refuse()
+        if snapshot["tree"] is not None:
+            tree = snapshot["tree"]
+            if (not _entry(tree, (
+                    "files", "directories", "symlinks", "physical_sha256"))
+                    or any(type(tree[key]) is not int or tree[key] < 0
+                           for key in ("files", "directories", "symlinks"))
+                    or not _digest(tree["physical_sha256"], 64)):
+                _refuse()
     return value
 
 
-def imported_stage(stage_root):
-    """Ask the native importer to validate the exact extracted inner tree."""
+def _records(context, arguments):
     try:
-        stage_root = _absolute(stage_root)
         controller = _controller()
         deadline = time.monotonic() + RECORDS_TIMEOUT_SECONDS
         process = subprocess.Popen(
-            [str(controller), "records", "--stage-root", str(stage_root),
-             "--transport", "trusted-inner-zip", "--output", "handoff-v1"],
+            [str(controller), "records", *arguments, "--output", "handoff-v1"],
             cwd=HERE.parents[2], stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=True)
@@ -147,7 +197,7 @@ def imported_stage(stage_root):
             remaining = deadline - time.monotonic()
             if remaining <= 0 or process.wait(timeout=remaining) != 0:
                 _refuse()
-            result = _decode(b"".join(output), "trusted-inner-zip")
+            result = _decode(b"".join(output), context)
             accepted = True
             return result
         finally:
@@ -165,3 +215,21 @@ def imported_stage(stage_root):
                 process.stderr.close()
     except (OSError, subprocess.SubprocessError) as error:
         raise ValueError("native controller records refused") from error
+
+
+def imported_stage(stage_root):
+    """Ask the native importer to validate the exact extracted inner tree."""
+    stage_root = _absolute(stage_root)
+    return _records("trusted-inner-zip", (
+        "--stage-root", str(stage_root), "--transport", "trusted-inner-zip"))
+
+
+def local_runtime(runtime):
+    """Local handoff requires native v2; historical v1 is import-only."""
+    runtime = _absolute(runtime)
+    value = _records("local-runtime", ("--runtime", str(runtime)))
+    if value["compatibility"] == "tiny-v1":
+        raise ValueError("local v1 handoff/export unsupported until native acceptance")
+    if value["compatibility"] != "tiny-v2" or not value["runtime_inputs"]:
+        _refuse()
+    return value

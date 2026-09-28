@@ -29,6 +29,7 @@ pub const entries = [_]Entry{
     .{ .name = "support/build/wamr-native-ci/controller/dependency_custody.zig", .content = @embedFile("build/wamr-native-ci/controller/dependency_custody.zig") },
     .{ .name = "support/build/wamr-native-ci/controller/fixture_contract.zig", .content = @embedFile("build/wamr-native-ci/controller/fixture_contract.zig") },
     .{ .name = "support/build/wamr-native-ci/controller/fixture_runner.zig", .content = @embedFile("build/wamr-native-ci/controller/fixture_runner.zig") },
+    .{ .name = "support/build/wamr-native-ci/controller/handoff_inspect.zig", .content = @embedFile("build/wamr-native-ci/controller/handoff_inspect.zig") },
     .{ .name = "support/build/wamr-native-ci/controller/input_custody.zig", .content = @embedFile("build/wamr-native-ci/controller/input_custody.zig") },
     .{ .name = "support/build/wamr-native-ci/controller/install.zig", .content = @embedFile("build/wamr-native-ci/controller/install.zig") },
     .{ .name = "support/build/wamr-native-ci/controller/install_target_tests.zig", .content = @embedFile("build/wamr-native-ci/controller/install_target_tests.zig") },

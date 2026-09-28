@@ -33,7 +33,7 @@ authoritative production caller and differential reference until the later
 parity/bridge/cutover PRs; production callers, wrappers and authority are
 unchanged.
 
-## Native record-consumer bridge (not yet the production handoff caller)
+## Native record-consumer bridge (Python still performs the handoff)
 
 `uk-wamr-native-ci records --runtime ABS --output handoff-v1` reopens a
 completed local v2 run, including source and input custody, the six boot
@@ -47,11 +47,19 @@ boot, changes authority, or makes a partially checked manifest an accepted run.
 
 The public bundle importer now requires this native check before publishing
 its candidate, while retaining the Python publication and supervised-stage
-validation. The caller must independently authenticate the executable
+validation. The local v2 handoff reader also requires native acceptance before
+using its result-record hashes and source identity; the Python build, boot and
+inspection checks still run. Historical v1 local handoff remains on the
+pinned-source Python compatibility path; v2 never falls back to it after a
+native refusal. The caller must independently authenticate the executable
 provided by `WAMR_CI_CONTROLLER`; owner and mode checks alone do not prove
 its provenance. The completed local run still needs a protected end-to-end
-check, and checkout/consumer custody and supervised handoff stages need
-native owners before `run.py` can be removed.
+check. A typed native `handoff-inspect` operation binds the original compute
+supervisor and inputs but is not a production caller; the current native
+producer instead pins the records controller as `command-supervisor`, so that
+handoff operation refuses its records. Checkout/consumer custody and the
+remaining supervised handoff stages need native owners before `run.py` can be
+removed.
 
 ## Native controller preparation (unpublished build path)
 

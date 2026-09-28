@@ -46,6 +46,13 @@ ci.COMMAND_TOOL_PATHS.update({
 
 
 class NativeRecordBridge(unittest.TestCase):
+    def handoff_module(self):
+        spec = importlib.util.spec_from_file_location(
+            "wamr_handoff_native_records_test", HERE / "handoff.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
     def controller_fixture(self, body):
         parent = HERE.parents[2] / ".d"
         parent.mkdir(mode=0o700, exist_ok=True)
@@ -148,6 +155,189 @@ class NativeRecordBridge(unittest.TestCase):
         pid = int(pid_file.read_text())
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
+
+    def test_local_runtime_uses_bounded_native_command_without_fallback(self):
+        bridge = public_bundle.accepted_records
+        root, controller = self.controller_fixture(
+            "import json, os, sys\n"
+            "open(os.environ['WAMR_CI_TEST_ARGS'], 'w').write("
+            "json.dumps(sys.argv[1:]))\n"
+            "sys.exit(1)\n")
+        runtime = root / "runtime"
+        runtime.mkdir(mode=0o700)
+        arguments = root / "arguments.json"
+        with mock.patch.dict(os.environ, {
+                bridge.CONTROLLER_ENV: str(controller),
+                "WAMR_CI_TEST_ARGS": str(arguments)}):
+            with self.assertRaisesRegex(
+                    ValueError, "native controller records refused"):
+                bridge.local_runtime(runtime)
+        self.assertEqual(json.loads(arguments.read_text()), [
+            "records", "--runtime", str(runtime), "--output", "handoff-v1"])
+
+    def test_native_v1_view_cannot_be_relabeled_v2(self):
+        bridge = public_bundle.accepted_records
+        handoff = self.handoff_module()
+        root, unused_controller = self.controller_fixture(
+            "import sys\nsys.exit(1)\n")
+        del unused_controller
+        runtime = root / "runtime"
+        runtime.mkdir(mode=0o700)
+        (runtime / "compute").mkdir(mode=0o700)
+        output = root / "handoff"
+        with mock.patch.object(bridge, "_records", return_value={
+                "compatibility": "tiny-v1", "runtime_inputs": [{}]}) as native:
+            with self.assertRaisesRegex(
+                    ValueError, "local v1 handoff/export unsupported until native acceptance"):
+                bridge.local_runtime(runtime)
+            native.assert_called_once_with(
+                "local-runtime", ("--runtime", str(runtime)))
+        with mock.patch.object(
+                handoff.accepted_records, "local_runtime",
+                return_value={
+                    "compatibility": "tiny-v1", "profile": None,
+                    "modes": list(ci.MODES), "records": [],
+                }), mock.patch.object(
+                    handoff.ci, "document", return_value={"schema_version": 2}) as document:
+            with self.assertRaisesRegex(
+                    handoff.ci.Refusal, "unexpected native local modes"):
+                handoff.export(runtime, output)
+            document.assert_called_once_with(
+                runtime / "compute/evidence/result.json")
+        self.assertFalse(output.exists())
+
+    def test_pinned_historical_v1_result_reader_without_native_controller(self):
+        bridge = public_bundle.accepted_records
+        handoff = self.handoff_module()
+        root, unused_controller = self.controller_fixture(
+            "import sys\nsys.exit(1)\n")
+        del unused_controller
+        runtime = root / "runtime"
+        runtime.mkdir(mode=0o700)
+        compute = runtime / "compute"
+        compute.mkdir(mode=0o700)
+        evidence = compute / "evidence"
+        evidence.mkdir(mode=0o700)
+        source = {
+            "revision": "3c6d5d98dc5736d86e97884184b26be39c3f11d5",
+            "tree": "feb57a66615a6083378c7261e1e53c37730e0650",
+        }
+        self.assertIn((source["revision"], source["tree"]),
+                      public_bundle.PRE_SUPERVISOR_SOURCES)
+        for name in public_bundle.EVIDENCE:
+            handoff.ci.save(evidence / name, (
+                {"source": source} if name in ("build-start.json", "build.json")
+                else {}))
+        record_hashes = {
+            name: handoff.ci.digest(evidence / name)
+            for name in public_bundle.EVIDENCE
+        }
+        handoff.ci.save(evidence / "result.json", {
+            "schema_version": 1,
+            "scope": "local_native_compute_only",
+            "passed": True,
+            "hardware_acceptance": "not_established",
+            "cloud_authority": "not_admitted",
+            "benchmark": "not_measured",
+            "workload": "tiny",
+            "modes": list(handoff.ci.MODES),
+            "records": record_hashes,
+        })
+        with mock.patch.dict(os.environ, {bridge.CONTROLLER_ENV: ""}), \
+                mock.patch.object(
+                    handoff.accepted_records, "local_runtime") as native:
+            self.assertEqual(handoff.result_records(compute), record_hashes)
+            native.assert_not_called()
+            command = evidence / "command-adapter.json"
+            original_command = command.read_bytes()
+            command.write_bytes(b'{"tampered":true}\n')
+            with self.assertRaisesRegex(
+                    handoff.ci.Refusal, "local record changed"):
+                handoff.result_records(compute)
+            command.write_bytes(original_command)
+            (compute / "package").mkdir(mode=0o700)
+            handoff.ci.save(compute / "package/unikraft.qcow2", {})
+            with self.assertRaisesRegex(
+                    handoff.ci.Refusal, "historical v1 evidence required"):
+                handoff.result_records(compute)
+            (compute / "package/unikraft.qcow2").unlink()
+            (evidence / "build-start.json").unlink()
+            handoff.ci.save(evidence / "build-start.json", {
+                "source": {"revision": "0" * 40, "tree": source["tree"]},
+            })
+            with self.assertRaisesRegex(
+                    handoff.ci.Refusal, "historical v1 source required"):
+                handoff.result_records(compute)
+            native.assert_not_called()
+
+    def test_v2_refusal_never_falls_into_historical_v1(self):
+        handoff = self.handoff_module()
+        root, unused_controller = self.controller_fixture(
+            "import sys\nsys.exit(1)\n")
+        del unused_controller
+        runtime = root / "runtime"
+        runtime.mkdir(mode=0o700)
+        compute = runtime / "compute"
+        compute.mkdir(mode=0o700)
+        (compute / "evidence").mkdir(mode=0o700)
+        handoff.ci.save(compute / "evidence/result.json", {
+            "schema_version": 2,
+        })
+        with mock.patch.object(
+                handoff.accepted_records, "local_runtime",
+                side_effect=ValueError("native controller records refused")) as native, \
+                mock.patch.object(
+                    handoff, "_historical_v1_records") as historical, \
+                mock.patch.object(handoff.ci, "digest") as digest:
+            with self.assertRaisesRegex(
+                    ValueError, "native controller records refused"):
+                handoff.result_records(compute)
+            with self.assertRaisesRegex(
+                    ValueError, "native controller records refused"):
+                handoff.export(runtime, root / "handoff")
+            self.assertEqual(native.call_count, 2)
+            historical.assert_not_called()
+            digest.assert_not_called()
+        self.assertFalse((root / "handoff").exists())
+
+    def test_handoff_v2_local_result_and_export_refuse_without_python_replay(self):
+        bridge = public_bundle.accepted_records
+        handoff = self.handoff_module()
+        root, controller = self.controller_fixture(
+            "import sys\nsys.exit(1)\n")
+        runtime = root / "runtime"
+        runtime.mkdir(mode=0o700)
+        compute = runtime / "compute"
+        compute.mkdir(mode=0o700)
+        output = root / "handoff"
+        with mock.patch.dict(os.environ, {bridge.CONTROLLER_ENV: str(controller)}), \
+                mock.patch.object(
+                    handoff.ci, "document",
+                    return_value={"schema_version": 2}) as document, \
+                mock.patch.object(handoff.ci, "digest") as digest, \
+                mock.patch.object(handoff.ci, "check_build") as build:
+            with self.assertRaisesRegex(
+                    ValueError, "native controller records refused"):
+                handoff.result_records(compute)
+            with self.assertRaisesRegex(
+                    ValueError, "native controller records refused"):
+                handoff.export(runtime, output)
+            self.assertEqual(document.call_args_list, [
+                mock.call(compute / "evidence/result.json")] * 2)
+            digest.assert_not_called()
+            build.assert_not_called()
+        self.assertFalse(output.exists())
+
+    def test_real_local_run_requires_completed_runtime(self):
+        runtime = os.environ.get("WAMR_CI_NATIVE_LOCAL_RUNTIME")
+        controller = os.environ.get(
+            public_bundle.accepted_records.CONTROLLER_ENV)
+        if not runtime or not controller:
+            self.skipTest("completed local runtime and native controller unavailable")
+        handoff = self.handoff_module()
+        accepted = handoff.accepted_records.local_runtime(Path(runtime))
+        self.assertEqual(handoff.result_records(Path(runtime) / "compute"), {
+            record["name"]: record["sha256"] for record in accepted["records"]})
 
     def test_real_imported_stage_uses_native_acceptance(self):
         bridge = public_bundle.accepted_records

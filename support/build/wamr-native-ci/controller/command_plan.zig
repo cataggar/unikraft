@@ -23,6 +23,7 @@ pub const Stage = enum {
     inspect,
     @"log-validator-x2apic",
     @"log-validator-legacy",
+    @"handoff-inspect",
 };
 
 pub const Binding = union(enum) {
@@ -112,7 +113,7 @@ pub fn isBoot(stage: Stage) bool {
     return switch (stage) {
         .package, .@"raw-x2apic", .@"raw-legacy-apic", .@"finalize-qcow2",
         .@"qcow2-x2apic", .@"qcow2-legacy-apic", .@"derive-fixed-vhd",
-        .@"vpc-x2apic", .@"vpc-legacy-apic", .inspect => true,
+        .@"vpc-x2apic", .@"vpc-legacy-apic", .inspect, .@"handoff-inspect" => true,
         else => false,
     };
 }
@@ -150,6 +151,16 @@ pub fn spec(stage: Stage) Spec {
         } },
         .package => packageSpec(.package),
         .inspect => packageSpec(.inspect),
+        .@"handoff-inspect" => .{
+            .stage = stage,
+            .executable = "input:package_tool",
+            .seconds = 150,
+            .output_limit = 64 * 1024,
+            .argv = &.{
+                package_tool,                                                                                         .{ .literal = "inspect" },
+                .{ .path = .{ .role = "source", .relative = "support/apps/wamr-aot/build/wamr_hyperv-x86_64-efi" } }, .{ .path = .{ .role = "compute", .relative = "package" } },
+            },
+        },
         .@"finalize-qcow2" => packageSpec(.@"finalize-qcow2"),
         .@"derive-fixed-vhd" => packageSpec(.@"derive-fixed-vhd"),
         .@"raw-x2apic" => bootSpec(stage, .@"raw-x2apic"),
@@ -223,14 +234,15 @@ pub fn path(allocator: std.mem.Allocator, binding: Binding, roots: Roots) ![]con
 pub const Roots = struct {
     source_root: []const u8,
     work: []const u8,
+    compute: []const u8 = "",
     runtime: []const u8,
     zig: []const u8,
     producer: []const u8,
-    fixture_runner: []const u8,
+    fixture_runner: ?[]const u8 = null,
     supervisor: []const u8,
     package_tool: []const u8,
     validator: []const u8,
-    supervisor_fixture: []const u8,
+    supervisor_fixture: ?[]const u8 = null,
     efi: []const u8 = "",
     local_boot_tool: []const u8 = "",
     qemu: []const u8 = "",
@@ -243,15 +255,16 @@ pub const Roots = struct {
     pub fn get(self: Roots, role: []const u8) ![]const u8 {
         if (std.mem.eql(u8, role, "source")) return self.source_root;
         if (std.mem.eql(u8, role, "work")) return self.work;
+        if (std.mem.eql(u8, role, "compute") and self.compute.len != 0) return self.compute;
         if (std.mem.eql(u8, role, "runtime")) return self.runtime;
         if (std.mem.eql(u8, role, "tool:zig")) return self.zig;
         if (std.mem.eql(u8, role, "tool-tree:zig")) return std.fs.path.dirname(self.zig) orelse error.UnboundCommandRole;
         if (std.mem.eql(u8, role, "command-supervisor")) return self.supervisor;
         if (std.mem.eql(u8, role, "native:wamr-aot-build")) return self.producer;
-        if (std.mem.eql(u8, role, "native:wamr-native-ci-fixtures")) return self.fixture_runner;
+        if (std.mem.eql(u8, role, "native:wamr-native-ci-fixtures")) return self.fixture_runner orelse error.UnboundCommandRole;
         if (std.mem.eql(u8, role, "native:wamr-log-validate")) return self.validator;
         if (std.mem.eql(u8, role, "native:wamr-ci-package")) return self.package_tool;
-        if (std.mem.eql(u8, role, "native:wamr-ci-supervisor-fixture")) return self.supervisor_fixture;
+        if (std.mem.eql(u8, role, "native:wamr-ci-supervisor-fixture")) return self.supervisor_fixture orelse error.UnboundCommandRole;
         if (std.mem.eql(u8, role, "input:efi") and self.efi.len != 0) return self.efi;
         if (std.mem.eql(u8, role, "input:package_tool")) return self.package_tool;
         if (std.mem.eql(u8, role, "input:local_boot_tool") and self.local_boot_tool.len != 0) return self.local_boot_tool;

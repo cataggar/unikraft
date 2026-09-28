@@ -4,6 +4,14 @@ const linux = std.os.linux;
 
 pub fn main(init: std.process.Init) void {
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch std.process.exit(2);
+    if (args.len == 4 and std.mem.eql(u8, args[1], "inspect")) {
+        const efi = std.Io.Dir.openFileAbsolute(init.io, args[2], .{ .follow_symlinks = false }) catch std.process.exit(2);
+        defer efi.close(init.io);
+        const package = std.Io.Dir.openDirAbsolute(init.io, args[3], .{ .follow_symlinks = false }) catch std.process.exit(2);
+        defer package.close(init.io);
+        std.Io.File.stdout().writeStreamingAll(init.io, "{\"image\":{\"efi\":{\"size\":3}},\"producer_sha256\":\"fixture\"}\n") catch std.process.exit(2);
+        return;
+    }
     if (args.len != 3 or !std.mem.eql(u8, args[1], "--fixture-root"))
         std.process.exit(2);
     const directory = std.Io.Dir.openDirAbsolute(init.io, args[2], .{

@@ -84,6 +84,7 @@ NATIVE_SOURCE_FILES = (
     "support/build/wamr-native-ci/controller/dependency_custody.zig",
     "support/build/wamr-native-ci/controller/fixture_contract.zig",
     "support/build/wamr-native-ci/controller/fixture_runner.zig",
+    "support/build/wamr-native-ci/controller/handoff_inspect.zig",
     "support/build/wamr-native-ci/controller/input_custody.zig",
     "support/build/wamr-native-ci/controller/install.zig",
     "support/build/wamr-native-ci/controller/install_target_tests.zig",
@@ -3487,25 +3488,48 @@ class DeterministicContracts(unittest.TestCase):
                         with self.assertRaisesRegex(ParityError, expected):
                             checked_stage(altered, log, side, reference, stage)
 
-    def test_v1_read_only_and_v2_acceptance_parser_fixtures(self):
+    def test_v1_v2_reference_parser_and_record_hashes_without_controller(self):
         reference = oracle()
-        for version in (1, 2):
-            with self.subTest(version=version):
-                raw = (FIXTURES / f"accepted-v{version}.json").read_bytes()
-                result = parsed(raw, reference)
-                self.assertEqual(result["schema_version"], version)
-                self.assertEqual(result["modes"], list(
-                    reference.MODES if version == 1 else reference.SIX_MODES))
-                self.assertEqual(len(result["records"]), 8 if version == 1 else 33)
-                self.assertNotIn("result.json", result["records"])
-                self.assertEqual(set(result["records"]), set(
-                    ("build-start.json", "build.json", "boot-inputs.json",
-                     "package.json", *(mode + "-compute.json"
-                                       for mode in result["modes"]))
-                    if version == 1 else set(ORDER) - {"result.json"}))
-                self.assertEqual(set(result["records"].values()), {sha(b"{}\n")})
+        parent = fresh(fixture_parent(), f"reference-result-parser-{os.getpid()}")
+        try:
+            for version in (1, 2):
+                with self.subTest(version=version):
+                    evidence = fresh(fresh(parent, f"v{version}"), "evidence")
+                    raw = (FIXTURES / f"accepted-v{version}.json").read_bytes()
+                    result_path = evidence / "result.json"
+                    result_path.write_bytes(raw)
+                    result_path.chmod(0o600)
+                    result = parsed(checked_file(result_path), reference)
+                    self.assertEqual(result["schema_version"], version)
+                    self.assertEqual(result["modes"], list(
+                        reference.MODES if version == 1 else reference.SIX_MODES))
+                    self.assertEqual(len(result["records"]), 8 if version == 1 else 33)
+                    self.assertNotIn("result.json", result["records"])
+                    self.assertEqual(set(result["records"]), set(
+                        ("build-start.json", "build.json", "boot-inputs.json",
+                         "package.json", *(mode + "-compute.json"
+                                           for mode in result["modes"]))
+                        if version == 1 else set(ORDER) - {"result.json"}))
+                    self.assertEqual(set(result["records"].values()), {sha(b"{}\n")})
+                    for name in result["records"]:
+                        path = evidence / name
+                        path.write_bytes(b"{}\n")
+                        path.chmod(0o600)
+                    self.assertEqual(reference.digest(result_path), sha(raw))
+                    self.assertEqual(
+                        {name: reference.digest(evidence / name)
+                         for name in result["records"]},
+                        result["records"])
+                    (evidence / "build.json").write_bytes(b'{"tampered":true}\n')
+                    self.assertNotEqual(
+                        reference.digest(evidence / "build.json"),
+                        result["records"]["build.json"])
+        finally:
+            shutil.rmtree(parent)
 
-    def test_python_v1_v2_reader_rehashes_synthetic_parser_fixtures(self):
+    def test_native_local_handoff_refuses_synthetic_parser_fixtures(self):
+        if not os.environ.get("WAMR_CI_CONTROLLER"):
+            self.skipTest("native controller not configured")
         spec = importlib.util.spec_from_file_location(
             "wamr_handoff_fixture_reader", CONTROLLER / "handoff.py")
         handoff = importlib.util.module_from_spec(spec)
@@ -3514,7 +3538,8 @@ class DeterministicContracts(unittest.TestCase):
         parent = fresh(scratch, f"synthetic-result-parser-{os.getpid()}")
         try:
             for version in (1, 2):
-                root = fresh(parent, f"v{version}")
+                runtime = fresh(parent, f"v{version}")
+                root = fresh(runtime, "compute")
                 evidence = fresh(root, "evidence")
                 raw = (FIXTURES / f"accepted-v{version}.json").read_bytes()
                 value = parsed(raw, handoff.ci)
@@ -3524,10 +3549,7 @@ class DeterministicContracts(unittest.TestCase):
                     file.chmod(0o600)
                 (evidence / "result.json").write_bytes(raw)
                 (evidence / "result.json").chmod(0o600)
-                self.assertEqual(handoff.result_records(root), value["records"])
-                changed = evidence / "build.json"
-                changed.write_bytes(b'{"tampered":true}\n')
-                with self.assertRaises(handoff.ci.Refusal):
+                with self.assertRaises(ValueError):
                     handoff.result_records(root)
         finally:
             shutil.rmtree(parent)

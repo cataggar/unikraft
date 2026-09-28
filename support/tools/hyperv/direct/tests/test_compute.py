@@ -1130,10 +1130,37 @@ class Compute(unittest.TestCase):
         # An alternate worktree cannot satisfy that and today's exact root.
         if REPO.name == "unikraft":
             delivered.publication_records(handoff, stage, source)
+        refused = self.root / "refused-import"
+        with self.assertRaisesRegex(ValueError, "native controller records refused"):
+            public_bundle.import_bundle(
+                handoff, archive, refused, source, archive_sha256,
+                VALIDATOR, SUPERVISOR)
+        self.assertFalse((refused / "candidate-bundle.json").exists())
+        self.assertFalse((refused / "bundle.json").exists())
+        # This v1 policy fixture has mocked producer custody, not a complete
+        # native-accepted run; only the downstream archive checks use a stub.
+        native_view = {
+            "source": {
+                "revision": source["source_revision"],
+                "tree": source["source_tree"],
+            },
+            "compatibility": "tiny-v1",
+            "result": {
+                "sha256": portable["artifacts"][
+                    handoff.NAMES.index("local_result")]["sha256"],
+            },
+            "records": [
+                {"name": Path(item["path"]).name, "sha256": item["sha256"]}
+                for item in portable["evidence"]
+            ],
+        }
         output = self.root / "imported"
-        imported = public_bundle.import_bundle(
-            handoff, archive, output, source, archive_sha256,
-            VALIDATOR, SUPERVISOR)
+        with mock.patch.object(
+                public_bundle.accepted_records, "imported_stage",
+                return_value=native_view):
+            imported = public_bundle.import_bundle(
+                handoff, archive, output, source, archive_sha256,
+                VALIDATOR, SUPERVISOR)
         self.assertEqual(imported["authority"], "not_admitted")
         self.assertEqual((output / "artifacts/vhd").read_bytes(), (stage / "artifacts/vhd").read_bytes())
         self.assertEqual(handoff.candidate_plan(output / "bundle.json", self.root / "public-plan.json")["authority"],
