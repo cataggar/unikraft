@@ -48,7 +48,10 @@ configure, complete I/O, or meet the timeout returns 1.
 ## Read-only storage topology profile
 
 Select `CONFIG_APPHYPERVACCEPTANCE_STORAGE_TOPOLOGY=y` for a separate,
-default-off storage-only workload. Configure the 32-lowercase-hex-digit
+default-off storage-only workload. It selects guarded StorVSC read sessions
+and requires a nonempty LU-associated VPD identity for every target; unlike
+the default smoke workload, it cannot fall back to unpinned reads. Configure
+the 32-lowercase-hex-digit
 `CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_RUN_ID`, distinct
 `CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_DISK0_ID` and
 `CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_DISK_NONZERO_ID`, exact positive
@@ -69,6 +72,15 @@ capacity, CRC, and layout). It validates each read session and the final
 inventory; unexpected unseeded LUNs are reported but cannot substitute for
 either required data disk. Only `UK_HYPERV_TOPOLOGY_READ_OK` with
 `HYPERV_TOPOLOGY FINAL PASS` means all three reads and mappings passed.
+An empty inventory is `UNAVAILABLE` only after two coherent, driver-proven
+pristine-empty snapshots with no StorVSC offers. An unbound/rejected offer,
+previously observed storage lifetime, or mappings without an offer fail
+instead. Raw and fixed-VHD local QEMU boots without offered StorVSC can
+demonstrate only this `UNAVAILABLE` path, never a real-device `PASS`.
+On a read timeout, the probe fails closed: its request buffer and read session
+stay pinned while the I/O is outstanding, and subsequent probes cannot reuse
+either. If a delayed completion arrives, a later probe can release the session
+but still fails; only a fresh boot can retry acceptance.
 Serial evidence contains controller/channel/SCSI mappings and diagnostic
 CRC32 fingerprints, not raw run IDs, disk IDs, VPD IDs, or instance GUIDs.
 These CRC32 values are correlation hints, not security identities.
@@ -77,7 +89,16 @@ This profile never issues block writes or flushes, does not run the DHCP/network
 workload, and cannot be used as the persistence two-boot workload. Its
 production-backed hosted fixture verifies reverse controller offers, two
 distinct seed reads, wrong-disk and corrupt-copy seed rejection, duplicate
-boot-disk rejection, and zero write/flush commands. The separate
+boot-disk rejection, and zero write/flush commands. A guest-side fixture at
+`support/apps/hyperv-acceptance/tests/topology-workload-test.sh` exercises
+both mapping orders, failure/timeout session ownership, and pristine-empty
+availability entirely offline. Run it with:
+
+```sh
+sh support/apps/hyperv-acceptance/tests/topology-workload-test.sh
+```
+
+The separate
 `support/scripts/hyperv_issue90_topology.py` controller can prepare a fresh
 image and two seeded disks offline, but its live run is **not yet safe**:
 if an Azure create response is lost, it cannot prove the original resource
