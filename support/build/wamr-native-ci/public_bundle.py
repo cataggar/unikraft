@@ -1776,7 +1776,11 @@ def publish_ci(handoff):
 
     require_validator_record()
     handoff.FAILURE_STAGE = "public-export"
-    exported = handoff.export(runtime, stage)
+    exported = handoff.export(
+        runtime, stage,
+        on_phase=lambda phase: setattr(
+            handoff, "FAILURE_STAGE", "public-export-" + phase))
+    handoff.FAILURE_STAGE = "public-export-postcheck"
     require_validator_record()
     validator = publication / "tools/bin/uk-wamr-direct-validate"
     supervisor = Path(handoff.ci.COMMAND_SUPERVISOR_PATH)

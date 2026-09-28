@@ -54,12 +54,16 @@ validation. Native-produced v2 local handoff requires native acceptance before u
 result-record hashes and source identity; the Python build, boot and inspection
 checks still run. A Python-produced local run instead retains the pinned
 Python source-custody path until the protected production caller is switched.
+The separately validated `command-public-validator-build.json` may appear in
+Python-produced evidence after acceptance; it is not part of the 33 pinned
+result records or the exported archive. Other extra evidence is refused.
 Historical v1 retains its pinned-source compatibility path; native-produced v2
 never falls back to Python after a native refusal. The caller must
 independently authenticate the executable
 provided by `WAMR_CI_CONTROLLER`; owner and mode checks alone do not prove
-its provenance. The completed local run still needs a protected end-to-end
-check. A typed native `handoff-inspect` operation binds the original compute
+its provenance. Protected paired boots have exercised the completed native
+local-record replay and Python record selection; the later publication gates
+remain separate. A typed native `handoff-inspect` operation binds the original compute
 supervisor and inputs but is not a production caller; the current native
 producer instead pins the records controller as `command-supervisor`, so that
 handoff operation refuses its records. Checkout/consumer custody and the

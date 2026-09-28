@@ -974,6 +974,8 @@ def _python_v2_records(root, result, start):
     ci.require(ci.producer_inputs(
         root.parent, start["consumer_inputs"]) == start,
         "producer inputs changed")
+    evidence = {path.name for path in (root / "evidence").iterdir()}
+    accepted_evidence = policy.V2_EVIDENCE | {"result.json"}
     ci.require(
         set(result) == {
             "schema_version", "profile", "scope", "passed",
@@ -989,8 +991,9 @@ def _python_v2_records(root, result, start):
         and result["modes"] == list(ci.SIX_MODES)
         and type(result["records"]) is dict
         and result["records"].keys() == policy.V2_EVIDENCE
-        and {path.name for path in (root / "evidence").iterdir()}
-        == policy.V2_EVIDENCE | {"result.json"},
+        and evidence in (
+            accepted_evidence,
+            accepted_evidence | {"command-public-validator-build.json"}),
         "invalid Python local v2 records")
     for name, expected in result["records"].items():
         ci.require(ci.digest(root / "evidence" / name) == expected,
@@ -1037,11 +1040,16 @@ def result_records(root):
     return records
 
 
-def export(runtime, output):
+def export(runtime, output, *, on_phase=None):
     """Use the pinned producer's reader; never downgrade a native refusal."""
+    def phase(name):
+        if on_phase is not None:
+            on_phase(name)
+
     private(runtime)
     private(output.parent)
     root = runtime / "compute"
+    phase("records")
     result = _local_result(root)
     version = result["schema_version"]
     accepted, records = _selected_records(root, result)
@@ -1062,9 +1070,11 @@ def export(runtime, output):
                 expected["consumer_inputs"])
             ci.COMMAND_ENVIRONMENT[
                 "WAMR_CI_SUPERVISOR"] = supervisor_path
+    phase("custody")
     before = ci.producer_inputs(runtime, expected["consumer_inputs"])
     ci.require(before == expected,
                "producer inputs changed")
+    phase("build")
     build = ci.check_build()
     ci.require(build == ci.document(root / "evidence/build.json"), "build changed")
     if accepted is not None:
@@ -1076,6 +1086,7 @@ def export(runtime, output):
              "ovmf_code": runtime / "firmware/code.fd",
              "ovmf_vars": runtime / "firmware/vars.fd",
              "efi": ci.APP / "build" / ci.EFI}
+    phase("boots")
     ci.boot_input_state(runtime, tools, expected=inputs)
     for i, mode in enumerate(modes):
         checked = ci.check_boot(
@@ -1104,6 +1115,7 @@ def export(runtime, output):
     inspect_stage = (
         "handoff-inspect-legacy"
         if legacy_supervision else "handoff-inspect")
+    phase("inspect")
     inspected_output, inspected_command = ci.execute(
         output, inspect_stage,
         [tools["package_tool"], "inspect", ci.APP / "build" / ci.EFI, root / "package"],
@@ -1184,6 +1196,7 @@ def export(runtime, output):
                    "handoff copy changed")
         return saved
 
+    phase("copy")
     artifacts = [
         retain(path, output / "artifacts" / name)
         for name, path in zip(names, paths)
@@ -1200,6 +1213,7 @@ def export(runtime, output):
                 ("compute", root / "evidence" / (mode + "-compute.json")))}))
     evidence = [retain(root / "evidence" / name, output / "evidence" / name)
                 for name in sorted(records)]
+    phase("recheck")
     ci.require(result_records(root) == records and ci.check_build() == build
                and ci.producer_inputs(
                    runtime, expected["consumer_inputs"]) == before,
@@ -1249,6 +1263,7 @@ def export(runtime, output):
                     by_name["final_inspection"]["sha256"],
             },
         )
+    phase("publish")
     ci.save(output / "bundle.json", bundle)
     return bundle
 

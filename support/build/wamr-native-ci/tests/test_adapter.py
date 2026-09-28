@@ -318,6 +318,15 @@ class NativeRecordBridge(unittest.TestCase):
             custody.assert_called_once_with(
                 runtime, start["consumer_inputs"])
             native.assert_not_called()
+            handoff.ci.save(evidence / "command-public-validator-build.json", {
+                "stage": "public-validator-build",
+            })
+            self.assertEqual(handoff.result_records(runtime / "compute"), hashes)
+            handoff.ci.save(evidence / "unexpected.json", {})
+            with self.assertRaisesRegex(
+                    handoff.ci.Refusal, "invalid Python local v2 records"):
+                handoff.result_records(runtime / "compute")
+            (evidence / "unexpected.json").unlink()
             changed = evidence / "command-adapter.json"
             changed.write_bytes(b'{"tampered":true}\n')
             with self.assertRaisesRegex(
@@ -369,6 +378,7 @@ class NativeRecordBridge(unittest.TestCase):
         handoff.ci.save(
             compute / "evidence/result.json", {"schema_version": 2})
         output = root / "handoff"
+        phases = []
         with mock.patch.dict(os.environ, {bridge.CONTROLLER_ENV: str(controller)}), \
                 mock.patch.object(handoff.ci, "digest") as digest, \
                 mock.patch.object(handoff.ci, "check_build") as build:
@@ -377,7 +387,8 @@ class NativeRecordBridge(unittest.TestCase):
                 handoff.result_records(compute)
             with self.assertRaisesRegex(
                     ValueError, "native controller records refused"):
-                handoff.export(runtime, output)
+                handoff.export(runtime, output, on_phase=phases.append)
+            self.assertEqual(phases, ["records"])
             digest.assert_not_called()
             build.assert_not_called()
         self.assertFalse(output.exists())
