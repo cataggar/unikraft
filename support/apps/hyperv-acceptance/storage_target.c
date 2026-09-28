@@ -159,6 +159,7 @@ static struct uk_blkreq topology_request;
 static struct hyperv_acceptance_storage_target topology_target;
 static int topology_request_owned;
 static int topology_request_abandoned;
+static int topology_session_quarantined;
 
 static int topology_expected(
 	struct hyperv_acceptance_persistence_expected expected[2])
@@ -281,14 +282,11 @@ static int topology_read_target(
 	topology_target.inventory_count = inventory_count;
 	topology_target.device = uk_blkdev_get(mapping->blkdev_id);
 	if (!topology_target.device || !snapshot->size ||
+	    !mapping->vpd_length ||
 	    mapping->vpd_length > UK_STORVSC_VPD_ID_MAX)
 		return -ENODEV;
 	rc = uk_storvsc_session_begin_read(
 		snapshot, &topology_target.session);
-	if (rc == -ENOTSUP ||
-	    (rc == -EINVAL && !mapping->vpd_length))
-		rc = hyperv_acceptance_storage_target_validate(
-			&topology_target);
 	if (rc)
 		return rc;
 	rc = topology_configure(topology_target.device);
@@ -399,6 +397,7 @@ out:
 	release_rc = hyperv_acceptance_storage_target_release(
 		&topology_target);
 	if (release_rc) {
+		topology_session_quarantined = 1;
 		printf("HYPERV_TOPOLOGY TARGET FAIL reason=session-end rc=%d\n",
 		       release_rc);
 		return release_rc;
@@ -415,6 +414,18 @@ enum hyperv_acceptance_result hyperv_acceptance_storage_topology_probe(
 	unsigned int found[3] = { 0 };
 	int rc;
 
+	if (topology_request_abandoned || topology_session_quarantined ||
+	    topology_request_owned ||
+	    topology_target.session.opaque[0]) {
+		if (topology_request_abandoned && topology_request_owned &&
+		    uk_blkreq_is_done(&topology_request))
+			topology_request_owned = 0;
+		if (!topology_request_owned && topology_target.session.opaque[0])
+			(void)hyperv_acceptance_storage_target_release(
+				&topology_target);
+		puts("HYPERV_TOPOLOGY FINAL FAIL reason=session-quarantined");
+		return HYPERV_ACCEPTANCE_FAIL;
+	}
 	rc = topology_expected(expected);
 	if (rc) {
 		puts("HYPERV_TOPOLOGY FINAL FAIL reason=invalid-expectation");
@@ -437,13 +448,28 @@ enum hyperv_acceptance_result hyperv_acceptance_storage_topology_probe(
 		       rc);
 		return HYPERV_ACCEPTANCE_FAIL;
 	}
+	if (inventory.count >
+	    CONFIG_LIBSTORVSC_MAX_DEVICES * CONFIG_LIBSTORVSC_MAX_LUNS) {
+		puts("HYPERV_TOPOLOGY FINAL FAIL reason=inventory-overflow");
+		return HYPERV_ACCEPTANCE_FAIL;
+	}
 	if (!inventory.count) {
 		if (storage_offers) {
 			puts("HYPERV_TOPOLOGY FINAL FAIL reason=offered-unbound");
 			return HYPERV_ACCEPTANCE_FAIL;
 		}
+		rc = uk_storvsc_inventory_get(&final_inventory);
+		if (rc || !uk_storvsc_inventory_pristine_empty(
+				    &inventory, &final_inventory)) {
+			puts("HYPERV_TOPOLOGY FINAL FAIL reason=unproven-empty");
+			return HYPERV_ACCEPTANCE_FAIL;
+		}
 		puts("HYPERV_TOPOLOGY FINAL UNAVAILABLE reason=no-devices");
 		return HYPERV_ACCEPTANCE_UNAVAILABLE;
+	}
+	if (!storage_offers) {
+		puts("HYPERV_TOPOLOGY FINAL FAIL reason=unoffered-mappings");
+		return HYPERV_ACCEPTANCE_FAIL;
 	}
 	for (unsigned int index = 0; index < inventory.count; index++) {
 		struct uk_storvsc_target_snapshot snapshot;

@@ -40,6 +40,7 @@ config APPHYPERVACCEPTANCE_PERSISTENCE
 config APPHYPERVACCEPTANCE_STORAGE_TOPOLOGY
 	bool "Read-only OS and two seeded data-disk topology acceptance"
 	select LIBSTORVSC_LUN_DISCOVERY
+	select LIBSTORVSC_GUARDED_IO
 	help
 	  Inventory coherent StorVSC mappings, read the OS boot signatures,
 	  and verify two independent policy-2 seed manifests. No block writes,
