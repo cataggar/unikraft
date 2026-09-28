@@ -885,15 +885,34 @@ topology guest profile described in the
 uses two independent policy-2 seeds instead. The existing Azure controller
 still provisions only one disk. Do not use it for #90 live acceptance: a
 separate two-data-disk controller (`support/scripts/hyperv_issue90_topology.py`)
-provides offline planning, four-boot image verification, distinct seed
-preparation, and an exact resource envelope. Its live run remains **blocked**:
-if a create response is lost, the original Azure-assigned disk/VM identity
-cannot be recovered safely from a currently tagged resource, so mandatory
-owner-checked deletion cannot be guaranteed. Do not allocate Azure resources
-with this controller or reuse the one-disk lane until that failure path is
-resolved and its Azure response shapes are verified. Local QEMU boots without
-StorVSC devices are `UNAVAILABLE`, not real-host read evidence. Write/flush
-persistence remains a separate workload.
+provides offline planning and synthetic checks for four local raw/fixed-VHD
+x2APIC/legacy-APIC boots, two distinct policy-2 fixed-VHD seeds of 8,388,608
+sectors, the exact resource envelope, and redacted serial evidence. **Prepare
+is blocked** even if all four boots and the EFI, raw/VHD, and miz fingerprints
+match: neither an ID-byte scan nor a mutable self-reported hash proves that the
+EFI was built from the reviewed source and the solved config. A trustworthy
+build-to-EFI provenance gate must be supplied and checked on a private build
+host before these artifacts can be accepted; do not fabricate or publish
+private build state. The distinct **live gate remains blocked**: if an Azure
+create response is lost, the original Azure-assigned disk/VM identity cannot
+be recovered safely from a currently tagged resource, so mandatory
+owner-checked deletion cannot be guaranteed. The official
+[disk TypeSpec](https://github.com/Azure/azure-rest-api-specs/blob/main/specification/compute/resource-manager/Microsoft.Compute/Compute/ComputeDisk/models.tsp),
+[deployment TypeSpec](https://github.com/Azure/azure-rest-api-specs/blob/main/specification/resources/resource-manager/Microsoft.Resources/deployments/models.tsp),
+and [Compute 2025-11-01 OpenAPI](https://github.com/Azure/azure-rest-api-specs/blob/main/specification/compute/resource-manager/Microsoft.Compute/Compute/stable/2025-11-01/ComputeRP.json)
+document the disk read-only size/UUID and upload-size fields, ARM deployment
+outputs/correlation, and the Standard security response; they are **not**
+actual Azure CLI create/show records. The official
+[upload](https://github.com/Azure/azure-rest-api-specs/blob/main/specification/compute/resource-manager/Microsoft.Compute/Compute/ComputeDisk/examples/2025-01-02/diskExamples/Disk_Create_UploadDisk.json)
+and [disk GET](https://github.com/Azure/azure-rest-api-specs/blob/main/specification/compute/resource-manager/Microsoft.Compute/Compute/ComputeDisk/examples/2025-01-02/diskExamples/Disk_Get.json)
+examples omit both `uniqueId` and `diskSizeBytes`; the offline checks require
+them and fail closed if the selected CLI/region omits either. CLI field
+presence and size/UUID/deployment response values still need redacted real
+response proof
+before any live use. Do not allocate Azure resources with this controller or
+reuse the one-disk lane. Local QEMU boots without StorVSC devices are
+`UNAVAILABLE`, not real-host read evidence. Write/flush persistence remains a
+separate workload.
 
 ## Private application-network peer
 

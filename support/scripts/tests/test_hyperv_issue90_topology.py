@@ -64,6 +64,7 @@ class FakeAzure:
         self.fail_vm_show_once = False
         self.deployment_shown = False
         self.pinned_reads = 0
+        self.serial_noise = ""
         self.calls = []
         self.disk_uuids = {
             role: str(uuid.uuid5(uuid.NAMESPACE_DNS, role)) for role in lane.ROLES
@@ -97,7 +98,13 @@ class FakeAzure:
             "uniqueId": self.disk_uuids[role],
             "sku": {"name": "StandardSSD_LRS"},
             "diskSizeBytes": lane.azure.VIRTUAL_SIZE if role == "os" else lane.DISK_BYTES,
-            "hyperVGeneration": "V2",
+            "diskSizeGb": 1 if role == "os" else 4,
+            "creationData": {
+                "createOption": "Upload",
+                "uploadSizeBytes": (lane.azure.VIRTUAL_SIZE if role == "os"
+                                    else lane.DISK_BYTES) + 512,
+            },
+            "hyperVGeneration": "V2" if role == "os" else None,
             "osType": "Linux" if role == "os" else None,
             "provisioningState": "Succeeded",
             "diskState": "Attached" if self.deployed else "Unattached",
@@ -107,6 +114,18 @@ class FakeAzure:
             result["uniqueId"] = str(uuid.uuid5(uuid.NAMESPACE_DNS, "replaced"))
         if self.tamper == ("disk-size", role):
             result["diskSizeBytes"] += 512
+        if self.tamper == ("disk-size-missing", role):
+            del result["diskSizeBytes"]
+        if self.tamper == ("disk-uuid-missing", role):
+            del result["uniqueId"]
+        if self.tamper == ("disk-upload-size", role):
+            result["creationData"]["uploadSizeBytes"] += 512
+        if self.tamper == ("disk-upload-option", role):
+            result["creationData"]["createOption"] = "Empty"
+        if self.tamper == ("disk-gib", role):
+            result["diskSizeGb"] += 1
+        if self.tamper == ("disk-generation", role):
+            result["hyperVGeneration"] = "V1"
         if self.tamper == ("disk-owner", role):
             result["tags"]["issue90-run"] = "foreign"
         return result
@@ -122,22 +141,33 @@ class FakeAzure:
             del outputs["dataDisk7Id"]
         if self.tamper == ("output-foreign", "data7"):
             outputs["dataDisk7Id"]["value"] = lane.resource_id(self.state, "data0")
-        return {
+        if self.tamper == ("output-uuid-missing", "vm"):
+            del outputs["vmUuid"]
+        if self.tamper == ("output-uuid-type", "vm"):
+            outputs["vmUuid"]["type"] = "Integer"
+        result = {
             "id": lane.resource_id(self.state, "deployment"),
             "name": self.state["prefix"],
+            "type": "Microsoft.Resources/deployments",
             "properties": {
-                "provisioningState": "Succeeded",
+                "provisioningState": "Succeeded", "mode": "Incremental",
                 "correlationId": (
                     str(uuid.uuid5(uuid.NAMESPACE_DNS, "replaced-operation"))
                     if self.tamper == ("correlation-replaced", "deployment")
                     and self.deployment_shown else self.correlation
                 ),
-                "parameters": {key: {"value": value} for key, value in parameters.items()},
+                "parameters": {key: {"type": "String", "value": value}
+                               for key, value in parameters.items()},
                 "outputResources": [{"id": lane.resource_id(self.state, role)}
                                     for role in ("nsg", "vnet", "nic", "vm")],
                 "outputs": outputs,
             },
         }
+        if self.tamper == ("deployment-mode-missing", "deployment"):
+            del result["properties"]["mode"]
+        if self.tamper == ("deployment-parameter-missing", "deployment"):
+            del result["properties"]["parameters"]["runId"]["type"]
+        return result
 
     def vm(self):
         vm = {
@@ -145,22 +175,38 @@ class FakeAzure:
             "hardwareProfile": {"vmSize": "Standard_D2s_v5"},
             "storageProfile": {
                 "diskControllerType": "SCSI",
-                "osDisk": {"managedDisk": {"id": lane.resource_id(self.state, "os")}},
+                "osDisk": {
+                    "name": self.state["prefix"] + "-os", "osType": "Linux",
+                    "createOption": "Attach", "caching": "ReadOnly",
+                    "deleteOption": "Detach",
+                    "managedDisk": {"id": lane.resource_id(self.state, "os")},
+                },
                 "dataDisks": [
-                    {"lun": lane.LUNS[role], "managedDisk": {
+                    {"lun": lane.LUNS[role], "name": self.state["prefix"] + "-" + role,
+                     "createOption": "Attach", "caching": "None",
+                     "deleteOption": "Detach", "managedDisk": {
                         "id": lane.resource_id(self.state, role)}}
                     for role in lane.LUNS
                 ],
             },
             "securityProfile": {"securityType": "Standard"},
             "networkProfile": {"networkInterfaces": [
-                {"id": lane.resource_id(self.state, "nic")}
+                {"id": lane.resource_id(self.state, "nic"),
+                 "properties": {"primary": True, "deleteOption": "Delete"}}
             ]},
         }
         if self.tamper == ("vm-lun", "data7"):
             vm["storageProfile"]["dataDisks"][1]["lun"] = 6
         if self.tamper == ("vm-uuid", "vm"):
             vm["vmId"] = str(uuid.uuid5(uuid.NAMESPACE_DNS, "other-vm"))
+        if self.tamper == ("vm-os-create", "vm"):
+            vm["storageProfile"]["osDisk"]["createOption"] = "FromImage"
+        if self.tamper == ("vm-os-delete", "vm"):
+            vm["storageProfile"]["osDisk"]["deleteOption"] = "Delete"
+        if self.tamper == ("vm-data-cache", "vm"):
+            vm["storageProfile"]["dataDisks"][1]["caching"] = "ReadWrite"
+        if self.tamper == ("vm-nic-delete", "vm"):
+            vm["networkProfile"]["networkInterfaces"][0]["properties"]["deleteOption"] = "Detach"
         if self.tamper == ("security-missing", "vm-show"):
             del vm["securityProfile"]
         return vm
@@ -200,6 +246,8 @@ class FakeAzure:
             resource["tags"]["issue90-operation"] = str(uuid.uuid4())
         if self.tamper == ("security-type", "pinned"):
             resource["type"] = "Microsoft.Compute/disks"
+        if self.tamper == ("security-os-delete", "pinned"):
+            properties["storageProfile"]["osDisk"]["deleteOption"] = "Delete"
         return {**resource, "properties": properties}
 
     def az(self, args, *, subscription, private, timeout):
@@ -282,18 +330,33 @@ class FakeAzure:
         if action[:2] == ("vm", "deallocate"):
             return {}
         if action == ("vm", "boot-diagnostics", "get-boot-log"):
-            return serial(self.state)
+            return serial(self.state) + self.serial_noise
         if action == ("network", "nic", "show"):
-            return {**self.resource("nic"), "enableIPForwarding": False,
+            resource = {**self.resource("nic"), "enableIPForwarding": False,
+                    "enableAcceleratedNetworking": False,
                     "ipConfigurations": [{
+                        "name": "primary", "privateIPAllocationMethod": "Dynamic",
                         "publicIPAddress": None, "subnet": {"id":
                             lane.resource_id(self.state, "vnet") + "/subnets/default"}
                     }]}
+            if self.tamper == ("network-public", "nic"):
+                resource["ipConfigurations"][0]["publicIPAddress"] = {
+                    "id": lane.resource_id(self.state, "nic") + "-public"
+                }
+            return resource
         if action == ("network", "vnet", "show"):
-            return {**self.resource("vnet"), "subnets": [{
-                "name": "default", "defaultOutboundAccess": False,
+            resource = {**self.resource("vnet"),
+                        "addressSpace": {"addressPrefixes": ["10.90.0.0/29"]},
+                        "subnets": [{
+                "name": "default", "addressPrefix": "10.90.0.0/29",
+                "defaultOutboundAccess": False,
                 "networkSecurityGroup": {"id": lane.resource_id(self.state, "nsg")},
             }]}
+            if self.tamper == ("network-outbound", "vnet"):
+                resource["subnets"][0]["defaultOutboundAccess"] = True
+            if self.tamper == ("network-nat", "vnet"):
+                resource["subnets"][0]["natGateway"] = {"id": "external-nat"}
+            return resource
         if action == ("network", "nsg", "show"):
             return {**self.resource("nsg"), "securityRules": []}
         raise AssertionError(f"Unexpected synthetic Azure command: {action}")
@@ -345,22 +408,65 @@ class Issue90TopologyTest(unittest.TestCase):
         self.assertEqual(lane.load(self.directory)["phase"], "prepared")
         self.assertFalse(self.fake.group_exists)
 
+    def test_prepared_state_cannot_claim_unverified_build_provenance(self):
+        with self.assertRaisesRegex(ValueError, "build provenance is unavailable"):
+            lane.verify_inputs(self.directory, self.state)
+
     def test_exact_arm_envelope_is_private_and_pinned(self):
         template = json.loads(lane.TEMPLATE.read_text())
         self.assertEqual(lane.digest(lane.TEMPLATE), lane.TEMPLATE_SHA256)
+        self.assertEqual(
+            set(template["parameters"]),
+            set(lane.TopologyRun(self.state, self.directory).parameters()),
+        )
+        self.assertEqual(template["variables"]["tags"]["issue90-operation"],
+                         "[parameters('operationId')]")
+        for role, key in (("os", "image-sha256"), ("data0", "seed0-sha256"),
+                          ("data7", "seed7-sha256")):
+            self.assertEqual(lane.tags(self.state, role)[key],
+                             self.fake.resource(role)["tags"][key])
+        for resource in template["resources"]:
+            self.assertIn("variables('tags')", resource["tags"])
+            self.assertIn("'issue90-role'", resource["tags"])
         vm = next(resource for resource in template["resources"]
                   if resource["type"] == "Microsoft.Compute/virtualMachines")
+        self.assertEqual(vm["apiVersion"], lane.COMPUTE_API_VERSION)
+        self.assertEqual(vm["properties"]["securityProfile"]["securityType"],
+                         "Standard")
         self.assertEqual(vm["properties"]["hardwareProfile"]["vmSize"],
                          "Standard_D2s_v5")
+        os_disk = vm["properties"]["storageProfile"]["osDisk"]
+        self.assertEqual(os_disk["createOption"], "Attach")
+        self.assertEqual(os_disk["osType"], "Linux")
+        self.assertEqual(os_disk["caching"], "ReadOnly")
+        self.assertEqual(os_disk["deleteOption"], "Detach")
+        self.assertEqual(os_disk["managedDisk"]["id"], "[parameters('osDiskId')]")
         data = vm["properties"]["storageProfile"]["dataDisks"]
         self.assertEqual([disk["lun"] for disk in data], [0, 7])
+        self.assertEqual([disk["managedDisk"]["id"] for disk in data],
+                         ["[parameters('dataDisk0Id')]",
+                          "[parameters('dataDisk7Id')]"])
+        self.assertTrue(all(disk["createOption"] == "Attach"
+                            and disk["caching"] == "None"
+                            and disk["deleteOption"] == "Detach" for disk in data))
+        self.assertEqual(
+            vm["properties"]["networkProfile"]["networkInterfaces"][0]["properties"],
+            {"primary": True, "deleteOption": "Delete"},
+        )
         self.assertEqual(len(template["resources"]), 4)
         self.assertEqual(set(template["outputs"]), set(lane.OUTPUT_ROLES) | {"vmUuid"})
+        self.assertIn(f"'{lane.COMPUTE_API_VERSION}'",
+                      template["outputs"]["vmUuid"]["value"])
         self.assertEqual(template["resources"][0]["properties"]["securityRules"], [])
         self.assertFalse(template["resources"][1]["properties"]["subnets"][0]
                          ["properties"]["defaultOutboundAccess"])
+        self.assertNotIn("publicIPAddress", template["resources"][2]
+                         ["properties"]["ipConfigurations"][0]["properties"])
         self.assertFalse(any(resource["type"].endswith("/publicIPAddresses")
                              for resource in template["resources"]))
+        with mock.patch.object(lane, "TEMPLATE_SHA256", "f" * 64):
+            with self.assertRaisesRegex(ValueError, "reviewed #90 ARM template"):
+                lane.implementation()
 
     def test_solved_guest_config_binds_both_fresh_seeds_and_read_only_mode(self):
         settings = {
@@ -391,6 +497,7 @@ class Issue90TopologyTest(unittest.TestCase):
             ("LIBSTORVSC_MAX_DEVICES", "1"),
             ("APPHYPERVACCEPTANCE_STORAGE_TOPOLOGY", "n"),
             ("APPHYPERVACCEPTANCE_PERSISTENCE", "y"),
+            ("APPHYPERVACCEPTANCE_NETWORK_APPLICATION", "y"),
         ):
             with self.subTest(key=key):
                 with self.assertRaises(ValueError):
@@ -416,6 +523,7 @@ class Issue90TopologyTest(unittest.TestCase):
             "phase": "prepared", "local_platform_boot": True,
             "location": "northeurope", "vm_size": "Standard_D2s_v5",
             "image_sha256": "a" * 64, "efi_sha256": "b" * 64,
+            "raw_sha256": "c" * 64,
             "acceptance": {"mode": "raw-dhcp"},
             "local_platform_boot_modes": {
                 "raw": {"x2apic": True, "legacy-apic": True},
@@ -441,11 +549,13 @@ class Issue90TopologyTest(unittest.TestCase):
         self.assertEqual(self.state["phase"], "planned")
         self.assertFalse(self.fake.group_exists)
 
-    def test_local_prepare_succeeds_only_after_four_matching_platform_boots(self):
+    def test_local_prepare_rejects_id_bytes_without_reviewed_build_proof(self):
         source = {
             "phase": "prepared", "local_platform_boot": True,
             "location": "northeurope", "vm_size": "Standard_D2s_v5",
             "image_sha256": "a" * 64, "efi_sha256": None,
+            "miz_executable": str(Path(sys.executable).resolve()),
+            "miz_executable_sha256": lane.digest(Path(sys.executable).resolve()),
             "acceptance": {"mode": "raw-dhcp"},
             "local_platform_boot_modes": {
                 "raw": {"x2apic": True, "legacy-apic": True},
@@ -465,6 +575,10 @@ class Issue90TopologyTest(unittest.TestCase):
         image = producer / "unikraft.vhd"
         with image.open("xb") as output:
             output.truncate(lane.azure.VIRTUAL_SIZE + 512)
+        raw = producer / "unikraft.raw"
+        with raw.open("xb") as output:
+            output.truncate(lane.azure.VIRTUAL_SIZE)
+        source["raw_sha256"] = lane.digest(raw)
         for kind in ("raw", "vpc"):
             for mode in ("x2apic", "legacy-apic"):
                 (producer / f"local-{kind}-{mode}-serial.log").write_text(
@@ -493,28 +607,36 @@ class Issue90TopologyTest(unittest.TestCase):
         def image_digest(path):
             return "a" * 64 if Path(path) == image else real_digest(path)
 
-        def copy_guest(_source, destination, _size, _sha):
-            destination.write_bytes(b"synthetic checked guest")
-
-        def fake_seed(_directory, _state, role):
-            return {"sha256": ("c" if role == "data0" else "d") * 64,
-                    "manifest_sha256": "e" * 64, "size": lane.DISK_BYTES + 512}
-
         self.state["phase"] = "planned"
         with mock.patch.object(lane.azure, "load_state", return_value=(
             source, producer / "state.json"
         )), mock.patch.object(lane.azure, "validate_local_boot_log",
                              return_value={"io_ready": False, "crashes": []}), mock.patch.object(
             lane.azure, "miz_command", return_value=report
-        ), mock.patch.object(lane, "digest", side_effect=image_digest), mock.patch.object(
-            lane.azure, "copy_regular_file", side_effect=copy_guest
-        ), mock.patch.object(lane, "create_seed", side_effect=fake_seed), mock.patch.object(
-            lane, "verify_inputs"
-        ):
+        ), mock.patch.object(lane, "digest", side_effect=image_digest):
+            legacy_log = producer / "local-vpc-legacy-apic-serial.log"
+            original_log = legacy_log.read_bytes()
+            legacy_log.unlink()
+            with self.assertRaisesRegex(ValueError, "Local topology serial"):
+                lane.prepare(
+                    self.directory, self.state, producer, config,
+                    hashlib.sha256(config.read_bytes()).hexdigest(), "a" * 64,
+                    Path(sys.executable),
+                )
+            legacy_log.write_bytes(original_log)
+            source["local_platform_boot_modes"]["raw"]["legacy-apic"] = False
+            with self.assertRaisesRegex(ValueError, "locally booted"):
+                lane.prepare(
+                    self.directory, self.state, producer, config,
+                    hashlib.sha256(config.read_bytes()).hexdigest(), "a" * 64,
+                    Path(sys.executable),
+                )
+            source["local_platform_boot_modes"]["raw"]["legacy-apic"] = True
             original_efi = efi.read_bytes()
             efi.write_bytes(b"public fixture run and disk IDs, not this run")
             source["efi_sha256"] = hashlib.sha256(efi.read_bytes()).hexdigest()
-            with self.assertRaisesRegex(ValueError, "fresh seed identity"):
+            report["boot-file-sha256"] = source["efi_sha256"]
+            with self.assertRaisesRegex(ValueError, "build provenance is unavailable"):
                 lane.prepare(
                     self.directory, self.state, producer, config,
                     hashlib.sha256(config.read_bytes()).hexdigest(), "a" * 64,
@@ -522,13 +644,41 @@ class Issue90TopologyTest(unittest.TestCase):
                 )
             efi.write_bytes(original_efi)
             source["efi_sha256"] = hashlib.sha256(original_efi).hexdigest()
-            prepared = lane.prepare(
-                self.directory, self.state, producer, config,
-                hashlib.sha256(config.read_bytes()).hexdigest(), "a" * 64,
-                Path(sys.executable),
-            )
-        self.assertEqual(prepared["phase"], "prepared")
-        self.assertEqual(lane.load(self.directory)["prepared"]["image_sha256"], "a" * 64)
+            report["boot-file-sha256"] = source["efi_sha256"]
+            source["miz_executable_sha256"] = "f" * 64
+            with self.assertRaisesRegex(ValueError, "Miz checker differs"):
+                lane.prepare(
+                    self.directory, self.state, producer, config,
+                    hashlib.sha256(config.read_bytes()).hexdigest(), "a" * 64,
+                    Path(sys.executable),
+                )
+            source["miz_executable_sha256"] = lane.digest(Path(sys.executable).resolve())
+            with self.assertRaisesRegex(ValueError, "build provenance is unavailable"):
+                lane.prepare(
+                    self.directory, self.state, producer, config,
+                    hashlib.sha256(config.read_bytes()).hexdigest(), "a" * 64,
+                    Path(sys.executable),
+                )
+            with raw.open("r+b") as output:
+                output.write(b"tampered")
+            source["raw_sha256"] = lane.digest(raw)
+            with self.assertRaisesRegex(ValueError, "different guest bytes"):
+                lane.prepare(
+                    self.directory, self.state, producer, config,
+                    hashlib.sha256(config.read_bytes()).hexdigest(), "a" * 64,
+                    Path(sys.executable),
+                )
+            source["raw_sha256"] = "1" * 64
+            with self.assertRaisesRegex(ValueError, "raw/fixed-VHD pair changed"):
+                lane.prepare(
+                    self.directory, self.state, producer, config,
+                    hashlib.sha256(config.read_bytes()).hexdigest(), "a" * 64,
+                    Path(sys.executable),
+                )
+        self.assertEqual(self.state["phase"], "planned")
+        self.assertFalse((self.directory / "solved.config").exists())
+        self.assertEqual(lane.load(self.directory)["prepared"]["implementation"],
+                         {"synthetic": "e" * 64})
         self.assertFalse(self.fake.group_exists)
 
     def test_seed_copies_have_distinct_fresh_ids_and_identical_mirrors(self):
@@ -588,6 +738,15 @@ class Issue90TopologyTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "official VHD footer"):
                 lane.verify_seed(self.directory, self.state, "data0")
+            manifest_path = self.directory / "data0-seed.json"
+            manifest = json.loads(manifest_path.read_text())
+            del manifest["identity_policy_version"]
+            manifest_path.write_text(json.dumps(manifest))
+            self.state["prepared"]["seeds"]["data0"]["manifest_sha256"] = (
+                sparse_fingerprint(manifest_path)
+            )
+            with self.assertRaisesRegex(ValueError, "manifest changed"):
+                lane.verify_seed(self.directory, self.state, "data0")
             with (self.directory / "data7.vhd").open("r+b") as disk:
                 disk.seek(9 * 512)
                 disk.write(b"tampered")
@@ -609,10 +768,22 @@ class Issue90TopologyTest(unittest.TestCase):
                                        f"sectors={lane.SECTORS - 1}"),
             serial(self.state).replace("DATA_READ PASS role=1", "DATA_READ PASS role=0"),
             serial(self.state).replace("main returned 0", "main returned 1"),
+            serial(self.state).replace("UK_HYPERV_PLATFORM_READY", "other"),
+            serial(self.state) + f"run={self.state['run_id']}\n",
+            serial(self.state) + (
+                f"run={self.state['run_id'][:16]}\x1b[31m"
+                f"{self.state['run_id'][16:]}\n"
+            ),
+            serial(self.state) + "secret=https://example.invalid/disk?sig=abc\n",
+            serial(self.state) + "HYPERV_TOPOLOGY RESULT FAIL\n",
         ):
             with self.subTest(changed=changed[-200:]):
                 with self.assertRaises(ValueError):
                     lane.parse_serial(changed, self.state)
+        noisy = serial(self.state) + "UEFI non-topology line\n"
+        lane.parse_serial(noisy, self.state)
+        self.assertNotIn("UEFI non-topology line", lane.redacted_serial(noisy))
+        self.assertEqual(lane.redacted_serial(noisy), serial(self.state))
 
     def test_extra_host_disk_is_skipped_but_counted_not_accepted_as_data(self):
         extra = (
@@ -648,6 +819,22 @@ class Issue90TopologyTest(unittest.TestCase):
 
     def test_foreign_output_fails_before_any_acceptance_or_deletion(self):
         self.fake.tamper = ("output-foreign", "data7")
+        self._run_refused()
+
+    def test_missing_vm_uuid_output_fails_before_any_acceptance_or_deletion(self):
+        self.fake.tamper = ("output-uuid-missing", "vm")
+        self._run_refused()
+
+    def test_wrong_vm_uuid_output_type_fails_before_any_acceptance_or_deletion(self):
+        self.fake.tamper = ("output-uuid-type", "vm")
+        self._run_refused()
+
+    def test_missing_arm_mode_fails_before_any_acceptance_or_deletion(self):
+        self.fake.tamper = ("deployment-mode-missing", "deployment")
+        self._run_refused()
+
+    def test_missing_arm_parameter_type_fails_before_any_acceptance_or_deletion(self):
+        self.fake.tamper = ("deployment-parameter-missing", "deployment")
         self._run_refused()
 
     def test_wrong_lun_refuses_cleanup(self):
@@ -721,6 +908,73 @@ class Issue90TopologyTest(unittest.TestCase):
     def test_wrong_disk_size_refuses_cleanup(self):
         self.fake.tamper = ("disk-size", "data0")
         self._run_refused()
+
+    def test_missing_disk_size_refuses_cleanup(self):
+        self.fake.tamper = ("disk-size-missing", "data0")
+        self._run_refused()
+
+    def test_missing_disk_uuid_refuses_cleanup(self):
+        self.fake.tamper = ("disk-uuid-missing", "data0")
+        self._run_refused()
+
+    def test_upload_proof_requires_exact_size_option_and_generation(self):
+        for tamper in ("disk-upload-size", "disk-upload-option", "disk-gib",
+                       "disk-generation"):
+            with self.subTest(tamper=tamper):
+                role = "os" if tamper == "disk-generation" else "data7"
+                self.fake.tamper = (tamper, role)
+                with self.assertRaises(RuntimeError):
+                    lane.TopologyRun(self.state, self.directory).validate_disk_response(
+                        role, self.fake.disk(role)
+                    )
+        self.fake.tamper = None
+        for role in lane.ROLES:
+            self.assertEqual(lane.TopologyRun(self.state, self.directory)
+                             .validate_disk_response(role, self.fake.disk(role)),
+                             self.fake.disk_uuids[role])
+
+    def test_os_disk_must_attach_original_not_create_from_image(self):
+        self.fake.tamper = ("vm-os-create", "vm")
+        self._run_refused()
+
+    def test_os_disk_must_detach_on_vm_deletion(self):
+        self.fake.tamper = ("vm-os-delete", "vm")
+        self._run_refused()
+
+    def test_data_disk_must_not_enable_write_cache(self):
+        self.fake.tamper = ("vm-data-cache", "vm")
+        self._run_refused()
+
+    def test_nic_must_delete_with_vm(self):
+        self.fake.tamper = ("vm-nic-delete", "vm")
+        self._run_refused()
+
+    def test_pinned_os_disk_delete_option_must_remain_detach(self):
+        self.fake.tamper = ("security-os-delete", "pinned")
+        self._run_refused()
+
+    def test_public_ip_refuses_acceptance_and_cleanup(self):
+        self.fake.tamper = ("network-public", "nic")
+        self._run_refused()
+
+    def test_default_outbound_refuses_acceptance_and_cleanup(self):
+        self.fake.tamper = ("network-outbound", "vnet")
+        self._run_refused()
+
+    def test_cross_group_nat_gateway_refuses_acceptance_and_cleanup(self):
+        self.fake.tamper = ("network-nat", "vnet")
+        self._run_refused()
+
+    def test_unredacted_serial_refuses_receipt_and_discards_raw_log(self):
+        self.fake.serial_noise = f"run={self.state['run_id']}\n"
+        checks = self._patch_cloud()
+        with checks[0], checks[1], checks[2], checks[3], checks[4]:
+            with self.assertRaisesRegex(RuntimeError, "cleanup completed"):
+                lane.run(self.directory, self.state["subscription"],
+                         lane.envelope_sha(self.state))
+        self.assertTrue(self.fake.deleted)
+        self.assertFalse((self.directory / "acceptance.json").exists())
+        self.assertFalse((self.directory / "guest-serial.log").exists())
 
     def test_foreign_disk_tags_refuse_cleanup(self):
         self.fake.tamper = ("disk-owner", "data0")
@@ -855,6 +1109,7 @@ class Issue90TopologyTest(unittest.TestCase):
         self.assertFalse((self.directory / "acceptance.json").exists())
 
     def test_success_has_one_boot_and_complete_owner_checked_deletion(self):
+        self.fake.serial_noise = "UEFI non-topology diagnostic\n"
         checks = self._patch_cloud()
         with checks[0], checks[1], checks[2], checks[3], checks[4]:
             receipt = lane.run(self.directory, self.state["subscription"],
@@ -865,6 +1120,12 @@ class Issue90TopologyTest(unittest.TestCase):
         self.assertTrue(self.fake.deleted)
         self.assertEqual(lane.load(self.directory)["phase"], "cleaned")
         self.assertTrue((self.directory / "acceptance.json").exists())
+        self.assertEqual((self.directory / "guest-serial.log").read_text(),
+                         serial(self.state))
+        self.assertEqual(receipt["evidence"]["serial_sha256"],
+                         hashlib.sha256(
+                             (serial(self.state) + self.fake.serial_noise).encode()
+                         ).hexdigest())
 
     def test_wrong_approval_or_preflight_cannot_create_group(self):
         with self.assertRaisesRegex(ValueError, "approval"):
