@@ -229,6 +229,32 @@ jobs:
           export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
           bash .github/scripts/hyperv-qemu-candidate-runtime.sh "${root}" compute
 
+      - name: Revalidate the completed local run through the native records bridge
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          umask 077
+          root=/d/wamr-ci/wamr-native-runtime
+          controller=/d/wamr-ci/wamr-differential-controller/controller/bin/uk-wamr-native-ci
+          output="${RUNNER_TEMP}/wamr-controller-handoff-v1.json"
+          test -x "${controller}"
+          test ! -e "${output}"
+          "${controller}" records --runtime "${root}" --output handoff-v1 > "${output}"
+          python3 -B - "${output}" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+          value = json.loads(Path(sys.argv[1]).read_bytes())
+          if (value["schema"] != "uk.wamr.native-ci-controller-records"
+                  or value["schema_version"] != 1
+                  or value["context"] != "local-runtime"
+                  or value["compatibility"] != "tiny-v2"
+                  or value["profile"] != "qcow2-derived-vhd"
+                  or len(value["modes"]) != 6
+                  or not value["records"] or not value["artifacts"]):
+              raise SystemExit("native record bridge refused the completed local run")
+          PY
+
       - name: Retain the expressly authorized public-source tiny image bundle
         id: public_bundle
         timeout-minutes: 15
