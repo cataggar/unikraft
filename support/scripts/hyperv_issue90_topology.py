@@ -6,12 +6,12 @@ Plan a private directory with an explicit subscription. Build a fresh EFI
 image with CONFIG_APPHYPERVACCEPTANCE_STORAGE_TOPOLOGY=y, the printed run/disk
 IDs, 8388608 sectors for each disk, nonzero LUN 7, at least three controller
 slots and two LUNs per controller. Locally four-boot it using hyperv-azure.py
-prepare (raw and VHD, normal and legacy APIC). Prepare with the solved config,
-the locally booted state, an independent config/VHD digest and miz. Inspect
-the envelope offline. Live allocation is disabled until owner-checked cleanup
-can handle a lost Azure create response without adopting an unproven replacement.
-Interrupted cloud state may ONLY be cleaned, never redeployed. No #89 grant
-is consumed.
+prepare (raw and VHD, normal and legacy APIC). Preparation remains blocked
+until a reviewed-source, solved-config-to-EFI build proof exists; finding
+the IDs in the EFI is not that proof. Live allocation is separately disabled
+until owner-checked cleanup can handle a lost Azure create response without
+adopting an unproven replacement. Interrupted cloud state may ONLY be cleaned,
+never redeployed. No #89 grant is consumed.
 """
 
 import argparse
@@ -49,6 +49,7 @@ OUTPUT_ROLES = {
     "dataDisk7Id": "data7", "nicId": "nic", "vnetId": "vnet",
     "nsgId": "nsg",
 }
+GIB = 1024**3
 MAX_RUNTIME = 3600
 CLEANUP_HEADROOM = 2400
 MAX_SERIAL = 4 * 1024 * 1024
@@ -75,6 +76,13 @@ SKIP = re.compile(
 )
 FINAL = re.compile(
     r"HYPERV_TOPOLOGY FINAL PASS devices=(\d+) os=1 data0=1 data_nonzero=1"
+)
+PRIVATE_SERIAL = re.compile(
+    r"[0-9a-fA-F]{32,}|"
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|"
+    r"(?:/subscriptions/|(?:https?://)|(?:sig=)|(?:accessSAS))",
+    re.IGNORECASE,
 )
 
 
@@ -305,6 +313,7 @@ def solved_config(raw, state):
     if any(settings.get(key) != value for key, value in exact.items()):
         raise ValueError("Guest configuration does not match fresh #90 run and both disks")
     if (settings.get("APPHYPERVACCEPTANCE_PERSISTENCE") == "y"
+            or settings.get("APPHYPERVACCEPTANCE_NETWORK_APPLICATION") == "y"
             or settings.get("LIBSTORVSC_GUARDED_IO") == "y"
             or not 3 <= int(settings.get("LIBSTORVSC_MAX_DEVICES", "0")) <= 16
             or not 2 <= int(settings.get("LIBSTORVSC_MAX_LUNS", "0")) <= 16):
@@ -390,6 +399,7 @@ def verify_seed(directory, state, role):
 
 def verify_inputs(directory, state):
     prepared = state["prepared"]
+    require_reviewed_build_proof()
     if implementation() != prepared["implementation"]:
         raise ValueError("Prepared controller or reviewed template changed")
     if digest(directory / "guest.vhd") != prepared["image_sha256"]:
@@ -402,6 +412,13 @@ def verify_inputs(directory, state):
         verify_seed(directory, state, role)
     if prepared["seeds"]["data0"]["sha256"] == prepared["seeds"]["data7"]["sha256"]:
         raise ValueError("Both data disks have identical bytes")
+
+
+def require_reviewed_build_proof():
+    raise ValueError(
+        "Reviewed-source/solved-config-to-EFI build provenance is unavailable; "
+        "an ID-byte scan, mutable build receipt or EFI hash is not a build proof"
+    )
 
 
 def prepare(directory, state, prepared_directory, config_path, config_sha,
@@ -417,6 +434,8 @@ def prepare(directory, state, prepared_directory, config_path, config_sha,
     source, source_path = azure.load_state(Path(prepared_directory))
     if (source["phase"] != "prepared" or source.get("local_platform_boot") is not True
             or source.get("image_sha256") != image_sha
+            or not isinstance(source.get("raw_sha256"), str)
+            or not HEX64.fullmatch(source["raw_sha256"])
             or source.get("location") != "northeurope"
             or source.get("vm_size") != "Standard_D2s_v5"
             or source.get("acceptance") != {"mode": "raw-dhcp"}
@@ -444,16 +463,25 @@ def prepare(directory, state, prepared_directory, config_path, config_sha,
     )
     if hashlib.sha256(efi).hexdigest() != source["efi_sha256"]:
         raise ValueError("Locally booted EFI no longer matches its prepared fingerprint")
-    for identity in (state["run_id"], *state["disk_ids"].values()):
-        if identity.encode("ascii") not in efi and bytes.fromhex(identity) not in efi:
-            raise ValueError("Locally booted EFI lacks this run's fresh seed identity")
+    raw_image = source_path.parent / "unikraft.raw"
     image = source_path.parent / "unikraft.vhd"
-    if (image.is_symlink() or image.stat().st_size != azure.VIRTUAL_SIZE + 512
+    if (raw_image.is_symlink() or raw_image.stat().st_size != azure.VIRTUAL_SIZE
+            or digest(raw_image) != source["raw_sha256"]
+            or image.is_symlink() or image.stat().st_size != azure.VIRTUAL_SIZE + 512
             or digest(image) != image_sha):
-        raise ValueError("Locally booted VHD differs from the expected image")
+        raise ValueError("Locally booted raw/fixed-VHD pair changed")
+    with raw_image.open("rb") as raw_disk, image.open("rb") as vhd_disk:
+        for chunk in iter(lambda: raw_disk.read(1024 * 1024), b""):
+            if vhd_disk.read(len(chunk)) != chunk:
+                raise ValueError("Raw and fixed-VHD boot images have different guest bytes")
+        if len(vhd_disk.read()) != 512:
+            raise ValueError("Fixed-VHD footer is missing")
     miz = Path(miz_path).resolve(strict=True)
-    if not os.access(miz, os.X_OK):
-        raise ValueError("Miz checker is not executable")
+    if (not os.access(miz, os.X_OK)
+            or source.get("miz_executable") != str(miz)
+            or source.get("miz_executable_sha256") != digest(miz)):
+        raise ValueError("Miz checker differs from the locally booted image producer")
+    require_reviewed_build_proof()
     report = azure.miz_command(miz, [
         "check-efi-application", "--output=json", "--architecture", "x86_64",
         "--expected-efi-sha256", source["efi_sha256"],
@@ -511,12 +539,23 @@ def parse_serial(text, state):
         raise ValueError("Azure boot diagnostics are invalid or too large")
     lines = [azure.ANSI_ESCAPE.sub("", line).replace("\0", "").strip()
              for line in text.splitlines()]
+    normalized = "\n".join(lines)
+    if PRIVATE_SERIAL.search(normalized) or any(
+        identity in normalized.lower()
+        for identity in (state["run_id"], *state["disk_ids"].values())
+    ):
+        raise ValueError("Azure boot diagnostics contain unredacted private identifiers")
     for line in lines:
         if (line.startswith(("HYPERV_TOPOLOGY FINAL FAIL",
                               "HYPERV_TOPOLOGY TARGET FAIL",
                               "UK_HYPERV_ACCEPTANCE_FAIL:",
                               "UK_HYPERV_ACCEPTANCE_UNAVAILABLE:",
                               "HYPERV_PERSISTENCE"))
+                or any(marker in line for marker in (
+                    "HYPERV_TOPOLOGY RESULT FAIL",
+                    "HYPERV_TOPOLOGY RESULT UNAVAILABLE",
+                    "HYPERV_TOPOLOGY FINAL UNAVAILABLE",
+                ))
                 or any(crash in line for crash in (
                     "Unikraft Crash", "Assertion failure", "Exception Type"))
                 or re.search(r"\bmain returned (?!0\b)-?\d+\b", line)):
@@ -534,6 +573,7 @@ def parse_serial(text, state):
     if (not all(info) or len(os_records) != 1
             or not all(os_records) or len(data) != 2 or not all(data)
             or not all(skips) or len(final) != 1 or not final[0]
+            or lines.count("UK_HYPERV_PLATFORM_READY") != 1
             or lines.count("UK_HYPERV_TOPOLOGY_READ_OK") != 1
             or lines.count("HYPERV_TOPOLOGY RESULT PASS") != 1
             or lines.count("main returned 0") != 1):
@@ -605,6 +645,20 @@ def parse_serial(text, state):
     }
 
 
+def redacted_serial(text):
+    markers = {
+        "UK_HYPERV_PLATFORM_READY", "UK_HYPERV_TOPOLOGY_READ_OK",
+        "HYPERV_TOPOLOGY RESULT PASS", "main returned 0",
+    }
+    lines = [azure.ANSI_ESCAPE.sub("", line).replace("\0", "").strip()
+             for line in text.splitlines()]
+    return "\n".join(line for line in lines if (
+        line in markers or any(pattern.fullmatch(line) for pattern in (
+            INFO, OS_READ, DATA_READ, SKIP, FINAL
+        ))
+    )) + "\n"
+
+
 class TopologyRun:
     def __init__(self, state, directory):
         self.state = state
@@ -650,16 +704,10 @@ class TopologyRun:
         proof = self.state.get("disks", {}).get(role)
         if not isinstance(proof, dict) or set(proof) != {"id", "uuid"}:
             raise RuntimeError(f"Refusing an unproven {role} disk")
-        owned(self.state, disk, role)
-        size = (azure.VIRTUAL_SIZE if role == "os" else DISK_BYTES)
+        self.validate_disk_response(role, disk)
         managed_by = disk.get("managedBy")
         if (proof["id"].lower() != resource_id(self.state, role).lower()
                 or require_uuid(disk.get("uniqueId")) != proof["uuid"]
-                or disk.get("diskSizeBytes") != size
-                or disk.get("sku", {}).get("name") != "StandardSSD_LRS"
-                or disk.get("hyperVGeneration") != "V2"
-                or (disk.get("osType") != "Linux" if role == "os"
-                    else disk.get("osType") not in (None, ""))
                 or (str(managed_by or "").lower() != attached.lower()
                     if attached else managed_by not in (None, ""))
                 or (ready and (disk.get("provisioningState") != "Succeeded"
@@ -667,6 +715,27 @@ class TopologyRun:
                         "Attached" if attached else "Unattached")))):
             raise RuntimeError(f"Refusing a replaced, attached elsewhere or wrong-size {role} disk")
         return proof
+
+    def validate_disk_response(self, role, disk):
+        owned(self.state, disk, role)
+        size = (azure.VIRTUAL_SIZE if role == "os" else DISK_BYTES)
+        creation = disk.get("creationData")
+        if (type(disk.get("diskSizeBytes")) is not int
+                or disk["diskSizeBytes"] != size
+                or type(disk.get("diskSizeGb")) is not int
+                or disk["diskSizeGb"] != (size + GIB - 1) // GIB
+                or not isinstance(creation, dict)
+                or creation.get("createOption") != "Upload"
+                or type(creation.get("uploadSizeBytes")) is not int
+                or creation["uploadSizeBytes"] != size + 512
+                or not isinstance(disk.get("sku"), dict)
+                or disk["sku"].get("name") != "StandardSSD_LRS"
+                or (disk.get("hyperVGeneration") != "V2" if role == "os"
+                    else disk.get("hyperVGeneration") not in (None, "V2"))
+                or (disk.get("osType") != "Linux" if role == "os"
+                    else disk.get("osType") not in (None, ""))):
+            raise RuntimeError(f"Refusing an unproven {role} upload size or disk geometry")
+        return require_uuid(disk.get("uniqueId"))
 
     def preflight_cloud(self):
         subscription = azure.selected_account(self.state["subscription"])
@@ -740,15 +809,14 @@ class TopologyRun:
             "disk", "create", "--resource-group", self.group(),
             "--name", self.name(role), "--location", "northeurope",
             "--upload-type", "Upload", "--upload-size-bytes", str(path.stat().st_size),
-            "--sku", "StandardSSD_LRS", "--hyper-v-generation", "V2",
+            "--sku", "StandardSSD_LRS",
             "--tags", *self.tag_args(role),
         ]
         if role == "os":
-            arguments += ["--os-type", "Linux"]
+            arguments += ["--os-type", "Linux", "--hyper-v-generation", "V2"]
         disk = self.az(arguments, timeout=600)
-        owned(self.state, disk, role)
         proof = {"id": resource_id(self.state, role),
-                 "uuid": require_uuid(disk.get("uniqueId"))}
+                 "uuid": self.validate_disk_response(role, disk)}
         if proof["uuid"] in {item["uuid"] for item in self.state.get("disks", {}).values()}:
             raise RuntimeError("Azure returned duplicate disk UUIDs")
         self.record(f"uploading-{role}",
@@ -827,6 +895,8 @@ class TopologyRun:
                 or str(deployment.get("id", "")).lower()
                 != resource_id(self.state, "deployment").lower()
                 or props.get("provisioningState") != "Succeeded"
+                or props.get("mode") != "Incremental"
+                or deployment.get("type") != "Microsoft.Resources/deployments"
                 or not isinstance(output_resources, list)
                 or len(output_resources) != 4
                 or not all(isinstance(item, dict)
@@ -836,12 +906,18 @@ class TopologyRun:
                 or not isinstance(parameters, dict)
                 or set(parameters) != set(self.parameters())
                 or any(not isinstance(parameters[key], dict)
+                       or not isinstance(parameters[key].get("type"), str)
+                       or parameters[key]["type"].lower() != "string"
                        or parameters[key].get("value") != value
                        for key, value in self.parameters().items())
                 or not isinstance(outputs, dict)
                 or set(outputs) != set(OUTPUT_ROLES) | {"vmUuid"}
+                or not isinstance(outputs.get("vmUuid"), dict)
+                or not isinstance(outputs["vmUuid"].get("type"), str)
+                or outputs["vmUuid"]["type"].lower() != "string"
                 or any(not isinstance(outputs[key], dict)
-                       or outputs[key].get("type", "").lower() != "string"
+                       or not isinstance(outputs[key].get("type"), str)
+                       or outputs[key]["type"].lower() != "string"
                        or str(outputs[key].get("value", "")).lower()
                        != resource_id(self.state, role).lower()
                        for key, role in OUTPUT_ROLES.items())):
@@ -893,24 +969,19 @@ class TopologyRun:
             "vm", "show", "--resource-group", self.group(), "--name", self.name("vm"),
         ], timeout=180 if cleanup else 120)
         owned(self.state, vm, "vm")
-        storage = vm.get("storageProfile", {})
+        storage = vm.get("storageProfile") or {}
         data = storage.get("dataDisks")
-        nics = vm.get("networkProfile", {}).get("networkInterfaces")
+        nics = (vm.get("networkProfile") or {}).get("networkInterfaces")
         if (require_uuid(vm.get("vmId")) != proof["uuid"]
-                or vm.get("hardwareProfile", {}).get("vmSize") != "Standard_D2s_v5"
+                or (vm.get("hardwareProfile") or {}).get("vmSize") != "Standard_D2s_v5"
                 or storage.get("diskControllerType") != "SCSI"
-                or str(storage.get("osDisk", {}).get("managedDisk", {}).get("id", "")).lower()
-                != proof["disks"]["os"]["id"].lower()
+                or not self.valid_os_attachment(storage.get("osDisk"), proof)
                 or not isinstance(data, list) or len(data) != 2
                 or {entry.get("lun") for entry in data if isinstance(entry, dict)}
                 != {0, 7}
-                or any(not isinstance(entry, dict)
-                       or str(entry.get("managedDisk", {}).get("id", "")).lower()
-                       != proof["disks"]["data0" if entry.get("lun") == 0 else "data7"]["id"].lower()
-                       for entry in data)
+                or any(not self.valid_data_attachment(entry, proof) for entry in data)
                 or not isinstance(nics, list) or len(nics) != 1
-                or str(nics[0].get("id", "")).lower()
-                != resource_id(self.state, "nic").lower()
+                or not self.valid_nic_attachment(nics[0])
                 or (vm.get("securityProfile") is not None
                     and (not isinstance(vm["securityProfile"], dict)
                          or vm["securityProfile"].get("securityType") != "Standard"))):
@@ -920,6 +991,42 @@ class TopologyRun:
             self.verify_disk(role, self.disk_show(role, cleanup=cleanup),
                              attached=proof["id"], ready=not cleanup)
         return proof
+
+    def valid_os_attachment(self, disk, proof):
+        return (
+            isinstance(disk, dict)
+            and isinstance(disk.get("managedDisk"), dict)
+            and str(disk["managedDisk"].get("id", "")).lower()
+            == proof["disks"]["os"]["id"].lower()
+            and disk.get("name") == self.name("os")
+            and disk.get("osType") == "Linux"
+            and disk.get("createOption") == "Attach"
+            and disk.get("caching") == "ReadOnly"
+            and disk.get("deleteOption") == "Detach"
+        )
+
+    def valid_data_attachment(self, disk, proof):
+        return (
+            isinstance(disk, dict)
+            and disk.get("lun") in (0, 7)
+            and isinstance(disk.get("managedDisk"), dict)
+            and str(disk["managedDisk"].get("id", "")).lower()
+            == proof["disks"]["data0" if disk["lun"] == 0 else "data7"]["id"].lower()
+            and disk.get("name") == self.name("data0" if disk["lun"] == 0 else "data7")
+            and disk.get("createOption") == "Attach"
+            and disk.get("caching") == "None"
+            and disk.get("deleteOption") == "Detach"
+        )
+
+    def valid_nic_attachment(self, nic):
+        return (
+            isinstance(nic, dict)
+            and str(nic.get("id", "")).lower()
+            == resource_id(self.state, "nic").lower()
+            and isinstance(nic.get("properties"), dict)
+            and nic["properties"].get("primary") is True
+            and nic["properties"].get("deleteOption") == "Delete"
+        )
 
     def verify_vm_security(self, proof, *, cleanup=False):
         resource = self.az([
@@ -945,28 +1052,15 @@ class TopologyRun:
             or not isinstance(hardware, dict)
             or hardware.get("vmSize") != "Standard_D2s_v5"
             or storage.get("diskControllerType") != "SCSI"
-            or not isinstance(os_disk, dict)
-            or not isinstance(os_disk.get("managedDisk"), dict)
-            or str(os_disk["managedDisk"].get("id", "")).lower()
-            != proof["disks"]["os"]["id"].lower()
+            or not self.valid_os_attachment(os_disk, proof)
             or not isinstance(data, list)
             or len(data) != 2
             or {entry.get("lun") for entry in data if isinstance(entry, dict)}
             != {0, 7}
-            or any(
-                not isinstance(entry, dict)
-                or not isinstance(entry.get("managedDisk"), dict)
-                or str(entry["managedDisk"].get("id", "")).lower()
-                != proof["disks"][
-                    "data0" if entry.get("lun") == 0 else "data7"
-                ]["id"].lower()
-                for entry in data
-            )
+            or any(not self.valid_data_attachment(entry, proof) for entry in data)
             or not isinstance(interfaces, list)
             or len(interfaces) != 1
-            or not isinstance(interfaces[0], dict)
-            or str(interfaces[0].get("id", "")).lower()
-            != resource_id(self.state, "nic").lower()
+            or not self.valid_nic_attachment(interfaces[0])
             or not isinstance(security, dict)
             or not set(security).issubset({
                 "securityType", "encryptionAtHost", "encryptionIdentity",
@@ -988,6 +1082,7 @@ class TopologyRun:
         self.record("waiting-boot")
         while time.monotonic() < self.deadline - CLEANUP_HEADROOM:
             self.verify_topology()
+            self.verify_network()
             try:
                 text = self.az([
                     "vm", "boot-diagnostics", "get-boot-log",
@@ -1003,7 +1098,9 @@ class TopologyRun:
                     raise RuntimeError("Azure returned invalid serial output")
                 if "HYPERV_TOPOLOGY RESULT PASS" in text:
                     evidence = parse_serial(text, self.state)
-                    azure.save_private_text(self.directory / "guest-serial.log", text)
+                    azure.save_private_text(
+                        self.directory / "guest-serial.log", redacted_serial(text)
+                    )
                     azure.fsync_directory(self.directory)
                     self.record("accepted", evidence=evidence)
                     return evidence
@@ -1036,14 +1133,25 @@ class TopologyRun:
         configs = nic.get("ipConfigurations")
         subnets = vnet.get("subnets")
         if (nic.get("enableIPForwarding") is not False
+                or nic.get("enableAcceleratedNetworking") is not False
+                or nic.get("networkSecurityGroup") is not None
                 or not isinstance(configs, list) or len(configs) != 1
+                or not isinstance(configs[0], dict)
+                or configs[0].get("name") != "primary"
+                or configs[0].get("privateIPAllocationMethod") != "Dynamic"
                 or configs[0].get("publicIPAddress") is not None
-                or str(configs[0].get("subnet", {}).get("id", "")).lower()
+                or str((configs[0].get("subnet") or {}).get("id", "")).lower()
                 != (resource_id(self.state, "vnet") + "/subnets/default").lower()
+                or (vnet.get("addressSpace") or {}).get("addressPrefixes")
+                != ["10.90.0.0/29"]
                 or not isinstance(subnets, list) or len(subnets) != 1
+                or not isinstance(subnets[0], dict)
                 or subnets[0].get("name") != "default"
+                or subnets[0].get("addressPrefix") != "10.90.0.0/29"
                 or subnets[0].get("defaultOutboundAccess") is not False
-                or str(subnets[0].get("networkSecurityGroup", {}).get("id", "")).lower()
+                or subnets[0].get("natGateway") is not None
+                or subnets[0].get("routeTable") is not None
+                or str((subnets[0].get("networkSecurityGroup") or {}).get("id", "")).lower()
                 != resource_id(self.state, "nsg").lower()
                 or nsg.get("securityRules") != []):
             raise RuntimeError("Private network gained public ingress or outbound access")
