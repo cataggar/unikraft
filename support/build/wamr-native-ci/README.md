@@ -33,6 +33,23 @@ authoritative production caller and differential reference until the later
 parity/bridge/cutover PRs; production callers, wrappers and authority are
 unchanged.
 
+## Native record-consumer bridge (not yet the production handoff caller)
+
+`uk-wamr-native-ci records --runtime ABS --output handoff-v1` reopens a
+completed local v2 run, including source and input custody, the six boot
+transcripts and image chain, before emitting a bounded, canonical private JSON
+description of pinned records, artifacts and runtime inputs. The separate
+`records --stage-root ABS --transport trusted-inner-zip --output handoff-v1`
+form checks an extracted public-source inner tree. The initial imported-stage
+fixture covers older allowlisted v1 evidence; pre-supervisor v1 and current v2
+imports still need end-to-end checks. Neither form executes build or boot,
+changes authority, or makes a partially checked manifest an accepted run.
+
+This bridge is still under integration: a completed local run and a current v2
+import must pass end-to-end before `handoff.py` or `public_bundle.py` switches
+away from `run.py`. The current checkout/consumer custody and supervised
+handoff stages also need native owners before `run.py` can be removed.
+
 ## Native controller preparation (unpublished build path)
 
 `zig build --build-file support/build/wamr-native-ci/build.zig test-controller`

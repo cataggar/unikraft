@@ -112,7 +112,8 @@ test "exact bounded validator JSON and Python tiny differential faults" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     const raw_hash = std.fmt.bytesToHex(controller.records.fileIdentity("abc"), .lower);
-    const valid = try std.fmt.allocPrint(a,
+    const valid = try std.fmt.allocPrint(
+        a,
         "{{\"compute\":{{\"answer\":42}},\"mode\":\"tiny\",\"raw_serial_bytes\":3,\"raw_serial_sha256\":\"{s}\",\"schema\":\"uk.wamr.log-validation\",\"schema_version\":1}}\n",
         .{&raw_hash},
     );
@@ -158,7 +159,8 @@ test "exact bounded validator JSON and Python tiny differential faults" {
         const result = try std.process.run(a, io, .{
             .argv = &.{ options.python_executable, "-B", "-c", oracle, reference, hex },
             .cwd = .{ .path = options.repository_root },
-            .stdout_limit = .limited(64), .stderr_limit = .limited(4096),
+            .stdout_limit = .limited(64),
+            .stderr_limit = .limited(4096),
         });
         defer a.free(result.stdout);
         defer a.free(result.stderr);
@@ -199,8 +201,7 @@ test "native diagnostics retain only bounded allowlisted observations and never 
     defer a.free(report);
     try writeFixtureFile(io, boot, "report.json", report);
     try writeFixtureFile(io, evidence, "command-fixtures.json", "{\"exit_code\":1}\n");
-    try writeFixtureFile(io, private, "fixtures.log",
-        "test_safe_name (test_adapter.Evidence.test_safe_name) ... ERROR\nPRIVATE_SYNTHETIC_SERIAL_AND_PATH\n");
+    try writeFixtureFile(io, private, "fixtures.log", "test_safe_name (test_adapter.Evidence.test_safe_name) ... ERROR\nPRIVATE_SYNTHETIC_SERIAL_AND_PATH\n");
     var signal = try controller.build_pipeline.installCancellation();
     defer signal.deinit();
     var scratch = std.heap.ArenaAllocator.init(a);
@@ -208,13 +209,21 @@ test "native diagnostics retain only bounded allowlisted observations and never 
     const compute_path = try std.fs.path.join(a, &.{ runtime, "compute" });
     defer a.free(compute_path);
     var base: controller.build_pipeline.Context = .{
-        .allocator = scratch.allocator(), .io = io, .environ = undefined, .runtime = runtime,
-        .repository = options.repository_root, .wamr = "",
-        .compute = compute_path, .git = undefined, .tools = undefined,
-        .roots = undefined, .signal = &signal,
+        .allocator = scratch.allocator(),
+        .io = io,
+        .environ = undefined,
+        .runtime = runtime,
+        .repository = options.repository_root,
+        .wamr = "",
+        .compute = compute_path,
+        .git = undefined,
+        .tools = undefined,
+        .roots = undefined,
+        .signal = &signal,
     };
     var ctx: controller.boot_pipeline.Context = .{
-        .build_context = &base, .pinned = std.StringHashMap(controller.custody_files.File).init(scratch.allocator()),
+        .build_context = &base,
+        .pinned = std.StringHashMap(controller.custody_files.File).init(scratch.allocator()),
     };
     defer ctx.pinned.deinit();
     try controller.boot_pipeline.diagnostics(&ctx);
@@ -255,9 +264,17 @@ test "result refuses unpinned evidence files and directories before publication"
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     var base: controller.build_pipeline.Context = .{
-        .allocator = arena.allocator(), .io = io, .environ = undefined, .runtime = path,
-        .repository = options.repository_root, .wamr = "", .compute = path,
-        .git = undefined, .tools = undefined, .roots = undefined, .signal = &signal,
+        .allocator = arena.allocator(),
+        .io = io,
+        .environ = undefined,
+        .runtime = path,
+        .repository = options.repository_root,
+        .wamr = "",
+        .compute = path,
+        .git = undefined,
+        .tools = undefined,
+        .roots = undefined,
+        .signal = &signal,
     };
     var ctx: controller.boot_pipeline.Context = .{
         .build_context = &base,
@@ -307,9 +324,17 @@ test "boot recheck uses transient scratch and refuses changed pinned evidence wi
     var empty: [0]u8 = .{};
     var no_growth = std.heap.FixedBufferAllocator.init(&empty);
     var base: controller.build_pipeline.Context = .{
-        .allocator = no_growth.allocator(), .io = io, .environ = undefined, .runtime = path,
-        .repository = options.repository_root, .wamr = "", .compute = path,
-        .git = undefined, .tools = undefined, .roots = undefined, .signal = &signal,
+        .allocator = no_growth.allocator(),
+        .io = io,
+        .environ = undefined,
+        .runtime = path,
+        .repository = options.repository_root,
+        .wamr = "",
+        .compute = path,
+        .git = undefined,
+        .tools = undefined,
+        .roots = undefined,
+        .signal = &signal,
         .build_start_record = try controller.custody_files.readFile(io, start_path, 4096, true),
     };
     base.build_start_record.?.bytes += 1;
@@ -319,12 +344,10 @@ test "boot recheck uses transient scratch and refuses changed pinned evidence wi
     };
     defer ctx.pinned.deinit();
     try ctx.pinned.put("build.json", try controller.custody_files.readFile(io, build_path, 4096, true));
-    for (0..3) |_| try std.testing.expectError(error.BuildStartChanged,
-        controller.boot_pipeline.testing.revalidateBase(&ctx));
+    for (0..3) |_| try std.testing.expectError(error.BuildStartChanged, controller.boot_pipeline.testing.revalidateBase(&ctx));
     try evidence.deleteFile(io, "build.json");
     try writeFixtureFile(io, evidence, "build.json", "{\"changed\":true}\n");
-    try std.testing.expectError(error.EvidenceChanged,
-        controller.boot_pipeline.testing.revalidateBase(&ctx));
+    try std.testing.expectError(error.EvidenceChanged, controller.boot_pipeline.testing.revalidateBase(&ctx));
 }
 
 test "changed raw QCOW2 and derived VHD images never publish compute evidence" {
@@ -351,9 +374,17 @@ test "changed raw QCOW2 and derived VHD images never publish compute evidence" {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     var base: controller.build_pipeline.Context = .{
-        .allocator = arena.allocator(), .io = io, .environ = undefined, .runtime = path,
-        .repository = options.repository_root, .wamr = "", .compute = path,
-        .git = undefined, .tools = undefined, .roots = undefined, .signal = &signal,
+        .allocator = arena.allocator(),
+        .io = io,
+        .environ = undefined,
+        .runtime = path,
+        .repository = options.repository_root,
+        .wamr = "",
+        .compute = path,
+        .git = undefined,
+        .tools = undefined,
+        .roots = undefined,
+        .signal = &signal,
     };
     var ctx: controller.boot_pipeline.Context = .{
         .build_context = &base,
@@ -362,8 +393,7 @@ test "changed raw QCOW2 and derived VHD images never publish compute evidence" {
     defer ctx.pinned.deinit();
     const source = "original-image";
     const hash = std.fmt.bytesToHex(controller.records.fileIdentity(source), .lower);
-    ctx.package = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
-        try std.fmt.allocPrint(arena.allocator(), "{{\"image\":{{\"raw\":{{\"sha256\":\"{s}\"}}}}}}", .{&hash}), .{});
+    ctx.package = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), try std.fmt.allocPrint(arena.allocator(), "{{\"image\":{{\"raw\":{{\"sha256\":\"{s}\"}}}}}}", .{&hash}), .{});
     const output = try std.fmt.allocPrint(arena.allocator(), "{{\"output\":{{\"sha256\":\"{s}\"}}}}", .{&hash});
     ctx.finalization = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), output, .{});
     ctx.derivation = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), output, .{});
@@ -377,8 +407,7 @@ test "changed raw QCOW2 and derived VHD images never publish compute evidence" {
         const image = try package_dir.openFile(io, filename, .{ .mode = .read_write, .follow_symlinks = false });
         try image.writePositionalAll(io, "changed--image", 0);
         image.close(io);
-        try std.testing.expectError(error.ArtifactChanged,
-            controller.boot_pipeline.testing.publishCompute(&ctx, index, .null));
+        try std.testing.expectError(error.ArtifactChanged, controller.boot_pipeline.testing.publishCompute(&ctx, index, .null));
         try std.testing.expectError(error.FileNotFound, evidence_dir.openFile(io, record_name, .{}));
     }
 }
@@ -510,7 +539,7 @@ fn directSharedSupervisorFixtures() !void {
         seconds: u32 = 4,
         cancelled: bool = false,
     }{
-        .{ .name = "ok", .accepted = true, .kind = "exited" },
+        .{ .name = "ok", .accepted = true, .kind = "exited", .limit = 8 * 1024 * 1024, .seconds = 600 },
         .{ .name = "reported-error", .accepted = false, .kind = "exited" },
         .{ .name = "nonzero", .accepted = false, .kind = "exited" },
         .{ .name = "partial", .accepted = false, .kind = "exited" },
@@ -626,6 +655,21 @@ fn directSharedSupervisorFixtures() !void {
             .test_output_limit = scenario.limit,
         }));
         if (std.mem.eql(u8, scenario.name, "ok")) {
+            const validated = try controller.accepted_run.validateCommandBinding(a, raw, .fixtures, .local_runtime);
+            try std.testing.expectEqual(controller.command_plan.Stage.fixtures, validated.stage);
+            _ = try controller.accepted_run.validateCommandBinding(a, raw, .fixtures, .trusted_inner_zip);
+            var mutated = try std.json.parseFromSlice(std.json.Value, a, raw, .{
+                .duplicate_field_behavior = .@"error",
+                .allocate = .alloc_always,
+            });
+            defer mutated.deinit();
+            const request = mutated.value.object.getPtr("supervisor").?.object.getPtr("request").?;
+            try request.object.put(a, "timeout_ns", .{ .integer = 1 });
+            const tampered_raw = try std.json.Stringify.valueAlloc(a, mutated.value, .{});
+            defer a.free(tampered_raw);
+            const tampered = try controller.records.canonicalAlloc(a, tampered_raw);
+            defer a.free(tampered);
+            try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBinding(a, tampered, .fixtures, .trusted_inner_zip));
             var cancellation = try controller.build_pipeline.installCancellation();
             defer cancellation.deinit();
             var context: controller.build_pipeline.Context = .{
@@ -702,9 +746,21 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
     try std.testing.expectEqual(cli.Action.describe, (try cli.parse(&.{ "uk-wamr-native-ci", "describe", "--output", "json-v1" })).action);
     try std.testing.expectEqual(cli.Action.boot, (try cli.parse(&.{ "uk-wamr-native-ci", "boot", "--runtime", "/runtime" })).action);
     try std.testing.expectEqual(cli.Action.diagnostics, (try cli.parse(&.{ "uk-wamr-native-ci", "diagnostics", "--runtime", "/runtime" })).action);
+    const local_records = try cli.parse(&.{ "uk-wamr-native-ci", "records", "--output", "handoff-v1", "--runtime", "/runtime" });
+    try std.testing.expectEqual(cli.Action.records, local_records.action);
+    try std.testing.expectEqualStrings("/runtime", local_records.runtime.?);
+    const imported_records = try cli.parse(&.{ "uk-wamr-native-ci", "records", "--stage-root", "/stage", "--transport", "trusted-inner-zip", "--output", "handoff-v1" });
+    try std.testing.expectEqual(cli.Action.records, imported_records.action);
+    try std.testing.expectEqualStrings("/stage", imported_records.stage_root.?);
     const rejected = [_][]const []const u8{
         &.{"uk-wamr-native-ci"},
         &.{ "uk-wamr-native-ci", "records", "--runtime", "/runtime" },
+        &.{ "uk-wamr-native-ci", "records", "--runtime", "/runtime", "--transport", "trusted-inner-zip", "--output", "handoff-v1" },
+        &.{ "uk-wamr-native-ci", "records", "--stage-root", "/stage", "--output", "handoff-v1" },
+        &.{ "uk-wamr-native-ci", "records", "--runtime", "/runtime", "--stage-root", "/stage", "--output", "handoff-v1" },
+        &.{ "uk-wamr-native-ci", "records", "--stage-root", "/stage", "--transport", "producer-direct", "--output", "handoff-v1" },
+        &.{ "uk-wamr-native-ci", "records", "--stage-root", "/stage", "--transport", "trusted-inner-zip", "--output", "json-v1" },
+        &.{ "uk-wamr-native-ci", "records", "--runtime", "/root/../runtime", "--output", "handoff-v1" },
         &.{ "uk-wamr-native-ci", "describe" },
         &.{ "uk-wamr-native-ci", "describe", "--output", "text" },
         &.{ "uk-wamr-native-ci", "boot", "--runtime", "/runtime", "--wamr-source", "/wamr" },
@@ -730,6 +786,50 @@ test "canonical bytes and domain-separated file versus record identity" {
     try std.testing.expect(!std.mem.eql(u8, &record, &file));
     try std.testing.expectError(error.IntegerOverflow, controller.records.identity(allocator, "{\"value\":18446744073709551616}"));
     try std.testing.expectError(error.DuplicateField, controller.records.identity(allocator, "{\"a\":1,\"a\":2}"));
+}
+
+test "historical v2 supervised bindings use the closed imported producer contract" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const script =
+        \\import copy, importlib.util, sys
+        \\s=importlib.util.spec_from_file_location("witness",sys.argv[1])
+        \\m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+        \\e=m.Evidence()
+        \\stages=("adapter","local-boot-tool","fixtures","prepare","config","native-image","package","raw-x2apic","raw-legacy-apic","finalize-qcow2","qcow2-x2apic","qcow2-legacy-apic","derive-fixed-vhd","vpc-x2apic","vpc-legacy-apic","inspect","log-validator-x2apic","log-validator-legacy")
+        \\records={name:e.supervised_binding(name)[0] for name in stages}
+        \\tampered=copy.deepcopy(records["adapter"]); tampered["supervisor"]["request"]["argv"][1]={"kind":"literal","value":"--arbitrary"}
+        \\records["tampered"]=e.rehash_supervised_binding(tampered)
+        \\sys.stdout.buffer.write(m.ci.canonical_json(records))
+    ;
+    const witness = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/tests/test_adapter.py" });
+    const response = try std.process.run(a, std.testing.io, .{
+        .argv = &.{ options.python_executable, "-B", "-c", script, witness },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(4096),
+    });
+    if (response.term != .exited or response.term.exited != 0)
+        std.debug.print("historical binding witness: {s}\n", .{response.stderr});
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, response.term);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, response.stdout, .{ .duplicate_field_behavior = .@"error" });
+    const values = parsed.object;
+    var verified: usize = 0;
+    for (values.keys(), values.values()) |name, value| {
+        const bytes = try fixtureCanonical(a, value);
+        if (std.mem.eql(u8, name, "tampered")) {
+            try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBinding(a, bytes, .adapter, .trusted_inner_zip));
+            continue;
+        }
+        const stage = std.meta.stringToEnum(controller.command_plan.Stage, name) orelse return error.UnexpectedStage;
+        const observed = try controller.accepted_run.validateCommandBinding(a, bytes, stage, .trusted_inner_zip);
+        try std.testing.expectEqual(stage, observed.stage);
+        if (stage == .adapter or stage == .@"local-boot-tool" or stage == .fixtures or controller.command_plan.isValidator(stage))
+            try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBinding(a, bytes, stage, .local_runtime));
+        verified += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 18), verified);
 }
 
 fn fixture(allocator: std.mem.Allocator, v2: bool, commands: bool) ![]u8 {
@@ -775,6 +875,502 @@ fn fixture(allocator: std.mem.Allocator, v2: bool, commands: bool) ![]u8 {
     }
     try w.writeAll("}}");
     return writer.toOwnedSlice();
+}
+
+test "accepted run requires complete local and trusted-inner-zip evidence before handoff" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "accepted-records-{d}", .{std.os.linux.getpid()});
+    defer a.free(name);
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("accepted records fixture cleanup failed");
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    try root.createDir(io, "compute", .fromMode(0o700));
+    try root.createDir(io, "artifacts", .fromMode(0o700));
+    try root.createDir(io, "evidence", .fromMode(0o700));
+    const compute = try root.openDir(io, "compute", .{ .iterate = true });
+    defer compute.close(io);
+    try compute.createDir(io, "evidence", .fromMode(0o700));
+    const local = try compute.openDir(io, "evidence", .{ .iterate = true });
+    defer local.close(io);
+    const imported = try root.openDir(io, "evidence", .{ .iterate = true });
+    defer imported.close(io);
+    const artifacts = try root.openDir(io, "artifacts", .{ .iterate = true });
+    defer artifacts.close(io);
+    const unencoded = try fixture(a, true, true);
+    defer a.free(unencoded);
+    const accepted = try controller.records.canonicalAlloc(a, unencoded);
+    defer a.free(accepted);
+    try writeFixtureFile(io, local, "result.json", accepted);
+    try writeFixtureFile(io, artifacts, "local_result", accepted);
+    const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    defer a.free(path);
+    const directory = try core.private_files.Directory.open(io, path);
+    defer directory.close(io);
+    try std.testing.expectError(error.MissingEvidence, controller.accepted_run.openImportedStage(a, io, &directory, path));
+    try std.testing.expectError(error.MissingEvidence, controller.accepted_run.openAndValidate(a, io, undefined, &directory, path, options.repository_root));
+    const local_refusal = try std.process.run(a, io, .{
+        .argv = &.{ options.host_controller_cli, "records", "--runtime", path, "--output", "handoff-v1" },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(256),
+        .stderr_limit = .limited(4096),
+    });
+    defer a.free(local_refusal.stdout);
+    defer a.free(local_refusal.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, local_refusal.term);
+    try std.testing.expectEqualStrings("", local_refusal.stdout);
+
+    var parsed = try controller.records.parseCanonicalResult(a, accepted);
+    defer parsed.deinit();
+    for (parsed.value.records.keys()) |record| {
+        try writeFixtureFile(io, local, record, "{}\n");
+        try writeFixtureFile(io, imported, record, "{}\n");
+    }
+    try std.testing.expectError(error.InvalidEvidence, controller.accepted_run.openImportedStage(a, io, &directory, path));
+    try std.testing.expectError(error.InvalidEvidence, controller.accepted_run.openAndValidate(a, io, undefined, &directory, path, options.repository_root));
+    const changed = try imported.openFile(io, "build.json", .{ .mode = .read_write, .follow_symlinks = false });
+    try changed.setLength(io, 0);
+    try changed.writePositionalAll(io, "{\"forged\":true}\n", 0);
+    changed.close(io);
+    try std.testing.expectError(error.RecordChanged, controller.accepted_run.openImportedStage(a, io, &directory, path));
+}
+
+test "handoff document has a fixed canonical shape and finite output limit" {
+    const a = std.testing.allocator;
+    var view = controller.accepted_run.AcceptedRun{
+        .arena = std.heap.ArenaAllocator.init(a),
+        .io = std.testing.io,
+        .context = .trusted_inner_zip,
+        .compatibility = .tiny_v1_legacy,
+        .production_profile = null,
+        .source = .{ .revision = "993e4d0d394c08202c0d0c57ea97450a19a4f394", .tree = "54f8e118146c78c24e7c802657c6ec62b268a5de" },
+        .result = .{ .relative_path = "artifacts/local_result", .bytes = 1, .sha256 = [_]u8{'a'} ** 64 },
+        .records = &.{},
+        .artifacts = &.{},
+        .runtime_inputs = &.{},
+        .root = "/fixture",
+        .repository = null,
+        .environ = null,
+    };
+    defer view.deinit();
+    const raw = try view.handoffV1();
+    var document = try core.contracts.Document.parse(a, raw, .{});
+    defer document.deinit();
+    try document.requireCanonical(a, raw);
+    _ = try core.contracts.exactFields(document.value(), &.{
+        "schema",         "schema_version", "context", "compatibility", "profile",
+        "source",         "modes",          "result",  "records",       "artifacts",
+        "runtime_inputs",
+    });
+    try std.testing.expectEqualStrings("trusted-inner-zip", document.value().object.get("context").?.string);
+    try std.testing.expectEqual(@as(usize, 4), document.value().object.get("modes").?.array.items.len);
+    const result = document.value().object.get("result").?;
+    try std.testing.expect(result.object.get("sha256").? == .string);
+    const oversized = try view.arena.allocator().alloc(u8, 2 * 1024 * 1024);
+    @memset(oversized, 'a');
+    view.source.revision = oversized;
+    try std.testing.expectError(error.HandoffTooLarge, view.handoffV1());
+}
+
+fn fixtureCanonical(a: std.mem.Allocator, value: anytype) ![]const u8 {
+    return controller.records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, value, .{}));
+}
+
+fn fixtureMember(
+    a: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    members: *std.json.Value,
+    path: []const u8,
+    bytes: []const u8,
+) !std.json.Value {
+    try writeFixtureFile(io, dir, path, bytes);
+    const sha256 = try a.dupe(u8, &std.fmt.bytesToHex(controller.records.fileIdentity(bytes), .lower));
+    const size: u64 = @intCast(bytes.len);
+    try members.object.put(a, path, try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{
+        .size = size,
+        .sha256 = sha256,
+    }, .{}), .{}));
+    return std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{
+        .path = path,
+        .size = size,
+        .sha256 = sha256,
+    }, .{}), .{});
+}
+
+fn fixtureItem(a: std.mem.Allocator, members: std.json.Value, path: []const u8) !std.json.Value {
+    const member = members.object.get(path) orelse return error.MissingFixture;
+    return std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{
+        .path = path,
+        .size = member.object.get("size").?,
+        .sha256 = member.object.get("sha256").?,
+    }, .{}), .{});
+}
+
+fn fixtureSparseImage(
+    a: std.mem.Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    root_path: []const u8,
+    members: *std.json.Value,
+    role: []const u8,
+    footer: ?*const [512]u8,
+) !std.json.Value {
+    const path = try std.fmt.allocPrint(a, "artifacts/{s}", .{role});
+    const file = try root.createFile(io, path, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    defer file.close(io);
+    const bytes: u64 = 66 * 1024 * 1024;
+    try file.setLength(io, bytes + @as(u64, if (footer == null) 0 else 512));
+    if (footer) |value| try file.writePositionalAll(io, value, bytes);
+    const recorded = try controller.custody_files.readFile(io, try std.fs.path.join(a, &.{ root_path, path }), bytes + 512, true);
+    const size = recorded.bytes;
+    const digest = try a.dupe(u8, &recorded.sha256);
+    try members.object.put(a, path, try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{
+        .size = size,
+        .sha256 = digest,
+    }, .{}), .{}));
+    return fixtureItem(a, members.*, path);
+}
+
+test "trusted historical inner stage accepts complete records and refuses tampered boot bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "accepted-import-v1-{d}", .{std.os.linux.getpid()});
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("import fixture cleanup failed");
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    for ([_][]const u8{ "artifacts", "evidence", "boots" }) |part|
+        try root.createDir(io, part, .fromMode(0o700));
+    for (controller.profile.legacy_modes) |mode|
+        try root.createDir(io, try std.fmt.allocPrint(a, "boots/{s}", .{@tagName(mode)}), .fromMode(0o700));
+    const stage_root_path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    var members = std.json.Value{ .object = .empty };
+    var record_hashes = std.json.Value{ .object = .empty };
+    const source = .{
+        .revision = "993e4d0d394c08202c0d0c57ea97450a19a4f394",
+        .tree = "54f8e118146c78c24e7c802657c6ec62b268a5de",
+    };
+    const wamr_revision = controller.custody_limits.wamr_revision;
+    for ([_][]const u8{
+        "efi",      "debug_elf", "bootinfo", "runtime",
+        "compiler", "wasm",      "cwasm",    "config",
+    }) |role| {
+        const artifact_path = try std.fmt.allocPrint(a, "artifacts/{s}", .{role});
+        _ = try fixtureMember(a, io, root, &members, artifact_path, role);
+    }
+    var footer = [_]u8{0} ** 512;
+    footer[0..8].* = "conectix".*;
+    std.mem.writeInt(u32, footer[8..12], 2, .big);
+    std.mem.writeInt(u32, footer[12..16], 0x10000, .big);
+    std.mem.writeInt(u64, footer[16..24], std.math.maxInt(u64), .big);
+    footer[28..32].* = "miz ".*;
+    std.mem.writeInt(u64, footer[40..48], 66 * 1024 * 1024, .big);
+    std.mem.writeInt(u64, footer[48..56], 66 * 1024 * 1024, .big);
+    std.mem.writeInt(u16, footer[56..58], 134, .big);
+    footer[58] = 16;
+    footer[59] = 63;
+    std.mem.writeInt(u32, footer[60..64], 2, .big);
+    footer[68] = 1;
+    var footer_sum: u32 = 0;
+    for (footer, 0..) |byte, index| if (index < 64 or index >= 68) {
+        footer_sum +%= byte;
+    };
+    std.mem.writeInt(u32, footer[64..68], ~footer_sum, .big);
+    const footer_hash = std.fmt.bytesToHex(controller.records.fileIdentity(&footer), .lower);
+    _ = try fixtureSparseImage(a, io, root, stage_root_path, &members, "raw", null);
+    _ = try fixtureSparseImage(a, io, root, stage_root_path, &members, "vhd", &footer);
+    const identity = .{
+        .wamr_revision = wamr_revision,
+        .minimal_wasi = false,
+        .files = .{
+            .@"tiny.wasm" = members.object.get("artifacts/wasm").?.object.get("sha256").?.string,
+            .@"tiny.cwasm" = members.object.get("artifacts/cwasm").?.object.get("sha256").?.string,
+            .@"libwamr-aot.a" = members.object.get("artifacts/runtime").?.object.get("sha256").?.string,
+            .wamrc = members.object.get("artifacts/compiler").?.object.get("sha256").?.string,
+        },
+    };
+    const identity_raw = try fixtureCanonical(a, identity);
+    _ = try fixtureMember(a, io, root, &members, "artifacts/runtime_identity", identity_raw);
+    const image = .{
+        .files = .{
+            .@"wamr_hyperv-x86_64-efi" = members.object.get("artifacts/efi").?.object.get("sha256").?.string,
+            .@"wamr_hyperv-x86_64-efi.dbg" = members.object.get("artifacts/debug_elf").?.object.get("sha256").?.string,
+            .@"wamr_hyperv-x86_64-efi.bootinfo" = members.object.get("artifacts/bootinfo").?.object.get("sha256").?.string,
+        },
+        .solved_config_sha256 = members.object.get("artifacts/config").?.object.get("sha256").?.string,
+        .runtime_inputs_sha256 = members.object.get("artifacts/runtime_identity").?.object.get("sha256").?.string,
+    };
+    const image_raw = try fixtureCanonical(a, image);
+    _ = try fixtureMember(a, io, root, &members, "artifacts/image_identity", image_raw);
+
+    const start = try fixtureCanonical(a, .{ .source = source });
+    const built = try fixtureCanonical(a, .{ .source = source, .runtime = identity, .image = image });
+    const empty_hash = std.fmt.bytesToHex(controller.records.fileIdentity(""), .lower);
+    const boot_inputs = try fixtureCanonical(a, .{
+        .package_tool = empty_hash,
+        .local_boot_tool = empty_hash,
+        .qemu = empty_hash,
+        .ovmf_code = empty_hash,
+        .ovmf_vars = empty_hash,
+    });
+    const package = try fixtureCanonical(a, .{
+        .scope = "public_local_compute_packaging_only",
+        .acceptance = "not_established",
+        .producer_sha256 = empty_hash,
+        .image = .{
+            .schema_version = @as(u8, 1),
+            .miz_revision = controller.custody_limits.miz_revision,
+            .efi = .{ .size = @as(u64, 3), .sha256 = image.files.@"wamr_hyperv-x86_64-efi" },
+            .raw = .{ .size = @as(u64, 66 * 1024 * 1024), .sha256 = members.object.get("artifacts/raw").?.object.get("sha256").?.string },
+            .vhd = .{ .size = @as(u64, 66 * 1024 * 1024 + 512), .sha256 = members.object.get("artifacts/vhd").?.object.get("sha256").?.string },
+            .footer_sha256 = footer_hash,
+            .packaging = .{
+                .architecture = "x86_64",
+                .@"boot-file-sha256" = image.files.@"wamr_hyperv-x86_64-efi",
+                .@"boot-path" = "EFI/BOOT/BOOTX64.EFI",
+                .contract = "miz.efi-application-image",
+                .@"esp-length" = 64 * 1024 * 1024,
+                .@"esp-offset" = 1024 * 1024,
+                .@"file-size" = 66 * 1024 * 1024 + 512,
+                .format = "vhd",
+                .generation = 2,
+                .@"schema-version" = 1,
+                .subformat = "fixed",
+                .valid = true,
+                .@"virtual-size" = 66 * 1024 * 1024,
+            },
+        },
+    });
+    for ([_]struct { name: []const u8, value: []const u8 }{
+        .{ .name = "build-start.json", .value = start },
+        .{ .name = "build.json", .value = built },
+        .{ .name = "boot-inputs.json", .value = boot_inputs },
+        .{ .name = "package.json", .value = package },
+    }) |item| {
+        const path = try std.fmt.allocPrint(a, "evidence/{s}", .{item.name});
+        const descriptor = try fixtureMember(a, io, root, &members, path, item.value);
+        try record_hashes.object.put(a, item.name, descriptor.object.get("sha256").?);
+        const role: []const u8 = if (std.mem.eql(u8, item.name, "build.json"))
+            "build"
+        else
+            item.name[0 .. item.name.len - ".json".len];
+        const copy_path = try std.fmt.allocPrint(a, "artifacts/{s}", .{if (std.mem.eql(u8, role, "build-start"))
+            "build_start"
+        else if (std.mem.eql(u8, role, "boot-inputs"))
+            "boot_inputs"
+        else
+            role});
+        _ = try fixtureMember(a, io, root, &members, copy_path, item.value);
+    }
+    for ([_][]const u8{
+        "adapter", "local-boot-tool", "fixtures",        "prepare",    "config",          "native-image",
+        "package", "raw-x2apic",      "raw-legacy-apic", "vpc-x2apic", "vpc-legacy-apic", "inspect",
+    }) |stage| {
+        const filename = try std.fmt.allocPrint(a, "command-{s}.json", .{stage});
+        const bytes = try fixtureCanonical(a, .{
+            .scope = "command_diagnostic_not_acceptance",
+            .stage = stage,
+            .exit_code = @as(u8, 0),
+            .bytes = @as(u8, 0),
+            .sha256 = empty_hash,
+            .over_limit = false,
+            .known_error_markers = &[_][]const u8{},
+        });
+        const path = try std.fmt.allocPrint(a, "evidence/{s}", .{filename});
+        const descriptor = try fixtureMember(a, io, root, &members, path, bytes);
+        try record_hashes.object.put(a, filename, descriptor.object.get("sha256").?);
+    }
+    var boots = std.json.Value{ .array = std.array_list.Managed(std.json.Value).init(a) };
+    const compute_json = try std.fmt.allocPrint(
+        a,
+        "{{\"version\":1,\"workload\":\"tiny\",\"wamr_revision\":\"{s}\",\"wasm_sha256\":\"{s}\",\"cwasm_sha256\":\"{s}\",\"runtime_sha256\":\"{s}\",\"platform_status\":0,\"checks\":2,\"answer\":42,\"terminal\":1,\"detail\":2,\"reserved_bytes\":0,\"frame_bytes\":0,\"accessible_bytes\":0,\"allocation_bytes\":0,\"system_page_table_bytes\":4096,\"error_name\":\"\"}}",
+        .{ wamr_revision, identity.files.@"tiny.wasm", identity.files.@"tiny.cwasm", identity.files.@"libwamr-aot.a" },
+    );
+    const compute_value = try std.json.parseFromSliceLeaky(std.json.Value, a, compute_json, .{});
+    for (controller.profile.legacy_modes) |mode| {
+        const mode_name = @tagName(mode);
+        const serial = try std.fmt.allocPrint(
+            a,
+            "Hyper-V Hv#1 hypercall page enabled\nHyper-V SynIC:\nPowered by\n{s}Calling main(0, 0)\nWAMR_NATIVE_COMPUTE={s}\nWAMR_NATIVE_AOT_OK answer=42 teardown=0\n[    1.000001] Info: [libukboot] main returned 0\n",
+            .{ if (mode.legacyApic()) "Using legacy xAPIC MMIO\n" else "", compute_json },
+        );
+        const serial_path = try std.fmt.allocPrint(a, "boots/{s}/serial", .{mode_name});
+        const serial_item = try fixtureMember(a, io, root, &members, serial_path, serial);
+        const image_role: []const u8 = if (std.mem.startsWith(u8, mode_name, "raw-")) "raw" else "vhd";
+        const image_pin = members.object.get(try std.fmt.allocPrint(a, "artifacts/{s}", .{image_role})).?;
+        const image_hash = try core.contracts.parseSha256(image_pin.object.get("sha256").?.string);
+        const empty_digest = try core.contracts.parseSha256(&empty_hash);
+        const pins = [_]struct { size: u64, sha256: [32]u8 }{
+            .{ .size = if (std.mem.eql(u8, image_role, "raw")) 66 * 1024 * 1024 else 66 * 1024 * 1024 + 512, .sha256 = image_hash },
+            .{ .size = 1, .sha256 = empty_digest },
+            .{ .size = 1, .sha256 = empty_digest },
+            .{ .size = 1, .sha256 = empty_digest },
+        };
+        const request = try fixtureCanonical(a, .{
+            .schema_version = @as(u8, 1),
+            .supervisor_pid = @as(u32, 1234),
+            .config = try controller.boot_pipeline.expectedModeConfig(
+                a,
+                mode,
+                if (std.mem.startsWith(u8, mode_name, "raw-"))
+                    "/d/wamr-ci/wamr-native-runtime/compute/package/unikraft.raw"
+                else
+                    "/d/wamr-ci/wamr-native-runtime/compute/package/unikraft.vhd",
+                "/d/wamr-ci/wamr-native-runtime/firmware/code.fd",
+                "/d/wamr-ci/wamr-native-runtime/firmware/vars.fd",
+                "/d/wamr-ci/wamr-native-runtime/bin/qemu-system-x86_64",
+                try std.fmt.allocPrint(a, "/d/wamr-ci/wamr-native-runtime/compute/boot-{s}", .{mode_name}),
+            ),
+            .pins = pins,
+        });
+        const report = try fixtureCanonical(a, .{
+            .scope = "public_local_qemu_only",
+            .acceptance = "not_established",
+            .schema_version = @as(u8, 1),
+            .passed = true,
+            .consumed = true,
+            .cleanup_complete = true,
+            .input_unchanged = true,
+            .serial_valid = true,
+            .serial_limit_reached = false,
+            .termination = .{ .exited = @as(u8, 0) },
+            .failures = .{ .primary = @as(?[]const u8, null), .cleanup = @as(?[]const u8, null), .recording = @as(?[]const u8, null) },
+            .serial_bytes = serial_item.object.get("size").?,
+            .serial_sha256 = serial_item.object.get("sha256").?,
+        });
+        const request_item = try fixtureMember(a, io, root, &members, try std.fmt.allocPrint(a, "boots/{s}/request", .{mode_name}), request);
+        const report_item = try fixtureMember(a, io, root, &members, try std.fmt.allocPrint(a, "boots/{s}/report", .{mode_name}), report);
+        const pins_value = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, pins, .{}), .{});
+        const report_value = try std.json.parseFromSliceLeaky(std.json.Value, a, report, .{});
+        const evidence = try fixtureCanonical(a, .{
+            .scope = "local_native_compute_only",
+            .report = report_value,
+            .input_pins = pins_value,
+            .request_sha256 = request_item.object.get("sha256").?,
+            .report_sha256 = report_item.object.get("sha256").?,
+            .compute = compute_value,
+        });
+        const filename = try std.fmt.allocPrint(a, "{s}-compute.json", .{mode_name});
+        const evidence_item = try fixtureMember(a, io, root, &members, try std.fmt.allocPrint(a, "evidence/{s}", .{filename}), evidence);
+        try record_hashes.object.put(a, filename, evidence_item.object.get("sha256").?);
+        const compute_item = try fixtureMember(a, io, root, &members, try std.fmt.allocPrint(a, "boots/{s}/compute", .{mode_name}), evidence);
+        const boot = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{
+            .mode = mode_name,
+            .serial = serial_item,
+            .request = request_item,
+            .report = report_item,
+            .compute = compute_item,
+        }, .{}), .{});
+        try boots.array.append(boot);
+    }
+    const result = try fixtureCanonical(a, .{
+        .schema_version = @as(u8, 1),
+        .scope = "local_native_compute_only",
+        .passed = true,
+        .hardware_acceptance = "not_established",
+        .cloud_authority = "not_admitted",
+        .benchmark = "not_measured",
+        .workload = "tiny",
+        .modes = &[_][]const u8{
+            "raw-x2apic", "raw-legacy-apic", "vpc-x2apic", "vpc-legacy-apic",
+        },
+        .records = record_hashes,
+    });
+    _ = try fixtureMember(a, io, root, &members, "artifacts/local_result", result);
+    const artifact_names = [_][]const u8{
+        "efi",         "debug_elf", "bootinfo",         "raw",            "vhd",          "runtime", "compiler", "wasm",
+        "cwasm",       "config",    "runtime_identity", "image_identity", "local_result", "package", "build",    "build_start",
+        "boot_inputs",
+    };
+    var artifacts = std.json.Value{ .array = std.array_list.Managed(std.json.Value).init(a) };
+    for (artifact_names) |role|
+        try artifacts.array.append(try fixtureItem(a, members, try std.fmt.allocPrint(a, "artifacts/{s}", .{role})));
+    var evidence = std.json.Value{ .array = std.array_list.Managed(std.json.Value).init(a) };
+    const sorted = try a.dupe([]const u8, record_hashes.object.keys());
+    std.mem.sort([]const u8, sorted, {}, struct {
+        fn less(_: void, first: []const u8, second: []const u8) bool {
+            return std.mem.lessThan(u8, first, second);
+        }
+    }.less);
+    for (sorted) |entry|
+        try evidence.array.append(try fixtureItem(a, members, try std.fmt.allocPrint(a, "evidence/{s}", .{entry})));
+    const context = .{
+        .repository = "cataggar/unikraft",
+        .run_id = "1",
+        .run_attempt = "1",
+        .source_revision = source.revision,
+        .source_tree = source.tree,
+        .wamr_revision = wamr_revision,
+    };
+    try writeFixtureFile(io, root, "portable-bundle.json", try fixtureCanonical(a, .{
+        .schema = "uk.wamr.local-image-handoff",
+        .version = @as(u8, 1),
+        .authority = "not_admitted",
+        .source_revision = source.revision,
+        .source_tree = source.tree,
+        .identity = .{
+            .wamr_revision = wamr_revision,
+            .wasm_sha256 = identity.files.@"tiny.wasm",
+            .cwasm_sha256 = identity.files.@"tiny.cwasm",
+            .runtime_sha256 = identity.files.@"libwamr-aot.a",
+            .compiler_sha256 = identity.files.wamrc,
+            .config_sha256 = image.solved_config_sha256,
+        },
+        .artifacts = artifacts,
+        .boots = boots,
+        .evidence = evidence,
+    }));
+    try writeFixtureFile(io, root, "public-source.json", try fixtureCanonical(a, .{
+        .schema = "uk.wamr.public-source-bundle",
+        .version = @as(u8, 1),
+        .authority = "not_admitted",
+        .source = context,
+        .members = members,
+    }));
+    const directory = try core.private_files.Directory.open(io, stage_root_path);
+    defer directory.close(io);
+    var accepted = try controller.accepted_run.openImportedStage(a, io, &directory, stage_root_path);
+    defer accepted.deinit();
+    try accepted.revalidate();
+    const handoff = try accepted.handoffV1();
+    try std.testing.expect(std.mem.indexOf(u8, handoff, "\"context\":\"trusted-inner-zip\"") != null);
+    try std.testing.expectEqual(@as(usize, 20), accepted.records.len);
+    const cli_success = try std.process.run(a, io, .{
+        .argv = &.{ options.host_controller_cli, "records", "--stage-root", stage_root_path, "--transport", "trusted-inner-zip", "--output", "handoff-v1" },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(2 * 1024 * 1024),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, cli_success.term);
+    try std.testing.expectEqualStrings(handoff, cli_success.stdout);
+    try root.createDir(io, "boots/unexpected", .fromMode(0o700));
+    try std.testing.expectError(error.InvalidImportedBundle, accepted.revalidate());
+    try root.deleteDir(io, "boots/unexpected");
+    try writeFixtureFile(io, root, "evidence/extra.json", "{}\n");
+    try std.testing.expectError(error.UnexpectedImportedFile, accepted.revalidate());
+    try root.deleteFile(io, "evidence/extra.json");
+    const serial_path = try std.fmt.allocPrint(a, "boots/{s}/serial", .{@tagName(controller.profile.legacy_modes[0])});
+    const changed = try root.openFile(io, serial_path, .{ .mode = .read_write, .follow_symlinks = false });
+    try changed.writePositionalAll(io, "!", 0);
+    changed.close(io);
+    try std.testing.expectError(error.EvidenceChanged, accepted.revalidate());
+    try std.testing.expectError(error.BootChanged, accepted.pinBoot(.@"raw-x2apic", .serial));
+    const cli_refusal = try std.process.run(a, io, .{
+        .argv = &.{ options.host_controller_cli, "records", "--stage-root", stage_root_path, "--transport", "trusted-inner-zip", "--output", "handoff-v1" },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(256),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, cli_refusal.term);
+    try std.testing.expectEqualStrings("", cli_refusal.stdout);
 }
 
 test "v1 and v2 frozen result evidence sets reject rehashed fields" {
@@ -1162,8 +1758,7 @@ test "native clean Git custody, stable physical identities and pinned archive re
         options.git_executable,
         captured.revision,
         1024,
-    )) |_| return error.OversizedArchiveAccepted else |err|
-        try std.testing.expect(err == error.GitExited or err == error.GitOutputOverflow);
+    )) |_| return error.OversizedArchiveAccepted else |err| try std.testing.expect(err == error.GitExited or err == error.GitOutputOverflow);
     const limited_archive = try std.fs.path.join(allocator, &.{ limited_path, "custody/wamr-source.tar" });
     defer allocator.free(limited_archive);
     try std.testing.expect((try controller.custody_files.readFile(io, limited_archive, 1024, true)).bytes <= 1024);

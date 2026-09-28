@@ -12,6 +12,7 @@ const physical = @import("custody_files.zig");
 const dependencies = @import("dependency_custody.zig");
 const records = @import("records.zig");
 const profile = @import("profile.zig");
+const log_validator = @import("wamr_log_validator");
 
 const Value = std.json.Value;
 const mib = 1024 * 1024;
@@ -19,8 +20,8 @@ const efi_name = "wamr_hyperv-x86_64-efi";
 const marker = "WAMR_NATIVE_AOT_OK answer=42 teardown=0";
 const legacy_marker = "Using legacy xAPIC MMIO";
 const forbidden = [_][]const u8{
-    "HYPERV_ACCEPTANCE", "UK_HYPERV_IO_READY", "UK_HYPERV_NETWORK_APP_READY",
-    "UK_HYPERV_PLATFORM_READY", "WAMR_NATIVE_WASI=", "WAMR_NATIVE_AOT_FAIL",
+    "HYPERV_ACCEPTANCE",        "UK_HYPERV_IO_READY", "UK_HYPERV_NETWORK_APP_READY",
+    "UK_HYPERV_PLATFORM_READY", "WAMR_NATIVE_WASI=",  "WAMR_NATIVE_AOT_FAIL",
 };
 
 pub const Context = struct {
@@ -104,7 +105,9 @@ pub const Context = struct {
         defer directory.close(self.io());
         if (std.mem.eql(u8, name, "result.json")) try self.requireExactEvidenceIn(directory);
         const file = try directory.createFile(self.io(), name, .{
-            .exclusive = true, .read = true, .permissions = .fromMode(0o600),
+            .exclusive = true,
+            .read = true,
+            .permissions = .fromMode(0o600),
         });
         defer file.close(self.io());
         try file.writeStreamingAll(self.io(), encoded);
@@ -119,14 +122,19 @@ pub const Context = struct {
         var buffer = try files.readSensitiveFile(self.io(), self.allocator(), retained.file, limit, if (private) .private else .artifact);
         defer buffer.deinit();
         const document = try contracts.Document.parse(self.allocator(), buffer.bytes(), .{
-            .bytes = @min(limit, records.max_record_bytes), .depth = 32, .items = 4096, .tokens = 65536,
+            .bytes = @min(limit, records.max_record_bytes),
+            .depth = 32,
+            .items = 4096,
+            .tokens = 65536,
         });
         defer document.deinit();
         try document.requireCanonical(self.allocator(), buffer.bytes());
         try retained.verify(self.io());
         return std.json.parseFromSliceLeaky(Value, self.allocator(), buffer.bytes(), .{
-            .duplicate_field_behavior = .@"error", .allocate = .alloc_always,
-            .parse_numbers = false, .max_value_len = 4096,
+            .duplicate_field_behavior = .@"error",
+            .allocate = .alloc_always,
+            .parse_numbers = false,
+            .max_value_len = 4096,
         });
     }
 
@@ -236,7 +244,8 @@ pub fn admit(context: *Context) !HostAdmitted {
     try context.cancelled();
     if (builtin.cpu.arch != .x86_64) return error.KvmUnavailable;
     const device = std.Io.Dir.openFileAbsolute(context.io(), "/dev/kvm", .{
-        .mode = .read_write, .follow_symlinks = false,
+        .mode = .read_write,
+        .follow_symlinks = false,
     }) catch return error.KvmUnavailable;
     defer device.close(context.io());
     const info = try files.snapshot(device);
@@ -246,18 +255,13 @@ pub fn admit(context: *Context) !HostAdmitted {
     const work = try files.Directory.open(context.io(), context.build_context.compute);
     defer work.close(context.io());
     try build.loadAccepted(context.build_context);
-    for ([_][]const u8{ "package", "public-source", "boot-raw-x2apic",
-        "boot-raw-legacy-apic", "boot-qcow2-x2apic", "boot-qcow2-legacy-apic",
-        "boot-vpc-x2apic", "boot-vpc-legacy-apic" }) |name| {
+    for ([_][]const u8{ "package", "public-source", "boot-raw-x2apic", "boot-raw-legacy-apic", "boot-qcow2-x2apic", "boot-qcow2-legacy-apic", "boot-vpc-x2apic", "boot-vpc-legacy-apic" }) |name| {
         const slot = try files.Directory.open(context.io(), try context.path(name));
         defer slot.close(context.io());
         var iterator = slot.dir.iterate();
         if (try iterator.next(context.io()) != null) return error.PriorOutput;
     }
-    for ([_][]const u8{ "build-start.json", "build.json",
-        "command-adapter.json", "command-local-boot-tool.json",
-        "command-fixtures.json", "command-prepare.json",
-        "command-config.json", "command-native-image.json" }) |name|
+    for ([_][]const u8{ "build-start.json", "build.json", "command-adapter.json", "command-local-boot-tool.json", "command-fixtures.json", "command-prepare.json", "command-config.json", "command-native-image.json" }) |name|
         try context.pin(name);
     try context.base();
     return .{ .context = context };
@@ -267,6 +271,13 @@ pub fn bindInputs(state: HostAdmitted) !BootInputsBound {
     const ctx = state.context;
     ctx.build_context.failed_stage = "boot-input-record";
     try ctx.base();
+    try captureBootInputs(ctx);
+    try ctx.publish("boot-inputs.json", try readValueFromCustody(ctx));
+    try ctx.base();
+    return advance(state, BootInputsBound);
+}
+
+fn captureBootInputs(ctx: *Context) !void {
     const a = ctx.allocator();
     const roots = &ctx.build_context.roots;
     roots.package_tool = try ctx.path("tools/bin/wamr-ci-package");
@@ -299,7 +310,8 @@ pub fn bindInputs(state: HostAdmitted) !BootInputsBound {
                 break;
             };
             if (!found) try bound.append(a, .{
-                .role = try std.fmt.allocPrint(a, "runtime:{s}", .{path_name}), .path = path_name,
+                .role = try std.fmt.allocPrint(a, "runtime:{s}", .{path_name}),
+                .path = path_name,
             });
         }
     }
@@ -307,9 +319,6 @@ pub fn bindInputs(state: HostAdmitted) !BootInputsBound {
     const qemu_data = try std.fs.path.join(a, &.{ ctx.build_context.runtime, "bin/share" });
     ctx.tree_bindings = try a.dupe(inputs.Binding, &.{.{ .role = "qemu-data", .path = qemu_data }});
     ctx.boot_inputs = try inputs.capture(a, ctx.io(), ctx.file_bindings, ctx.tree_bindings);
-    try ctx.publish("boot-inputs.json", try readValueFromCustody(ctx));
-    try ctx.base();
-    return advance(state, BootInputsBound);
 }
 
 fn readValueFromCustody(ctx: *Context) !Value {
@@ -332,10 +341,13 @@ fn runStage(ctx: *Context, stage: plan.Stage, private_record: bool) !Value {
     const record_dir = try files.openDirectory(ctx.io(), slot, .private);
     defer record_dir.close(ctx.io());
     const outcome = try adapter.execute(ctx.allocator(), ctx.io(), .{
-        .roots = ctx.build_context.roots, .stage = stage,
-        .private_dir = log_dir, .evidence_dir = record_dir,
+        .roots = ctx.build_context.roots,
+        .stage = stage,
+        .private_dir = log_dir,
+        .evidence_dir = record_dir,
         .cancel = ctx.build_context.signal.flag(),
-        .capture_stdout = true, .private_record = private_record,
+        .capture_stdout = true,
+        .private_record = private_record,
     });
     if (outcome.poisoned) return error.CleanupPoisoned;
     if (!outcome.accepted) return error.StageRefused;
@@ -348,7 +360,9 @@ fn runStage(ctx: *Context, stage: plan.Stage, private_record: bool) !Value {
         return error.InvalidStageOutput;
     const document = try contracts.Document.parse(ctx.allocator(), outcome.stdout, .{
         .bytes = if (is_validator) 64 * 1024 else 64 * 1024,
-        .depth = 32, .items = 4096, .tokens = 65536,
+        .depth = 32,
+        .items = 4096,
+        .tokens = 65536,
     });
     defer document.deinit();
     try document.requireCanonical(ctx.allocator(), outcome.stdout);
@@ -370,8 +384,7 @@ fn recordPackage(ctx: *Context, observed: Value) !void {
     try sameText(try field(observed, "acceptance"), "not_established");
     const image = try field(observed, "image");
     const boot_inputs = try ctx.readEvidence("boot-inputs.json");
-    try sameText(try field(observed, "producer_sha256"),
-        try text(try field(try field(try field(boot_inputs, "files"), "package_tool"), "sha256")));
+    try sameText(try field(observed, "producer_sha256"), try text(try field(try field(try field(boot_inputs, "files"), "package_tool"), "sha256")));
     _ = try matchFile(ctx, ctx.build_context.roots.efi, try field(image, "efi"), 64 * mib, false);
     _ = try matchFile(ctx, try ctx.path("package/unikraft.raw"), try field(image, "raw"), 66 * mib, true);
     _ = try matchFile(ctx, try ctx.path("package/unikraft.vhd"), try field(image, "vhd"), 66 * mib + 512, true);
@@ -395,7 +408,10 @@ fn recordPackage(ctx: *Context, observed: Value) !void {
 
 pub fn parseValidator(a: std.mem.Allocator, raw: []const u8, expected_bytes: u64, expected_sha256: []const u8) !Value {
     const document = try contracts.Document.parse(a, raw, .{
-        .bytes = 64 * 1024, .depth = 32, .items = 4096, .tokens = 65536,
+        .bytes = 64 * 1024,
+        .depth = 32,
+        .items = 4096,
+        .tokens = 65536,
     });
     defer document.deinit();
     try document.requireCanonical(a, raw);
@@ -414,6 +430,27 @@ pub fn parseValidator(a: std.mem.Allocator, raw: []const u8, expected_bytes: u64
 
 fn modeConfig(ctx: *Context, mode: profile.Mode) !Value {
     const a = ctx.allocator();
+    const roots = ctx.build_context.roots;
+    return expectedModeConfig(
+        a,
+        mode,
+        try ctx.path(try std.fmt.allocPrint(a, "package/{s}", .{plan.bootImage(mode)})),
+        roots.ovmf_code,
+        roots.ovmf_vars,
+        roots.qemu,
+        try ctx.path(try std.fmt.allocPrint(a, "boot-{s}", .{@tagName(mode)})),
+    );
+}
+
+pub fn expectedModeConfig(
+    a: std.mem.Allocator,
+    mode: profile.Mode,
+    source_path: []const u8,
+    ovmf_code: []const u8,
+    ovmf_vars: []const u8,
+    qemu: []const u8,
+    work_dir: []const u8,
+) !Value {
     var prohibited: std.ArrayList([]const u8) = .empty;
     try prohibited.appendSlice(a, &forbidden);
     if (!mode.legacyApic()) try prohibited.append(a, legacy_marker);
@@ -422,16 +459,19 @@ fn modeConfig(ctx: *Context, mode: profile.Mode) !Value {
         .@"qcow2-x2apic", .@"qcow2-legacy-apic" => "qcow2",
         .@"vpc-x2apic", .@"vpc-legacy-apic" => "fixed_vhd",
     };
-    const roots = ctx.build_context.roots;
-    const source_path = try ctx.path(try std.fmt.allocPrint(a, "package/{s}", .{plan.bootImage(mode)}));
     return typed(a, .{
         .source = .{ .kind = kind, .path = source_path },
-        .ovmf_code = roots.ovmf_code, .ovmf_vars = roots.ovmf_vars, .qemu = roots.qemu,
-        .work_dir = try ctx.path(try std.fmt.allocPrint(a, "boot-{s}", .{@tagName(mode)})),
-        .expect = marker, .expect_main_return = @as(i32, 0),
+        .ovmf_code = ovmf_code,
+        .ovmf_vars = ovmf_vars,
+        .qemu = qemu,
+        .work_dir = work_dir,
+        .expect = marker,
+        .expect_main_return = @as(i32, 0),
         .required = if (mode.legacyApic()) &[_][]const u8{legacy_marker} else &[_][]const u8{},
-        .forbidden = prohibited.items, .cpus = @as(u8, 1),
-        .disable_x2apic = mode.legacyApic(), .timeout_ms = @as(u32, 60_000),
+        .forbidden = prohibited.items,
+        .cpus = @as(u8, 1),
+        .disable_x2apic = mode.legacyApic(),
+        .timeout_ms = @as(u32, 60_000),
     });
 }
 
@@ -443,11 +483,18 @@ fn pinFor(ctx: *Context, path_name: []const u8) !Value {
     const stat = retained.file_snapshot;
     const sha = try contracts.parseSha256(&current.sha256);
     return typed(ctx.allocator(), .{
-        .device_major = stat.dev_major, .device_minor = stat.dev_minor,
-        .inode = stat.ino, .mode = stat.mode, .uid = stat.uid, .gid = stat.gid,
-        .nlink = stat.nlink, .size = stat.size,
-        .mtime_seconds = stat.mtime.sec, .mtime_nanoseconds = stat.mtime.nsec,
-        .ctime_seconds = stat.ctime.sec, .ctime_nanoseconds = stat.ctime.nsec,
+        .device_major = stat.dev_major,
+        .device_minor = stat.dev_minor,
+        .inode = stat.ino,
+        .mode = stat.mode,
+        .uid = stat.uid,
+        .gid = stat.gid,
+        .nlink = stat.nlink,
+        .size = stat.size,
+        .mtime_seconds = stat.mtime.sec,
+        .mtime_nanoseconds = stat.mtime.nsec,
+        .ctime_seconds = stat.ctime.sec,
+        .ctime_nanoseconds = stat.ctime.nsec,
         .sha256 = sha,
     });
 }
@@ -506,7 +553,8 @@ fn checkBoot(ctx: *Context, index: usize) !CheckedBoot {
     const req = try physical.readFile(ctx.io(), request_path, 64 * 1024, true);
     const rep = try physical.readFile(ctx.io(), report_path, 64 * 1024, true);
     return .{
-        .report = report, .pins = pins,
+        .report = report,
+        .pins = pins,
         .request_sha256 = try a.dupe(u8, &req.sha256),
         .report_sha256 = try a.dupe(u8, &rep.sha256),
         .serial_sha256 = try a.dupe(u8, &serial.sha256),
@@ -517,8 +565,10 @@ fn checkBoot(ctx: *Context, index: usize) !CheckedBoot {
 fn summary(ctx: *Context, index: usize, checked: CheckedBoot) !Value {
     const name = try std.fmt.allocPrint(ctx.allocator(), "{s}-compute.json", .{@tagName(profile.production_modes[index])});
     return typed(ctx.allocator(), .{
-        .request_sha256 = checked.request_sha256, .report_sha256 = checked.report_sha256,
-        .serial_sha256 = checked.serial_sha256, .compute_sha256 = try ctx.hash(name),
+        .request_sha256 = checked.request_sha256,
+        .report_sha256 = checked.report_sha256,
+        .serial_sha256 = checked.serial_sha256,
+        .compute_sha256 = try ctx.hash(name),
     });
 }
 
@@ -530,8 +580,7 @@ fn requireModeImage(ctx: *Context, index: usize) !void {
         try field(ctx.finalization orelse return error.MissingFinalization, "output")
     else
         try field(ctx.derivation orelse return error.MissingDerivation, "output");
-    _ = try matchFile(ctx, try ctx.path(try std.fmt.allocPrint(ctx.allocator(), "package/{s}", .{plan.bootImage(mode)})),
-        expected, 66 * mib + 512, true);
+    _ = try matchFile(ctx, try ctx.path(try std.fmt.allocPrint(ctx.allocator(), "package/{s}", .{plan.bootImage(mode)})), expected, 66 * mib + 512, true);
 }
 
 fn verifyMode(ctx: *Context, index: usize) !Value {
@@ -545,15 +594,26 @@ fn verifyMode(ctx: *Context, index: usize) !Value {
     try sameText(try field(evidence, "request_sha256"), checked.request_sha256);
     try sameText(try field(evidence, "report_sha256"), checked.report_sha256);
     if (try field(evidence, "compute") != .object) return error.InvalidComputeEvidence;
+    const serial = try ctx.path(try std.fmt.allocPrint(ctx.allocator(), "boot-{s}/hyperv-efi-boot.log", .{@tagName(mode)}));
+    var checked_serial = try log_validator.validate(ctx.allocator(), ctx.io(), serial, ctx.build_context.roots.identity, .{ .tiny = if (mode.legacyApic()) .required else .forbidden });
+    defer checked_serial.deinit();
+    const hash = std.fmt.bytesToHex(checked_serial.raw_serial_sha256, .lower);
+    if (checked_serial.raw_serial_bytes != checked.serial_bytes or
+        !std.mem.eql(u8, &hash, checked.serial_sha256))
+        return error.SerialChanged;
+    try sameJson(ctx.allocator(), try field(evidence, "compute"), try typed(ctx.allocator(), checked_serial.compute orelse return error.InvalidComputeEvidence));
     try requireModeImage(ctx, index);
     return summary(ctx, index, checked);
 }
 
 fn publishCheckedMode(ctx: *Context, index: usize, checked: CheckedBoot, compute: Value) !void {
     const evidence = try typed(ctx.allocator(), .{
-        .scope = "local_native_compute_only", .report = checked.report,
-        .input_pins = checked.pins, .request_sha256 = checked.request_sha256,
-        .report_sha256 = checked.report_sha256, .compute = compute,
+        .scope = "local_native_compute_only",
+        .report = checked.report,
+        .input_pins = checked.pins,
+        .request_sha256 = checked.request_sha256,
+        .report_sha256 = checked.report_sha256,
+        .compute = compute,
     });
     try publishMode(ctx, index, evidence);
     ctx.boots[index] = try verifyMode(ctx, index);
@@ -605,7 +665,7 @@ pub fn rawLegacy(state: RawX2Validated) !RawLegacyValidated {
     return advance(state, RawLegacyValidated);
 }
 
-const compute_limits = .{
+pub const compute_limits = .{
     .max_input_bytes = 66 * mib,
     .max_output_bytes = 66 * mib + 512,
     .max_virtual_bytes = 66 * mib,
@@ -639,12 +699,15 @@ fn publishQcow2Intent(ctx: *Context) !void {
     if (raw_file.bytes != try number(u64, try field(raw, "size"))) return error.RawImageChanged;
     try ctx.publish("qcow2-finalization-intent.json", .{
         .schema = "uk.wamr.compute-qcow2-finalization-intent",
-        .schema_version = @as(u8, 1), .source_path = try ctx.path("package/unikraft.raw"),
+        .schema_version = @as(u8, 1),
+        .source_path = try ctx.path("package/unikraft.raw"),
         .expected_source_sha256 = try text(try field(raw, "sha256")),
-        .expected_source_bytes = raw_file.bytes, .expected_virtual_bytes = raw_file.bytes,
+        .expected_source_bytes = raw_file.bytes,
+        .expected_virtual_bytes = raw_file.bytes,
         .expected_workload_sha256 = try text(try field(efi, "sha256")),
         .expected_workload_bytes = try number(u64, try field(efi, "size")),
-        .timeout_ms = 120_000, .limits = compute_limits,
+        .timeout_ms = 120_000,
+        .limits = compute_limits,
     });
 }
 
@@ -655,8 +718,8 @@ fn packageProducer(ctx: *Context) ![]const u8 {
 
 fn checkFinalize(ctx: *Context, value: Value) !void {
     _ = try contracts.exactFields(value, &.{
-        "schema", "schema_version", "status", "source_sha256", "source_bytes",
-        "output", "identity", "profile", "limits", "provenance",
+        "schema", "schema_version", "status",  "source_sha256", "source_bytes",
+        "output", "identity",       "profile", "limits",        "provenance",
     });
     try sameText(try field(value, "schema"), "uk.wamr.compute-qcow2-finalization");
     try sameText(try field(value, "status"), "succeeded");
@@ -679,11 +742,19 @@ fn checkFinalize(ctx: *Context, value: Value) !void {
     if (try number(u64, try field(identity, "workload_bytes")) != try number(u64, try field(efi, "size")))
         return error.InvalidQcow2;
     const expected_profile = try typed(ctx.allocator(), .{
-        .format = "qcow2", .version = 3, .cluster_bytes = 64 * 1024,
-        .compression = "zstd", .incompatible_features = 8,
-        .compatible_features = 0, .autoclear_features = 0,
-        .header_extensions = false, .extended_l2 = false, .encryption = false,
-        .snapshots = 0, .backing_file = false, .external_data_file = false,
+        .format = "qcow2",
+        .version = 3,
+        .cluster_bytes = 64 * 1024,
+        .compression = "zstd",
+        .incompatible_features = 8,
+        .compatible_features = 0,
+        .autoclear_features = 0,
+        .header_extensions = false,
+        .extended_l2 = false,
+        .encryption = false,
+        .snapshots = 0,
+        .backing_file = false,
+        .external_data_file = false,
         .standalone = true,
     });
     try sameJson(ctx.allocator(), try field(value, "profile"), expected_profile);
@@ -734,10 +805,12 @@ fn artifact(ctx: *Context, path_name: []const u8, virtual_bytes: u64) !Value {
     const stat = retained.file_snapshot;
     try retained.verify(ctx.io());
     return typed(ctx.allocator(), .{
-        .path = path_name, .sha256 = file.sha256,
+        .path = path_name,
+        .sha256 = file.sha256,
         .file_bytes = file.bytes,
         .allocated = .{ .state = "available", .bytes = stat.blocks * 512 },
-        .virtual_bytes = virtual_bytes, .metadata = file.metadata,
+        .virtual_bytes = virtual_bytes,
+        .metadata = file.metadata,
     });
 }
 
@@ -753,8 +826,7 @@ fn publishQcow2Acceptance(ctx: *Context) !void {
     try noDerived(ctx);
     try checkFinalize(ctx, ctx.finalization.?);
     const output = try field(ctx.finalization.?, "output");
-    const accepted = try artifact(ctx, try ctx.path("package/unikraft.qcow2"),
-        try number(u64, try field(output, "virtual_bytes")));
+    const accepted = try artifact(ctx, try ctx.path("package/unikraft.qcow2"), try number(u64, try field(output, "virtual_bytes")));
     try sameText(try field(accepted, "sha256"), try text(try field(output, "sha256")));
     if (try number(u64, try field(accepted, "file_bytes")) != try number(u64, try field(output, "file_bytes")))
         return error.Qcow2Changed;
@@ -763,12 +835,15 @@ fn publishQcow2Acceptance(ctx: *Context) !void {
         "raw-x2apic", "raw-legacy-apic", "qcow2-x2apic", "qcow2-legacy-apic",
     };
     try ctx.publish("qcow2-acceptance.json", .{
-        .schema = "uk.wamr.compute-qcow2-acceptance", .schema_version = @as(u8, 1),
-        .profile = "qcow2-derived-vhd", .status = "accepted",
+        .schema = "uk.wamr.compute-qcow2-acceptance",
+        .schema_version = @as(u8, 1),
+        .profile = "qcow2-derived-vhd",
+        .status = "accepted",
         .source = .{ .revision = source.revision, .tree = source.tree },
         .accepted_qcow2 = accepted,
         .finalization_sha256 = try ctx.hash("qcow2-finalization.json"),
-        .modes = modes, .boots = try collectedBoots(ctx, 4),
+        .modes = modes,
+        .boots = try collectedBoots(ctx, 4),
         .build_sha256 = try ctx.hash("build.json"),
         .boot_inputs_sha256 = try ctx.hash("boot-inputs.json"),
     });
@@ -798,7 +873,8 @@ fn publishVhdIntent(ctx: *Context) !void {
         .accepted_qcow2_sha256 = try text(try field(accepted, "sha256")),
         .expected_source_bytes = try number(u64, try field(accepted, "file_bytes")),
         .expected_capacity_bytes = try number(u64, try field(accepted, "virtual_bytes")),
-        .timeout_ms = 120_000, .limits = compute_limits,
+        .timeout_ms = 120_000,
+        .limits = compute_limits,
     });
 }
 
@@ -813,7 +889,8 @@ fn publishVhdGate(ctx: *Context) !void {
     try noDerived(ctx);
     try ctx.publish("fixed-vhd-derivation-gate.json", .{
         .schema = "uk.wamr.compute-fixed-vhd-derivation-gate",
-        .schema_version = @as(u8, 1), .profile = "qcow2-derived-vhd",
+        .schema_version = @as(u8, 1),
+        .profile = "qcow2-derived-vhd",
         .status = "accepted_qcow2_only",
         .accepted_qcow2_sha256 = try text(try field(try field(ctx.acceptance.?, "accepted_qcow2"), "sha256")),
         .qcow2_acceptance_sha256 = try ctx.hash("qcow2-acceptance.json"),
@@ -824,10 +901,10 @@ fn publishVhdGate(ctx: *Context) !void {
 
 fn checkDerivation(ctx: *Context, value: Value) !void {
     _ = try contracts.exactFields(value, &.{
-        "schema", "schema_version", "status", "accepted_qcow2",
-        "accepted_qcow2_decoded_sha256", "accepted_qcow2_profile",
-        "source_identity", "output", "output_identity", "footer",
-        "relocation", "limits", "provenance",
+        "schema",                        "schema_version",         "status",          "accepted_qcow2",
+        "accepted_qcow2_decoded_sha256", "accepted_qcow2_profile", "source_identity", "output",
+        "output_identity",               "footer",                 "relocation",      "limits",
+        "provenance",
     });
     try sameText(try field(value, "schema"), "uk.wamr.compute-fixed-vhd-derivation");
     try sameText(try field(value, "status"), "succeeded");
@@ -836,14 +913,10 @@ fn checkDerivation(ctx: *Context, value: Value) !void {
     const source = try field(value, "accepted_qcow2");
     for ([_][]const u8{ "sha256", "file_bytes", "virtual_bytes" }) |key|
         try sameJson(ctx.allocator(), try field(source, key), try field(accepted, key));
-    try sameText(try field(value, "accepted_qcow2_decoded_sha256"),
-        try text(try field(try field(try packageImage(ctx), "raw"), "sha256")));
-    try sameJson(ctx.allocator(), try field(value, "accepted_qcow2_profile"),
-        try field(ctx.finalization.?, "profile"));
-    try sameJson(ctx.allocator(), try field(value, "source_identity"),
-        try field(ctx.finalization.?, "identity"));
-    try sameJson(ctx.allocator(), try field(value, "output_identity"),
-        try field(ctx.finalization.?, "identity"));
+    try sameText(try field(value, "accepted_qcow2_decoded_sha256"), try text(try field(try field(try packageImage(ctx), "raw"), "sha256")));
+    try sameJson(ctx.allocator(), try field(value, "accepted_qcow2_profile"), try field(ctx.finalization.?, "profile"));
+    try sameJson(ctx.allocator(), try field(value, "source_identity"), try field(ctx.finalization.?, "identity"));
+    try sameJson(ctx.allocator(), try field(value, "output_identity"), try field(ctx.finalization.?, "identity"));
     try sameJson(ctx.allocator(), try field(value, "limits"), try typed(ctx.allocator(), compute_limits));
     const output = try field(value, "output");
     if (try number(u64, try field(output, "file_bytes")) != 66 * mib + 512 or
@@ -927,14 +1000,10 @@ fn inspectArtifacts(ctx: *Context) !Value {
     const derived = try field(ctx.derivation.?, "output");
     var artifacts = Value{ .object = .empty };
     for ([_]struct { name: []const u8, path_name: []const u8, identity: Value, virtual: u64 }{
-        .{ .name = "efi", .path_name = ctx.build_context.roots.efi, .identity = efi,
-            .virtual = try number(u64, try field(efi, "size")) },
-        .{ .name = "raw", .path_name = try ctx.path("package/unikraft.raw"), .identity = raw,
-            .virtual = try number(u64, try field(raw, "size")) },
-        .{ .name = "qcow2", .path_name = try ctx.path("package/unikraft.qcow2"), .identity = qcow2,
-            .virtual = try number(u64, try field(qcow2, "virtual_bytes")) },
-        .{ .name = "vhd", .path_name = try ctx.path("package/unikraft-derived.vhd"), .identity = derived,
-            .virtual = try number(u64, try field(derived, "virtual_bytes")) },
+        .{ .name = "efi", .path_name = ctx.build_context.roots.efi, .identity = efi, .virtual = try number(u64, try field(efi, "size")) },
+        .{ .name = "raw", .path_name = try ctx.path("package/unikraft.raw"), .identity = raw, .virtual = try number(u64, try field(raw, "size")) },
+        .{ .name = "qcow2", .path_name = try ctx.path("package/unikraft.qcow2"), .identity = qcow2, .virtual = try number(u64, try field(qcow2, "virtual_bytes")) },
+        .{ .name = "vhd", .path_name = try ctx.path("package/unikraft-derived.vhd"), .identity = derived, .virtual = try number(u64, try field(derived, "virtual_bytes")) },
     }) |item| {
         const observed = try artifact(ctx, item.path_name, item.virtual);
         try sameText(try field(observed, "sha256"), try text(try field(item.identity, "sha256")));
@@ -942,19 +1011,23 @@ fn inspectArtifacts(ctx: *Context) !Value {
     }
     var pin_map = Value{ .object = .empty };
     for ([_][]const u8{
-        "build-start.json", "build.json", "boot-inputs.json", "package.json",
-        "qcow2-finalization-intent.json", "qcow2-finalization.json", "qcow2-acceptance.json",
-        "fixed-vhd-derivation-intent.json", "fixed-vhd-derivation-gate.json",
-        "fixed-vhd-derivation.json",
+        "build-start.json",               "build.json",                "boot-inputs.json",      "package.json",
+        "qcow2-finalization-intent.json", "qcow2-finalization.json",   "qcow2-acceptance.json", "fixed-vhd-derivation-intent.json",
+        "fixed-vhd-derivation-gate.json", "fixed-vhd-derivation.json",
     }) |name| try pin_map.object.put(ctx.allocator(), name, .{ .string = try ctx.hash(name) });
     const source = ctx.build_context.source.?;
     var modes: [profile.production_modes.len][]const u8 = undefined;
     for (profile.production_modes, &modes) |mode, *entry| entry.* = @tagName(mode);
     return typed(ctx.allocator(), .{
-        .schema = "uk.wamr.compute-image-chain-inspection", .schema_version = @as(u8, 1),
-        .profile = "qcow2-derived-vhd", .status = "complete",
+        .schema = "uk.wamr.compute-image-chain-inspection",
+        .schema_version = @as(u8, 1),
+        .profile = "qcow2-derived-vhd",
+        .status = "complete",
         .source = .{ .revision = source.revision, .tree = source.tree },
-        .artifacts = artifacts, .records = pin_map, .modes = modes, .boots = boots,
+        .artifacts = artifacts,
+        .records = pin_map,
+        .modes = modes,
+        .boots = boots,
     });
 }
 
@@ -977,14 +1050,137 @@ fn publishAcceptedResult(ctx: *Context) !ResultPublished {
     var modes: [profile.production_modes.len][]const u8 = undefined;
     for (profile.production_modes, &modes) |mode, *entry| entry.* = @tagName(mode);
     const accepted = try typed(ctx.allocator(), .{
-        .schema_version = @as(u8, 2), .profile = "qcow2-derived-vhd",
-        .scope = "local_native_compute_only", .passed = true,
-        .hardware_acceptance = "not_established", .cloud_authority = "not_admitted",
-        .benchmark = "not_measured", .workload = "tiny", .modes = modes, .records = map,
+        .schema_version = @as(u8, 2),
+        .profile = "qcow2-derived-vhd",
+        .scope = "local_native_compute_only",
+        .passed = true,
+        .hardware_acceptance = "not_established",
+        .cloud_authority = "not_admitted",
+        .benchmark = "not_measured",
+        .workload = "tiny",
+        .modes = modes,
+        .records = map,
     });
     _ = try records.readResult(accepted);
     try ctx.publish("result.json", accepted);
     return .{ .context = ctx };
+}
+
+/// Read-only replay of the final-inspection path. A result digest alone is not
+/// acceptance: source, consumer and boot inputs, every boot transcript, image
+/// and intermediate image-chain record are checked again before returning.
+pub fn revalidateComplete(ctx: *Context, accepted: records.Result) !void {
+    if (accepted.set != .tiny_v2_qcow2_derived_vhd) return error.UnsupportedRecordSet;
+    try build.loadAccepted(ctx.build_context);
+    try captureBootInputs(ctx);
+    const recorded_inputs = try ctx.readValue(try ctx.evidencePath("boot-inputs.json"), records.max_record_bytes, true);
+    try sameJson(ctx.allocator(), recorded_inputs, try readValueFromCustody(ctx));
+    var iterator = accepted.records.iterator();
+    while (iterator.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const observed = try physical.readFile(ctx.io(), try ctx.evidencePath(name), records.max_record_bytes, true);
+        if (!std.mem.eql(u8, &observed.sha256, try text(entry.value_ptr.*)))
+            return error.RecordChanged;
+        try ctx.pinned.put(name, observed);
+    }
+    try ctx.pin("result.json");
+    try ctx.requireExactEvidence();
+    try ctx.base();
+
+    ctx.package = try ctx.readEvidence("package.json");
+    const package_record = ctx.package.?;
+    _ = try contracts.exactFields(package_record, &.{ "scope", "acceptance", "producer_sha256", "image" });
+    try sameText(try field(package_record, "scope"), "public_local_compute_packaging_only");
+    try sameText(try field(package_record, "acceptance"), "not_established");
+    try sameText(try field(package_record, "producer_sha256"), try packageProducer(ctx));
+    const image = try packageImage(ctx);
+    const efi = try field(image, "efi");
+    const raw = try field(image, "raw");
+    const vhd = try field(image, "vhd");
+    const efi_file = try matchFile(ctx, ctx.build_context.roots.efi, efi, 64 * mib, false);
+    const raw_file = try matchFile(ctx, try ctx.path("package/unikraft.raw"), raw, 66 * mib, true);
+    const vhd_file = try matchFile(ctx, try ctx.path("package/unikraft.vhd"), vhd, 66 * mib + 512, true);
+    if (efi_file.bytes != try number(u64, try field(efi, "size")) or
+        raw_file.bytes != try number(u64, try field(raw, "size")) or
+        vhd_file.bytes != try number(u64, try field(vhd, "size")))
+        return error.PackageChanged;
+
+    ctx.finalization = try ctx.readEvidence("qcow2-finalization.json");
+    try checkFinalize(ctx, ctx.finalization.?);
+    try sameJson(ctx.allocator(), ctx.finalization.?, try ctx.readValue(try ctx.path("package/qcow2-finalization.json"), 64 * 1024, true));
+    ctx.derivation = try ctx.readEvidence("fixed-vhd-derivation.json");
+    ctx.acceptance = try ctx.readEvidence("qcow2-acceptance.json");
+    try checkDerivation(ctx, ctx.derivation.?);
+    try sameJson(ctx.allocator(), ctx.derivation.?, try ctx.readValue(try ctx.path("package/fixed-vhd-derivation.json"), 64 * 1024, true));
+    for (profile.production_modes, 0..) |_, index|
+        ctx.boots[index] = try verifyMode(ctx, index);
+    try revalidateChain(ctx);
+    try sameJson(ctx.allocator(), try ctx.readEvidence("final-inspection.json"), try inspectArtifacts(ctx));
+    try ctx.base();
+    try ctx.requireExactEvidence();
+}
+
+fn revalidateChain(ctx: *Context) !void {
+    const a = ctx.allocator();
+    const raw = try field(try packageImage(ctx), "raw");
+    const efi = try field(try packageImage(ctx), "efi");
+    const source = ctx.build_context.source.?;
+    const intent = try typed(a, .{
+        .schema = "uk.wamr.compute-qcow2-finalization-intent",
+        .schema_version = @as(u8, 1),
+        .source_path = try ctx.path("package/unikraft.raw"),
+        .expected_source_sha256 = try text(try field(raw, "sha256")),
+        .expected_source_bytes = try number(u64, try field(raw, "size")),
+        .expected_virtual_bytes = try number(u64, try field(raw, "size")),
+        .expected_workload_sha256 = try text(try field(efi, "sha256")),
+        .expected_workload_bytes = try number(u64, try field(efi, "size")),
+        .timeout_ms = 120_000,
+        .limits = compute_limits,
+    });
+    try sameJson(a, intent, try ctx.readEvidence("qcow2-finalization-intent.json"));
+    const final_output = try field(ctx.finalization.?, "output");
+    const accepted_image = try artifact(ctx, try ctx.path("package/unikraft.qcow2"), try number(u64, try field(final_output, "virtual_bytes")));
+    try sameText(try field(accepted_image, "sha256"), try text(try field(final_output, "sha256")));
+    if (try number(u64, try field(accepted_image, "file_bytes")) !=
+        try number(u64, try field(final_output, "file_bytes")))
+        return error.Qcow2Changed;
+    const acceptance = try typed(a, .{
+        .schema = "uk.wamr.compute-qcow2-acceptance",
+        .schema_version = @as(u8, 1),
+        .profile = "qcow2-derived-vhd",
+        .status = "accepted",
+        .source = .{ .revision = source.revision, .tree = source.tree },
+        .accepted_qcow2 = accepted_image,
+        .finalization_sha256 = try ctx.hash("qcow2-finalization.json"),
+        .modes = [_][]const u8{ "raw-x2apic", "raw-legacy-apic", "qcow2-x2apic", "qcow2-legacy-apic" },
+        .boots = try collectedBoots(ctx, 4),
+        .build_sha256 = try ctx.hash("build.json"),
+        .boot_inputs_sha256 = try ctx.hash("boot-inputs.json"),
+    });
+    try sameJson(a, ctx.acceptance.?, acceptance);
+    const accepted_qcow2 = try field(ctx.acceptance.?, "accepted_qcow2");
+    const derivation_intent = try typed(a, .{
+        .schema = "uk.wamr.compute-fixed-vhd-derivation-intent",
+        .schema_version = @as(u8, 1),
+        .source_path = try ctx.path("package/unikraft.qcow2"),
+        .accepted_qcow2_sha256 = try text(try field(accepted_qcow2, "sha256")),
+        .expected_source_bytes = try number(u64, try field(accepted_qcow2, "file_bytes")),
+        .expected_capacity_bytes = try number(u64, try field(accepted_qcow2, "virtual_bytes")),
+        .timeout_ms = 120_000,
+        .limits = compute_limits,
+    });
+    try sameJson(a, derivation_intent, try ctx.readEvidence("fixed-vhd-derivation-intent.json"));
+    const gate = try typed(a, .{
+        .schema = "uk.wamr.compute-fixed-vhd-derivation-gate",
+        .schema_version = @as(u8, 1),
+        .profile = "qcow2-derived-vhd",
+        .status = "accepted_qcow2_only",
+        .accepted_qcow2_sha256 = try text(try field(accepted_qcow2, "sha256")),
+        .qcow2_acceptance_sha256 = try ctx.hash("qcow2-acceptance.json"),
+        .derivation_intent_sha256 = try ctx.hash("fixed-vhd-derivation-intent.json"),
+        .derived_output_absent = true,
+    });
+    try sameJson(a, gate, try ctx.readEvidence("fixed-vhd-derivation-gate.json"));
 }
 
 pub const testing = if (builtin.is_test) struct {
@@ -1155,8 +1351,7 @@ fn commandFailure(ctx: *Context, name: []const u8) !?i32 {
 
 fn configFailure(ctx: *Context, code: i32) !Value {
     const a = ctx.allocator();
-    const base = try std.fs.path.join(a, &.{ ctx.build_context.repository,
-        "support/apps/wamr-aot/build/native-environment" });
+    const base = try std.fs.path.join(a, &.{ ctx.build_context.repository, "support/apps/wamr-aot/build/native-environment" });
     const dir = try files.Directory.open(ctx.io(), base);
     defer dir.close(ctx.io());
     const name = try diagnosticName(ctx, try std.fs.path.join(a, &.{ base, "failure-error-name.txt" }), true);
@@ -1175,8 +1370,7 @@ fn configFailure(ctx: *Context, code: i32) !Value {
     const backend_path = try std.fs.path.join(a, &.{ diagnostic_path, entry.name });
     const backend_dir = try files.Directory.open(ctx.io(), backend_path);
     defer backend_dir.close(ctx.io());
-    const backend = try ctx.readValue(
-        try std.fs.path.join(a, &.{ backend_path, "000-root-olddefconfig.json" }), 64 * 1024, true);
+    const backend = try ctx.readValue(try std.fs.path.join(a, &.{ backend_path, "000-root-olddefconfig.json" }), 64 * 1024, true);
     try sameText(try field(backend, "stage"), "root-olddefconfig");
     const exit_code = try number(u8, try field(try field(backend, "primary"), "exited"));
     const raw = try diagnosticBytes(ctx, try std.fs.path.join(a, &.{
@@ -1217,7 +1411,7 @@ pub fn diagnostics(ctx: *Context) !void {
                 continue;
             }
             const flags = [_][]const u8{
-                "passed", "cleanup_complete", "input_unchanged",
+                "passed",       "cleanup_complete",     "input_unchanged",
                 "serial_valid", "serial_limit_reached",
             };
             var state = Value{ .object = .empty };
@@ -1249,7 +1443,8 @@ pub fn diagnostics(ctx: *Context) !void {
                     const log_path = try std.fs.path.join(a, &.{ work_path, "hyperv-efi-boot.log" });
                     if (physical.readFile(io, log_path, 4 * mib, true) catch null) |log| {
                         try item.object.put(a, "serial", try typed(a, .{
-                            .bytes = log.bytes, .sha256 = log.sha256,
+                            .bytes = log.bytes,
+                            .sha256 = log.sha256,
                         }));
                     }
                 }
@@ -1262,7 +1457,8 @@ pub fn diagnostics(ctx: *Context) !void {
         const log_path = try ctx.path("private/fixtures.log");
         const raw = diagnosticBytes(ctx, log_path, 64 * 1024) catch "";
         try failures.object.put(a, "fixtures", try typed(a, .{
-            .exit_code = code, .tests = try testMarkers(a, raw),
+            .exit_code = code,
+            .tests = try testMarkers(a, raw),
         }));
     }
     if (try commandFailure(ctx, "config")) |code| {
@@ -1270,8 +1466,7 @@ pub fn diagnostics(ctx: *Context) !void {
             try failures.object.put(a, "config", value);
     }
     if (try commandFailure(ctx, "native-image")) |code| {
-        const base = try std.fs.path.join(a, &.{ ctx.build_context.repository,
-            "support/apps/wamr-aot/build/native-environment" });
+        const base = try std.fs.path.join(a, &.{ ctx.build_context.repository, "support/apps/wamr-aot/build/native-environment" });
         if (diagnosticName(ctx, try std.fs.path.join(a, &.{ base, "failure-error-name.txt" }), true) catch null) |name| {
             var item = try typed(a, .{ .exit_code = code, .native_error_name_sha256 = name });
             if (diagnosticName(ctx, try std.fs.path.join(a, &.{ base, "failure-image-guard.txt" }), false) catch null) |guard|

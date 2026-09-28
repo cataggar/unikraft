@@ -72,6 +72,21 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     portable_core.addAssemblyFile(b.path("../../tools/hyperv/sha256_clear_upper.S"));
+    const portable_serial = b.createModule(.{
+        .root_source_file = b.path("../../tools/hyperv/local_boot/serial.zig"),
+        .target = portable_target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "hyperv_core", .module = portable_core }},
+    });
+    const portable_validator = b.createModule(.{
+        .root_source_file = b.path("../../apps/wamr-aot/validator/root.zig"),
+        .target = portable_target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = portable_core },
+            .{ .name = "local_boot_serial", .module = portable_serial },
+        },
+    });
     const source_closure_module = b.createModule(.{
         .root_source_file = b.path("../../controller_source_closure.zig"),
         .target = portable_target,
@@ -83,6 +98,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "hyperv_core", .module = portable_core },
+            .{ .name = "wamr_log_validator", .module = portable_validator },
             .{ .name = "controller_source_closure", .module = source_closure_module },
         },
     });
@@ -135,12 +151,28 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     });
+    const host_serial = b.createModule(.{
+        .root_source_file = b.path("../../tools/hyperv/local_boot/serial.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "hyperv_core", .module = host_core }},
+    });
+    const host_validator = b.createModule(.{
+        .root_source_file = b.path("../../apps/wamr-aot/validator/root.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = host_core },
+            .{ .name = "local_boot_serial", .module = host_serial },
+        },
+    });
     const host_controller = b.createModule(.{
         .root_source_file = b.path("controller/root.zig"),
         .target = b.graph.host,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "hyperv_core", .module = host_core },
+            .{ .name = "wamr_log_validator", .module = host_validator },
             .{ .name = "controller_source_closure", .module = host_closure },
         },
     });
@@ -192,6 +224,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     controller_tests.root_module.addOptions("test_options", controller_options);
+    controller_options.addOptionPath("host_controller_cli", host_cli.getEmittedBin());
     const fixture_host = b.addExecutable(.{
         .name = "wamr-native-ci-fixtures-host-test",
         .root_module = b.createModule(.{
@@ -302,12 +335,28 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const proof_serial = b.createModule(.{
+        .root_source_file = b.path("controller/public_image_serial.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "local_boot", .module = image.import_table.get("local_boot").? }},
+    });
+    const proof_validator = b.createModule(.{
+        .root_source_file = b.path("../../apps/wamr-aot/validator/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = image.import_table.get("hyperv_core").? },
+            .{ .name = "local_boot_serial", .module = proof_serial },
+        },
+    });
     const proof_controller = b.createModule(.{
         .root_source_file = b.path("controller/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "hyperv_core", .module = image.import_table.get("hyperv_core").? },
+            .{ .name = "wamr_log_validator", .module = proof_validator },
             .{ .name = "controller_source_closure", .module = proof_closure },
         },
     });

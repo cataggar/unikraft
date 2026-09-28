@@ -20,6 +20,34 @@ pub fn main(init: std.process.Init) void {
         stdout.interface.writeAll(encoded) catch refused(init.io);
         return;
     }
+    if (command.action == .records) {
+        const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
+        const root = command.runtime orelse command.stage_root.?;
+        const directory = controller.layout.runtime(init.io, root) catch refused(init.io);
+        defer directory.close(init.io);
+        var accepted = if (command.runtime != null)
+            controller.accepted_run.openAndValidate(
+                allocator,
+                init.io,
+                init.minimal.environ,
+                &directory,
+                root,
+                repository,
+            ) catch refused(init.io)
+        else
+            controller.accepted_run.openImportedStage(
+                allocator,
+                init.io,
+                &directory,
+                root,
+            ) catch refused(init.io);
+        defer accepted.deinit();
+        accepted.revalidate() catch refused(init.io);
+        const encoded = accepted.handoffV1() catch refused(init.io);
+        var stdout = std.Io.File.stdout().writerStreaming(init.io, &.{});
+        stdout.interface.writeAll(encoded) catch refused(init.io);
+        return;
+    }
     const runtime = controller.layout.runtime(init.io, command.runtime.?) catch refused(init.io);
     defer runtime.close(init.io);
     const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
@@ -59,6 +87,7 @@ pub fn main(init: std.process.Init) void {
             controller.boot_pipeline.diagnostics(&boot_context) catch |err| failed(init.io, "diagnostics", "", err);
         },
         .describe => unreachable,
+        .records => unreachable,
     }
 }
 
@@ -67,7 +96,9 @@ fn usage(io: std.Io) noreturn {
     stderr.interface.writeAll(
         "usage: uk-wamr-native-ci build --runtime ABS --wamr-source ABS\n" ++
             "       uk-wamr-native-ci boot|diagnostics --runtime ABS\n" ++
-            "       uk-wamr-native-ci describe --output json-v1\n",
+            "       uk-wamr-native-ci describe --output json-v1\n" ++
+            "       uk-wamr-native-ci records --runtime ABS --output handoff-v1\n" ++
+            "       uk-wamr-native-ci records --stage-root ABS --transport trusted-inner-zip --output handoff-v1\n",
     ) catch {};
     std.process.exit(2);
 }
