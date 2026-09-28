@@ -1752,6 +1752,14 @@ static int storvsc_submit(struct uk_blkdev *blkdev,
 		request->nb_sectors, (uintptr_t)request->aio_buf,
 		ukplat_monotonic_clock(), STORVSC_REQUEST_TIMEOUT_NS, &tx);
 	if (rc) {
+		if (rc == -ENOSPC)
+			uk_pr_debug(DRIVER_NAME
+				    ": controller%u relid=%"PRIu32
+				    " %u:%u:%u request pool exhausted (max %u)\n",
+				    device->index, device->vmbus_device->channel_id,
+				    lun->address.path_id, lun->address.target_id,
+				    lun->address.lun,
+				    CONFIG_LIBSTORVSC_QUEUE_DEPTH);
 		ukplat_spin_unlock_irqrestore(&device->lock, flags);
 		return rc;
 	}
@@ -3004,7 +3012,8 @@ static int storvsc_add_device(struct vmbus_device *vmbus_device)
 		if (device)
 			return rc;
 		uk_pr_err(DRIVER_NAME
-			  ": controller pool exhausted for relid=%"PRIu32"\n",
+			  ": controller pool exhausted (max %u) for relid=%"PRIu32"\n",
+			  CONFIG_LIBSTORVSC_MAX_DEVICES,
 			  vmbus_device->channel_id);
 		return -ENOSPC;
 	}

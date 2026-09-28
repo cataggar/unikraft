@@ -8,6 +8,7 @@
 #undef ukplat_monotonic_clock
 #undef vmbus_channel_send_gpa_direct_ex
 #undef vmbus_channel_close
+#include <stdarg.h>
 #include "../../vmbus/include/uk/vmbus_storage.h"
 
 int vmbus_bus_host_storage_enumeration(unsigned int stage);
@@ -26,6 +27,22 @@ static int topology_duplicate_boot;
 static int topology_corrupt_seed_copy;
 static int topology_seed_fixture;
 static unsigned int topology_seed_reads[2];
+static unsigned int pool_log_count;
+static char pool_log[256];
+
+void storage_binding_capture_log(const char *format, ...)
+{
+	char message[sizeof(pool_log)];
+	va_list args;
+
+	va_start(args, format);
+	vsnprintf(message, sizeof(message), format, args);
+	va_end(args);
+	if (strstr(message, "pool exhausted")) {
+		pool_log_count++;
+		strcpy(pool_log, message);
+	}
+}
 
 static void seeded_topology_read(
 	struct vmbus_channel *channel, const uint8_t *packet)
@@ -189,6 +206,7 @@ static int saturated_controller_requests(
 	unsigned int first = reverse ? 2 : 0;
 	unsigned int other = reverse ? 0 : 2;
 	unsigned int target;
+	unsigned int sent;
 
 	CHECK(CONFIG_LIBSTORVSC_QUEUE_DEPTH == 4);
 	atomic_init(&callbacks, 0);
@@ -203,11 +221,17 @@ static int saturated_controller_requests(
 			      &requests[i]) & UK_BLKDEV_STATUS_SUCCESS);
 	}
 	CHECK(pending_count == 4);
+	sent = discovery_sends;
 	initialize_request(&overflow, UK_BLKREQ_READ, 24, 1,
 			   buffer + 2560, NULL, NULL);
 	CHECK(disks[first]->submit_one(disks[first], disks[first]->_queue[0],
 				       &overflow) == -ENOSPC);
-	CHECK(pending_count == 4 && !storvsc_host_request_bound(&overflow));
+	CHECK(discovery_sends == sent && pending_count == 4 &&
+	      !storvsc_host_request_bound(&overflow));
+	CHECK(pool_log_count == 1 &&
+	      strstr(pool_log, reverse ?
+		     "controller0 relid=12 0:0:0 request pool exhausted (max 4)" :
+		     "controller0 relid=10 0:0:0 request pool exhausted (max 4)"));
 
 	initialize_request(&requests[4], UK_BLKREQ_READ, 25, 1,
 			   buffer + 2048, request_done, &callbacks);
@@ -259,6 +283,8 @@ static int pair(int reverse, int empty)
 		CHECK(uk_storvsc_discovery_status() == -ENOSPC);
 		CHECK(uk_storvsc_inventory_get(&inventory) == -EAGAIN);
 		CHECK(uk_storvsc_mapping_count() == (reverse && empty ? 0 : 1));
+		CHECK(pool_log_count == 1 &&
+		      strstr(pool_log, "controller pool exhausted (max 1)"));
 		return 0;
 	}
 	CHECK(!vmbus_storage_binding_status());
@@ -326,7 +352,7 @@ static int pair(int reverse, int empty)
 			      disks[i]->capabilities.ssize == 512 &&
 			      disks[i]->capabilities.mode ==
 				      (mappings[i].read_only ? O_RDONLY : O_RDWR));
-			CHECK(!activate_device(disks[i], &events[i]));
+			CHECK(!configure_device(disks[i], 4, &events[i]));
 			CHECK(!uk_storvsc_target_get(i, &targets[i]));
 			CHECK(!uk_storvsc_session_begin_read(
 				&targets[i], &sessions[i]));
@@ -451,6 +477,10 @@ static int rejected(int before_admission)
 		CHECK(vmbus_bus_host_fill_nonstorage_offers(40) == -ENOSPC);
 	rc = offer(&excess_id, 20, 7);
 	CHECK(rc == (before_admission ? -ENOSPC : 0));
+	CHECK(pool_log_count == (before_admission ? 0U : 1U));
+	if (!before_admission)
+		CHECK(strstr(pool_log,
+			     "controller pool exhausted (max 2) for relid=20"));
 	CHECK(uk_storvsc_mapping_count() == 2);
 	CHECK(uk_storvsc_inventory_get(&inventory) == -EAGAIN);
 	CHECK(uk_storvsc_discovery_status() == -ENOSPC);
@@ -538,6 +568,9 @@ static int failed_discovery(int mode)
 		CHECK(uk_storvsc_inventory_get(&inventory) == -EAGAIN);
 		CHECK(uk_storvsc_mapping_count() == 3 && nonzero &&
 		      !storvsc_host_blkdev_address(1, 7));
+		CHECK(pool_log_count == 1 &&
+		      strstr(pool_log,
+			     "controller1 relid=12 0:0:7 LUN pool exhausted (max 2)"));
 		CHECK(disk && !target_for_device(disk, &target));
 		CHECK(!uk_storvsc_session_begin_read(&target, &session));
 		CHECK(uk_storvsc_session_authorize_write(&session) == -ENOSPC);
