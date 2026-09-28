@@ -346,6 +346,10 @@ fn sameJson(a: std.mem.Allocator, first: std.json.Value, second: std.json.Value)
 }
 
 fn canonicalFile(self: *AcceptedRun, path: []const u8, limit: usize) !std.json.Value {
+    return documentFile(self, path, limit, true);
+}
+
+fn documentFile(self: *AcceptedRun, path: []const u8, limit: usize, canonical: bool) !std.json.Value {
     const a = self.allocator();
     var retained = try files.RetainedFile.open(self.io, path, .private);
     defer retained.close(self.io);
@@ -358,7 +362,7 @@ fn canonicalFile(self: *AcceptedRun, path: []const u8, limit: usize) !std.json.V
         .tokens = 65536,
     });
     defer document.deinit();
-    try document.requireCanonical(a, buffer.bytes());
+    if (canonical) try document.requireCanonical(a, buffer.bytes());
     try retained.verify(self.io);
     return std.json.parseFromSliceLeaky(std.json.Value, a, buffer.bytes(), .{
         .duplicate_field_behavior = .@"error",
@@ -912,10 +916,11 @@ fn verifyImportedEvidence(self: *AcceptedRun, portable: std.json.Value) !void {
     try compareCopy(self, "build-start.json", .build_start);
     try compareCopy(self, "boot-inputs.json", .boot_inputs);
     try compareCopy(self, "package.json", .package);
-    const identity = try canonicalFile(self, try self.artifactPath(.runtime_identity), 64 * 1024);
+    // Producer identity artifacts are not canonical JSON; archive member hashes pin their exact bytes.
+    const identity = try documentFile(self, try self.artifactPath(.runtime_identity), 64 * 1024, false);
     if (v2) try build.admitPreparedIdentity(identity);
     try sameJson(a, try get(built, "runtime"), identity);
-    const image = try canonicalFile(self, try self.artifactPath(.image_identity), 1024 * 1024);
+    const image = try documentFile(self, try self.artifactPath(.image_identity), 1024 * 1024, false);
     try sameJson(a, try get(built, "image"), image);
     for ([_]struct { name: []const u8, role: ArtifactRole }{
         .{ .name = "wamr_hyperv-x86_64-efi", .role = .efi },
@@ -1492,7 +1497,7 @@ fn verifyCustodyDocument(a: std.mem.Allocator, value: std.json.Value) !void {
 }
 
 fn evidenceHash(self: *AcceptedRun, name: []const u8) ![]const u8 {
-    for (self.records) |entry| if (std.mem.eql(u8, entry.name, name))
+    for (self.records) |*entry| if (std.mem.eql(u8, entry.name, name))
         return &entry.sha256;
     return error.MissingRecord;
 }
@@ -1605,12 +1610,12 @@ fn verifyImportedBoot(self: *AcceptedRun, mode: profile.Mode, boot_inputs: std.j
     try equal(try text(try get(compute, "request_sha256")), &request_file.sha256);
     try equal(try text(try get(compute, "report_sha256")), &report_file.sha256);
     try sameJson(a, try get(compute, "compute"), try valueOf(a, parsed.compute orelse return error.InvalidComputeEvidence));
-    return valueOf(a, .{
-        .request_sha256 = request_file.sha256,
-        .report_sha256 = report_file.sha256,
-        .serial_sha256 = raw.sha256,
-        .compute_sha256 = try evidenceHash(self, name),
-    });
+    var summary = std.json.Value{ .object = .empty };
+    try summary.object.put(a, "request_sha256", .{ .string = try a.dupe(u8, &request_file.sha256) });
+    try summary.object.put(a, "report_sha256", .{ .string = try a.dupe(u8, &report_file.sha256) });
+    try summary.object.put(a, "serial_sha256", .{ .string = try a.dupe(u8, &raw.sha256) });
+    try summary.object.put(a, "compute_sha256", .{ .string = try evidenceHash(self, name) });
+    return summary;
 }
 
 fn verifyBootPin(pin: std.json.Value, recorded: ?struct { metadata: std.json.Value, digest: []const u8 }, detailed: bool) !void {

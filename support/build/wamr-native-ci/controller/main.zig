@@ -33,17 +33,17 @@ pub fn main(init: std.process.Init) void {
                 &directory,
                 root,
                 repository,
-            ) catch refused(init.io)
+            ) catch |err| failed(init.io, "records", "", err)
         else
             controller.accepted_run.openImportedStage(
                 allocator,
                 init.io,
                 &directory,
                 root,
-            ) catch refused(init.io);
+            ) catch |err| failed(init.io, "records", "", err);
         defer accepted.deinit();
-        accepted.revalidate() catch refused(init.io);
-        const encoded = accepted.handoffV1() catch refused(init.io);
+        accepted.revalidate() catch |err| failed(init.io, "records", "", err);
+        const encoded = accepted.handoffV1() catch |err| failed(init.io, "records", "", err);
         var stdout = std.Io.File.stdout().writerStreaming(init.io, &.{});
         stdout.interface.writeAll(encoded) catch refused(init.io);
         return;
