@@ -2734,7 +2734,9 @@ def outcome_details(results, snapshots):
 
 def report_progress(side, phase):
     check(side in ("python", "native")
-          and phase in ("build-start", "build-done", "boot-start", "boot-done"),
+          and phase in (
+              "build-start", "build-done", "boot-start", "boot-done",
+              "records-start", "records-done"),
           "invalid differential progress label")
     print(f"DIFFERENTIAL_PROGRESS: {side}:{phase}", file=sys.stderr, flush=True)
 
@@ -2896,8 +2898,13 @@ def full(args):
             str(controller), "records", "--runtime", str(native_runtime),
             "--output", "handoff-v1",
         ], native_repo, executions["native"][3], seconds=600)
+        refusal = re.search(
+            r"(?m)^WAMR_CI_FAILED_STAGE: records; cause: "
+            r"([A-Za-z][A-Za-z0-9_]{0,79}); bounded private logs retained\.$",
+            result.stderr.decode("utf-8", "replace"))
         check(result.returncode == 0 and not result.stderr,
-              "native completed-run records replay refused")
+              "native completed-run records replay refused: " +
+              (refusal.group(1) if refusal else "unexpected result"))
         reference = oracle(native_repo)
         view = parsed(result.stdout, reference)
         recorded = parsed(checked_file(
