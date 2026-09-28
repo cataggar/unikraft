@@ -2926,11 +2926,6 @@ def full(args):
                 and item["path"] == str(controller)
                 for item in view["runtime_inputs"]) == 1,
             "native completed-run records differ from accepted evidence")
-        with (parent / "native-records.json").open("xb") as output:
-            os.fchmod(output.fileno(), 0o600)
-            output.write(result.stdout)
-            output.flush()
-            os.fsync(output.fileno())
         report_progress("native", "records-checked")
         script = (
             "import importlib.util,json,sys\n"
@@ -2948,6 +2943,12 @@ def full(args):
         ], native_repo, dict(
             executions["native"][3], WAMR_CI_CONTROLLER=str(controller)),
             seconds=650)
+        # The comparison root is a pinned runtime ancestor until replay ends.
+        with (parent / "native-records.json").open("xb") as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(result.stdout)
+            output.flush()
+            os.fsync(output.fileno())
         refusal = re.search(
             r"(?m)^(?:ValueError|wamr_native_ci\.Refusal): "
             r"([A-Za-z][A-Za-z0-9 _-]{0,119})$",
