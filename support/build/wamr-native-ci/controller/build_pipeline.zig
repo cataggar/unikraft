@@ -801,6 +801,16 @@ pub fn buildValue(context: *Context) !std.json.Value {
 /// Reconstruct the frozen build state from its actual source, dependency,
 /// executable and image inputs; boot never republishes build evidence.
 pub fn loadAccepted(context: *Context) !void {
+    try loadAcceptedWithBinding(context, true);
+}
+
+// Records replay checks the original controller through build-start custody,
+// but does not execute it: the separately installed verifier is not that file.
+pub fn loadAcceptedForRecords(context: *Context) !void {
+    try loadAcceptedWithBinding(context, false);
+}
+
+fn loadAcceptedWithBinding(context: *Context, require_self_binding: bool) !void {
     const a = context.allocator;
     const io = context.io;
     try cancelled(context);
@@ -823,7 +833,7 @@ pub fn loadAccepted(context: *Context) !void {
     }
     context.git = context.tools[0];
     const own = try join(context, &.{ context.runtime, "controller/bin/uk-wamr-native-ci" });
-    if (!std.mem.eql(u8, own, try std.process.executablePathAlloc(io, a)))
+    if (require_self_binding and !std.mem.eql(u8, own, try std.process.executablePathAlloc(io, a)))
         return error.UnboundController;
     context.roots = .{
         .runtime = context.runtime, .source_root = context.repository, .work = context.compute,

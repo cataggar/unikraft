@@ -242,11 +242,12 @@ jobs:
           test -x "${controller}"
           test ! -e "${output}"
           "${controller}" records --runtime "${root}" --output handoff-v1 > "${output}"
-          python3 -B - "${output}" <<'PY'
+          python3 -B - "${output}" "${root}" <<'PY'
           import json
           from pathlib import Path
           import sys
           value = json.loads(Path(sys.argv[1]).read_bytes())
+          runtime = Path(sys.argv[2])
           if (value["schema"] != "uk.wamr.native-ci-controller-records"
                   or value["schema_version"] != 1
                   or value["context"] != "local-runtime"
@@ -258,7 +259,11 @@ jobs:
                       "vpc-x2apic", "vpc-legacy-apic"]
                   or len(value["records"]) != 33
                   or len(value["artifacts"]) != 50
-                  or not value["runtime_inputs"]):
+                  or sum(
+                      item["role"] == "command-supervisor"
+                      and item["path"] == str(
+                          runtime / "controller/bin/uk-wamr-native-ci")
+                      for item in value["runtime_inputs"]) != 1):
               raise SystemExit("native record bridge refused the completed local run")
           PY
           python3 -B - "${root}" "${output}" <<'PY'

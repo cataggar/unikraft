@@ -38,7 +38,11 @@ unchanged.
 `uk-wamr-native-ci records --runtime ABS --output handoff-v1` reopens a
 completed local v2 run, including source and input custody, the six boot
 transcripts and image chain, before emitting a bounded, canonical private JSON
-description of pinned records, artifacts and runtime inputs. The separate
+description of pinned records, artifacts and runtime inputs. The read-only
+verifier can be installed separately from the runtime's recorded controller:
+replay still checks that controller against build-start input custody, while
+build and boot continue to require execution from its exact runtime path. The
+separate
 `records --stage-root ABS --transport trusted-inner-zip --output handoff-v1`
 form checks an extracted public-source inner tree. The initial imported-stage
 fixture covers older allowlisted v1 evidence; the current v2 import is also
