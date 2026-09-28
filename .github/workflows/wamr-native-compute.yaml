@@ -428,6 +428,7 @@ jobs:
           ARTIFACT_URL: ${{ steps.public_upload.outputs.artifact-url }}
           REDOWNLOAD_DIR: ${{ steps.public_redownload.outputs.destination }}
           SOURCE_TREE: ${{ steps.public_bundle.outputs.source_tree }}
+          WAMR_CI_CONTROLLER: /d/wamr-ci/wamr-differential-controller/controller/bin/uk-wamr-native-ci
         run: |
           set -euo pipefail
           export PYTHONDONTWRITEBYTECODE=1
@@ -617,6 +618,78 @@ jobs:
               f"footer_sha256={derivation['footer']['sha256']}")
           PY
           } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Revalidate the trusted inner stage through the native records bridge
+        timeout-minutes: 20
+        env:
+          SOURCE_TREE: ${{ steps.public_bundle.outputs.source_tree }}
+        run: |
+          set -euo pipefail
+          umask 077
+          imported=/d/wamr-ci/wamr-native-runtime/compute/public-source/exact-redownload/success
+          stage="${RUNNER_TEMP}/wamr-inner-stage"
+          output="${RUNNER_TEMP}/wamr-imported-handoff-v1.json"
+          controller=/d/wamr-ci/wamr-differential-controller/controller/bin/uk-wamr-native-ci
+          test -x "${controller}"
+          test ! -e "${stage}"
+          test ! -e "${output}"
+          python3 -B - "${imported}" "${stage}" <<'PY'
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import shutil
+          import sys
+
+          source, stage = map(Path, sys.argv[1:])
+          manifest = json.loads((source / "public-source.json").read_bytes())
+          stage.mkdir(mode=0o700)
+          names = sorted(manifest["members"])
+          if len(names) != 83:
+              raise SystemExit("unexpected trusted inner stage member count")
+          for name in [*names, "public-source.json", "portable-bundle.json"]:
+              relative = PurePosixPath(name)
+              if (str(relative) != name or not 1 <= len(relative.parts) <= 3
+                      or relative.parts[0] not in (
+                          "artifacts", "boots", "evidence",
+                          "public-source.json", "portable-bundle.json")
+                      or any(part in ("", ".", "..") for part in relative.parts)):
+                  raise SystemExit("unsafe trusted inner stage member")
+              original = source.joinpath(*relative.parts)
+              if original.is_symlink() or not original.is_file():
+                  raise SystemExit("missing trusted inner stage member")
+              copy = stage.joinpath(*relative.parts)
+              copy.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+              with original.open("rb") as src, copy.open("xb") as dst:
+                  os.fchmod(dst.fileno(), 0o600)
+                  shutil.copyfileobj(src, dst, 65536)
+          PY
+          "${controller}" records --stage-root "${stage}" \
+            --transport trusted-inner-zip --output handoff-v1 > "${output}"
+          python3 -B - "${output}" "${GITHUB_SHA}" "${SOURCE_TREE}" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          value = json.loads(Path(sys.argv[1]).read_bytes())
+          if (value["schema"] != "uk.wamr.native-ci-controller-records"
+                  or value["schema_version"] != 1
+                  or value["context"] != "trusted-inner-zip"
+                  or value["compatibility"] != "tiny-v2"
+                  or value["profile"] != "qcow2-derived-vhd"
+                  or value["source"] != {
+                      "revision": sys.argv[2], "tree": sys.argv[3]}
+                  or len(value["modes"]) != 6
+                  or not value["records"] or not value["artifacts"]):
+              raise SystemExit("native record bridge refused trusted v2 import")
+          PY
+          printf '\n' >> "${stage}/evidence/build.json"
+          if "${controller}" records --stage-root "${stage}" \
+            --transport trusted-inner-zip --output handoff-v1 \
+            > "${RUNNER_TEMP}/wamr-tampered-handoff-v1.json"; then
+            echo "Native records bridge accepted changed inner evidence" >&2
+            exit 1
+          fi
+          test ! -s "${RUNNER_TEMP}/wamr-tampered-handoff-v1.json"
 
       - name: Retain redacted diagnostics separately from the public-source image bundle
         if: always()

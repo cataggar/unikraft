@@ -41,14 +41,17 @@ transcripts and image chain, before emitting a bounded, canonical private JSON
 description of pinned records, artifacts and runtime inputs. The separate
 `records --stage-root ABS --transport trusted-inner-zip --output handoff-v1`
 form checks an extracted public-source inner tree. The initial imported-stage
-fixture covers older allowlisted v1 evidence; pre-supervisor v1 and current v2
-imports still need end-to-end checks. Neither form executes build or boot,
-changes authority, or makes a partially checked manifest an accepted run.
+fixture covers older allowlisted v1 evidence; the current v2 import is also
+exercised against a retained protected archive. Neither form executes build or
+boot, changes authority, or makes a partially checked manifest an accepted run.
 
-This bridge is still under integration: a completed local run and a current v2
-import must pass end-to-end before `handoff.py` or `public_bundle.py` switches
-away from `run.py`. The current checkout/consumer custody and supervised
-handoff stages also need native owners before `run.py` can be removed.
+The public bundle importer now requires this native check before publishing
+its candidate, while retaining the Python publication and supervised-stage
+validation. The caller must independently authenticate the executable
+provided by `WAMR_CI_CONTROLLER`; owner and mode checks alone do not prove
+its provenance. The completed local run still needs a protected end-to-end
+check, and checkout/consumer custody and supervised handoff stages need
+native owners before `run.py` can be removed.
 
 ## Native controller preparation (unpublished build path)
 

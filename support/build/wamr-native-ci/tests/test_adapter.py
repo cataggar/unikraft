@@ -45,6 +45,178 @@ ci.COMMAND_TOOL_PATHS.update({
 })
 
 
+class NativeRecordBridge(unittest.TestCase):
+    def controller_fixture(self, body):
+        parent = HERE.parents[2] / ".d"
+        parent.mkdir(mode=0o700, exist_ok=True)
+        root = Path(tempfile.mkdtemp(prefix="native-records-", dir=parent))
+        self.addCleanup(shutil.rmtree, root)
+        controller = root / "controller"
+        controller.write_text(
+            f"#!{Path(sys.executable).resolve(strict=True)}\n"
+            + body, encoding="utf-8")
+        controller.chmod(0o700)
+        return root, controller
+
+    def test_imported_stage_requires_native_controller(self):
+        bridge = public_bundle.accepted_records
+        with mock.patch.dict(os.environ, {bridge.CONTROLLER_ENV: ""}), \
+                mock.patch.object(bridge.subprocess, "Popen") as spawn:
+            with self.assertRaisesRegex(ValueError, "native controller records refused"):
+                bridge.imported_stage(HERE)
+            spawn.assert_not_called()
+
+    def test_imported_stage_never_accepts_failed_or_malformed_native_output(self):
+        bridge = public_bundle.accepted_records
+        unused_root, controller = self.controller_fixture(
+            "import os, sys\n"
+            "sys.stdout.buffer.write(b'{\"schema\":\"success\"}\\n')\n"
+            "sys.exit(int(os.environ['WAMR_CI_TEST_EXIT']))\n")
+        del unused_root
+        with mock.patch.dict(os.environ, {
+                bridge.CONTROLLER_ENV: str(controller),
+                "WAMR_CI_TEST_EXIT": "1"}), \
+                mock.patch.object(bridge.os, "killpg") as killpg:
+            with self.assertRaisesRegex(ValueError, "native controller records refused"):
+                bridge.imported_stage(HERE)
+            killpg.assert_not_called()
+        with mock.patch.dict(os.environ, {
+                bridge.CONTROLLER_ENV: str(controller),
+                "WAMR_CI_TEST_EXIT": "0"}), \
+                mock.patch.object(bridge.os, "killpg") as killpg:
+            with self.assertRaisesRegex(ValueError, "native controller records refused"):
+                bridge.imported_stage(HERE)
+            killpg.assert_not_called()
+
+    def test_oversized_native_stdout_and_stderr_are_killed_and_reaped(self):
+        bridge = public_bundle.accepted_records
+        for descriptor in (1, 2):
+            with self.subTest(descriptor=descriptor):
+                root, controller = self.controller_fixture(
+                    "import os, time\n"
+                    "open(os.environ['WAMR_CI_TEST_PID'], 'w').write(str(os.getpid()))\n"
+                    "for unused in range(40):\n"
+                    "    os.write(int(os.environ['WAMR_CI_TEST_FD']), b'x' * 65536)\n"
+                    "time.sleep(60)\n")
+                pid_file = root / "pid"
+                with mock.patch.dict(os.environ, {
+                        bridge.CONTROLLER_ENV: str(controller),
+                        "WAMR_CI_TEST_PID": str(pid_file),
+                        "WAMR_CI_TEST_FD": str(descriptor)}), \
+                        mock.patch.object(bridge, "RECORDS_TIMEOUT_SECONDS", 5):
+                    with self.assertRaisesRegex(
+                            ValueError, "native controller records refused"):
+                        bridge.imported_stage(HERE)
+                pid = int(pid_file.read_text())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+
+    def test_native_output_limit_is_shared_across_pipes(self):
+        bridge = public_bundle.accepted_records
+        root, controller = self.controller_fixture(
+            "import os, time\n"
+            "open(os.environ['WAMR_CI_TEST_PID'], 'w').write(str(os.getpid()))\n"
+            "for unused in range(12):\n"
+            "    os.write(1, b'x' * 98304)\n"
+            "    os.write(2, b'x' * 98304)\n"
+            "time.sleep(60)\n")
+        pid_file = root / "pid"
+        with mock.patch.dict(os.environ, {
+                bridge.CONTROLLER_ENV: str(controller),
+                "WAMR_CI_TEST_PID": str(pid_file)}), \
+                mock.patch.object(bridge, "RECORDS_TIMEOUT_SECONDS", 5):
+            with self.assertRaisesRegex(
+                    ValueError, "native controller records refused"):
+                bridge.imported_stage(HERE)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(pid_file.read_text()), 0)
+
+    def test_silent_native_deadline_kills_and_reaps_child(self):
+        bridge = public_bundle.accepted_records
+        root, controller = self.controller_fixture(
+            "import os, time\n"
+            "open(os.environ['WAMR_CI_TEST_PID'], 'w').write(str(os.getpid()))\n"
+            "time.sleep(60)\n")
+        pid_file = root / "pid"
+        with mock.patch.dict(os.environ, {
+                bridge.CONTROLLER_ENV: str(controller),
+                "WAMR_CI_TEST_PID": str(pid_file)}), \
+                mock.patch.object(bridge, "RECORDS_TIMEOUT_SECONDS", 2):
+            with self.assertRaisesRegex(
+                    ValueError, "native controller records refused"):
+                bridge.imported_stage(HERE)
+        pid = int(pid_file.read_text())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    def test_real_imported_stage_uses_native_acceptance(self):
+        bridge = public_bundle.accepted_records
+        stage = os.environ.get("WAMR_CI_NATIVE_IMPORT_FIXTURE")
+        controller = os.environ.get(bridge.CONTROLLER_ENV)
+        if not stage or not controller:
+            self.skipTest("native controller and real imported stage not configured")
+        accepted = bridge.imported_stage(Path(stage))
+        self.assertEqual(accepted["context"], "trusted-inner-zip")
+        self.assertEqual(accepted["compatibility"], "tiny-v2")
+        self.assertEqual(len(accepted["records"]), 33)
+        self.assertEqual(len(accepted["artifacts"]), 50)
+        with self.assertRaisesRegex(ValueError, "native controller records refused"):
+            bridge.imported_stage(HERE)
+
+    def test_real_archive_requires_native_acceptance_before_publication(self):
+        bridge = public_bundle.accepted_records
+        stage = os.environ.get("WAMR_CI_NATIVE_IMPORT_FIXTURE")
+        archive = os.environ.get("WAMR_CI_NATIVE_IMPORT_ARCHIVE")
+        if not stage or not archive or not os.environ.get(bridge.CONTROLLER_ENV):
+            self.skipTest("native controller and real imported archive not configured")
+        from_fixture = Path(stage)
+        source = json.loads((from_fixture / "public-source.json").read_bytes())["source"]
+        archive = Path(archive)
+        root = Path(tempfile.mkdtemp(
+            prefix="native-import-", dir=HERE.parents[2] / ".d"))
+        self.addCleanup(shutil.rmtree, root)
+        handoff = types.SimpleNamespace(
+            ci=ci, NAMES=(
+                "efi", "debug_elf", "bootinfo", "raw", "vhd", "runtime",
+                "compiler", "wasm", "cwasm", "config", "runtime_identity",
+                "image_identity", "local_result", "package", "build",
+                "build_start", "boot_inputs"),
+            V2_NAMES=(
+                "efi", "debug_elf", "bootinfo", "raw", "qcow2", "vhd",
+                "runtime", "compiler", "wasm", "cwasm", "config",
+                "runtime_identity", "image_identity", "local_result",
+                "package", "build", "build_start", "boot_inputs",
+                "qcow2_finalization_intent", "qcow2_finalization",
+                "qcow2_acceptance", "fixed_vhd_derivation_intent",
+                "fixed_vhd_derivation_gate", "fixed_vhd_derivation",
+                "final_inspection", "cleanup"),
+            private=mock.Mock(), FAILURE_STAGE="")
+        output = root / "import"
+        with mock.patch.object(
+                public_bundle, "publication_records",
+                side_effect=RuntimeError("after native acceptance")):
+            with self.assertRaisesRegex(RuntimeError, "after native acceptance"):
+                public_bundle.import_bundle(
+                    handoff, archive, output, source, ci.digest(archive),
+                    Path("/unused/validator"), Path("/unused/supervisor"),
+                    artifact_id="123", container_digest="0" * 64)
+        self.assertEqual(handoff.FAILURE_STAGE, "public-import-records")
+        self.assertTrue((output / "candidate-bundle.json").exists())
+        self.assertFalse((output / "bundle.json").exists())
+        refused = root / "refused"
+        with mock.patch.object(
+                bridge, "imported_stage",
+                side_effect=ValueError("native controller records refused")):
+            with self.assertRaisesRegex(ValueError, "native controller records refused"):
+                public_bundle.import_bundle(
+                    handoff, archive, refused, source, ci.digest(archive),
+                    Path("/unused/validator"), Path("/unused/supervisor"),
+                    artifact_id="123", container_digest="0" * 64)
+        self.assertEqual(handoff.FAILURE_STAGE, "public-import-native-records")
+        self.assertFalse((refused / "candidate-bundle.json").exists())
+        self.assertFalse((refused / "bundle.json").exists())
+
+
 class Contract(unittest.TestCase):
     def setUp(self):
         self.identity = {

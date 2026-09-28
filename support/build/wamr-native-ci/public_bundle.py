@@ -4,6 +4,7 @@
 import copy
 import contextlib
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,11 @@ import re
 import stat
 import subprocess
 import zipfile
+
+_records_spec = importlib.util.spec_from_file_location(
+    "wamr_accepted_records", Path(__file__).with_name("accepted_records.py"))
+accepted_records = importlib.util.module_from_spec(_records_spec)
+_records_spec.loader.exec_module(accepted_records)
 
 MAX_TOTAL = 512 * 1024 * 1024
 MAX_MEMBERS = 96
@@ -1641,6 +1647,8 @@ def import_bundle(
         bundle = verify_archive_descriptor(
             handoff, handle, expected, expected_archive_sha256)
         output.mkdir(mode=0o700)
+        for name in ("artifacts", "boots", "evidence"):
+            (output / name).mkdir(mode=0o700)
         with descriptor_zip(handle) as zipped:
             for name, item in members(handoff, bundle).items():
                 path = output / name
@@ -1660,6 +1668,25 @@ def import_bundle(
                 )
     for item in members(handoff, bundle).values():
         item["path"] = str(output / item["path"])
+    handoff.FAILURE_STAGE = "public-import-native-records"
+    accepted = accepted_records.imported_stage(output)
+    require(
+        accepted["source"] == {
+            "revision": expected["source_revision"],
+            "tree": expected["source_tree"],
+        }
+        and accepted["compatibility"]
+        == ("tiny-v2" if bundle["version"] == 2 else "tiny-v1")
+        and accepted["result"]["sha256"]
+        == bundle["artifacts"][
+            (handoff.V2_NAMES if bundle["version"] == 2 else handoff.NAMES
+             ).index("local_result")]["sha256"]
+        and {
+            record["name"]: record["sha256"] for record in accepted["records"]
+        } == {
+            Path(item["path"]).name: item["sha256"]
+            for item in bundle["evidence"]
+        })
     if bundle["version"] == 2:
         require(expected_archive_sha256 is not None
                 and type(artifact_id) is str
@@ -1681,9 +1708,11 @@ def import_bundle(
     else:
         require(artifact_id is None and container_digest is None)
     handoff.ci.save(output / "candidate-bundle.json", bundle)
+    handoff.FAILURE_STAGE = "public-import-records"
     publication_records(
         handoff, output, expected, "trusted_inner_zip",
         "candidate-bundle.json")
+    handoff.FAILURE_STAGE = "public-import-revalidation"
     native(
         handoff, validator, supervisor,
         output / "candidate-bundle.json", expected)
