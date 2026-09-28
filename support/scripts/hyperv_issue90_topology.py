@@ -1197,7 +1197,19 @@ class TopologyRun:
             return
         self.deadline = None
         try:
+            if self.state.get("pending_create") is not None:
+                raise RuntimeError(
+                    "An Azure create response or durable receipt is unresolved; "
+                    "an absent resource group cannot exclude an in-flight create, "
+                    "and a matching name, ID or tags cannot prove the original "
+                    "group, disk UUID or ARM deployment correlation"
+                )
             if self.az(["group", "exists", "--name", self.group()]) is False:
+                if self.state.get("resource_group_id") is not None:
+                    raise RuntimeError(
+                        "A previously created group is not currently visible; "
+                        "absence cannot prove its deletion or exclude delayed visibility"
+                    )
                 self.record("cleaned")
                 return
             group = self.az(["group", "show", "--name", self.group()])
@@ -1207,17 +1219,15 @@ class TopologyRun:
                     "Original resource-group creation proof is missing; "
                     "manual owner verification required"
                 )
+            if not self.state.get("disks"):
+                raise RuntimeError(
+                    "A resource-group ID is a reusable name path and its tags "
+                    "can be copied; no immutable group instance or original "
+                    "disk receipt proves this group is the one created"
+                )
             resources = self.az([
                 "resource", "list", "--resource-group", self.group(),
             ])
-            if self.state.get("pending_create") is not None:
-                raise RuntimeError(
-                    "An Azure create response was lost before its immutable "
-                    "disk UUID or VM UUID/ARM correlation could be recorded; "
-                    "current tags, IDs and inventory cannot prove the original "
-                    "resource or exclude an in-flight create; manual owner "
-                    "verification required"
-                )
             self.inventory_for_cleanup(resources)
             for role in self.state.get("disks", {}):
                 self.verify_disk(role, self.disk_show(role, cleanup=True),
@@ -1243,7 +1253,7 @@ class TopologyRun:
             self.az(["group", "delete", "--name", self.group(), "--yes"], timeout=900)
             if self.az(["group", "exists", "--name", self.group()]) is not False:
                 raise RuntimeError("Owned resource-group deletion did not complete")
-            self.record("cleaned")
+            self.record("cleaned", group_deletion_observed=True)
             if deallocation_error:
                 self.state["deallocation_warning"] = azure.safe_failure_message(
                     deallocation_error
@@ -1339,7 +1349,11 @@ def run(directory, subscription, approved_envelope):
 def cleanup_state(directory):
     with locked(directory) as directory:
         state = load(directory)
-        if state["phase"] in ("planned", "prepared", "cleaned"):
+        if state["phase"] in ("planned", "prepared") or (
+            state["phase"] == "cleaned" and state.get("pending_create") is None
+            and (state.get("resource_group_id") is None
+                 or state.get("group_deletion_observed") is True)
+        ):
             return
         TopologyRun(state, directory).cleanup()
 
