@@ -61,6 +61,9 @@ class FakeAzure:
         self.deleted = False
         self.tamper = None
         self.missing_response = None
+        self.group_hidden_after_lost_response = False
+        self.replace_after_lost_response = False
+        self.group_incarnation = str(uuid.uuid5(uuid.NAMESPACE_DNS, "issue90-group"))
         self.fail_vm_show_once = False
         self.deployment_shown = False
         self.pinned_reads = 0
@@ -259,6 +262,12 @@ class FakeAzure:
         if action[:2] == ("group", "create"):
             self.group_exists = True
             if self.missing_response == ("group", "group"):
+                if self.group_hidden_after_lost_response:
+                    self.group_exists = False
+                if self.replace_after_lost_response:
+                    self.group_incarnation = str(uuid.uuid5(
+                        uuid.NAMESPACE_DNS, "issue90-replaced-group"
+                    ))
                 raise lane.azure.AzureCliTimeout(["group", "create"])
             return self.resource("group")
         if action[:2] == ("group", "show"):
@@ -301,6 +310,12 @@ class FakeAzure:
                 for role in lane.ROLES}[args[args.index("--name") + 1]]
             self.created.append(role)
             if self.missing_response == ("disk", role):
+                if self.group_hidden_after_lost_response:
+                    self.group_exists = False
+                if self.replace_after_lost_response:
+                    self.disk_uuids[role] = str(uuid.uuid5(
+                        uuid.NAMESPACE_DNS, "issue90-replaced-" + role
+                    ))
                 raise lane.azure.AzureCliTimeout(["disk", "create"])
             return self.disk(role)
         if action[:2] == ("disk", "show"):
@@ -317,6 +332,15 @@ class FakeAzure:
             assert self.created == list(lane.ROLES)
             self.deployed = True
             if self.missing_response == ("deployment", "vm"):
+                if self.group_hidden_after_lost_response:
+                    self.group_exists = False
+                if self.replace_after_lost_response:
+                    self.correlation = str(uuid.uuid5(
+                        uuid.NAMESPACE_DNS, "issue90-replaced-deployment"
+                    ))
+                    self.vm_uuid = str(uuid.uuid5(
+                        uuid.NAMESPACE_DNS, "issue90-replaced-vm"
+                    ))
                 raise lane.azure.AzureCliTimeout(["deployment", "group", "create"])
             return self.deployment()
         if action == ("deployment", "group", "show"):
@@ -1008,8 +1032,9 @@ class Issue90TopologyTest(unittest.TestCase):
         self.assertFalse((self.directory / "acceptance.json").exists())
         self.assertEqual(lane.load(self.directory)["phase"], "cleanup-failed")
 
-    def _missing_create_response(self, stage, role):
+    def _missing_create_response(self, stage, role, *, hidden_group=False):
         self.fake.missing_response = (stage, role)
+        self.fake.group_hidden_after_lost_response = hidden_group
         checks = self._patch_cloud()
         with checks[0], checks[1], checks[2], checks[3], checks[4]:
             with self.assertRaisesRegex(RuntimeError, "manual owner verification required"):
@@ -1021,7 +1046,7 @@ class Issue90TopologyTest(unittest.TestCase):
         self.assertEqual(recorded["phase"], "cleanup-failed")
         self.assertIn("manual owner verification required", recorded["cleanup_error"])
         self.assertEqual(recorded["pending_create"], {"kind": stage, "role": role})
-        self.assertTrue(self.fake.group_exists)
+        self.assertEqual(self.fake.group_exists, not hidden_group)
         self.assertFalse(self.fake.deleted)
         self.assertFalse((self.directory / "acceptance.json").exists())
         self.assertNotIn(("group", "delete", "--name"), self.fake.calls)
@@ -1033,9 +1058,74 @@ class Issue90TopologyTest(unittest.TestCase):
         self.assertEqual(self.fake.created, ["os"])
 
     def test_group_create_timeout_cannot_adopt_matching_recreated_group(self):
+        self.fake.replace_after_lost_response = True
+        original_incarnation = self.fake.group_incarnation
+        original_response = self.fake.resource("group")
         recorded = self._missing_create_response("group", "group")
         self.assertNotIn("resource_group_id", recorded)
         self.assertEqual(self.fake.created, [])
+        self.assertNotEqual(self.fake.group_incarnation, original_incarnation)
+        self.assertEqual(self.fake.resource("group"), original_response)
+
+    def _hidden_group_remains_unresolved(self, stage, role):
+        self._missing_create_response(stage, role, hidden_group=True)
+        self.fake.group_exists = True
+        with mock.patch.object(lane.azure, "azure_cli", side_effect=self.fake.az):
+            with self.assertRaisesRegex(RuntimeError, "manual owner verification required"):
+                lane.cleanup_state(self.directory)
+        self.assertFalse(self.fake.deleted)
+        self.assertEqual(lane.load(self.directory)["phase"], "cleanup-failed")
+        self.assertNotIn(("group", "delete", "--name"), self.fake.calls)
+
+    def test_lost_group_response_with_invisible_in_flight_group_stays_pending(self):
+        self._hidden_group_remains_unresolved("group", "group")
+
+    def test_lost_disk_response_with_invisible_group_stays_pending(self):
+        self._hidden_group_remains_unresolved("disk", "os")
+
+    def test_lost_deployment_response_with_invisible_group_stays_pending(self):
+        self._hidden_group_remains_unresolved("deployment", "vm")
+
+    def test_previously_cleaned_state_with_unresolved_create_is_not_skipped(self):
+        self.state["phase"] = "cleaned"
+        self.state["pending_create"] = {"kind": "group", "role": "group"}
+        lane.save(self.directory, self.state)
+        with mock.patch.object(lane.azure, "azure_cli") as cli:
+            with self.assertRaisesRegex(RuntimeError, "manual owner verification required"):
+                lane.cleanup_state(self.directory)
+        cli.assert_not_called()
+        self.assertEqual(lane.load(self.directory)["phase"], "cleanup-failed")
+
+    def test_same_name_and_tags_cannot_prove_recreated_group_without_disk_receipts(self):
+        self.state["phase"] = "group-created"
+        self.state["resource_group_id"] = lane.group_id(self.state)
+        lane.save(self.directory, self.state)
+        self.fake.group_exists = True
+        with mock.patch.object(lane.azure, "azure_cli", side_effect=self.fake.az):
+            with self.assertRaisesRegex(RuntimeError, "immutable group instance"):
+                lane.cleanup_state(self.directory)
+        self.assertFalse(self.fake.deleted)
+        self.assertEqual(lane.load(self.directory)["phase"], "cleanup-failed")
+
+    def test_temporarily_invisible_created_group_cannot_be_marked_cleaned(self):
+        self.state["phase"] = "group-created"
+        self.state["resource_group_id"] = lane.group_id(self.state)
+        lane.save(self.directory, self.state)
+        with mock.patch.object(lane.azure, "azure_cli", side_effect=self.fake.az):
+            with self.assertRaisesRegex(RuntimeError, "delayed visibility"):
+                lane.cleanup_state(self.directory)
+        self.assertFalse(self.fake.deleted)
+        self.assertEqual(lane.load(self.directory)["phase"], "cleanup-failed")
+
+    def test_legacy_cleaned_group_without_deletion_observation_is_not_skipped(self):
+        self.state["phase"] = "cleaned"
+        self.state["resource_group_id"] = lane.group_id(self.state)
+        lane.save(self.directory, self.state)
+        with mock.patch.object(lane.azure, "azure_cli", side_effect=self.fake.az):
+            with self.assertRaisesRegex(RuntimeError, "delayed visibility"):
+                lane.cleanup_state(self.directory)
+        self.assertFalse(self.fake.deleted)
+        self.assertEqual(lane.load(self.directory)["phase"], "cleanup-failed")
 
     def test_data0_create_timeout_preserves_original_os_proof_but_refuses_adoption(self):
         recorded = self._missing_create_response("disk", "data0")
@@ -1048,14 +1138,22 @@ class Issue90TopologyTest(unittest.TestCase):
         self.assertEqual(self.fake.created, ["os", "data0", "data7"])
 
     def test_deployment_create_timeout_cannot_infer_original_vm_or_correlation(self):
+        self.fake.replace_after_lost_response = True
+        original_correlation, original_vm = self.fake.correlation, self.fake.vm_uuid
         recorded = self._missing_create_response("deployment", "vm")
         self.assertEqual(set(recorded["disks"]), set(lane.ROLES))
         self.assertNotIn("vm", recorded)
         self.assertTrue(self.fake.deployed)
+        self.assertNotEqual(self.fake.correlation, original_correlation)
+        self.assertNotEqual(self.fake.vm_uuid, original_vm)
+        self.assertEqual(self.fake.deployment()["name"], self.state["prefix"])
 
     def test_disk_create_timeout_with_replaced_current_resource_remains_refused(self):
-        self.fake.tamper = ("disk-owner", "os")
+        self.fake.replace_after_lost_response = True
+        original_uuid = self.fake.disk_uuids["os"]
         self._missing_create_response("disk", "os")
+        self.assertNotEqual(self.fake.disk_uuids["os"], original_uuid)
+        self.assertEqual(self.fake.disk("os")["tags"], lane.tags(self.state, "os"))
 
     def test_invisible_in_flight_create_does_not_make_empty_inventory_safe(self):
         self.fake.tamper = ("inventory", "not-yet-visible")
@@ -1065,11 +1163,11 @@ class Issue90TopologyTest(unittest.TestCase):
         self.fake.tamper = ("inventory", "not-yet-visible")
         self._missing_create_response("deployment", "vm")
 
-    def test_failed_immutable_receipt_write_keeps_create_intent_for_cleanup(self):
+    def _failed_create_receipt(self, phase, stage, role):
         original_save = lane.save
 
         def fail_receipt(directory, state):
-            if state["phase"] == "uploading-os":
+            if state["phase"] == phase:
                 raise OSError("synthetic durable receipt write failed")
             original_save(directory, state)
 
@@ -1081,9 +1179,49 @@ class Issue90TopologyTest(unittest.TestCase):
                 lane.run(self.directory, self.state["subscription"],
                          lane.envelope_sha(self.state))
         recorded = lane.load(self.directory)
-        self.assertEqual(recorded["pending_create"], {"kind": "disk", "role": "os"})
-        self.assertEqual(recorded.get("disks", {}), {})
+        self.assertEqual(recorded["pending_create"], {"kind": stage, "role": role})
+        self.assertTrue(self.fake.group_exists)
         self.assertFalse(self.fake.deleted)
+        self.assertFalse((self.directory / "acceptance.json").exists())
+        with mock.patch.object(lane.azure, "azure_cli", side_effect=self.fake.az):
+            with self.assertRaisesRegex(RuntimeError, "manual owner verification required"):
+                lane.cleanup_state(self.directory)
+        self.assertNotIn(("group", "delete", "--name"), self.fake.calls)
+        return recorded
+
+    def test_failed_group_receipt_write_keeps_create_intent_for_cleanup(self):
+        recorded = self._failed_create_receipt("group-created", "group", "group")
+        self.assertNotIn("resource_group_id", recorded)
+        self.assertEqual(recorded.get("disks", {}), {})
+
+    def test_failed_immutable_disk_receipt_write_keeps_create_intent_for_cleanup(self):
+        recorded = self._failed_create_receipt("uploading-os", "disk", "os")
+        self.assertEqual(recorded.get("disks", {}), {})
+
+    def test_failed_deployment_receipt_write_keeps_create_intent_for_cleanup(self):
+        recorded = self._failed_create_receipt("vm-created", "deployment", "vm")
+        self.assertTrue(self.fake.deployed)
+        self.assertNotIn("vm", recorded)
+        self.assertEqual(set(recorded["disks"]), set(lane.ROLES))
+
+    def test_failed_group_intent_write_makes_no_group_create_call(self):
+        original_save = lane.save
+
+        def fail_intent(directory, state):
+            if state["phase"] == "creating-group":
+                raise OSError("synthetic durable intent write failed")
+            original_save(directory, state)
+
+        checks = self._patch_cloud()
+        with checks[0], checks[1], checks[2], checks[3], checks[4], mock.patch.object(
+            lane, "save", side_effect=fail_intent
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cleanup completed"):
+                lane.run(self.directory, self.state["subscription"],
+                         lane.envelope_sha(self.state))
+        self.assertNotIn(("group", "create"), self.fake.calls)
+        self.assertFalse(self.fake.group_exists)
+        self.assertEqual(lane.load(self.directory)["phase"], "cleaned")
 
     def test_proven_os_disk_upload_failure_can_still_delete_exact_owned_inventory(self):
         checks = self._patch_cloud()
@@ -1119,6 +1257,10 @@ class Issue90TopologyTest(unittest.TestCase):
         self.assertEqual(receipt["boot_count"], 1)
         self.assertTrue(self.fake.deleted)
         self.assertEqual(lane.load(self.directory)["phase"], "cleaned")
+        self.assertIs(lane.load(self.directory)["group_deletion_observed"], True)
+        with mock.patch.object(lane.azure, "azure_cli") as cli:
+            lane.cleanup_state(self.directory)
+        cli.assert_not_called()
         self.assertTrue((self.directory / "acceptance.json").exists())
         self.assertEqual((self.directory / "guest-serial.log").read_text(),
                          serial(self.state))

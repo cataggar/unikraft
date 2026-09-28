@@ -893,10 +893,34 @@ match: neither an ID-byte scan nor a mutable self-reported hash proves that the
 EFI was built from the reviewed source and the solved config. A trustworthy
 build-to-EFI provenance gate must be supplied and checked on a private build
 host before these artifacts can be accepted; do not fabricate or publish
-private build state. The distinct **live gate remains blocked**: if an Azure
-create response is lost, the original Azure-assigned disk/VM identity cannot
-be recovered safely from a currently tagged resource, so mandatory
-owner-checked deletion cannot be guaranteed. The official
+private build state. The distinct **live gate remains blocked**:
+the [group PUT](https://learn.microsoft.com/en-us/rest/api/resources/resource-groups/create-or-update?view=rest-resources-2021-04-01)
+returns a reusable name-based ID, not an immutable group incarnation. The
+[disk PUT](https://learn.microsoft.com/en-us/rest/api/compute/disks/create-or-update?view=rest-compute-2025-01-02)
+returns an Azure-assigned `uniqueId`, and the
+[deployment PUT](https://learn.microsoft.com/en-us/rest/api/resources/deployments/create-or-update?view=rest-resources-2025-04-01)
+returns an Azure-assigned correlation ID and this template's VM UUID output.
+The group ID is precomputable but does not identify a group incarnation; the
+disk UUID, deployment correlation, and VM UUID cannot be selected before
+their calls or reconstructed as the *original* from a same-name GET after a
+lost response or failed durable receipt write. Names, ARM IDs, parameters,
+and tags can match a replacement. A prechosen `x-ms-client-request-id` can
+aid investigation through the
+[Activity Log](https://learn.microsoft.com/en-us/azure/azure-monitor/fundamentals/activity-log-schema#administrative-category)
+but is not an immutable field on those resources. Activity logs
+[typically arrive after 3–20 minutes and expire after 90 days](https://learn.microsoft.com/en-us/azure/azure-monitor/fundamentals/activity-log);
+they do not alone bind the present resource incarnation to the original
+create or rule out an in-flight request. An absent group or inventory is
+not proof of completed cleanup while a create is unresolved.
+The controller refuses such cleanup (including stale `cleaned` state), and
+refuses to interpret temporary absence of a previously created group as
+deletion or delete a same-name group with no original disk receipts. Prior
+`cleaned` receipts for a created group without an observed deletion are
+rechecked, not silently accepted. No synthetic success path establishes a
+live ownership guarantee: retain manual owner verification and keep the
+live gate closed.
+
+The official
 [disk TypeSpec](https://github.com/Azure/azure-rest-api-specs/blob/main/specification/compute/resource-manager/Microsoft.Compute/Compute/ComputeDisk/models.tsp),
 [deployment TypeSpec](https://github.com/Azure/azure-rest-api-specs/blob/main/specification/resources/resource-manager/Microsoft.Resources/deployments/models.tsp),
 and [Compute 2025-11-01 OpenAPI](https://github.com/Azure/azure-rest-api-specs/blob/main/specification/compute/resource-manager/Microsoft.Compute/Compute/stable/2025-11-01/ComputeRP.json)
@@ -908,11 +932,11 @@ and [disk GET](https://github.com/Azure/azure-rest-api-specs/blob/main/specifica
 examples omit both `uniqueId` and `diskSizeBytes`; the offline checks require
 them and fail closed if the selected CLI/region omits either. CLI field
 presence and size/UUID/deployment response values still need redacted real
-response proof
-before any live use. Do not allocate Azure resources with this controller or
-reuse the one-disk lane. Local QEMU boots without StorVSC devices are
-`UNAVAILABLE`, not real-host read evidence. Write/flush persistence remains a
-separate workload.
+response proof before any live use. Do not allocate Azure resources with this
+controller or reuse the one-disk lane until both gates and the response
+shapes are verified. Local QEMU boots without StorVSC devices are
+`UNAVAILABLE`, not real-host read evidence. Write/flush persistence remains
+a separate workload.
 
 ## Private application-network peer
 
