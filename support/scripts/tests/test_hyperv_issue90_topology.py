@@ -119,8 +119,12 @@ class FakeAzure:
             result["diskSizeBytes"] += 512
         if self.tamper == ("disk-size-missing", role):
             del result["diskSizeBytes"]
+        if self.tamper == ("disk-gib-missing", role):
+            del result["diskSizeGb"]
         if self.tamper == ("disk-uuid-missing", role):
             del result["uniqueId"]
+        if self.tamper == ("disk-upload-size-missing", role):
+            del result["creationData"]["uploadSizeBytes"]
         if self.tamper == ("disk-upload-size", role):
             result["creationData"]["uploadSizeBytes"] += 512
         if self.tamper == ("disk-upload-option", role):
@@ -170,6 +174,10 @@ class FakeAzure:
             del result["properties"]["mode"]
         if self.tamper == ("deployment-parameter-missing", "deployment"):
             del result["properties"]["parameters"]["runId"]["type"]
+        if self.tamper == ("deployment-inventory-missing", "deployment"):
+            del result["properties"]["outputResources"]
+        if self.tamper == ("deployment-correlation-missing", "deployment"):
+            del result["properties"]["correlationId"]
         return result
 
     def vm(self):
@@ -861,6 +869,14 @@ class Issue90TopologyTest(unittest.TestCase):
         self.fake.tamper = ("deployment-parameter-missing", "deployment")
         self._run_refused()
 
+    def test_missing_arm_output_inventory_fails_before_any_acceptance_or_deletion(self):
+        self.fake.tamper = ("deployment-inventory-missing", "deployment")
+        self._run_refused()
+
+    def test_missing_arm_correlation_fails_before_any_acceptance_or_deletion(self):
+        self.fake.tamper = ("deployment-correlation-missing", "deployment")
+        self._run_refused()
+
     def test_wrong_lun_refuses_cleanup(self):
         self.fake.tamper = ("vm-lun", "data7")
         self._run_refused()
@@ -939,6 +955,14 @@ class Issue90TopologyTest(unittest.TestCase):
 
     def test_missing_disk_uuid_refuses_cleanup(self):
         self.fake.tamper = ("disk-uuid-missing", "data0")
+        self._run_refused()
+
+    def test_missing_disk_size_gib_refuses_cleanup(self):
+        self.fake.tamper = ("disk-gib-missing", "data0")
+        self._run_refused()
+
+    def test_missing_disk_upload_size_refuses_cleanup(self):
+        self.fake.tamper = ("disk-upload-size-missing", "data0")
         self._run_refused()
 
     def test_upload_proof_requires_exact_size_option_and_generation(self):
