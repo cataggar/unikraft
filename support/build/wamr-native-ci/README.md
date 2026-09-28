@@ -634,6 +634,16 @@ passes, four separate bounded, credential-free x86/KVM matrix jobs run paired
 `build-start-tamper`, `missing-build`, `occupied-boot-slot`, and
 `prior-build-output` cases from fresh worktrees. Each retains strict fault
 and evidence parity; there is no TCG or successful-skip fallback.
+For the three post-build faults, both builds must first pass the full paired
+physical comparison. After injecting the same named fault into each side,
+the oracle requires the case-specific Python refusal and native boot-platform
+error, rechecks the original source and consumer custody, and compares each
+side's complete evidence, artifacts and retained outputs with its own
+previously verified build. Only the exact injected record rewrite, missing
+build record or occupied boot-slot file may differ. The rewritten
+`build-start.json` necessarily has a newer timestamp; only that named fault
+excludes its timestamp from evidence-order checking, while the order of
+every other record remains strict. No fault may publish an acceptance result.
 The different Python/native supervised build commands, controller closures,
 local-boot installation paths, and native-only boot-input validator role are
 checked against their own exact physical contracts; each QCOW2 acceptance

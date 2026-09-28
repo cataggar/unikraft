@@ -230,7 +230,7 @@ def identity(path):
     return hasher.hexdigest()
 
 
-def phase_snapshot(runtime, reference):
+def phase_snapshot(runtime, reference, rewritten_build_start=False):
     compute = runtime / "compute"
     if not compute.exists():
         return {"order": (), "records": {}, "retained": {}, "artifacts": {}}
@@ -249,10 +249,20 @@ def phase_snapshot(runtime, reference):
     check(all(left[0] != right[0] for left, right in
               zip(publications, publications[1:])),
           "ambiguous evidence publication order")
+    if rewritten_build_start:
+        check("build-start.json" in records,
+              "rewritten build-start evidence missing")
+        publications = [
+            item for item in publications if item[1] != "build-start.json"]
     ordered = tuple(name for _, name in publications)
     check(tuple(sorted(ordered, key=lambda name: ORDER.index(name)
                       if name in ORDER else len(ORDER))) == ordered,
           "evidence phase order changed")
+    if rewritten_build_start:
+        ordered = tuple(sorted(
+            (*ordered, "build-start.json"),
+            key=lambda name: ORDER.index(name)
+            if name in ORDER else len(ORDER)))
     if "result.json" in records:
         result = records["result.json"][1]
         check(ordered[-1] == "result.json"
@@ -2443,9 +2453,10 @@ def compare_observations(left, right, reviewed_build_compat=False):
     return failures
 
 
-def observed(result, runtime, repository):
+def observed(result, runtime, repository, rewritten_build_start=False):
     reference = oracle(repository)
-    files = phase_snapshot(runtime, reference)
+    files = phase_snapshot(
+        runtime, reference, rewritten_build_start=rewritten_build_start)
     files["command_logs"] = {}
     for stage in (*REVIEWED_BUILD_COMMANDS, *REVIEWED_BOOT_COMMANDS):
         if f"command-{stage}.json" in files["records"]:
@@ -2619,6 +2630,64 @@ def require_prior_build_output_refusal(python, native, py_runtime, native_runtim
                   f"{label} occupied build root published {name}")
 
 
+FAULT_REFUSALS = {
+    "build-start-tamper": ("producer inputs changed", "BuildStartChanged"),
+    "missing-build": ("unsafe or oversized file", "FileNotFound"),
+    "occupied-boot-slot": ("boot output already exists", "PriorOutput"),
+}
+
+
+def require_fault_refusal(case, results):
+    python_reason, native_cause = FAULT_REFUSALS[case]
+    expected = {
+        "python": f"WAMR_CI_REFUSED: {python_reason}\n".encode(),
+        "native": (
+            "WAMR_CI_FAILED_STAGE: boot-platform; cause: "
+            f"{native_cause}; bounded private logs retained.\n").encode(),
+    }
+    for side in ("python", "native"):
+        result = results[side]
+        check(result.returncode == 1 and result.stderr == expected[side]
+              and not result.stdout,
+              f"{case} {side} refused with a different fault outcome")
+
+
+def require_fault_transition(case, side, before, after):
+    prior, current = before["files"], after["files"]
+    records = dict(prior["records"])
+    retained = dict(prior["retained"])
+    order = prior["order"]
+    if case == "build-start-tamper":
+        original = records["build-start.json"][1]
+        check(original["source"]["revision"] != "0" * 40,
+              "build-start tamper was not a mutation")
+        changed = copy.deepcopy(original)
+        changed["source"]["revision"] = "0" * 40
+        records["build-start.json"] = (
+            before["reference"].compact_json(changed, newline=True), changed)
+    elif case == "missing-build":
+        del records["build.json"]
+        order = tuple(name for name in order if name != "build.json")
+    elif case == "occupied-boot-slot":
+        check("boot-raw-x2apic/prior" not in retained,
+              "boot slot was occupied before fault injection")
+        retained["boot-raw-x2apic/prior"] = ("file", 0o600, len(b"prior"))
+    else:
+        raise ParityError("unknown reviewed fault")
+    check(current["order"] == order and current["records"] == records,
+          f"{case} {side} changed other evidence")
+    check(current["retained"] == retained
+          and current["artifacts"] == prior["artifacts"],
+          f"{case} {side} changed other retained outputs")
+    checked = after
+    if case == "build-start-tamper":
+        original_records = dict(current["records"])
+        original_records["build-start.json"] = prior["records"][
+            "build-start.json"]
+        checked = dict(after, files=dict(current, records=original_records))
+    verified_build_start_side(checked, side)
+
+
 def outcome_details(results, snapshots):
     details = []
     for label in ("python", "native"):
@@ -2783,21 +2852,27 @@ def full(args):
             report_progress(label, "boot-done")
         py, native = (results[name] for name in ("python", "native"))
         boot_snapshots = {
-            label: observed(results[label], runtime, repo)
+            label: observed(
+                results[label], runtime, repo,
+                rewritten_build_start=args.case == "build-start-tamper")
             for label, (repo, runtime, _, _) in executions.items()
         }
-        failures.extend("boot:" + name for name in compare_observations(
-            boot_snapshots["python"], boot_snapshots["native"],
-            reviewed_build_compat=True))
-        check((py.returncode == native.returncode == 0) == (args.case == "success"),
-              "unexpected full-chain outcome; " +
-              outcome_details(results, boot_snapshots) + "; " +
-              ", ".join(failures))
         if args.case == "success":
+            failures.extend("boot:" + name for name in compare_observations(
+                boot_snapshots["python"], boot_snapshots["native"],
+                reviewed_build_compat=True))
+            check(py.returncode == native.returncode == 0,
+                  "unexpected full-chain outcome; " +
+                  outcome_details(results, boot_snapshots) + "; " +
+                  ", ".join(failures))
             for runtime in (py_runtime, native_runtime):
                 check((runtime / "compute/evidence/result.json").is_file(),
                       "missing real KVM acceptance record")
         else:
+            require_fault_refusal(args.case, results)
+            for label in ("python", "native"):
+                require_fault_transition(
+                    args.case, label, snapshots[label], boot_snapshots[label])
             for runtime in (py_runtime, native_runtime):
                 check(not (runtime / "compute/evidence/result.json").exists(),
                       "refusal published acceptance")
@@ -2805,6 +2880,132 @@ def full(args):
 
 
 class DeterministicContracts(unittest.TestCase):
+    def test_rewritten_build_start_preserves_other_evidence_order(self):
+        parent = fresh(fixture_parent(), f"fault-order-{os.getpid()}")
+        try:
+            runtime = fresh(parent, "runtime")
+            compute = fresh(runtime, "compute")
+            evidence = fresh(compute, "evidence")
+            reference = oracle()
+            reference.APP = parent / "absent-app"
+            start = evidence / "build-start.json"
+            build = evidence / "build.json"
+            boot_inputs = evidence / "boot-inputs.json"
+            for path in (start, build, boot_inputs):
+                path.write_bytes(b"{}\n")
+                path.chmod(0o600)
+            os.utime(start, ns=(1_000_000_000, 1_000_000_000))
+            os.utime(build, ns=(2_000_000_000, 2_000_000_000))
+            os.utime(boot_inputs, ns=(4_000_000_000, 4_000_000_000))
+            self.assertEqual(
+                phase_snapshot(runtime, reference)["order"],
+                ("build-start.json", "build.json", "boot-inputs.json"))
+            os.utime(start, ns=(5_000_000_000, 5_000_000_000))
+            with self.assertRaisesRegex(
+                    ParityError, "evidence phase order changed"):
+                phase_snapshot(runtime, reference)
+            self.assertEqual(
+                phase_snapshot(runtime, reference, rewritten_build_start=True)[
+                    "order"],
+                ("build-start.json", "build.json", "boot-inputs.json"))
+            prelude = evidence / "prelude.json"
+            prelude.write_bytes(b"{}\n")
+            prelude.chmod(0o600)
+            os.utime(prelude, ns=(500_000_000, 500_000_000))
+            with mock.patch.dict(
+                    phase_snapshot.__globals__,
+                    {"ORDER": ("prelude.json", *ORDER)}):
+                self.assertEqual(
+                    phase_snapshot(
+                        runtime, reference, rewritten_build_start=True)["order"],
+                    ("prelude.json", "build-start.json",
+                     "build.json", "boot-inputs.json"))
+            os.utime(build, ns=(6_000_000_000, 6_000_000_000))
+            with mock.patch.dict(
+                    phase_snapshot.__globals__,
+                    {"ORDER": ("prelude.json", *ORDER)}):
+                with self.assertRaisesRegex(
+                        ParityError, "evidence phase order changed"):
+                    phase_snapshot(
+                        runtime, reference, rewritten_build_start=True)
+        finally:
+            shutil.rmtree(parent)
+
+    def test_fault_outcomes_and_post_states_are_case_exact(self):
+        reference = oracle()
+        original = {
+            "source": {"revision": "1" * 40, "tree": "2" * 40},
+        }
+        records = {
+            "build-start.json": (
+                reference.compact_json(original, newline=True), original),
+            "build.json": (b"{}\n", {}),
+        }
+        before = {
+            "reference": reference,
+            "files": {
+                "records": records,
+                "order": ("build-start.json", "build.json"),
+                "retained": {"boot-raw-x2apic": ("directory", 0o700, None)},
+                "artifacts": {"efi": (7, "a" * 64, 0o600)},
+            },
+        }
+        for case, (python_reason, native_cause) in FAULT_REFUSALS.items():
+            with self.subTest(case=case):
+                results = {
+                    "python": subprocess.CompletedProcess(
+                        [], 1, b"",
+                        f"WAMR_CI_REFUSED: {python_reason}\n".encode()),
+                    "native": subprocess.CompletedProcess(
+                        [], 1, b"",
+                        ("WAMR_CI_FAILED_STAGE: boot-platform; cause: "
+                         f"{native_cause}; bounded private logs retained.\n"
+                         ).encode()),
+                }
+                require_fault_refusal(case, results)
+                results["native"] = subprocess.CompletedProcess(
+                    [], 1, b"",
+                    b"WAMR_CI_FAILED_STAGE: boot-platform; cause: Other;\n")
+                with self.assertRaisesRegex(
+                        ParityError, "different fault outcome"):
+                    require_fault_refusal(case, results)
+                after = dict(before, files=copy.deepcopy(before["files"]))
+                current = after["files"]
+                if case == "build-start-tamper":
+                    changed = copy.deepcopy(original)
+                    changed["source"]["revision"] = "0" * 40
+                    current["records"]["build-start.json"] = (
+                        reference.compact_json(changed, newline=True), changed)
+                elif case == "missing-build":
+                    del current["records"]["build.json"]
+                    current["order"] = ("build-start.json",)
+                else:
+                    current["retained"]["boot-raw-x2apic/prior"] = (
+                        "file", 0o600, len(b"prior"))
+                with mock.patch(
+                        __name__ + ".verified_build_start_side") as verify:
+                    require_fault_transition(case, "python", before, after)
+                    checked = verify.call_args.args[0]
+                    self.assertEqual(
+                        checked["files"]["records"]["build-start.json"],
+                        before["files"]["records"]["build-start.json"])
+                current["artifacts"]["efi"] = (7, "b" * 64, 0o600)
+                with self.assertRaisesRegex(
+                        ParityError, "changed other retained outputs"):
+                    require_fault_transition(case, "python", before, after)
+                current["artifacts"]["efi"] = before["files"][
+                    "artifacts"]["efi"]
+                current["records"]["result.json"] = (b"{}\n", {})
+                with self.assertRaisesRegex(
+                        ParityError, "changed other evidence"):
+                    require_fault_transition(case, "python", before, after)
+                del current["records"]["result.json"]
+                current["retained"]["private/unreviewed"] = (
+                    "file", 0o600, 1)
+                with self.assertRaisesRegex(
+                        ParityError, "changed other retained outputs"):
+                    require_fault_transition(case, "python", before, after)
+
     def test_build_mismatch_refuses_before_boot(self):
         self.assertIsNone(require_matching_builds_before_boot([]))
         with self.assertRaisesRegex(
