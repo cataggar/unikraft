@@ -932,11 +932,36 @@ and [disk GET](https://github.com/Azure/azure-rest-api-specs/blob/main/specifica
 examples omit both `uniqueId` and `diskSizeBytes`; the offline checks require
 them and fail closed if the selected CLI/region omits either. CLI field
 presence and size/UUID/deployment response values still need redacted real
-response proof before any live use. Do not allocate Azure resources with this
-controller or reuse the one-disk lane until both gates and the response
-shapes are verified. Local QEMU boots without StorVSC devices are
-`UNAVAILABLE`, not real-host read evidence. Write/flush persistence remains
-a separate workload.
+response proof before any live use.
+
+Offline inspection of installed Azure CLI 2.90.0 and its
+[public release sources](https://github.com/Azure/azure-cli/tree/azure-cli-2.90.0/src/azure-cli/azure/cli/command_modules)
+confirms that `az disk create` maps `--upload-type Upload` and
+`--upload-size-bytes` (including the VHD footer) to a Compute `2025-01-02`
+disk PUT. Both [create](https://github.com/Azure/azure-cli/blob/azure-cli-2.90.0/src/azure-cli/azure/cli/command_modules/vm/aaz/latest/disk/_create.py)
+and [show](https://github.com/Azure/azure-cli/blob/azure-cli-2.90.0/src/azure-cli/azure/cli/command_modules/vm/aaz/latest/disk/_show.py)
+flatten disk properties for JSON output, with model fields for `diskSizeGb`,
+`diskSizeBytes`, `uniqueId`, and `creationData.uploadSizeBytes`. Those models
+do **not** guarantee that the service returns the optional fields or the
+expected values. `az deployment group create/show` use
+[deployment operations](https://github.com/Azure/azure-cli/blob/azure-cli-2.90.0/src/azure-cli/azure/cli/command_modules/resource/commands.py)
+and return service-backed deployment objects, not a fixed JSON example.
+`az resource show --ids ... --api-version 2025-11-01` passes that explicit
+version to the [generic resource GET](https://github.com/Azure/azure-cli/blob/azure-cli-2.90.0/src/azure-cli/azure/cli/command_modules/resource/custom.py);
+the pinned Compute schema documents a `Standard` security type, but there
+is no real VM response here. None of these offline command/model checks
+substitutes for approved, private, redacted create/show records.
+
+The separate private builder can bind the physical tracked Git tree, solved
+configuration, tool fingerprints, and built EFI in a two-pass receipt. Its
+existing guarded producer contract applies to the **persistence** profile,
+not this read-only topology profile. There is no reviewed topology-specific
+build receipt or private EFI/raw/VHD in this worktree, so neither the builder
+implementation nor an operator-provided hash lifts the preparation blocker.
+Do not allocate Azure resources with this controller or reuse the one-disk
+lane until both gates and the response shapes are verified. Local QEMU boots
+without StorVSC devices are `UNAVAILABLE`, not real-host read evidence.
+Write/flush persistence remains a separate workload.
 
 ## Private application-network peer
 
