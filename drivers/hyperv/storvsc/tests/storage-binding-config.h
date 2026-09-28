@@ -14,3 +14,10 @@
 #define CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_DISK0_SECTORS 2000
 #define CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_DISK_NONZERO_SECTORS 2300
 #define CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_NONZERO_LUN 3
+
+#include "../../../../support/build/tests/storvsc-host-include/uk/print.h"
+void storage_binding_capture_log(const char *format, ...);
+#undef uk_pr_err
+#undef uk_pr_debug
+#define uk_pr_err(...) storage_binding_capture_log(__VA_ARGS__)
+#define uk_pr_debug(...) storage_binding_capture_log(__VA_ARGS__)
