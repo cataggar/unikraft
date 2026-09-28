@@ -37,7 +37,7 @@ pub fn bind(accepted: *accepted_run.AcceptedRun, output: []const u8) !plan.Roots
     }
     const package_tool = try std.fs.path.join(a, &.{ compute, "tools/bin/wamr-ci-package" });
     const efi = try std.fs.path.join(a, &.{ repository, image });
-    const supervisor = try std.fs.path.join(a, &.{ compute, "supervisor/bin/wamr-ci-supervisor" });
+    const supervisor = try std.fs.path.join(a, &.{ accepted.root, "controller/bin/uk-wamr-native-ci" });
     return .{
         .source_root = repository,
         .runtime = accepted.root,

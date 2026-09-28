@@ -2,12 +2,13 @@
 const std = @import("std");
 const files = @import("hyperv_core").private_files;
 
-pub const Action = enum { build, boot, diagnostics, describe, records };
+pub const Action = enum { build, boot, diagnostics, describe, records, @"handoff-inspect" };
 pub const Command = struct {
     action: Action,
     runtime: ?[]const u8 = null,
     wamr_source: ?[]const u8 = null,
     stage_root: ?[]const u8 = null,
+    output: ?[]const u8 = null,
 };
 
 pub fn parse(args: []const []const u8) !Command {
@@ -47,6 +48,24 @@ pub fn parse(args: []const []const u8) !Command {
         if (!output or (result.runtime != null) == (result.stage_root != null) or
             transport != (result.stage_root != null))
             return error.InvalidUsage;
+        return result;
+    }
+    if (action == .@"handoff-inspect") {
+        if (args.len != 6) return error.InvalidUsage;
+        var result = Command{ .action = action };
+        var i: usize = 2;
+        while (i < args.len) : (i += 2) {
+            const flag = args[i];
+            const value = args[i + 1];
+            if (std.mem.eql(u8, flag, "--runtime") and result.runtime == null) {
+                files.absoluteFilePath(value) catch return error.InvalidUsage;
+                result.runtime = value;
+            } else if (std.mem.eql(u8, flag, "--output") and result.output == null) {
+                files.absoluteFilePath(value) catch return error.InvalidUsage;
+                result.output = value;
+            } else return error.InvalidUsage;
+        }
+        if (result.runtime == null or result.output == null) return error.InvalidUsage;
         return result;
     }
     if (args.len < 4 or args.len > 6 or args.len % 2 != 0) return error.InvalidUsage;

@@ -2736,7 +2736,8 @@ def report_progress(side, phase):
     check(side in ("python", "native")
           and phase in (
               "build-start", "build-done", "boot-start", "boot-done",
-              "records-start", "records-checked", "records-done"),
+              "records-start", "records-checked", "inspect-start",
+              "inspect-done", "records-done"),
           "invalid differential progress label")
     print(f"DIFFERENTIAL_PROGRESS: {side}:{phase}", file=sys.stderr, flush=True)
 
@@ -2773,6 +2774,8 @@ def full(args):
     check(args.case in {"success", "build-start-tamper", "missing-build",
                         "occupied-boot-slot", "prior-build-output"},
           "unknown differential case")
+    inspection_parent = (
+        fresh(parent, "native-inspection") if args.case == "success" else None)
     py_runtime = fresh(parent, "python")
     native_runtime = fresh(parent, "native")
     for runtime in (py_runtime, native_runtime):
@@ -2943,21 +2946,50 @@ def full(args):
         ], native_repo, dict(
             executions["native"][3], WAMR_CI_CONTROLLER=str(controller)),
             seconds=650)
-        # The comparison root is a pinned runtime ancestor until replay ends.
-        with (parent / "native-records.json").open("xb") as output:
-            os.fchmod(output.fileno(), 0o600)
-            output.write(result.stdout)
-            output.flush()
-            os.fsync(output.fileno())
-        refusal = re.search(
-            r"(?m)^(?:ValueError|wamr_native_ci\.Refusal): "
-            r"([A-Za-z][A-Za-z0-9 _-]{0,119})$",
-            bridged.stderr.decode("utf-8", "replace"))
-        check(bridged.returncode == 0,
-              "Python local handoff refused native-produced records: " +
-              (refusal.group(1) if refusal else "unexpected result"))
-        check(json.loads(bridged.stdout) == recorded["records"],
-              "Python local handoff returned different record hashes")
+        try:
+            refusal = re.search(
+                r"(?m)^(?:ValueError|wamr_native_ci\.Refusal): "
+                r"([A-Za-z][A-Za-z0-9 _-]{0,119})$",
+                bridged.stderr.decode("utf-8", "replace"))
+            check(bridged.returncode == 0,
+                  "Python local handoff refused native-produced records: " +
+                  (refusal.group(1) if refusal else "unexpected result"))
+            check(json.loads(bridged.stdout) == recorded["records"],
+                  "Python local handoff returned different record hashes")
+            report_progress("native", "inspect-start")
+            inspection = inspection_parent / "handoff"
+            inspected = command([
+                str(controller), "handoff-inspect",
+                "--runtime", str(native_runtime),
+                "--output", str(inspection),
+            ], native_repo, executions["native"][3], seconds=1200)
+            refusal = re.search(
+                r"(?m)^WAMR_CI_FAILED_STAGE: handoff-inspect; cause: "
+                r"([A-Za-z][A-Za-z0-9_]{0,79}); bounded private logs retained\.$",
+                inspected.stderr.decode("utf-8", "replace"))
+            check(inspected.returncode == 0
+                  and not inspected.stdout and not inspected.stderr,
+                  "native completed-run handoff inspection refused: " +
+                  (refusal.group(1) if refusal else "unexpected result"))
+            inspection_record = parsed(checked_file(
+                inspection / "evidence/command-handoff-inspect.json"), reference)
+            inspection_log = checked_file(
+                inspection / "private/handoff-inspect.log")
+            check(
+                inspection_record["scope"] == "command_diagnostic_not_acceptance"
+                and inspection_record["stage"] == "handoff-inspect"
+                and inspection_record["exit_code"] == 0
+                and inspection_record["bytes"] == len(inspection_log)
+                and inspection_record["sha256"] == sha(inspection_log),
+                "native handoff inspection command output changed")
+            report_progress("native", "inspect-done")
+        finally:
+            # The comparison root is a pinned runtime ancestor until replay ends.
+            with (parent / "native-records.json").open("xb") as output:
+                os.fchmod(output.fileno(), 0o600)
+                output.write(result.stdout)
+                output.flush()
+                os.fsync(output.fileno())
         report_progress("native", "records-done")
 
 

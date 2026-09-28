@@ -62,13 +62,16 @@ never falls back to Python after a native refusal. The caller must
 independently authenticate the executable
 provided by `WAMR_CI_CONTROLLER`; owner and mode checks alone do not prove
 its provenance. Protected paired boots have exercised the completed native
-local-record replay and Python record selection; the later publication gates
-remain separate. A typed native `handoff-inspect` operation binds the original compute
-supervisor and inputs but is not a production caller; the current native
-producer instead pins the records controller as `command-supervisor`, so that
-handoff operation refuses its records. Checkout/consumer custody and the
-remaining supervised handoff stages need native owners before `run.py` can be
-removed.
+local-record replay and Python record selection, with public-source
+publication and trusted import passing separately.
+`handoff-inspect --runtime ABS --output ABS` is a support-only stage for
+native-produced v2 runs. It uses the runtime-installed recorded controller
+and pinned package/EFI inputs, then retains its bounded private log and
+command record in a create-only owner-only output beneath an existing private
+parent outside the runtime's pinned input ancestors. It neither exports an
+image nor accepts a Python-produced runtime. Python remains the production
+handoff caller; checkout/consumer custody and the other supervised handoff
+stages need native owners before `run.py` can be removed.
 
 ## Native controller preparation (unpublished build path)
 

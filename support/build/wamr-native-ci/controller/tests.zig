@@ -219,7 +219,7 @@ fn handoffInspectFixtures() !void {
         .zig = bound_tool,
         .producer = bound_tool,
         .fixture_runner = bound_tool,
-        .supervisor = original_supervisor,
+        .supervisor = records_controller,
         .package_tool = original_tool,
         .validator = bound_tool,
         .supervisor_fixture = bound_tool,
@@ -240,7 +240,7 @@ fn handoffInspectFixtures() !void {
     const additional = [_]struct { role: []const u8, path: []const u8 }{
         .{ .role = "package_tool", .path = original_tool },
         .{ .role = "efi", .path = efi },
-        .{ .role = "command-supervisor", .path = original_supervisor },
+        .{ .role = "command-supervisor", .path = records_controller },
         .{ .role = "native:wamr-aot-build", .path = bound_tool },
         .{ .role = "native:wamr-log-validate", .path = bound_tool },
     };
@@ -253,16 +253,16 @@ fn handoffInspectFixtures() !void {
     accepted.repository = source;
     accepted.runtime_inputs = &pinned;
     const bound = try controller.handoff_inspect.bind(&accepted, output);
-    try std.testing.expectEqualStrings(original_supervisor, bound.supervisor);
+    try std.testing.expectEqualStrings(records_controller, bound.supervisor);
     try std.testing.expectEqualStrings(original_tool, bound.package_tool);
     try std.testing.expectEqualStrings(efi, bound.efi);
     try std.testing.expectEqualStrings(compute, bound.compute);
     try std.testing.expectEqualStrings(output, bound.work);
     try std.testing.expectError(error.UnboundCommandRole, bound.get("native:wamr-native-ci-fixtures"));
     try std.testing.expectError(error.UnboundCommandRole, bound.get("native:wamr-ci-supervisor-fixture"));
-    pinned[controller.input_custody.host_tools.len + 2].path = records_controller;
-    try std.testing.expectError(error.InputChanged, controller.handoff_inspect.bind(&accepted, output));
     pinned[controller.input_custody.host_tools.len + 2].path = original_supervisor;
+    try std.testing.expectError(error.InputChanged, controller.handoff_inspect.bind(&accepted, output));
+    pinned[controller.input_custody.host_tools.len + 2].path = records_controller;
     pinned[controller.input_custody.host_tools.len + 1].path = "/substituted/efi";
     try std.testing.expectError(error.InputChanged, controller.handoff_inspect.bind(&accepted, output));
     pinned[controller.input_custody.host_tools.len + 1].path = efi;
@@ -305,7 +305,7 @@ fn handoffInspectFixtures() !void {
     defer source_evidence.close(io);
     const tool_record = try controller.custody_files.readFile(io, bound_tool, 64 * 1024 * 1024, false);
     const package_record = try controller.custody_files.readFile(io, original_tool, 64 * 1024 * 1024, false);
-    const supervisor_record = try controller.custody_files.readFile(io, original_supervisor, 64 * 1024 * 1024, false);
+    const supervisor_record = try controller.custody_files.readFile(io, records_controller, 64 * 1024 * 1024, false);
     const tool_json = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .metadata = tool_record.metadata, .sha256 = tool_record.sha256 }, .{}), .{ .parse_numbers = false });
     const package_json = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .metadata = package_record.metadata, .sha256 = package_record.sha256 }, .{}), .{ .parse_numbers = false });
     const supervisor_json = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .metadata = supervisor_record.metadata, .sha256 = supervisor_record.sha256 }, .{}), .{ .parse_numbers = false });
@@ -1049,8 +1049,17 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
     const imported_records = try cli.parse(&.{ "uk-wamr-native-ci", "records", "--stage-root", "/stage", "--transport", "trusted-inner-zip", "--output", "handoff-v1" });
     try std.testing.expectEqual(cli.Action.records, imported_records.action);
     try std.testing.expectEqualStrings("/stage", imported_records.stage_root.?);
+    const inspection = try cli.parse(&.{ "uk-wamr-native-ci", "handoff-inspect", "--output", "/private/inspection", "--runtime", "/runtime" });
+    try std.testing.expectEqual(cli.Action.@"handoff-inspect", inspection.action);
+    try std.testing.expectEqualStrings("/runtime", inspection.runtime.?);
+    try std.testing.expectEqualStrings("/private/inspection", inspection.output.?);
     const rejected = [_][]const []const u8{
         &.{"uk-wamr-native-ci"},
+        &.{ "uk-wamr-native-ci", "handoff-inspect", "--runtime", "/runtime" },
+        &.{ "uk-wamr-native-ci", "handoff-inspect", "--runtime", "/runtime", "--output", "/private/../inspection" },
+        &.{ "uk-wamr-native-ci", "handoff-inspect", "--runtime", "/runtime", "--output", "/private/inspection", "--profile", "tiny" },
+        &.{ "uk-wamr-native-ci", "handoff-inspect", "--runtime", "/runtime", "--runtime", "/other" },
+        &.{ "uk-wamr-native-ci", "handoff-inspect", "--stage-root", "/stage", "--output", "/private/inspection" },
         &.{ "uk-wamr-native-ci", "records", "--runtime", "/runtime" },
         &.{ "uk-wamr-native-ci", "records", "--runtime", "/runtime", "--transport", "trusted-inner-zip", "--output", "handoff-v1" },
         &.{ "uk-wamr-native-ci", "records", "--stage-root", "/stage", "--output", "handoff-v1" },
@@ -1219,6 +1228,19 @@ test "accepted run requires complete local and trusted-inner-zip evidence before
     defer a.free(local_refusal.stderr);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, local_refusal.term);
     try std.testing.expectEqualStrings("", local_refusal.stdout);
+    const inspection_path = try std.fs.path.join(a, &.{ path, "inspection" });
+    defer a.free(inspection_path);
+    const inspection = try std.process.run(a, io, .{
+        .argv = &.{ options.host_controller_cli, "handoff-inspect", "--runtime", path, "--output", inspection_path },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(256),
+        .stderr_limit = .limited(4096),
+    });
+    defer a.free(inspection.stdout);
+    defer a.free(inspection.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, inspection.term);
+    try std.testing.expectEqualStrings("", inspection.stdout);
+    try std.testing.expectError(error.FileNotFound, root.openDir(io, "inspection", .{}));
 
     var parsed = try controller.records.parseCanonicalResult(a, accepted);
     defer parsed.deinit();

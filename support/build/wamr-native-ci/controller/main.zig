@@ -48,6 +48,22 @@ pub fn main(init: std.process.Init) void {
         stdout.interface.writeAll(encoded) catch refused(init.io);
         return;
     }
+    if (command.action == .@"handoff-inspect") {
+        const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
+        const root = command.runtime.?;
+        const runtime = controller.layout.runtime(init.io, root) catch refused(init.io);
+        defer runtime.close(init.io);
+        var accepted = controller.accepted_run.openAndValidate(
+            allocator, init.io, init.minimal.environ, &runtime, root, repository,
+        ) catch |err| failed(init.io, "handoff-inspect", "", err);
+        defer accepted.deinit();
+        var signal = controller.build_pipeline.installCancellation() catch refused(init.io);
+        defer signal.deinit();
+        _ = controller.handoff_inspect.run(
+            allocator, init.io, &accepted, command.output.?, signal.flag(),
+        ) catch |err| failed(init.io, "handoff-inspect", "", err);
+        return;
+    }
     const runtime = controller.layout.runtime(init.io, command.runtime.?) catch refused(init.io);
     defer runtime.close(init.io);
     const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
@@ -88,6 +104,7 @@ pub fn main(init: std.process.Init) void {
         },
         .describe => unreachable,
         .records => unreachable,
+        .@"handoff-inspect" => unreachable,
     }
 }
 
@@ -98,7 +115,8 @@ fn usage(io: std.Io) noreturn {
             "       uk-wamr-native-ci boot|diagnostics --runtime ABS\n" ++
             "       uk-wamr-native-ci describe --output json-v1\n" ++
             "       uk-wamr-native-ci records --runtime ABS --output handoff-v1\n" ++
-            "       uk-wamr-native-ci records --stage-root ABS --transport trusted-inner-zip --output handoff-v1\n",
+            "       uk-wamr-native-ci records --stage-root ABS --transport trusted-inner-zip --output handoff-v1\n" ++
+            "       uk-wamr-native-ci handoff-inspect --runtime ABS --output ABS\n",
     ) catch {};
     std.process.exit(2);
 }
