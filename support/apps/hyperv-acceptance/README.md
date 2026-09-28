@@ -99,12 +99,50 @@ sh support/apps/hyperv-acceptance/tests/topology-workload-test.sh
 ```
 
 The separate
-`support/scripts/hyperv_issue90_topology.py` controller can prepare a fresh
-image and two seeded disks offline, but its live run is **not yet safe**:
+`support/scripts/hyperv_issue90_topology.py` controller describes offline
+fresh-image and two-seed preparation, but its current `solved_config()` rejects
+the guarded I/O selected by this profile. Do not count its preparation as
+evidence until that mismatch is resolved. Its live run is **not yet safe**:
 if an Azure create response is lost, it cannot prove the original resource
 identity needed for mandatory owner-checked deletion. Do not allocate Azure
 resources through this lane until that failure path is resolved. The
 one-data-disk runner is not a substitute.
+
+### Outstanding local four-boot proof
+
+Fixtures, parsed or synthesized serial logs, and the default-smoke public CI
+image are **not** physical topology boot evidence. On a capable x86-64 host,
+build a fresh *public* topology-enabled EFI from a recorded source commit and
+solved config with non-secret, distinct local IDs; package and hash its complete
+raw GPT disk and complete fixed VHD independently. Record the source/config,
+EFI, raw, VHD (including footer), QEMU executable, and OVMF firmware SHA-256
+digests. Do not borrow private images, seeds, or Azure resources.
+
+Use the [native local-boot driver](../../tools/hyperv/local_boot/README.md)
+with real x86 QEMU/KVM, `/dev/kvm`, OVMF, and four distinct owned work
+directories. Boot both `--raw-disk` and **actual** `--fixed-vhd` (the native
+driver opens a read-only `vpc` node), each with and without `--disable-x2apic`.
+For every invocation require `--expect-main-return 2`,
+`--expect 'HYPERV_TOPOLOGY FINAL UNAVAILABLE reason=no-devices'` and
+`--require-marker 'HYPERV_TOPOLOGY RESULT UNAVAILABLE'`; forbid
+`HYPERV_TOPOLOGY FINAL PASS`, `UK_HYPERV_TOPOLOGY_READ_OK`,
+`HYPERV_TOPOLOGY TARGET INFO`, `HYPERV_TOPOLOGY OS_READ`,
+`HYPERV_TOPOLOGY DATA_READ`, `HYPERV_PERSISTENCE`, and
+`UK_HYPERV_IO_READY`. Require the
+`Using legacy xAPIC MMIO` marker only in the legacy boot and forbid it in
+the x2APIC boot. Inspect all four complete serial logs for exactly one
+UNAVAILABLE final/result pair, no real-device PASS or crash, and an anchored
+`main returned 2`; retain per-boot runner reports, raw serial hashes and
+input/command provenance. An offline parser test cannot replace any boot.
+
+The older Python `hyperv-azure.py` VHD path opens a **raw prefix** rather than
+a `vpc` node; its VHD-mode log is not proof of a fixed-VHD boot. The native
+driver currently requires `q35,accel=kvm` and a host CPU: a downloaded
+AArch64 QEMU/TCG executable does not make this four-boot recipe runnable on
+an AArch64 host without x86 KVM. QEMU can be obtained from
+[upstream signed source or distribution packages](https://www.qemu.org/download/);
+the repository also pins a public QEMU release in its x86 CI acquisition
+script. Neither acquisition path supplies the missing EFI, firmware, or KVM.
 
 The default private peer inputs are:
 
