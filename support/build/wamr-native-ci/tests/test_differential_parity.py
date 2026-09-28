@@ -2736,7 +2736,7 @@ def report_progress(side, phase):
     check(side in ("python", "native")
           and phase in (
               "build-start", "build-done", "boot-start", "boot-done",
-              "records-start", "records-done"),
+              "records-start", "records-checked", "records-done"),
           "invalid differential progress label")
     print(f"DIFFERENTIAL_PROGRESS: {side}:{phase}", file=sys.stderr, flush=True)
 
@@ -2931,6 +2931,7 @@ def full(args):
             output.write(result.stdout)
             output.flush()
             os.fsync(output.fileno())
+        report_progress("native", "records-checked")
         script = (
             "import importlib.util,json,sys\n"
             "from pathlib import Path\n"
@@ -2947,10 +2948,15 @@ def full(args):
         ], native_repo, dict(
             executions["native"][3], WAMR_CI_CONTROLLER=str(controller)),
             seconds=650)
-        check(bridged.returncode == 0
-              and json.loads(bridged.stdout)
-              == recorded["records"],
-              "Python local handoff refused native-produced records")
+        refusal = re.search(
+            r"(?m)^(?:ValueError|wamr_native_ci\.Refusal): "
+            r"([A-Za-z][A-Za-z0-9 _-]{0,119})$",
+            bridged.stderr.decode("utf-8", "replace"))
+        check(bridged.returncode == 0,
+              "Python local handoff refused native-produced records: " +
+              (refusal.group(1) if refusal else "unexpected result"))
+        check(json.loads(bridged.stdout) == recorded["records"],
+              "Python local handoff returned different record hashes")
         report_progress("native", "records-done")
 
 

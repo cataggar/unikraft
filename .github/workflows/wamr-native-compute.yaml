@@ -707,6 +707,15 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Retain bounded paired native replay for handoff diagnosis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wamr-native-replay-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /d/wamr-ci/wamr-differential/native-records.json
+          if-no-files-found: ignore
+          retention-days: 7
+
   wamr-differential-parity:
     needs: wamr-native-compute
     runs-on: ubuntu-24.04
