@@ -108,6 +108,10 @@ def version_environment(base):
 def configure_environment(args, base, app, output, config, values):
     kconfig_dir = output / "native-config" / "kconfig"
     kconfig_dir.mkdir(parents=True, exist_ok=True)
+    portable_flag = os.environ.get("WAMR_CI_PORTABLE_CONFIG")
+    if portable_flag not in (None, "1"):
+        raise ValueError("invalid portable Kconfig selection")
+    portable = portable_flag == "1"
     fullversion, codename = version_environment(base)
     configured_name = unquote(values.get("UK_NAME", ""))
     image_name = args.image_name or configured_name or app.name
@@ -120,6 +124,8 @@ def configure_environment(args, base, app, output, config, values):
             "BUILD_DIR": str(output),
             "UK_BASE": str(base),
             "UK_APP": str(app),
+            "UK_CONFIG_BASE": "/wamr-ci/source" if portable else str(base),
+            "UK_CONFIG_APP": "/wamr-ci/app" if portable else str(app),
             "UK_CONFIG": str(config),
             "UK_FULLVERSION": fullversion,
             "UK_CODENAME": codename,

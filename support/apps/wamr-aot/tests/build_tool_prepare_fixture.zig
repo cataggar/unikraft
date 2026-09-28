@@ -15,6 +15,67 @@ fn run(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const arguments = try init.minimal.args.toSlice(allocator);
     try recordEnvironment(init, allocator, arguments);
+    if (arguments.len >= 3 and std.mem.eql(u8, arguments[1], "ar")) {
+        if (arguments.len == 4 and std.mem.eql(u8, arguments[2], "t")) {
+            try failIfSelected(init, "runtime-archive-members");
+            const cache = init.environ_map.get("ZIG_LOCAL_CACHE_DIR") orelse
+                return error.MissingCache;
+            var stdout = std.Io.File.stdout().writer(init.io, &.{});
+            if (init.environ_map.get("WAMR_PREPARE_FIXTURE_INVALID_MEMBER") != null)
+                try stdout.interface.writeAll("unexpected.o\n")
+            else
+                try stdout.interface.print(
+                    "{s}/o/0123456789abcdef0123456789abcdef/libwamr-aot_zcu.o\n",
+                    .{cache},
+                );
+            return;
+        }
+        if (arguments.len == 5 and std.mem.eql(u8, arguments[2], "x") and
+            std.mem.startsWith(u8, arguments[3], "--output="))
+        {
+            try failIfSelected(init, "runtime-archive-extract");
+            const bytes = try std.Io.Dir.cwd().readFileAlloc(
+                init.io,
+                arguments[4],
+                allocator,
+                .limited(1024 * 1024),
+            );
+            const member = if (std.mem.indexOf(u8, bytes, "\nmember-name=")) |index|
+                bytes[0 .. index + 1]
+            else
+                bytes;
+            const output = try std.fs.path.join(allocator, &.{
+                arguments[3]["--output=".len..], "libwamr-aot_zcu.o",
+            });
+            try writeFile(init.io, output, member, 0o600);
+            return;
+        }
+        if (arguments.len == 5 and std.mem.eql(u8, arguments[2], "rcsD") and
+            std.mem.eql(u8, arguments[4], "libwamr-aot_zcu.o"))
+        {
+            try failIfSelected(init, "runtime-archive-repack");
+            const bytes = try std.Io.Dir.cwd().readFileAlloc(
+                init.io,
+                arguments[4],
+                allocator,
+                .limited(1024 * 1024),
+            );
+            try writeFile(init.io, arguments[3], bytes, 0o600);
+            return;
+        }
+        return error.InvalidArguments;
+    }
+    if (arguments.len == 4 and std.mem.eql(u8, arguments[1], "--strip-debug")) {
+        try failIfSelected(init, "runtime-strip");
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(
+            init.io,
+            arguments[2],
+            allocator,
+            .limited(1024 * 1024),
+        );
+        try writeFile(init.io, arguments[3], bytes, 0o600);
+        return;
+    }
     if (arguments.len >= 2 and std.mem.eql(u8, arguments[1], "version")) {
         try failIfSelected(init, "version");
         var stdout = std.Io.File.stdout().writer(init.io, &.{});
@@ -61,10 +122,20 @@ fn run(init: std.process.Init) !void {
                 allocator,
                 &.{ prefix, "lib", "libwamr-aot.a" },
             );
+            const member_name = if (init.environ_map.get(
+                "WAMR_PREPARE_FIXTURE_ARCHIVE_PATH_DEPENDENT",
+            ) != null)
+                try std.fmt.allocPrint(
+                    allocator,
+                    "member-name={s}\n",
+                    .{init.environ_map.get("ZIG_LOCAL_CACHE_DIR") orelse return error.MissingCache},
+                )
+            else
+                "";
             const payload = try std.fmt.allocPrint(
                 allocator,
-                "fixture-library variant={s} coremark={s}\n",
-                .{ variant, coremark },
+                "fixture-library variant={s} coremark={s}\n{s}",
+                .{ variant, coremark, member_name },
             );
             try writeFile(init.io, library, payload, 0o600);
             if (std.mem.eql(u8, variant, "jit") or
@@ -120,6 +191,17 @@ fn recordEnvironment(
 }
 
 fn stageName(arguments: []const []const u8) []const u8 {
+    if (arguments.len >= 3 and std.mem.eql(u8, arguments[1], "ar"))
+        return if (std.mem.eql(u8, arguments[2], "t"))
+            "runtime-archive-members"
+        else if (std.mem.eql(u8, arguments[2], "x"))
+            "runtime-archive-extract"
+        else if (std.mem.eql(u8, arguments[2], "rcsD"))
+            "runtime-archive-repack"
+        else
+            "invalid";
+    if (arguments.len >= 2 and std.mem.eql(u8, arguments[1], "--strip-debug"))
+        return "runtime-strip";
     if (arguments.len >= 2 and std.mem.eql(u8, arguments[1], "version"))
         return "version";
     if (arguments.len >= 2 and std.mem.eql(u8, arguments[1], "compile"))

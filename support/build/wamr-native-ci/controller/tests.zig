@@ -280,6 +280,53 @@ test "result refuses unpinned evidence files and directories before publication"
     try controller.boot_pipeline.testing.checkExactEvidence(&ctx);
 }
 
+test "boot recheck uses transient scratch and refuses changed pinned evidence with no persistent space" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "boot-recheck-{d}", .{std.os.linux.getpid()});
+    defer a.free(name);
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("boot recheck fixture cleanup failed");
+    const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    defer a.free(path);
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    try root.createDir(io, "evidence", .fromMode(0o700));
+    const evidence = try root.openDir(io, "evidence", .{ .iterate = true });
+    defer evidence.close(io);
+    try writeFixtureFile(io, evidence, "build.json", "{}\n");
+    try writeFixtureFile(io, evidence, "build-start.json", "{}\n");
+    const build_path = try std.fs.path.join(a, &.{ path, "evidence/build.json" });
+    defer a.free(build_path);
+    const start_path = try std.fs.path.join(a, &.{ path, "evidence/build-start.json" });
+    defer a.free(start_path);
+    var signal = try controller.build_pipeline.installCancellation();
+    defer signal.deinit();
+    var empty: [0]u8 = .{};
+    var no_growth = std.heap.FixedBufferAllocator.init(&empty);
+    var base: controller.build_pipeline.Context = .{
+        .allocator = no_growth.allocator(), .io = io, .environ = undefined, .runtime = path,
+        .repository = options.repository_root, .wamr = "", .compute = path,
+        .git = undefined, .tools = undefined, .roots = undefined, .signal = &signal,
+        .build_start_record = try controller.custody_files.readFile(io, start_path, 4096, true),
+    };
+    base.build_start_record.?.bytes += 1;
+    var ctx: controller.boot_pipeline.Context = .{
+        .build_context = &base,
+        .pinned = std.StringHashMap(controller.custody_files.File).init(a),
+    };
+    defer ctx.pinned.deinit();
+    try ctx.pinned.put("build.json", try controller.custody_files.readFile(io, build_path, 4096, true));
+    for (0..3) |_| try std.testing.expectError(error.BuildStartChanged,
+        controller.boot_pipeline.testing.revalidateBase(&ctx));
+    try evidence.deleteFile(io, "build.json");
+    try writeFixtureFile(io, evidence, "build.json", "{\"changed\":true}\n");
+    try std.testing.expectError(error.EvidenceChanged,
+        controller.boot_pipeline.testing.revalidateBase(&ctx));
+}
+
 test "changed raw QCOW2 and derived VHD images never publish compute evidence" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -839,6 +886,43 @@ test "embedded tracked source closure and physical/no-follow checks" {
     try std.testing.expectError(error.FileNotFound, source.verifyPhysical(std.testing.io, std.testing.allocator, "/d/does-not-exist-controller"));
 }
 
+test "recaptured source custody compares content, not allocated string addresses" {
+    const allocator = std.testing.allocator;
+    const source = controller.source_custody;
+    const before: source.Source = .{
+        .revision = "revision",
+        .tree = "tree",
+        .custody = .{
+            .object_format = "sha1",
+            .files = 4,
+            .directories = 2,
+            .bytes = 128,
+            .content_sha256 = [_]u8{'a'} ** 64,
+            .physical_sha256 = [_]u8{'b'} ** 64,
+        },
+    };
+    const revision = try allocator.dupe(u8, before.revision);
+    defer allocator.free(revision);
+    const tree = try allocator.dupe(u8, before.tree);
+    defer allocator.free(tree);
+    const format = try allocator.dupe(u8, before.custody.object_format);
+    defer allocator.free(format);
+    var actual = before;
+    actual.revision = revision;
+    actual.tree = tree;
+    actual.custody.object_format = format;
+    try std.testing.expect(before.same(actual));
+
+    actual.custody.physical_sha256[0] = 'c';
+    try std.testing.expect(!before.same(actual));
+    actual.custody = before.custody;
+    actual.custody.object_format = "sha256";
+    try std.testing.expect(!before.same(actual));
+    actual.custody = before.custody;
+    actual.custody.role_excluded_outputs[0] = "unexpected";
+    try std.testing.expect(!before.same(actual));
+}
+
 test "frozen custody limits, component-bound roles and first excess" {
     const l = controller.custody_limits;
     try std.testing.expectEqual(@as(usize, 40_000), l.tracked_entries);
@@ -989,7 +1073,7 @@ test "native clean Git custody, stable physical identities and pinned archive re
     const exact_version = try controller.source_custody.gitOutput(allocator, io, path, options.git_executable, &.{"version"}, version.len, null);
     defer allocator.free(exact_version);
     try std.testing.expectEqualStrings(version, exact_version);
-    try std.testing.expectError(error.GitRefused, controller.source_custody.gitOutput(
+    try std.testing.expectError(error.GitOutputOverflow, controller.source_custody.gitOutput(
         allocator,
         io,
         path,
@@ -1012,6 +1096,25 @@ test "native clean Git custody, stable physical identities and pinned archive re
         allocator.free(captured.custody.object_format);
     }
     try std.testing.expectEqual(@as(usize, 4), captured.custody.files);
+    var signal = try controller.build_pipeline.installCancellation();
+    defer signal.deinit();
+    var empty: [0]u8 = .{};
+    var no_growth = std.heap.FixedBufferAllocator.init(&empty);
+    var context: controller.build_pipeline.Context = .{
+        .allocator = no_growth.allocator(),
+        .io = io,
+        .environ = undefined,
+        .runtime = path,
+        .repository = path,
+        .wamr = "",
+        .compute = path,
+        .git = options.git_executable,
+        .tools = undefined,
+        .roots = undefined,
+        .signal = &signal,
+        .source = captured,
+    };
+    for (0..3) |_| try controller.build_pipeline.requireSource(&context);
     const unchanged = try controller.source_custody.source(allocator, io, path, options.git_executable);
     defer {
         allocator.free(unchanged.revision);
@@ -1051,7 +1154,7 @@ test "native clean Git custody, stable physical identities and pinned archive re
     try limited_dir.createDir(io, "custody", .fromMode(0o700));
     const limited_path = try std.fs.path.join(allocator, &.{ path, ".d/runtime-limited" });
     defer allocator.free(limited_path);
-    try std.testing.expectError(error.GitRefused, controller.source_custody.Fixture.sealLimited(
+    if (controller.source_custody.Fixture.sealLimited(
         allocator,
         io,
         path,
@@ -1059,7 +1162,8 @@ test "native clean Git custody, stable physical identities and pinned archive re
         options.git_executable,
         captured.revision,
         1024,
-    ));
+    )) |_| return error.OversizedArchiveAccepted else |err|
+        try std.testing.expect(err == error.GitExited or err == error.GitOutputOverflow);
     const limited_archive = try std.fs.path.join(allocator, &.{ limited_path, "custody/wamr-source.tar" });
     defer allocator.free(limited_archive);
     try std.testing.expect((try controller.custody_files.readFile(io, limited_archive, 1024, true)).bytes <= 1024);
@@ -1526,6 +1630,52 @@ test "source custody diagnostics cap changes at 64 without losing total" {
 
 test "direct shared supervisor retains bounded native success and failure evidence" {
     try directSharedSupervisorFixtures();
+}
+
+test "accepted build records replay at the 4 MiB boundary, not the tracked-file limit" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "build-record-replay-{d}", .{std.os.linux.getpid()});
+    defer a.free(name);
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("build record fixture cleanup failed");
+    const work = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    defer a.free(work);
+    const slot = try parent.openDir(io, name, .{ .iterate = true });
+    defer slot.close(io);
+    try slot.createDir(io, "evidence", .fromMode(0o700));
+    const evidence = try slot.openDir(io, "evidence", .{ .iterate = true });
+    defer evidence.close(io);
+    const boundary = 4 * 1024 * 1024;
+    const content = try a.alloc(u8, boundary + 1);
+    defer a.free(content);
+    @memset(content, 'x');
+    for ([_][]const u8{ "build-start.json", "build.json" }, 0..) |record, index| {
+        const file = try evidence.createFile(io, record, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+        defer file.close(io);
+        try file.writePositionalAll(io, content[0 .. boundary + index], 0);
+    }
+    var signal = try controller.build_pipeline.installCancellation();
+    defer signal.deinit();
+    var context: controller.build_pipeline.Context = .{
+        .allocator = a,
+        .io = io,
+        .environ = undefined,
+        .runtime = work,
+        .repository = options.repository_root,
+        .wamr = work,
+        .compute = work,
+        .git = undefined,
+        .tools = undefined,
+        .roots = undefined,
+        .signal = &signal,
+    };
+    const accepted = try controller.build_pipeline.readAcceptedRecord(&context, "build-start.json");
+    defer a.free(accepted);
+    try std.testing.expectEqualSlices(u8, content[0..boundary], accepted);
+    try std.testing.expectError(error.FileTooLarge, controller.build_pipeline.readAcceptedRecord(&context, "build.json"));
 }
 
 test "late cancellation refuses final build publication after record preparation" {

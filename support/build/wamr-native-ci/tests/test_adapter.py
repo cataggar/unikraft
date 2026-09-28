@@ -973,9 +973,10 @@ class Evidence(unittest.TestCase):
         owner = type("Handoff", (), {"ci": ci})
         events = []
 
-        def recorded(expected, content=False):
+        def recorded(expected, content=False, on_role=None):
             self.assertIs(expected, consumer)
             self.assertTrue(content)
+            self.assertIsNotNone(on_role)
             self.assertIsNone(ci.COMMAND_SUPERVISOR_PATH)
             events.append("consumer")
 
@@ -1092,6 +1093,68 @@ class Evidence(unittest.TestCase):
                     self.assertRaises((ValueError, ci.Refusal)):
                 public_bundle.accepted_public_build_start(owner, runtime)
             bind.assert_not_called()
+            self.assertEqual(
+                owner.FAILURE_STAGE,
+                "public-build-start-consumer-roles"
+                if case == "missing" else "public-build-start-consumer-custody")
+
+    def test_public_custody_reports_fixed_role_without_recorded_paths(self):
+        inputs = self.root / "public-custody-roles"
+        tree = inputs / "zig"
+        tree.mkdir(parents=True, mode=0o700)
+        paths = {
+            "native:wamr-aot-build": inputs / "native",
+            "runtime:/private/untrusted-path": inputs / "loader",
+            "tool:git": inputs / "git",
+        }
+        for path in (*paths.values(), tree / "data"):
+            self.put(path, b"baseline")
+        owner = types.SimpleNamespace(ci=ci, FAILURE_STAGE="handoff")
+        for role, path, label in (
+                ("native:wamr-aot-build", paths["native:wamr-aot-build"],
+                 "native-build"),
+                ("runtime:/private/untrusted-path",
+                 paths["runtime:/private/untrusted-path"], "runtime"),
+                ("tool:git", paths["tool:git"], "tool-git"),
+                ("zig", tree / "data", "zig")):
+            with self.subTest(role=label):
+                expected = ci.record_input_paths(paths, {"zig": tree})
+                ci.require_recorded_consumer_inputs(
+                    expected, content=True,
+                    on_role=lambda kind, name:
+                    public_bundle.public_consumer_custody_stage(
+                        owner, kind, name))
+                self.assertEqual(
+                    owner.FAILURE_STAGE,
+                    "public-build-start-consumer-custody-aggregate")
+                path.write_bytes(b"changed")
+                with self.assertRaises(ci.Refusal):
+                    ci.require_recorded_consumer_inputs(
+                        expected, content=True,
+                        on_role=lambda kind, name:
+                        public_bundle.public_consumer_custody_stage(
+                            owner, kind, name))
+                self.assertEqual(
+                    owner.FAILURE_STAGE,
+                    "public-build-start-consumer-custody-" + label)
+
+    def test_precreated_parity_slots_preserve_recorded_runtime_ancestor(self):
+        parent = self.root / "paired-parent"
+        runtime = parent / "runtime"
+        sources = parent / "sources"
+        comparison = parent / "comparison"
+        for directory in (runtime, sources, comparison):
+            directory.mkdir(parents=True, mode=0o700)
+        tool = runtime / "tool"
+        self.put(tool, b"bound")
+        expected = ci.record_input_paths({"tool:git": tool}, {})
+        (sources / "python").mkdir(mode=0o700)
+        (comparison / "result").mkdir(mode=0o700)
+        (sources / "python").rmdir()
+        ci.require_recorded_consumer_inputs(expected, content=True)
+        (parent / "late-slot").mkdir(mode=0o700)
+        with self.assertRaisesRegex(ci.Refusal, "directory custody changed"):
+            ci.require_recorded_consumer_inputs(expected, content=True)
 
     def test_public_context_binds_installed_log_validator_or_refuses(self):
         runtime = self.root / "public-validator-runtime"
@@ -1136,7 +1199,9 @@ class Evidence(unittest.TestCase):
         original_tools = dict(ci.COMMAND_TOOL_PATHS)
         original_environment = dict(ci.COMMAND_ENVIRONMENT)
         try:
-            for case in ("present", "missing", "wrong-path", "extra-role"):
+            for case in (
+                    "present", "missing", "wrong-path", "extra-role",
+                    "wrong-tree"):
                 candidate = copy.deepcopy(start)
                 if case == "missing":
                     del candidate["consumer_inputs"]["files"][
@@ -1147,6 +1212,9 @@ class Evidence(unittest.TestCase):
                 elif case == "extra-role":
                     candidate["consumer_inputs"]["files"][
                         "native:unapproved"] = {"path": "/trusted/other"}
+                elif case == "wrong-tree":
+                    candidate["consumer_inputs"]["trees"]["zig"][
+                        "path"] = "/trusted/other"
                 ci.COMMAND_SUPERVISOR_PATH = None
                 ci.COMMAND_TOOL_PATHS.clear()
                 ci.COMMAND_ENVIRONMENT.clear()
@@ -1185,7 +1253,7 @@ class Evidence(unittest.TestCase):
                             runtime / "compute")
                         context.assert_called_once_with(owner, candidate)
                         bind.assert_called_once_with(consumer)
-                        self.assertEqual(owner.FAILURE_STAGE, "public-context")
+                        self.assertEqual(owner.FAILURE_STAGE, "public-context-entry")
                     else:
                         failure = (
                             ci.Refusal if case == "missing" else ValueError)
@@ -1193,6 +1261,13 @@ class Evidence(unittest.TestCase):
                             public_bundle.publish_ci(owner)
                         bind.assert_not_called()
                         context.assert_not_called()
+                        self.assertEqual(
+                            owner.FAILURE_STAGE,
+                            "public-build-start-path-binaries"
+                            if case in ("missing", "wrong-path") else
+                            "public-build-start-path-runtime"
+                            if case == "extra-role" else
+                            "public-build-start-path-trees")
         finally:
             ci.COMMAND_SUPERVISOR_PATH = original_supervisor
             ci.COMMAND_TOOL_PATHS.clear()
@@ -1905,6 +1980,14 @@ class Evidence(unittest.TestCase):
             }
 
         def command(runtime, expected, root, stage, args, *unused):
+            self.assertEqual(ci.COMMAND_ENVIRONMENT["WAMR_CI_PORTABLE_CONFIG"], "1")
+            self.assertEqual(os.environ["WAMR_CI_PORTABLE_CONFIG"], "1")
+            planned = {
+                item["name"]: item["value"]
+                for item in ci.production_command_contract(stage)["environment"]
+            }
+            self.assertEqual(
+                planned["WAMR_CI_PORTABLE_CONFIG"], ci.command_literal("1"))
             fixture_only = (
                 "WAMR_CI_PACKAGE",
                 "WAMR_CI_PYTHON",

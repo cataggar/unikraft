@@ -298,6 +298,7 @@ pub fn environment(allocator: std.mem.Allocator, stage: Stage) ![]EnvironmentBin
         .{ .name = "KCONFIG_OVERWRITECONFIG", .value = .{ .literal = "1" } },
         .{ .name = "M4", .value = .{ .path = .{ .role = "tool:m4" } } },
         .{ .name = "MAKEFLAGS", .value = .{ .literal = "-j2" } },
+        .{ .name = "WAMR_CI_PORTABLE_CONFIG", .value = .{ .literal = "1" } },
         .{ .name = "ZIG_GLOBAL_CACHE_DIR", .value = .{ .path = .{ .role = "work", .relative = "global-cache" } } },
         .{ .name = "ZIG_LIB_DIR", .value = .{ .path = .{ .role = "tool-tree:zig", .relative = "lib" } } },
         .{ .name = "ZIG_LOCAL_CACHE_DIR", .value = .{ .path = .{ .role = "work", .relative = "cache" } } },

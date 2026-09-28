@@ -464,7 +464,18 @@ HOSTRANLIB	:= $(shell which $(HOSTRANLIB) || type -p $(HOSTRANLIB) || echo ranli
 HOSTCC_VERSION	:= $(shell $(HOSTCC_NOCCACHE) --version | \
 		   $(SED) -n -r 's/^.* ([0-9]*)\.([0-9]*)\.([0-9]*)[ ]*.*/\1 \2/p')
 # UTC time in ISO 8601 format:
+ifeq ($(WAMR_CI_PORTABLE_CONFIG),1)
+HOSTEPOCH	:= $(shell git -C "$(CONFIG_UK_BASE)" show -s --format=%ct HEAD)
+ifeq ($(HOSTEPOCH),)
+$(error Portable CI requires a source commit timestamp)
+endif
+HOSTUTC		:= $(shell date -Iseconds -u -d "@$(HOSTEPOCH)")
+ifeq ($(HOSTUTC),)
+$(error Portable CI could not format the source commit timestamp)
+endif
+else
 HOSTUTC		:= $(shell date -Iseconds -u)
+endif
 HOSTNAME	:= $(shell hostname -s)
 HOSTUSER	:= $(shell whoami)
 
@@ -769,6 +780,10 @@ CFLAGS		+= -DCC_VERSION=$(CC_VERSION)
 CXXFLAGS	+= -DCC_VERSION=$(CC_VERSION)
 GOCFLAGS	+= -DCC_VERSION=$(CC_VERSION)
 
+ifeq ($(WAMR_CI_PORTABLE_CONFIG),1)
+DBGFLAGS	+= -fdebug-prefix-map=$(CONFIG_UK_BASE)=/wamr-ci/source
+endif
+
 # Add user supplied flags as the last assignments
 ASFLAGS  += $(UK_ASFLAGS)
 CFLAGS   += $(UK_CFLAGS)
@@ -986,6 +1001,8 @@ COMMON_CONFIG_ENV = \
 	BUILD_DIR="$(BUILD_DIR)" \
 	UK_BASE="$(CONFIG_UK_BASE)" \
 	UK_APP="$(CONFIG_UK_APP)" \
+	UK_CONFIG_BASE="$(if $(filter 1,$(WAMR_CI_PORTABLE_CONFIG)),/wamr-ci/source,$(CONFIG_UK_BASE))" \
+	UK_CONFIG_APP="$(if $(filter 1,$(WAMR_CI_PORTABLE_CONFIG)),/wamr-ci/app,$(CONFIG_UK_APP))" \
 	UK_CONFIG="$(UK_CONFIG)" \
 	UK_FULLVERSION="$(UK_FULLVERSION)" \
 	UK_CODENAME="$(UK_CODENAME)" \

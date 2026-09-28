@@ -602,6 +602,7 @@ def ci_runtime(ci):
 
 def ci_context(handoff, start):
     ci = handoff.ci
+    handoff.FAILURE_STAGE = "public-context-environment"
     require(os.environ.get("GITHUB_ACTIONS") == "true"
             and os.environ.get("GITHUB_REPOSITORY") == "cataggar/unikraft"
             and os.environ.get("GITHUB_JOB") == "wamr-native-compute"
@@ -610,17 +611,21 @@ def ci_context(handoff, start):
             and os.environ.get("GITHUB_WORKSPACE") == str(ci.REPO)
             and os.environ.get("GITHUB_WORKFLOW_REF", "").startswith(
                 "cataggar/unikraft/.github/workflows/wamr-native-compute.yaml@"))
+    handoff.FAILURE_STAGE = "public-context-source"
     source = ci.source()
     require(ci.source_identity(source) == start["source"]
             and os.environ.get("GITHUB_SHA") == source["revision"])
+    handoff.FAILURE_STAGE = "public-context-binding"
     return context(dict(repository="cataggar/unikraft", run_id=os.environ["GITHUB_RUN_ID"],
                         run_attempt=os.environ["GITHUB_RUN_ATTEMPT"],
                         source_revision=source["revision"], source_tree=source["tree"],
                         wamr_revision=ci.REVISION))
 
 
-def require_public_consumer_paths(ci, runtime, consumer_inputs):
+def require_public_consumer_paths(handoff, runtime, consumer_inputs):
+    ci = handoff.ci
     files = consumer_inputs["files"]
+    handoff.FAILURE_STAGE = "public-build-start-path-roles"
     required_files = (
         {f"tool:{name}" for name in ci.HOST_TOOLS}
         | {
@@ -629,6 +634,7 @@ def require_public_consumer_paths(ci, runtime, consumer_inputs):
             ci.WAMR_AOT_BUILD_ROLE,
         })
     require(required_files <= set(files))
+    handoff.FAILURE_STAGE = "public-build-start-path-binaries"
     supervisor = (
         runtime / "compute/supervisor/bin/wamr-ci-supervisor").resolve(
             strict=True)
@@ -649,6 +655,7 @@ def require_public_consumer_paths(ci, runtime, consumer_inputs):
             and files["wamr-source-archive"]["path"]
             == str((runtime / "custody/wamr-source.tar").resolve(
                 strict=True)))
+    handoff.FAILURE_STAGE = "public-build-start-path-runtime"
     runtime_paths = set()
     for name in ci.HOST_TOOLS:
         runtime_paths.update(ci.executable_runtime_paths(
@@ -662,6 +669,7 @@ def require_public_consumer_paths(ci, runtime, consumer_inputs):
         "runtime:" + str(path) for path in runtime_paths
     }
     require(set(files) == expected_files)
+    handoff.FAILURE_STAGE = "public-build-start-path-trees"
     trees = consumer_inputs["trees"]
     require(set(trees) == {"bison", "python-stdlib", "zig", "llvm"}
             and trees["bison"]["path"]
@@ -676,8 +684,33 @@ def require_public_consumer_paths(ci, runtime, consumer_inputs):
     return consumer_inputs
 
 
+def public_consumer_custody_stage(handoff, kind, role):
+    if kind == "file":
+        if role in {f"tool:{name}" for name in handoff.ci.HOST_TOOLS}:
+            label = role.replace(":", "-")
+        elif role.startswith("runtime:"):
+            label = "runtime"
+        elif role in {
+                "command-supervisor", "wamr-source-archive",
+                handoff.ci.WAMR_AOT_BUILD_ROLE,
+                handoff.ci.WAMR_LOG_VALIDATOR_ROLE}:
+            label = {
+                handoff.ci.WAMR_AOT_BUILD_ROLE: "native-build",
+                handoff.ci.WAMR_LOG_VALIDATOR_ROLE: "native-validator",
+            }.get(role, role)
+        else:
+            label = "other-file"
+    elif kind == "tree":
+        label = role if role in {
+            "bison", "python-stdlib", "zig", "llvm"} else "other-tree"
+    else:
+        label = "aggregate"
+    handoff.FAILURE_STAGE = "public-build-start-consumer-custody-" + label
+
+
 def accepted_public_build_start(handoff, runtime):
     ci = handoff.ci
+    handoff.FAILURE_STAGE = "public-build-start-shape"
     start = ci.document(runtime / "compute/evidence/build-start.json")
     require(set(start) == {
         "source", "source_custody", "tools", "bison_data",
@@ -692,16 +725,22 @@ def accepted_public_build_start(handoff, runtime):
     source_custody_record(ci, start["source_custody"])
     consumer_input_record(ci, start["consumer_inputs"])
     command_supervisor_record(start["command_supervisor"])
+    handoff.FAILURE_STAGE = "public-build-start-consumer-roles"
     files = start["consumer_inputs"]["files"]
     required_files = (
         {f"tool:{name}" for name in ci.HOST_TOOLS}
         | {"wamr-source-archive", "command-supervisor"})
     require(required_files <= set(files))
+    handoff.FAILURE_STAGE = "public-build-start-consumer-trees"
     require_consumer_tree_roles(start["consumer_inputs"], False)
+    handoff.FAILURE_STAGE = "public-build-start-consumer-custody"
     ci.require_recorded_consumer_inputs(
-        start["consumer_inputs"], content=True)
-    require_public_consumer_paths(ci, runtime, start["consumer_inputs"])
+        start["consumer_inputs"], content=True,
+        on_role=lambda kind, role: public_consumer_custody_stage(
+            handoff, kind, role))
+    require_public_consumer_paths(handoff, runtime, start["consumer_inputs"])
 
+    handoff.FAILURE_STAGE = "public-build-start-dependencies"
     original_tools = dict(ci.COMMAND_TOOL_PATHS)
     ci.COMMAND_TOOL_PATHS.clear()
     ci.COMMAND_TOOL_PATHS["git"] = files["tool:git"]["path"]
@@ -717,6 +756,7 @@ def accepted_public_build_start(handoff, runtime):
     ci.COMMAND_SUPERVISOR_PATH = None
     ci.COMMAND_ENVIRONMENT.update(
         ci.bind_command_tools(start["consumer_inputs"]))
+    handoff.FAILURE_STAGE = "public-build-start-custody"
     ci.require_recorded_build_custody(runtime, start)
     return start
 
@@ -1654,10 +1694,12 @@ def import_bundle(
 
 def publish_ci(handoff):
     """Only the named public repository lane may select this fixed publication."""
-    handoff.FAILURE_STAGE = "public-context"
+    handoff.FAILURE_STAGE = "public-context-runtime"
     runtime = ci_runtime(handoff.ci)
+    handoff.FAILURE_STAGE = "public-result-records"
     handoff.result_records(runtime / "compute")
     start = accepted_public_build_start(handoff, runtime)
+    handoff.FAILURE_STAGE = "public-context-entry"
     source = ci_context(handoff, start)
     publication = runtime / "compute/public-source"
     stage = publication / "handoff"
