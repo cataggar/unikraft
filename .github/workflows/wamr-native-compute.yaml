@@ -229,61 +229,24 @@ jobs:
           export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
           bash .github/scripts/hyperv-qemu-candidate-runtime.sh "${root}" compute
 
-      - name: Revalidate the completed local run through the native records bridge
-        timeout-minutes: 20
-        env:
-          WAMR_CI_CONTROLLER: /d/wamr-ci/wamr-differential-controller/controller/bin/uk-wamr-native-ci
+      - name: Keep the Python-produced local handoff on its pinned source path
+        timeout-minutes: 10
         run: |
           set -euo pipefail
-          umask 077
           root=/d/wamr-ci/wamr-native-runtime
-          controller="${WAMR_CI_CONTROLLER}"
-          output="${RUNNER_TEMP}/wamr-controller-handoff-v1.json"
-          test -x "${controller}"
-          test ! -e "${output}"
-          "${controller}" records --runtime "${root}" --output handoff-v1 > "${output}"
-          python3 -B - "${output}" "${root}" <<'PY'
-          import json
-          from pathlib import Path
-          import sys
-          value = json.loads(Path(sys.argv[1]).read_bytes())
-          runtime = Path(sys.argv[2])
-          if (value["schema"] != "uk.wamr.native-ci-controller-records"
-                  or value["schema_version"] != 1
-                  or value["context"] != "local-runtime"
-                  or value["compatibility"] != "tiny-v2"
-                  or value["profile"] != "qcow2-derived-vhd"
-                  or value["modes"] != [
-                      "raw-x2apic", "raw-legacy-apic",
-                      "qcow2-x2apic", "qcow2-legacy-apic",
-                      "vpc-x2apic", "vpc-legacy-apic"]
-                  or len(value["records"]) != 33
-                  or len(value["artifacts"]) != 50
-                  or sum(
-                      item["role"] == "command-supervisor"
-                      and item["path"] == str(
-                          runtime / "controller/bin/uk-wamr-native-ci")
-                      for item in value["runtime_inputs"]) != 1):
-              raise SystemExit("native record bridge refused the completed local run")
-          PY
-          python3 -B - "${root}" "${output}" <<'PY'
+          python3 -B - "${root}" <<'PY'
           import importlib.util
-          import json
           from pathlib import Path
           import sys
 
-          runtime, output = map(Path, sys.argv[1:])
+          runtime = Path(sys.argv[1])
           module = Path("support/build/wamr-native-ci/handoff.py").resolve()
           spec = importlib.util.spec_from_file_location("wamr_handoff", module)
           handoff = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(handoff)
-          accepted = json.loads(output.read_bytes())
           records = handoff.result_records(runtime / "compute")
-          if (len(records) != 33
-                  or records != {
-                      item["name"]: item["sha256"] for item in accepted["records"]
-                  }):
-              raise SystemExit("Python handoff refused completed native records")
+          if len(records) != 33:
+              raise SystemExit("Python handoff refused completed Python records")
           PY
 
       - name: Retain the expressly authorized public-source tiny image bundle

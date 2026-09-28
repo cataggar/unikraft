@@ -660,6 +660,7 @@ fn collectArtifacts(self: *AcceptedRun) !void {
     const a = self.allocator();
     var result: std.ArrayList(PinnedArtifact) = .empty;
     for (artifact_specs) |spec| {
+        if (self.context == .local_runtime and spec.role == .cleanup) continue;
         if (self.compatibility == .tiny_v1_legacy and
             (spec.role == .qcow2 or spec.role == .cleanup or
                 @intFromEnum(spec.role) >= @intFromEnum(ArtifactRole.qcow2_finalization_intent)))

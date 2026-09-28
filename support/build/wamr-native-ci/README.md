@@ -38,11 +38,10 @@ unchanged.
 `uk-wamr-native-ci records --runtime ABS --output handoff-v1` reopens a
 completed local v2 run, including source and input custody, the six boot
 transcripts and image chain, before emitting a bounded, canonical private JSON
-description of pinned records, artifacts and runtime inputs. The read-only
-verifier can be installed separately from the runtime's recorded controller:
-replay still checks that controller against build-start input custody, while
-build and boot continue to require execution from its exact runtime path. The
-separate
+description of pinned records, artifacts and runtime inputs. Local replay
+requires the original runtime-installed controller and its recorded source
+worktree; a separately installed controller cannot replay a Python-produced
+run. The separate
 `records --stage-root ABS --transport trusted-inner-zip --output handoff-v1`
 form checks an extracted public-source inner tree. The initial imported-stage
 fixture covers older allowlisted v1 evidence; the current v2 import is also
@@ -51,11 +50,13 @@ boot, changes authority, or makes a partially checked manifest an accepted run.
 
 The public bundle importer now requires this native check before publishing
 its candidate, while retaining the Python publication and supervised-stage
-validation. The local v2 handoff reader also requires native acceptance before
-using its result-record hashes and source identity; the Python build, boot and
-inspection checks still run. Historical v1 local handoff remains on the
-pinned-source Python compatibility path; v2 never falls back to it after a
-native refusal. The caller must independently authenticate the executable
+validation. Native-produced v2 local handoff requires native acceptance before using its
+result-record hashes and source identity; the Python build, boot and inspection
+checks still run. A Python-produced local run instead retains the pinned
+Python source-custody path until the protected production caller is switched.
+Historical v1 retains its pinned-source compatibility path; native-produced v2
+never falls back to Python after a native refusal. The caller must
+independently authenticate the executable
 provided by `WAMR_CI_CONTROLLER`; owner and mode checks alone do not prove
 its provenance. The completed local run still needs a protected end-to-end
 check. A typed native `handoff-inspect` operation binds the original compute

@@ -1071,7 +1071,7 @@ fn publishAcceptedResult(ctx: *Context) !ResultPublished {
 /// and intermediate image-chain record are checked again before returning.
 pub fn revalidateComplete(ctx: *Context, accepted: records.Result) !void {
     if (accepted.set != .tiny_v2_qcow2_derived_vhd) return error.UnsupportedRecordSet;
-    try build.loadAcceptedForRecords(ctx.build_context);
+    try build.loadAccepted(ctx.build_context);
     try captureBootInputs(ctx);
     const recorded_inputs = try ctx.readValue(try ctx.evidencePath("boot-inputs.json"), records.max_record_bytes, true);
     try sameJson(ctx.allocator(), recorded_inputs, try readValueFromCustody(ctx));

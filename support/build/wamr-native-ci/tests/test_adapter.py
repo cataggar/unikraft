@@ -65,6 +65,18 @@ class NativeRecordBridge(unittest.TestCase):
         controller.chmod(0o700)
         return root, controller
 
+    def native_start(self, handoff, runtime):
+        (runtime / "compute/evidence").mkdir(
+            mode=0o700, parents=True, exist_ok=True)
+        handoff.ci.save(runtime / "compute/evidence/build-start.json", {
+            "consumer_inputs": {"files": {
+                "command-supervisor": {
+                    "path": str(
+                        runtime / "controller/bin/uk-wamr-native-ci"),
+                },
+            }},
+        })
+
     def test_imported_stage_requires_native_controller(self):
         bridge = public_bundle.accepted_records
         with mock.patch.dict(os.environ, {bridge.CONTROLLER_ENV: ""}), \
@@ -184,6 +196,10 @@ class NativeRecordBridge(unittest.TestCase):
         runtime = root / "runtime"
         runtime.mkdir(mode=0o700)
         (runtime / "compute").mkdir(mode=0o700)
+        (runtime / "compute/evidence").mkdir(mode=0o700)
+        self.native_start(handoff, runtime)
+        handoff.ci.save(
+            runtime / "compute/evidence/result.json", {"schema_version": 2})
         output = root / "handoff"
         with mock.patch.object(bridge, "_records", return_value={
                 "compatibility": "tiny-v1", "runtime_inputs": [{}]}) as native:
@@ -197,13 +213,10 @@ class NativeRecordBridge(unittest.TestCase):
                 return_value={
                     "compatibility": "tiny-v1", "profile": None,
                     "modes": list(ci.MODES), "records": [],
-                }), mock.patch.object(
-                    handoff.ci, "document", return_value={"schema_version": 2}) as document:
+                }):
             with self.assertRaisesRegex(
                     handoff.ci.Refusal, "unexpected native local modes"):
                 handoff.export(runtime, output)
-            document.assert_called_once_with(
-                runtime / "compute/evidence/result.json")
         self.assertFalse(output.exists())
 
     def test_pinned_historical_v1_result_reader_without_native_controller(self):
@@ -270,6 +283,48 @@ class NativeRecordBridge(unittest.TestCase):
                 handoff.result_records(compute)
             native.assert_not_called()
 
+    def test_python_produced_v2_rechecks_pinned_source_and_all_records(self):
+        handoff = self.handoff_module()
+        root, unused_controller = self.controller_fixture(
+            "import sys\nsys.exit(1)\n")
+        del unused_controller
+        runtime = root / "runtime"
+        evidence = runtime / "compute/evidence"
+        evidence.mkdir(mode=0o700, parents=True)
+        start = {"consumer_inputs": {"files": {
+            "command-supervisor": {"path": str(
+                runtime / "compute/supervisor/bin/wamr-ci-supervisor")},
+        }}}
+        handoff.ci.save(evidence / "build-start.json", start)
+        for name in public_bundle.V2_EVIDENCE - {"build-start.json"}:
+            handoff.ci.save(evidence / name, {})
+        hashes = {
+            name: handoff.ci.digest(evidence / name)
+            for name in public_bundle.V2_EVIDENCE
+        }
+        handoff.ci.save(evidence / "result.json", {
+            "schema_version": 2, "profile": handoff.ci.CURRENT_PROFILE,
+            "scope": "local_native_compute_only", "passed": True,
+            "hardware_acceptance": "not_established",
+            "cloud_authority": "not_admitted",
+            "benchmark": "not_measured", "workload": "tiny",
+            "modes": list(handoff.ci.SIX_MODES), "records": hashes,
+        })
+        with mock.patch.object(
+                handoff.ci, "producer_inputs", return_value=start) as custody, \
+                mock.patch.object(
+                    handoff.accepted_records, "local_runtime") as native:
+            self.assertEqual(handoff.result_records(runtime / "compute"), hashes)
+            custody.assert_called_once_with(
+                runtime, start["consumer_inputs"])
+            native.assert_not_called()
+            changed = evidence / "command-adapter.json"
+            changed.write_bytes(b'{"tampered":true}\n')
+            with self.assertRaisesRegex(
+                    handoff.ci.Refusal, "local record changed"):
+                handoff.result_records(runtime / "compute")
+            native.assert_not_called()
+
     def test_v2_refusal_never_falls_into_historical_v1(self):
         handoff = self.handoff_module()
         root, unused_controller = self.controller_fixture(
@@ -280,6 +335,7 @@ class NativeRecordBridge(unittest.TestCase):
         compute = runtime / "compute"
         compute.mkdir(mode=0o700)
         (compute / "evidence").mkdir(mode=0o700)
+        self.native_start(handoff, runtime)
         handoff.ci.save(compute / "evidence/result.json", {
             "schema_version": 2,
         })
@@ -309,11 +365,11 @@ class NativeRecordBridge(unittest.TestCase):
         runtime.mkdir(mode=0o700)
         compute = runtime / "compute"
         compute.mkdir(mode=0o700)
+        self.native_start(handoff, runtime)
+        handoff.ci.save(
+            compute / "evidence/result.json", {"schema_version": 2})
         output = root / "handoff"
         with mock.patch.dict(os.environ, {bridge.CONTROLLER_ENV: str(controller)}), \
-                mock.patch.object(
-                    handoff.ci, "document",
-                    return_value={"schema_version": 2}) as document, \
                 mock.patch.object(handoff.ci, "digest") as digest, \
                 mock.patch.object(handoff.ci, "check_build") as build:
             with self.assertRaisesRegex(
@@ -322,8 +378,6 @@ class NativeRecordBridge(unittest.TestCase):
             with self.assertRaisesRegex(
                     ValueError, "native controller records refused"):
                 handoff.export(runtime, output)
-            self.assertEqual(document.call_args_list, [
-                mock.call(compute / "evidence/result.json")] * 2)
             digest.assert_not_called()
             build.assert_not_called()
         self.assertFalse(output.exists())

@@ -905,7 +905,7 @@ def prepare_azure_runtime(output, azure, az_python, stdlib, *,
 
 
 def _native_local_result(root):
-    """Accept only v2 through the native local-runtime interface."""
+    """Accept a native-produced v2 run through its bound controller."""
     ci.require(root.name == "compute" and root.is_absolute(),
                "local compute root required")
     accepted = accepted_records.local_runtime(root.parent)
@@ -920,12 +920,17 @@ def _native_local_result(root):
     return accepted, records
 
 
-def _historical_v1_records(root, result):
-    """Keep the pinned historical v1 fixture path separate from native v2."""
+def _local_policy():
     policy_spec = importlib.util.spec_from_file_location(
         "wamr_public_bundle_v1_policy", HERE / "public_bundle.py")
     policy = importlib.util.module_from_spec(policy_spec)
     policy_spec.loader.exec_module(policy)
+    return policy
+
+
+def _historical_v1_records(root, result):
+    """Keep the pinned historical v1 fixture path separate from native v2."""
+    policy = _local_policy()
     start = ci.document(root / "evidence/build-start.json")
     build = ci.document(root / "evidence/build.json")
     ci.require(type(start) is dict and type(build) is dict,
@@ -964,6 +969,35 @@ def _historical_v1_records(root, result):
     return records
 
 
+def _python_v2_records(root, result, start):
+    policy = _local_policy()
+    ci.require(ci.producer_inputs(
+        root.parent, start["consumer_inputs"]) == start,
+        "producer inputs changed")
+    ci.require(
+        set(result) == {
+            "schema_version", "profile", "scope", "passed",
+            "hardware_acceptance", "cloud_authority", "benchmark",
+            "workload", "modes", "records"}
+        and result["profile"] == ci.CURRENT_PROFILE
+        and result["passed"] is True
+        and result["scope"] == "local_native_compute_only"
+        and result["hardware_acceptance"] == "not_established"
+        and result["cloud_authority"] == "not_admitted"
+        and result["benchmark"] == "not_measured"
+        and result["workload"] == "tiny"
+        and result["modes"] == list(ci.SIX_MODES)
+        and type(result["records"]) is dict
+        and result["records"].keys() == policy.V2_EVIDENCE
+        and {path.name for path in (root / "evidence").iterdir()}
+        == policy.V2_EVIDENCE | {"result.json"},
+        "invalid Python local v2 records")
+    for name, expected in result["records"].items():
+        ci.require(ci.digest(root / "evidence" / name) == expected,
+                   "local record changed")
+    return result["records"]
+
+
 def _local_result(root):
     result = ci.document(root / "evidence/result.json")
     ci.require(type(result) is dict
@@ -977,7 +1011,23 @@ def _selected_records(root, result):
     if result["schema_version"] == 1:
         accepted, records = None, _historical_v1_records(root, result)
     else:
-        accepted, records = _native_local_result(root)
+        start = ci.document(root / "evidence/build-start.json")
+        ci.require(
+            type(start) is dict
+            and type(start.get("consumer_inputs")) is dict
+            and type(start["consumer_inputs"].get("files")) is dict
+            and type(start["consumer_inputs"]["files"].get(
+                "command-supervisor")) is dict,
+            "local v2 producer custody required")
+        supervisor = start["consumer_inputs"]["files"][
+            "command-supervisor"].get("path")
+        if supervisor == str(root / "supervisor/bin/wamr-ci-supervisor"):
+            accepted, records = None, _python_v2_records(root, result, start)
+        else:
+            ci.require(
+                supervisor == str(root.parent / "controller/bin/uk-wamr-native-ci"),
+                "unsupported local v2 producer")
+            accepted, records = _native_local_result(root)
     ci.require(_local_result(root) == result, "local result changed")
     return accepted, records
 
@@ -988,14 +1038,15 @@ def result_records(root):
 
 
 def export(runtime, output):
-    """Keep pinned historical v1; require native acceptance for every v2 run."""
+    """Use the pinned producer's reader; never downgrade a native refusal."""
     private(runtime)
     private(output.parent)
     root = runtime / "compute"
     result = _local_result(root)
     version = result["schema_version"]
     accepted, records = _selected_records(root, result)
-    modes = ci.MODES if version == 1 else tuple(accepted["modes"])
+    modes = ci.MODES if version == 1 else (
+        ci.SIX_MODES if accepted is None else tuple(accepted["modes"]))
     names = NAMES if version == 1 else V2_NAMES
     expected = ci.document(root / "evidence/build-start.json")
     legacy_supervision = "command_supervisor" not in expected
@@ -1016,7 +1067,7 @@ def export(runtime, output):
                "producer inputs changed")
     build = ci.check_build()
     ci.require(build == ci.document(root / "evidence/build.json"), "build changed")
-    if version == 2:
+    if accepted is not None:
         ci.require(build["source"] == accepted["source"], "native source changed")
     inputs = ci.document(root / "evidence/boot-inputs.json")
     tools = {"package_tool": root / "tools/bin/wamr-ci-package",

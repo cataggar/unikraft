@@ -2890,6 +2890,61 @@ def full(args):
                 check(not (runtime / "compute/evidence/result.json").exists(),
                       "refusal published acceptance")
     check(not failures, "differential mismatches: " + ", ".join(failures))
+    if args.case == "success":
+        report_progress("native", "records-start")
+        result = command([
+            str(controller), "records", "--runtime", str(native_runtime),
+            "--output", "handoff-v1",
+        ], native_repo, executions["native"][3], seconds=600)
+        check(result.returncode == 0 and not result.stderr,
+              "native completed-run records replay refused")
+        reference = oracle(native_repo)
+        view = parsed(result.stdout, reference)
+        recorded = parsed(checked_file(
+            native_runtime / "compute/evidence/result.json"), reference)
+        check(
+            result.stdout == reference.compact_json(view, newline=True)
+            and view["schema"] == "uk.wamr.native-ci-controller-records"
+            and view["schema_version"] == 1
+            and view["context"] == "local-runtime"
+            and view["compatibility"] == "tiny-v2"
+            and view["profile"] == reference.CURRENT_PROFILE
+            and view["modes"] == list(reference.SIX_MODES)
+            and len(view["records"]) == len(recorded["records"]) == 33
+            and len(view["artifacts"]) == 49
+            and {item["name"]: item["sha256"] for item in view["records"]}
+            == recorded["records"]
+            and sum(
+                item["role"] == "command-supervisor"
+                and item["path"] == str(controller)
+                for item in view["runtime_inputs"]) == 1,
+            "native completed-run records differ from accepted evidence")
+        with (parent / "native-records.json").open("xb") as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(result.stdout)
+            output.flush()
+            os.fsync(output.fileno())
+        script = (
+            "import importlib.util,json,sys\n"
+            "from pathlib import Path\n"
+            "spec=importlib.util.spec_from_file_location("
+            "'native_handoff',Path(sys.argv[1])/'support/build/wamr-native-ci/handoff.py')\n"
+            "handoff=importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(handoff)\n"
+            "records=handoff.result_records(Path(sys.argv[2])/'compute')\n"
+            "sys.stdout.write(json.dumps(records,sort_keys=True,separators=(',',':'))+'\\n')\n"
+        )
+        bridged = command([
+            sys.executable, "-B", "-c", script,
+            str(native_repo), str(native_runtime),
+        ], native_repo, dict(
+            executions["native"][3], WAMR_CI_CONTROLLER=str(controller)),
+            seconds=650)
+        check(bridged.returncode == 0
+              and json.loads(bridged.stdout)
+              == recorded["records"],
+              "Python local handoff refused native-produced records")
+        report_progress("native", "records-done")
 
 
 class DeterministicContracts(unittest.TestCase):
