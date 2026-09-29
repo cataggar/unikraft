@@ -231,6 +231,48 @@ def _uuid_receipt(value, label):
     return _uuid(value, label)
 
 
+def _run_tags(value, expected, label):
+    tags = value.get("tags")
+    if (not isinstance(tags, dict)
+            or tags.get("issue90-run") != expected.run_id
+            or tags.get("issue90-operation") != expected.operation_id):
+        raise ValueError(f"{label} has foreign or missing run tags")
+
+
+def _deployment_parameters(value, expected, label):
+    parameters = _props(value).get("parameters")
+    if (not isinstance(parameters, dict)
+            or any(not isinstance(parameters.get(name), dict)
+                   or not isinstance(parameters[name].get("type"), str)
+                   or parameters[name]["type"].lower() != "string"
+                   or parameters[name].get("value") != expected_value
+                   for name, expected_value in (
+                       ("runId", expected.run_id),
+                       ("operationId", expected.operation_id),
+                   ))):
+        raise ValueError(f"{label} has foreign or missing deployment parameters")
+
+
+def _settled_lro(original, tracking, archive, label):
+    _exact(tracking, ("initial", "terminal"), f"{label} LRO")
+    operation = _exact(original.get("operation"), ("url", "operation_id"),
+                       f"{label} original operation")
+    initial = archive.read(tracking["initial"], f"{label} original LRO")
+    settled = archive.read(tracking["terminal"], f"{label} terminal LRO")
+    if (not isinstance(initial, dict) or not isinstance(settled, dict)
+            or not isinstance(operation["url"], str)
+            or not operation["url"].startswith("https://management.azure.com/")
+            or not isinstance(operation["operation_id"], str)
+            or initial.get("url") != operation["url"]
+            or settled.get("url") != operation["url"]
+            or initial.get("operation_id") != operation["operation_id"]
+            or settled.get("operation_id") != operation["operation_id"]
+            or initial.get("status") not in ("Accepted", "InProgress", "Running")
+            or settled.get("status") != "Succeeded"):
+        raise ValueError(f"{label} original LRO was not settled")
+    _uuid(operation["operation_id"], f"{label} LRO operation ID")
+
+
 def _direct(receipts, expected, archive):
     _exact(receipts, DIRECT, "Direct create receipts")
     identities = {}
@@ -253,6 +295,23 @@ def _direct(receipts, expected, archive):
                 or terminal.get("id") != resource_id
                 or _state(terminal) != "Succeeded"):
             raise ValueError(f"{role} lacks its original create and terminal identity")
+        if role == "deployment":
+            _deployment_parameters(original, expected, "Original deployment")
+            _deployment_parameters(terminal, expected, "Terminal deployment")
+        else:
+            _run_tags(original, expected, f"{role} original create")
+            _run_tags(terminal, expected, f"{role} terminal observation")
+        state = _state(original)
+        tracking = receipt["tracking"]
+        if state == "Succeeded":
+            if tracking is not None:
+                raise ValueError(f"{role} successful create has unrelated LRO tracking")
+        elif state in ("Accepted", "InProgress", "Running"):
+            if tracking is None:
+                raise ValueError(f"{role} unsettled create lacks original LRO")
+            _settled_lro(original, tracking, archive, role)
+        else:
+            raise ValueError(f"{role} original create did not succeed or remain pending")
         if role == "group":
             if receipt["uuid"] is not None:
                 raise ValueError("Group ARM path is not an incarnation UUID")
@@ -296,30 +355,12 @@ def _direct(receipts, expected, archive):
                     or revocation.get("status") != "Succeeded"
                     or revocation.get("active_sas") is not False):
                 raise ValueError(f"{role} VHD upload or access revocation is unproven")
-        tracking = receipt["tracking"]
-        if tracking is None:
-            if _state(original) != "Succeeded":
-                raise ValueError(f"{role} unsettled create lacks original LRO")
-        else:
-            _exact(tracking, ("initial", "terminal"), f"{role} LRO")
-            initial = archive.read(tracking["initial"], f"{role} original LRO")
-            settled = archive.read(tracking["terminal"], f"{role} terminal LRO")
-            if (not isinstance(initial, dict) or not isinstance(settled, dict)
-                    or initial.get("url") != settled.get("url")
-                    or not isinstance(initial.get("url"), str)
-                    or not initial["url"].startswith("https://management.azure.com/")
-                    or initial.get("operation_id") != settled.get("operation_id")
-                    or not isinstance(initial.get("operation_id"), str)
-                    or initial.get("status") not in ("Accepted", "InProgress", "Running")
-                    or settled.get("status") != "Succeeded"):
-                raise ValueError(f"{role} original LRO was not settled")
-            _uuid(initial["operation_id"], f"{role} LRO operation ID")
     if len(set(identities.values())) != 5:
         raise ValueError("Disk/deployment immutable values must be distinct")
     return identities
 
 
-def _children(observations, expected, archive, vm_uuid):
+def _children(observations, expected, archive, vm_uuid, os_role):
     _exact(observations, CHILDREN, "Deployment child observations")
     resources = {}
     for role in CHILDREN:
@@ -327,8 +368,9 @@ def _children(observations, expected, archive, vm_uuid):
         if (not isinstance(child, dict) or child.get("id") != expected.resource_ids[role]
                 or _state(child) != "Succeeded"):
             raise ValueError(f"{role} is not a settled observed deployment child")
-        if role == "vm" and _props(child).get("vmId") != vm_uuid:
-            raise ValueError("VM observation differs from deployment VM UUID")
+        _run_tags(child, expected, f"{role} deployment child")
+        if role == "vm":
+            _vm_attachment(child, expected, vm_uuid, os_role)
         resources[role] = child
     nic = resources["nic"]
     vnet = resources["vnet"]
@@ -381,13 +423,21 @@ def _vm_attachment(value, expected, vm_uuid, os_role):
         raise ValueError("VM observation has wrong identity")
     props = _props(value)
     storage = props.get("storageProfile")
+    network = props.get("networkProfile")
+    interfaces = network.get("networkInterfaces") if isinstance(network, dict) else None
     if (props.get("vmId") != vm_uuid or not isinstance(storage, dict)
             or storage.get("diskControllerType") != "SCSI"
             or not isinstance(props.get("securityProfile"), dict)
             or props["securityProfile"].get("securityType") != "Standard"
             or not isinstance(props.get("hardwareProfile"), dict)
-            or props["hardwareProfile"].get("vmSize") != "Standard_D2s_v5"):
-        raise ValueError("VM UUID or storage profile differs")
+            or props["hardwareProfile"].get("vmSize") != "Standard_D2s_v5"
+            or not isinstance(interfaces, list) or len(interfaces) != 1
+            or not isinstance(interfaces[0], dict)
+            or interfaces[0].get("id") != expected.resource_ids["nic"]
+            or not isinstance(interfaces[0].get("properties"), dict)
+            or interfaces[0]["properties"].get("primary") is not True
+            or interfaces[0]["properties"].get("deleteOption") != "Delete"):
+        raise ValueError("VM UUID, storage profile or private NIC attachment differs")
     disk = storage.get("osDisk")
     data = storage.get("dataDisks")
     if (not isinstance(disk, dict) or not isinstance(disk.get("managedDisk"), dict)
@@ -436,6 +486,9 @@ def _prepared(body, expected, archive):
     deployment = archive.read(
         evidence["direct_receipts"]["deployment"]["terminal"], "Deployment outputs"
     )
+    original_deployment = archive.read(
+        evidence["direct_receipts"]["deployment"]["create"], "Original deployment outputs"
+    )
     deployment_props = _props(deployment)
     outputs = deployment_props.get("outputs")
     output_resources = deployment_props.get("outputResources")
@@ -457,9 +510,21 @@ def _prepared(body, expected, archive):
     vm_output = outputs["vmUuid"]
     vm_uuid = vm_output.get("value") if isinstance(vm_output, dict) else None
     _uuid(vm_uuid, "Original VM UUID output")
+    original_props = _props(original_deployment)
+    original_outputs = original_props.get("outputs")
+    if (_state(original_deployment) == "Succeeded"
+            and (original_outputs != outputs
+                 or original_props.get("outputResources") != output_resources)):
+        raise ValueError("Original deployment outputs differ from terminal observation")
+    if original_outputs is not None:
+        original_vm = (original_outputs.get("vmUuid")
+                       if isinstance(original_outputs, dict) else None)
+        if (not isinstance(original_vm, dict)
+                or original_vm.get("value") != vm_uuid):
+            raise ValueError("Original deployment VM UUID differs from terminal output")
     if vm_uuid in identities.values():
         raise ValueError("VM UUID collides with a disk or deployment correlation")
-    _children(evidence["children"], expected, archive, vm_uuid)
+    _children(evidence["children"], expected, archive, vm_uuid, "dummy")
     _inventory(evidence["inventory"], expected, archive, identities, vm_uuid)
     dummy_vm = archive.read(evidence["dummy_vm"], "Original dummy VM attachment")
     _vm_attachment(dummy_vm, expected, vm_uuid, "dummy")
@@ -475,7 +540,7 @@ def _handoff(body, expected, archive, identities, vm_uuid, prepared_sha, now, fr
     evidence = _exact(
         body["evidence"],
         ("prepared_sha256", "challenge", "expires_at_utc", "final_envelope_sha256",
-         "deallocation", "swap", "swap_settlement", "vm", "dummy", "os",
+         "deallocation", "swap", "swap_tracking", "swap_settlement", "vm", "dummy", "os",
          "data_disks", "inventory", "children", "no_prior_acceptance_boot",
          "exclusive_no_writer", "running_seconds"),
         "HANDOFF evidence",
@@ -506,12 +571,23 @@ def _handoff(body, expected, archive, identities, vm_uuid, prepared_sha, now, fr
             or not isinstance(swap, dict) or not isinstance(settled, dict)
             or _state(settled) != "Succeeded" or _state(vm) != "Succeeded"):
         raise ValueError("Deallocation and original OS swap are not settled")
+    swap_state = _state(swap)
+    tracking = evidence["swap_tracking"]
+    if swap_state == "Succeeded":
+        if tracking is not None:
+            raise ValueError("Successful original OS swap has unrelated LRO tracking")
+    elif swap_state in ("Accepted", "InProgress", "Running"):
+        if tracking is None:
+            raise ValueError("Pending original OS swap lacks operation tracking")
+        _settled_lro(swap, tracking, archive, "OS swap")
+    else:
+        raise ValueError("Original OS swap did not succeed or remain pending")
     for item in (swap, settled, vm):
         _vm_attachment(item, expected, vm_uuid, "os")
     _current_disk("dummy", evidence["dummy"], expected, archive, identities, False)
     _current_disk("os", evidence["os"], expected, archive, identities, True)
     _current_data_disks(evidence["data_disks"], expected, archive, identities)
-    _children(evidence["children"], expected, archive, vm_uuid)
+    _children(evidence["children"], expected, archive, vm_uuid, "os")
     _inventory(evidence["inventory"], expected, archive, identities, vm_uuid)
     if not isinstance(vm, dict) or _props(vm).get("powerState") != "deallocated":
         raise ValueError("Handoff VM must be observed deallocated")

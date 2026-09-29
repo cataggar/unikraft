@@ -67,18 +67,6 @@ class Fixture:
         self.direct = {}
         for role in custody.DIRECT:
             resource = self.resource(role)
-            if role == "deployment":
-                resource["properties"]["outputResources"] = [
-                    {"id": ids[child]} for child in custody.CHILDREN
-                ]
-                resource["properties"]["outputs"] = {
-                    **{name: {"value": ids[target]} for name, target in {
-                        "vmId": "vm", "osDiskId": "dummy", "dataDisk0Id": "data0",
-                        "dataDisk7Id": "data7", "nicId": "nic", "vnetId": "vnet",
-                        "nsgId": "nsg",
-                    }.items()},
-                    "vmUuid": {"value": self.uuids["vm"]},
-                }
             self.direct[role] = {
                 "id": ids[role],
                 "uuid": self.uuids.get(role),
@@ -152,6 +140,7 @@ class Fixture:
                     "id": ids["vm"], "vmId": self.uuids["vm"], "status": "Succeeded",
                 }),
                 "swap": self.final_vm,
+                "swap_tracking": None,
                 "swap_settlement": self.final_vm,
                 "vm": self.final_vm, "dummy": self.dummy, "os": self.os,
                 "data_disks": self.data_disks,
@@ -195,6 +184,11 @@ class Fixture:
 
     def resource(self, role):
         result = {"id": self.ids[role], "provisioningState": "Succeeded"}
+        if role != "deployment":
+            result["tags"] = {
+                "issue90-run": self.expected.run_id,
+                "issue90-operation": self.expected.operation_id,
+            }
         if role in ("dummy", "os", "data0", "data7"):
             result["uniqueId"] = self.uuids[role]
             size = (azure.VIRTUAL_SIZE if role in ("dummy", "os")
@@ -210,6 +204,21 @@ class Fixture:
         elif role == "deployment":
             result["properties"] = {
                 "correlationId": self.uuids[role], "provisioningState": "Succeeded",
+                "parameters": {
+                    "runId": {"type": "String", "value": self.expected.run_id},
+                    "operationId": {"type": "String", "value": self.expected.operation_id},
+                },
+                "outputResources": [
+                    {"id": self.ids[child]} for child in custody.CHILDREN
+                ],
+                "outputs": {
+                    **{name: {"value": self.ids[target]} for name, target in {
+                        "vmId": "vm", "osDiskId": "dummy", "dataDisk0Id": "data0",
+                        "dataDisk7Id": "data7", "nicId": "nic", "vnetId": "vnet",
+                        "nsgId": "nsg",
+                    }.items()},
+                    "vmUuid": {"value": self.uuids["vm"]},
+                },
             }
         elif role == "nic":
             result.update({
@@ -244,6 +253,10 @@ class Fixture:
             "powerState": "deallocated",
             "hardwareProfile": {"vmSize": "Standard_D2s_v5"},
             "securityProfile": {"securityType": "Standard"},
+            "networkProfile": {"networkInterfaces": [{
+                "id": self.ids["nic"],
+                "properties": {"primary": True, "deleteOption": "Delete"},
+            }]},
             "storageProfile": {
                 "diskControllerType": "SCSI",
                 "osDisk": {"managedDisk": {"id": self.ids[os_role]}},
@@ -254,6 +267,17 @@ class Fixture:
             },
         })
         return result
+
+    def tracking(self, original):
+        operation = {
+            "url": "https://management.azure.com/operation/status",
+            "operation_id": "55555555-5555-4555-8555-555555555555",
+        }
+        original["operation"] = operation
+        return {
+            "initial": self.put({**operation, "status": "Accepted"}),
+            "terminal": self.put({**operation, "status": "Succeeded"}),
+        }
 
     def body(self, stage, sequence, previous, nonce, timestamp, evidence):
         return {
@@ -416,6 +440,8 @@ class CustodyRecordsTests(unittest.TestCase):
             "initial": {"sha256": "f" * 64, "size": 40},
             "terminal": {"sha256": "e" * 64, "size": 40},
         }
+        self.fixture.tracking(pending)
+        self.fixture.direct["dummy"]["create"] = self.fixture.put(pending)
         self.fixture.resign_prepared()
         with self.assertRaisesRegex(ValueError, "archive bytes are missing"):
             self.handoff(prepared=self.fixture.sign(self.fixture.prepared))
@@ -424,17 +450,125 @@ class CustodyRecordsTests(unittest.TestCase):
         original = self.fixture.resource("group")
         original["provisioningState"] = "Accepted"
         group = self.fixture.direct["group"]
+        group["tracking"] = self.fixture.tracking(original)
         group["create"] = self.fixture.put(original)
-        tracking = {
-            "url": "https://management.azure.com/operation/status",
-            "operation_id": "55555555-5555-4555-8555-555555555555",
-        }
-        group["tracking"] = {
-            "initial": self.fixture.put({**tracking, "status": "Accepted"}),
-            "terminal": self.fixture.put({**tracking, "status": "Succeeded"}),
-        }
         self.fixture.resign_prepared()
         self.assertEqual(self.handoff(), self.fixture.sha(self.fixture.handoff_raw))
+
+    def test_failed_or_unbound_original_group_create_cannot_borrow_successful_lro(self):
+        for state, operation, reason in (
+            ("Failed", True, "did not succeed"),
+            ("Succeeded", True, "unrelated LRO"),
+            ("Accepted", False, "original operation"),
+            ("Accepted", "foreign", "original LRO"),
+        ):
+            with self.subTest(state=state, operation=operation):
+                self.fixture = Fixture()
+                original = self.fixture.resource("group")
+                original["provisioningState"] = state
+                tracking = self.fixture.tracking(original)
+                if operation is False:
+                    del original["operation"]
+                elif operation == "foreign":
+                    original["operation"]["operation_id"] = (
+                        "66666666-6666-4666-8666-666666666666"
+                    )
+                self.fixture.direct["group"].update({
+                    "create": self.fixture.put(original), "tracking": tracking,
+                })
+                self.fixture.resign_prepared()
+                with self.assertRaisesRegex(ValueError, reason):
+                    self.handoff()
+
+    def test_deployment_run_parameters_bind_both_original_and_terminal(self):
+        for receipt in ("create", "terminal"):
+            for field in ("runId", "operationId"):
+                with self.subTest(receipt=receipt, field=field):
+                    self.fixture = Fixture()
+                    response = self.fixture.resource("deployment")
+                    response["properties"]["parameters"][field]["value"] = "foreign"
+                    self.fixture.direct["deployment"][receipt] = self.fixture.put(response)
+                    self.fixture.resign_prepared()
+                    with self.assertRaisesRegex(ValueError, "deployment parameters"):
+                        self.handoff()
+
+    def test_run_tags_bind_original_direct_and_observed_children(self):
+        for role, receipt in (
+            ("group", "create"), ("os", "terminal"),
+            ("nic", "prepared"), ("vm", "handoff"),
+        ):
+            for field in ("issue90-run", "issue90-operation"):
+                with self.subTest(role=role, receipt=receipt, field=field):
+                    self.fixture = Fixture()
+                    response = (self.fixture.vm("dummy" if receipt == "prepared" else "os")
+                                if role == "vm" else self.fixture.resource(role))
+                    response["tags"][field] = "foreign"
+                    ref = self.fixture.put(response)
+                    if receipt in ("create", "terminal"):
+                        self.fixture.direct[role][receipt] = ref
+                    elif receipt == "prepared":
+                        self.fixture.prepared["evidence"]["children"][role] = ref
+                    else:
+                        self.fixture.handoff["evidence"]["children"][role] = ref
+                    self.fixture.resign_prepared()
+                    with self.assertRaisesRegex(ValueError, "run tags"):
+                        self.handoff()
+
+    def test_original_deployment_vm_uuid_and_outputs_cannot_contradict_terminal(self):
+        for state in ("Succeeded", "Accepted"):
+            with self.subTest(state=state):
+                self.fixture = Fixture()
+                original = self.fixture.resource("deployment")
+                original["properties"]["provisioningState"] = state
+                original["properties"]["outputs"]["vmUuid"]["value"] = (
+                    "33333333-3333-4333-8333-333333333333"
+                )
+                if state == "Accepted":
+                    self.fixture.direct["deployment"]["tracking"] = (
+                        self.fixture.tracking(original)
+                    )
+                self.fixture.direct["deployment"]["create"] = self.fixture.put(original)
+                self.fixture.resign_prepared()
+                with self.assertRaisesRegex(ValueError, "Original deployment"):
+                    self.handoff()
+
+    def test_pending_deployment_requires_its_original_tracking(self):
+        original = self.fixture.resource("deployment")
+        original["properties"]["provisioningState"] = "Accepted"
+        original["properties"].pop("outputs")
+        original["properties"].pop("outputResources")
+        self.fixture.direct["deployment"]["tracking"] = self.fixture.tracking(original)
+        self.fixture.direct["deployment"]["create"] = self.fixture.put(original)
+        self.fixture.resign_prepared()
+        self.assertEqual(self.handoff(), self.fixture.sha(self.fixture.handoff_raw))
+        del original["operation"]
+        self.fixture.direct["deployment"]["create"] = self.fixture.put(original)
+        self.fixture.resign_prepared()
+        with self.assertRaisesRegex(ValueError, "original operation"):
+            self.handoff()
+
+    def test_pending_create_terminal_lro_cannot_be_swapped(self):
+        for role in ("group", "dummy", "deployment"):
+            with self.subTest(role=role):
+                self.fixture = Fixture()
+                original = self.fixture.resource(role)
+                if role == "deployment":
+                    original["properties"]["provisioningState"] = "Accepted"
+                else:
+                    original["provisioningState"] = "Accepted"
+                tracking = self.fixture.tracking(original)
+                foreign = {
+                    **original["operation"],
+                    "operation_id": "66666666-6666-4666-8666-666666666666",
+                    "status": "Succeeded",
+                }
+                tracking["terminal"] = self.fixture.put(foreign)
+                self.fixture.direct[role].update({
+                    "create": self.fixture.put(original), "tracking": tracking,
+                })
+                self.fixture.resign_prepared()
+                with self.assertRaisesRegex(ValueError, "original LRO"):
+                    self.handoff()
 
     def test_missing_upload_revocation_or_dummy_original_refuses_handoff(self):
         for field in ("upload", "revocation", "create"):
@@ -484,6 +618,57 @@ class CustodyRecordsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "VM UUID"):
             self.handoff(handoff=self.fixture.sign(self.fixture.handoff))
 
+    def test_failed_or_unbound_original_swap_cannot_borrow_successful_settlement(self):
+        for state, operation, reason in (
+            ("Failed", True, "did not succeed"),
+            ("Succeeded", True, "unrelated LRO"),
+            ("Accepted", False, "original operation"),
+            ("Accepted", "foreign", "original LRO"),
+        ):
+            with self.subTest(state=state, operation=operation):
+                self.fixture = Fixture()
+                original = self.fixture.vm("os")
+                original["provisioningState"] = state
+                tracking = self.fixture.tracking(original)
+                if operation is False:
+                    del original["operation"]
+                elif operation == "foreign":
+                    original["operation"]["url"] = (
+                        "https://management.azure.com/operation/foreign"
+                    )
+                self.fixture.handoff["evidence"].update({
+                    "swap": self.fixture.put(original),
+                    "swap_tracking": tracking,
+                })
+                with self.assertRaisesRegex(ValueError, reason):
+                    self.handoff(handoff=self.fixture.sign(self.fixture.handoff))
+
+    def test_pending_swap_requires_matching_original_operation_and_terminal(self):
+        original = self.fixture.vm("os")
+        original["provisioningState"] = "Accepted"
+        self.fixture.handoff["evidence"]["swap_tracking"] = self.fixture.tracking(original)
+        self.fixture.handoff["evidence"]["swap"] = self.fixture.put(original)
+        self.assertIsInstance(self.handoff(handoff=self.fixture.sign(self.fixture.handoff)),
+                              str)
+        self.fixture = Fixture()
+        original = self.fixture.vm("os")
+        original["provisioningState"] = "Accepted"
+        self.fixture.handoff["evidence"]["swap"] = self.fixture.put(original)
+        with self.assertRaisesRegex(ValueError, "lacks operation tracking"):
+            self.handoff(handoff=self.fixture.sign(self.fixture.handoff))
+        tracking = self.fixture.tracking(original)
+        tracking["terminal"] = self.fixture.put({
+            **original["operation"],
+            "operation_id": "66666666-6666-4666-8666-666666666666",
+            "status": "Succeeded",
+        })
+        self.fixture.handoff["evidence"].update({
+            "swap": self.fixture.put(original),
+            "swap_tracking": tracking,
+        })
+        with self.assertRaisesRegex(ValueError, "original LRO"):
+            self.handoff(handoff=self.fixture.sign(self.fixture.handoff))
+
     def test_lost_original_swap_or_deallocation_response_refuses_handoff(self):
         for field in ("swap", "deallocation"):
             with self.subTest(field=field):
@@ -518,17 +703,6 @@ class CustodyRecordsTests(unittest.TestCase):
 
     def test_tampered_original_deployment_child_outputs_refused(self):
         result = self.fixture.resource("deployment")
-        result["properties"]["outputResources"] = [
-            {"id": self.fixture.ids[child]} for child in custody.CHILDREN
-        ]
-        result["properties"]["outputs"] = {
-            **{name: {"value": self.fixture.ids[target]} for name, target in {
-                "vmId": "vm", "osDiskId": "dummy", "dataDisk0Id": "data0",
-                "dataDisk7Id": "data7", "nicId": "nic", "vnetId": "vnet",
-                "nsgId": "nsg",
-            }.items()},
-            "vmUuid": {"value": self.fixture.uuids["vm"]},
-        }
         result["properties"]["outputs"]["nicId"]["value"] = self.fixture.ids["vm"]
         self.fixture.direct["deployment"]["terminal"] = self.fixture.put(result)
         self.fixture.resign_prepared()
@@ -549,6 +723,36 @@ class CustodyRecordsTests(unittest.TestCase):
         self.fixture.resign_prepared()
         with self.assertRaisesRegex(ValueError, "inventory"):
             self.handoff(prepared=self.fixture.sign(self.fixture.prepared))
+
+    def test_each_vm_observation_must_attach_only_approved_private_nic(self):
+        for stage, field, os_role in (
+            ("prepared", "children", "dummy"),
+            ("prepared", "dummy_vm", "dummy"),
+            ("handoff", "children", "os"),
+            ("handoff", "swap", "os"),
+            ("handoff", "vm", "os"),
+        ):
+            for attachment in ("foreign", "missing", "extra", "wrong-primary"):
+                with self.subTest(stage=stage, field=field, attachment=attachment):
+                    self.fixture = Fixture()
+                    vm = self.fixture.vm(os_role)
+                    nics = vm["networkProfile"]["networkInterfaces"]
+                    if attachment == "foreign":
+                        nics[0]["id"] = self.fixture.ids["nic"] + "-public"
+                    elif attachment == "missing":
+                        nics.clear()
+                    elif attachment == "extra":
+                        nics.append({"id": self.fixture.ids["nic"] + "-public"})
+                    else:
+                        nics[0]["properties"]["primary"] = False
+                    ref = self.fixture.put(vm)
+                    if field == "children":
+                        getattr(self.fixture, stage)["evidence"]["children"]["vm"] = ref
+                    else:
+                        getattr(self.fixture, stage)["evidence"][field] = ref
+                    self.fixture.resign_prepared()
+                    with self.assertRaisesRegex(ValueError, "private NIC attachment"):
+                        self.handoff()
 
     def test_no_in_memory_or_absent_registry_can_claim_success(self):
         for registry in (None, {}, object()):
