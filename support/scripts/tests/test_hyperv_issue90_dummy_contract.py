@@ -53,6 +53,25 @@ EXTRA_TAGS = {
 }
 
 
+def _deny_rule(direction):
+    return {
+        "name": f"DenyAll{direction}",
+        "properties": {
+            "priority": 4095 if direction == "Inbound" else 4096,
+            "access": "Deny",
+            "direction": direction,
+            "protocol": "*",
+            "sourceAddressPrefix": "*",
+            "sourcePortRange": "*",
+            "destinationAddressPrefix": "*",
+            "destinationPortRange": "*",
+        },
+    }
+
+
+DENY_RULES = [_deny_rule("Inbound"), _deny_rule("Outbound")]
+
+
 def _read(path):
     if path.stat().st_size > 64 * 1024:
         raise ValueError(f"{path.name} exceeds the offline template limit")
@@ -105,7 +124,9 @@ def _dummy_spec(legacy):
         tag: f"[parameters('{name}')]"
         for tag, name in EXTRA_TAGS.items()
     })
-    vm = _roles(spec["resources"])["vm"]
+    resources = _roles(spec["resources"])
+    resources["nsg"]["properties"]["securityRules"] = deepcopy(DENY_RULES)
+    vm = resources["vm"]
     disk = vm["properties"]["storageProfile"]["osDisk"]
     disk["name"] = DUMMY_NAME
     disk["managedDisk"]["id"] = DUMMY_ID
@@ -133,9 +154,12 @@ def check_dummy_contract(template, legacy):
 
     actual = _roles(_field(template, "resources"))
     baseline = _roles(legacy["resources"])
-    for role in ("nsg", "vnet", "nic"):
+    _require(actual["nsg"] == _roles(spec["resources"])["nsg"],
+             "nsg needs exact priority-4095/4096 inbound/outbound wildcard Deny, "
+             "no custom Allow or extra rules")
+    for role in ("vnet", "nic"):
         _require(actual[role] == baseline[role],
-                 f"approved private {role} (no custom ingress/public IP/default outbound)")
+                 f"approved private {role} (no public IP/default outbound)")
 
     vm = actual["vm"]
     expected_vm = _roles(spec["resources"])["vm"]
@@ -314,6 +338,56 @@ class DummyContractTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.template = _dummy_spec(self.original)
                 self.refuse(path, value, reason)
+
+    def test_nsg_overrides_default_vnet_and_internet_allows_without_exceptions(self):
+        for direction in ("Inbound", "Outbound"):
+            with self.subTest(missing=direction):
+                self.template = _dummy_spec(self.original)
+                rules = self.template["resources"][0]["properties"]["securityRules"]
+                rules[:] = [rule for rule in rules
+                            if rule["properties"]["direction"] != direction]
+                with self.assertRaisesRegex(ValueError, "nsg needs exact"):
+                    check_dummy_contract(self.template, self.original)
+            for field, value in (
+                ("access", "Allow"),
+                ("direction", "Outbound" if direction == "Inbound" else "Inbound"),
+                ("priority", 65000),
+                ("priority", 100),
+                ("sourceAddressPrefix", "VirtualNetwork"),
+                ("destinationAddressPrefix", "10.90.0.0/29"),
+                ("sourcePortRange", "1024"),
+                ("destinationPortRange", "443"),
+                ("protocol", "Tcp"),
+            ):
+                with self.subTest(direction=direction, field=field, value=value):
+                    self.template = _dummy_spec(self.original)
+                    index = 0 if direction == "Inbound" else 1
+                    self.refuse(
+                        ("resources", 0, "properties", "securityRules", index,
+                         "properties", field),
+                        value, "nsg needs exact",
+                    )
+        for additional in (
+            _deny_rule("Inbound"),
+            {
+                "name": "allow-platform-dns",
+                "properties": {
+                    **_deny_rule("Outbound")["properties"],
+                    "priority": 99,
+                    "access": "Allow",
+                    "destinationAddressPrefix": "AzurePlatformDNS",
+                },
+            },
+        ):
+            with self.subTest(extra_rule=additional["name"]):
+                self.template = _dummy_spec(self.original)
+                self.template["resources"][0]["properties"]["securityRules"].append(
+                    additional
+                )
+                with self.assertRaisesRegex(ValueError, "no custom Allow or extra"):
+                    check_dummy_contract(self.template, self.original)
+        self.template = _dummy_spec(self.original)
+        self.refuse(("resources", 0, "properties", "securityRules"), [], "nsg needs exact")
 
     def test_gen2_compatible_standard_scsi_and_exact_luns(self):
         for path, value, reason in (
