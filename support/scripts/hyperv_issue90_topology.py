@@ -5,8 +5,9 @@
 Plan a private directory with an explicit subscription. Build a fresh EFI
 image with CONFIG_APPHYPERVACCEPTANCE_STORAGE_TOPOLOGY=y, the printed run/disk
 IDs, 8388608 sectors for each disk, nonzero LUN 7, at least three controller
-slots and two LUNs per controller. Locally four-boot it using hyperv-azure.py
-prepare (raw and VHD, normal and legacy APIC). Preparation remains blocked
+slots and two LUNs per controller. The older hyperv-azure.py prepare opens a
+raw prefix in VHD mode; only the separate offline admission's native raw/vpc
+boots can prove both formats and both APIC modes. Preparation remains blocked
 until a reviewed-source, solved-config-to-EFI build proof exists; finding
 the IDs in the EFI is not that proof. Live allocation is separately disabled
 until owner-checked cleanup can handle a lost Azure create response without
@@ -414,6 +415,20 @@ def verify_inputs(directory, state):
         raise ValueError("Both data disks have identical bytes")
 
 
+def verify_raw_vhd_pair(raw_image, image, raw_sha, image_sha):
+    if (raw_image.is_symlink() or raw_image.stat().st_size != azure.VIRTUAL_SIZE
+            or digest(raw_image) != raw_sha
+            or image.is_symlink() or image.stat().st_size != azure.VIRTUAL_SIZE + 512
+            or digest(image) != image_sha):
+        raise ValueError("Locally booted raw/fixed-VHD pair changed")
+    with raw_image.open("rb") as raw_disk, image.open("rb") as vhd_disk:
+        for chunk in iter(lambda: raw_disk.read(1024 * 1024), b""):
+            if vhd_disk.read(len(chunk)) != chunk:
+                raise ValueError("Raw and fixed-VHD boot images have different guest bytes")
+        if len(vhd_disk.read()) != 512:
+            raise ValueError("Fixed-VHD footer is missing")
+
+
 def require_reviewed_build_proof():
     raise ValueError(
         "Reviewed-source/solved-config-to-EFI build provenance is unavailable; "
@@ -465,17 +480,7 @@ def prepare(directory, state, prepared_directory, config_path, config_sha,
         raise ValueError("Locally booted EFI no longer matches its prepared fingerprint")
     raw_image = source_path.parent / "unikraft.raw"
     image = source_path.parent / "unikraft.vhd"
-    if (raw_image.is_symlink() or raw_image.stat().st_size != azure.VIRTUAL_SIZE
-            or digest(raw_image) != source["raw_sha256"]
-            or image.is_symlink() or image.stat().st_size != azure.VIRTUAL_SIZE + 512
-            or digest(image) != image_sha):
-        raise ValueError("Locally booted raw/fixed-VHD pair changed")
-    with raw_image.open("rb") as raw_disk, image.open("rb") as vhd_disk:
-        for chunk in iter(lambda: raw_disk.read(1024 * 1024), b""):
-            if vhd_disk.read(len(chunk)) != chunk:
-                raise ValueError("Raw and fixed-VHD boot images have different guest bytes")
-        if len(vhd_disk.read()) != 512:
-            raise ValueError("Fixed-VHD footer is missing")
+    verify_raw_vhd_pair(raw_image, image, source["raw_sha256"], image_sha)
     miz = Path(miz_path).resolve(strict=True)
     if (not os.access(miz, os.X_OK)
             or source.get("miz_executable") != str(miz)
