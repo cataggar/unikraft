@@ -1011,15 +1011,19 @@ GETs are observations, not original child PUT receipts**. The complete
 inventory includes the dummy and final OS disks, and the observed deallocated
 VM must still attach the dummy and exactly the approved private NIC while the
 final OS disk is unattached. All four disk UUIDs/attachments are reobserved
-at handoff, including both seeded
-data disks; an inventory label or ARM ID alone cannot replace these checks.
+at handoff, including both seeded data disks; every observed VM and current
+disk must carry the independently expected run/operation tags. An inventory
+label or ARM ID alone cannot replace these checks.
 
 HANDED_OFF binds PREPARED, the settled deallocation and dummy-to-final swap,
 the unchanged VM/disk identities, exactly one attached approved private NIC,
 the final private network, full inventory including the now-unattached dummy,
-a fresh one-use challenge and an
-expiring window. Its `no_prior_acceptance_boot` and `exclusive_no_writer`
-fields are **signed custodian assertions**, not Azure or cryptographic proofs.
+a fresh one-use challenge and an expiring window. The swap response, swap
+settlement and final VM observation each require matching run/operation tags;
+a deallocation *outcome* need not contain resource tags but must not
+contradict them if present. The HANDOFF `no_prior_acceptance_boot` and
+`exclusive_no_writer` fields are **signed custodian assertions**, not Azure
+or cryptographic proofs.
 The original swap must report success, or be pending with `swap_tracking`
 containing original/terminal LRO archive references bound to its original
 `operation` fields; `swap_tracking` is null for a successful original swap.

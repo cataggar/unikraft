@@ -669,6 +669,59 @@ class CustodyRecordsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "original LRO"):
             self.handoff(handoff=self.fixture.sign(self.fixture.handoff))
 
+    def test_post_swap_vm_observations_reject_foreign_or_missing_run_tags(self):
+        for role in ("swap", "swap_settlement", "vm"):
+            for field in ("issue90-run", "issue90-operation"):
+                for missing in (False, True):
+                    with self.subTest(role=role, field=field, missing=missing):
+                        self.fixture = Fixture()
+                        foreign = self.fixture.vm("os")
+                        if missing:
+                            del foreign["tags"][field]
+                        else:
+                            foreign["tags"][field] = "foreign"
+                        self.fixture.handoff["evidence"][role] = self.fixture.put(foreign)
+                        with self.assertRaisesRegex(ValueError, "VM observation.*run tags"):
+                            self.handoff(handoff=self.fixture.sign(self.fixture.handoff))
+
+    def test_prepared_vm_and_current_disk_observations_bind_run_tags(self):
+        for stage, field, role, attached in (
+            ("prepared", "dummy_vm", "vm", False),
+            ("prepared", "os_disk", "os", False),
+            ("handoff", "dummy", "dummy", False),
+            ("handoff", "os", "os", True),
+            ("handoff", "data_disks", "data7", True),
+        ):
+            with self.subTest(stage=stage, field=field):
+                self.fixture = Fixture()
+                resource = (self.fixture.vm("dummy") if role == "vm"
+                            else self.fixture.resource(role))
+                if role != "vm":
+                    resource["managedBy"] = (
+                        self.fixture.ids["vm"] if attached else None
+                    )
+                resource["tags"]["issue90-operation"] = "foreign"
+                evidence = getattr(self.fixture, stage)["evidence"]
+                if field == "data_disks":
+                    evidence[field][role] = self.fixture.put(resource)
+                else:
+                    evidence[field] = self.fixture.put(resource)
+                self.fixture.resign_prepared()
+                with self.assertRaisesRegex(ValueError, "run tags"):
+                    self.handoff()
+
+    def test_deallocation_outcome_cannot_contradict_vm_run_tags(self):
+        outcome = {
+            "id": self.fixture.ids["vm"],
+            "vmId": self.fixture.uuids["vm"],
+            "status": "Succeeded",
+            "tags": {"issue90-run": "foreign",
+                     "issue90-operation": self.fixture.expected.operation_id},
+        }
+        self.fixture.handoff["evidence"]["deallocation"] = self.fixture.put(outcome)
+        with self.assertRaisesRegex(ValueError, "Deallocation outcome.*run tags"):
+            self.handoff(handoff=self.fixture.sign(self.fixture.handoff))
+
     def test_lost_original_swap_or_deallocation_response_refuses_handoff(self):
         for field in ("swap", "deallocation"):
             with self.subTest(field=field):

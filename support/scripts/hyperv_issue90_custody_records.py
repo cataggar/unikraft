@@ -368,9 +368,10 @@ def _children(observations, expected, archive, vm_uuid, os_role):
         if (not isinstance(child, dict) or child.get("id") != expected.resource_ids[role]
                 or _state(child) != "Succeeded"):
             raise ValueError(f"{role} is not a settled observed deployment child")
-        _run_tags(child, expected, f"{role} deployment child")
         if role == "vm":
             _vm_attachment(child, expected, vm_uuid, os_role)
+        else:
+            _run_tags(child, expected, f"{role} deployment child")
         resources[role] = child
     nic = resources["nic"]
     vnet = resources["vnet"]
@@ -421,6 +422,7 @@ def _inventory(ref, expected, archive, identities, vm_uuid):
 def _vm_attachment(value, expected, vm_uuid, os_role):
     if not isinstance(value, dict) or value.get("id") != expected.resource_ids["vm"]:
         raise ValueError("VM observation has wrong identity")
+    _run_tags(value, expected, "VM observation")
     props = _props(value)
     storage = props.get("storageProfile")
     network = props.get("networkProfile")
@@ -459,6 +461,7 @@ def _current_disk(role, ref, expected, archive, identities, attached):
             or (value.get("managedBy") != expected.resource_ids["vm"]
                 if attached else bool(value.get("managedBy")))):
         raise ValueError(f"{role} current disk identity or attachment differs")
+    _run_tags(value, expected, f"{role} current disk")
 
 
 def _current_data_disks(refs, expected, archive, identities):
@@ -571,6 +574,8 @@ def _handoff(body, expected, archive, identities, vm_uuid, prepared_sha, now, fr
             or not isinstance(swap, dict) or not isinstance(settled, dict)
             or _state(settled) != "Succeeded" or _state(vm) != "Succeeded"):
         raise ValueError("Deallocation and original OS swap are not settled")
+    if "tags" in deallocation:
+        _run_tags(deallocation, expected, "Deallocation outcome")
     swap_state = _state(swap)
     tracking = evidence["swap_tracking"]
     if swap_state == "Succeeded":
