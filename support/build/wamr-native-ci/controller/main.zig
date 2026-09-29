@@ -53,14 +53,14 @@ pub fn main(init: std.process.Init) void {
         const root = command.runtime.?;
         const runtime = controller.layout.runtime(init.io, root) catch refused(init.io);
         defer runtime.close(init.io);
-        var accepted = controller.accepted_run.openAndValidate(
-            allocator, init.io, init.minimal.environ, &runtime, root, repository,
-        ) catch |err| failed(init.io, "handoff-inspect", "", err);
-        defer accepted.deinit();
         var signal = controller.build_pipeline.installCancellation() catch refused(init.io);
         defer signal.deinit();
+        var accepted = controller.accepted_run.openAndValidateWithSignal(
+            allocator, init.io, init.minimal.environ, &runtime, root, repository, &signal,
+        ) catch |err| failed(init.io, "handoff-inspect", "", err);
+        defer accepted.deinit();
         _ = controller.handoff_inspect.run(
-            allocator, init.io, &accepted, command.output.?, signal.flag(),
+            allocator, init.io, &accepted, command.output.?, &signal,
         ) catch |err| failed(init.io, "handoff-inspect", "", err);
         return;
     }

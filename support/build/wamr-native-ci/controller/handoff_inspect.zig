@@ -92,11 +92,11 @@ pub fn run(
     io: std.Io,
     accepted: *accepted_run.AcceptedRun,
     output: []const u8,
-    cancel: ?*const std.atomic.Value(bool),
+    signal: ?*core.process.SignalCancellation,
 ) !@import("command_validation.zig").ValidatedCommand {
     if (accepted.context != .local_runtime or accepted.repository == null)
         return error.InvalidContext;
-    try accepted.revalidate();
+    try accepted.revalidateWithSignal(signal);
     const roots = try bind(accepted, output);
     var original_tool = try files.RetainedFile.open(io, roots.package_tool, .tool);
     defer original_tool.close(io);
@@ -127,7 +127,7 @@ pub fn run(
         .stage = .@"handoff-inspect",
         .private_dir = private,
         .evidence_dir = evidence,
-        .cancel = cancel,
+        .cancel = if (signal) |active| active.flag() else null,
         .capture_stdout = true,
     });
     defer allocator.free(outcome.stdout);
@@ -155,7 +155,7 @@ pub fn run(
     if (checked.output_bytes != outcome.stdout.len or
         !std.mem.eql(u8, &checked.output_sha256, &stdout_sha256))
         return error.CommandOutputChanged;
-    try accepted.revalidate();
+    try accepted.revalidateWithSignal(signal);
     try pinned_record.verify(io);
     try original_tool.verify(io);
     try original_efi.verify(io);

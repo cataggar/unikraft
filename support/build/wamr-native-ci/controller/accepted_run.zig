@@ -191,8 +191,12 @@ pub const AcceptedRun = struct {
     }
 
     pub fn revalidate(self: *AcceptedRun) !void {
+        return self.revalidateWithSignal(null);
+    }
+
+    pub fn revalidateWithSignal(self: *AcceptedRun, signal: ?*core.process.SignalCancellation) !void {
         if (self.context == .local_runtime) {
-            try revalidateLocal(self);
+            try revalidateLocal(self, signal);
         } else {
             try revalidateImported(self);
         }
@@ -245,6 +249,18 @@ pub fn openAndValidate(
     root: []const u8,
     repository: []const u8,
 ) !AcceptedRun {
+    return openAndValidateWithSignal(allocator, io, environ, runtime, root, repository, null);
+}
+
+pub fn openAndValidateWithSignal(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: std.process.Environ,
+    runtime: *const files.Directory,
+    root: []const u8,
+    repository: []const u8,
+    signal: ?*core.process.SignalCancellation,
+) !AcceptedRun {
     try files.absoluteFilePath(root);
     try files.absoluteFilePath(repository);
     var accepted = AcceptedRun{
@@ -271,7 +287,7 @@ pub fn openAndValidate(
     try loadResult(&accepted);
     if (accepted.compatibility != .tiny_v2_qcow2_derived_vhd)
         return error.UnsupportedLocalLegacyRun;
-    try revalidateLocal(&accepted);
+    try revalidateLocal(&accepted, signal);
     try collectArtifacts(&accepted);
     return accepted;
 }
@@ -464,14 +480,19 @@ fn loadResult(self: *AcceptedRun) !void {
     }
 }
 
-fn revalidateLocal(self: *AcceptedRun) !void {
+fn revalidateLocal(self: *AcceptedRun, signal: ?*core.process.SignalCancellation) !void {
+    if (signal) |active| return revalidateLocalWithSignal(self, active);
+    var installed = try build.installCancellation();
+    defer installed.deinit();
+    return revalidateLocalWithSignal(self, &installed);
+}
+
+fn revalidateLocalWithSignal(self: *AcceptedRun, signal: *core.process.SignalCancellation) !void {
     const a = self.allocator();
     const raw = try canonicalFile(self, try resultPath(self), records.max_record_bytes);
     const result = try records.readResult(raw);
     if (result.set != self.compatibility or result.set != .tiny_v2_qcow2_derived_vhd)
         return error.InvalidResult;
-    var signal = try build.installCancellation();
-    defer signal.deinit();
     const compute = try join(a, &.{ self.root, "compute" });
     var context: build.Context = .{
         .allocator = a,
@@ -484,7 +505,7 @@ fn revalidateLocal(self: *AcceptedRun) !void {
         .git = undefined,
         .tools = undefined,
         .roots = undefined,
-        .signal = &signal,
+        .signal = signal,
     };
     var boot_context: boot.Context = .{
         .build_context = &context,

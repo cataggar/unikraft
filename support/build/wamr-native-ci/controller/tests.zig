@@ -1216,6 +1216,30 @@ test "accepted run requires complete local and trusted-inner-zip evidence before
     defer a.free(path);
     const directory = try core.private_files.Directory.open(io, path);
     defer directory.close(io);
+    {
+        var signal = try controller.build_pipeline.installCancellation();
+        defer signal.deinit();
+        var local_view = controller.accepted_run.AcceptedRun{
+            .arena = std.heap.ArenaAllocator.init(a),
+            .io = io,
+            .context = .local_runtime,
+            .compatibility = .tiny_v2_qcow2_derived_vhd,
+            .production_profile = null,
+            .source = undefined,
+            .result = undefined,
+            .records = &.{},
+            .artifacts = &.{},
+            .runtime_inputs = &.{},
+            .root = path,
+            .repository = options.repository_root,
+            .environ = std.process.Environ.empty,
+        };
+        defer local_view.deinit();
+        try std.testing.expectError(error.FileNotFound, local_view.revalidateWithSignal(&signal));
+        try std.testing.expectError(error.MissingEvidence, controller.accepted_run.openAndValidateWithSignal(
+            a, io, undefined, &directory, path, options.repository_root, &signal,
+        ));
+    }
     try std.testing.expectError(error.MissingEvidence, controller.accepted_run.openImportedStage(a, io, &directory, path));
     try std.testing.expectError(error.MissingEvidence, controller.accepted_run.openAndValidate(a, io, undefined, &directory, path, options.repository_root));
     const local_refusal = try std.process.run(a, io, .{
