@@ -547,8 +547,14 @@ pub fn validateCommandBinding(
 }
 
 pub fn validateLocalHandoffCommand(self: *AcceptedRun, raw: []const u8) !ValidatedCommand {
+    return validateLocalPostRunCommand(self, raw, .@"handoff-inspect");
+}
+
+pub fn validateLocalPostRunCommand(self: *AcceptedRun, raw: []const u8, stage: Stage) !ValidatedCommand {
     if (self.context != .local_runtime or self.repository == null)
         return error.InvalidContext;
+    if (stage != .@"handoff-inspect" and stage != .@"public-validator-build")
+        return error.InvalidCommand;
     const a = self.allocator();
     var document = try contracts.Document.parse(a, raw, .{
         .bytes = records.max_record_bytes,
@@ -559,7 +565,7 @@ pub fn validateLocalHandoffCommand(self: *AcceptedRun, raw: []const u8) !Validat
     defer document.deinit();
     try document.requireCanonical(a, raw);
     const record = document.value();
-    const checked = try command.validate(a, record, .@"handoff-inspect", .local_runtime);
+    const checked = try command.validate(a, record, stage, .local_runtime);
     const request = try get(try get(record, "supervisor"), "request");
     const start = try canonicalFile(self, try recordPath(self, "build-start.json"), records.max_record_bytes);
     const boot_inputs = try canonicalFile(self, try recordPath(self, "boot-inputs.json"), records.max_record_bytes);

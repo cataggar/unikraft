@@ -38,6 +38,7 @@ pub const entries = [_]Entry{
     .{ .name = "support/build/wamr-native-ci/controller/portable_main.zig", .content = @embedFile("build/wamr-native-ci/controller/portable_main.zig") },
     .{ .name = "support/build/wamr-native-ci/controller/profile.zig", .content = @embedFile("build/wamr-native-ci/controller/profile.zig") },
     .{ .name = "support/build/wamr-native-ci/controller/public_image_serial.zig", .content = @embedFile("build/wamr-native-ci/controller/public_image_serial.zig") },
+    .{ .name = "support/build/wamr-native-ci/controller/public_validator_build.zig", .content = @embedFile("build/wamr-native-ci/controller/public_validator_build.zig") },
     .{ .name = "support/build/wamr-native-ci/controller/records.zig", .content = @embedFile("build/wamr-native-ci/controller/records.zig") },
     .{ .name = "support/build/wamr-native-ci/controller/root.zig", .content = @embedFile("build/wamr-native-ci/controller/root.zig") },
     .{ .name = "support/build/wamr-native-ci/controller/source_custody.zig", .content = @embedFile("build/wamr-native-ci/controller/source_custody.zig") },

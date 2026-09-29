@@ -144,6 +144,7 @@ fn handoffInspectFixtures() !void {
     defer accepted.deinit();
     try std.testing.expectError(error.InvalidContext, controller.handoff_inspect.bind(&accepted, "/output"));
     try std.testing.expectError(error.InvalidContext, controller.handoff_inspect.run(a, io, &accepted, "/output", null));
+    try std.testing.expectError(error.InvalidContext, controller.public_validator_build.run(a, io, &accepted, "/output", null));
     accepted.context = .local_runtime;
     accepted.repository = "/source";
     try std.testing.expectError(error.MissingInput, controller.handoff_inspect.bind(&accepted, "/output"));
@@ -319,6 +320,48 @@ fn handoffInspectFixtures() !void {
     try writeFixtureFile(io, source_evidence, "boot-inputs.json", boot_inputs);
     const verified = try controller.accepted_run.validateLocalHandoffCommand(&accepted, raw);
     try std.testing.expectEqual(plan.Stage.@"handoff-inspect", verified.stage);
+    const validator_plan = plan.spec(.@"public-validator-build");
+    try std.testing.expectEqualStrings("tool:zig", validator_plan.executable);
+    try std.testing.expectEqual(@as(u32, 600), validator_plan.seconds);
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), validator_plan.output_limit);
+    try std.testing.expectEqualStrings(
+        try std.fs.path.join(a, &.{ output, "public-source/tools" }),
+        try plan.path(a, validator_plan.argv[9], roots),
+    );
+    const env = try plan.environment(a, .@"public-validator-build");
+    defer plan.freeEnvironment(a, env);
+    var launch = false;
+    var temporary = false;
+    for (env) |entry| {
+        if (std.mem.eql(u8, entry.name, "WAMR_CI_LAUNCH_EXECUTABLE")) {
+            try std.testing.expectEqualStrings("tool:zig", entry.value.path.role);
+            launch = true;
+        } else if (std.mem.eql(u8, entry.name, "TMPDIR")) {
+            try std.testing.expectEqualStrings("private", entry.value.path.relative);
+            temporary = true;
+        }
+        try std.testing.expect(!std.mem.eql(u8, entry.name, "KCONFIG_CONFIG"));
+    }
+    try std.testing.expect(launch and temporary);
+    const built = try controller.command_adapter.execute(a, io, .{
+        .roots = roots,
+        .stage = .@"public-validator-build",
+        .private_dir = private,
+        .evidence_dir = evidence,
+    });
+    try std.testing.expect(built.accepted);
+    const builder_path = try std.fs.path.join(a, &.{ output, "evidence/command-public-validator-build.json" });
+    defer a.free(builder_path);
+    const builder_record = try controller.custody_files.readFile(io, builder_path, 1024 * 1024, true);
+    const builder_raw = try a.alloc(u8, @intCast(builder_record.bytes));
+    defer a.free(builder_raw);
+    const builder_file = try evidence.openFile(io, "command-public-validator-build.json", .{ .follow_symlinks = false });
+    defer builder_file.close(io);
+    try std.testing.expectEqual(builder_raw.len, try builder_file.readPositionalAll(io, builder_raw, 0));
+    const validated_builder = try controller.accepted_run.validateLocalPostRunCommand(&accepted, builder_raw, .@"public-validator-build");
+    try std.testing.expectEqual(plan.Stage.@"public-validator-build", validated_builder.stage);
+    try std.testing.expectEqual(@as(u64, 0), validated_builder.output_bytes);
+    try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateLocalPostRunCommand(&accepted, builder_raw, .package));
     var changed_boot = try std.json.parseFromSlice(std.json.Value, a, boot_inputs, .{
         .duplicate_field_behavior = .@"error",
         .parse_numbers = false,
@@ -1053,6 +1096,10 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
     try std.testing.expectEqual(cli.Action.@"handoff-inspect", inspection.action);
     try std.testing.expectEqualStrings("/runtime", inspection.runtime.?);
     try std.testing.expectEqualStrings("/private/inspection", inspection.output.?);
+    const validator_build = try cli.parse(&.{ "uk-wamr-native-ci", "public-validator-build", "--output", "/private/validator", "--runtime", "/runtime" });
+    try std.testing.expectEqual(cli.Action.@"public-validator-build", validator_build.action);
+    try std.testing.expectEqualStrings("/runtime", validator_build.runtime.?);
+    try std.testing.expectEqualStrings("/private/validator", validator_build.output.?);
     const rejected = [_][]const []const u8{
         &.{"uk-wamr-native-ci"},
         &.{ "uk-wamr-native-ci", "handoff-inspect", "--runtime", "/runtime" },
@@ -1060,6 +1107,9 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
         &.{ "uk-wamr-native-ci", "handoff-inspect", "--runtime", "/runtime", "--output", "/private/inspection", "--profile", "tiny" },
         &.{ "uk-wamr-native-ci", "handoff-inspect", "--runtime", "/runtime", "--runtime", "/other" },
         &.{ "uk-wamr-native-ci", "handoff-inspect", "--stage-root", "/stage", "--output", "/private/inspection" },
+        &.{ "uk-wamr-native-ci", "public-validator-build", "--runtime", "/runtime" },
+        &.{ "uk-wamr-native-ci", "public-validator-build", "--output", "/private/validator", "--runtime", "/runtime", "--profile", "tiny" },
+        &.{ "uk-wamr-native-ci", "public-validator-build", "--stage-root", "/stage", "--output", "/private/validator" },
         &.{ "uk-wamr-native-ci", "records", "--runtime", "/runtime" },
         &.{ "uk-wamr-native-ci", "records", "--runtime", "/runtime", "--transport", "trusted-inner-zip", "--output", "handoff-v1" },
         &.{ "uk-wamr-native-ci", "records", "--stage-root", "/stage", "--output", "handoff-v1" },
@@ -1265,6 +1315,19 @@ test "accepted run requires complete local and trusted-inner-zip evidence before
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, inspection.term);
     try std.testing.expectEqualStrings("", inspection.stdout);
     try std.testing.expectError(error.FileNotFound, root.openDir(io, "inspection", .{}));
+    const validation_path = try std.fs.path.join(a, &.{ path, "validator" });
+    defer a.free(validation_path);
+    const validator_build = try std.process.run(a, io, .{
+        .argv = &.{ options.host_controller_cli, "public-validator-build", "--runtime", path, "--output", validation_path },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(256),
+        .stderr_limit = .limited(4096),
+    });
+    defer a.free(validator_build.stdout);
+    defer a.free(validator_build.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, validator_build.term);
+    try std.testing.expectEqualStrings("", validator_build.stdout);
+    try std.testing.expectError(error.FileNotFound, root.openDir(io, "validator", .{}));
 
     var parsed = try controller.records.parseCanonicalResult(a, accepted);
     defer parsed.deinit();

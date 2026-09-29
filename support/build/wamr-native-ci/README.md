@@ -69,9 +69,13 @@ native-produced v2 runs. It uses the runtime-installed recorded controller
 and pinned package/EFI inputs, then retains its bounded private log and
 command record in a create-only owner-only output beneath an existing private
 parent outside the runtime's pinned input ancestors. It neither exports an
-image nor accepts a Python-produced runtime. Python remains the production
-handoff caller; checkout/consumer custody and the other supervised handoff
-stages need native owners before `run.py` can be removed.
+image nor accepts a Python-produced runtime. `public-validator-build --runtime
+ABS --output ABS` similarly uses the recorded Zig tool and controller to
+build the fixed x86_64 validator in an independent private output, retaining
+its bounded command evidence without modifying the accepted runtime or
+publishing an archive. Python remains the production handoff caller;
+checkout/consumer custody and the other supervised handoff stages need native
+owners before `run.py` can be removed.
 
 ## Native controller preparation (unpublished build path)
 

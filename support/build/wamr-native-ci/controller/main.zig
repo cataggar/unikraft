@@ -48,7 +48,8 @@ pub fn main(init: std.process.Init) void {
         stdout.interface.writeAll(encoded) catch refused(init.io);
         return;
     }
-    if (command.action == .@"handoff-inspect") {
+    if (command.action == .@"handoff-inspect" or command.action == .@"public-validator-build") {
+        const stage = @tagName(command.action);
         const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
         const root = command.runtime.?;
         const runtime = controller.layout.runtime(init.io, root) catch refused(init.io);
@@ -57,11 +58,18 @@ pub fn main(init: std.process.Init) void {
         defer signal.deinit();
         var accepted = controller.accepted_run.openAndValidateWithSignal(
             allocator, init.io, init.minimal.environ, &runtime, root, repository, &signal,
-        ) catch |err| failed(init.io, "handoff-inspect", "", err);
+        ) catch |err| failed(init.io, stage, "", err);
         defer accepted.deinit();
-        _ = controller.handoff_inspect.run(
-            allocator, init.io, &accepted, command.output.?, &signal,
-        ) catch |err| failed(init.io, "handoff-inspect", "", err);
+        const result = switch (command.action) {
+            .@"handoff-inspect" => controller.handoff_inspect.run(
+                allocator, init.io, &accepted, command.output.?, &signal,
+            ),
+            .@"public-validator-build" => controller.public_validator_build.run(
+                allocator, init.io, &accepted, command.output.?, &signal,
+            ),
+            else => unreachable,
+        };
+        _ = result catch |err| failed(init.io, stage, "", err);
         return;
     }
     const runtime = controller.layout.runtime(init.io, command.runtime.?) catch refused(init.io);
@@ -105,6 +113,7 @@ pub fn main(init: std.process.Init) void {
         .describe => unreachable,
         .records => unreachable,
         .@"handoff-inspect" => unreachable,
+        .@"public-validator-build" => unreachable,
     }
 }
 
@@ -116,7 +125,8 @@ fn usage(io: std.Io) noreturn {
             "       uk-wamr-native-ci describe --output json-v1\n" ++
             "       uk-wamr-native-ci records --runtime ABS --output handoff-v1\n" ++
             "       uk-wamr-native-ci records --stage-root ABS --transport trusted-inner-zip --output handoff-v1\n" ++
-            "       uk-wamr-native-ci handoff-inspect --runtime ABS --output ABS\n",
+            "       uk-wamr-native-ci handoff-inspect --runtime ABS --output ABS\n" ++
+            "       uk-wamr-native-ci public-validator-build --runtime ABS --output ABS\n",
     ) catch {};
     std.process.exit(2);
 }

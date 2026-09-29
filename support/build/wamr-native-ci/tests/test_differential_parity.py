@@ -93,6 +93,7 @@ NATIVE_SOURCE_FILES = (
     "support/build/wamr-native-ci/controller/portable_main.zig",
     "support/build/wamr-native-ci/controller/profile.zig",
     "support/build/wamr-native-ci/controller/public_image_serial.zig",
+    "support/build/wamr-native-ci/controller/public_validator_build.zig",
     "support/build/wamr-native-ci/controller/records.zig",
     "support/build/wamr-native-ci/controller/root.zig",
     "support/build/wamr-native-ci/controller/source_custody.zig",
@@ -2737,7 +2738,8 @@ def report_progress(side, phase):
           and phase in (
               "build-start", "build-done", "boot-start", "boot-done",
               "records-start", "records-checked", "inspect-start",
-              "inspect-done", "records-done"),
+              "inspect-done", "validator-start", "validator-done",
+              "records-done"),
           "invalid differential progress label")
     print(f"DIFFERENTIAL_PROGRESS: {side}:{phase}", file=sys.stderr, flush=True)
 
@@ -2776,6 +2778,8 @@ def full(args):
           "unknown differential case")
     inspection_parent = (
         fresh(parent, "native-inspection") if args.case == "success" else None)
+    validator_parent = (
+        fresh(parent, "native-validation") if args.case == "success" else None)
     py_runtime = fresh(parent, "python")
     native_runtime = fresh(parent, "native")
     for runtime in (py_runtime, native_runtime):
@@ -2983,6 +2987,53 @@ def full(args):
                 and inspection_record["sha256"] == sha(inspection_log),
                 "native handoff inspection command output changed")
             report_progress("native", "inspect-done")
+            report_progress("native", "validator-start")
+            validation = validator_parent / "build"
+            built = command([
+                str(controller), "public-validator-build",
+                "--runtime", str(native_runtime),
+                "--output", str(validation),
+            ], native_repo, executions["native"][3], seconds=1200)
+            refusal = re.search(
+                r"(?m)^WAMR_CI_FAILED_STAGE: public-validator-build; cause: "
+                r"([A-Za-z][A-Za-z0-9_]{0,79}); bounded private logs retained\.$",
+                built.stderr.decode("utf-8", "replace"))
+            check(built.returncode == 0 and not built.stdout and not built.stderr,
+                  "native public validator build refused: " +
+                  (refusal.group(1) if refusal else "unexpected result"))
+            validator_record = parsed(checked_file(
+                validation / "evidence/command-public-validator-build.json"),
+                reference)
+            validator_log = checked_file(
+                validation / "private/public-validator-build.log",
+                8 * 1024 * 1024 + 1)
+            check(
+                validator_record["scope"] == "command_diagnostic_not_acceptance"
+                and validator_record["stage"] == "public-validator-build"
+                and validator_record["exit_code"] == 0
+                and validator_record["bytes"] == len(validator_log)
+                and validator_record["sha256"] == sha(validator_log),
+                "native public validator command output changed")
+            validator = (
+                validation / "public-source/tools/bin/uk-wamr-direct-validate")
+            before = validator.lstat()
+            check(stat.S_ISREG(before.st_mode) and before.st_nlink == 1
+                  and before.st_uid == os.getuid()
+                  and stat.S_IMODE(before.st_mode) & 0o022 == 0
+                  and before.st_mode & 0o111 != 0
+                  and 20 <= before.st_size <= 64 * 1024 * 1024,
+                  "unsafe native-built public validator")
+            with validator.open("rb") as stream:
+                header = stream.read(20)
+            after = validator.lstat()
+            check(header[:6] == b"\x7fELF\x02\x01"
+                  and header[18:20] == b"\x3e\x00"
+                  and (before.st_dev, before.st_ino, before.st_size,
+                       before.st_mtime_ns, before.st_ctime_ns)
+                  == (after.st_dev, after.st_ino, after.st_size,
+                      after.st_mtime_ns, after.st_ctime_ns),
+                  "native-built public validator identity changed")
+            report_progress("native", "validator-done")
         finally:
             # The comparison root is a pinned runtime ancestor until replay ends.
             with (parent / "native-records.json").open("xb") as output:

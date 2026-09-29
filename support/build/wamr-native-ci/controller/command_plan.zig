@@ -24,6 +24,7 @@ pub const Stage = enum {
     @"log-validator-x2apic",
     @"log-validator-legacy",
     @"handoff-inspect",
+    @"public-validator-build",
 };
 
 pub const Binding = union(enum) {
@@ -161,6 +162,21 @@ pub fn spec(stage: Stage) Spec {
                 .{ .path = .{ .role = "source", .relative = "support/apps/wamr-aot/build/wamr_hyperv-x86_64-efi" } }, .{ .path = .{ .role = "compute", .relative = "package" } },
             },
         },
+        .@"public-validator-build" => .{
+            .stage = stage,
+            .executable = "tool:zig",
+            .seconds = 600,
+            .output_limit = 8 * 1024 * 1024,
+            .argv = &.{
+                zig, .{ .literal = "build" }, .{ .literal = "--build-file" },
+                .{ .path = .{ .role = "source", .relative = "support/tools/hyperv/direct/build.zig" } },
+                .{ .literal = "--cache-dir" }, .{ .path = .{ .role = "work", .relative = "cache" } },
+                .{ .literal = "--global-cache-dir" }, .{ .path = .{ .role = "work", .relative = "global-cache" } },
+                .{ .literal = "--prefix" }, .{ .path = .{ .role = "work", .relative = "public-source/tools" } },
+                .{ .literal = "-Dtarget=x86_64-linux-gnu" }, .{ .literal = "-Dcpu=x86_64_v2" },
+                .{ .literal = "-Doptimize=ReleaseSafe" }, .{ .literal = "-j2" }, .{ .literal = "install" },
+            },
+        },
         .@"finalize-qcow2" => packageSpec(.@"finalize-qcow2"),
         .@"derive-fixed-vhd" => packageSpec(.@"derive-fixed-vhd"),
         .@"raw-x2apic" => bootSpec(stage, .@"raw-x2apic"),
@@ -294,7 +310,7 @@ pub fn environment(allocator: std.mem.Allocator, stage: Stage) ![]EnvironmentBin
     var bindings: std.ArrayList(EnvironmentBinding) = .empty;
     errdefer bindings.deinit(allocator);
     if (isValidator(stage)) return bindings.toOwnedSlice(allocator);
-    const build = !isBoot(stage);
+    const build = !isBoot(stage) and stage != .@"public-validator-build";
     try bindings.appendSlice(allocator, &.{
         .{ .name = "HOME", .value = .{ .path = .{ .role = "work", .relative = "private" } } },
         .{ .name = "LANG", .value = .{ .literal = "C" } },
@@ -316,7 +332,7 @@ pub fn environment(allocator: std.mem.Allocator, stage: Stage) ![]EnvironmentBin
         .{ .name = "ZIG_LIB_DIR", .value = .{ .path = .{ .role = "tool-tree:zig", .relative = "lib" } } },
         .{ .name = "ZIG_LOCAL_CACHE_DIR", .value = .{ .path = .{ .role = "work", .relative = "cache" } } },
     });
-    if (stage == .adapter or stage == .@"local-boot-tool")
+    if (stage == .adapter or stage == .@"local-boot-tool" or stage == .@"public-validator-build")
         try bindings.append(allocator, .{ .name = "WAMR_CI_LAUNCH_EXECUTABLE", .value = zig });
     if (stage == .fixtures)
         try bindings.appendSlice(allocator, &.{
