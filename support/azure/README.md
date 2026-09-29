@@ -1058,6 +1058,68 @@ This format assumes a newly reviewed dummy-OS deployment template and
 original-response capture outside this module. The current pinned template
 attaches the final OS disk and cannot be relabeled as a dummy deployment.
 
+### Separate offline dummy-OS ARM candidate (not a deployment approval)
+
+`support/azure/hyperv-issue90-custodian-dummy.json` is a **candidate only**;
+the pinned `hyperv-issue90-topology.json`, its controller and both disabled
+live gates remain unchanged. No existing runner selects this candidate.
+An independent approver must review its exact bytes and put its SHA-256 in
+`custody_records.Expected.template_sha256` and the signed preprovision
+authorization; a tag, same-name GET or locally computed hash is not an
+independent approval.
+
+Before a deployment, an external custodian would have to create the resource
+group and **four distinct managed disks** with separately captured original
+CLI create/terminal/upload/revocation receipts: the disposable dummy Linux
+Gen2 OS disk, the unattached final Linux Gen2 acceptance OS disk, and two
+independently seeded policy-2 data disks. Both OS disks must be compatible
+fixed VHDs and `StandardSSD_LRS`; both data disks must be
+`StandardSSD_LRS`, 4 GiB (8,388,608 sectors of 512 bytes), with different
+reviewed seed hashes. Verify each original Azure-assigned disk `uniqueId`,
+`diskSizeBytes`, `creationData.uploadSizeBytes`, Gen2 `hyperVGeneration: V2`
+on both OS disks, exact ID/tags and image bytes separately. Template string
+bounds do **not** validate lowercase digests, canonical UUIDs, disk SKU,
+generation, actual byte digests, uniqueness or ownership: these need
+independent approval and the original-response custody checks. Supplying a
+UUID as a deployment parameter or VM tag does not prove it is Azure's UUID.
+
+The candidate deploys only the original VM, NIC, VNet and NSG as **nested
+deployment children** in North Europe. It selects `Standard_D2s_v5`, SCSI,
+explicit `Standard` security, a private NIC, an NSG without custom ingress
+rules and a subnet with default outbound access disabled; it creates no
+public IP or NAT gateway. It attaches the externally created
+dummy disk as the initial VM OS disk and the two data disks at LUN 0 and 7;
+the final acceptance OS disk is supplied as a distinct **unattached**
+parameter and original owner receipt, never deployed or attached here.
+`outputs.osDiskId` intentionally names the **dummy** disk; `outputs.vmUuid`
+uses the same pinned Compute 2025-11-01 `reference(...).properties.vmId`
+as the original template. The inherited `image-sha256` tag pins the reviewed
+**final** image, while `dummy-image-sha256` identifies the initially attached
+dummy; neither tag attests uploaded bytes. ARM's original deployment outputResources,
+correlation ID and VM UUID need separate original deployment-response
+capture and independently verified child GETs; outputResources do not
+constitute direct PUT receipts for individual VM/network children. The
+custodian must deallocate and account for **all dummy boots in the total
+60-minute runtime** before a later, separately authorized deallocated OS
+swap. Nothing in this template performs that swap or acceptance boot.
+
+The [ARM template schema](https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json),
+[Compute VM 2025-11-01](https://learn.microsoft.com/en-us/azure/templates/microsoft.compute/2025-11-01/virtualmachines),
+[disk 2025-01-02](https://learn.microsoft.com/en-us/azure/templates/microsoft.compute/2025-01-02/disks)
+and [Network VNet 2024-05-01](https://learn.microsoft.com/en-us/azure/templates/microsoft.network/2024-05-01/virtualnetworks)
+references document the attached managed OS disk, explicit `Standard`
+security, disk `V2` generation and subnet `defaultOutboundAccess: false`.
+ARM does **not** set the generation of an externally attached OS disk in
+the VM resource: the original disk create/show proof must establish Gen2,
+and a template parameter/tag cannot replace it. The public template schema
+does not furnish the pinned Compute/Network provider resource schemas for a
+complete offline deployment validation; these synthetic tests verify JSON,
+parameter bounds and exact resource/output structure, not Azure acceptance.
+The actual Azure CLI response shapes, regional deployment behavior and
+private reviewed image/build evidence are still unavailable. Do not run
+`az deployment`, change the controller gate, or treat this candidate as
+provisioning permission.
+
 ### Opt-in offline custody verifier (no Azure dispatch)
 
 `support/scripts/hyperv_issue90_custody_verifier.py` is a **separate offline

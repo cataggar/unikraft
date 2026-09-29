@@ -1,0 +1,157 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "namePrefix": { "type": "string", "minLength": 6, "maxLength": 32 },
+    "location": { "type": "string", "allowedValues": ["northeurope"] },
+    "runId": { "type": "string", "minLength": 32, "maxLength": 32 },
+    "operationId": { "type": "string", "minLength": 36, "maxLength": 36 },
+    "reviewedHead": { "type": "string", "minLength": 40, "maxLength": 40 },
+    "provenanceSha256": { "type": "string", "minLength": 64, "maxLength": 64 },
+    "configSha256": { "type": "string", "minLength": 64, "maxLength": 64 },
+    "efiSha256": { "type": "string", "minLength": 64, "maxLength": 64 },
+    "rawSha256": { "type": "string", "minLength": 64, "maxLength": 64 },
+    "mizSha256": { "type": "string", "minLength": 64, "maxLength": 64 },
+    "imageSha256": { "type": "string", "minLength": 64, "maxLength": 64 },
+    "dummyImageSha256": { "type": "string", "minLength": 64, "maxLength": 64 },
+    "seed0Sha256": { "type": "string", "minLength": 64, "maxLength": 64 },
+    "seed7Sha256": { "type": "string", "minLength": 64, "maxLength": 64 },
+    "dummyOsDiskId": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "dummyOsDiskUuid": { "type": "string", "minLength": 36, "maxLength": 36 },
+    "acceptanceOsDiskId": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "acceptanceOsDiskUuid": { "type": "string", "minLength": 36, "maxLength": 36 },
+    "dataDisk0Id": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "dataDisk0Uuid": { "type": "string", "minLength": 36, "maxLength": 36 },
+    "dataDisk7Id": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "dataDisk7Uuid": { "type": "string", "minLength": 36, "maxLength": 36 }
+  },
+  "variables": {
+    "tags": {
+      "managed-by": "unikraft-hyperv",
+      "purpose": "issue90-read-only-topology",
+      "unikraft-run": "[parameters('namePrefix')]",
+      "issue90-run": "[parameters('runId')]",
+      "issue90-operation": "[parameters('operationId')]",
+      "reviewed-head": "[parameters('reviewedHead')]",
+      "provenance-sha256": "[parameters('provenanceSha256')]",
+      "config-sha256": "[parameters('configSha256')]",
+      "efi-sha256": "[parameters('efiSha256')]",
+      "raw-sha256": "[parameters('rawSha256')]",
+      "miz-sha256": "[parameters('mizSha256')]",
+      "image-sha256": "[parameters('imageSha256')]",
+      "dummy-image-sha256": "[parameters('dummyImageSha256')]",
+      "seed0-sha256": "[parameters('seed0Sha256')]",
+      "seed7-sha256": "[parameters('seed7Sha256')]",
+      "dummy-os-uuid": "[parameters('dummyOsDiskUuid')]",
+      "acceptance-os-uuid": "[parameters('acceptanceOsDiskUuid')]",
+      "data0-uuid": "[parameters('dataDisk0Uuid')]",
+      "data7-uuid": "[parameters('dataDisk7Uuid')]"
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2024-05-01",
+      "name": "[concat(parameters('namePrefix'), '-nsg')]",
+      "location": "[parameters('location')]",
+      "tags": "[union(variables('tags'), createObject('issue90-role', 'nsg'))]",
+      "properties": { "securityRules": [] }
+    },
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2024-05-01",
+      "name": "[concat(parameters('namePrefix'), '-vnet')]",
+      "location": "[parameters('location')]",
+      "tags": "[union(variables('tags'), createObject('issue90-role', 'vnet'))]",
+      "dependsOn": ["[resourceId('Microsoft.Network/networkSecurityGroups', concat(parameters('namePrefix'), '-nsg'))]"],
+      "properties": {
+        "addressSpace": { "addressPrefixes": ["10.90.0.0/29"] },
+        "subnets": [{
+          "name": "default",
+          "properties": {
+            "addressPrefix": "10.90.0.0/29",
+            "defaultOutboundAccess": false,
+            "networkSecurityGroup": { "id": "[resourceId('Microsoft.Network/networkSecurityGroups', concat(parameters('namePrefix'), '-nsg'))]" }
+          }
+        }]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2024-05-01",
+      "name": "[concat(parameters('namePrefix'), '-nic')]",
+      "location": "[parameters('location')]",
+      "tags": "[union(variables('tags'), createObject('issue90-role', 'nic'))]",
+      "dependsOn": ["[resourceId('Microsoft.Network/virtualNetworks', concat(parameters('namePrefix'), '-vnet'))]"],
+      "properties": {
+        "enableAcceleratedNetworking": false,
+        "enableIPForwarding": false,
+        "ipConfigurations": [{
+          "name": "primary",
+          "properties": {
+            "privateIPAllocationMethod": "Dynamic",
+            "subnet": { "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', concat(parameters('namePrefix'), '-vnet'), 'default')]" }
+          }
+        }]
+      }
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines",
+      "apiVersion": "2025-11-01",
+      "name": "[concat(parameters('namePrefix'), '-vm')]",
+      "location": "[parameters('location')]",
+      "tags": "[union(variables('tags'), createObject('issue90-role', 'vm'))]",
+      "dependsOn": ["[resourceId('Microsoft.Network/networkInterfaces', concat(parameters('namePrefix'), '-nic'))]"],
+      "properties": {
+        "hardwareProfile": { "vmSize": "Standard_D2s_v5" },
+        "storageProfile": {
+          "diskControllerType": "SCSI",
+          "osDisk": {
+            "name": "[last(split(parameters('dummyOsDiskId'), '/'))]",
+            "osType": "Linux",
+            "createOption": "Attach",
+            "caching": "ReadOnly",
+            "deleteOption": "Detach",
+            "managedDisk": { "id": "[parameters('dummyOsDiskId')]" }
+          },
+          "dataDisks": [
+            {
+              "lun": 0,
+              "name": "[last(split(parameters('dataDisk0Id'), '/'))]",
+              "createOption": "Attach",
+              "caching": "None",
+              "deleteOption": "Detach",
+              "managedDisk": { "id": "[parameters('dataDisk0Id')]" }
+            },
+            {
+              "lun": 7,
+              "name": "[last(split(parameters('dataDisk7Id'), '/'))]",
+              "createOption": "Attach",
+              "caching": "None",
+              "deleteOption": "Detach",
+              "managedDisk": { "id": "[parameters('dataDisk7Id')]" }
+            }
+          ]
+        },
+        "securityProfile": { "securityType": "Standard" },
+        "networkProfile": {
+          "networkInterfaces": [{
+            "id": "[resourceId('Microsoft.Network/networkInterfaces', concat(parameters('namePrefix'), '-nic'))]",
+            "properties": { "primary": true, "deleteOption": "Delete" }
+          }]
+        },
+        "diagnosticsProfile": { "bootDiagnostics": { "enabled": true } }
+      }
+    }
+  ],
+  "outputs": {
+    "vmId": { "type": "string", "value": "[resourceId('Microsoft.Compute/virtualMachines', concat(parameters('namePrefix'), '-vm'))]" },
+    "vmUuid": { "type": "string", "value": "[reference(resourceId('Microsoft.Compute/virtualMachines', concat(parameters('namePrefix'), '-vm')), '2025-11-01', 'Full').properties.vmId]" },
+    "osDiskId": { "type": "string", "value": "[parameters('dummyOsDiskId')]" },
+    "dataDisk0Id": { "type": "string", "value": "[parameters('dataDisk0Id')]" },
+    "dataDisk7Id": { "type": "string", "value": "[parameters('dataDisk7Id')]" },
+    "nicId": { "type": "string", "value": "[resourceId('Microsoft.Network/networkInterfaces', concat(parameters('namePrefix'), '-nic'))]" },
+    "vnetId": { "type": "string", "value": "[resourceId('Microsoft.Network/virtualNetworks', concat(parameters('namePrefix'), '-vnet'))]" },
+    "nsgId": { "type": "string", "value": "[resourceId('Microsoft.Network/networkSecurityGroups', concat(parameters('namePrefix'), '-nsg'))]" }
+  }
+}
