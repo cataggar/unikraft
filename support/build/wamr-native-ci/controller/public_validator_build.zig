@@ -64,6 +64,23 @@ pub fn run(
         header[18] != 62 or header[19] != 0)
         return error.InvalidValidator;
 
+    const checked = try validateCommandEvidence(allocator, io, accepted, output, outcome.bytes);
+    try accepted.revalidateWithSignal(signal);
+    const rechecked = try validateCommandEvidence(allocator, io, accepted, output, outcome.bytes);
+    if (!std.meta.eql(checked, rechecked)) return error.CommandOutputChanged;
+    try zig.verify(io);
+    try supervisor.verify(io);
+    try validator.verify(io);
+    return checked;
+}
+
+pub fn validateCommandEvidence(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    accepted: *accepted_run.AcceptedRun,
+    output: []const u8,
+    expected_bytes: usize,
+) !@import("command_validation.zig").ValidatedCommand {
     const record_path = try std.fs.path.join(allocator, &.{ output, "evidence/command-public-validator-build.json" });
     defer allocator.free(record_path);
     const record = try physical.readFile(io, record_path, records.max_record_bytes, true);
@@ -71,11 +88,11 @@ pub fn run(
     defer pinned.close(io);
     const raw = try allocator.alloc(u8, @intCast(record.bytes));
     defer allocator.free(raw);
-    const observed_sha256 = std.fmt.bytesToHex(records.fileIdentity(raw), .lower);
-    if (try pinned.file.readPositionalAll(io, raw, 0) != raw.len or
-        !std.meta.eql(record.metadata, physical.metadata(pinned.file_snapshot)) or
-        !std.mem.eql(u8, &record.sha256, &observed_sha256))
+    if (try pinned.file.readPositionalAll(io, raw, 0) != raw.len)
         return error.CommandOutputChanged;
+    const observed_sha256 = std.fmt.bytesToHex(records.fileIdentity(raw), .lower);
+    if (!std.meta.eql(record.metadata, physical.metadata(pinned.file_snapshot)) or
+        !std.mem.eql(u8, &record.sha256, &observed_sha256)) return error.CommandOutputChanged;
     try pinned.verify(io);
     const checked = try accepted_run.validateLocalPostRunCommand(
         accepted, raw, .@"public-validator-build",
@@ -83,13 +100,9 @@ pub fn run(
     const log_path = try std.fs.path.join(allocator, &.{ output, "private/public-validator-build.log" });
     defer allocator.free(log_path);
     const log = try physical.readFile(io, log_path, 8 * 1024 * 1024 + 1, true);
-    if (checked.output_bytes != outcome.bytes or checked.output_bytes != log.bytes or
+    if (checked.output_bytes != expected_bytes or checked.output_bytes != log.bytes or
         !std.mem.eql(u8, &checked.output_sha256, &log.sha256))
         return error.CommandOutputChanged;
-    try accepted.revalidateWithSignal(signal);
     try pinned.verify(io);
-    try zig.verify(io);
-    try supervisor.verify(io);
-    try validator.verify(io);
     return checked;
 }

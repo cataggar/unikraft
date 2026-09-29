@@ -361,6 +361,11 @@ fn handoffInspectFixtures() !void {
     const validated_builder = try controller.accepted_run.validateLocalPostRunCommand(&accepted, builder_raw, .@"public-validator-build");
     try std.testing.expectEqual(plan.Stage.@"public-validator-build", validated_builder.stage);
     try std.testing.expectEqual(@as(u64, 0), validated_builder.output_bytes);
+    const checked_builder = try controller.public_validator_build.validateCommandEvidence(a, io, &accepted, output, built.bytes);
+    try std.testing.expectEqual(plan.Stage.@"public-validator-build", checked_builder.stage);
+    try std.testing.expectError(error.CommandOutputChanged, controller.public_validator_build.validateCommandEvidence(
+        a, io, &accepted, output, built.bytes + 1,
+    ));
     try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateLocalPostRunCommand(&accepted, builder_raw, .package));
     var changed_boot = try std.json.parseFromSlice(std.json.Value, a, boot_inputs, .{
         .duplicate_field_behavior = .@"error",
