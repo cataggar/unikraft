@@ -14,13 +14,13 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "support/scripts"))
 import hyperv_issue90_topology as topology
 
-TEMPLATE = ROOT / "support/azure/hyperv-issue90-custodian-dummy.json"
+TEMPLATE = ROOT / "support/azure/hyperv-issue90-dummy-topology.json"
 PIN_NAMES = (
     "provenanceSha256", "configSha256", "efiSha256", "rawSha256",
     "mizSha256", "imageSha256", "dummyImageSha256",
     "seed0Sha256", "seed7Sha256",
 )
-DISK_IDS = ("dummyOsDiskId", "acceptanceOsDiskId", "dataDisk0Id", "dataDisk7Id")
+DISK_IDS = ("dummyDiskId", "osDiskId", "dataDisk0Id", "dataDisk7Id")
 DISK_UUIDS = (
     "dummyOsDiskUuid", "acceptanceOsDiskUuid",
     "dataDisk0Uuid", "dataDisk7Uuid",
@@ -172,10 +172,10 @@ def check_contract(template):
     assert set(storage) == {"diskControllerType", "osDisk", "dataDisks"}
     assert storage["diskControllerType"] == "SCSI"
     assert storage["osDisk"] == {
-        "name": "[last(split(parameters('dummyOsDiskId'), '/'))]",
+        "name": "[last(split(parameters('dummyDiskId'), '/'))]",
         "osType": "Linux", "createOption": "Attach", "caching": "ReadOnly",
         "deleteOption": "Detach",
-        "managedDisk": {"id": "[parameters('dummyOsDiskId')]"},
+        "managedDisk": {"id": "[parameters('dummyDiskId')]"},
     }
     assert storage["dataDisks"] == [{
         "lun": lun, "name": f"[last(split(parameters('{name}'), '/'))]",
@@ -192,7 +192,7 @@ def check_contract(template):
             "concat(parameters('namePrefix'), '-vm')), '2025-11-01', "
             "'Full').properties.vmId]"
         )},
-        "osDiskId": {"type": "string", "value": "[parameters('dummyOsDiskId')]"},
+        "osDiskId": {"type": "string", "value": "[parameters('dummyDiskId')]"},
         "dataDisk0Id": {"type": "string", "value": "[parameters('dataDisk0Id')]"},
         "dataDisk7Id": {"type": "string", "value": "[parameters('dataDisk7Id')]"},
         "nicId": {"type": "string", "value": (
@@ -205,7 +205,7 @@ def check_contract(template):
         )},
         "nsgId": {"type": "string", "value": resources[1]["dependsOn"][0]},
     }
-    assert "parameters('acceptanceOsDiskId')" not in json.dumps(
+    assert "parameters('osDiskId')" not in json.dumps(
         {"resources": resources, "outputs": template["outputs"]},
     )
 
@@ -234,21 +234,21 @@ def check_synthetic_inputs(template, state, values, receipts):
     assert len({values[name] for name in DISK_UUIDS}) == 4
     for name in ("operationId", *DISK_UUIDS):
         assert str(uuid.UUID(values[name])) == values[name]
-    assert values["dummyOsDiskId"] == (
+    assert values["dummyDiskId"] == (
         topology.group_id(state) + "/providers/Microsoft.Compute/disks/"
         + state["prefix"] + "-dummy"
     )
     for name, role in (
-        ("acceptanceOsDiskId", "os"),
+        ("osDiskId", "os"),
         ("dataDisk0Id", "data0"),
         ("dataDisk7Id", "data7"),
     ):
         assert values[name] == topology.resource_id(state, role)
     assert set(receipts) == {"dummy", "os", "data0", "data7"}
     for role, disk_id, disk_uuid, image, size in (
-        ("dummy", "dummyOsDiskId", "dummyOsDiskUuid",
+        ("dummy", "dummyDiskId", "dummyOsDiskUuid",
          "dummyImageSha256", topology.azure.VIRTUAL_SIZE),
-        ("os", "acceptanceOsDiskId", "acceptanceOsDiskUuid",
+        ("os", "osDiskId", "acceptanceOsDiskUuid",
          "imageSha256", topology.azure.VIRTUAL_SIZE),
         ("data0", "dataDisk0Id", "dataDisk0Uuid",
          "seed0Sha256", topology.DISK_BYTES),
@@ -336,8 +336,8 @@ class DummyTemplateTest(unittest.TestCase):
             "efiSha256": "2" * 64,
             "rawSha256": "3" * 64,
             "mizSha256": "4" * 64,
-            "dummyOsDiskId": disks["dummy"],
-            "acceptanceOsDiskId": disks["os"],
+            "dummyDiskId": disks["dummy"],
+            "osDiskId": disks["os"],
             "dataDisk0Id": disks["data0"],
             "dataDisk7Id": disks["data7"],
             "dummyOsDiskUuid": "22222222-2222-4222-8222-222222222221",
@@ -383,14 +383,14 @@ class DummyTemplateTest(unittest.TestCase):
         )
         self.assertEqual(
             template["outputs"]["osDiskId"]["value"],
-            "[parameters('dummyOsDiskId')]",
+            "[parameters('dummyDiskId')]",
         )
         self.assertNotIn(
-            "parameters('acceptanceOsDiskId')",
+            "parameters('osDiskId')",
             json.dumps(template["resources"]),
         )
         changes = {
-            "foreign final OS ID": ("acceptanceOsDiskId", disks["dummy"]),
+            "foreign final OS ID": ("osDiskId", disks["dummy"]),
             "wrong data LUN owner": ("dataDisk7Id", disks["data0"]),
             "wrong region": ("location", "westus2"),
             "missing reviewed head": ("reviewedHead", "e" * 39),
@@ -453,9 +453,9 @@ class DummyTemplateTest(unittest.TestCase):
                 ["hardwareProfile"].update({"vmSize": "Standard_D4s_v5"}),
             "final OS attached": lambda t: t["resources"][3]["properties"]
                 ["storageProfile"]["osDisk"]["managedDisk"]
-                .update({"id": "[parameters('acceptanceOsDiskId')]"}),
+                .update({"id": "[parameters('osDiskId')]"}),
             "final OS output": lambda t: t["outputs"]["osDiskId"]
-                .update({"value": "[parameters('acceptanceOsDiskId')]"}),
+                .update({"value": "[parameters('osDiskId')]"}),
             "wrong LUN": lambda t: t["resources"][3]["properties"]
                 ["storageProfile"]["dataDisks"][1].update({"lun": 6}),
             "seed swapped": lambda t: t["resources"][3]["properties"]
@@ -463,7 +463,7 @@ class DummyTemplateTest(unittest.TestCase):
                 .update({"id": "[parameters('dataDisk0Id')]"}),
             "extra output": lambda t: t["outputs"].update({
                 "acceptanceOsDiskId": {
-                    "type": "string", "value": "[parameters('acceptanceOsDiskId')]",
+                    "type": "string", "value": "[parameters('osDiskId')]",
                 },
             }),
         }

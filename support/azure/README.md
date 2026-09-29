@@ -1060,7 +1060,7 @@ attaches the final OS disk and cannot be relabeled as a dummy deployment.
 
 ### Separate offline dummy-OS ARM candidate (not a deployment approval)
 
-`support/azure/hyperv-issue90-custodian-dummy.json` is a **candidate only**;
+`support/azure/hyperv-issue90-dummy-topology.json` is a **candidate only**;
 the pinned `hyperv-issue90-topology.json`, its controller and both disabled
 live gates remain unchanged. No existing runner selects this candidate.
 An independent approver must review its exact bytes and put its SHA-256 in
@@ -1088,10 +1088,14 @@ deployment children** in North Europe. It selects `Standard_D2s_v5`, SCSI,
 explicit `Standard` security, a private NIC, an NSG without custom ingress
 rules and a subnet with default outbound access disabled; it creates no
 public IP or NAT gateway. It attaches the externally created
-dummy disk as the initial VM OS disk and the two data disks at LUN 0 and 7;
-the final acceptance OS disk is supplied as a distinct **unattached**
-parameter and original owner receipt, never deployed or attached here.
-`outputs.osDiskId` intentionally names the **dummy** disk; `outputs.vmUuid`
+`dummyDiskId` as the initial VM OS disk and the two data disks at LUN 0 and 7;
+the final acceptance OS disk is supplied in `parameters.osDiskId` with a
+distinct **unattached** original owner receipt, never deployed or attached
+here. `outputs.osDiskId` intentionally names `dummyDiskId`, **not**
+`parameters.osDiskId`; despite the shared name, an output is not evidence
+that the final OS disk was attached. The existing disabled controller's
+`deployment_proof()` expects its old final-OS output and must not be reused
+for this candidate. `outputs.vmUuid`
 uses the same pinned Compute 2025-11-01 `reference(...).properties.vmId`
 as the original template. The inherited `image-sha256` tag pins the reviewed
 **final** image, while `dummy-image-sha256` identifies the initially attached

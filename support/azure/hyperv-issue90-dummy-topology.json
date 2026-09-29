@@ -16,9 +16,9 @@
     "dummyImageSha256": { "type": "string", "minLength": 64, "maxLength": 64 },
     "seed0Sha256": { "type": "string", "minLength": 64, "maxLength": 64 },
     "seed7Sha256": { "type": "string", "minLength": 64, "maxLength": 64 },
-    "dummyOsDiskId": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "dummyDiskId": { "type": "string", "minLength": 1, "maxLength": 512 },
     "dummyOsDiskUuid": { "type": "string", "minLength": 36, "maxLength": 36 },
-    "acceptanceOsDiskId": { "type": "string", "minLength": 1, "maxLength": 512 },
+    "osDiskId": { "type": "string", "minLength": 1, "maxLength": 512 },
     "acceptanceOsDiskUuid": { "type": "string", "minLength": 36, "maxLength": 36 },
     "dataDisk0Id": { "type": "string", "minLength": 1, "maxLength": 512 },
     "dataDisk0Uuid": { "type": "string", "minLength": 36, "maxLength": 36 },
@@ -107,12 +107,12 @@
         "storageProfile": {
           "diskControllerType": "SCSI",
           "osDisk": {
-            "name": "[last(split(parameters('dummyOsDiskId'), '/'))]",
+            "name": "[last(split(parameters('dummyDiskId'), '/'))]",
             "osType": "Linux",
             "createOption": "Attach",
             "caching": "ReadOnly",
             "deleteOption": "Detach",
-            "managedDisk": { "id": "[parameters('dummyOsDiskId')]" }
+            "managedDisk": { "id": "[parameters('dummyDiskId')]" }
           },
           "dataDisks": [
             {
@@ -147,7 +147,7 @@
   "outputs": {
     "vmId": { "type": "string", "value": "[resourceId('Microsoft.Compute/virtualMachines', concat(parameters('namePrefix'), '-vm'))]" },
     "vmUuid": { "type": "string", "value": "[reference(resourceId('Microsoft.Compute/virtualMachines', concat(parameters('namePrefix'), '-vm')), '2025-11-01', 'Full').properties.vmId]" },
-    "osDiskId": { "type": "string", "value": "[parameters('dummyOsDiskId')]" },
+    "osDiskId": { "type": "string", "value": "[parameters('dummyDiskId')]" },
     "dataDisk0Id": { "type": "string", "value": "[parameters('dataDisk0Id')]" },
     "dataDisk7Id": { "type": "string", "value": "[parameters('dataDisk7Id')]" },
     "nicId": { "type": "string", "value": "[resourceId('Microsoft.Network/networkInterfaces', concat(parameters('namePrefix'), '-nic'))]" },
