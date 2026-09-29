@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import importlib
 import os
@@ -32,6 +33,7 @@ MAX_TOTAL_ARCHIVE = 512 * 1024
 SHA = re.compile(r"[0-9a-f]{64}\Z")
 NONCE = re.compile(r"[0-9a-f]{32}\Z")
 UTC = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ\Z")
+PRECISE_UTC = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z\Z")
 
 
 def _exact(value, fields, label):
@@ -67,6 +69,16 @@ def _utc(value):
         parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
     except ValueError:
         raise ValueError("Invalid custody timestamp") from None
+    return parsed.replace(tzinfo=timezone.utc)
+
+
+def _precise_utc(value):
+    if not isinstance(value, str) or not PRECISE_UTC.fullmatch(value):
+        raise ValueError("Durable reservation timestamp is invalid")
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError:
+        raise ValueError("Durable reservation timestamp is invalid") from None
     return parsed.replace(tzinfo=timezone.utc)
 
 
@@ -681,7 +693,40 @@ class FileReplayRegistry:
         self._create("closed", run_id, {"run_id": run_id, "closed_sha256": digest})
 
     def claim_start(self, run_id, claim):
-        self._create("start", run_id, claim)
+        self._name("start", run_id)
+        _nonce(run_id, "Reservation run ID")
+        if not isinstance(claim, dict) or claim.get("run_id") != run_id:
+            raise ValueError("Reservation claim has a foreign run ID")
+        reserved = _precise_utc(claim.get("reserved_at_utc"))
+        descriptor = os.open(
+            ".reservation-clock.lock",
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            0o600, dir_fd=self._directory_fd,
+        )
+        try:
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_mode & 0o077 or info.st_nlink != 1
+                    or info.st_size != 0):
+                raise ValueError("Reservation lock must be a private empty regular file")
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            names = os.listdir(self._directory_fd)
+            if len(names) > 4096:
+                raise ValueError("Reservation ledger exceeds its bounded inventory")
+            for name in names:
+                if not name.startswith("start-"):
+                    continue
+                matched = re.fullmatch(r"start-([0-9a-f]{32})\.json", name)
+                if matched is None:
+                    raise ValueError("Reservation ledger contains an invalid start claim")
+                previous = self._read("start", matched[1])
+                if (not isinstance(previous, dict)
+                        or previous.get("run_id") != matched[1]
+                        or reserved <= _precise_utc(previous.get("reserved_at_utc"))):
+                    raise ValueError("Reservation clock moved backwards or stopped")
+            self._create("start", run_id, claim)
+        finally:
+            os.close(descriptor)
 
     def require_start(self, run_id, claim):
         if self._read("start", run_id) != claim:

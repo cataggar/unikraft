@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Only synthetic signed evidence: never substitute for actual boots or Azure CLI."""
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 import hashlib
@@ -181,7 +182,7 @@ class CustodyVerifierTests(unittest.TestCase):
             self.sign(self.assurance, f.witness), self.baseline, now=now,
         )
 
-    def dispatch(self, preboot=None, **changes):
+    def dispatch(self, preboot=None, *, now=RESERVATION, **changes):
         preboot = preboot or self.prepare()
         self.assertIsInstance(preboot, verifier.PreBootCandidate)
         self.authorization = {
@@ -208,7 +209,7 @@ class CustodyVerifierTests(unittest.TestCase):
         self.authorization.update(changes)
         return self.v.reserve_dispatch(
             preboot, self.sign(self.authorization, self.approver),
-            "f" * 32, now=RESERVATION,
+            "f" * 32, now=now,
         )
 
     def observe(self, permit=None, *, guest=None, baseline=b"", **changes):
@@ -396,6 +397,126 @@ class CustodyVerifierTests(unittest.TestCase):
         self.assertFalse((self.state_dir.parent / (
             "start-" + self.state["run_id"] + ".json"
         )).exists())
+
+    def test_trusted_call_and_handoff_at_0410_refuse_0406_reservation(self):
+        call_at = datetime(2026, 9, 29, 4, 10, tzinfo=timezone.utc)
+        preboot = self.prepare(now=call_at)
+        self.assertIsInstance(preboot, verifier.PreBootCandidate)
+        self.reservation_clock = RESERVATION
+        self.assertIsInstance(
+            self.dispatch(preboot, now=call_at), verifier.Refusal,
+        )
+        self.assertIsInstance(
+            self.dispatch(preboot, now=RESERVATION), verifier.Refusal,
+        )
+        self.assertFalse((self.state_dir.parent / (
+            "start-" + self.state["run_id"] + ".json"
+        )).exists())
+        self.reservation_clock = call_at
+        permit = self.dispatch(preboot, now=call_at)
+        self.assertIsInstance(permit, verifier.DispatchPermit)
+        self.assertIsInstance(self.observe(permit), verifier.Refusal)
+
+    def test_trusted_call_time_alone_rejects_backwards_clock(self):
+        call_at = datetime(2026, 9, 29, 4, 10, tzinfo=timezone.utc)
+        preboot = self.prepare()
+        self.reservation_clock = RESERVATION
+        self.assertIsInstance(
+            self.dispatch(preboot, now=call_at), verifier.Refusal,
+        )
+        self.assertFalse((self.state_dir.parent / (
+            "start-" + self.state["run_id"] + ".json"
+        )).exists())
+        self.reservation_clock = call_at.replace(
+            minute=9, second=59, microsecond=999999,
+        )
+        self.assertIsInstance(
+            self.dispatch(preboot, now=call_at), verifier.Refusal,
+        )
+        self.reservation_clock = call_at.replace(microsecond=1)
+        self.assertIsInstance(
+            self.dispatch(preboot, now=call_at), verifier.DispatchPermit,
+        )
+
+    def test_persisted_clock_high_water_survives_registry_reopen(self):
+        permit = self.dispatch()
+        self.assertIsInstance(permit, verifier.DispatchPermit)
+        second = custody.FileReplayRegistry(self.state_dir.parent)
+        self.addCleanup(second.close)
+        earlier = {
+            "run_id": "b" * 32,
+            "reserved_at_utc": "2026-09-29T04:05:59.999999Z",
+        }
+        with self.assertRaisesRegex(ValueError, "clock moved backwards"):
+            second.claim_start(earlier["run_id"], earlier)
+        self.assertFalse((self.state_dir.parent / (
+            "start-" + earlier["run_id"] + ".json"
+        )).exists())
+        equal = {
+            "run_id": "c" * 32,
+            "reserved_at_utc": permit.reserved_at_utc,
+        }
+        with self.assertRaisesRegex(ValueError, "clock moved backwards"):
+            second.claim_start(equal["run_id"], equal)
+        later = {
+            "run_id": "e" * 32,
+            "reserved_at_utc": "2026-09-29T04:06:00.000001Z",
+        }
+        second.claim_start(later["run_id"], later)
+        self.assertEqual(
+            second._read("start", later["run_id"]), later,
+        )
+
+    def test_incomplete_prior_reservation_blocks_new_run(self):
+        previous = {
+            "run_id": "b" * 32, "reserved_at_utc": "not-a-time",
+        }
+        self.registry._create("start", previous["run_id"], previous)
+        reopened = custody.FileReplayRegistry(self.state_dir.parent)
+        self.addCleanup(reopened.close)
+        next_run = {
+            "run_id": "c" * 32,
+            "reserved_at_utc": "2026-09-29T04:06:00.000000Z",
+        }
+        with self.assertRaisesRegex(ValueError, "timestamp is invalid"):
+            reopened.claim_start(next_run["run_id"], next_run)
+        self.assertFalse((self.state_dir.parent / (
+            "start-" + next_run["run_id"] + ".json"
+        )).exists())
+
+    def test_concurrent_reservations_share_one_clock_high_water(self):
+        other = custody.FileReplayRegistry(self.state_dir.parent)
+        self.addCleanup(other.close)
+        when = "2026-09-29T04:07:00.000000Z"
+        claims = (
+            (self.registry, "b" * 32, {"run_id": "b" * 32, "reserved_at_utc": when}),
+            (other, "c" * 32, {"run_id": "c" * 32, "reserved_at_utc": when}),
+        )
+
+        def reserve(arguments):
+            registry, run_id, claim = arguments
+            try:
+                registry.claim_start(run_id, claim)
+            except ValueError:
+                return False
+            return True
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            self.assertEqual(
+                sorted(executor.map(reserve, claims)), [False, True],
+            )
+
+    def test_closed_registry_cannot_create_reservation_lock(self):
+        self.registry.close()
+        with self.assertRaisesRegex(ValueError, "closed"):
+            self.registry.claim_start(
+                "b" * 32,
+                {"run_id": "b" * 32,
+                 "reserved_at_utc": "2026-09-29T04:06:00.000000Z"},
+            )
+        self.assertFalse(
+            (self.state_dir.parent / ".reservation-clock.lock").exists()
+        )
 
     def test_stale_trusted_reservation_clock_refuses_before_claim(self):
         preboot = self.prepare()

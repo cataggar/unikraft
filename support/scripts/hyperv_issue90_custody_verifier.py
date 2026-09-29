@@ -4,7 +4,6 @@
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 import hashlib
 import importlib
 import re
@@ -34,18 +33,6 @@ def _sha(value, label):
 
 def _time(value):
     return custody._utc(value)
-
-
-def _reservation_time(value):
-    if (not isinstance(value, str) or not re.fullmatch(
-            r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z", value)):
-        raise ValueError("Durable reservation timestamp is invalid")
-    try:
-        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
-            tzinfo=timezone.utc,
-        )
-    except ValueError:
-        raise ValueError("Durable reservation timestamp is invalid") from None
 
 
 def _signed(raw, stage, public_key):
@@ -160,6 +147,7 @@ class PreBootCandidate:
     prepared_sha256: str
     preprovision_sha256: str
     assurance_sha256: str
+    verified_at_utc: str
     assurance_issued_at_utc: str
     handoff_challenge: str
     handoff_issued_at_utc: str
@@ -255,7 +243,7 @@ class Verifier:
                     azure.canonical_json(self._start_claim)
                 ).hexdigest()):
             raise ValueError("Permit differs from its durable one-use reservation")
-        return _reservation_time(self._start_claim["reserved_at_utc"])
+        return custody._precise_utc(self._start_claim["reserved_at_utc"])
 
     def _unchanged_state(self):
         raw = azure.read_regular_file(
@@ -441,6 +429,7 @@ class Verifier:
                 raise ValueError("Independent witness has foreign resource identities")
             result = PreBootCandidate(
                 offline, handoff_sha, first_sha, approval_sha, witness_sha,
+                custody._now(now).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
                 witness["issued_at_utc"],
                 self.expected.handoff_challenge, second["issued_at_utc"],
                 witness["expires_at_utc"], witness["baseline_generation"],
@@ -512,6 +501,8 @@ class Verifier:
             reserved = custody._now(self.clock())
             if (not _time(preboot.handoff_issued_at_utc) < reserved
                     or not _time(preboot.assurance_issued_at_utc) < reserved
+                    or custody._precise_utc(preboot.verified_at_utc) > reserved
+                    or custody._now(now) > reserved
                     or issued > reserved or reserved >= expires):
                 raise ValueError("Trusted reservation clock is outside the authorized window")
             reserved_at = reserved.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -711,7 +702,7 @@ class Verifier:
             if (not closed_at <= ack_at < observed_at
                     or (observation_at is not None
                         and not observation_at < closed_at)
-                    or observed_at <= _reservation_time(permit.reserved_at_utc)
+                    or observed_at <= custody._precise_utc(permit.reserved_at_utc)
                     or body["handoff_sha256"] != permit.preboot.handoff_sha256
                     or body["dispatch_sha256"] != permit.claim_sha256
                     or body["acceptance_sha256"] != permit.acceptance_sha256

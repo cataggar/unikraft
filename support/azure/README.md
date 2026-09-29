@@ -1115,8 +1115,20 @@ remaining runtime. Its expiry cannot exceed the shorter assurance/handoff
 window. The private fsynced replay registry claims the run's **only start**
 and the fresh dispatch challenge before any permit is returned. It records the
 independent `clock()` reading with microsecond precision in the durable start
-claim and binds its hash and timestamp to the permit; the clock must be
-externally trusted and stable (no backwards jumps). Neither the approver's
+claim and binds its hash and timestamp to the permit. Reservation refuses if
+that clock reading is before either the independently supplied trusted `now`
+at dispatch or the earlier trusted handoff-verification time; no unknown
+clock skew is accepted. Under an owner-only file lock, the registry also
+rejects timestamps at or before the latest retained start claim, including
+claims made by another verifier instance or process. Keep the **same**
+operator-owned, append-only registry across invocations; missing, malformed
+or legacy **retained** start claims refuse new reservations. This relies on
+reliable local file locking/fsync; deletion or replacement of earlier claims
+by the registry owner cannot be detected by scanning the remaining files.
+The external clock and `now` must both be independently trustworthy and
+stable: an initially wrong clock with an empty registry, or two clocks that
+roll back together before any retained high-water mark, cannot be proved
+correct by this offline verifier. Neither the approver's
 issue time nor an unpersisted later `now` substitutes for the reservation.
 Signed boot intervals must begin strictly after the persisted reservation,
 and the signed observation cannot predate it. A lost
