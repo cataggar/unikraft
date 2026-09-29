@@ -19,6 +19,38 @@ CHILD_TYPES = {
 DUMMY_ID = "[parameters('dummyDiskId')]"
 DUMMY_NAME = "[last(split(parameters('dummyDiskId'), '/'))]"
 MISSING = object()
+PIN_NAMES = (
+    "provenanceSha256", "configSha256", "efiSha256", "rawSha256",
+    "mizSha256", "imageSha256", "dummyImageSha256",
+    "seed0Sha256", "seed7Sha256",
+)
+DISK_IDS = ("dummyDiskId", "osDiskId", "dataDisk0Id", "dataDisk7Id")
+DISK_UUIDS = (
+    "dummyOsDiskUuid", "acceptanceOsDiskUuid",
+    "dataDisk0Uuid", "dataDisk7Uuid",
+)
+PARAMETER_BOUNDS = {
+    "namePrefix": (6, 32),
+    "runId": (32, 32),
+    "operationId": (36, 36),
+    "reviewedHead": (40, 40),
+    **{name: (64, 64) for name in PIN_NAMES},
+    **{name: (1, 512) for name in DISK_IDS},
+    **{name: (36, 36) for name in DISK_UUIDS},
+}
+EXTRA_TAGS = {
+    "reviewed-head": "reviewedHead",
+    "provenance-sha256": "provenanceSha256",
+    "config-sha256": "configSha256",
+    "efi-sha256": "efiSha256",
+    "raw-sha256": "rawSha256",
+    "miz-sha256": "mizSha256",
+    "dummy-image-sha256": "dummyImageSha256",
+    "dummy-os-uuid": "dummyOsDiskUuid",
+    "acceptance-os-uuid": "acceptanceOsDiskUuid",
+    "data0-uuid": "dataDisk0Uuid",
+    "data7-uuid": "dataDisk7Uuid",
+}
 
 
 def _read(path):
@@ -65,13 +97,14 @@ def _roles(resources):
 
 def _dummy_spec(legacy):
     spec = deepcopy(legacy)
-    spec["parameters"]["dummyDiskId"] = {"type": "string"}
-    spec["parameters"]["dummyImageSha256"] = {
-        "type": "string", "minLength": 64, "maxLength": 64,
-    }
-    spec["variables"]["tags"]["dummy-image-sha256"] = (
-        "[parameters('dummyImageSha256')]"
-    )
+    spec["parameters"].update({
+        name: {"type": "string", "minLength": lower, "maxLength": upper}
+        for name, (lower, upper) in PARAMETER_BOUNDS.items()
+    })
+    spec["variables"]["tags"].update({
+        tag: f"[parameters('{name}')]"
+        for tag, name in EXTRA_TAGS.items()
+    })
     vm = _roles(spec["resources"])["vm"]
     disk = vm["properties"]["storageProfile"]["osDisk"]
     disk["name"] = DUMMY_NAME
@@ -89,12 +122,14 @@ def check_dummy_contract(template, legacy):
     parameters = _field(template, "parameters")
     _require(isinstance(parameters, dict)
              and set(parameters) == set(spec["parameters"]),
-             "dummyDiskId/dummyImageSha256 and original final OS/run/operation parameters")
+             "all 22 dummyDiskId/dummyImageSha256, reviewed source/build, disk "
+             "UUID, final OS and run/operation parameters")
     _require(parameters == spec["parameters"],
-             "run/operation, final OS, dummy OS and digest parameter declarations")
+             "exact bounded source/build, run, disk ID/UUID and digest parameter "
+             "declarations")
     _require(_field(template, "variables", "tags") == spec["variables"]["tags"]
              and template["variables"] == spec["variables"],
-             "independent run/operation and dummy/final image digest tags")
+             "exact run/operation, source/build, image and disk UUID tag expressions")
 
     actual = _roles(_field(template, "resources"))
     baseline = _roles(legacy["resources"])
@@ -174,15 +209,15 @@ class DummyContractTests(unittest.TestCase):
             "[parameters('osDiskId')]", "dummy OS",
         )
 
-    def test_synthetic_minimal_dummy_candidate_satisfies_offline_contract(self):
+    def test_synthetic_reviewed_dummy_candidate_satisfies_offline_contract(self):
         check_dummy_contract(self.template, self.original)
 
     def test_separately_owned_candidate_when_integrated(self):
         if not CANDIDATE.exists():
             self.skipTest(
                 f"Candidate required at {CANDIDATE.relative_to(AZURE.parent.parent)}; "
-                "add reviewed dummyDiskId/dummyImageSha256 parameters, attach "
-                "only dummyDiskId, retain osDiskId for the separately created final OS"
+                "add the reviewed 22 bounded parameters and tag bindings; "
+                "attach only dummyDiskId, keep osDiskId for the separate final OS"
             )
         check_dummy_contract(_read(CANDIDATE), self.original)
 
@@ -194,8 +229,10 @@ class DummyContractTests(unittest.TestCase):
             (("parameters", "operationId"), MISSING, "run/operation"),
             (("parameters", "osDiskId"), MISSING, "dummyDiskId"),
             (("variables", "tags", "dummy-image-sha256"),
-             "[parameters('imageSha256')]", "dummy/final image"),
-            (("variables", "tags", "issue90-run"), "foreign", "run/operation"),
+             "[parameters('imageSha256')]", "tag expressions"),
+            (("variables", "tags", "issue90-run"), "foreign", "tag expressions"),
+            (("variables", "tags", "issue90-operation"),
+             "[parameters('runId')]", "tag expressions"),
             (("resources", 3, "tags"), "[variables('tags')]", "VM name"),
             (("resources", 3, "properties", "storageProfile", "osDisk",
               "name"), "[last(split(parameters('osDiskId'), '/'))]", "dummy OS"),
@@ -205,6 +242,30 @@ class DummyContractTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.template = _dummy_spec(self.original)
                 self.refuse(path, value, reason)
+
+    def test_each_reviewed_extension_is_bounded_and_its_tag_is_pinned(self):
+        for name in (*PARAMETER_BOUNDS, "location"):
+            with self.subTest(missing_parameter=name):
+                self.template = _dummy_spec(self.original)
+                self.refuse(("parameters", name), MISSING, "parameters")
+        for name, (lower, upper) in PARAMETER_BOUNDS.items():
+            for field, value in (
+                ("type", "int"),
+                ("minLength", lower - 1),
+                ("maxLength", upper + 1),
+            ):
+                with self.subTest(parameter=name, field=field):
+                    self.template = _dummy_spec(self.original)
+                    self.refuse(("parameters", name, field), value,
+                                "parameter declarations")
+        for tag, name in EXTRA_TAGS.items():
+            for value in (MISSING, "[parameters('runId')]"):
+                with self.subTest(tag=tag, replacement=value):
+                    self.template = _dummy_spec(self.original)
+                    self.refuse(("variables", "tags", tag), value, "tag expressions")
+        self.template = _dummy_spec(self.original)
+        self.refuse(("parameters", "unreviewedExtra"), {"type": "string"},
+                    "parameters")
 
     def test_outputs_and_children_exclude_unowned_or_extra_arm_resources(self):
         for name in ("vmUuid", "vmId", "osDiskId", "dataDisk7Id", "nicId", "vnetId",
