@@ -115,7 +115,22 @@ def check_contract(template):
             "type", "apiVersion", "name", "location", "tags", "properties",
             *(() if role == "nsg" else ("dependsOn",)),
         }
-    assert resources[0]["properties"] == {"securityRules": []}
+    assert resources[0]["properties"] == {"securityRules": [{
+        "name": "DenyAllInbound",
+        "properties": {
+            "priority": 4095,
+            "access": "Deny",
+            "direction": "Inbound",
+            "protocol": "*",
+            "sourcePortRange": "*",
+            "destinationPortRange": "*",
+            "sourceAddressPrefix": "*",
+            "destinationAddressPrefix": "*",
+        },
+    }]}
+    priority = (resources[0]["properties"]["securityRules"][0]
+                ["properties"]["priority"])
+    assert type(priority) is int and 100 <= priority <= 4096 and priority < 65000
     assert resources[1]["dependsOn"] == [
         "[resourceId('Microsoft.Network/networkSecurityGroups', "
         "concat(parameters('namePrefix'), '-nsg'))]"
@@ -439,7 +454,27 @@ class DummyTemplateTest(unittest.TestCase):
             "public ip": lambda t: t["resources"][2]["properties"]
                 ["ipConfigurations"][0]["properties"]
                 .update({"publicIPAddress": {"id": "synthetic-public"}}),
-            "public ingress": lambda t: t["resources"][0]["properties"]
+            "missing deny rule": lambda t: t["resources"][0]["properties"]
+                ["securityRules"].clear(),
+            "weak default-level priority": lambda t: t["resources"][0]
+                ["properties"]["securityRules"][0]["properties"]
+                .update({"priority": 65000}),
+            "wrong-direction deny": lambda t: t["resources"][0]
+                ["properties"]["securityRules"][0]["properties"]
+                .update({"direction": "Outbound"}),
+            "allow rather than deny": lambda t: t["resources"][0]
+                ["properties"]["securityRules"][0]["properties"]
+                .update({"access": "Allow"}),
+            "only VNet sources denied": lambda t: t["resources"][0]
+                ["properties"]["securityRules"][0]["properties"]
+                .update({"sourceAddressPrefix": "VirtualNetwork"}),
+            "only TCP denied": lambda t: t["resources"][0]
+                ["properties"]["securityRules"][0]["properties"]
+                .update({"protocol": "Tcp"}),
+            "one destination port": lambda t: t["resources"][0]
+                ["properties"]["securityRules"][0]["properties"]
+                .update({"destinationPortRange": "80"}),
+            "extra public ingress Allow": lambda t: t["resources"][0]["properties"]
                 ["securityRules"].append({"name": "allow-all"}),
             "outbound enabled": lambda t: t["resources"][1]["properties"]
                 ["subnets"][0]["properties"]

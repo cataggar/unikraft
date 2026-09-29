@@ -55,7 +55,21 @@
       "name": "[concat(parameters('namePrefix'), '-nsg')]",
       "location": "[parameters('location')]",
       "tags": "[union(variables('tags'), createObject('issue90-role', 'nsg'))]",
-      "properties": { "securityRules": [] }
+      "properties": {
+        "securityRules": [{
+          "name": "DenyAllInbound",
+          "properties": {
+            "priority": 4095,
+            "access": "Deny",
+            "direction": "Inbound",
+            "protocol": "*",
+            "sourcePortRange": "*",
+            "destinationPortRange": "*",
+            "sourceAddressPrefix": "*",
+            "destinationAddressPrefix": "*"
+          }
+        }]
+      }
     },
     {
       "type": "Microsoft.Network/virtualNetworks",
