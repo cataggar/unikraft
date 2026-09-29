@@ -1106,6 +1106,31 @@ test "imported validator build binds the fixed portable plan with minimal tools"
     try std.testing.expect(git and compiler and library);
 }
 
+test "imported validator retains runtime paths after the source buffer is released" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const path = try std.Io.Dir.realPathFileAbsoluteAlloc(io, options.python_executable, a);
+    const identity = try controller.custody_files.readFile(io, path, 64 * 1024 * 1024, false);
+    const encoded = try std.json.Stringify.valueAlloc(a, .{
+        .path = path,
+        .sha256 = identity.sha256,
+        .metadata = identity.metadata,
+    }, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, encoded, .{ .parse_numbers = false });
+    defer parsed.deinit();
+    var file_records = std.json.Value{ .object = .empty };
+    try file_records.object.put(a, try std.fmt.allocPrint(a, "runtime:{s}", .{path}), parsed.value);
+    var consumer = std.json.Value{ .object = .empty };
+    try consumer.object.put(a, "files", file_records);
+    var start = std.json.Value{ .object = .empty };
+    try start.object.put(a, "consumer_inputs", consumer);
+    try controller.import_validator_build.Fixture.runtimePathRemainsPinned(
+        std.testing.allocator, io, start, path,
+    );
+}
+
 test "CLI accepts only closed arguments and no caller-selected profile" {
     const cli = controller.cli;
     const build = try cli.parse(&.{ "uk-wamr-native-ci", "build", "--wamr-source", "/wamr", "--runtime", "/runtime" });

@@ -21,6 +21,16 @@ const Tool = struct {
     }
 };
 
+const RuntimePin = struct {
+    path: []const u8,
+    file: files.RetainedFile,
+
+    fn deinit(self: *RuntimePin, allocator: std.mem.Allocator, io: std.Io) void {
+        self.file.close(io);
+        allocator.free(self.path);
+    }
+};
+
 fn get(value: std.json.Value, key: []const u8) !std.json.Value {
     if (value != .object) return error.InvalidImportedTool;
     return value.object.get(key) orelse error.InvalidImportedTool;
@@ -61,6 +71,7 @@ fn tool(
     bound: usize,
 ) !Tool {
     const role = try std.fmt.allocPrint(allocator, "tool:{s}", .{name});
+    defer allocator.free(role);
     const record = try get(try get(try get(start, "consumer_inputs"), "files"), role);
     const path = try contracts.string(try get(record, "path"));
     const identity = try recordedFile(io, start, role, path, bound);
@@ -72,12 +83,32 @@ fn tool(
     return .{ .path = path, .pinned = pinned };
 }
 
+fn pinRecordedRuntime(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    start: std.json.Value,
+    path: []const u8,
+    pinned: *std.ArrayList(RuntimePin),
+) !void {
+    const role = try std.fmt.allocPrint(allocator, "runtime:{s}", .{path});
+    defer allocator.free(role);
+    const identity = try recordedFile(io, start, role, path, 64 * limits.mib);
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
+    var retained = try files.RetainedFile.open(io, owned_path, .artifact);
+    errdefer retained.close(io);
+    if (!std.meta.eql(identity.metadata, physical.metadata(retained.file_snapshot)))
+        return error.ImportedToolChanged;
+    try retained.verify(io);
+    try pinned.append(allocator, .{ .path = owned_path, .file = retained });
+}
+
 fn pinRuntime(
     allocator: std.mem.Allocator,
     io: std.Io,
     start: std.json.Value,
     executable: []const u8,
-    pinned: *std.ArrayList(files.RetainedFile),
+    pinned: *std.ArrayList(RuntimePin),
 ) !void {
     const paths = try inputs.executableRuntimePaths(allocator, io, executable);
     defer {
@@ -85,17 +116,33 @@ fn pinRuntime(
         allocator.free(paths);
     }
     if (paths.len > 256 or paths.len > 512 - pinned.items.len) return error.RuntimeInventoryRefused;
-    for (paths) |path| {
-        const role = try std.fmt.allocPrint(allocator, "runtime:{s}", .{path});
-        const identity = try recordedFile(io, start, role, path, 64 * limits.mib);
-        var retained = try files.RetainedFile.open(io, path, .artifact);
-        errdefer retained.close(io);
-        if (!std.meta.eql(identity.metadata, physical.metadata(retained.file_snapshot)))
-            return error.ImportedToolChanged;
-        try retained.verify(io);
-        try pinned.append(allocator, retained);
-    }
+    for (paths) |path| try pinRecordedRuntime(allocator, io, start, path, pinned);
 }
+
+pub const Fixture = if (@import("builtin").is_test) struct {
+    pub fn runtimePathRemainsPinned(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        start: std.json.Value,
+        path: []const u8,
+    ) !void {
+        var pinned: std.ArrayList(RuntimePin) = .empty;
+        defer {
+            for (pinned.items) |*entry| entry.deinit(allocator, io);
+            pinned.deinit(allocator);
+        }
+        {
+            const transient_path = try allocator.dupe(u8, path);
+            defer allocator.free(transient_path);
+            try pinRecordedRuntime(allocator, io, start, transient_path, &pinned);
+        }
+        for (pinned.items) |*entry| {
+            if (@intFromPtr(entry.file.path.ptr) != @intFromPtr(entry.path.ptr))
+                return error.UnretainedRuntimePath;
+            try entry.file.verify(io);
+        }
+    }
+} else struct {};
 
 fn tree(allocator: std.mem.Allocator, io: std.Io, start: std.json.Value, zig_path: []const u8) !inputs.TreeRecord {
     const root = std.fs.path.dirname(zig_path) orelse return error.UnsafePath;
@@ -187,9 +234,9 @@ pub fn run(
     defer git.deinit(io);
     var zig = try tool(allocator, io, start, "zig", 256 * limits.mib);
     defer zig.deinit(io);
-    var runtime: std.ArrayList(files.RetainedFile) = .empty;
+    var runtime: std.ArrayList(RuntimePin) = .empty;
     defer {
-        for (runtime.items) |*entry| entry.close(io);
+        for (runtime.items) |*entry| entry.deinit(allocator, io);
         runtime.deinit(allocator);
     }
     try pinRuntime(allocator, io, start, git.path, &runtime);
@@ -273,7 +320,7 @@ pub fn run(
     try pinned_start.verify(io);
     try git.pinned.verify(io);
     try zig.pinned.verify(io);
-    for (runtime.items) |*entry| try entry.verify(io);
+    for (runtime.items) |*entry| try entry.file.verify(io);
     try supervisor.verify(io);
     try validator.verify(io);
 }
