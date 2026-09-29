@@ -963,6 +963,101 @@ lane until both gates and the response shapes are verified. Local QEMU boots
 without StorVSC devices are `UNAVAILABLE`, not real-host read evidence.
 Write/flush persistence remains a separate workload.
 
+### Offline #90 custodian record format (not a live handoff)
+
+`support/scripts/hyperv_issue90_custody_records.py` validates synthetic
+accountable custody records **offline**. It is not called by the live controller,
+does not authenticate a cloud account or authorize a boot, and never changes
+`require_live_cleanup_proof()`. It uses the pinned `cryptography==50.0.1`
+dependency in `support/azure/requirements.txt`, the existing strict JSON
+parser/canonical serializer, and Ed25519. Signed envelopes contain exactly
+`body` and `signature`; the signature is lowercase hex over
+`uk-hyperv-issue90-custody-v1-STAGE + "\n" + canonical_json(body)`.
+The three stages `prepared`, `handoff`, `closed` and the independent `ack`
+have separate domains. Unknown/duplicate fields, noncanonical signed JSON,
+unbounded data, bad signatures, absent archive bytes, and mismatched digests
+or lengths are errors. Original CLI/HTTP observation bytes need not be
+canonical, but their archived SHA-256 and exact length must match.
+
+Each signed stage body has `schema`, `version: 1`, `stage`, `sequence: 1/2/3`,
+`previous_sha256` (null only for PREPARED), `run_id`, `operation_id`,
+`issued_at_utc` (whole-second `Z`), a fresh nonzero `nonce`,
+`preprovision_authorization_sha256`, and stage-specific `evidence`.
+The predecessor hashes the **entire signed envelope**. `Expected` supplies the
+run, independently selected handoff challenge, resource paths, reviewed image
+and dummy VHD digests, both seed digests,
+source-provenance and revised dummy-OS-template digests, exact final envelope,
+and pre-provision approval hash independently of the records. Neither an
+approval nor a trusted key may be selected from a record under examination.
+
+PREPARED requires the original group, four uploaded disk, and deployment
+create bytes and terminal observations, with original disk UUIDs and deployment
+correlation. Unsettled creates require their original operation tracking
+observation and a matching successful terminal operation; a failed original
+response cannot borrow a successful LRO. For pending operations, the archived
+original response must itself contain `operation: {url, operation_id}` matching
+both the initial and terminal tracked results. If the original CLI response
+omits those fields, it cannot support this pending-evidence shape: no later
+same-name GET or invented tracking can substitute. Successful original
+responses cannot borrow unrelated tracking either. The original and terminal
+group/disk `issue90-run` and `issue90-operation` tags, deployment `runId` and
+`operationId` parameters, and both stages' child tags must match independent
+`Expected`. Original successful deployment outputs/inventory must match
+terminal outputs/inventory; any original VM UUID output must match the terminal
+VM UUID. Each uploaded VHD digest/size and SAS-revocation observation must
+match its reviewed input. Deployment outputs identify the
+original VM UUID and the four ARM-created VM/network children; **those child
+GETs are observations, not original child PUT receipts**. The complete
+inventory includes the dummy and final OS disks, and the observed deallocated
+VM must still attach the dummy and exactly the approved private NIC while the
+final OS disk is unattached. All four disk UUIDs/attachments are reobserved
+at handoff, including both seeded data disks; every observed VM and current
+disk must carry the independently expected run/operation tags. An inventory
+label or ARM ID alone cannot replace these checks.
+
+HANDED_OFF binds PREPARED, the settled deallocation and dummy-to-final swap,
+the unchanged VM/disk identities, exactly one attached approved private NIC,
+the final private network, full inventory including the now-unattached dummy,
+a fresh one-use challenge and an expiring window. The swap response, swap
+settlement and final VM observation each require matching run/operation tags;
+a deallocation *outcome* need not contain resource tags but must not
+contradict them if present. The HANDOFF `no_prior_acceptance_boot` and
+`exclusive_no_writer` fields are **signed custodian assertions**, not Azure
+or cryptographic proofs.
+The original swap must report success, or be pending with `swap_tracking`
+containing original/terminal LRO archive references bound to its original
+`operation` fields; `swap_tracking` is null for a successful original swap.
+The final settled VM observation is separately required. The synthetic
+`operation` field is a **protocol-required evidence-shape assumption**, not
+a documented ordinary `az` CLI output: capturing and authenticating original
+Azure LRO response metadata is outside this offline validator. If that
+metadata is unavailable, the pending path stays closed; a signer cannot
+recover omitted response headers or prove Azure provenance by signing them.
+Only *after* handoff may an independent approver issue the separate
+acceptance authorization. CLOSED subsequently binds that externally supplied
+authorization digest, custody return and disposition archive bytes; a
+separately pinned witness key must sign the exact CLOSED-envelope hash.
+No record can assert its own subsequent successful fsync.
+
+`inspect_handoff(..., expected=..., public_key=..., archive=...,
+registry=FileReplayRegistry(operator_directory), now=...)` consumes the
+run/challenge in a caller-injected, private, create-only, fsynced disk ledger
+and returns only the signed handoff digest. `inspect_closed(...)` additionally
+requires the previously consumed handoff, an independently supplied
+post-handoff authorization digest/time and independent witness key; it
+consumes a separate close claim and returns a `DispositionClaim` containing
+the claimed disposition (`disposed` or `quarantined`), closed-record digest
+and witness-acknowledgment digest, never a PASS or verified Azure deletion.
+Close the operator-supplied registry after use.
+No in-memory registry or missing registry qualifies. A failed
+registry fsync burns the attempted claim rather than allowing retry. Callers
+must independently authenticate approvals, both keys, the archive's custody,
+the clock and the operator-owned ledger; signatures authenticate the
+accountable signer, not historical boot counts or uninterrupted control.
+This format assumes a newly reviewed dummy-OS deployment template and
+original-response capture outside this module. The current pinned template
+attaches the final OS disk and cannot be relabeled as a dummy deployment.
+
 ## Private application-network peer
 
 `support/scripts/hyperv-network-peer.py` implements the guest's UKNA v1
