@@ -4,6 +4,7 @@
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 import hashlib
 import importlib
 import re
@@ -33,6 +34,18 @@ def _sha(value, label):
 
 def _time(value):
     return custody._utc(value)
+
+
+def _reservation_time(value):
+    if (not isinstance(value, str) or not re.fullmatch(
+            r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z", value)):
+        raise ValueError("Durable reservation timestamp is invalid")
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+            tzinfo=timezone.utc,
+        )
+    except ValueError:
+        raise ValueError("Durable reservation timestamp is invalid") from None
 
 
 def _signed(raw, stage, public_key):
@@ -147,6 +160,7 @@ class PreBootCandidate:
     prepared_sha256: str
     preprovision_sha256: str
     assurance_sha256: str
+    assurance_issued_at_utc: str
     handoff_challenge: str
     handoff_issued_at_utc: str
     expires_at_utc: str
@@ -166,6 +180,7 @@ class DispatchPermit:
     acceptance_sha256: str
     challenge: str
     issued_at_utc: str
+    reserved_at_utc: str
     expires_at_utc: str
     claim_sha256: str
     max_remaining_seconds: int
@@ -198,15 +213,17 @@ class FinalAcceptance:
 
 class Verifier:
     def __init__(self, inputs, expected, archive, registry, *,
-                 custodian_key, approver_key, witness_key):
+                 custodian_key, approver_key, witness_key, clock):
         if (type(inputs) is not admission.OfflineInputs
                 or type(expected) is not custody.Expected
                 or type(registry) is not custody.FileReplayRegistry
                 or any(not isinstance(key, bytes) or len(key) != 32
                        for key in (custodian_key, approver_key, witness_key))
                 or len({custodian_key, approver_key, witness_key}) != 3
-                or type(archive) is not dict):
-            raise ValueError("Independent keys, evidence, and a durable registry are required")
+                or type(archive) is not dict or not callable(clock)):
+            raise ValueError(
+                "Independent keys, trusted clock, evidence, and a durable registry are required"
+            )
         expected.validate()
         _bounded_archive(archive)
         self.inputs = inputs
@@ -216,6 +233,7 @@ class Verifier:
         self.custodian_key = custodian_key
         self.approver_key = approver_key
         self.witness_key = witness_key
+        self.clock = clock
         self._offline = None
         self._state = None
         self._state_sha = None
@@ -224,6 +242,20 @@ class Verifier:
         self._candidate = None
         self._start_claim = None
         self._observation_claim = None
+
+    def _durable_reservation(self, permit):
+        self.registry.require_start(
+            permit.preboot.offline.run_id, self._start_claim,
+        )
+        self.registry.require_dispatch_challenge(
+            permit.challenge, self._start_claim,
+        )
+        if (permit.reserved_at_utc != self._start_claim["reserved_at_utc"]
+                or permit.claim_sha256 != hashlib.sha256(
+                    azure.canonical_json(self._start_claim)
+                ).hexdigest()):
+            raise ValueError("Permit differs from its durable one-use reservation")
+        return _reservation_time(self._start_claim["reserved_at_utc"])
 
     def _unchanged_state(self):
         raw = azure.read_regular_file(
@@ -409,6 +441,7 @@ class Verifier:
                 raise ValueError("Independent witness has foreign resource identities")
             result = PreBootCandidate(
                 offline, handoff_sha, first_sha, approval_sha, witness_sha,
+                witness["issued_at_utc"],
                 self.expected.handoff_challenge, second["issued_at_utc"],
                 witness["expires_at_utc"], witness["baseline_generation"],
                 witness["baseline_serial_sha256"], vm_uuid, correlation,
@@ -476,10 +509,17 @@ class Verifier:
                     or approval["remaining_seconds"] != 3600 - preboot.consumed_seconds
                     or approval["one_start"] is not True):
                 raise ValueError("Acceptance authorization differs from exact handoff")
+            reserved = custody._now(self.clock())
+            if (not _time(preboot.handoff_issued_at_utc) < reserved
+                    or not _time(preboot.assurance_issued_at_utc) < reserved
+                    or issued > reserved or reserved >= expires):
+                raise ValueError("Trusted reservation clock is outside the authorized window")
+            reserved_at = reserved.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
             claim = {
                 "run_id": preboot.offline.run_id,
                 "handoff_sha256": preboot.handoff_sha256,
                 "acceptance_sha256": approval_sha, "challenge": challenge,
+                "reserved_at_utc": reserved_at,
                 "vm_uuid": preboot.vm_uuid,
                 "disks": {role: uid for role, _, uid in preboot.disks},
                 "remaining_seconds": 3600 - preboot.consumed_seconds,
@@ -491,7 +531,7 @@ class Verifier:
             self._start_claim = claim
             permit = DispatchPermit(
                 preboot, approval_sha, challenge, approval["issued_at_utc"],
-                approval["expires_at_utc"],
+                reserved_at, approval["expires_at_utc"],
                 hashlib.sha256(azure.canonical_json(claim)).hexdigest(),
                 claim["remaining_seconds"],
             )
@@ -506,12 +546,7 @@ class Verifier:
         try:
             self._unchanged_state()
             _bounded_archive(self.archive)
-            self.registry.require_start(
-                permit.preboot.offline.run_id, self._start_claim,
-            )
-            self.registry.require_dispatch_challenge(
-                permit.challenge, self._start_claim,
-            )
+            reserved = self._durable_reservation(permit)
             body, digest = _signed(
                 witness_record, "observation", self.witness_key,
             )
@@ -528,7 +563,7 @@ class Verifier:
                 body, permit.preboot.offline.run_id,
                 permit.preboot.offline.operation_id, "Observation", now,
             )
-            if (not _time(permit.issued_at_utc) <= captured
+            if (not reserved <= captured
                     or captured >= _time(permit.expires_at_utc)
                     or body["challenge"] != permit.challenge
                     or body["dispatch_sha256"] != permit.claim_sha256
@@ -560,6 +595,7 @@ class Verifier:
                 "run_id": permit.preboot.offline.run_id,
                 "dispatch_sha256": permit.claim_sha256,
                 "observation_sha256": digest, "status": body["start_status"],
+                "observed_at_utc": body["issued_at_utc"],
             }
             if body["start_status"] == "lost":
                 self.registry.claim_observation(permit.preboot.offline.run_id, claim)
@@ -591,7 +627,7 @@ class Verifier:
             if (intervals[:-1] != permit.preboot.dummy_intervals
                     or len(intervals) != len(permit.preboot.dummy_intervals) + 1
                     or intervals[-1][0] != "acceptance"
-                    or _time(intervals[-1][1]) < _time(permit.issued_at_utc)
+                    or _time(intervals[-1][1]) <= reserved
                     or total > 3600):
                 raise ValueError("Observed VM runtime is incomplete or over budget")
             parsed = topology.parse_serial(serial.decode("utf-8"), self._state)
@@ -639,12 +675,7 @@ class Verifier:
         try:
             self._unchanged_state()
             _bounded_archive(self.archive)
-            self.registry.require_start(
-                permit.preboot.offline.run_id, self._start_claim,
-            )
-            self.registry.require_dispatch_challenge(
-                permit.challenge, self._start_claim,
-            )
+            self._durable_reservation(permit)
             if type(candidate_or_permit) is CandidateAcceptance:
                 self.registry.require_observation(
                     permit.preboot.offline.run_id, self._observation_claim,
@@ -665,7 +696,22 @@ class Verifier:
                 body, permit.preboot.offline.run_id,
                 permit.preboot.offline.operation_id, "Disposal", now,
             )
-            if (observed_at < _time(permit.issued_at_utc)
+            closed_body, _ = custody._envelope(
+                closed, "closed", self.custodian_key,
+            )
+            ack_body, _ = custody._envelope(
+                acknowledgment, "ack", self.witness_key,
+            )
+            closed_at = _time(closed_body["issued_at_utc"])
+            ack_at = _time(ack_body["issued_at_utc"])
+            observation_at = (
+                _time(self._observation_claim["observed_at_utc"])
+                if self._observation_claim is not None else None
+            )
+            if (not closed_at <= ack_at < observed_at
+                    or (observation_at is not None
+                        and not observation_at < closed_at)
+                    or observed_at <= _reservation_time(permit.reserved_at_utc)
                     or body["handoff_sha256"] != permit.preboot.handoff_sha256
                     or body["dispatch_sha256"] != permit.claim_sha256
                     or body["acceptance_sha256"] != permit.acceptance_sha256

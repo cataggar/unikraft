@@ -1063,7 +1063,8 @@ attaches the final OS disk and cannot be relabeled as a dummy deployment.
 `support/scripts/hyperv_issue90_custody_verifier.py` is a **separate offline
 API**, not a route through `hyperv_issue90_topology.run()` and not a cloud
 authorization. Instantiate `Verifier(OfflineInputs, Expected, archive,
-FileReplayRegistry, custodian_key=..., approver_key=..., witness_key=...)`
+FileReplayRegistry, custodian_key=..., approver_key=..., witness_key=...,
+clock=...)`
 with **three different externally pinned Ed25519 public keys**, an
 operator-owned durable registry, a trusted independent UTC clock and a
 custodied original-response archive. Do not choose keys, expected IDs, or
@@ -1112,7 +1113,13 @@ handoff and binds its hash, prepared/preprovision/assurance/offline hashes,
 the exact VM/disk IDs and UUIDs, independently selected fresh challenge and
 remaining runtime. Its expiry cannot exceed the shorter assurance/handoff
 window. The private fsynced replay registry claims the run's **only start**
-and the fresh dispatch challenge before any permit is returned; a lost
+and the fresh dispatch challenge before any permit is returned. It records the
+independent `clock()` reading with microsecond precision in the durable start
+claim and binds its hash and timestamp to the permit; the clock must be
+externally trusted and stable (no backwards jumps). Neither the approver's
+issue time nor an unpersisted later `now` substitutes for the reservation.
+Signed boot intervals must begin strictly after the persisted reservation,
+and the signed observation cannot predate it. A lost
 response or fsync uncertainty consumes that start. There is no retry.
 
 An independently signed observation binds the permit hash, an archived
@@ -1134,6 +1141,11 @@ reconcile VM quiescence, the total runtime and every original group, dummy
 and final disk, deployment, VM and network identity with an archived settled
 disposal/quarantine terminal. Quarantine or a failed boot records a refusal,
 never PASS.
+
+The independently signed disposal statement must be **strictly later** than
+the signed candidate observation (if present) and the authenticated
+CLOSED acknowledgment; CLOSED itself must follow the observation. The
+verified custody chain and its durable close acknowledgment remain mandatory.
 
 An authenticated signature binds *asserted evidence*, not actual Azure
 authority. The operator must independently establish control of the witness

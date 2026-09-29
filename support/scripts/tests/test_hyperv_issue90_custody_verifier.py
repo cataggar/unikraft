@@ -23,7 +23,8 @@ custody = importlib.import_module("hyperv_issue90_custody_records")
 topology = importlib.import_module("hyperv_issue90_topology")
 verifier = importlib.import_module("hyperv_issue90_custody_verifier")
 
-NOW = datetime(2026, 9, 29, 4, 6, tzinfo=timezone.utc)
+RESERVATION = datetime(2026, 9, 29, 4, 6, tzinfo=timezone.utc)
+NOW = datetime(2026, 9, 29, 4, 13, tzinfo=timezone.utc)
 DUMMY_RUNTIME = {
     "complete": True, "running_seconds": 10,
     "intervals": [{
@@ -34,8 +35,8 @@ DUMMY_RUNTIME = {
 TOTAL_RUNTIME = {
     "complete": True, "running_seconds": 20,
     "intervals": [*DUMMY_RUNTIME["intervals"], {
-        "kind": "acceptance", "start_utc": "2026-09-29T04:02:05Z",
-        "end_utc": "2026-09-29T04:02:15Z",
+        "kind": "acceptance", "start_utc": "2026-09-29T04:07:05Z",
+        "end_utc": "2026-09-29T04:07:15Z",
     }],
 }
 
@@ -107,6 +108,7 @@ class CustodyVerifierTests(unittest.TestCase):
             "final_envelope_sha256": approval["final_envelope_sha256"],
         })
         self.baseline = b""
+        self.reservation_clock = RESERVATION
         self.registry = custody.FileReplayRegistry(root)
         self.addCleanup(self.registry.close)
         self.inputs = admission.OfflineInputs(
@@ -121,6 +123,7 @@ class CustodyVerifierTests(unittest.TestCase):
             custodian_key=signature_key(self.fixture.signer),
             approver_key=signature_key(self.approver),
             witness_key=signature_key(self.fixture.witness),
+            clock=lambda: self.reservation_clock,
         )
         self.approval = approval
 
@@ -138,7 +141,7 @@ class CustodyVerifierTests(unittest.TestCase):
             "body": body, "signature": signature.hex(),
         })
 
-    def prepare(self, **changes):
+    def prepare(self, *, now=RESERVATION, **changes):
         if self.v._offline is None:
             with mock.patch.object(admission, "admit", return_value=self.offline):
                 result = self.v.verify_offline()
@@ -175,7 +178,7 @@ class CustodyVerifierTests(unittest.TestCase):
         self.assurance.update(changes)
         return self.v.verify_handoff(
             result, f.prepared_raw, f.handoff_raw, self.preprovision,
-            self.sign(self.assurance, f.witness), self.baseline, now=NOW,
+            self.sign(self.assurance, f.witness), self.baseline, now=now,
         )
 
     def dispatch(self, preboot=None, **changes):
@@ -205,7 +208,7 @@ class CustodyVerifierTests(unittest.TestCase):
         self.authorization.update(changes)
         return self.v.reserve_dispatch(
             preboot, self.sign(self.authorization, self.approver),
-            "f" * 32, now=NOW,
+            "f" * 32, now=RESERVATION,
         )
 
     def observe(self, permit=None, *, guest=None, baseline=b"", **changes):
@@ -227,7 +230,7 @@ class CustodyVerifierTests(unittest.TestCase):
             "schema": verifier.SCHEMA, "stage": "observation",
             "run_id": self.state["run_id"],
             "operation_id": self.state["operation_id"],
-            "issued_at_utc": "2026-09-29T04:03:00Z",
+            "issued_at_utc": "2026-09-29T04:08:00Z",
             "challenge": permit.challenge,
             "dispatch_sha256": permit.claim_sha256,
             "acceptance_sha256": permit.acceptance_sha256,
@@ -271,18 +274,20 @@ class CustodyVerifierTests(unittest.TestCase):
         f.closed["evidence"]["acceptance_authorization_sha256"] = (
             permit.acceptance_sha256
         )
+        f.closed["issued_at_utc"] = "2026-09-29T04:10:00Z"
         f.closed["evidence"]["disposition"] = disposition
         f.closed["evidence"]["disposal_receipt"] = f.put({
             "run_id": f.expected.run_id, "disposition": disposition,
         })
         f.closed_raw = f.sign(f.closed)
+        f.ack["issued_at_utc"] = "2026-09-29T04:11:00Z"
         f.ack["closed_sha256"] = self.sha(f.closed_raw)
         f.ack_raw = f.sign(f.ack, key=f.witness)
         disposition = {
             "schema": verifier.SCHEMA, "stage": "disposal",
             "run_id": self.state["run_id"],
             "operation_id": self.state["operation_id"],
-            "issued_at_utc": "2026-09-29T04:05:30Z",
+            "issued_at_utc": "2026-09-29T04:12:30Z",
             "handoff_sha256": permit.preboot.handoff_sha256,
             "dispatch_sha256": permit.claim_sha256,
             "acceptance_sha256": permit.acceptance_sha256,
@@ -333,6 +338,76 @@ class CustodyVerifierTests(unittest.TestCase):
         self.assertEqual(result.result, "PASS")
         self.assertFalse(result.cloud_authorized)
         self.assertEqual(result.scope, "offline_only")
+
+    def test_reservation_is_durable_and_stale_boot_cannot_become_candidate(self):
+        permit = self.dispatch()
+        self.assertEqual(permit.reserved_at_utc, "2026-09-29T04:06:00.000000Z")
+        start = self.state_dir.parent / (
+            "start-" + self.state["run_id"] + ".json"
+        )
+        claim = azure.parse_strict_json(start.read_bytes(), "Durable start claim")
+        self.assertEqual(claim["reserved_at_utc"], permit.reserved_at_utc)
+        self.assertEqual(
+            permit.claim_sha256, self.sha(azure.canonical_json(claim)),
+        )
+        stale_runtime = {
+            "complete": True, "running_seconds": 20,
+            "intervals": [*DUMMY_RUNTIME["intervals"], {
+                "kind": "acceptance", "start_utc": "2026-09-29T04:02:05Z",
+                "end_utc": "2026-09-29T04:02:15Z",
+            }],
+        }
+        self.assertIsInstance(self.observe(
+            permit, issued_at_utc="2026-09-29T04:03:00Z",
+            runtime=stale_runtime,
+        ), verifier.Refusal)
+        self.assertIsInstance(self.observe(
+            permit, runtime=stale_runtime,
+        ), verifier.Refusal)
+        candidate = self.observe(permit)
+        self.assertIsInstance(candidate, verifier.CandidateAcceptance)
+        self.assertIsInstance(self.dispose(candidate), verifier.FinalAcceptance)
+
+    def test_reservation_preserves_microseconds_and_requires_trusted_clock(self):
+        self.reservation_clock = RESERVATION.replace(microsecond=654321)
+        permit = self.dispatch()
+        self.assertEqual(permit.reserved_at_utc, "2026-09-29T04:06:00.654321Z")
+        self.assertIsInstance(self.observe(
+            permit, issued_at_utc="2026-09-29T04:06:00Z",
+        ), verifier.Refusal)
+        almost_current = {
+            "complete": True, "running_seconds": 20,
+            "intervals": [*DUMMY_RUNTIME["intervals"], {
+                "kind": "acceptance", "start_utc": "2026-09-29T04:06:00Z",
+                "end_utc": "2026-09-29T04:06:10Z",
+            }],
+        }
+        self.assertIsInstance(
+            self.observe(permit, runtime=almost_current), verifier.Refusal,
+        )
+        self.assertIsInstance(self.observe(permit), verifier.CandidateAcceptance)
+
+    def test_reservation_cannot_precede_independent_handoff_assurance(self):
+        preboot = self.prepare(
+            now=NOW, issued_at_utc="2026-09-29T04:07:00Z",
+        )
+        self.assertIsInstance(preboot, verifier.PreBootCandidate)
+        self.assertIsInstance(self.dispatch(preboot), verifier.Refusal)
+        self.assertFalse((self.state_dir.parent / (
+            "start-" + self.state["run_id"] + ".json"
+        )).exists())
+
+    def test_stale_trusted_reservation_clock_refuses_before_claim(self):
+        preboot = self.prepare()
+        self.reservation_clock = datetime(
+            2026, 9, 29, 4, 0, tzinfo=timezone.utc,
+        )
+        self.assertIsInstance(self.dispatch(preboot), verifier.Refusal)
+        self.assertFalse((self.state_dir.parent / (
+            "start-" + self.state["run_id"] + ".json"
+        )).exists())
+        self.reservation_clock = RESERVATION
+        self.assertIsInstance(self.dispatch(preboot), verifier.DispatchPermit)
 
     def test_missing_private_offline_evidence_refuses(self):
         result = self.v.verify_offline()
@@ -423,7 +498,7 @@ class CustodyVerifierTests(unittest.TestCase):
         self.assertIsInstance(permit, verifier.DispatchPermit)
         self.assertIsInstance(self.v.reserve_dispatch(
             permit.preboot, self.sign(self.authorization, self.approver),
-            "f" * 32, now=NOW,
+            "f" * 32, now=RESERVATION,
         ), verifier.Refusal)
         lost = self.observe(permit, start_status="lost", observed_boot_count=0)
         self.assertEqual(lost.reason, "lost_start_consumed_disposal_required")
@@ -436,6 +511,7 @@ class CustodyVerifierTests(unittest.TestCase):
             custodian_key=signature_key(self.fixture.signer),
             approver_key=signature_key(self.approver),
             witness_key=signature_key(self.fixture.witness),
+            clock=lambda: self.reservation_clock,
         )
         with mock.patch.object(admission, "admit", return_value=self.offline):
             self.assertIsInstance(another.verify_offline(), admission.OfflineAdmission)
@@ -608,6 +684,28 @@ class CustodyVerifierTests(unittest.TestCase):
                     self.dispose(candidate, **alteration), verifier.Refusal,
                 )
         self.assertIsInstance(self.dispose(candidate), verifier.FinalAcceptance)
+
+    def test_disposal_signed_before_closed_ack_or_observation_refuses(self):
+        candidate = self.observe()
+        self.assertIsInstance(candidate, verifier.CandidateAcceptance)
+        for timestamp in (
+            "2026-09-29T04:02:20Z",
+            "2026-09-29T04:10:30Z",
+            "2026-09-29T04:11:00Z",
+        ):
+            with self.subTest(timestamp=timestamp):
+                result = self.dispose(candidate, issued_at_utc=timestamp)
+                self.assertIsInstance(result, verifier.Refusal)
+                self.assertFalse(result.disposal_recorded)
+        self.assertIsInstance(self.dispose(candidate), verifier.FinalAcceptance)
+
+    def test_closed_before_candidate_observation_refuses(self):
+        permit = self.dispatch()
+        candidate = self.observe(
+            permit, issued_at_utc="2026-09-29T04:11:30Z",
+        )
+        self.assertIsInstance(candidate, verifier.CandidateAcceptance)
+        self.assertIsInstance(self.dispose(candidate), verifier.Refusal)
 
     def test_replaced_terminal_or_missing_archive_refuses_disposal(self):
         candidate = self.observe()
