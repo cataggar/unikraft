@@ -107,6 +107,51 @@ class NativeRecordBridge(unittest.TestCase):
                 bridge.imported_stage(HERE)
             killpg.assert_not_called()
 
+    def test_imported_supervisor_identity_requires_private_native_evidence(self):
+        bridge = public_bundle.accepted_records
+        root, controller = self.controller_fixture(
+            "import os, pathlib, sys\n"
+            "output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
+            "mode = os.environ['WAMR_CI_TEST_MODE']\n"
+            "if mode == 'failed': sys.exit(1)\n"
+            "if mode == 'missing': sys.exit(0)\n"
+            "output.mkdir(mode=0o700)\n"
+            "for name in ('private', 'evidence'):\n"
+            "    (output / name).mkdir(mode=0o700)\n"
+            "for name, data in (('private/supervisor-import-identity.log', b'ok'),\n"
+            "                   ('evidence/command-supervisor-import-identity.json', b'{}')):\n"
+            "    path = output / name\n"
+            "    path.write_bytes(data)\n"
+            "    path.chmod(0o644 if mode == 'public' else 0o600)\n"
+            "if mode == 'stdout': os.write(1, b'unexpected')\n"
+            "if mode == 'stderr': os.write(2, b'unexpected')\n")
+        stage = root / "stage"
+        stage.mkdir(mode=0o700)
+        supervisor = root / "supervisor"
+        supervisor.write_bytes(b"supervisor")
+        git = root / "git"
+        git.write_bytes(b"git")
+        with mock.patch.dict(os.environ, {
+                bridge.CONTROLLER_ENV: str(controller),
+                "WAMR_CI_TEST_MODE": "accepted"}):
+            output = root / "accepted"
+            self.assertEqual(
+                bridge.supervisor_import_identity(
+                    stage, supervisor, git, output), output)
+            with mock.patch.object(bridge.subprocess, "Popen") as spawn, \
+                    self.assertRaisesRegex(ValueError, "import identity refused"):
+                bridge.supervisor_import_identity(
+                    stage, supervisor, git, output)
+            spawn.assert_not_called()
+        for mode in ("failed", "missing", "public", "stdout", "stderr"):
+            with self.subTest(mode=mode), mock.patch.dict(os.environ, {
+                    bridge.CONTROLLER_ENV: str(controller),
+                    "WAMR_CI_TEST_MODE": mode}):
+                output = root / mode
+                with self.assertRaisesRegex(ValueError, "import identity refused"):
+                    bridge.supervisor_import_identity(
+                        stage, supervisor, git, output)
+
     def test_oversized_native_stdout_and_stderr_are_killed_and_reaped(self):
         bridge = public_bundle.accepted_records
         for descriptor in (1, 2):
@@ -458,6 +503,76 @@ class NativeRecordBridge(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "native gate passed"):
                 public_bundle.publication_records(*args, native_accepted=native)
 
+    def test_native_import_identity_replaces_only_python_identity_command(self):
+        root, unused_controller = self.controller_fixture("")
+        del unused_controller
+        supervisor = root / "supervisor"
+        validator = root / "validator"
+        supervisor.write_bytes(b"supervisor")
+        validator.write_bytes(b"validator")
+        bundle = root / "import/candidate-bundle.json"
+        bundle.parent.mkdir(mode=0o700)
+        bundle.write_bytes(b"{}")
+        identity = root / "import-native-identity/accepted"
+        identity.parent.mkdir(mode=0o700)
+        identity.mkdir(mode=0o700)
+        supervisor_input = {"files": {
+            "command-supervisor": {"path": str(supervisor)}}}
+        validator_input = {"files": {
+            "validator": {"path": str(validator)}}}
+
+        def record_inputs(paths, unused_trees, content=True, expected=None):
+            return expected if expected is not None else validator_input
+
+        def execute(unused_root, stage, unused_args, unused_seconds,
+                    unused_limit, **unused_options):
+            return root / ("identity-output" if stage ==
+                           "supervisor-import-identity" else "native-output"), {}
+
+        def read(path, unused_limit):
+            return (b"{}\n" if path == root / "identity-output"
+                    else b"Compute handoff revalidated; authority=not_admitted.\n")
+
+        handoff = types.SimpleNamespace(ci=ci, private=mock.Mock())
+        with mock.patch.object(public_bundle, "validate_local_supervisor",
+                               return_value=(supervisor_input, {})), \
+                mock.patch.object(public_bundle, "supervised_command_record") as checked, \
+                mock.patch.object(ci, "document", return_value={}), \
+                mock.patch.object(ci, "record_input_paths",
+                                  side_effect=record_inputs), \
+                mock.patch.object(ci, "consumer_file_records",
+                                  return_value={}), \
+                mock.patch.object(ci, "bind_command_supervisor",
+                                  return_value=str(supervisor)), \
+                mock.patch.object(ci, "native_executable_identity",
+                                  return_value={}), \
+                mock.patch.object(ci, "execute", side_effect=execute) as run, \
+                mock.patch.object(ci, "read", side_effect=read), \
+                mock.patch.object(ci, "COMMAND_SUPERVISOR_PATH", None), \
+                mock.patch.object(ci, "COMMAND_TOOL_PATHS", {}), \
+                mock.patch.object(ci, "COMMAND_ENVIRONMENT", {}):
+            public_bundle.native(
+                handoff, validator, supervisor, bundle, {},
+                native_identity=identity)
+            self.assertEqual(
+                [call.args[1] for call in run.call_args_list],
+                ["native-revalidation"])
+            self.assertEqual(
+                [call.args[2] for call in checked.call_args_list],
+                ["native-revalidation"])
+            handoff.private.assert_called_once_with(identity)
+            run.reset_mock()
+            checked.reset_mock()
+            with self.assertRaisesRegex(ValueError, "bundle refused"):
+                public_bundle.native(
+                    handoff, validator, supervisor, bundle, {},
+                    native_identity=root / "untrusted")
+            run.assert_not_called()
+            public_bundle.native(handoff, validator, supervisor, bundle, {})
+            self.assertEqual(
+                [call.args[1] for call in run.call_args_list],
+                ["supervisor-import-identity", "native-revalidation"])
+
     def test_real_archive_requires_native_acceptance_before_publication(self):
         bridge = public_bundle.accepted_records
         stage = os.environ.get("WAMR_CI_NATIVE_IMPORT_FIXTURE")
@@ -495,13 +610,19 @@ class NativeRecordBridge(unittest.TestCase):
 
         with mock.patch.object(
                 public_bundle, "publication_records",
-                side_effect=after_native_acceptance):
+                side_effect=after_native_acceptance), \
+                mock.patch.object(
+                    bridge, "supervisor_import_identity",
+                    side_effect=lambda unused_stage, unused_supervisor,
+                        unused_git, output: Path(output)) as identity:
             with self.assertRaisesRegex(RuntimeError, "after native acceptance"):
                 public_bundle.import_bundle(
                     handoff, archive, output, source, ci.digest(archive),
                     Path("/unused/validator"), Path("/unused/supervisor"),
                     artifact_id="123", container_digest="0" * 64)
         self.assertEqual(handoff.FAILURE_STAGE, "public-import-records")
+        identity.assert_called_once()
+        self.assertTrue((root / "import-native-identity").is_dir())
         self.assertTrue((output / "candidate-bundle.json").exists())
         self.assertFalse((output / "bundle.json").exists())
         with mock.patch.object(
@@ -527,6 +648,21 @@ class NativeRecordBridge(unittest.TestCase):
         self.assertEqual(handoff.FAILURE_STAGE, "public-import-native-records")
         self.assertFalse((refused / "candidate-bundle.json").exists())
         self.assertFalse((refused / "bundle.json").exists())
+        identity_refused = root / "native-identity-refused"
+        with mock.patch.object(
+                bridge, "supervisor_import_identity",
+                side_effect=ValueError("native controller import identity refused")):
+            with self.assertRaisesRegex(ValueError, "import identity refused"):
+                public_bundle.import_bundle(
+                    handoff, archive, identity_refused, source,
+                    ci.digest(archive), Path("/unused/validator"),
+                    Path("/unused/supervisor"), artifact_id="123",
+                    container_digest="0" * 64)
+        self.assertEqual(
+            handoff.FAILURE_STAGE, "public-import-native-supervisor-identity")
+        self.assertFalse((identity_refused / "transport.json").exists())
+        self.assertFalse((identity_refused / "candidate-bundle.json").exists())
+        self.assertFalse((identity_refused / "bundle.json").exists())
 
 
 class Contract(unittest.TestCase):

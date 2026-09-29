@@ -1035,7 +1035,9 @@ def validate_local_supervisor(handoff, supervisor, start, expected):
     return custody, identity
 
 
-def native(handoff, validator, supervisor, bundle, expected):
+def native(
+        handoff, validator, supervisor, bundle, expected,
+        native_identity=None):
     validator = Path(validator)
     supervisor = Path(supervisor)
     require(validator.is_absolute() and supervisor.is_absolute()
@@ -1065,19 +1067,24 @@ def native(handoff, validator, supervisor, bundle, expected):
             supervisor_input)
         handoff.ci.COMMAND_ENVIRONMENT[
             "WAMR_CI_SUPERVISOR"] = supervisor_path
-        identity_output, identity_command = handoff.ci.execute(
-            bundle.parent, "supervisor-import-identity",
-            [supervisor, "--identity"], 30, 1024, evidence=False,
-            input_records=input_records)
         supervisor_role_identity = handoff.ci.native_executable_identity(
             supervisor_input["files"]["command-supervisor"])
-        supervised_command_record(
-            handoff.ci, identity_command, "supervisor-import-identity",
-            {"command-supervisor": supervisor_role_identity},
-            "producer_direct")
-        require(handoff.ci.read(identity_output, 1024)
-                == handoff.ci.canonical_json(
-                    supervisor_identity_document))
+        if native_identity is None:
+            identity_output, identity_command = handoff.ci.execute(
+                bundle.parent, "supervisor-import-identity",
+                [supervisor, "--identity"], 30, 1024, evidence=False,
+                input_records=input_records)
+            supervised_command_record(
+                handoff.ci, identity_command, "supervisor-import-identity",
+                {"command-supervisor": supervisor_role_identity},
+                "producer_direct")
+            require(handoff.ci.read(identity_output, 1024)
+                    == handoff.ci.canonical_json(
+                        supervisor_identity_document))
+        else:
+            require(native_identity == bundle.parent.with_name(
+                bundle.parent.name + "-native-identity") / "accepted")
+            handoff.private(native_identity)
         output, command = handoff.ci.execute(
             bundle.parent, "native-revalidation",
             [validator, "handoff", bundle], 600, 4096,
@@ -1682,6 +1689,11 @@ def import_bundle(
                 )
     for item in members(handoff, bundle).values():
         item["path"] = str(output / item["path"])
+    identity_parent = None
+    if bundle["version"] == 2:
+        identity_parent = output.with_name(output.name + "-native-identity")
+        identity_parent.mkdir(mode=0o700)
+        handoff.private(identity_parent)
     handoff.FAILURE_STAGE = "public-import-native-records"
     accepted = accepted_records.imported_stage(output)
     require(
@@ -1701,12 +1713,17 @@ def import_bundle(
             Path(item["path"]).name: item["sha256"]
             for item in bundle["evidence"]
         })
+    native_identity = None
     if bundle["version"] == 2:
         require(expected_archive_sha256 is not None
                 and type(artifact_id) is str
                 and re.fullmatch(r"[1-9][0-9]{0,19}", artifact_id)
                 and type(container_digest) is str)
         digest_string(container_digest)
+        handoff.FAILURE_STAGE = "public-import-native-supervisor-identity"
+        native_identity = accepted_records.supervisor_import_identity(
+            output, supervisor, handoff.ci.tool("git"),
+            identity_parent / "accepted")
         handoff.ci.save(output / "transport.json", {
             "schema": "uk.wamr.public-source-transport",
             "version": 2,
@@ -1730,7 +1747,8 @@ def import_bundle(
     handoff.FAILURE_STAGE = "public-import-revalidation"
     native(
         handoff, validator, supervisor,
-        output / "candidate-bundle.json", expected)
+        output / "candidate-bundle.json", expected,
+        native_identity=native_identity)
     # Only a fully revalidated import publishes the operator-facing bundle.
     handoff.ci.save(output / "bundle.json", bundle)
     return bundle

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: BSD-3-Clause
-"""Bounded, fail-closed transport for the native accepted-run records."""
+"""Bounded, fail-closed transport for native records and imported identity."""
 import json
 import os
 from pathlib import Path
@@ -17,8 +17,8 @@ RECORDS_TIMEOUT_SECONDS = 600
 CONTROLLER_ENV = "WAMR_CI_CONTROLLER"
 
 
-def _refuse():
-    raise ValueError("native controller records refused")
+def _refuse(reason="native controller records refused"):
+    raise ValueError(reason)
 
 
 def _absolute(path):
@@ -159,12 +159,12 @@ def _decode(raw, context):
     return value
 
 
-def _records(context, arguments):
+def _controller_command(arguments, refusal):
     try:
         controller = _controller()
         deadline = time.monotonic() + RECORDS_TIMEOUT_SECONDS
         process = subprocess.Popen(
-            [str(controller), "records", *arguments, "--output", "handoff-v1"],
+            [str(controller), *arguments],
             cwd=HERE.parents[2], stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=True)
@@ -172,16 +172,17 @@ def _records(context, arguments):
         try:
             output = []
             total = 0
+            stderr_seen = False
             with selectors.DefaultSelector() as selector:
                 selector.register(process.stdout, selectors.EVENT_READ)
                 selector.register(process.stderr, selectors.EVENT_READ)
                 while selector.get_map():
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        _refuse()
+                        _refuse(refusal)
                     ready = selector.select(remaining)
                     if not ready:
-                        _refuse()
+                        _refuse(refusal)
                     for key, unused_events in ready:
                         chunk = os.read(
                             key.fileobj.fileno(),
@@ -191,15 +192,16 @@ def _records(context, arguments):
                             continue
                         total += len(chunk)
                         if total > MAX_RECORDS_BYTES:
-                            _refuse()
+                            _refuse(refusal)
                         if key.fileobj is process.stdout:
                             output.append(chunk)
+                        else:
+                            stderr_seen = True
             remaining = deadline - time.monotonic()
             if remaining <= 0 or process.wait(timeout=remaining) != 0:
-                _refuse()
-            result = _decode(b"".join(output), context)
+                _refuse(refusal)
             accepted = True
-            return result
+            return b"".join(output), stderr_seen
         finally:
             if not accepted and process.returncode is None:
                 try:
@@ -214,7 +216,14 @@ def _records(context, arguments):
                 process.stdout.close()
                 process.stderr.close()
     except (OSError, subprocess.SubprocessError) as error:
-        raise ValueError("native controller records refused") from error
+        raise ValueError(refusal) from error
+
+
+def _records(context, arguments):
+    raw, unused_stderr = _controller_command(
+        ("records", *arguments, "--output", "handoff-v1"),
+        "native controller records refused")
+    return _decode(raw, context)
 
 
 def imported_stage(stage_root):
@@ -222,6 +231,49 @@ def imported_stage(stage_root):
     stage_root = _absolute(stage_root)
     return _records("trusted-inner-zip", (
         "--stage-root", str(stage_root), "--transport", "trusted-inner-zip"))
+
+
+def supervisor_import_identity(stage_root, supervisor, git, output):
+    """Prove the supplied supervisor against a pristine trusted v2 stage."""
+    stage_root, supervisor, git, output = map(
+        Path, (stage_root, supervisor, git, output))
+    refusal = "native controller import identity refused"
+    try:
+        stage_root = _absolute(stage_root)
+        supervisor = _absolute(supervisor)
+        git = _absolute(git)
+        _absolute(output.parent)
+    except (OSError, ValueError) as error:
+        raise ValueError(refusal) from error
+    if (not output.is_absolute()
+            or os.path.normpath(str(output)) != str(output)
+            or os.path.lexists(output)):
+        _refuse(refusal)
+    raw, stderr_seen = _controller_command((
+        "supervisor-import-identity",
+        "--stage-root", str(stage_root), "--supervisor", str(supervisor),
+        "--git", str(git), "--output", str(output)), refusal)
+    if raw or stderr_seen:
+        _refuse(refusal)
+    try:
+        for path in (output, output / "private", output / "evidence"):
+            info = path.lstat()
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) != 0o700):
+                _refuse(refusal)
+        for path, bound in (
+                (output / "private/supervisor-import-identity.log", 1024),
+                (output / "evidence/command-supervisor-import-identity.json",
+                 MAX_RECORDS_BYTES)):
+            info = path.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                    or not 0 < info.st_size <= bound):
+                _refuse(refusal)
+    except OSError as error:
+        raise ValueError(refusal) from error
+    return output
 
 
 def local_runtime(runtime):

@@ -84,9 +84,12 @@ imported v2 inner stage. It checks the recorded supervisor source files
 against the imported Git revision and the supplied executable and loader
 closure against the imported consumer records, then supervises `--identity`
 under the fixed plan. Its owner-only output is outside the imported stage and
-checkout; it does not replace Python's production import or revalidation.
-Remaining checkout/consumer custody and supervised handoff stages need native
-owners before `run.py` can be removed.
+checkout. Trusted v2 import now invokes this operation before writing
+transport/candidate records and does not repeat the identity command through
+Python. Python still owns publication policy, source/consumer recapture,
+validator supervision, and legacy/producer-direct identity checks. Remaining
+checkout/consumer custody and supervised handoff stages need native owners
+before `run.py` can be removed.
 
 ## Native controller preparation (unpublished build path)
 
