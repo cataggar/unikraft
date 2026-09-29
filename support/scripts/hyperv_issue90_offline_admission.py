@@ -3,10 +3,13 @@
 ReviewPins must be independently authenticated and cover an observed build
 from the reviewed source and config; neither this module nor a self-reported
 receipt can establish that review. No pins or private inputs are shipped here.
-The legacy #90 prepare/live gates remain closed.
+Source executable parents need not be trusted: only descriptor-copied,
+reviewed bytes execute under owner-only, nonreplaceable directory ancestry.
+The private Git runtime also requires nonreplaceable ancestry. The legacy
+#90 prepare/live gates remain closed.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import importlib
 import os
@@ -148,6 +151,35 @@ def _file(path, maximum, *, private=False, executable=False):
     return azure.image_sha256(path)
 
 
+def _trusted_execution_parent(directory):
+    preflight.private_directory(directory, "Executable custody directory")
+    for path in (directory, *directory.parents):
+        metadata = path.lstat()
+        if (not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid not in (0, os.getuid())
+                or (metadata.st_mode & 0o022
+                    and not (metadata.st_uid == 0
+                             and metadata.st_mode & stat.S_ISVTX))):
+            raise ValueError("Executable custody has a replaceable parent")
+
+
+def _stage_executable(source, destination, maximum, expected_sha256):
+    if _file(source, maximum, executable=True) != expected_sha256:
+        raise ValueError("Executable differs from independent review")
+    size = source.stat().st_size
+    if not 0 < size <= maximum:
+        raise ValueError("Executable size changed before private copy")
+    azure.copy_regular_file(source, destination, size, expected_sha256)
+    destination.chmod(0o500)
+    if (_file(destination, maximum, private=True, executable=True)
+            != expected_sha256):
+        raise ValueError("Private executable copy differs from independent review")
+    with destination.open("rb") as program:
+        if program.read(4) != b"\x7fELF":
+            raise ValueError("Private executable is not a native ELF")
+    return destination
+
+
 def _seed_proofs(directory, state):
     proofs = {}
     for role in topology.LUNS:
@@ -173,6 +205,9 @@ def _seed_proofs(directory, state):
 
 
 def _boot(inputs, state_dir, state, source, mode, legacy, image, image_sha, tool_sha):
+    if inputs.runner.parent != inputs.qemu.parent:
+        raise ValueError("Native boot executables must share private custody")
+    _trusted_execution_parent(inputs.runner.parent)
     work = state_dir / f"offline-{source}-{mode}"
     work.mkdir(mode=0o700, exist_ok=False)
     preflight.private_directory(work, "Fresh native boot workspace")
@@ -285,6 +320,18 @@ def _boot(inputs, state_dir, state, source, mode, legacy, image, image_sha, tool
     )
 
 
+def _check_packaging(miz, state_dir, efi_sha, efi_size, vhd):
+    _trusted_execution_parent(miz.parent)
+    report = azure.miz_command(miz, [
+        "check-efi-application", "--output=json", "--architecture", "x86_64",
+        "--expected-efi-sha256", efi_sha, "--expected-virtual-size", "66M",
+        str(vhd),
+    ], state_dir / "miz-issue90-offline-check.log", json_output=True)
+    preflight.validate_packaging_report(
+        report, efi_sha, efi_size, azure.VIRTUAL_SIZE + 512,
+    )
+
+
 def admit(inputs: OfflineInputs) -> OfflineAdmission | OfflineRefusal:
     """Check private evidence and execute four fresh local boots; never call Azure."""
     stage = "review"
@@ -319,6 +366,8 @@ def admit(inputs: OfflineInputs) -> OfflineAdmission | OfflineRefusal:
             raise ValueError("Offline admission needs a fresh unallocated plan")
         build_dir = preflight.private_directory(inputs.build_dir, "Private build")
         image_dir = preflight.private_directory(inputs.image_dir, "Private image")
+        _trusted_execution_parent(build_dir)
+        _trusted_execution_parent(state_dir)
         stage = "config"
         config_path = build_dir / preflight.SOLVED_CONFIG
         config = azure.read_regular_file(config_path, 1024 * 1024, "Solved config")
@@ -387,18 +436,29 @@ def admit(inputs: OfflineInputs) -> OfflineAdmission | OfflineRefusal:
                 inputs.miz, inputs.runner, inputs.qemu
             )) != expected:
                 raise ValueError("Tool differs from independent review")
-        stage = "packaging"
-        report = azure.miz_command(inputs.miz, [
-            "check-efi-application", "--output=json", "--architecture", "x86_64",
-            "--expected-efi-sha256", efi_sha, "--expected-virtual-size", "66M",
-            str(vhd),
-        ], state_dir / "miz-issue90-offline-check.log", json_output=True)
-        preflight.validate_packaging_report(
-            report, efi_sha, efi["size"], azure.VIRTUAL_SIZE + 512,
+        executable_dir = state_dir / "offline-executables"
+        executable_dir.mkdir(mode=0o700, exist_ok=False)
+        _trusted_execution_parent(executable_dir)
+        staged = replace(
+            inputs,
+            miz=_stage_executable(
+                inputs.miz, executable_dir / "miz",
+                256 * 1024 * 1024, reviewed.miz_sha256,
+            ),
+            runner=_stage_executable(
+                inputs.runner, executable_dir / "runner",
+                256 * 1024 * 1024, reviewed.runner_sha256,
+            ),
+            qemu=_stage_executable(
+                inputs.qemu, executable_dir / "qemu-system-x86_64",
+                256 * 1024 * 1024, reviewed.qemu_sha256,
+            ),
         )
+        stage = "packaging"
+        _check_packaging(staged.miz, state_dir, efi_sha, efi["size"], vhd)
         stage = "boots"
         boots = tuple(
-            _boot(inputs, state_dir, state, source, mode, legacy,
+            _boot(staged, state_dir, state, source, mode, legacy,
                   raw if source == "raw" else vhd,
                   raw_sha if source == "raw" else vhd_sha,
                   (reviewed.ovmf_code_sha256, reviewed.ovmf_vars_sha256,
@@ -406,6 +466,7 @@ def admit(inputs: OfflineInputs) -> OfflineAdmission | OfflineRefusal:
             for source, mode, legacy in MODES
         )
         stage = "final"
+        _trusted_execution_parent(executable_dir)
         if (topology.digest(raw) != raw_sha or topology.digest(vhd) != vhd_sha
                 or _file(copied_efi, 64 * 1024 * 1024, private=True) != efi_sha
                 or _file(efi_path, 64 * 1024 * 1024, private=True) != efi_sha
@@ -424,7 +485,13 @@ def admit(inputs: OfflineInputs) -> OfflineAdmission | OfflineRefusal:
                 ) != git_fingerprint
                 or any(_file(path, size, executable=path in (
                     inputs.miz, inputs.runner, inputs.qemu
-                )) != expected for path, size, expected in tools)):
+                )) != expected for path, size, expected in tools)
+                or _file(staged.miz, 256 * 1024 * 1024, private=True,
+                         executable=True) != reviewed.miz_sha256
+                or _file(staged.runner, 256 * 1024 * 1024, private=True,
+                         executable=True) != reviewed.runner_sha256
+                or _file(staged.qemu, 256 * 1024 * 1024, private=True,
+                         executable=True) != reviewed.qemu_sha256):
             raise ValueError("Booted image changed during local verification")
         return OfflineAdmission(
             state["run_id"], state["operation_id"], reviewed.head_commit,

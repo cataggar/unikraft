@@ -115,6 +115,9 @@ and tool fingerprints, verifies both policy-2 seed VHDs, runs Miz against the
 complete fixed VHD, and executes four fresh local native QEMU boots (including
 real read-only `vpc` boots). It returns `OfflineAdmission` or an explicit
 `OfflineRefusal`, always scoped `offline_only` and never a cloud grant.
+It copies pinned Miz, native runner, and QEMU bytes from verified file
+descriptors into a fresh owner-only directory before execution; that
+directory and the private Git runtime require nonreplaceable ancestors.
 The caller must authenticate the reviewed build and tool pins independently;
 a self-reported build receipt or saved local-boot report is insufficient.
 No private pins, images, QEMU installation, or build proof are supplied here.

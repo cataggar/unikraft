@@ -6,6 +6,8 @@ import hashlib
 import importlib
 import json
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -63,6 +65,124 @@ class OfflineAdmissionTest(unittest.TestCase):
         (self.build_dir / "solved.config").write_text(
             "\n".join(f"CONFIG_{key}={value}" for key, value in values.items()) + "\n"
         )
+
+    def staged_tool(self, role):
+        shared = self.state_dir.parent / "shared"
+        shared.mkdir(mode=0o777, exist_ok=True)
+        shared.chmod(0o777)
+        source = shared / role
+        shutil.copyfile("/bin/echo", source)
+        source.chmod(0o500)
+        private = self.state_dir / "offline-executables"
+        private.mkdir(mode=0o700, exist_ok=True)
+        admission._trusted_execution_parent(private)
+        sha = hashlib.sha256(source.read_bytes()).hexdigest()
+        staged = admission._stage_executable(
+            source, private / role, 256 * 1024 * 1024, sha,
+        )
+        return source, staged, sha
+
+    @staticmethod
+    def swap_original(source):
+        source.unlink()
+        shutil.copyfile("/bin/false", source)
+        source.chmod(0o500)
+
+    def test_shared_nonsticky_execution_parent_refuses(self):
+        shared = self.state_dir.parent / "unsafe-parent"
+        shared.mkdir(mode=0o777)
+        shared.chmod(0o777)
+        unsafe = shared / "state"
+        unsafe.mkdir(mode=0o700)
+        with self.assertRaisesRegex(ValueError, "replaceable parent"):
+            admission._trusted_execution_parent(unsafe)
+        alias = self.state_dir.parent / "symlinked-state"
+        alias.symlink_to(self.state_dir, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "symlinks"):
+            admission._trusted_execution_parent(alias)
+
+    def test_direct_boot_or_miz_from_shared_parent_cannot_execute(self):
+        runner_source, _, _ = self.staged_tool("runner")
+        qemu_source, _, _ = self.staged_tool("qemu-system-x86_64")
+        miz_source, _, _ = self.staged_tool("miz")
+        untrusted = replace(
+            self.inputs(self.pins),
+            runner=runner_source, qemu=qemu_source, miz=miz_source,
+        )
+        with mock.patch.object(admission.subprocess, "Popen") as process:
+            with self.assertRaisesRegex(ValueError, "owner-only"):
+                admission._boot(
+                    untrusted, self.state_dir, self.state,
+                    "vhd", "x2apic", False, self.image_dir / "unikraft.vhd",
+                    "a" * 64, ("b" * 64,) * 3,
+                )
+        process.assert_not_called()
+        with mock.patch.object(admission.azure, "miz_command") as command:
+            with self.assertRaisesRegex(ValueError, "owner-only"):
+                admission._check_packaging(
+                    miz_source, self.state_dir, "a" * 64, 123,
+                    self.image_dir / "unikraft.vhd",
+                )
+        command.assert_not_called()
+
+    def test_swap_before_copy_refuses_runner_miz_and_qemu(self):
+        for role in ("runner", "miz", "qemu-system-x86_64"):
+            with self.subTest(role=role):
+                source, staged, sha = self.staged_tool(role)
+                staged.unlink()
+                copy = admission.azure.copy_regular_file
+
+                def swap_before_copy(src, dst, size, expected):
+                    src.unlink()
+                    src.write_bytes(b"\x7fELF" + b"F" * (size - 4))
+                    src.chmod(0o500)
+                    return copy(src, dst, size, expected)
+
+                with mock.patch.object(
+                    admission.azure, "copy_regular_file",
+                    side_effect=swap_before_copy,
+                ), mock.patch.object(admission.subprocess, "Popen") as process:
+                    with self.assertRaisesRegex(ValueError, "manifest"):
+                        admission._stage_executable(
+                            source, staged, 256 * 1024 * 1024, sha,
+                        )
+                process.assert_not_called()
+                self.assertFalse(staged.exists())
+
+    def test_runner_launch_executes_private_bytes_after_source_swap(self):
+        original_runner, runner, _ = self.staged_tool("runner")
+        _, qemu, _ = self.staged_tool("qemu-system-x86_64")
+        self.swap_original(original_runner)
+        trusted = subprocess.run(
+            [str(runner), "trusted"], capture_output=True, check=True, timeout=5,
+        )
+        self.assertEqual(trusted.stdout, b"trusted\n")
+        staged_inputs = replace(self.inputs(self.pins), runner=runner, qemu=qemu)
+        original_popen = subprocess.Popen
+        with mock.patch.object(
+            admission.subprocess, "Popen", wraps=original_popen,
+        ) as process:
+            with self.assertRaisesRegex(ValueError, "Native boot report"):
+                admission._boot(
+                    staged_inputs, self.state_dir, self.state, "vhd", "x2apic",
+                    False, self.image_dir / "unikraft.vhd", "a" * 64,
+                    ("b" * 64,) * 3,
+                )
+        self.assertEqual(process.call_args.args[0][0], str(runner))
+        self.assertNotEqual(process.call_args.args[0][0], str(original_runner))
+
+    def test_miz_invocation_executes_private_bytes_after_source_swap(self):
+        original_miz, miz, _ = self.staged_tool("miz")
+        self.swap_original(original_miz)
+        command = admission.azure.miz_command
+        with mock.patch.object(admission.azure, "miz_command", wraps=command) as run:
+            with self.assertRaises(json.JSONDecodeError):
+                admission._check_packaging(
+                    miz, self.state_dir, "a" * 64, 123,
+                    self.image_dir / "unikraft.vhd",
+                )
+        self.assertEqual(run.call_args.args[0], miz)
+        self.assertNotEqual(run.call_args.args[0], original_miz)
 
     def test_review_and_output_are_typed_and_do_not_authorize_cloud(self):
         with mock.patch.object(admission.subprocess, "Popen") as process:
