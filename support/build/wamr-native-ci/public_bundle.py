@@ -1288,7 +1288,7 @@ def publication_role_identities(ci, consumer_files, boot_files):
 
 def publication_records(
         handoff, stage, source, transport_context,
-        bundle_name="bundle.json"):
+        bundle_name="bundle.json", native_accepted=None):
     """The uploaded originals must be the successful fixed public lane records."""
     ci = handoff.ci
     bundle = ci.document(stage / bundle_name)
@@ -1310,6 +1310,18 @@ def publication_records(
         "revision": source["source_revision"],
         "tree": source["source_tree"],
     }
+    if native_accepted is not None:
+        require(version == 2 and transport_context == "trusted_inner_zip"
+                and native_accepted["context"] == "trusted-inner-zip"
+                and native_accepted["compatibility"] == "tiny-v2"
+                and native_accepted["source"] == expected_source
+                and {record["name"]: record["sha256"]
+                     for record in native_accepted["records"]} == {
+                         Path(item["path"]).name: item["sha256"]
+                         for item in bundle["evidence"]
+                     })
+    else:
+        require(version != 2 or transport_context != "trusted_inner_zip")
     require(build["source"] == expected_source)
     start = ci.document(stage / "evidence/build-start.json")
     require(start["source"] == expected_source)
@@ -1352,13 +1364,15 @@ def publication_records(
         })
         for value in boot_inputs.values():
             digest_string(value)
-    if not pre_supervisor:
+    if not pre_supervisor and native_accepted is None:
         consumer_files = start["consumer_inputs"]["files"]
         role_identities = publication_role_identities(
             ci, consumer_files, boot_inputs["files"])
     for name in sorted(evidence_names):
         item = ci.document(stage / "evidence" / name)
         if name.startswith("command-"):
+            if native_accepted is not None:
+                continue
             expected_fields = {
                 "scope", "stage", "exit_code", "bytes", "sha256",
                 "over_limit", "known_error_markers",
@@ -1711,7 +1725,8 @@ def import_bundle(
     handoff.FAILURE_STAGE = "public-import-records"
     publication_records(
         handoff, output, expected, "trusted_inner_zip",
-        "candidate-bundle.json")
+        "candidate-bundle.json",
+        native_accepted=accepted if bundle["version"] == 2 else None)
     handoff.FAILURE_STAGE = "public-import-revalidation"
     native(
         handoff, validator, supervisor,

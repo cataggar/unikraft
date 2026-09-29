@@ -418,6 +418,46 @@ class NativeRecordBridge(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "native controller records refused"):
             bridge.imported_stage(HERE)
 
+    def test_imported_v2_commands_require_matching_native_acceptance(self):
+        source = {"source_revision": "1" * 40, "source_tree": "2" * 40}
+        expected_source = {
+            "revision": source["source_revision"], "tree": source["source_tree"]}
+        bundle = {"version": 2, "evidence": [
+            {"path": "evidence/command-build.json", "sha256": "3" * 64}]}
+        documents = {
+            "candidate-bundle.json": bundle,
+            "artifacts/local_result": {
+                "records": public_bundle.V2_EVIDENCE, "schema_version": 2,
+                "passed": True, "cloud_authority": "not_admitted",
+                "modes": list(ci.SIX_MODES), "profile": ci.CURRENT_PROFILE},
+            "artifacts/build": {"source": expected_source},
+        }
+        native = {
+            "context": "trusted-inner-zip", "compatibility": "tiny-v2",
+            "source": expected_source, "records": [
+                {"name": "command-build.json", "sha256": "3" * 64}]}
+
+        def document(path):
+            relative = path.relative_to(HERE).as_posix()
+            if relative == "evidence/build-start.json":
+                raise RuntimeError("native gate passed")
+            return documents[relative]
+
+        with mock.patch.object(ci, "document", side_effect=document):
+            args = (types.SimpleNamespace(ci=ci), HERE, source,
+                    "trusted_inner_zip", "candidate-bundle.json")
+            with self.assertRaisesRegex(ValueError, "bundle refused"):
+                public_bundle.publication_records(*args)
+            for changed in (
+                    {"source": {"revision": "4" * 40, "tree": "5" * 40}},
+                    {"records": [{"name": "command-build.json",
+                                  "sha256": "6" * 64}]}):
+                with self.assertRaisesRegex(ValueError, "bundle refused"):
+                    public_bundle.publication_records(
+                        *args, native_accepted=native | changed)
+            with self.assertRaisesRegex(RuntimeError, "native gate passed"):
+                public_bundle.publication_records(*args, native_accepted=native)
+
     def test_real_archive_requires_native_acceptance_before_publication(self):
         bridge = public_bundle.accepted_records
         stage = os.environ.get("WAMR_CI_NATIVE_IMPORT_FIXTURE")
@@ -447,9 +487,15 @@ class NativeRecordBridge(unittest.TestCase):
                 "final_inspection", "cleanup"),
             private=mock.Mock(), FAILURE_STAGE="")
         output = root / "import"
+        accepted_result = {}
+
+        def after_native_acceptance(*args, **kwargs):
+            accepted_result["value"] = kwargs["native_accepted"]
+            raise RuntimeError("after native acceptance")
+
         with mock.patch.object(
                 public_bundle, "publication_records",
-                side_effect=RuntimeError("after native acceptance")):
+                side_effect=after_native_acceptance):
             with self.assertRaisesRegex(RuntimeError, "after native acceptance"):
                 public_bundle.import_bundle(
                     handoff, archive, output, source, ci.digest(archive),
@@ -458,6 +504,17 @@ class NativeRecordBridge(unittest.TestCase):
         self.assertEqual(handoff.FAILURE_STAGE, "public-import-records")
         self.assertTrue((output / "candidate-bundle.json").exists())
         self.assertFalse((output / "bundle.json").exists())
+        with mock.patch.object(
+                public_bundle, "supervised_command_record",
+                side_effect=AssertionError("Python revalidated native commands")):
+            public_bundle.publication_records(
+                handoff, output, source, "trusted_inner_zip",
+                "candidate-bundle.json",
+                native_accepted=accepted_result["value"])
+        with self.assertRaisesRegex(ValueError, "bundle refused"):
+            public_bundle.publication_records(
+                handoff, output, source, "trusted_inner_zip",
+                "candidate-bundle.json")
         refused = root / "refused"
         with mock.patch.object(
                 bridge, "imported_stage",

@@ -64,6 +64,10 @@ provided by `WAMR_CI_CONTROLLER`; owner and mode checks alone do not prove
 its provenance. Protected paired boots have exercised the completed native
 local-record replay and Python record selection, with public-source
 publication and trusted import passing separately.
+For a trusted v2 import, the native accepted-run records gate validates the
+imported command bindings before Python applies archive and publication policy;
+Python no longer reinterprets those imported command records. Producer-direct
+publication and legacy v1 import retain their existing Python command checks.
 `handoff-inspect --runtime ABS --output ABS` is a support-only stage for
 native-produced v2 runs. It uses the runtime-installed recorded controller
 and pinned package/EFI inputs, then retains its bounded private log and
