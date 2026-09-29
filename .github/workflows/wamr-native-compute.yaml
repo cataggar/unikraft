@@ -715,6 +715,33 @@ jobs:
                       {"kind": "literal", "value": "--identity"}]):
               raise SystemExit("native imported supervisor identity record refused")
           PY
+          imported_validator="${identity_parent}/validator"
+          test ! -e "${imported_validator}"
+          "${controller}" import-validator-build \
+            --stage-root "${stage}" --output "${imported_validator}"
+          test -x "${imported_validator}/public-source/tools/bin/uk-wamr-direct-validate"
+          python3 -B - "${imported_validator}" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+
+          root = Path(sys.argv[1])
+          log = (root / "private/import-validator-build.log").read_bytes()
+          record = json.loads(
+              (root / "evidence/command-import-validator-build.json").read_bytes())
+          binary = (root / "public-source/tools/bin/uk-wamr-direct-validate").read_bytes()
+          if (record["scope"] != "command_diagnostic_not_acceptance"
+                  or record["stage"] != "import-validator-build"
+                  or record["exit_code"] != 0
+                  or record["bytes"] != len(log)
+                  or record["sha256"] != hashlib.sha256(log).hexdigest()
+                  or record["supervisor"]["request"]["native_executable"]["path"] != {
+                      "kind": "path", "role": "tool:zig", "relative": ""}
+                  or binary[:6] != b"\x7fELF\x02\x01"
+                  or binary[18:20] != b"\x3e\x00"):
+              raise SystemExit("native imported validator build record refused")
+          PY
           tampered="${identity_parent}/tampered-supervisor"
           test ! -e "${tampered}"
           cp -- "${supervisor}" "${tampered}"
@@ -745,6 +772,12 @@ jobs:
             exit 1
           fi
           test ! -e "${identity_parent}/refused-stage"
+          if "${controller}" import-validator-build \
+            --stage-root "${stage}" --output "${identity_parent}/refused-validator"; then
+            echo "Native import validator build accepted changed inner evidence" >&2
+            exit 1
+          fi
+          test ! -e "${identity_parent}/refused-validator"
 
       - name: Retain redacted diagnostics separately from the public-source image bundle
         if: always()

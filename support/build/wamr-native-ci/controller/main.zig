@@ -66,6 +66,31 @@ pub fn main(init: std.process.Init) void {
         ) catch |err| failed(init.io, stage, "", err);
         return;
     }
+    if (command.action == .@"import-validator-build") {
+        const stage = @tagName(command.action);
+        const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
+        const root = command.stage_root.?;
+        const directory = controller.layout.runtime(init.io, root) catch refused(init.io);
+        defer directory.close(init.io);
+        var signal = controller.build_pipeline.installCancellation() catch refused(init.io);
+        defer signal.deinit();
+        var accepted = controller.accepted_run.openImportedStage(
+            allocator,
+            init.io,
+            &directory,
+            root,
+        ) catch |err| failed(init.io, stage, "", err);
+        defer accepted.deinit();
+        controller.import_validator_build.run(
+            allocator,
+            init.io,
+            &accepted,
+            repository,
+            command.output.?,
+            &signal,
+        ) catch |err| failed(init.io, stage, "", err);
+        return;
+    }
     if (command.action == .@"handoff-inspect" or command.action == .@"public-validator-build") {
         const stage = @tagName(command.action);
         const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
@@ -133,6 +158,7 @@ pub fn main(init: std.process.Init) void {
         .@"handoff-inspect" => unreachable,
         .@"public-validator-build" => unreachable,
         .@"supervisor-import-identity" => unreachable,
+        .@"import-validator-build" => unreachable,
     }
 }
 
@@ -146,7 +172,8 @@ fn usage(io: std.Io) noreturn {
             "       uk-wamr-native-ci records --stage-root ABS --transport trusted-inner-zip --output handoff-v1\n" ++
             "       uk-wamr-native-ci handoff-inspect --runtime ABS --output ABS\n" ++
             "       uk-wamr-native-ci public-validator-build --runtime ABS --output ABS\n" ++
-            "       uk-wamr-native-ci supervisor-import-identity --stage-root ABS --supervisor ABS --git ABS --output ABS\n",
+            "       uk-wamr-native-ci supervisor-import-identity --stage-root ABS --supervisor ABS --git ABS --output ABS\n" ++
+            "       uk-wamr-native-ci import-validator-build --stage-root ABS --output ABS\n",
     ) catch {};
     std.process.exit(2);
 }

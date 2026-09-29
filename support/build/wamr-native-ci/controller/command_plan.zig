@@ -26,6 +26,7 @@ pub const Stage = enum {
     @"handoff-inspect",
     @"public-validator-build",
     @"supervisor-import-identity",
+    @"import-validator-build",
 };
 
 pub const Binding = union(enum) {
@@ -163,7 +164,7 @@ pub fn spec(stage: Stage) Spec {
                 .{ .path = .{ .role = "source", .relative = "support/apps/wamr-aot/build/wamr_hyperv-x86_64-efi" } }, .{ .path = .{ .role = "compute", .relative = "package" } },
             },
         },
-        .@"public-validator-build" => .{
+        .@"public-validator-build", .@"import-validator-build" => .{
             .stage = stage,
             .executable = "tool:zig",
             .seconds = 600,
@@ -330,6 +331,23 @@ pub fn environment(allocator: std.mem.Allocator, stage: Stage) ![]EnvironmentBin
             .{ .name = "PYTHONDONTWRITEBYTECODE", .value = .{ .literal = "1" } },
             .{ .name = "TMPDIR", .value = .{ .path = .{ .role = "work", .relative = "private" } } },
             .{ .name = "WAMR_CI_SUPERVISOR", .value = .{ .path = .{ .role = "command-supervisor" } } },
+        });
+        return bindings.toOwnedSlice(allocator);
+    }
+    if (stage == .@"import-validator-build") {
+        try bindings.appendSlice(allocator, &.{
+            .{ .name = "HOME", .value = .{ .path = .{ .role = "work", .relative = "private" } } },
+            .{ .name = "LANG", .value = .{ .literal = "C" } },
+            .{ .name = "LC_ALL", .value = .{ .literal = "C" } },
+            .{ .name = "PATH", .value = .{ .literal = "/usr/bin:/bin" } },
+            .{ .name = "PYTHONDONTWRITEBYTECODE", .value = .{ .literal = "1" } },
+            .{ .name = "TMPDIR", .value = .{ .path = .{ .role = "work", .relative = "private" } } },
+            .{ .name = "WAMR_CI_GIT", .value = .{ .path = .{ .role = "tool:git" } } },
+            .{ .name = "WAMR_CI_LAUNCH_EXECUTABLE", .value = zig },
+            .{ .name = "WAMR_CI_SUPERVISOR", .value = .{ .path = .{ .role = "command-supervisor" } } },
+            .{ .name = "ZIG_GLOBAL_CACHE_DIR", .value = .{ .path = .{ .role = "work", .relative = "global-cache" } } },
+            .{ .name = "ZIG_LIB_DIR", .value = .{ .path = .{ .role = "tool-tree:zig", .relative = "lib" } } },
+            .{ .name = "ZIG_LOCAL_CACHE_DIR", .value = .{ .path = .{ .role = "work", .relative = "cache" } } },
         });
         return bindings.toOwnedSlice(allocator);
     }

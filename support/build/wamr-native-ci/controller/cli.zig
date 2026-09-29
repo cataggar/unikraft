@@ -2,7 +2,7 @@
 const std = @import("std");
 const files = @import("hyperv_core").private_files;
 
-pub const Action = enum { build, boot, diagnostics, describe, records, @"handoff-inspect", @"public-validator-build", @"supervisor-import-identity" };
+pub const Action = enum { build, boot, diagnostics, describe, records, @"handoff-inspect", @"public-validator-build", @"supervisor-import-identity", @"import-validator-build" };
 pub const Command = struct {
     action: Action,
     runtime: ?[]const u8 = null,
@@ -72,6 +72,23 @@ pub fn parse(args: []const []const u8) !Command {
         }
         if (result.stage_root == null or result.supervisor == null or result.git == null or result.output == null)
             return error.InvalidUsage;
+        return result;
+    }
+    if (action == .@"import-validator-build") {
+        if (args.len != 6) return error.InvalidUsage;
+        var result = Command{ .action = action };
+        var i: usize = 2;
+        while (i < args.len) : (i += 2) {
+            const flag = args[i];
+            const value = args[i + 1];
+            files.absoluteFilePath(value) catch return error.InvalidUsage;
+            if (std.mem.eql(u8, flag, "--stage-root") and result.stage_root == null) {
+                result.stage_root = value;
+            } else if (std.mem.eql(u8, flag, "--output") and result.output == null) {
+                result.output = value;
+            } else return error.InvalidUsage;
+        }
+        if (result.stage_root == null or result.output == null) return error.InvalidUsage;
         return result;
     }
     if (action == .@"handoff-inspect" or action == .@"public-validator-build") {

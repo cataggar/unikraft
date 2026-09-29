@@ -86,6 +86,7 @@ NATIVE_SOURCE_FILES = (
     "support/build/wamr-native-ci/controller/fixture_runner.zig",
     "support/build/wamr-native-ci/controller/handoff_inspect.zig",
     "support/build/wamr-native-ci/controller/import_supervisor_identity.zig",
+    "support/build/wamr-native-ci/controller/import_validator_build.zig",
     "support/build/wamr-native-ci/controller/input_custody.zig",
     "support/build/wamr-native-ci/controller/install.zig",
     "support/build/wamr-native-ci/controller/install_target_tests.zig",

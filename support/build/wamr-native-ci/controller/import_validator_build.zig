@@ -1,0 +1,279 @@
+// SPDX-License-Identifier: BSD-3-Clause
+const std = @import("std");
+const core = @import("hyperv_core");
+const files = core.private_files;
+const contracts = core.contracts;
+const accepted_run = @import("accepted_run.zig");
+const adapter = @import("command_adapter.zig");
+const physical = @import("custody_files.zig");
+const inputs = @import("input_custody.zig");
+const limits = @import("custody_limits.zig");
+const plan = @import("command_plan.zig");
+const records = @import("records.zig");
+const source = @import("source_custody.zig");
+
+const Tool = struct {
+    path: []const u8,
+    pinned: files.RetainedFile,
+
+    fn deinit(self: *Tool, io: std.Io) void {
+        self.pinned.close(io);
+    }
+};
+
+fn get(value: std.json.Value, key: []const u8) !std.json.Value {
+    if (value != .object) return error.InvalidImportedTool;
+    return value.object.get(key) orelse error.InvalidImportedTool;
+}
+
+fn contained(path: []const u8, root: []const u8) bool {
+    return std.mem.eql(u8, path, root) or
+        (path.len > root.len and std.mem.startsWith(u8, path, root) and path[root.len] == '/');
+}
+
+fn recordedFile(
+    io: std.Io,
+    start: std.json.Value,
+    role: []const u8,
+    path: []const u8,
+    bound: usize,
+) !physical.File {
+    const record = try get(try get(try get(start, "consumer_inputs"), "files"), role);
+    if (!std.mem.eql(u8, path, try contracts.string(try get(record, "path"))))
+        return error.ImportedToolChanged;
+    try files.absoluteFilePath(path);
+    const identity = try physical.readFile(io, path, bound, false);
+    if (!std.mem.eql(u8, &identity.sha256, try contracts.string(try get(record, "sha256"))))
+        return error.ImportedToolChanged;
+    const metadata = try get(record, "metadata");
+    if (metadata != .array or metadata.array.items.len != identity.metadata.len)
+        return error.InvalidImportedTool;
+    for (metadata.array.items, identity.metadata) |recorded, observed|
+        if (try contracts.integer(i128, recorded) != observed) return error.ImportedToolChanged;
+    return identity;
+}
+
+fn tool(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    start: std.json.Value,
+    name: []const u8,
+    bound: usize,
+) !Tool {
+    const role = try std.fmt.allocPrint(allocator, "tool:{s}", .{name});
+    const record = try get(try get(try get(start, "consumer_inputs"), "files"), role);
+    const path = try contracts.string(try get(record, "path"));
+    const identity = try recordedFile(io, start, role, path, bound);
+    var pinned = try adapter.openPinnedTool(io, path, role);
+    errdefer pinned.close(io);
+    if (!std.meta.eql(identity.metadata, physical.metadata(pinned.file_snapshot)))
+        return error.ImportedToolChanged;
+    try pinned.verify(io);
+    return .{ .path = path, .pinned = pinned };
+}
+
+fn pinRuntime(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    start: std.json.Value,
+    executable: []const u8,
+    pinned: *std.ArrayList(files.RetainedFile),
+) !void {
+    const paths = try inputs.executableRuntimePaths(allocator, io, executable);
+    defer {
+        for (paths) |path| allocator.free(path);
+        allocator.free(paths);
+    }
+    if (paths.len > 256 or paths.len > 512 - pinned.items.len) return error.RuntimeInventoryRefused;
+    for (paths) |path| {
+        const role = try std.fmt.allocPrint(allocator, "runtime:{s}", .{path});
+        const identity = try recordedFile(io, start, role, path, 64 * limits.mib);
+        var retained = try files.RetainedFile.open(io, path, .artifact);
+        errdefer retained.close(io);
+        if (!std.meta.eql(identity.metadata, physical.metadata(retained.file_snapshot)))
+            return error.ImportedToolChanged;
+        try retained.verify(io);
+        try pinned.append(allocator, retained);
+    }
+}
+
+fn tree(allocator: std.mem.Allocator, io: std.Io, start: std.json.Value, zig_path: []const u8) !inputs.TreeRecord {
+    const root = std.fs.path.dirname(zig_path) orelse return error.UnsafePath;
+    const recorded = try get(try get(try get(start, "consumer_inputs"), "trees"), "zig");
+    if (!std.mem.eql(u8, root, try contracts.string(try get(recorded, "path"))))
+        return error.ImportedToolChanged;
+    const observed = try inputs.tree(allocator, io, .{ .role = "zig", .path = root });
+    if (observed.files != try contracts.integer(usize, try get(recorded, "files")) or
+        observed.directories != try contracts.integer(usize, try get(recorded, "directories")) or
+        observed.symlinks != try contracts.integer(usize, try get(recorded, "symlinks")) or
+        observed.bytes != try contracts.integer(usize, try get(recorded, "bytes")) or
+        !std.mem.eql(u8, &observed.content_sha256, try contracts.string(try get(recorded, "content_sha256"))))
+        return error.ImportedToolChanged;
+    return observed;
+}
+
+fn checkoutSource(before: source.Source, start: std.json.Value) !void {
+    const custody = try get(start, "source_custody");
+    if (before.custody.files != try contracts.integer(usize, try get(custody, "files")) or
+        before.custody.directories != try contracts.integer(usize, try get(custody, "directories")) or
+        before.custody.bytes != try contracts.integer(usize, try get(custody, "bytes")) or
+        !std.mem.eql(u8, &before.custody.content_sha256, try contracts.string(try get(custody, "content_sha256"))))
+        return error.ImportSourceChanged;
+}
+
+fn postRun(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    output: []const u8,
+    expected_bytes: usize,
+) !void {
+    const record_path = try std.fs.path.join(allocator, &.{ output, "evidence/command-import-validator-build.json" });
+    const identity = try physical.readFile(io, record_path, records.max_record_bytes, true);
+    var retained = try files.RetainedFile.open(io, record_path, .private);
+    defer retained.close(io);
+    var raw = try files.readSensitiveFile(io, allocator, retained.file, records.max_record_bytes, .private);
+    defer raw.deinit();
+    const digest = std.fmt.bytesToHex(records.fileIdentity(raw.bytes()), .lower);
+    if (identity.bytes != raw.bytes().len or
+        !std.meta.eql(identity.metadata, physical.metadata(retained.file_snapshot)) or
+        !std.mem.eql(u8, &identity.sha256, &digest))
+        return error.CommandOutputChanged;
+    const checked = try accepted_run.validateCommandBinding(
+        allocator,
+        raw.bytes(),
+        .@"import-validator-build",
+        .trusted_inner_zip,
+    );
+    const log_path = try std.fs.path.join(allocator, &.{ output, "private/import-validator-build.log" });
+    const log = try physical.readFile(io, log_path, 8 * limits.mib + 1, true);
+    if (checked.output_bytes != expected_bytes or checked.output_bytes != log.bytes or
+        !std.mem.eql(u8, &checked.output_sha256, &log.sha256))
+        return error.CommandOutputChanged;
+    try retained.verify(io);
+}
+
+pub fn run(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    accepted: *accepted_run.AcceptedRun,
+    repository: []const u8,
+    output: []const u8,
+    signal: ?*core.process.SignalCancellation,
+) !void {
+    if (accepted.context != .trusted_inner_zip or
+        accepted.compatibility != .tiny_v2_qcow2_derived_vhd)
+        return error.InvalidContext;
+    try files.absoluteFilePath(output);
+    if (contained(output, accepted.root) or contained(output, repository) or
+        contained(accepted.root, output) or contained(repository, output))
+        return error.AliasedOutput;
+    if (signal) |active|
+        if (active.flag().load(.acquire)) return error.Cancelled;
+    try accepted.revalidateWithSignal(signal);
+    var pinned_start = try accepted.pinArtifact(.build_start);
+    defer pinned_start.close(io);
+    var raw = try files.readSensitiveFile(io, allocator, pinned_start.file, records.max_record_bytes, .private);
+    defer raw.deinit();
+    var document = try contracts.Document.parse(allocator, raw.bytes(), .{
+        .bytes = records.max_record_bytes,
+        .depth = 32,
+        .items = 4096,
+        .tokens = 65536,
+    });
+    defer document.deinit();
+    try document.requireCanonical(allocator, raw.bytes());
+    const start = document.value();
+    var git = try tool(allocator, io, start, "git", 64 * limits.mib);
+    defer git.deinit(io);
+    var zig = try tool(allocator, io, start, "zig", 256 * limits.mib);
+    defer zig.deinit(io);
+    var runtime: std.ArrayList(files.RetainedFile) = .empty;
+    defer {
+        for (runtime.items) |*entry| entry.close(io);
+        runtime.deinit(allocator);
+    }
+    try pinRuntime(allocator, io, start, git.path, &runtime);
+    try pinRuntime(allocator, io, start, zig.path, &runtime);
+    const zig_root = std.fs.path.dirname(zig.path) orelse return error.UnsafePath;
+    if (contained(zig_root, output) or contained(output, zig_root) or
+        contained(zig_root, repository) or contained(repository, zig_root) or
+        contained(zig_root, accepted.root) or contained(accepted.root, zig_root))
+        return error.AliasedTool;
+    const compiler_before = try tree(allocator, io, start, zig.path);
+    const before = try source.source(allocator, io, repository, git.path);
+    if (!std.mem.eql(u8, before.revision, accepted.source.revision) or
+        !std.mem.eql(u8, before.tree, accepted.source.tree) or
+        !std.mem.eql(u8, before.custody.object_format, "sha1"))
+        return error.ImportSourceChanged;
+    try checkoutSource(before, start);
+    const executable_path = try std.process.executablePathAlloc(io, allocator);
+    var supervisor = try files.RetainedFile.open(io, executable_path, .tool);
+    defer supervisor.close(io);
+    try git.pinned.verify(io);
+    try zig.pinned.verify(io);
+    try accepted.revalidateWithSignal(signal);
+    if (signal) |active|
+        if (active.flag().load(.acquire)) return error.Cancelled;
+
+    const parent_path = std.fs.path.dirname(output) orelse return error.UnsafePath;
+    const name = std.fs.path.basename(output);
+    try files.basename(name);
+    const parent = try files.openDirectory(io, parent_path, .private);
+    defer parent.close(io);
+    try parent.createDir(io, name, .fromMode(0o700));
+    const work = try files.openDirectory(io, output, .private);
+    defer work.close(io);
+    for ([_][]const u8{ "private", "evidence", "public-source", "cache", "global-cache" }) |entry|
+        try work.createDir(io, entry, .fromMode(0o700));
+    const private = try work.openDir(io, "private", .{ .iterate = true });
+    defer private.close(io);
+    const evidence = try work.openDir(io, "evidence", .{ .iterate = true });
+    defer evidence.close(io);
+    var tools: [inputs.host_tools.len][]const u8 = @splat("");
+    tools[0] = git.path;
+    const roots = plan.Roots{
+        .source_root = repository,
+        .work = output,
+        .runtime = accepted.root,
+        .zig = zig.path,
+        .producer = "",
+        .supervisor = executable_path,
+        .package_tool = "",
+        .validator = "",
+        .tools = tools,
+    };
+    const outcome = try adapter.execute(allocator, io, .{
+        .roots = roots,
+        .stage = .@"import-validator-build",
+        .private_dir = private,
+        .evidence_dir = evidence,
+        .cancel = if (signal) |active| active.flag() else null,
+    });
+    if (outcome.poisoned) return error.CleanupPoisoned;
+    if (!outcome.accepted) return error.StageRefused;
+    const validator_path = try std.fs.path.join(allocator, &.{ output, "public-source/tools/bin/uk-wamr-direct-validate" });
+    var validator = try files.RetainedFile.open(io, validator_path, .tool);
+    defer validator.close(io);
+    const installed = try physical.readFile(io, validator_path, 64 * limits.mib, false);
+    if (installed.bytes < 20 or !std.meta.eql(installed.metadata, physical.metadata(validator.file_snapshot)))
+        return error.InvalidValidator;
+    var header: [20]u8 = undefined;
+    if (try validator.file.readPositionalAll(io, &header, 0) != header.len or
+        !std.mem.eql(u8, header[0..4], "\x7fELF") or header[4] != 2 or header[5] != 1 or
+        header[18] != 62 or header[19] != 0)
+        return error.InvalidValidator;
+    try postRun(allocator, io, output, outcome.bytes);
+    try accepted.revalidateWithSignal(signal);
+    const after = try source.source(allocator, io, repository, git.path);
+    if (!before.same(after)) return error.SourceChanged;
+    const compiler_after = try tree(allocator, io, start, zig.path);
+    if (!std.meta.eql(compiler_before.physical_sha256, compiler_after.physical_sha256))
+        return error.ImportedToolChanged;
+    try postRun(allocator, io, output, outcome.bytes);
+    try pinned_start.verify(io);
+    try git.pinned.verify(io);
+    try zig.pinned.verify(io);
+    for (runtime.items) |*entry| try entry.verify(io);
+    try supervisor.verify(io);
+    try validator.verify(io);
+}

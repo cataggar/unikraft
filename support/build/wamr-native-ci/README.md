@@ -90,6 +90,17 @@ Python. Python still owns publication policy, source/consumer recapture,
 validator supervision, and legacy/producer-direct identity checks. Remaining
 checkout/consumer custody and supervised handoff stages need native owners
 before `run.py` can be removed.
+`import-validator-build --stage-root ABS --output ABS` is a support-only
+trusted-v2 companion for a pristine imported stage. It accepts no caller
+selected executable: it requires the current clean physical checkout to
+match the imported revision, tree, and source-content commitment, and the
+recorded Git and Zig executables, loader files, and Zig installation tree to
+retain their imported consumer content. It supervises the fixed x86_64 direct-validator build in
+a separate owner-only output and checks its ELF and bounded private command
+evidence. A historical revision or unavailable recorded tool refuses this
+operation; trusted historical imports still follow the existing Python
+revalidation path. This does not yet change the production import caller or
+make the built binary a published bundle member.
 
 ## Native controller preparation (unpublished build path)
 

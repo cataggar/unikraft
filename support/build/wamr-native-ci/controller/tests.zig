@@ -1083,6 +1083,29 @@ test "portable target installer refuses musl, v3 and incomplete overrides" {
     }
 }
 
+test "imported validator build binds the fixed portable plan with minimal tools" {
+    const plan = controller.command_plan;
+    const native = plan.spec(.@"public-validator-build");
+    const imported = plan.spec(.@"import-validator-build");
+    try std.testing.expectEqualStrings("tool:zig", imported.executable);
+    try std.testing.expectEqual(native.seconds, imported.seconds);
+    try std.testing.expectEqual(native.output_limit, imported.output_limit);
+    try std.testing.expectEqualSlices(plan.Binding, native.argv, imported.argv);
+    const env = try plan.environment(std.testing.allocator, .@"import-validator-build");
+    defer plan.freeEnvironment(std.testing.allocator, env);
+    var git = false;
+    var compiler = false;
+    var library = false;
+    for (env, 0..) |item, i| {
+        if (i > 0) try std.testing.expect(std.mem.lessThan(u8, env[i - 1].name, item.name));
+        if (std.mem.eql(u8, item.name, "WAMR_CI_GIT")) git = std.mem.eql(u8, item.value.path.role, "tool:git");
+        if (std.mem.eql(u8, item.name, "WAMR_CI_LAUNCH_EXECUTABLE")) compiler = std.mem.eql(u8, item.value.path.role, "tool:zig");
+        if (std.mem.eql(u8, item.name, "ZIG_LIB_DIR")) library = std.mem.eql(u8, item.value.path.role, "tool-tree:zig");
+        try std.testing.expect(!std.mem.startsWith(u8, item.name, "WAMR_CI_TOOL_"));
+    }
+    try std.testing.expect(git and compiler and library);
+}
+
 test "CLI accepts only closed arguments and no caller-selected profile" {
     const cli = controller.cli;
     const build = try cli.parse(&.{ "uk-wamr-native-ci", "build", "--wamr-source", "/wamr", "--runtime", "/runtime" });
@@ -1105,6 +1128,10 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
     try std.testing.expectEqual(cli.Action.@"public-validator-build", validator_build.action);
     try std.testing.expectEqualStrings("/runtime", validator_build.runtime.?);
     try std.testing.expectEqualStrings("/private/validator", validator_build.output.?);
+    const imported_validator = try cli.parse(&.{ "uk-wamr-native-ci", "import-validator-build", "--output", "/private/validator", "--stage-root", "/stage" });
+    try std.testing.expectEqual(cli.Action.@"import-validator-build", imported_validator.action);
+    try std.testing.expectEqualStrings("/stage", imported_validator.stage_root.?);
+    try std.testing.expectEqualStrings("/private/validator", imported_validator.output.?);
     const imported_identity = try cli.parse(&.{
         "uk-wamr-native-ci", "supervisor-import-identity", "--stage-root", "/stage",
         "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git", "--output", "/private/identity",
@@ -1122,6 +1149,11 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
         &.{ "uk-wamr-native-ci", "public-validator-build", "--runtime", "/runtime" },
         &.{ "uk-wamr-native-ci", "public-validator-build", "--output", "/private/validator", "--runtime", "/runtime", "--profile", "tiny" },
         &.{ "uk-wamr-native-ci", "public-validator-build", "--stage-root", "/stage", "--output", "/private/validator" },
+        &.{ "uk-wamr-native-ci", "import-validator-build", "--stage-root", "/stage" },
+        &.{ "uk-wamr-native-ci", "import-validator-build", "--runtime", "/runtime", "--output", "/private/validator" },
+        &.{ "uk-wamr-native-ci", "import-validator-build", "--stage-root", "/stage", "--output", "/stage/../validator" },
+        &.{ "uk-wamr-native-ci", "import-validator-build", "--stage-root", "/stage", "--output", "/private/validator", "--zig", "/arbitrary/zig" },
+        &.{ "uk-wamr-native-ci", "import-validator-build", "--stage-root", "/stage", "--stage-root", "/another" },
         &.{ "uk-wamr-native-ci", "supervisor-import-identity", "--stage-root", "/stage", "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git" },
         &.{ "uk-wamr-native-ci", "supervisor-import-identity", "--stage-root", "/stage", "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git", "--output", "/stage/../identity" },
         &.{ "uk-wamr-native-ci", "supervisor-import-identity", "--stage-root", "/stage", "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git", "--output", "/private/identity", "--profile", "tiny" },
