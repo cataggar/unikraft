@@ -1105,6 +1105,13 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
     try std.testing.expectEqual(cli.Action.@"public-validator-build", validator_build.action);
     try std.testing.expectEqualStrings("/runtime", validator_build.runtime.?);
     try std.testing.expectEqualStrings("/private/validator", validator_build.output.?);
+    const imported_identity = try cli.parse(&.{
+        "uk-wamr-native-ci", "supervisor-import-identity", "--stage-root", "/stage",
+        "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git", "--output", "/private/identity",
+    });
+    try std.testing.expectEqual(cli.Action.@"supervisor-import-identity", imported_identity.action);
+    try std.testing.expectEqualStrings("/stage", imported_identity.stage_root.?);
+    try std.testing.expectEqualStrings("/trusted/supervisor", imported_identity.supervisor.?);
     const rejected = [_][]const []const u8{
         &.{"uk-wamr-native-ci"},
         &.{ "uk-wamr-native-ci", "handoff-inspect", "--runtime", "/runtime" },
@@ -1115,6 +1122,11 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
         &.{ "uk-wamr-native-ci", "public-validator-build", "--runtime", "/runtime" },
         &.{ "uk-wamr-native-ci", "public-validator-build", "--output", "/private/validator", "--runtime", "/runtime", "--profile", "tiny" },
         &.{ "uk-wamr-native-ci", "public-validator-build", "--stage-root", "/stage", "--output", "/private/validator" },
+        &.{ "uk-wamr-native-ci", "supervisor-import-identity", "--stage-root", "/stage", "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git" },
+        &.{ "uk-wamr-native-ci", "supervisor-import-identity", "--stage-root", "/stage", "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git", "--output", "/stage/../identity" },
+        &.{ "uk-wamr-native-ci", "supervisor-import-identity", "--stage-root", "/stage", "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git", "--output", "/private/identity", "--profile", "tiny" },
+        &.{ "uk-wamr-native-ci", "supervisor-import-identity", "--stage-root", "/stage", "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git", "--git", "/another" },
+        &.{ "uk-wamr-native-ci", "supervisor-import-identity", "--runtime", "/runtime", "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git", "--output", "/private/identity" },
         &.{ "uk-wamr-native-ci", "records", "--runtime", "/runtime" },
         &.{ "uk-wamr-native-ci", "records", "--runtime", "/runtime", "--transport", "trusted-inner-zip", "--output", "handoff-v1" },
         &.{ "uk-wamr-native-ci", "records", "--stage-root", "/stage", "--output", "handoff-v1" },
@@ -1133,6 +1145,41 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
         &.{ "uk-wamr-native-ci", "boot", "--runtime", "/runtime", "--output", "json-v1" },
     };
     for (rejected) |argv| try std.testing.expectError(error.InvalidUsage, cli.parse(argv));
+}
+
+test "import identity source allowlist matches the historical supervisor source set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const script =
+        \\import importlib.util, json, sys
+        \\spec=importlib.util.spec_from_file_location("ci",sys.argv[1])
+        \\ci=importlib.util.module_from_spec(spec); spec.loader.exec_module(ci)
+        \\sys.stdout.write(json.dumps(ci.SUPERVISOR_SOURCE_FILES))
+    ;
+    const witness = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" });
+    const output = try std.process.run(a, std.testing.io, .{
+        .argv = &.{ options.python_executable, "-B", "-c", script, witness },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(8192),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, output.term);
+    const names = try std.json.parseFromSliceLeaky(std.json.Value, a, output.stdout, .{});
+    try std.testing.expect(names == .array);
+    var selected = std.json.Value{ .object = .empty };
+    var modified = std.json.Value{ .object = .empty };
+    for (names.array.items, 0..) |entry, index| {
+        try std.testing.expect(entry == .string);
+        try selected.object.put(a, entry.string, .null);
+        try modified.object.put(a, if (index == 0) "support/unexpected.zig" else entry.string, .null);
+    }
+    try controller.import_supervisor_identity.validateSourceNames(selected);
+    try std.testing.expectError(error.InvalidImportIdentity, controller.import_supervisor_identity.validateSourceNames(modified));
+    var native = std.json.Value{ .object = .empty };
+    for (controller.source_custody.closure) |entry|
+        try native.object.put(a, entry.name, .null);
+    try controller.import_supervisor_identity.validateSourceNames(native);
 }
 
 test "canonical bytes and domain-separated file versus record identity" {

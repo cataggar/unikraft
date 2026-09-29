@@ -25,6 +25,7 @@ pub const Stage = enum {
     @"log-validator-legacy",
     @"handoff-inspect",
     @"public-validator-build",
+    @"supervisor-import-identity",
 };
 
 pub const Binding = union(enum) {
@@ -177,6 +178,16 @@ pub fn spec(stage: Stage) Spec {
                 .{ .literal = "-Doptimize=ReleaseSafe" }, .{ .literal = "-j2" }, .{ .literal = "install" },
             },
         },
+        .@"supervisor-import-identity" => .{
+            .stage = stage,
+            .executable = "command-supervisor",
+            .seconds = 30,
+            .output_limit = 1024,
+            .argv = &.{
+                .{ .path = .{ .role = "command-supervisor" } },
+                .{ .literal = "--identity" },
+            },
+        },
         .@"finalize-qcow2" => packageSpec(.@"finalize-qcow2"),
         .@"derive-fixed-vhd" => packageSpec(.@"derive-fixed-vhd"),
         .@"raw-x2apic" => bootSpec(stage, .@"raw-x2apic"),
@@ -310,6 +321,18 @@ pub fn environment(allocator: std.mem.Allocator, stage: Stage) ![]EnvironmentBin
     var bindings: std.ArrayList(EnvironmentBinding) = .empty;
     errdefer bindings.deinit(allocator);
     if (isValidator(stage)) return bindings.toOwnedSlice(allocator);
+    if (stage == .@"supervisor-import-identity") {
+        try bindings.appendSlice(allocator, &.{
+            .{ .name = "HOME", .value = .{ .path = .{ .role = "work", .relative = "private" } } },
+            .{ .name = "LANG", .value = .{ .literal = "C" } },
+            .{ .name = "LC_ALL", .value = .{ .literal = "C" } },
+            .{ .name = "PATH", .value = .{ .literal = "/usr/bin:/bin" } },
+            .{ .name = "PYTHONDONTWRITEBYTECODE", .value = .{ .literal = "1" } },
+            .{ .name = "TMPDIR", .value = .{ .path = .{ .role = "work", .relative = "private" } } },
+            .{ .name = "WAMR_CI_SUPERVISOR", .value = .{ .path = .{ .role = "command-supervisor" } } },
+        });
+        return bindings.toOwnedSlice(allocator);
+    }
     const build = !isBoot(stage) and stage != .@"public-validator-build";
     try bindings.appendSlice(allocator, &.{
         .{ .name = "HOME", .value = .{ .path = .{ .role = "work", .relative = "private" } } },

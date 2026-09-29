@@ -78,7 +78,14 @@ ABS --output ABS` similarly uses the recorded Zig tool and controller to
 build the fixed x86_64 validator in an independent private output, retaining
 its bounded command evidence without modifying the accepted runtime or
 publishing an archive. Python remains the production handoff caller;
-checkout/consumer custody and the other supervised handoff stages need native
+`supervisor-import-identity --stage-root ABS --supervisor ABS --git ABS
+--output ABS` is a separate support-only operation for a clean, trusted
+imported v2 inner stage. It checks the recorded supervisor source files
+against the imported Git revision and the supplied executable and loader
+closure against the imported consumer records, then supervises `--identity`
+under the fixed plan. Its owner-only output is outside the imported stage and
+checkout; it does not replace Python's production import or revalidation.
+Remaining checkout/consumer custody and supervised handoff stages need native
 owners before `run.py` can be removed.
 
 ## Native controller preparation (unpublished build path)
