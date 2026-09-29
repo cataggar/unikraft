@@ -18,6 +18,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 custody = importlib.import_module("hyperv_issue90_custody_records")
 azure = importlib.import_module("hyperv-azure")
+topology = importlib.import_module("hyperv_issue90_topology")
 
 TIME = datetime(2026, 9, 29, 4, 6, tzinfo=timezone.utc)
 RUN = "a" * 32
@@ -32,7 +33,7 @@ def signature_key(key):
 
 
 class Fixture:
-    def __init__(self):
+    def __init__(self, state=None, expected_changes=None):
         self.signer = Ed25519PrivateKey.generate()
         self.witness = Ed25519PrivateKey.generate()
         self.archive = {}
@@ -49,6 +50,19 @@ class Fixture:
             "vnet": base + "/providers/Microsoft.Network/virtualNetworks/vnet",
             "nsg": base + "/providers/Microsoft.Network/networkSecurityGroups/nsg",
         }
+        if state is not None:
+            ids = {
+                role: topology.resource_id(state, role)
+                for role in ("os", "data0", "data7", "deployment",
+                             "vm", "nic", "vnet", "nsg")
+            }
+            ids["group"] = topology.group_id(state)
+            ids["dummy"] = (
+                ids["group"] + "/providers/Microsoft.Compute/disks/"
+                + state["prefix"] + "-dummy"
+            )
+        run_id = state["run_id"] if state is not None else RUN
+        operation_id = state["operation_id"] if state is not None else OPERATION
         self.ids = ids
         self.uuids = {
             role: f"22222222-2222-4222-8222-{number:012x}"
@@ -56,7 +70,7 @@ class Fixture:
                                            "deployment", "vm"), 1)
         }
         self.expected = custody.Expected(
-            run_id=RUN, operation_id=OPERATION, handoff_challenge="d" * 32,
+            run_id=run_id, operation_id=operation_id, handoff_challenge="d" * 32,
             preprovision_authorization_sha256="1" * 64,
             reviewed_image_sha256="2" * 64, dummy_image_sha256="9" * 64,
             provenance_sha256="3" * 64,
@@ -64,6 +78,8 @@ class Fixture:
             template_sha256="6" * 64, final_envelope_sha256="7" * 64,
             resource_ids=ids,
         )
+        if expected_changes:
+            self.expected = replace(self.expected, **expected_changes)
         self.direct = {}
         for role in custody.DIRECT:
             resource = self.resource(role)
@@ -156,9 +172,11 @@ class Fixture:
             "2026-09-29T04:04:00Z", {
                 "handoff_sha256": self.sha(self.handoff_raw),
                 "acceptance_authorization_sha256": "8" * 64,
-                "return_receipt": self.put({"run_id": RUN, "status": "returned"}),
+                "return_receipt": self.put({
+                    "run_id": self.expected.run_id, "status": "returned",
+                }),
                 "disposal_receipt": self.put({
-                    "run_id": RUN, "disposition": "quarantined"
+                    "run_id": self.expected.run_id, "disposition": "quarantined"
                 }),
                 "disposition": "quarantined",
             },
@@ -166,7 +184,7 @@ class Fixture:
         self.closed_raw = self.sign(self.closed)
         self.ack = {
             "schema": custody.SCHEMA, "version": 1, "stage": "ack",
-            "run_id": RUN, "challenge": "d" * 32,
+            "run_id": self.expected.run_id, "challenge": "d" * 32,
             "closed_sha256": self.sha(self.closed_raw),
             "issued_at_utc": "2026-09-29T04:05:00Z",
         }
@@ -283,7 +301,8 @@ class Fixture:
         return {
             "schema": custody.SCHEMA, "version": 1, "stage": stage,
             "sequence": sequence, "previous_sha256": previous,
-            "run_id": RUN, "operation_id": OPERATION,
+            "run_id": self.expected.run_id,
+            "operation_id": self.expected.operation_id,
             "issued_at_utc": timestamp, "nonce": nonce,
             "preprovision_authorization_sha256":
             self.expected.preprovision_authorization_sha256,
