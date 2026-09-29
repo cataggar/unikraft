@@ -44,6 +44,11 @@ fn number(value: std.json.Value) !u64 {
     return contracts.integer(u64, value);
 }
 
+fn notCancelled(signal: ?*core.process.SignalCancellation) !void {
+    if (signal) |active|
+        if (active.flag().load(.acquire)) return error.Cancelled;
+}
+
 fn contained(path: []const u8, root: []const u8) bool {
     return std.mem.eql(u8, path, root) or
         (path.len > root.len and std.mem.startsWith(u8, path, root) and path[root.len] == '/');
@@ -67,17 +72,21 @@ fn verifyGitSource(
     repository: []const u8,
     git: []const u8,
     source_map: std.json.Value,
+    signal: ?*core.process.SignalCancellation,
 ) ![]const u8 {
     const a = allocator;
     const records_map = try get(source_map, "records");
     try validateSourceNames(records_map);
     const revision_ref = try std.mem.concat(a, u8, &.{ accepted.source.revision, "^{commit}" });
     const tree_ref = try std.mem.concat(a, u8, &.{ accepted.source.revision, "^{tree}" });
+    try notCancelled(signal);
     const commit = try source.gitOutput(a, io, repository, git, &.{ "rev-parse", "--verify", revision_ref }, 65, null);
     try same(commit, try std.fmt.allocPrint(a, "{s}\n", .{accepted.source.revision}));
+    try notCancelled(signal);
     const tree = try source.gitOutput(a, io, repository, git, &.{ "rev-parse", tree_ref }, 65, null);
     try same(tree, try std.fmt.allocPrint(a, "{s}\n", .{accepted.source.tree}));
     for (records_map.object.keys(), records_map.object.values()) |name, value| {
+        try notCancelled(signal);
         try @import("custody_limits.zig").relative(name, 256, 8);
         const size = try number(try get(value, "bytes"));
         if (size == 0 or size > 8 * 1024 * 1024) return error.InvalidImportIdentity;
@@ -97,10 +106,12 @@ fn verifyGitSource(
         for (oid) |char|
             if (!std.ascii.isDigit(char) and !(char >= 'a' and char <= 'f'))
                 return error.ImportSourceChanged;
+        try notCancelled(signal);
         const size_raw = try source.gitOutput(a, io, repository, git, &.{ "cat-file", "-s", oid }, 32, null);
         if (size_raw.len < 2 or size_raw[size_raw.len - 1] != '\n' or
             try std.fmt.parseInt(u64, size_raw[0 .. size_raw.len - 1], 10) != size)
             return error.ImportSourceChanged;
+        try notCancelled(signal);
         const blob = try source.gitOutput(a, io, repository, git, &.{ "cat-file", "blob", oid }, @intCast(size), null);
         const hash = std.fmt.bytesToHex(records.fileIdentity(blob), .lower);
         if (blob.len != size) return error.ImportSourceChanged;
@@ -136,6 +147,7 @@ fn verifyRuntime(
     io: std.Io,
     supervisor_path: []const u8,
     start: std.json.Value,
+    signal: ?*core.process.SignalCancellation,
 ) !PinnedRuntime {
     const expected = try get(try get(try get(start, "command_supervisor"), "runtime_map"), "records");
     const executable_record = try get(expected, "executable");
@@ -159,6 +171,7 @@ fn verifyRuntime(
         (header[18] != 62 and header[18] != 183) or header[19] != 0)
         return error.InvalidSupervisor;
 
+    try notCancelled(signal);
     const paths = try inputs.executableRuntimePaths(allocator, io, supervisor_path);
     defer {
         for (paths) |path| allocator.free(path);
@@ -219,6 +232,7 @@ pub fn run(
     if (contained(output, accepted.root) or contained(output, repository) or
         contained(accepted.root, output) or contained(repository, output))
         return error.AliasedOutput;
+    try notCancelled(signal);
     var git_file = try adapter.openPinnedTool(io, git, "tool:git");
     defer git_file.close(io);
     try accepted.revalidateWithSignal(signal);
@@ -233,11 +247,12 @@ pub fn run(
     try document.requireCanonical(allocator, raw.bytes());
     const start = document.value();
     const source_map = try get(try get(start, "command_supervisor"), "source_map");
-    const source_sha256 = try verifyGitSource(allocator, io, accepted, repository, git, source_map);
-    var supervisor = try verifyRuntime(allocator, io, supervisor_path, start);
+    const source_sha256 = try verifyGitSource(allocator, io, accepted, repository, git, source_map, signal);
+    var supervisor = try verifyRuntime(allocator, io, supervisor_path, start, signal);
     defer supervisor.deinit(allocator, io);
     try git_file.verify(io);
     try accepted.revalidateWithSignal(signal);
+    try notCancelled(signal);
 
     const parent_path = std.fs.path.dirname(output) orelse return error.UnsafePath;
     const name = std.fs.path.basename(output);
