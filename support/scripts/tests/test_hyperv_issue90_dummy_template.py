@@ -115,22 +115,38 @@ def check_contract(template):
             "type", "apiVersion", "name", "location", "tags", "properties",
             *(() if role == "nsg" else ("dependsOn",)),
         }
-    assert resources[0]["properties"] == {"securityRules": [{
-        "name": "DenyAllInbound",
-        "properties": {
-            "priority": 4095,
-            "access": "Deny",
-            "direction": "Inbound",
-            "protocol": "*",
-            "sourcePortRange": "*",
-            "destinationPortRange": "*",
-            "sourceAddressPrefix": "*",
-            "destinationAddressPrefix": "*",
+    rules = resources[0]["properties"]["securityRules"]
+    assert resources[0]["properties"] == {"securityRules": [
+        {
+            "name": "DenyAllInbound",
+            "properties": {
+                "priority": 4095,
+                "access": "Deny",
+                "direction": "Inbound",
+                "protocol": "*",
+                "sourcePortRange": "*",
+                "destinationPortRange": "*",
+                "sourceAddressPrefix": "*",
+                "destinationAddressPrefix": "*",
+            },
         },
-    }]}
-    priority = (resources[0]["properties"]["securityRules"][0]
-                ["properties"]["priority"])
-    assert type(priority) is int and 100 <= priority <= 4096 and priority < 65000
+        {
+            "name": "DenyAllOutbound",
+            "properties": {
+                "priority": 4096,
+                "access": "Deny",
+                "direction": "Outbound",
+                "protocol": "*",
+                "sourcePortRange": "*",
+                "destinationPortRange": "*",
+                "sourceAddressPrefix": "*",
+                "destinationAddressPrefix": "*",
+            },
+        },
+    ]}
+    for rule in rules:
+        priority = rule["properties"]["priority"]
+        assert type(priority) is int and 100 <= priority <= 4096
     assert resources[1]["dependsOn"] == [
         "[resourceId('Microsoft.Network/networkSecurityGroups', "
         "concat(parameters('namePrefix'), '-nsg'))]"
@@ -454,28 +470,6 @@ class DummyTemplateTest(unittest.TestCase):
             "public ip": lambda t: t["resources"][2]["properties"]
                 ["ipConfigurations"][0]["properties"]
                 .update({"publicIPAddress": {"id": "synthetic-public"}}),
-            "missing deny rule": lambda t: t["resources"][0]["properties"]
-                ["securityRules"].clear(),
-            "weak default-level priority": lambda t: t["resources"][0]
-                ["properties"]["securityRules"][0]["properties"]
-                .update({"priority": 65000}),
-            "wrong-direction deny": lambda t: t["resources"][0]
-                ["properties"]["securityRules"][0]["properties"]
-                .update({"direction": "Outbound"}),
-            "allow rather than deny": lambda t: t["resources"][0]
-                ["properties"]["securityRules"][0]["properties"]
-                .update({"access": "Allow"}),
-            "only VNet sources denied": lambda t: t["resources"][0]
-                ["properties"]["securityRules"][0]["properties"]
-                .update({"sourceAddressPrefix": "VirtualNetwork"}),
-            "only TCP denied": lambda t: t["resources"][0]
-                ["properties"]["securityRules"][0]["properties"]
-                .update({"protocol": "Tcp"}),
-            "one destination port": lambda t: t["resources"][0]
-                ["properties"]["securityRules"][0]["properties"]
-                .update({"destinationPortRange": "80"}),
-            "extra public ingress Allow": lambda t: t["resources"][0]["properties"]
-                ["securityRules"].append({"name": "allow-all"}),
             "outbound enabled": lambda t: t["resources"][1]["properties"]
                 ["subnets"][0]["properties"]
                 .update({"defaultOutboundAccess": True}),
@@ -506,6 +500,45 @@ class DummyTemplateTest(unittest.TestCase):
             with self.subTest(label=label):
                 tampered = deepcopy(base)
                 mutate(tampered)
+                with self.assertRaises(AssertionError):
+                    check_contract(tampered)
+
+    def test_nsg_rules_require_exact_inbound_and_outbound_denies(self):
+        base = load()
+        check_contract(base)
+        for index, direction in enumerate(("Inbound", "Outbound")):
+            with self.subTest(direction=direction, change="missing rule"):
+                tampered = deepcopy(base)
+                tampered["resources"][0]["properties"]["securityRules"].pop(index)
+                with self.assertRaises(AssertionError):
+                    check_contract(tampered)
+            changes = (
+                ("default-level priority", "priority", 65000),
+                ("swapped priority", "priority", 4096 if index == 0 else 4095),
+                ("wrong direction", "direction",
+                 "Outbound" if index == 0 else "Inbound"),
+                ("Allow instead of Deny", "access", "Allow"),
+                ("partial protocol", "protocol", "Tcp"),
+                ("partial source address", "sourceAddressPrefix", "VirtualNetwork"),
+                ("partial destination address", "destinationAddressPrefix",
+                 "10.90.0.0/29"),
+                ("partial source port", "sourcePortRange", "80"),
+                ("partial destination port", "destinationPortRange", "80"),
+            )
+            for label, field, value in changes:
+                with self.subTest(direction=direction, change=label):
+                    tampered = deepcopy(base)
+                    rule = tampered["resources"][0]["properties"]["securityRules"]
+                    rule[index]["properties"][field] = value
+                    with self.assertRaises(AssertionError):
+                        check_contract(tampered)
+            with self.subTest(direction=direction, change="extra Allow"):
+                tampered = deepcopy(base)
+                rules = tampered["resources"][0]["properties"]["securityRules"]
+                allow = deepcopy(rules[index])
+                allow["name"] = f"Allow{direction}"
+                allow["properties"].update({"priority": 100, "access": "Allow"})
+                rules.insert(index, allow)
                 with self.assertRaises(AssertionError):
                     check_contract(tampered)
 

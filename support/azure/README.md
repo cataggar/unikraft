@@ -1085,15 +1085,17 @@ UUID as a deployment parameter or VM tag does not prove it is Azure's UUID.
 
 The candidate deploys only the original VM, NIC, VNet and NSG as **nested
 deployment children** in North Europe. It selects `Standard_D2s_v5`, SCSI,
-explicit `Standard` security, a private NIC, and an NSG with exactly one
-priority-4095 `DenyAllInbound` rule covering every source, destination,
-protocol and port. This overrides the default priority-65000
-`AllowVnetInBound` rule, which otherwise permits same-VNet/peered ingress
-even without a public IP. The subnet still disables default outbound
-access; the candidate creates no public IP or NAT gateway. It attaches the
-externally created `dummyDiskId` as the initial VM OS disk and the two data
-disks at LUN 0 and 7;
-the final acceptance OS disk is supplied in `parameters.osDiskId` with a
+explicit `Standard` security, a private NIC, and an NSG with exactly two
+wildcard rules: `DenyAllInbound` at priority 4095 and `DenyAllOutbound` at
+priority 4096. Both cover every source, destination, protocol and port,
+ahead of the default `AllowVnetInBound` and `AllowVnetOutBound` at priority
+65000 and `AllowInternetOutBound` at 65001. Without the inbound deny,
+same-VNet/peered sources can initiate ingress even without a public IP;
+without the outbound deny, the default outbound NSG allows still apply.
+The subnet also disables default outbound access; the candidate creates
+no public IP or NAT gateway. It attaches the externally created
+`dummyDiskId` as the initial VM OS disk and the two data disks at LUN 0 and
+7; the final acceptance OS disk is supplied in `parameters.osDiskId` with a
 distinct **unattached** original owner receipt, never deployed or attached
 here. `outputs.osDiskId` intentionally names `dummyDiskId`, **not**
 `parameters.osDiskId`; despite the shared name, an output is not evidence
@@ -1118,10 +1120,10 @@ The [ARM template schema](https://schema.management.azure.com/schemas/2019-04-01
 and [NSG rule/default behavior](https://learn.microsoft.com/en-us/azure/virtual-network/network-security-groups-overview)
 references document the attached managed OS disk, explicit `Standard`
 security, disk `V2` generation and subnet `defaultOutboundAccess: false`.
-No AzurePlatformDNS/IMDS Allow rules were added. An NSG deny is not a claim
-that Azure platform-service flows are filtered, nor that the subnet's
-disabled default internet outbound access blocks every private outbound
-route; verify those separately if required.
+No AzurePlatformDNS/IMDS Allow rules were added. Azure platform DNS/IMDS
+exemptions may still exist: the NSG denies do **not** prove universal
+egress isolation or that every platform-service flow is filtered. Verify
+any required platform-flow controls independently.
 ARM does **not** set the generation of an externally attached OS disk in
 the VM resource: the original disk create/show proof must establish Gen2,
 and a template parameter/tag cannot replace it. The public template schema

@@ -56,19 +56,34 @@
       "location": "[parameters('location')]",
       "tags": "[union(variables('tags'), createObject('issue90-role', 'nsg'))]",
       "properties": {
-        "securityRules": [{
-          "name": "DenyAllInbound",
-          "properties": {
-            "priority": 4095,
-            "access": "Deny",
-            "direction": "Inbound",
-            "protocol": "*",
-            "sourcePortRange": "*",
-            "destinationPortRange": "*",
-            "sourceAddressPrefix": "*",
-            "destinationAddressPrefix": "*"
+        "securityRules": [
+          {
+            "name": "DenyAllInbound",
+            "properties": {
+              "priority": 4095,
+              "access": "Deny",
+              "direction": "Inbound",
+              "protocol": "*",
+              "sourcePortRange": "*",
+              "destinationPortRange": "*",
+              "sourceAddressPrefix": "*",
+              "destinationAddressPrefix": "*"
+            }
+          },
+          {
+            "name": "DenyAllOutbound",
+            "properties": {
+              "priority": 4096,
+              "access": "Deny",
+              "direction": "Outbound",
+              "protocol": "*",
+              "sourcePortRange": "*",
+              "destinationPortRange": "*",
+              "sourceAddressPrefix": "*",
+              "destinationAddressPrefix": "*"
+            }
           }
-        }]
+        ]
       }
     },
     {
