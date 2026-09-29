@@ -682,7 +682,10 @@ jobs:
                   or value["runtime_inputs"]):
               raise SystemExit("native record bridge refused trusted v2 import")
           PY
-          identity="${RUNNER_TEMP}/wamr-imported-supervisor-identity"
+          identity_parent="${RUNNER_TEMP}/wamr-private-native-identity"
+          test ! -e "${identity_parent}"
+          mkdir -m 700 "${identity_parent}"
+          identity="${identity_parent}/success"
           supervisor=/d/wamr-ci/wamr-native-runtime/compute/supervisor/bin/wamr-ci-supervisor
           test ! -e "${identity}"
           "${controller}" supervisor-import-identity \
@@ -712,7 +715,7 @@ jobs:
                       {"kind": "literal", "value": "--identity"}]):
               raise SystemExit("native imported supervisor identity record refused")
           PY
-          tampered="${RUNNER_TEMP}/wamr-imported-supervisor-tampered"
+          tampered="${identity_parent}/tampered-supervisor"
           test ! -e "${tampered}"
           cp -- "${supervisor}" "${tampered}"
           printf 'tamper' >> "${tampered}"
@@ -720,11 +723,11 @@ jobs:
             --stage-root "${stage}" \
             --supervisor "${tampered}" \
             --git /usr/bin/git \
-            --output "${RUNNER_TEMP}/wamr-refused-imported-supervisor"; then
+            --output "${identity_parent}/refused-supervisor"; then
             echo "Native import identity accepted changed supervisor" >&2
             exit 1
           fi
-          test ! -e "${RUNNER_TEMP}/wamr-refused-imported-supervisor"
+          test ! -e "${identity_parent}/refused-supervisor"
           printf '\n' >> "${stage}/evidence/build.json"
           if "${controller}" records --stage-root "${stage}" \
             --transport trusted-inner-zip --output handoff-v1 \
@@ -737,11 +740,11 @@ jobs:
             --stage-root "${stage}" \
             --supervisor "${supervisor}" \
             --git /usr/bin/git \
-            --output "${RUNNER_TEMP}/wamr-refused-imported-stage"; then
+            --output "${identity_parent}/refused-stage"; then
             echo "Native import identity accepted changed inner evidence" >&2
             exit 1
           fi
-          test ! -e "${RUNNER_TEMP}/wamr-refused-imported-stage"
+          test ! -e "${identity_parent}/refused-stage"
 
       - name: Retain redacted diagnostics separately from the public-source image bundle
         if: always()
