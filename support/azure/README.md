@@ -1058,6 +1058,93 @@ This format assumes a newly reviewed dummy-OS deployment template and
 original-response capture outside this module. The current pinned template
 attaches the final OS disk and cannot be relabeled as a dummy deployment.
 
+### Opt-in offline custody verifier (no Azure dispatch)
+
+`support/scripts/hyperv_issue90_custody_verifier.py` is a **separate offline
+API**, not a route through `hyperv_issue90_topology.run()` and not a cloud
+authorization. Instantiate `Verifier(OfflineInputs, Expected, archive,
+FileReplayRegistry, custodian_key=..., approver_key=..., witness_key=...)`
+with **three different externally pinned Ed25519 public keys**, an
+operator-owned durable registry, a trusted independent UTC clock and a
+custodied original-response archive. Do not choose keys, expected IDs, or
+timestamps from the records being verified. The stages are
+`verify_offline() -> OfflineAdmission`,
+`verify_handoff(offline, prepared, handoff, preprovision, assurance,
+baseline, now=...) -> PreBootCandidate`,
+`reserve_dispatch(preboot, acceptance, fresh_challenge, now=...)
+-> DispatchPermit`,
+`verify_observation(permit, observation, serial, baseline, now=...)
+-> CandidateAcceptance`, and
+`verify_disposal(candidate_or_permit, closed, acknowledgment, disposal,
+now=...) -> FinalAcceptance | Refusal`. Each stage may instead return a
+typed `Refusal(stage, reason)`; `disposal_recorded=True` means an unsuccessful
+attempt was independently closed, **not PASS**. The sole PASS field belongs
+to `FinalAcceptance`, which still has `scope=offline_only` and
+`cloud_authorized=False`. A permit consumes an allowance before it is
+returned; it is **not** permission for this library to start Azure. There is
+no network client, production key selection, resource creation or cleanup
+implementation in this module. Do not feed handcrafted `OfflineAdmission`
+instances to downstream code: the verifier itself calls the actual admission
+helper, which requires reviewed source, solved configuration, EFI/raw/fixed
+VHD/Miz fingerprints, distinct 8,388,608-sector policy-2 seed VHDs and four
+real local QEMU boots. The synthetic test doubles exercise shape/refusal
+only, not private build or actual Azure evidence.
+
+The separate verifier statement protocol uses canonical, bounded JSON
+`{"body": ..., "signature": "<128 lowercase hex characters>"}`, signed
+with Ed25519 over
+`uk-hyperv-issue90-verifier-v1-STAGE + "\n" + canonical_json(body)`.
+`body.schema` is `uk-hyperv-issue90-verifier-v1`; stages are
+`preprovision` (approver), `assurance` (witness), `acceptance`
+(approver), `observation` (witness), and `disposal` (witness).
+All carry the exact run/operation IDs and whole-second UTC issue time;
+extra/missing fields, unknown intervals, incomplete ledgers, stale records,
+unbound hashes, noncanonical signatures and missing archive bytes refuse.
+Preprovision predates PREPARED and binds the **entire offline admission hash**
+and its reviewed head/source, config, EFI, raw, VHD and Miz digests; both
+seed hashes, dummy VHD, reviewed dummy template, envelope and all ten
+original resource IDs. Assurance is issued at/after HANDED_OFF and binds
+the handoff/preprovision digests, independent no-writer and no-prior-boot
+assertions, bounded RBAC and boot-history archive digests, original VM/disk
+UUIDs, fresh pre-dispatch serial baseline and generation, and a **complete**
+dummy-boot runtime ledger. The acceptance authorization is issued **after**
+handoff and binds its hash, prepared/preprovision/assurance/offline hashes,
+the exact VM/disk IDs and UUIDs, independently selected fresh challenge and
+remaining runtime. Its expiry cannot exceed the shorter assurance/handoff
+window. The private fsynced replay registry claims the run's **only start**
+and the fresh dispatch challenge before any permit is returned; a lost
+response or fsync uncertainty consumes that start. There is no retry.
+
+An independently signed observation binds the permit hash, an archived
+**normalized witness start receipt** (not an invented Azure CLI output
+shape), one dispatch, an authenticated boot
+generation different from the witnessed pre-dispatch baseline, and the
+bounded serial bytes. `parse_serial()` must parse complete, ordered OS MBR/GPT
+and two distinct policy-2 data reads at LUNs 0 and 7, with multiple observed
+controllers; the signed device binding must map each parsed controller,
+channel and LUN to its **original disk UUID** and resource ID. A disk UUID
+is an Azure resource identity, **not** a VHD byte digest: both identity
+and separately reviewed VHD/seed hashes must match. Stale/partial/unredacted
+serial or a synthetic parsed report
+is insufficient. The witness's complete nonoverlapping VM ledger must
+reconcile dummy plus acceptance time at **at most 3,600 seconds**. A failed
+or ambiguous start still needs CLOSED and its independently signed,
+durably recorded ACK. A separate signed post-run witness statement must
+reconcile VM quiescence, the total runtime and every original group, dummy
+and final disk, deployment, VM and network identity with an archived settled
+disposal/quarantine terminal. Quarantine or a failed boot records a refusal,
+never PASS.
+
+An authenticated signature binds *asserted evidence*, not actual Azure
+authority. The operator must independently establish control of the witness
+key and provenance of unedited original Azure CLI/LRO, RBAC, boot diagnostics
+and deletion/quarantine observations, uninterrupted no-writer custody,
+genuine private image/build artifacts and a reviewed dummy-OS template.
+Those inputs are presently unavailable; no locally fabricated response or
+test fixture satisfies them. Neither this verifier nor a signed assertion
+opens `require_reviewed_build_proof()` or `require_live_cleanup_proof()`;
+the existing live lane remains disabled.
+
 ## Private application-network peer
 
 `support/scripts/hyperv-network-peer.py` implements the guest's UKNA v1

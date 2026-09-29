@@ -680,6 +680,27 @@ class FileReplayRegistry:
     def claim_closed(self, run_id, digest):
         self._create("closed", run_id, {"run_id": run_id, "closed_sha256": digest})
 
+    def claim_start(self, run_id, claim):
+        self._create("start", run_id, claim)
+
+    def require_start(self, run_id, claim):
+        if self._read("start", run_id) != claim:
+            raise ValueError("Durable acceptance-image start claim differs")
+
+    def claim_dispatch_challenge(self, challenge, claim):
+        self._create("dispatch-challenge", challenge, claim)
+
+    def require_dispatch_challenge(self, challenge, claim):
+        if self._read("dispatch-challenge", challenge) != claim:
+            raise ValueError("Durable dispatch challenge claim differs")
+
+    def claim_observation(self, run_id, claim):
+        self._create("observation", run_id, claim)
+
+    def require_observation(self, run_id, claim):
+        if self._read("observation", run_id) != claim:
+            raise ValueError("Durable acceptance-image observation differs")
+
 
 def _registry(value):
     if type(value) is not FileReplayRegistry:
