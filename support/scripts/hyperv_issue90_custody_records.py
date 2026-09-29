@@ -27,6 +27,26 @@ DOMAINS = {
 DIRECT = ("group", "dummy", "os", "data0", "data7", "deployment")
 CHILDREN = ("vm", "nic", "vnet", "nsg")
 INVENTORY = ("dummy", "os", "data0", "data7", *CHILDREN)
+
+
+def _deny_rule(direction, priority):
+    return {
+        "name": f"DenyAll{direction}",
+        "priority": priority,
+        "access": "Deny",
+        "direction": direction,
+        "protocol": "*",
+        "sourcePortRange": "*",
+        "destinationPortRange": "*",
+        "sourceAddressPrefix": "*",
+        "destinationAddressPrefix": "*",
+    }
+
+
+NSG_DENY_RULES = (
+    _deny_rule("Inbound", 4095),
+    _deny_rule("Outbound", 4096),
+)
 MAX_RECORD = 64 * 1024
 MAX_ARCHIVE = 64 * 1024
 MAX_TOTAL_ARCHIVE = 512 * 1024
@@ -388,6 +408,11 @@ def _children(observations, expected, archive, vm_uuid, os_role):
     nic = resources["nic"]
     vnet = resources["vnet"]
     nsg = resources["nsg"]
+    rules = nsg.get("securityRules")
+    if (not isinstance(rules, list) or len(rules) != len(NSG_DENY_RULES)
+            or any(rule not in NSG_DENY_RULES for rule in rules)
+            or rules[0] == rules[1]):
+        raise ValueError("Deployment NSG lacks the exact inbound/outbound wildcard Deny pair")
     configs = nic.get("ipConfigurations")
     subnets = vnet.get("subnets")
     if (nic.get("enableIPForwarding") is not False
@@ -410,8 +435,7 @@ def _children(observations, expected, archive, vm_uuid, os_role):
             or subnets[0].get("natGateway") is not None
             or subnets[0].get("routeTable") is not None
             or not isinstance(subnets[0].get("networkSecurityGroup"), dict)
-            or subnets[0]["networkSecurityGroup"].get("id") != expected.resource_ids["nsg"]
-            or nsg.get("securityRules") != []):
+            or subnets[0]["networkSecurityGroup"].get("id") != expected.resource_ids["nsg"]):
         raise ValueError("Deployment children do not have the approved private network")
 
 

@@ -260,7 +260,20 @@ class Fixture:
                 }],
             })
         elif role == "nsg":
-            result["securityRules"] = []
+            result["securityRules"] = [
+                {
+                    "name": f"DenyAll{direction}",
+                    "priority": priority,
+                    "access": "Deny",
+                    "direction": direction,
+                    "protocol": "*",
+                    "sourcePortRange": "*",
+                    "destinationPortRange": "*",
+                    "sourceAddressPrefix": "*",
+                    "destinationAddressPrefix": "*",
+                }
+                for direction, priority in (("Inbound", 4095), ("Outbound", 4096))
+            ]
         elif role == "vm":
             result["vmId"] = self.uuids["vm"]
         return result
@@ -795,6 +808,81 @@ class CustodyRecordsTests(unittest.TestCase):
         self.fixture.resign_prepared()
         with self.assertRaisesRegex(ValueError, "inventory"):
             self.handoff(prepared=self.fixture.sign(self.fixture.prepared))
+
+    def test_prepared_and_handoff_inventory_require_the_same_exact_nsg(self):
+        self.assertEqual(
+            self.fixture.prepared["evidence"]["children"]["nsg"],
+            self.fixture.handoff["evidence"]["children"]["nsg"],
+        )
+        inventory = json.loads(self.fixture.archive[self.fixture.inventory["sha256"]])
+        self.assertEqual({item["role"] for item in inventory["resources"]},
+                         set(custody.INVENTORY))
+        self.assertEqual(self.handoff(), self.fixture.sha(self.fixture.handoff_raw))
+
+    def test_fresh_handoff_nsg_observation_can_reorder_only_the_two_deny_rules(self):
+        nsg = self.fixture.resource("nsg")
+        nsg["securityRules"].reverse()
+        self.fixture.handoff["evidence"]["children"]["nsg"] = self.fixture.put(nsg)
+        self.assertNotEqual(self.fixture.prepared["evidence"]["children"]["nsg"],
+                            self.fixture.handoff["evidence"]["children"]["nsg"])
+        raw = self.fixture.sign(self.fixture.handoff)
+        self.assertEqual(self.handoff(handoff=raw), self.fixture.sha(raw))
+
+    def test_prepared_or_handoff_nsg_refuses_missing_and_extra_rules(self):
+        for stage in ("prepared", "handoff"):
+            for mutation in ("empty", "no-inbound", "no-outbound",
+                             "duplicate", "extra-allow-platform"):
+                with self.subTest(stage=stage, mutation=mutation):
+                    self.fixture = Fixture()
+                    nsg = self.fixture.resource("nsg")
+                    rules = nsg["securityRules"]
+                    if mutation == "empty":
+                        rules.clear()
+                    elif mutation == "no-inbound":
+                        rules.pop(0)
+                    elif mutation == "no-outbound":
+                        rules.pop()
+                    elif mutation == "duplicate":
+                        rules[1] = dict(rules[0])
+                    else:
+                        rules.append({
+                            **rules[1], "name": "AllowPlatformDNS",
+                            "priority": 100, "access": "Allow",
+                            "destinationAddressPrefix": "AzurePlatformDNS",
+                        })
+                    getattr(self.fixture, stage)["evidence"]["children"]["nsg"] = (
+                        self.fixture.put(nsg)
+                    )
+                    if stage == "prepared":
+                        self.fixture.resign_prepared()
+                    with self.assertRaisesRegex(ValueError, "exact inbound/outbound"):
+                        self.handoff(handoff=self.fixture.sign(self.fixture.handoff))
+
+    def test_prepared_or_handoff_nsg_refuses_weaker_rules(self):
+        for stage in ("prepared", "handoff"):
+            for index in (0, 1):
+                for field, value in (
+                    ("access", "Allow"),
+                    ("direction", "Outbound" if index == 0 else "Inbound"),
+                    ("priority", 65000),
+                    ("priority", 100),
+                    ("sourceAddressPrefix", "VirtualNetwork"),
+                    ("destinationAddressPrefix", "10.90.0.0/29"),
+                    ("sourcePortRange", "1024"),
+                    ("destinationPortRange", "443"),
+                    ("protocol", "Tcp"),
+                ):
+                    with self.subTest(stage=stage, rule=index, field=field, value=value):
+                        self.fixture = Fixture()
+                        nsg = self.fixture.resource("nsg")
+                        nsg["securityRules"][index][field] = value
+                        getattr(self.fixture, stage)["evidence"]["children"]["nsg"] = (
+                            self.fixture.put(nsg)
+                        )
+                        if stage == "prepared":
+                            self.fixture.resign_prepared()
+                        with self.assertRaisesRegex(ValueError, "exact inbound/outbound"):
+                            self.handoff(handoff=self.fixture.sign(self.fixture.handoff))
 
     def test_each_vm_observation_must_attach_only_approved_private_nic(self):
         for stage, field, os_role in (
