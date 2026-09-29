@@ -2,7 +2,7 @@
 const std = @import("std");
 const files = @import("hyperv_core").private_files;
 
-pub const Action = enum { build, boot, diagnostics, describe, records, @"handoff-inspect", @"public-validator-build", @"supervisor-import-identity", @"import-validator-build" };
+pub const Action = enum { build, boot, diagnostics, describe, records, @"handoff-inspect", @"public-validator-build", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation" };
 pub const Command = struct {
     action: Action,
     runtime: ?[]const u8 = null,
@@ -74,7 +74,7 @@ pub fn parse(args: []const []const u8) !Command {
             return error.InvalidUsage;
         return result;
     }
-    if (action == .@"import-validator-build") {
+    if (action == .@"import-validator-build" or action == .@"import-native-revalidation") {
         if (args.len != 6) return error.InvalidUsage;
         var result = Command{ .action = action };
         var i: usize = 2;

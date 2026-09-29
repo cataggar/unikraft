@@ -364,7 +364,11 @@ fn handoffInspectFixtures() !void {
     const checked_builder = try controller.public_validator_build.validateCommandEvidence(a, io, &accepted, output, built.bytes);
     try std.testing.expectEqual(plan.Stage.@"public-validator-build", checked_builder.stage);
     try std.testing.expectError(error.CommandOutputChanged, controller.public_validator_build.validateCommandEvidence(
-        a, io, &accepted, output, built.bytes + 1,
+        a,
+        io,
+        &accepted,
+        output,
+        built.bytes + 1,
     ));
     try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateLocalPostRunCommand(&accepted, builder_raw, .package));
     var changed_boot = try std.json.parseFromSlice(std.json.Value, a, boot_inputs, .{
@@ -1106,6 +1110,48 @@ test "imported validator build binds the fixed portable plan with minimal tools"
     try std.testing.expect(git and compiler and library);
 }
 
+test "imported revalidation binds only the built validator and private bundle" {
+    const plan = controller.command_plan;
+    const spec = plan.spec(.@"import-native-revalidation");
+    try std.testing.expectEqualStrings("input:validator", spec.executable);
+    try std.testing.expectEqual(@as(u32, 600), spec.seconds);
+    try std.testing.expectEqual(@as(usize, 4096), spec.output_limit);
+    try std.testing.expectEqual(@as(usize, 3), spec.argv.len);
+    try std.testing.expectEqualStrings("input:validator", spec.argv[0].path.role);
+    try std.testing.expectEqualStrings("handoff", spec.argv[1].literal);
+    try std.testing.expectEqualStrings("input:bundle", spec.argv[2].path.role);
+    const env = try plan.environment(std.testing.allocator, .@"import-native-revalidation");
+    defer plan.freeEnvironment(std.testing.allocator, env);
+    try std.testing.expectEqual(@as(usize, 6), env.len);
+    for (env, 0..) |entry, i| {
+        if (i > 0) try std.testing.expect(std.mem.lessThan(u8, env[i - 1].name, entry.name));
+        try std.testing.expect(!std.mem.startsWith(u8, entry.name, "WAMR_CI_TOOL_"));
+        try std.testing.expect(!std.mem.eql(u8, entry.name, "WAMR_CI_LAUNCH_EXECUTABLE"));
+    }
+}
+
+test "imported handoff member rebasing preserves only safe expected relative paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var valid = std.json.Value{ .object = .empty };
+    try valid.object.put(a, "path", .{ .string = "artifacts/wasm" });
+    try controller.import_validator_build.Fixture.rebaseMember(a, "/trusted/stage", &valid, "artifacts/");
+    try std.testing.expectEqualStrings("/trusted/stage/artifacts/wasm", valid.object.get("path").?.string);
+    for ([_]struct { path: []const u8, expected: anyerror }{
+        .{ .path = "artifacts/../wasm", .expected = error.UnsafePath },
+        .{ .path = "evidence/wasm", .expected = error.InvalidImportedBundle },
+        .{ .path = "/trusted/wasm", .expected = error.UnsafePath },
+    }) |case| {
+        var item = std.json.Value{ .object = .empty };
+        try item.object.put(a, "path", .{ .string = case.path });
+        try std.testing.expectError(
+            case.expected,
+            controller.import_validator_build.Fixture.rebaseMember(a, "/trusted/stage", &item, "artifacts/"),
+        );
+    }
+}
+
 test "imported validator retains runtime paths after the source buffer is released" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1127,7 +1173,10 @@ test "imported validator retains runtime paths after the source buffer is releas
     var start = std.json.Value{ .object = .empty };
     try start.object.put(a, "consumer_inputs", consumer);
     try controller.import_validator_build.Fixture.runtimePathRemainsPinned(
-        std.testing.allocator, io, start, path,
+        std.testing.allocator,
+        io,
+        start,
+        path,
     );
 }
 
@@ -1157,9 +1206,16 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
     try std.testing.expectEqual(cli.Action.@"import-validator-build", imported_validator.action);
     try std.testing.expectEqualStrings("/stage", imported_validator.stage_root.?);
     try std.testing.expectEqualStrings("/private/validator", imported_validator.output.?);
+    const revalidation = try cli.parse(&.{
+        "uk-wamr-native-ci", "import-native-revalidation", "--output", "/private/revalidated", "--stage-root", "/stage",
+    });
+    try std.testing.expectEqual(cli.Action.@"import-native-revalidation", revalidation.action);
+    try std.testing.expectEqualStrings("/stage", revalidation.stage_root.?);
+    try std.testing.expectEqualStrings("/private/revalidated", revalidation.output.?);
     const imported_identity = try cli.parse(&.{
         "uk-wamr-native-ci", "supervisor-import-identity", "--stage-root", "/stage",
-        "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git", "--output", "/private/identity",
+        "--supervisor",      "/trusted/supervisor",        "--git",        "/usr/bin/git",
+        "--output",          "/private/identity",
     });
     try std.testing.expectEqual(cli.Action.@"supervisor-import-identity", imported_identity.action);
     try std.testing.expectEqualStrings("/stage", imported_identity.stage_root.?);
@@ -1179,6 +1235,10 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
         &.{ "uk-wamr-native-ci", "import-validator-build", "--stage-root", "/stage", "--output", "/stage/../validator" },
         &.{ "uk-wamr-native-ci", "import-validator-build", "--stage-root", "/stage", "--output", "/private/validator", "--zig", "/arbitrary/zig" },
         &.{ "uk-wamr-native-ci", "import-validator-build", "--stage-root", "/stage", "--stage-root", "/another" },
+        &.{ "uk-wamr-native-ci", "import-native-revalidation", "--stage-root", "/stage" },
+        &.{ "uk-wamr-native-ci", "import-native-revalidation", "--runtime", "/runtime", "--output", "/private/revalidated" },
+        &.{ "uk-wamr-native-ci", "import-native-revalidation", "--stage-root", "/stage", "--output", "/private/../revalidated" },
+        &.{ "uk-wamr-native-ci", "import-native-revalidation", "--stage-root", "/stage", "--output", "/private/revalidated", "--validator", "/untrusted/validator" },
         &.{ "uk-wamr-native-ci", "supervisor-import-identity", "--stage-root", "/stage", "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git" },
         &.{ "uk-wamr-native-ci", "supervisor-import-identity", "--stage-root", "/stage", "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git", "--output", "/stage/../identity" },
         &.{ "uk-wamr-native-ci", "supervisor-import-identity", "--stage-root", "/stage", "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git", "--output", "/private/identity", "--profile", "tiny" },
@@ -1396,7 +1456,13 @@ test "accepted run requires complete local and trusted-inner-zip evidence before
         defer local_view.deinit();
         try std.testing.expectError(error.FileNotFound, local_view.revalidateWithSignal(&signal));
         try std.testing.expectError(error.MissingEvidence, controller.accepted_run.openAndValidateWithSignal(
-            a, io, undefined, &directory, path, options.repository_root, &signal,
+            a,
+            io,
+            undefined,
+            &directory,
+            path,
+            options.repository_root,
+            &signal,
         ));
     }
     try std.testing.expectError(error.MissingEvidence, controller.accepted_run.openImportedStage(a, io, &directory, path));

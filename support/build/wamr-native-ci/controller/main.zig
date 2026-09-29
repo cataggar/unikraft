@@ -57,16 +57,25 @@ pub fn main(init: std.process.Init) void {
         var signal = controller.build_pipeline.installCancellation() catch refused(init.io);
         defer signal.deinit();
         var accepted = controller.accepted_run.openImportedStage(
-            allocator, init.io, &directory, root,
+            allocator,
+            init.io,
+            &directory,
+            root,
         ) catch |err| failed(init.io, stage, "", err);
         defer accepted.deinit();
         controller.import_supervisor_identity.run(
-            allocator, init.io, &accepted, repository, command.git.?,
-            command.supervisor.?, command.output.?, &signal,
+            allocator,
+            init.io,
+            &accepted,
+            repository,
+            command.git.?,
+            command.supervisor.?,
+            command.output.?,
+            &signal,
         ) catch |err| failed(init.io, stage, "", err);
         return;
     }
-    if (command.action == .@"import-validator-build") {
+    if (command.action == .@"import-validator-build" or command.action == .@"import-native-revalidation") {
         const stage = @tagName(command.action);
         const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
         const root = command.stage_root.?;
@@ -87,6 +96,7 @@ pub fn main(init: std.process.Init) void {
             &accepted,
             repository,
             command.output.?,
+            command.action == .@"import-native-revalidation",
             &signal,
         ) catch |err| failed(init.io, stage, "", err);
         return;
@@ -100,15 +110,29 @@ pub fn main(init: std.process.Init) void {
         var signal = controller.build_pipeline.installCancellation() catch refused(init.io);
         defer signal.deinit();
         var accepted = controller.accepted_run.openAndValidateWithSignal(
-            allocator, init.io, init.minimal.environ, &runtime, root, repository, &signal,
+            allocator,
+            init.io,
+            init.minimal.environ,
+            &runtime,
+            root,
+            repository,
+            &signal,
         ) catch |err| failed(init.io, stage, "", err);
         defer accepted.deinit();
         const result = switch (command.action) {
             .@"handoff-inspect" => controller.handoff_inspect.run(
-                allocator, init.io, &accepted, command.output.?, &signal,
+                allocator,
+                init.io,
+                &accepted,
+                command.output.?,
+                &signal,
             ),
             .@"public-validator-build" => controller.public_validator_build.run(
-                allocator, init.io, &accepted, command.output.?, &signal,
+                allocator,
+                init.io,
+                &accepted,
+                command.output.?,
+                &signal,
             ),
             else => unreachable,
         };
@@ -159,6 +183,7 @@ pub fn main(init: std.process.Init) void {
         .@"public-validator-build" => unreachable,
         .@"supervisor-import-identity" => unreachable,
         .@"import-validator-build" => unreachable,
+        .@"import-native-revalidation" => unreachable,
     }
 }
 
@@ -173,7 +198,8 @@ fn usage(io: std.Io) noreturn {
             "       uk-wamr-native-ci handoff-inspect --runtime ABS --output ABS\n" ++
             "       uk-wamr-native-ci public-validator-build --runtime ABS --output ABS\n" ++
             "       uk-wamr-native-ci supervisor-import-identity --stage-root ABS --supervisor ABS --git ABS --output ABS\n" ++
-            "       uk-wamr-native-ci import-validator-build --stage-root ABS --output ABS\n",
+            "       uk-wamr-native-ci import-validator-build --stage-root ABS --output ABS\n" ++
+            "       uk-wamr-native-ci import-native-revalidation --stage-root ABS --output ABS\n",
     ) catch {};
     std.process.exit(2);
 }

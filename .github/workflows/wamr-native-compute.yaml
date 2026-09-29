@@ -742,6 +742,57 @@ jobs:
                   or binary[18:20] != b"\x3e\x00"):
               raise SystemExit("native imported validator build record refused")
           PY
+          revalidation="${identity_parent}/revalidation"
+          test ! -e "${revalidation}"
+          "${controller}" import-native-revalidation \
+            --stage-root "${stage}" --output "${revalidation}"
+          python3 -B - "${stage}" "${revalidation}" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+
+          stage, root = (Path(arg) for arg in sys.argv[1:])
+          portable = json.loads((stage / "portable-bundle.json").read_bytes())
+          candidate_path = root / "private/candidate-bundle.json"
+          candidate_raw = candidate_path.read_bytes()
+          candidate = json.loads(candidate_raw)
+          for original, member in zip(portable["artifacts"], candidate["artifacts"], strict=True):
+              original["path"] = str(stage / original["path"])
+              if member != original:
+                  raise SystemExit("native revalidation artifact candidate refused")
+          for original, member in zip(portable["evidence"], candidate["evidence"], strict=True):
+              original["path"] = str(stage / original["path"])
+              if member != original:
+                  raise SystemExit("native revalidation evidence candidate refused")
+          for original, member in zip(portable["boots"], candidate["boots"], strict=True):
+              for part in ("serial", "request", "report", "compute"):
+                  original[part]["path"] = str(stage / original[part]["path"])
+              if member != original:
+                  raise SystemExit("native revalidation boot candidate refused")
+          if candidate != portable or candidate_raw != (
+                  json.dumps(candidate, sort_keys=True, separators=(",", ":")).encode() + b"\n"):
+              raise SystemExit("native revalidation candidate refused")
+          log = (root / "private/import-native-revalidation.log").read_bytes()
+          record = json.loads(
+              (root / "evidence/command-import-native-revalidation.json").read_bytes())
+          expected = b"Compute handoff revalidated; authority=not_admitted.\n"
+          request = record["supervisor"]["request"]
+          if (log != expected or record["scope"] != "command_diagnostic_not_acceptance"
+                  or record["stage"] != "import-native-revalidation"
+                  or record["exit_code"] != 0
+                  or record["bytes"] != len(log)
+                  or record["sha256"] != hashlib.sha256(log).hexdigest()
+                  or record["supervisor"]["result"]["command"]["stdout"]["bytes"] != len(expected)
+                  or record["supervisor"]["result"]["command"]["stderr"]["bytes"] != 0
+                  or request["native_executable"]["path"] != {
+                      "kind": "path", "role": "input:validator", "relative": ""}
+                  or request["argv"] != [
+                      {"kind": "path", "role": "input:validator", "relative": ""},
+                      {"kind": "literal", "value": "handoff"},
+                      {"kind": "path", "role": "input:bundle", "relative": ""}]):
+              raise SystemExit("native revalidation command refused")
+          PY
           tampered="${identity_parent}/tampered-supervisor"
           test ! -e "${tampered}"
           cp -- "${supervisor}" "${tampered}"
@@ -763,6 +814,12 @@ jobs:
             exit 1
           fi
           test ! -s "${RUNNER_TEMP}/wamr-tampered-handoff-v1.json"
+          if "${controller}" import-native-revalidation \
+            --stage-root "${stage}" --output "${identity_parent}/refused-revalidation"; then
+            echo "Native revalidation accepted changed inner evidence" >&2
+            exit 1
+          fi
+          test ! -e "${identity_parent}/refused-revalidation"
           if "${controller}" supervisor-import-identity \
             --stage-root "${stage}" \
             --supervisor "${supervisor}" \

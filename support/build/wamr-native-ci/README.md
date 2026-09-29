@@ -87,9 +87,9 @@ under the fixed plan. Its owner-only output is outside the imported stage and
 checkout. Trusted v2 import now invokes this operation before writing
 transport/candidate records and does not repeat the identity command through
 Python. Python still owns publication policy, source/consumer recapture,
-validator supervision, and legacy/producer-direct identity checks. Remaining
-checkout/consumer custody and supervised handoff stages need native owners
-before `run.py` can be removed.
+production validator supervision, and legacy/producer-direct identity checks.
+Remaining checkout/consumer custody and production/historical supervised
+handoff stages need native owners before `run.py` can be removed.
 `import-validator-build --stage-root ABS --output ABS` is a support-only
 trusted-v2 companion for a pristine imported stage. It accepts no caller
 selected executable: it requires the current clean physical checkout to
@@ -101,6 +101,17 @@ evidence. A historical revision or unavailable recorded tool refuses this
 operation; trusted historical imports still follow the existing Python
 revalidation path. This does not yet change the production import caller or
 make the built binary a published bundle member.
+`import-native-revalidation --stage-root ABS --output ABS` is a support-only
+trusted-v2 companion that builds that fixed direct validator and supervises its
+`handoff` verification in the same native invocation. It constructs a private
+canonical candidate outside the pristine imported stage by rebasing only the
+exact artifact, boot, and evidence member paths already validated against the
+imported portable bundle; neither the candidate nor the validator is a public
+bundle member. The validator is retained from build through execution and its
+exact success stdout, empty stderr, bounded log, and command binding are
+checked before returning. A caller cannot select a validator or manifest.
+Historical imports and the production revalidation caller still use Python;
+this support stage does not transfer publication or admission authority.
 
 ## Native controller preparation (unpublished build path)
 

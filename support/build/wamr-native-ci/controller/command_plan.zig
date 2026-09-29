@@ -27,6 +27,7 @@ pub const Stage = enum {
     @"public-validator-build",
     @"supervisor-import-identity",
     @"import-validator-build",
+    @"import-native-revalidation",
 };
 
 pub const Binding = union(enum) {
@@ -52,8 +53,8 @@ const validator = Binding{ .path = .{ .role = "native:wamr-log-validate" } };
 const marker = "WAMR_NATIVE_AOT_OK answer=42 teardown=0";
 const legacy_marker = "Using legacy xAPIC MMIO";
 const forbidden = [_][]const u8{
-    "HYPERV_ACCEPTANCE", "UK_HYPERV_IO_READY", "UK_HYPERV_NETWORK_APP_READY",
-    "UK_HYPERV_PLATFORM_READY", "WAMR_NATIVE_WASI=", "WAMR_NATIVE_AOT_FAIL",
+    "HYPERV_ACCEPTANCE",        "UK_HYPERV_IO_READY", "UK_HYPERV_NETWORK_APP_READY",
+    "UK_HYPERV_PLATFORM_READY", "WAMR_NATIVE_WASI=",  "WAMR_NATIVE_AOT_FAIL",
 };
 
 pub fn modeStage(mode: profile.Mode) Stage {
@@ -82,16 +83,16 @@ fn bootArgv(comptime mode: profile.Mode) []const Binding {
         .@"vpc-x2apic", .@"vpc-legacy-apic" => "--fixed-vhd",
     };
     const start = [_]Binding{
-        boot_tool, .{ .literal = source_flag },
-        .{ .path = .{ .role = "work", .relative = "package/" ++ comptime bootImage(mode) } },
-        .{ .literal = "--qemu" }, .{ .path = .{ .role = "input:qemu" } },
-        .{ .literal = "--ovmf-code" }, .{ .path = .{ .role = "input:ovmf_code" } },
-        .{ .literal = "--ovmf-vars" }, .{ .path = .{ .role = "input:ovmf_vars" } },
-        .{ .literal = "--work-dir" }, .{ .path = .{ .role = "work", .relative = "boot-" ++ @tagName(mode) } },
-        .{ .literal = "--expect" }, .{ .literal = marker },
-        .{ .literal = "--expect-main-return" }, .{ .literal = "0" },
-        .{ .literal = "--cpus" }, .{ .literal = "1" },
-        .{ .literal = "--timeout" }, .{ .literal = "60" },
+        boot_tool,                                                                            .{ .literal = source_flag },
+        .{ .path = .{ .role = "work", .relative = "package/" ++ comptime bootImage(mode) } }, .{ .literal = "--qemu" },
+        .{ .path = .{ .role = "input:qemu" } },                                               .{ .literal = "--ovmf-code" },
+        .{ .path = .{ .role = "input:ovmf_code" } },                                          .{ .literal = "--ovmf-vars" },
+        .{ .path = .{ .role = "input:ovmf_vars" } },                                          .{ .literal = "--work-dir" },
+        .{ .path = .{ .role = "work", .relative = "boot-" ++ @tagName(mode) } },              .{ .literal = "--expect" },
+        .{ .literal = marker },                                                               .{ .literal = "--expect-main-return" },
+        .{ .literal = "0" },                                                                  .{ .literal = "--cpus" },
+        .{ .literal = "1" },                                                                  .{ .literal = "--timeout" },
+        .{ .literal = "60" },
     };
     const no_hardware = comptime blk: {
         var values: [forbidden.len * 2]Binding = undefined;
@@ -114,9 +115,7 @@ fn bootArgv(comptime mode: profile.Mode) []const Binding {
 
 pub fn isBoot(stage: Stage) bool {
     return switch (stage) {
-        .package, .@"raw-x2apic", .@"raw-legacy-apic", .@"finalize-qcow2",
-        .@"qcow2-x2apic", .@"qcow2-legacy-apic", .@"derive-fixed-vhd",
-        .@"vpc-x2apic", .@"vpc-legacy-apic", .inspect, .@"handoff-inspect" => true,
+        .package, .@"raw-x2apic", .@"raw-legacy-apic", .@"finalize-qcow2", .@"qcow2-x2apic", .@"qcow2-legacy-apic", .@"derive-fixed-vhd", .@"vpc-x2apic", .@"vpc-legacy-apic", .inspect, .@"handoff-inspect" => true,
         else => false,
     };
 }
@@ -170,13 +169,11 @@ pub fn spec(stage: Stage) Spec {
             .seconds = 600,
             .output_limit = 8 * 1024 * 1024,
             .argv = &.{
-                zig, .{ .literal = "build" }, .{ .literal = "--build-file" },
-                .{ .path = .{ .role = "source", .relative = "support/tools/hyperv/direct/build.zig" } },
-                .{ .literal = "--cache-dir" }, .{ .path = .{ .role = "work", .relative = "cache" } },
-                .{ .literal = "--global-cache-dir" }, .{ .path = .{ .role = "work", .relative = "global-cache" } },
-                .{ .literal = "--prefix" }, .{ .path = .{ .role = "work", .relative = "public-source/tools" } },
-                .{ .literal = "-Dtarget=x86_64-linux-gnu" }, .{ .literal = "-Dcpu=x86_64_v2" },
-                .{ .literal = "-Doptimize=ReleaseSafe" }, .{ .literal = "-j2" }, .{ .literal = "install" },
+                zig,                                                                                     .{ .literal = "build" },                                      .{ .literal = "--build-file" },
+                .{ .path = .{ .role = "source", .relative = "support/tools/hyperv/direct/build.zig" } }, .{ .literal = "--cache-dir" },                                .{ .path = .{ .role = "work", .relative = "cache" } },
+                .{ .literal = "--global-cache-dir" },                                                    .{ .path = .{ .role = "work", .relative = "global-cache" } }, .{ .literal = "--prefix" },
+                .{ .path = .{ .role = "work", .relative = "public-source/tools" } },                     .{ .literal = "-Dtarget=x86_64-linux-gnu" },                  .{ .literal = "-Dcpu=x86_64_v2" },
+                .{ .literal = "-Doptimize=ReleaseSafe" },                                                .{ .literal = "-j2" },                                        .{ .literal = "install" },
             },
         },
         .@"supervisor-import-identity" => .{
@@ -187,6 +184,17 @@ pub fn spec(stage: Stage) Spec {
             .argv = &.{
                 .{ .path = .{ .role = "command-supervisor" } },
                 .{ .literal = "--identity" },
+            },
+        },
+        .@"import-native-revalidation" => .{
+            .stage = stage,
+            .executable = "input:validator",
+            .seconds = 600,
+            .output_limit = 4096,
+            .argv = &.{
+                .{ .path = .{ .role = "input:validator" } },
+                .{ .literal = "handoff" },
+                .{ .path = .{ .role = "input:bundle" } },
             },
         },
         .@"finalize-qcow2" => packageSpec(.@"finalize-qcow2"),
@@ -204,7 +212,8 @@ pub fn spec(stage: Stage) Spec {
 
 fn packageSpec(comptime stage: Stage) Spec {
     const verb = switch (stage) {
-        .package => "package", .inspect => "inspect",
+        .package => "package",
+        .inspect => "inspect",
         .@"finalize-qcow2" => "finalize-qcow2",
         .@"derive-fixed-vhd" => "derive-fixed-vhd",
         else => @compileError("invalid package stage"),
@@ -215,22 +224,27 @@ fn packageSpec(comptime stage: Stage) Spec {
         .@"derive-fixed-vhd" => Binding{ .path = .{ .role = "work", .relative = "evidence/fixed-vhd-derivation-intent.json" } },
         else => unreachable,
     };
-    return .{ .stage = stage, .executable = "input:package_tool", .seconds = 150,
+    return .{
+        .stage = stage,
+        .executable = "input:package_tool",
+        .seconds = 150,
         .output_limit = 64 * 1024,
-        .argv = &.{ package_tool, .{ .literal = verb }, input,
-            .{ .path = .{ .role = "work", .relative = "package" } } },
+        .argv = &.{ package_tool, .{ .literal = verb }, input, .{ .path = .{ .role = "work", .relative = "package" } } },
     };
 }
 
 fn validatorSpec(comptime stage: Stage) Spec {
     return .{
-        .stage = stage, .executable = "native:wamr-log-validate",
-        .seconds = 30, .output_limit = 64 * 1024,
-        .argv = &.{ validator, .{ .literal = "tiny" },
-            .{ .literal = "--log" }, .{ .path = .{ .role = "input:serial" } },
-            .{ .literal = "--identity" }, .{ .path = .{ .role = "input:identity" } },
+        .stage = stage,
+        .executable = "native:wamr-log-validate",
+        .seconds = 30,
+        .output_limit = 64 * 1024,
+        .argv = &.{
+            validator,                       .{ .literal = "tiny" },
+            .{ .literal = "--log" },         .{ .path = .{ .role = "input:serial" } },
+            .{ .literal = "--identity" },    .{ .path = .{ .role = "input:identity" } },
             .{ .literal = "--legacy-apic" }, .{ .literal = if (stage == .@"log-validator-legacy") "required" else "forbidden" },
-            .{ .literal = "--output" }, .{ .literal = "json-v1" },
+            .{ .literal = "--output" },      .{ .literal = "json-v1" },
         },
     };
 }
@@ -278,6 +292,8 @@ pub const Roots = struct {
     ovmf_vars: []const u8 = "",
     serial: []const u8 = "",
     identity: []const u8 = "",
+    direct_validator: []const u8 = "",
+    bundle: []const u8 = "",
     tools: [inputs.host_tools.len][]const u8,
 
     pub fn get(self: Roots, role: []const u8) ![]const u8 {
@@ -301,6 +317,8 @@ pub const Roots = struct {
         if (std.mem.eql(u8, role, "input:ovmf_vars") and self.ovmf_vars.len != 0) return self.ovmf_vars;
         if (std.mem.eql(u8, role, "input:serial") and self.serial.len != 0) return self.serial;
         if (std.mem.eql(u8, role, "input:identity") and self.identity.len != 0) return self.identity;
+        if (std.mem.eql(u8, role, "input:validator") and self.direct_validator.len != 0) return self.direct_validator;
+        if (std.mem.eql(u8, role, "input:bundle") and self.bundle.len != 0) return self.bundle;
         if (std.mem.startsWith(u8, role, "tool:")) {
             for (inputs.host_tools, self.tools) |name, value|
                 if (std.mem.eql(u8, role["tool:".len..], name)) return value;
@@ -348,6 +366,17 @@ pub fn environment(allocator: std.mem.Allocator, stage: Stage) ![]EnvironmentBin
             .{ .name = "ZIG_GLOBAL_CACHE_DIR", .value = .{ .path = .{ .role = "work", .relative = "global-cache" } } },
             .{ .name = "ZIG_LIB_DIR", .value = .{ .path = .{ .role = "tool-tree:zig", .relative = "lib" } } },
             .{ .name = "ZIG_LOCAL_CACHE_DIR", .value = .{ .path = .{ .role = "work", .relative = "cache" } } },
+        });
+        return bindings.toOwnedSlice(allocator);
+    }
+    if (stage == .@"import-native-revalidation") {
+        try bindings.appendSlice(allocator, &.{
+            .{ .name = "HOME", .value = .{ .path = .{ .role = "work", .relative = "private" } } },
+            .{ .name = "LANG", .value = .{ .literal = "C" } },
+            .{ .name = "LC_ALL", .value = .{ .literal = "C" } },
+            .{ .name = "PATH", .value = .{ .literal = "/usr/bin:/bin" } },
+            .{ .name = "TMPDIR", .value = .{ .path = .{ .role = "work", .relative = "private" } } },
+            .{ .name = "WAMR_CI_SUPERVISOR", .value = .{ .path = .{ .role = "command-supervisor" } } },
         });
         return bindings.toOwnedSlice(allocator);
     }

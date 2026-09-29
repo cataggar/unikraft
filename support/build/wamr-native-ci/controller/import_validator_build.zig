@@ -9,8 +9,11 @@ const physical = @import("custody_files.zig");
 const inputs = @import("input_custody.zig");
 const limits = @import("custody_limits.zig");
 const plan = @import("command_plan.zig");
+const profile = @import("profile.zig");
 const records = @import("records.zig");
 const source = @import("source_custody.zig");
+
+const handoff_success = "Compute handoff revalidated; authority=not_admitted.\n";
 
 const Tool = struct {
     path: []const u8,
@@ -142,7 +145,79 @@ pub const Fixture = if (@import("builtin").is_test) struct {
             try entry.file.verify(io);
         }
     }
+
+    pub fn rebaseMember(
+        allocator: std.mem.Allocator,
+        root: []const u8,
+        item: *std.json.Value,
+        prefix: []const u8,
+    ) !void {
+        try rebase(allocator, root, item, prefix);
+    }
 } else struct {};
+
+fn rebase(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    item: *std.json.Value,
+    prefix: []const u8,
+) !void {
+    if (item.* != .object) return error.InvalidImportedBundle;
+    const member = item.object.getPtr("path") orelse return error.InvalidImportedBundle;
+    const relative = try contracts.string(member.*);
+    try limits.relative(relative, 128, 3);
+    if (!std.mem.startsWith(u8, relative, prefix) or relative.len == prefix.len)
+        return error.InvalidImportedBundle;
+    member.* = .{ .string = try std.fs.path.join(allocator, &.{ root, relative }) };
+}
+
+fn handoffCandidate(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    accepted: *accepted_run.AcceptedRun,
+) ![]const u8 {
+    const root = accepted.root;
+    const path = try std.fs.path.join(allocator, &.{ root, "portable-bundle.json" });
+    var pinned = try files.RetainedFile.open(io, path, .private);
+    defer pinned.close(io);
+    var raw = try files.readSensitiveFile(io, allocator, pinned.file, 64 * 1024, .private);
+    defer raw.deinit();
+    var document = try contracts.Document.parse(allocator, raw.bytes(), .{
+        .bytes = 64 * 1024,
+        .depth = 32,
+        .items = 4096,
+        .tokens = 65536,
+    });
+    defer document.deinit();
+    try document.requireCanonical(allocator, raw.bytes());
+    const bundle = document.value();
+    const artifacts = try get(bundle, "artifacts");
+    const boots = try get(bundle, "boots");
+    const evidence = try get(bundle, "evidence");
+    const mode_count = profile.modes(.tiny_v2_qcow2_derived_vhd).len;
+    if (accepted.artifacts.len < mode_count * 4 or
+        artifacts != .array or artifacts.array.items.len != accepted.artifacts.len - mode_count * 4 or
+        boots != .array or boots.array.items.len != profile.modes(.tiny_v2_qcow2_derived_vhd).len or
+        evidence != .array or evidence.array.items.len != accepted.records.len)
+        return error.InvalidImportedBundle;
+    for (artifacts.array.items) |*item| try rebase(allocator, root, item, "artifacts/");
+    for (profile.modes(.tiny_v2_qcow2_derived_vhd), boots.array.items) |mode, *boot| {
+        if (boot.* != .object or
+            !std.mem.eql(u8, try contracts.string(try get(boot.*, "mode")), @tagName(mode)))
+            return error.InvalidImportedBundle;
+        const prefix = try std.fmt.allocPrint(allocator, "boots/{s}/", .{@tagName(mode)});
+        for ([_][]const u8{ "serial", "request", "report", "compute" }) |part| {
+            const item = boot.object.getPtr(part) orelse return error.InvalidImportedBundle;
+            try rebase(allocator, root, item, prefix);
+        }
+    }
+    for (evidence.array.items) |*item| try rebase(allocator, root, item, "evidence/");
+    const serialized = try std.json.Stringify.valueAlloc(allocator, bundle, .{});
+    const candidate = try records.canonicalAlloc(allocator, serialized);
+    if (candidate.len > 65536) return error.InvalidImportedBundle;
+    try pinned.verify(io);
+    return candidate;
+}
 
 fn tree(allocator: std.mem.Allocator, io: std.Io, start: std.json.Value, zig_path: []const u8) !inputs.TreeRecord {
     const root = std.fs.path.dirname(zig_path) orelse return error.UnsafePath;
@@ -172,9 +247,10 @@ fn postRun(
     allocator: std.mem.Allocator,
     io: std.Io,
     output: []const u8,
+    stage: plan.Stage,
     expected_bytes: usize,
 ) !void {
-    const record_path = try std.fs.path.join(allocator, &.{ output, "evidence/command-import-validator-build.json" });
+    const record_path = try std.fmt.allocPrint(allocator, "{s}/evidence/command-{s}.json", .{ output, @tagName(stage) });
     const identity = try physical.readFile(io, record_path, records.max_record_bytes, true);
     var retained = try files.RetainedFile.open(io, record_path, .private);
     defer retained.close(io);
@@ -188,11 +264,11 @@ fn postRun(
     const checked = try accepted_run.validateCommandBinding(
         allocator,
         raw.bytes(),
-        .@"import-validator-build",
+        stage,
         .trusted_inner_zip,
     );
-    const log_path = try std.fs.path.join(allocator, &.{ output, "private/import-validator-build.log" });
-    const log = try physical.readFile(io, log_path, 8 * limits.mib + 1, true);
+    const log_path = try std.fmt.allocPrint(allocator, "{s}/private/{s}.log", .{ output, @tagName(stage) });
+    const log = try physical.readFile(io, log_path, plan.spec(stage).output_limit + 1, true);
     if (checked.output_bytes != expected_bytes or checked.output_bytes != log.bytes or
         !std.mem.eql(u8, &checked.output_sha256, &log.sha256))
         return error.CommandOutputChanged;
@@ -205,6 +281,7 @@ pub fn run(
     accepted: *accepted_run.AcceptedRun,
     repository: []const u8,
     output: []const u8,
+    revalidate: bool,
     signal: ?*core.process.SignalCancellation,
 ) !void {
     if (accepted.context != .trusted_inner_zip or
@@ -259,6 +336,7 @@ pub fn run(
     try git.pinned.verify(io);
     try zig.pinned.verify(io);
     try accepted.revalidateWithSignal(signal);
+    const candidate = if (revalidate) try handoffCandidate(allocator, io, accepted) else &.{};
     if (signal) |active|
         if (active.flag().load(.acquire)) return error.Cancelled;
 
@@ -276,9 +354,23 @@ pub fn run(
     defer private.close(io);
     const evidence = try work.openDir(io, "evidence", .{ .iterate = true });
     defer evidence.close(io);
+    const candidate_path = if (revalidate)
+        try std.fs.path.join(allocator, &.{ output, "private/candidate-bundle.json" })
+    else
+        "";
+    if (revalidate) {
+        const file = try private.createFile(io, "candidate-bundle.json", .{
+            .exclusive = true,
+            .read = true,
+            .permissions = .fromMode(0o600),
+        });
+        defer file.close(io);
+        try file.writeStreamingAll(io, candidate);
+        try file.sync(io);
+    }
     var tools: [inputs.host_tools.len][]const u8 = @splat("");
     tools[0] = git.path;
-    const roots = plan.Roots{
+    var roots = plan.Roots{
         .source_root = repository,
         .work = output,
         .runtime = accepted.root,
@@ -309,14 +401,48 @@ pub fn run(
         !std.mem.eql(u8, header[0..4], "\x7fELF") or header[4] != 2 or header[5] != 1 or
         header[18] != 62 or header[19] != 0)
         return error.InvalidValidator;
-    try postRun(allocator, io, output, outcome.bytes);
+    try postRun(allocator, io, output, .@"import-validator-build", outcome.bytes);
+    var revalidated_bytes: usize = 0;
+    var pinned_candidate: ?files.RetainedFile = null;
+    defer if (pinned_candidate) |*item| item.close(io);
+    if (revalidate) {
+        const observed = try physical.readFile(io, candidate_path, 65536, true);
+        const digest = std.fmt.bytesToHex(records.fileIdentity(candidate), .lower);
+        if (observed.bytes != candidate.len or
+            !std.mem.eql(u8, &observed.sha256, &digest))
+            return error.CandidateChanged;
+        pinned_candidate = try files.RetainedFile.open(io, candidate_path, .private);
+        try pinned_candidate.?.verify(io);
+        roots.direct_validator = validator_path;
+        roots.bundle = candidate_path;
+        const checked = try adapter.execute(allocator, io, .{
+            .roots = roots,
+            .stage = .@"import-native-revalidation",
+            .private_dir = private,
+            .evidence_dir = evidence,
+            .cancel = if (signal) |active| active.flag() else null,
+            .capture_stdout = true,
+        });
+        defer allocator.free(checked.stdout);
+        if (checked.poisoned) return error.CleanupPoisoned;
+        if (!checked.accepted or checked.stderr_bytes != 0 or
+            !std.mem.eql(u8, checked.stdout, handoff_success))
+            return error.StageRefused;
+        revalidated_bytes = checked.bytes;
+        try postRun(allocator, io, output, .@"import-native-revalidation", revalidated_bytes);
+        try pinned_candidate.?.verify(io);
+    }
     try accepted.revalidateWithSignal(signal);
     const after = try source.source(allocator, io, repository, git.path);
     if (!before.same(after)) return error.SourceChanged;
     const compiler_after = try tree(allocator, io, start, zig.path);
     if (!std.meta.eql(compiler_before.physical_sha256, compiler_after.physical_sha256))
         return error.ImportedToolChanged;
-    try postRun(allocator, io, output, outcome.bytes);
+    try postRun(allocator, io, output, .@"import-validator-build", outcome.bytes);
+    if (revalidate) {
+        try postRun(allocator, io, output, .@"import-native-revalidation", revalidated_bytes);
+        try pinned_candidate.?.verify(io);
+    }
     try pinned_start.verify(io);
     try git.pinned.verify(io);
     try zig.pinned.verify(io);
