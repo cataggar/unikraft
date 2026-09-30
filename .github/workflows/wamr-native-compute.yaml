@@ -444,6 +444,7 @@ jobs:
 
       - name: Bind and publish the redownloaded inner public-source ZIP
         id: public_binding
+        timeout-minutes: 45
         env:
           INNER_ZIP_SHA256: ${{ steps.public_bundle.outputs.inner_zip_sha256 }}
           CONTAINER_DIGEST: ${{ steps.public_upload.outputs.artifact-digest }}
@@ -522,7 +523,8 @@ jobs:
             --validator "${validator}" \
             --supervisor "${supervisor}" \
             --artifact-id "${ARTIFACT_ID}" \
-            --container-digest "${CONTAINER_DIGEST}"
+            --container-digest "${CONTAINER_DIGEST}" \
+            --native-import-revalidation
           native_revalidation="${import_root}/success-native-identity/revalidation"
           test -s "${native_revalidation}/private/import-native-revalidation.log"
           test -s "${native_revalidation}/evidence/command-import-native-revalidation.json"

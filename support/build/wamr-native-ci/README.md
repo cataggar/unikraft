@@ -48,10 +48,14 @@ fixture covers older allowlisted v1 evidence; the current v2 import is also
 exercised against a retained protected archive. Neither form executes build or
 boot, changes authority, or makes a partially checked manifest an accepted run.
 
-The public bundle importer now requires this native check before publishing
-its candidate, while retaining the Python publication policy. Native-produced v2
-local handoff requires native acceptance before using its result-record hashes
-and source identity; the Python build and boot checks still run. A
+The public bundle importer now requires this native imported-records check
+before publishing its candidate, while retaining the Python publication policy.
+Only the protected in-job import that passes `--native-import-revalidation`
+runs trusted-v2 native revalidation through the native controller; default,
+off-runner, and historical trusted-v2 imports retain Python supervised-stage
+revalidation with the caller-supplied validator. Native-produced v2 local
+handoff requires native acceptance before using its result-record hashes and
+source identity; the Python build and boot checks still run. A
 Python-produced local run retains the pinned Python source-custody path for
 result-record selection. It is accepted by the native controller only for the
 non-legacy v2 handoff inspection route; `records --runtime` and

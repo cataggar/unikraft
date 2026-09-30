@@ -200,6 +200,42 @@ class NativeRecordBridge(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "revalidation refused"):
                     bridge.import_native_revalidation(stage, output)
 
+    def test_imported_native_revalidation_uses_dedicated_timeout(self):
+        bridge = public_bundle.accepted_records
+        root, unused_controller = self.controller_fixture("")
+        del unused_controller
+        stage = root / "stage"
+        stage.mkdir(mode=0o700)
+        output = root / "accepted"
+
+        def accepted(arguments, refusal, *, timeout_seconds=None):
+            self.assertEqual(arguments, (
+                "import-native-revalidation",
+                "--stage-root", str(stage), "--output", str(output)))
+            self.assertEqual(
+                refusal, "native controller import revalidation refused")
+            self.assertEqual(
+                timeout_seconds,
+                bridge.IMPORT_NATIVE_REVALIDATION_TIMEOUT_SECONDS)
+            self.assertNotEqual(timeout_seconds, bridge.RECORDS_TIMEOUT_SECONDS)
+            output.mkdir(mode=0o700)
+            (output / "private").mkdir(mode=0o700)
+            (output / "evidence").mkdir(mode=0o700)
+            for path, content in (
+                    (output / "private/import-native-revalidation.log",
+                     b"Compute handoff revalidated; authority=not_admitted.\n"),
+                    (output / "evidence/command-import-native-revalidation.json",
+                     b"{}")):
+                path.write_bytes(content)
+                path.chmod(0o600)
+            return b"", False
+
+        with mock.patch.object(
+                bridge, "_controller_command", side_effect=accepted) as command:
+            self.assertEqual(
+                bridge.import_native_revalidation(stage, output), output)
+        command.assert_called_once()
+
     def test_oversized_native_stdout_and_stderr_are_killed_and_reaped(self):
         bridge = public_bundle.accepted_records
         for descriptor in (1, 2):
@@ -721,7 +757,7 @@ class NativeRecordBridge(unittest.TestCase):
                 [call.args[1] for call in run.call_args_list],
                 ["supervisor-import-identity", "native-revalidation"])
 
-    def test_trusted_v2_import_routes_revalidation_to_native_before_candidate(self):
+    def test_trusted_v2_import_revalidation_selection_is_explicit(self):
         root, unused_controller = self.controller_fixture("")
         del unused_controller
         sha256 = hashlib.sha256(b"x").hexdigest()
@@ -841,11 +877,17 @@ class NativeRecordBridge(unittest.TestCase):
         }
         output = root / "success"
 
-        def native_revalidation(stage, native_output):
-            self.assertEqual(stage, output)
-            self.assertFalse((stage / "transport.json").exists())
-            self.assertFalse((stage / "candidate-bundle.json").exists())
-            return Path(native_output)
+        def python_revalidation(
+                unused_handoff, validator, supervisor, candidate, expected_arg,
+                native_identity=None):
+            self.assertEqual(validator, root / "validator")
+            self.assertEqual(supervisor, root / "supervisor")
+            self.assertEqual(candidate, output / "candidate-bundle.json")
+            self.assertEqual(expected_arg, source)
+            self.assertEqual(
+                native_identity, root / "success-native-identity/accepted")
+            self.assertTrue((output / "transport.json").exists())
+            self.assertTrue((output / "candidate-bundle.json").exists())
 
         with mock.patch.object(
                 public_bundle.accepted_records, "imported_stage",
@@ -858,24 +900,68 @@ class NativeRecordBridge(unittest.TestCase):
                 mock.patch.object(
                     public_bundle.accepted_records,
                     "import_native_revalidation",
-                    side_effect=native_revalidation) as revalidation, \
+                    side_effect=AssertionError(
+                        "default import selected native revalidation")
+                ) as revalidation, \
                 mock.patch.object(
                     public_bundle, "publication_records") as records, \
                 mock.patch.object(
                     public_bundle, "native",
-                    side_effect=AssertionError(
-                        "Python revalidated trusted v2 import")):
+                    side_effect=python_revalidation) as python_native:
             public_bundle.import_bundle(
                 handoff, archive, output, source, ci.digest(archive),
                 root / "validator", root / "supervisor",
                 artifact_id="123", container_digest="0" * 64)
         imported.assert_called_once_with(output)
         identity.assert_called_once()
-        revalidation.assert_called_once()
+        self.assertEqual(
+            identity.call_args.args[3],
+            root / "success-native-identity/accepted")
+        revalidation.assert_not_called()
         records.assert_called_once()
+        self.assertEqual(records.call_args.kwargs["native_accepted"], accepted)
+        python_native.assert_called_once()
         self.assertTrue((output / "transport.json").exists())
         self.assertTrue((output / "candidate-bundle.json").exists())
         self.assertTrue((output / "bundle.json").exists())
+        native_output = root / "native-success"
+
+        def native_revalidation(stage, native_output_path):
+            self.assertEqual(stage, native_output)
+            self.assertFalse((stage / "transport.json").exists())
+            self.assertFalse((stage / "candidate-bundle.json").exists())
+            return Path(native_output_path)
+
+        with mock.patch.object(
+                public_bundle.accepted_records, "imported_stage",
+                return_value=accepted), \
+                mock.patch.object(
+                    public_bundle.accepted_records,
+                    "supervisor_import_identity",
+                    side_effect=lambda unused_stage, unused_supervisor,
+                        unused_git, output: Path(output)), \
+                mock.patch.object(
+                    public_bundle.accepted_records,
+                    "import_native_revalidation",
+                    side_effect=native_revalidation) as revalidation, \
+                mock.patch.object(
+                    public_bundle, "publication_records") as records, \
+                mock.patch.object(
+                    public_bundle, "native",
+                    side_effect=AssertionError(
+                        "native mode fell back to Python revalidation")
+                ) as python_native:
+            public_bundle.import_bundle(
+                handoff, archive, native_output, source, ci.digest(archive),
+                root / "validator", root / "supervisor",
+                artifact_id="123", container_digest="0" * 64,
+                native_import_revalidation=True)
+        revalidation.assert_called_once()
+        records.assert_called_once()
+        python_native.assert_not_called()
+        self.assertTrue((native_output / "transport.json").exists())
+        self.assertTrue((native_output / "candidate-bundle.json").exists())
+        self.assertTrue((native_output / "bundle.json").exists())
         refused = root / "refused"
         with mock.patch.object(
                 public_bundle.accepted_records, "imported_stage",
@@ -889,12 +975,19 @@ class NativeRecordBridge(unittest.TestCase):
                     public_bundle.accepted_records,
                     "import_native_revalidation",
                     side_effect=ValueError(
-                        "native controller import revalidation refused")):
+                        "native controller import revalidation refused")), \
+                mock.patch.object(
+                    public_bundle, "native",
+                    side_effect=AssertionError(
+                        "native refusal fell back to Python revalidation")
+                ) as python_native:
             with self.assertRaisesRegex(ValueError, "revalidation refused"):
                 public_bundle.import_bundle(
                     handoff, archive, refused, source, ci.digest(archive),
                     root / "validator", root / "supervisor",
-                    artifact_id="123", container_digest="0" * 64)
+                    artifact_id="123", container_digest="0" * 64,
+                    native_import_revalidation=True)
+        python_native.assert_not_called()
         self.assertEqual(
             handoff.FAILURE_STAGE, "public-import-native-revalidation")
         self.assertFalse((refused / "transport.json").exists())
@@ -945,7 +1038,8 @@ class NativeRecordBridge(unittest.TestCase):
                         unused_git, output: Path(output)) as identity, \
                 mock.patch.object(
                     bridge, "import_native_revalidation",
-                    side_effect=lambda unused_stage, output: Path(output)
+                    side_effect=AssertionError(
+                        "default import selected native revalidation")
                 ) as revalidation:
             with self.assertRaisesRegex(RuntimeError, "after native acceptance"):
                 public_bundle.import_bundle(
@@ -954,11 +1048,8 @@ class NativeRecordBridge(unittest.TestCase):
                     artifact_id="123", container_digest="0" * 64)
         self.assertEqual(handoff.FAILURE_STAGE, "public-import-records")
         identity.assert_called_once()
-        revalidation.assert_called_once()
+        revalidation.assert_not_called()
         self.assertTrue((root / "import-native-identity").is_dir())
-        self.assertEqual(
-            revalidation.call_args.args[1],
-            root / "import-native-identity/revalidation")
         self.assertTrue((output / "candidate-bundle.json").exists())
         self.assertFalse((output / "bundle.json").exists())
         with mock.patch.object(
@@ -1007,13 +1098,20 @@ class NativeRecordBridge(unittest.TestCase):
                 mock.patch.object(
                     bridge, "import_native_revalidation",
                     side_effect=ValueError(
-                        "native controller import revalidation refused")):
+                        "native controller import revalidation refused")), \
+                mock.patch.object(
+                    public_bundle, "native",
+                    side_effect=AssertionError(
+                        "native refusal fell back to Python revalidation")
+                ) as python_native:
             with self.assertRaisesRegex(ValueError, "revalidation refused"):
                 public_bundle.import_bundle(
                     handoff, archive, revalidation_refused, source,
                     ci.digest(archive), Path("/unused/validator"),
                     Path("/unused/supervisor"), artifact_id="123",
-                    container_digest="0" * 64)
+                    container_digest="0" * 64,
+                    native_import_revalidation=True)
+        python_native.assert_not_called()
         self.assertEqual(
             handoff.FAILURE_STAGE, "public-import-native-revalidation")
         self.assertFalse((revalidation_refused / "transport.json").exists())

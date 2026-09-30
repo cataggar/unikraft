@@ -14,6 +14,7 @@ import time
 HERE = Path(__file__).resolve().parent
 MAX_RECORDS_BYTES = 2 * 1024 * 1024
 RECORDS_TIMEOUT_SECONDS = 600
+IMPORT_NATIVE_REVALIDATION_TIMEOUT_SECONDS = 1500
 CONTROLLER_ENV = "WAMR_CI_CONTROLLER"
 
 
@@ -159,10 +160,12 @@ def _decode(raw, context):
     return value
 
 
-def _controller_command(arguments, refusal):
+def _controller_command(arguments, refusal, timeout_seconds=None):
     try:
         controller = _controller()
-        deadline = time.monotonic() + RECORDS_TIMEOUT_SECONDS
+        if timeout_seconds is None:
+            timeout_seconds = RECORDS_TIMEOUT_SECONDS
+        deadline = time.monotonic() + timeout_seconds
         process = subprocess.Popen(
             [str(controller), *arguments],
             cwd=HERE.parents[2], stdin=subprocess.DEVNULL,
@@ -330,7 +333,8 @@ def import_native_revalidation(stage_root, output):
         _refuse(refusal)
     raw, stderr_seen = _controller_command((
         "import-native-revalidation",
-        "--stage-root", str(stage_root), "--output", str(output)), refusal)
+        "--stage-root", str(stage_root), "--output", str(output)), refusal,
+        timeout_seconds=IMPORT_NATIVE_REVALIDATION_TIMEOUT_SECONDS)
     if raw or stderr_seen:
         _refuse(refusal)
     try:
