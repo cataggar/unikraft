@@ -313,6 +313,22 @@ pub fn build(b: *std.Build) void {
     b.step("test-differential-records", "Run frozen v1/v2 native record goldens")
         .dependOn(&record_goldens_run.step);
     controller_step.dependOn(&record_goldens_run.step);
+    const handoff_contracts = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("handoff/tests.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "hyperv_core", .module = host_core }},
+        }),
+    });
+    const handoff_contracts_run = b.addRunArtifact(handoff_contracts);
+    const handoff_python_goldens = b.addSystemCommand(&.{ "python3", "-B" });
+    handoff_python_goldens.addFileArg(b.path("tests/test_handoff_contract_goldens.py"));
+    const handoff_step = b.step("test-handoff-contracts", "Run native/Python handoff contract goldens");
+    handoff_step.dependOn(&handoff_contracts_run.step);
+    handoff_step.dependOn(&handoff_python_goldens.step);
+    controller_step.dependOn(&handoff_contracts_run.step);
+    controller_step.dependOn(&handoff_python_goldens.step);
     const tests = b.addTest(.{ .root_module = root });
     const unit_tests = b.addRunArtifact(tests);
     const unit_step = b.step("test-unit", "Test the compute packaging adapter command boundary");
@@ -380,4 +396,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&source_limits_run.step);
     test_step.dependOn(&fault_parity_run.step);
     test_step.dependOn(&record_goldens_run.step);
+    test_step.dependOn(&handoff_contracts_run.step);
+    test_step.dependOn(&handoff_python_goldens.step);
 }
