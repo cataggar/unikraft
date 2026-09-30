@@ -2740,6 +2740,7 @@ def build_private_image(
         f"-Dhost-cxx={zig} c++",
         "-Dhost-cflags=-fno-sanitize=null",
         f"-Dmake-arg=AR={zig} ar",
+        f"-Dmake-arg=ZIG={zig}",
         "-Dmake-arg=NM=llvm-nm",
         "-Dmake-arg=OBJCOPY=llvm-objcopy",
         "-Dmake-arg=OBJDUMP=llvm-objdump",
