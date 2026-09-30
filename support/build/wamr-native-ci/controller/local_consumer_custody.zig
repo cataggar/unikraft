@@ -1,0 +1,272 @@
+// SPDX-License-Identifier: BSD-3-Clause
+const std = @import("std");
+const core = @import("hyperv_core");
+const contracts = core.contracts;
+const files = core.private_files;
+const inputs = @import("input_custody.zig");
+const records = @import("records.zig");
+const source = @import("source_custody.zig");
+
+fn get(value: std.json.Value, key: []const u8) !std.json.Value {
+    if (value != .object) return error.InvalidInputCustody;
+    return value.object.get(key) orelse error.InvalidInputCustody;
+}
+
+fn notCancelled(signal: ?*core.process.SignalCancellation) !void {
+    if (signal) |active|
+        if (active.flag().load(.acquire)) return error.Cancelled;
+}
+
+fn sameValue(allocator: std.mem.Allocator, expected: std.json.Value, actual: anytype) !void {
+    const first = try records.canonicalAlloc(allocator, try std.json.Stringify.valueAlloc(allocator, expected, .{}));
+    const second = try records.canonicalAlloc(allocator, try std.json.Stringify.valueAlloc(allocator, actual, .{}));
+    if (!std.mem.eql(u8, first, second)) return error.RecordedCustodyChanged;
+}
+
+fn recordedPath(map: std.json.Value, role: []const u8) ![]const u8 {
+    const path = try contracts.string(try get(try get(map, role), "path"));
+    try files.absoluteFilePath(path);
+    return path;
+}
+
+fn fixedPath(
+    allocator: std.mem.Allocator,
+    map: std.json.Value,
+    role: []const u8,
+    root: []const u8,
+    relative: []const u8,
+) !void {
+    const expected = try std.fs.path.join(allocator, &.{ root, relative });
+    if (!std.mem.eql(u8, try recordedPath(map, role), expected))
+        return error.UnexpectedInputPath;
+}
+
+fn addRole(allowed: *std.StringHashMap(void), role: []const u8) !void {
+    if (allowed.contains(role)) return error.DuplicateInputRole;
+    try allowed.put(role, {});
+}
+
+fn addRuntime(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    allowed: *std.StringHashMap(void),
+    executable: []const u8,
+) !void {
+    const paths = try inputs.executableRuntimePaths(allocator, io, executable);
+    defer {
+        for (paths) |path| allocator.free(path);
+        allocator.free(paths);
+    }
+    for (paths) |path| {
+        const role = try std.fmt.allocPrint(allocator, "runtime:{s}", .{path});
+        if (!allowed.contains(role)) try addRole(allowed, role);
+    }
+}
+
+fn exactRoles(allowed: *std.StringHashMap(void), map: std.json.Value) !void {
+    if (map != .object or map.object.count() != allowed.count())
+        return error.UnexpectedInputRole;
+    for (map.object.keys()) |name|
+        if (!allowed.contains(name)) return error.UnexpectedInputRole;
+}
+
+fn buildRoles(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runtime: []const u8,
+    start: std.json.Value,
+    signal: ?*core.process.SignalCancellation,
+) !void {
+    const consumer = try get(start, "consumer_inputs");
+    const files_map = try get(consumer, "files");
+    const tree_map = try get(consumer, "trees");
+    const tools = try get(start, "tools");
+    if (files_map != .object or files_map.object.count() > 256 or
+        tree_map != .object or tree_map.object.count() != 4 or
+        tools != .object or tools.object.count() != inputs.host_tools.len)
+        return error.InvalidInputCustody;
+    var allowed: std.StringHashMap(void) = .init(allocator);
+    defer allowed.deinit();
+    for (inputs.host_tools) |name| {
+        try notCancelled(signal);
+        const role = try std.fmt.allocPrint(allocator, "tool:{s}", .{name});
+        try addRole(&allowed, role);
+        const entry = try get(files_map, role);
+        if (!std.mem.eql(u8, try contracts.string(try get(entry, "sha256")), try contracts.string(try get(tools, name))))
+            return error.RecordedCustodyChanged;
+        try addRuntime(allocator, io, &allowed, try recordedPath(files_map, role));
+    }
+    for ([_]struct { role: []const u8, relative: []const u8 }{
+        .{ .role = "command-supervisor", .relative = "compute/supervisor/bin/wamr-ci-supervisor" },
+        .{ .role = "native:wamr-aot-build", .relative = "compute/tools/bin/uk-wamr-aot-build" },
+        .{ .role = "native:wamr-log-validate", .relative = "compute/tools/bin/uk-wamr-log-validate" },
+        .{ .role = "wamr-source-archive", .relative = "custody/wamr-source.tar" },
+    }) |item| {
+        try addRole(&allowed, item.role);
+        try fixedPath(allocator, files_map, item.role, runtime, item.relative);
+        if (!std.mem.eql(u8, item.role, "wamr-source-archive")) {
+            try notCancelled(signal);
+            try addRuntime(allocator, io, &allowed, try recordedPath(files_map, item.role));
+        }
+    }
+    try exactRoles(&allowed, files_map);
+    var trees: std.StringHashMap(void) = .init(allocator);
+    defer trees.deinit();
+    for ([_][]const u8{ "bison", "llvm", "python-stdlib", "zig" }) |role|
+        try addRole(&trees, role);
+    try exactRoles(&trees, tree_map);
+    try fixedPath(allocator, tree_map, "bison", runtime, "bison");
+    try fixedPath(allocator, tree_map, "llvm", runtime, "llvm");
+    const zig_root = std.fs.path.dirname(try recordedPath(files_map, "tool:zig")) orelse return error.UnsafePath;
+    if (!std.mem.eql(u8, try recordedPath(tree_map, "zig"), zig_root))
+        return error.UnexpectedInputPath;
+    _ = try recordedPath(tree_map, "python-stdlib");
+}
+
+fn bootRoles(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repository: []const u8,
+    runtime: []const u8,
+    boot: std.json.Value,
+    signal: ?*core.process.SignalCancellation,
+) !void {
+    const files_map = try get(boot, "files");
+    const tree_map = try get(boot, "trees");
+    if (files_map != .object or files_map.object.count() > 256 or
+        tree_map != .object or tree_map.object.count() != 1)
+        return error.InvalidInputCustody;
+    var allowed: std.StringHashMap(void) = .init(allocator);
+    defer allowed.deinit();
+    for ([_]struct { role: []const u8, root: []const u8, relative: []const u8 }{
+        .{ .role = "efi", .root = repository, .relative = "support/apps/wamr-aot/build/wamr_hyperv-x86_64-efi" },
+        .{ .role = "local_boot_tool", .root = runtime, .relative = "compute/tools/bin/uk-hyperv-local-boot" },
+        .{ .role = "package_tool", .root = runtime, .relative = "compute/tools/bin/wamr-ci-package" },
+        .{ .role = "qemu", .root = runtime, .relative = "bin/qemu-system-x86_64" },
+        .{ .role = "ovmf_code", .root = runtime, .relative = "firmware/code.fd" },
+        .{ .role = "ovmf_vars", .root = runtime, .relative = "firmware/vars.fd" },
+    }) |item| {
+        try addRole(&allowed, item.role);
+        try fixedPath(allocator, files_map, item.role, item.root, item.relative);
+        if (std.mem.eql(u8, item.role, "local_boot_tool") or
+            std.mem.eql(u8, item.role, "package_tool") or
+            std.mem.eql(u8, item.role, "qemu"))
+        {
+            try notCancelled(signal);
+            try addRuntime(allocator, io, &allowed, try recordedPath(files_map, item.role));
+        }
+    }
+    try exactRoles(&allowed, files_map);
+    var trees: std.StringHashMap(void) = .init(allocator);
+    defer trees.deinit();
+    try addRole(&trees, "qemu-data");
+    try exactRoles(&trees, tree_map);
+    try fixedPath(allocator, tree_map, "qemu-data", runtime, "bin/share");
+}
+
+fn recapture(allocator: std.mem.Allocator, io: std.Io, expected: std.json.Value) !void {
+    const files_map = try get(expected, "files");
+    const tree_map = try get(expected, "trees");
+    if (files_map != .object or files_map.object.count() == 0 or files_map.object.count() > 256 or
+        tree_map != .object or tree_map.object.count() == 0 or tree_map.object.count() > 16)
+        return error.InvalidInputCustody;
+    const file_paths = try allocator.alloc(inputs.Binding, files_map.object.count());
+    defer allocator.free(file_paths);
+    const tree_paths = try allocator.alloc(inputs.Binding, tree_map.object.count());
+    defer allocator.free(tree_paths);
+    for (files_map.object.keys(), 0..) |role, i|
+        file_paths[i] = .{ .role = role, .path = try recordedPath(files_map, role) };
+    for (tree_map.object.keys(), 0..) |role, i|
+        tree_paths[i] = .{ .role = role, .path = try recordedPath(tree_map, role) };
+    var current = try inputs.capture(allocator, io, file_paths, tree_paths);
+    defer current.deinit(allocator);
+    const recorded = try records.canonicalAlloc(allocator, try std.json.Stringify.valueAlloc(allocator, expected, .{}));
+    const observed = try current.canonical(allocator);
+    if (!std.mem.eql(u8, recorded, observed)) return error.RecordedCustodyChanged;
+}
+
+pub const Fixture = if (@import("builtin").is_test) struct {
+    pub fn recaptureDocument(allocator: std.mem.Allocator, io: std.Io, expected: std.json.Value) !void {
+        try recapture(allocator, io, expected);
+    }
+
+    pub fn exactRoleSet(allowed: *std.StringHashMap(void), map: std.json.Value) !void {
+        try exactRoles(allowed, map);
+    }
+
+    pub fn fixedRolePath(
+        allocator: std.mem.Allocator,
+        map: std.json.Value,
+        role: []const u8,
+        root: []const u8,
+        relative: []const u8,
+    ) !void {
+        try fixedPath(allocator, map, role, root, relative);
+    }
+} else struct {};
+
+pub fn run(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repository: []const u8,
+    runtime: []const u8,
+    signal: ?*core.process.SignalCancellation,
+) !void {
+    try files.absoluteFilePath(repository);
+    try files.absoluteFilePath(runtime);
+    const root = try files.openDirectory(io, runtime, .private);
+    defer root.close(io);
+    const start_path = try std.fs.path.join(allocator, &.{ runtime, "compute/evidence/build-start.json" });
+    var pinned_start = try files.RetainedFile.open(io, start_path, .private);
+    defer pinned_start.close(io);
+    var start_bytes = try files.readSensitiveFile(io, allocator, pinned_start.file, records.max_record_bytes, .private);
+    defer start_bytes.deinit();
+    var start_doc = try contracts.Document.parse(allocator, start_bytes.bytes(), .{
+        .bytes = records.max_record_bytes,
+        .depth = 32,
+        .items = 4096,
+        .tokens = 65536,
+    });
+    defer start_doc.deinit();
+    try start_doc.requireCanonical(allocator, start_bytes.bytes());
+    const start = start_doc.value();
+    _ = try contracts.exactFields(start, &.{
+        "source",       "source_custody",  "tools",              "bison_data",
+        "dependencies", "consumer_inputs", "command_supervisor",
+    });
+    const boot_path = try std.fs.path.join(allocator, &.{ runtime, "compute/evidence/boot-inputs.json" });
+    var pinned_boot = try files.RetainedFile.open(io, boot_path, .private);
+    defer pinned_boot.close(io);
+    var boot_bytes = try files.readSensitiveFile(io, allocator, pinned_boot.file, records.max_record_bytes, .private);
+    defer boot_bytes.deinit();
+    var boot_doc = try contracts.Document.parse(allocator, boot_bytes.bytes(), .{
+        .bytes = records.max_record_bytes,
+        .depth = 32,
+        .items = 4096,
+        .tokens = 65536,
+    });
+    defer boot_doc.deinit();
+    try boot_doc.requireCanonical(allocator, boot_bytes.bytes());
+    const boot = boot_doc.value();
+    const consumer = try get(start, "consumer_inputs");
+    const git_path = try recordedPath(try get(consumer, "files"), "tool:git");
+    var git = try files.RetainedFile.open(io, git_path, .tool);
+    defer git.close(io);
+    try notCancelled(signal);
+    try source.verifyPhysical(io, allocator, repository);
+    const before = try source.source(allocator, io, repository, git_path);
+    try sameValue(allocator, try get(start, "source"), .{ .revision = before.revision, .tree = before.tree });
+    try sameValue(allocator, try get(start, "source_custody"), before.custody);
+    try buildRoles(allocator, io, runtime, start, signal);
+    try bootRoles(allocator, io, repository, runtime, boot, signal);
+    try notCancelled(signal);
+    try recapture(allocator, io, consumer);
+    try notCancelled(signal);
+    try recapture(allocator, io, boot);
+    try notCancelled(signal);
+    const after = try source.source(allocator, io, repository, git_path);
+    if (!before.same(after)) return error.SourceChanged;
+    try pinned_start.verify(io);
+    try pinned_boot.verify(io);
+    try git.verify(io);
+}

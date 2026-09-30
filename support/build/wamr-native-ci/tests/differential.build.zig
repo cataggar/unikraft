@@ -15,12 +15,28 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     });
+    const serial = b.createModule(.{
+        .root_source_file = b.path("../../../tools/hyperv/local_boot/serial.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "hyperv_core", .module = core }},
+    });
+    const validator = b.createModule(.{
+        .root_source_file = b.path("../../../apps/wamr-aot/validator/root.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = core },
+            .{ .name = "local_boot_serial", .module = serial },
+        },
+    });
     const controller = b.createModule(.{
         .root_source_file = b.path("../controller/root.zig"),
         .target = b.graph.host,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "hyperv_core", .module = core },
+            .{ .name = "wamr_log_validator", .module = validator },
             .{ .name = "controller_source_closure", .module = closure },
         },
     });

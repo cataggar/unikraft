@@ -229,10 +229,39 @@ jobs:
           export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
           bash .github/scripts/hyperv-qemu-candidate-runtime.sh "${root}" compute
 
+      - name: Keep the Python-produced local handoff on its pinned source path
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          root=/d/wamr-ci/wamr-native-runtime
+          python3 -B - "${root}" <<'PY'
+          import importlib.util
+          from pathlib import Path
+          import sys
+
+          runtime = Path(sys.argv[1])
+          module = Path("support/build/wamr-native-ci/handoff.py").resolve()
+          spec = importlib.util.spec_from_file_location("wamr_handoff", module)
+          handoff = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(handoff)
+          records = handoff.result_records(runtime / "compute")
+          if len(records) != 33:
+              raise SystemExit("Python handoff refused completed Python records")
+          PY
+
+      - name: Recapture the local checkout and consumers before loader cleanup
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          controller=/d/wamr-ci/wamr-differential-controller/controller/bin/uk-wamr-native-ci
+          root=/d/wamr-ci/wamr-native-runtime
+          "${controller}" local-consumer-custody --runtime "${root}"
+
       - name: Retain the expressly authorized public-source tiny image bundle
         id: public_bundle
         timeout-minutes: 15
         env:
+          WAMR_CI_CONTROLLER: /d/wamr-ci/wamr-differential-controller/controller/bin/uk-wamr-native-ci
           GITHUB_REPOSITORY_VISIBILITY: ${{ github.event.repository.private == false && 'public' || 'private' }}
           WAMR_CI_RUNTIME: /d/wamr-ci/wamr-native-runtime
         run: |
@@ -402,6 +431,7 @@ jobs:
           ARTIFACT_URL: ${{ steps.public_upload.outputs.artifact-url }}
           REDOWNLOAD_DIR: ${{ steps.public_redownload.outputs.destination }}
           SOURCE_TREE: ${{ steps.public_bundle.outputs.source_tree }}
+          WAMR_CI_CONTROLLER: /d/wamr-ci/wamr-differential-controller/controller/bin/uk-wamr-native-ci
         run: |
           set -euo pipefail
           export PYTHONDONTWRITEBYTECODE=1
@@ -592,6 +622,228 @@ jobs:
           PY
           } >> "${GITHUB_STEP_SUMMARY}"
 
+      - name: Revalidate the trusted inner stage through the native records bridge
+        timeout-minutes: 20
+        env:
+          SOURCE_TREE: ${{ steps.public_bundle.outputs.source_tree }}
+        run: |
+          set -euo pipefail
+          umask 077
+          imported=/d/wamr-ci/wamr-native-runtime/compute/public-source/exact-redownload/success
+          stage="${RUNNER_TEMP}/wamr-inner-stage"
+          output="${RUNNER_TEMP}/wamr-imported-handoff-v1.json"
+          controller=/d/wamr-ci/wamr-differential-controller/controller/bin/uk-wamr-native-ci
+          test -x "${controller}"
+          test ! -e "${stage}"
+          test ! -e "${output}"
+          python3 -B - "${imported}" "${stage}" <<'PY'
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import shutil
+          import sys
+
+          source, stage = map(Path, sys.argv[1:])
+          manifest = json.loads((source / "public-source.json").read_bytes())
+          stage.mkdir(mode=0o700)
+          names = sorted(manifest["members"])
+          if len(names) != 83:
+              raise SystemExit("unexpected trusted inner stage member count")
+          for name in [*names, "public-source.json", "portable-bundle.json"]:
+              relative = PurePosixPath(name)
+              if (str(relative) != name or not 1 <= len(relative.parts) <= 3
+                      or relative.parts[0] not in (
+                          "artifacts", "boots", "evidence",
+                          "public-source.json", "portable-bundle.json")
+                      or any(part in ("", ".", "..") for part in relative.parts)):
+                  raise SystemExit("unsafe trusted inner stage member")
+              original = source.joinpath(*relative.parts)
+              if original.is_symlink() or not original.is_file():
+                  raise SystemExit("missing trusted inner stage member")
+              copy = stage.joinpath(*relative.parts)
+              copy.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+              with original.open("rb") as src, copy.open("xb") as dst:
+                  os.fchmod(dst.fileno(), 0o600)
+                  shutil.copyfileobj(src, dst, 65536)
+          PY
+          "${controller}" records --stage-root "${stage}" \
+            --transport trusted-inner-zip --output handoff-v1 > "${output}"
+          python3 -B - "${output}" "${GITHUB_SHA}" "${SOURCE_TREE}" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          value = json.loads(Path(sys.argv[1]).read_bytes())
+          if (value["schema"] != "uk.wamr.native-ci-controller-records"
+                  or value["schema_version"] != 1
+                  or value["context"] != "trusted-inner-zip"
+                  or value["compatibility"] != "tiny-v2"
+                  or value["profile"] != "qcow2-derived-vhd"
+                  or value["source"] != {
+                      "revision": sys.argv[2], "tree": sys.argv[3]}
+                  or value["modes"] != [
+                      "raw-x2apic", "raw-legacy-apic",
+                      "qcow2-x2apic", "qcow2-legacy-apic",
+                      "vpc-x2apic", "vpc-legacy-apic"]
+                  or len(value["records"]) != 33
+                  or len(value["artifacts"]) != 50
+                  or value["runtime_inputs"]):
+              raise SystemExit("native record bridge refused trusted v2 import")
+          PY
+          identity_parent="${RUNNER_TEMP}/wamr-private-native-identity"
+          test ! -e "${identity_parent}"
+          mkdir -m 700 "${identity_parent}"
+          identity="${identity_parent}/success"
+          supervisor=/d/wamr-ci/wamr-native-runtime/compute/supervisor/bin/wamr-ci-supervisor
+          test ! -e "${identity}"
+          "${controller}" supervisor-import-identity \
+            --stage-root "${stage}" \
+            --supervisor "${supervisor}" \
+            --git /usr/bin/git \
+            --output "${identity}"
+          test -s "${identity}/private/supervisor-import-identity.log"
+          test -s "${identity}/evidence/command-supervisor-import-identity.json"
+          python3 -B - "${identity}" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+
+          root = Path(sys.argv[1])
+          log = (root / "private/supervisor-import-identity.log").read_bytes()
+          record = json.loads(
+              (root / "evidence/command-supervisor-import-identity.json").read_bytes())
+          if (record["scope"] != "command_diagnostic_not_acceptance"
+                  or record["stage"] != "supervisor-import-identity"
+                  or record["exit_code"] != 0
+                  or record["bytes"] != len(log)
+                  or record["sha256"] != hashlib.sha256(log).hexdigest()
+                  or record["supervisor"]["request"]["argv"] != [
+                      {"kind": "path", "role": "command-supervisor", "relative": ""},
+                      {"kind": "literal", "value": "--identity"}]):
+              raise SystemExit("native imported supervisor identity record refused")
+          PY
+          imported_validator="${identity_parent}/validator"
+          test ! -e "${imported_validator}"
+          "${controller}" import-validator-build \
+            --stage-root "${stage}" --output "${imported_validator}"
+          test -x "${imported_validator}/public-source/tools/bin/uk-wamr-direct-validate"
+          python3 -B - "${imported_validator}" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+
+          root = Path(sys.argv[1])
+          log = (root / "private/import-validator-build.log").read_bytes()
+          record = json.loads(
+              (root / "evidence/command-import-validator-build.json").read_bytes())
+          binary = (root / "public-source/tools/bin/uk-wamr-direct-validate").read_bytes()
+          if (record["scope"] != "command_diagnostic_not_acceptance"
+                  or record["stage"] != "import-validator-build"
+                  or record["exit_code"] != 0
+                  or record["bytes"] != len(log)
+                  or record["sha256"] != hashlib.sha256(log).hexdigest()
+                  or record["supervisor"]["request"]["native_executable"]["path"] != {
+                      "kind": "path", "role": "tool:zig", "relative": ""}
+                  or binary[:6] != b"\x7fELF\x02\x01"
+                  or binary[18:20] != b"\x3e\x00"):
+              raise SystemExit("native imported validator build record refused")
+          PY
+          revalidation="${identity_parent}/revalidation"
+          test ! -e "${revalidation}"
+          "${controller}" import-native-revalidation \
+            --stage-root "${stage}" --output "${revalidation}"
+          python3 -B - "${stage}" "${revalidation}" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+
+          stage, root = (Path(arg) for arg in sys.argv[1:])
+          portable = json.loads((stage / "portable-bundle.json").read_bytes())
+          candidate_path = root / "private/candidate-bundle.json"
+          candidate_raw = candidate_path.read_bytes()
+          candidate = json.loads(candidate_raw)
+          for original, member in zip(portable["artifacts"], candidate["artifacts"], strict=True):
+              original["path"] = str(stage / original["path"])
+              if member != original:
+                  raise SystemExit("native revalidation artifact candidate refused")
+          for original, member in zip(portable["evidence"], candidate["evidence"], strict=True):
+              original["path"] = str(stage / original["path"])
+              if member != original:
+                  raise SystemExit("native revalidation evidence candidate refused")
+          for original, member in zip(portable["boots"], candidate["boots"], strict=True):
+              for part in ("serial", "request", "report", "compute"):
+                  original[part]["path"] = str(stage / original[part]["path"])
+              if member != original:
+                  raise SystemExit("native revalidation boot candidate refused")
+          if candidate != portable or candidate_raw != (
+                  json.dumps(candidate, sort_keys=True, separators=(",", ":")).encode() + b"\n"):
+              raise SystemExit("native revalidation candidate refused")
+          log = (root / "private/import-native-revalidation.log").read_bytes()
+          record = json.loads(
+              (root / "evidence/command-import-native-revalidation.json").read_bytes())
+          expected = b"Compute handoff revalidated; authority=not_admitted.\n"
+          request = record["supervisor"]["request"]
+          if (log != expected or record["scope"] != "command_diagnostic_not_acceptance"
+                  or record["stage"] != "import-native-revalidation"
+                  or record["exit_code"] != 0
+                  or record["bytes"] != len(log)
+                  or record["sha256"] != hashlib.sha256(log).hexdigest()
+                  or record["supervisor"]["result"]["command"]["stdout"]["bytes"] != len(expected)
+                  or record["supervisor"]["result"]["command"]["stderr"]["bytes"] != 0
+                  or request["native_executable"]["path"] != {
+                      "kind": "path", "role": "input:validator", "relative": ""}
+                  or request["argv"] != [
+                      {"kind": "path", "role": "input:validator", "relative": ""},
+                      {"kind": "literal", "value": "handoff"},
+                      {"kind": "path", "role": "input:bundle", "relative": ""}]):
+              raise SystemExit("native revalidation command refused")
+          PY
+          tampered="${identity_parent}/tampered-supervisor"
+          test ! -e "${tampered}"
+          cp -- "${supervisor}" "${tampered}"
+          printf 'tamper' >> "${tampered}"
+          if "${controller}" supervisor-import-identity \
+            --stage-root "${stage}" \
+            --supervisor "${tampered}" \
+            --git /usr/bin/git \
+            --output "${identity_parent}/refused-supervisor"; then
+            echo "Native import identity accepted changed supervisor" >&2
+            exit 1
+          fi
+          test ! -e "${identity_parent}/refused-supervisor"
+          printf '\n' >> "${stage}/evidence/build.json"
+          if "${controller}" records --stage-root "${stage}" \
+            --transport trusted-inner-zip --output handoff-v1 \
+            > "${RUNNER_TEMP}/wamr-tampered-handoff-v1.json"; then
+            echo "Native records bridge accepted changed inner evidence" >&2
+            exit 1
+          fi
+          test ! -s "${RUNNER_TEMP}/wamr-tampered-handoff-v1.json"
+          if "${controller}" import-native-revalidation \
+            --stage-root "${stage}" --output "${identity_parent}/refused-revalidation"; then
+            echo "Native revalidation accepted changed inner evidence" >&2
+            exit 1
+          fi
+          test ! -e "${identity_parent}/refused-revalidation"
+          if "${controller}" supervisor-import-identity \
+            --stage-root "${stage}" \
+            --supervisor "${supervisor}" \
+            --git /usr/bin/git \
+            --output "${identity_parent}/refused-stage"; then
+            echo "Native import identity accepted changed inner evidence" >&2
+            exit 1
+          fi
+          test ! -e "${identity_parent}/refused-stage"
+          if "${controller}" import-validator-build \
+            --stage-root "${stage}" --output "${identity_parent}/refused-validator"; then
+            echo "Native import validator build accepted changed inner evidence" >&2
+            exit 1
+          fi
+          test ! -e "${identity_parent}/refused-validator"
+
       - name: Retain redacted diagnostics separately from the public-source image bundle
         if: always()
         run: |
@@ -606,6 +858,15 @@ jobs:
           path: /d/wamr-ci/wamr-native-runtime/compute/evidence/*.json
           include-hidden-files: true
           if-no-files-found: error
+          retention-days: 7
+
+      - name: Retain bounded paired native replay for handoff diagnosis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wamr-native-replay-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /d/wamr-ci/wamr-differential/native-records.json
+          if-no-files-found: ignore
           retention-days: 7
 
   wamr-differential-parity:

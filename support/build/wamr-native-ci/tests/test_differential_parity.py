@@ -62,25 +62,41 @@ FROZEN_HOST_TOOLS = (
     "llvm-readelf", "llvm-strip", "bison", "flex", "m4",
 )
 NATIVE_SOURCE_FILES = (
+    "support/apps/wamr-aot/validator/base64.zig",
+    "support/apps/wamr-aot/validator/coremark.zig",
+    "support/apps/wamr-aot/validator/input.zig",
+    "support/apps/wamr-aot/validator/optional.zig",
+    "support/apps/wamr-aot/validator/records.zig",
+    "support/apps/wamr-aot/validator/root.zig",
+    "support/apps/wamr-aot/validator/sampler.zig",
+    "support/apps/wamr-aot/validator/tiny.zig",
     "support/build/wamr-native-ci/build.zig",
     "support/build/wamr-native-ci/build.zig.zon",
+    "support/build/wamr-native-ci/controller/accepted_run.zig",
     "support/build/wamr-native-ci/controller/boot_pipeline.zig",
     "support/build/wamr-native-ci/controller/build_pipeline.zig",
     "support/build/wamr-native-ci/controller/cli.zig",
     "support/build/wamr-native-ci/controller/command_adapter.zig",
     "support/build/wamr-native-ci/controller/command_plan.zig",
+    "support/build/wamr-native-ci/controller/command_validation.zig",
     "support/build/wamr-native-ci/controller/custody_files.zig",
     "support/build/wamr-native-ci/controller/custody_limits.zig",
     "support/build/wamr-native-ci/controller/dependency_custody.zig",
     "support/build/wamr-native-ci/controller/fixture_contract.zig",
     "support/build/wamr-native-ci/controller/fixture_runner.zig",
+    "support/build/wamr-native-ci/controller/handoff_inspect.zig",
+    "support/build/wamr-native-ci/controller/import_supervisor_identity.zig",
+    "support/build/wamr-native-ci/controller/import_validator_build.zig",
     "support/build/wamr-native-ci/controller/input_custody.zig",
     "support/build/wamr-native-ci/controller/install.zig",
     "support/build/wamr-native-ci/controller/install_target_tests.zig",
     "support/build/wamr-native-ci/controller/layout.zig",
+    "support/build/wamr-native-ci/controller/local_consumer_custody.zig",
     "support/build/wamr-native-ci/controller/main.zig",
     "support/build/wamr-native-ci/controller/portable_main.zig",
     "support/build/wamr-native-ci/controller/profile.zig",
+    "support/build/wamr-native-ci/controller/public_image_serial.zig",
+    "support/build/wamr-native-ci/controller/public_validator_build.zig",
     "support/build/wamr-native-ci/controller/records.zig",
     "support/build/wamr-native-ci/controller/root.zig",
     "support/build/wamr-native-ci/controller/source_custody.zig",
@@ -92,6 +108,7 @@ NATIVE_SOURCE_FILES = (
     "support/tools/hyperv/contracts.zig",
     "support/tools/hyperv/core.zig",
     "support/tools/hyperv/diagnostics.zig",
+    "support/tools/hyperv/local_boot/serial.zig",
     "support/tools/hyperv/private_files.zig",
     "support/tools/hyperv/process-command-v1.json",
     "support/tools/hyperv/process.zig",
@@ -2721,7 +2738,11 @@ def outcome_details(results, snapshots):
 
 def report_progress(side, phase):
     check(side in ("python", "native")
-          and phase in ("build-start", "build-done", "boot-start", "boot-done"),
+          and phase in (
+              "build-start", "build-done", "boot-start", "boot-done",
+              "records-start", "records-checked", "inspect-start",
+              "inspect-done", "validator-start", "validator-done",
+              "records-done"),
           "invalid differential progress label")
     print(f"DIFFERENTIAL_PROGRESS: {side}:{phase}", file=sys.stderr, flush=True)
 
@@ -2758,6 +2779,10 @@ def full(args):
     check(args.case in {"success", "build-start-tamper", "missing-build",
                         "occupied-boot-slot", "prior-build-output"},
           "unknown differential case")
+    inspection_parent = (
+        fresh(parent, "native-inspection") if args.case == "success" else None)
+    validator_parent = (
+        fresh(parent, "native-validation") if args.case == "success" else None)
     py_runtime = fresh(parent, "python")
     native_runtime = fresh(parent, "native")
     for runtime in (py_runtime, native_runtime):
@@ -2877,6 +2902,149 @@ def full(args):
                 check(not (runtime / "compute/evidence/result.json").exists(),
                       "refusal published acceptance")
     check(not failures, "differential mismatches: " + ", ".join(failures))
+    if args.case == "success":
+        report_progress("native", "records-start")
+        result = command([
+            str(controller), "records", "--runtime", str(native_runtime),
+            "--output", "handoff-v1",
+        ], native_repo, executions["native"][3], seconds=600)
+        refusal = re.search(
+            r"(?m)^WAMR_CI_FAILED_STAGE: records; cause: "
+            r"([A-Za-z][A-Za-z0-9_]{0,79}); bounded private logs retained\.$",
+            result.stderr.decode("utf-8", "replace"))
+        check(result.returncode == 0 and not result.stderr,
+              "native completed-run records replay refused: " +
+              (refusal.group(1) if refusal else "unexpected result"))
+        reference = oracle(native_repo)
+        view = parsed(result.stdout, reference)
+        recorded = parsed(checked_file(
+            native_runtime / "compute/evidence/result.json"), reference)
+        check(
+            result.stdout == reference.compact_json(view, newline=True)
+            and view["schema"] == "uk.wamr.native-ci-controller-records"
+            and view["schema_version"] == 1
+            and view["context"] == "local-runtime"
+            and view["compatibility"] == "tiny-v2"
+            and view["profile"] == reference.CURRENT_PROFILE
+            and view["modes"] == list(reference.SIX_MODES)
+            and len(view["records"]) == len(recorded["records"]) == 33
+            and len(view["artifacts"]) == 49
+            and {item["name"]: item["sha256"] for item in view["records"]}
+            == recorded["records"]
+            and sum(
+                item["role"] == "command-supervisor"
+                and item["path"] == str(controller)
+                for item in view["runtime_inputs"]) == 1,
+            "native completed-run records differ from accepted evidence")
+        report_progress("native", "records-checked")
+        script = (
+            "import importlib.util,json,sys\n"
+            "from pathlib import Path\n"
+            "spec=importlib.util.spec_from_file_location("
+            "'native_handoff',Path(sys.argv[1])/'support/build/wamr-native-ci/handoff.py')\n"
+            "handoff=importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(handoff)\n"
+            "records=handoff.result_records(Path(sys.argv[2])/'compute')\n"
+            "sys.stdout.write(json.dumps(records,sort_keys=True,separators=(',',':'))+'\\n')\n"
+        )
+        bridged = command([
+            sys.executable, "-B", "-c", script,
+            str(native_repo), str(native_runtime),
+        ], native_repo, dict(
+            executions["native"][3], WAMR_CI_CONTROLLER=str(controller)),
+            seconds=650)
+        try:
+            refusal = re.search(
+                r"(?m)^(?:ValueError|wamr_native_ci\.Refusal): "
+                r"([A-Za-z][A-Za-z0-9 _-]{0,119})$",
+                bridged.stderr.decode("utf-8", "replace"))
+            check(bridged.returncode == 0,
+                  "Python local handoff refused native-produced records: " +
+                  (refusal.group(1) if refusal else "unexpected result"))
+            check(json.loads(bridged.stdout) == recorded["records"],
+                  "Python local handoff returned different record hashes")
+            report_progress("native", "inspect-start")
+            inspection = inspection_parent / "handoff"
+            inspected = command([
+                str(controller), "handoff-inspect",
+                "--runtime", str(native_runtime),
+                "--output", str(inspection),
+            ], native_repo, executions["native"][3], seconds=1200)
+            refusal = re.search(
+                r"(?m)^WAMR_CI_FAILED_STAGE: handoff-inspect; cause: "
+                r"([A-Za-z][A-Za-z0-9_]{0,79}); bounded private logs retained\.$",
+                inspected.stderr.decode("utf-8", "replace"))
+            check(inspected.returncode == 0
+                  and not inspected.stdout and not inspected.stderr,
+                  "native completed-run handoff inspection refused: " +
+                  (refusal.group(1) if refusal else "unexpected result"))
+            inspection_record = parsed(checked_file(
+                inspection / "evidence/command-handoff-inspect.json"), reference)
+            inspection_log = checked_file(
+                inspection / "private/handoff-inspect.log")
+            check(
+                inspection_record["scope"] == "command_diagnostic_not_acceptance"
+                and inspection_record["stage"] == "handoff-inspect"
+                and inspection_record["exit_code"] == 0
+                and inspection_record["bytes"] == len(inspection_log)
+                and inspection_record["sha256"] == sha(inspection_log),
+                "native handoff inspection command output changed")
+            report_progress("native", "inspect-done")
+            report_progress("native", "validator-start")
+            validation = validator_parent / "build"
+            built = command([
+                str(controller), "public-validator-build",
+                "--runtime", str(native_runtime),
+                "--output", str(validation),
+            ], native_repo, executions["native"][3], seconds=1200)
+            refusal = re.search(
+                r"(?m)^WAMR_CI_FAILED_STAGE: public-validator-build; cause: "
+                r"([A-Za-z][A-Za-z0-9_]{0,79}); bounded private logs retained\.$",
+                built.stderr.decode("utf-8", "replace"))
+            check(built.returncode == 0 and not built.stdout and not built.stderr,
+                  "native public validator build refused: " +
+                  (refusal.group(1) if refusal else "unexpected result"))
+            validator_record = parsed(checked_file(
+                validation / "evidence/command-public-validator-build.json"),
+                reference)
+            validator_log = checked_file(
+                validation / "private/public-validator-build.log",
+                8 * 1024 * 1024 + 1)
+            check(
+                validator_record["scope"] == "command_diagnostic_not_acceptance"
+                and validator_record["stage"] == "public-validator-build"
+                and validator_record["exit_code"] == 0
+                and validator_record["bytes"] == len(validator_log)
+                and validator_record["sha256"] == sha(validator_log),
+                "native public validator command output changed")
+            validator = (
+                validation / "public-source/tools/bin/uk-wamr-direct-validate")
+            before = validator.lstat()
+            check(stat.S_ISREG(before.st_mode) and before.st_nlink == 1
+                  and before.st_uid == os.getuid()
+                  and stat.S_IMODE(before.st_mode) & 0o022 == 0
+                  and before.st_mode & 0o111 != 0
+                  and 20 <= before.st_size <= 64 * 1024 * 1024,
+                  "unsafe native-built public validator")
+            with validator.open("rb") as stream:
+                header = stream.read(20)
+            after = validator.lstat()
+            check(header[:6] == b"\x7fELF\x02\x01"
+                  and header[18:20] == b"\x3e\x00"
+                  and (before.st_dev, before.st_ino, before.st_size,
+                       before.st_mtime_ns, before.st_ctime_ns)
+                  == (after.st_dev, after.st_ino, after.st_size,
+                      after.st_mtime_ns, after.st_ctime_ns),
+                  "native-built public validator identity changed")
+            report_progress("native", "validator-done")
+        finally:
+            # The comparison root is a pinned runtime ancestor until replay ends.
+            with (parent / "native-records.json").open("xb") as output:
+                os.fchmod(output.fileno(), 0o600)
+                output.write(result.stdout)
+                output.flush()
+                os.fsync(output.fileno())
+        report_progress("native", "records-done")
 
 
 class DeterministicContracts(unittest.TestCase):
@@ -3475,25 +3643,48 @@ class DeterministicContracts(unittest.TestCase):
                         with self.assertRaisesRegex(ParityError, expected):
                             checked_stage(altered, log, side, reference, stage)
 
-    def test_v1_read_only_and_v2_acceptance_parser_fixtures(self):
+    def test_v1_v2_reference_parser_and_record_hashes_without_controller(self):
         reference = oracle()
-        for version in (1, 2):
-            with self.subTest(version=version):
-                raw = (FIXTURES / f"accepted-v{version}.json").read_bytes()
-                result = parsed(raw, reference)
-                self.assertEqual(result["schema_version"], version)
-                self.assertEqual(result["modes"], list(
-                    reference.MODES if version == 1 else reference.SIX_MODES))
-                self.assertEqual(len(result["records"]), 8 if version == 1 else 33)
-                self.assertNotIn("result.json", result["records"])
-                self.assertEqual(set(result["records"]), set(
-                    ("build-start.json", "build.json", "boot-inputs.json",
-                     "package.json", *(mode + "-compute.json"
-                                       for mode in result["modes"]))
-                    if version == 1 else set(ORDER) - {"result.json"}))
-                self.assertEqual(set(result["records"].values()), {sha(b"{}\n")})
+        parent = fresh(fixture_parent(), f"reference-result-parser-{os.getpid()}")
+        try:
+            for version in (1, 2):
+                with self.subTest(version=version):
+                    evidence = fresh(fresh(parent, f"v{version}"), "evidence")
+                    raw = (FIXTURES / f"accepted-v{version}.json").read_bytes()
+                    result_path = evidence / "result.json"
+                    result_path.write_bytes(raw)
+                    result_path.chmod(0o600)
+                    result = parsed(checked_file(result_path), reference)
+                    self.assertEqual(result["schema_version"], version)
+                    self.assertEqual(result["modes"], list(
+                        reference.MODES if version == 1 else reference.SIX_MODES))
+                    self.assertEqual(len(result["records"]), 8 if version == 1 else 33)
+                    self.assertNotIn("result.json", result["records"])
+                    self.assertEqual(set(result["records"]), set(
+                        ("build-start.json", "build.json", "boot-inputs.json",
+                         "package.json", *(mode + "-compute.json"
+                                           for mode in result["modes"]))
+                        if version == 1 else set(ORDER) - {"result.json"}))
+                    self.assertEqual(set(result["records"].values()), {sha(b"{}\n")})
+                    for name in result["records"]:
+                        path = evidence / name
+                        path.write_bytes(b"{}\n")
+                        path.chmod(0o600)
+                    self.assertEqual(reference.digest(result_path), sha(raw))
+                    self.assertEqual(
+                        {name: reference.digest(evidence / name)
+                         for name in result["records"]},
+                        result["records"])
+                    (evidence / "build.json").write_bytes(b'{"tampered":true}\n')
+                    self.assertNotEqual(
+                        reference.digest(evidence / "build.json"),
+                        result["records"]["build.json"])
+        finally:
+            shutil.rmtree(parent)
 
-    def test_python_v1_v2_reader_rehashes_synthetic_parser_fixtures(self):
+    def test_native_local_handoff_refuses_synthetic_parser_fixtures(self):
+        if not os.environ.get("WAMR_CI_CONTROLLER"):
+            self.skipTest("native controller not configured")
         spec = importlib.util.spec_from_file_location(
             "wamr_handoff_fixture_reader", CONTROLLER / "handoff.py")
         handoff = importlib.util.module_from_spec(spec)
@@ -3502,7 +3693,8 @@ class DeterministicContracts(unittest.TestCase):
         parent = fresh(scratch, f"synthetic-result-parser-{os.getpid()}")
         try:
             for version in (1, 2):
-                root = fresh(parent, f"v{version}")
+                runtime = fresh(parent, f"v{version}")
+                root = fresh(runtime, "compute")
                 evidence = fresh(root, "evidence")
                 raw = (FIXTURES / f"accepted-v{version}.json").read_bytes()
                 value = parsed(raw, handoff.ci)
@@ -3512,10 +3704,7 @@ class DeterministicContracts(unittest.TestCase):
                     file.chmod(0o600)
                 (evidence / "result.json").write_bytes(raw)
                 (evidence / "result.json").chmod(0o600)
-                self.assertEqual(handoff.result_records(root), value["records"])
-                changed = evidence / "build.json"
-                changed.write_bytes(b'{"tampered":true}\n')
-                with self.assertRaises(handoff.ci.Refusal):
+                with self.assertRaises(ValueError):
                     handoff.result_records(root)
         finally:
             shutil.rmtree(parent)

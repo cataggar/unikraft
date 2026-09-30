@@ -33,6 +33,95 @@ authoritative production caller and differential reference until the later
 parity/bridge/cutover PRs; production callers, wrappers and authority are
 unchanged.
 
+## Native record-consumer bridge (Python still performs the handoff)
+
+`uk-wamr-native-ci records --runtime ABS --output handoff-v1` reopens a
+completed local v2 run, including source and input custody, the six boot
+transcripts and image chain, before emitting a bounded, canonical private JSON
+description of pinned records, artifacts and runtime inputs. Local replay
+requires the original runtime-installed controller and its recorded source
+worktree; a separately installed controller cannot replay a Python-produced
+run. The separate
+`records --stage-root ABS --transport trusted-inner-zip --output handoff-v1`
+form checks an extracted public-source inner tree. The initial imported-stage
+fixture covers older allowlisted v1 evidence; the current v2 import is also
+exercised against a retained protected archive. Neither form executes build or
+boot, changes authority, or makes a partially checked manifest an accepted run.
+
+The public bundle importer now requires this native check before publishing
+its candidate, while retaining the Python publication and supervised-stage
+validation. Native-produced v2 local handoff requires native acceptance before using its
+result-record hashes and source identity; the Python build, boot and inspection
+checks still run. A Python-produced local run instead retains the pinned
+Python source-custody path until the protected production caller is switched.
+The separately validated `command-public-validator-build.json` may appear in
+Python-produced evidence after acceptance; it is not part of the 33 pinned
+result records or the exported archive. Other extra evidence is refused.
+Historical v1 retains its pinned-source compatibility path; native-produced v2
+never falls back to Python after a native refusal. The caller must
+independently authenticate the executable
+provided by `WAMR_CI_CONTROLLER`; owner and mode checks alone do not prove
+its provenance. Protected paired boots have exercised the completed native
+local-record replay and Python record selection, with public-source
+publication and trusted import passing separately.
+For a trusted v2 import, the native accepted-run records gate validates the
+imported command bindings before Python applies archive and publication policy;
+Python no longer reinterprets those imported command records. Producer-direct
+publication and legacy v1 import retain their existing Python command checks.
+`handoff-inspect --runtime ABS --output ABS` is a support-only stage for
+native-produced v2 runs. It uses the runtime-installed recorded controller
+and pinned package/EFI inputs, then retains its bounded private log and
+command record in a create-only owner-only output beneath an existing private
+parent outside the runtime's pinned input ancestors. It neither exports an
+image nor accepts a Python-produced runtime. `public-validator-build --runtime
+ABS --output ABS` similarly uses the recorded Zig tool and controller to
+build the fixed x86_64 validator in an independent private output, retaining
+its bounded command evidence without modifying the accepted runtime or
+publishing an archive. Python remains the production handoff caller;
+`supervisor-import-identity --stage-root ABS --supervisor ABS --git ABS
+--output ABS` is a separate support-only operation for a clean, trusted
+imported v2 inner stage. It checks the recorded supervisor source files
+against the imported Git revision and the supplied executable and loader
+closure against the imported consumer records, then supervises `--identity`
+under the fixed plan. Its owner-only output is outside the imported stage and
+checkout. Trusted v2 import now invokes this operation before writing
+transport/candidate records and does not repeat the identity command through
+Python. Python still owns publication policy, source/consumer recapture,
+production validator supervision, and legacy/producer-direct identity checks.
+Remaining checkout/consumer custody and production/historical supervised
+handoff stages need native owners before `run.py` can be removed.
+`import-validator-build --stage-root ABS --output ABS` is a support-only
+trusted-v2 companion for a pristine imported stage. It accepts no caller
+selected executable: it requires the current clean physical checkout to
+match the imported revision, tree, and source-content commitment, and the
+recorded Git and Zig executables, loader files, and Zig installation tree to
+retain their imported consumer content. It supervises the fixed x86_64 direct-validator build in
+a separate owner-only output and checks its ELF and bounded private command
+evidence. A historical revision or unavailable recorded tool refuses this
+operation; trusted historical imports still follow the existing Python
+revalidation path. This does not yet change the production import caller or
+make the built binary a published bundle member.
+`import-native-revalidation --stage-root ABS --output ABS` is a support-only
+trusted-v2 companion that builds that fixed direct validator and supervises its
+`handoff` verification in the same native invocation. It constructs a private
+canonical candidate outside the pristine imported stage by rebasing only the
+exact artifact, boot, and evidence member paths already validated against the
+imported portable bundle; neither the candidate nor the validator is a public
+bundle member. The validator is retained from build through execution and its
+exact success stdout, empty stderr, bounded log, and command binding are
+checked before returning. A caller cannot select a validator or manifest.
+Historical imports and the production revalidation caller still use Python;
+this support stage does not transfer publication or admission authority.
+`local-consumer-custody --runtime ABS` is a support-only read-only probe
+for a completed Python-produced v2 runtime *before* the managed QEMU loader
+is removed. It compares the clean current checkout's full physical source
+custody and both recorded build/boot consumer sets against fresh native
+captures, including exact executable loader roles, input tree contents and
+physical ancestry. It emits no public or acceptance record and does not
+replace Python's dependency, supervisor, packaging, or production policy
+checks. An extracted historical archive cannot satisfy this local proof
+after the original consumer files or loader are removed.
+
 ## Native controller preparation (unpublished build path)
 
 `zig build --build-file support/build/wamr-native-ci/build.zig test-controller`

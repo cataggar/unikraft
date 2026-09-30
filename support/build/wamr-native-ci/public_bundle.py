@@ -4,6 +4,7 @@
 import copy
 import contextlib
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,11 @@ import re
 import stat
 import subprocess
 import zipfile
+
+_records_spec = importlib.util.spec_from_file_location(
+    "wamr_accepted_records", Path(__file__).with_name("accepted_records.py"))
+accepted_records = importlib.util.module_from_spec(_records_spec)
+_records_spec.loader.exec_module(accepted_records)
 
 MAX_TOTAL = 512 * 1024 * 1024
 MAX_MEMBERS = 96
@@ -1029,7 +1035,9 @@ def validate_local_supervisor(handoff, supervisor, start, expected):
     return custody, identity
 
 
-def native(handoff, validator, supervisor, bundle, expected):
+def native(
+        handoff, validator, supervisor, bundle, expected,
+        native_identity=None):
     validator = Path(validator)
     supervisor = Path(supervisor)
     require(validator.is_absolute() and supervisor.is_absolute()
@@ -1059,19 +1067,24 @@ def native(handoff, validator, supervisor, bundle, expected):
             supervisor_input)
         handoff.ci.COMMAND_ENVIRONMENT[
             "WAMR_CI_SUPERVISOR"] = supervisor_path
-        identity_output, identity_command = handoff.ci.execute(
-            bundle.parent, "supervisor-import-identity",
-            [supervisor, "--identity"], 30, 1024, evidence=False,
-            input_records=input_records)
         supervisor_role_identity = handoff.ci.native_executable_identity(
             supervisor_input["files"]["command-supervisor"])
-        supervised_command_record(
-            handoff.ci, identity_command, "supervisor-import-identity",
-            {"command-supervisor": supervisor_role_identity},
-            "producer_direct")
-        require(handoff.ci.read(identity_output, 1024)
-                == handoff.ci.canonical_json(
-                    supervisor_identity_document))
+        if native_identity is None:
+            identity_output, identity_command = handoff.ci.execute(
+                bundle.parent, "supervisor-import-identity",
+                [supervisor, "--identity"], 30, 1024, evidence=False,
+                input_records=input_records)
+            supervised_command_record(
+                handoff.ci, identity_command, "supervisor-import-identity",
+                {"command-supervisor": supervisor_role_identity},
+                "producer_direct")
+            require(handoff.ci.read(identity_output, 1024)
+                    == handoff.ci.canonical_json(
+                        supervisor_identity_document))
+        else:
+            require(native_identity == bundle.parent.with_name(
+                bundle.parent.name + "-native-identity") / "accepted")
+            handoff.private(native_identity)
         output, command = handoff.ci.execute(
             bundle.parent, "native-revalidation",
             [validator, "handoff", bundle], 600, 4096,
@@ -1282,7 +1295,7 @@ def publication_role_identities(ci, consumer_files, boot_files):
 
 def publication_records(
         handoff, stage, source, transport_context,
-        bundle_name="bundle.json"):
+        bundle_name="bundle.json", native_accepted=None):
     """The uploaded originals must be the successful fixed public lane records."""
     ci = handoff.ci
     bundle = ci.document(stage / bundle_name)
@@ -1304,6 +1317,18 @@ def publication_records(
         "revision": source["source_revision"],
         "tree": source["source_tree"],
     }
+    if native_accepted is not None:
+        require(version == 2 and transport_context == "trusted_inner_zip"
+                and native_accepted["context"] == "trusted-inner-zip"
+                and native_accepted["compatibility"] == "tiny-v2"
+                and native_accepted["source"] == expected_source
+                and {record["name"]: record["sha256"]
+                     for record in native_accepted["records"]} == {
+                         Path(item["path"]).name: item["sha256"]
+                         for item in bundle["evidence"]
+                     })
+    else:
+        require(version != 2 or transport_context != "trusted_inner_zip")
     require(build["source"] == expected_source)
     start = ci.document(stage / "evidence/build-start.json")
     require(start["source"] == expected_source)
@@ -1346,13 +1371,15 @@ def publication_records(
         })
         for value in boot_inputs.values():
             digest_string(value)
-    if not pre_supervisor:
+    if not pre_supervisor and native_accepted is None:
         consumer_files = start["consumer_inputs"]["files"]
         role_identities = publication_role_identities(
             ci, consumer_files, boot_inputs["files"])
     for name in sorted(evidence_names):
         item = ci.document(stage / "evidence" / name)
         if name.startswith("command-"):
+            if native_accepted is not None:
+                continue
             expected_fields = {
                 "scope", "stage", "exit_code", "bytes", "sha256",
                 "over_limit", "known_error_markers",
@@ -1641,6 +1668,8 @@ def import_bundle(
         bundle = verify_archive_descriptor(
             handoff, handle, expected, expected_archive_sha256)
         output.mkdir(mode=0o700)
+        for name in ("artifacts", "boots", "evidence"):
+            (output / name).mkdir(mode=0o700)
         with descriptor_zip(handle) as zipped:
             for name, item in members(handoff, bundle).items():
                 path = output / name
@@ -1660,12 +1689,41 @@ def import_bundle(
                 )
     for item in members(handoff, bundle).values():
         item["path"] = str(output / item["path"])
+    identity_parent = None
+    if bundle["version"] == 2:
+        identity_parent = output.with_name(output.name + "-native-identity")
+        identity_parent.mkdir(mode=0o700)
+        handoff.private(identity_parent)
+    handoff.FAILURE_STAGE = "public-import-native-records"
+    accepted = accepted_records.imported_stage(output)
+    require(
+        accepted["source"] == {
+            "revision": expected["source_revision"],
+            "tree": expected["source_tree"],
+        }
+        and accepted["compatibility"]
+        == ("tiny-v2" if bundle["version"] == 2 else "tiny-v1")
+        and accepted["result"]["sha256"]
+        == bundle["artifacts"][
+            (handoff.V2_NAMES if bundle["version"] == 2 else handoff.NAMES
+             ).index("local_result")]["sha256"]
+        and {
+            record["name"]: record["sha256"] for record in accepted["records"]
+        } == {
+            Path(item["path"]).name: item["sha256"]
+            for item in bundle["evidence"]
+        })
+    native_identity = None
     if bundle["version"] == 2:
         require(expected_archive_sha256 is not None
                 and type(artifact_id) is str
                 and re.fullmatch(r"[1-9][0-9]{0,19}", artifact_id)
                 and type(container_digest) is str)
         digest_string(container_digest)
+        handoff.FAILURE_STAGE = "public-import-native-supervisor-identity"
+        native_identity = accepted_records.supervisor_import_identity(
+            output, supervisor, handoff.ci.tool("git"),
+            identity_parent / "accepted")
         handoff.ci.save(output / "transport.json", {
             "schema": "uk.wamr.public-source-transport",
             "version": 2,
@@ -1681,12 +1739,16 @@ def import_bundle(
     else:
         require(artifact_id is None and container_digest is None)
     handoff.ci.save(output / "candidate-bundle.json", bundle)
+    handoff.FAILURE_STAGE = "public-import-records"
     publication_records(
         handoff, output, expected, "trusted_inner_zip",
-        "candidate-bundle.json")
+        "candidate-bundle.json",
+        native_accepted=accepted if bundle["version"] == 2 else None)
+    handoff.FAILURE_STAGE = "public-import-revalidation"
     native(
         handoff, validator, supervisor,
-        output / "candidate-bundle.json", expected)
+        output / "candidate-bundle.json", expected,
+        native_identity=native_identity)
     # Only a fully revalidated import publishes the operator-facing bundle.
     handoff.ci.save(output / "bundle.json", bundle)
     return bundle
@@ -1747,7 +1809,11 @@ def publish_ci(handoff):
 
     require_validator_record()
     handoff.FAILURE_STAGE = "public-export"
-    exported = handoff.export(runtime, stage)
+    exported = handoff.export(
+        runtime, stage,
+        on_phase=lambda phase: setattr(
+            handoff, "FAILURE_STAGE", "public-export-" + phase))
+    handoff.FAILURE_STAGE = "public-export-postcheck"
     require_validator_record()
     validator = publication / "tools/bin/uk-wamr-direct-validate"
     supervisor = Path(handoff.ci.COMMAND_SUPERVISOR_PATH)

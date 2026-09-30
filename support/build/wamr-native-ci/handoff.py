@@ -20,6 +20,10 @@ HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("wamr_native_ci", HERE / "run.py")
 ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ci)
+records_spec = importlib.util.spec_from_file_location(
+    "wamr_accepted_records", HERE / "accepted_records.py")
+accepted_records = importlib.util.module_from_spec(records_spec)
+records_spec.loader.exec_module(accepted_records)
 NAMES = ("efi", "debug_elf", "bootinfo", "raw", "vhd", "runtime", "compiler",
          "wasm", "cwasm", "config", "runtime_identity", "image_identity",
          "local_result", "package", "build", "build_start", "boot_inputs")
@@ -900,46 +904,157 @@ def prepare_azure_runtime(output, azure, az_python, stdlib, *,
     return value
 
 
-def result_records(root):
-    result = ci.document(root / "evidence/result.json")
-    version = result["schema_version"]
-    modes = ci.MODES if version == 1 else ci.SIX_MODES
-    ci.require(version in (1, 2) and result["passed"] is True
-               and (version == 1 or result.get("profile") == ci.CURRENT_PROFILE)
+def _native_local_result(root):
+    """Accept a native-produced v2 run through its bound controller."""
+    ci.require(root.name == "compute" and root.is_absolute(),
+               "local compute root required")
+    accepted = accepted_records.local_runtime(root.parent)
+    ci.require(accepted["compatibility"] == "tiny-v2"
+               and accepted["profile"] == ci.CURRENT_PROFILE
+               and accepted["modes"] == list(ci.SIX_MODES),
+               "unexpected native local modes")
+    records = {record["name"]: record["sha256"]
+               for record in accepted["records"]}
+    ci.require(len(records) == len(accepted["records"]),
+               "duplicate native local record")
+    return accepted, records
+
+
+def _local_policy():
+    policy_spec = importlib.util.spec_from_file_location(
+        "wamr_public_bundle_v1_policy", HERE / "public_bundle.py")
+    policy = importlib.util.module_from_spec(policy_spec)
+    policy_spec.loader.exec_module(policy)
+    return policy
+
+
+def _historical_v1_records(root, result):
+    """Keep the pinned historical v1 fixture path separate from native v2."""
+    policy = _local_policy()
+    start = ci.document(root / "evidence/build-start.json")
+    build = ci.document(root / "evidence/build.json")
+    ci.require(type(start) is dict and type(build) is dict,
+               "historical v1 source required")
+    source = start.get("source")
+    ci.require(
+        type(source) is dict and set(source) == {"revision", "tree"}
+        and type(source["revision"]) is str and type(source["tree"]) is str
+        and source == build.get("source")
+        and (source["revision"], source["tree"]) in (
+            policy.LEGACY_V1_SOURCES | policy.PRE_SUPERVISOR_SOURCES),
+        "historical v1 source required")
+    records = result.get("records")
+    ci.require(type(records) is dict and set(records) == policy.EVIDENCE
+               and {path.name for path in (root / "evidence").iterdir()}
+               == policy.EVIDENCE | {"result.json"}
+               and not (root / "package/unikraft.qcow2").exists()
+               and not (root / "package/unikraft.qcow2").is_symlink()
+               and not (root.parent / "evidence/runtime-cleanup.txt").exists()
+               and not (root.parent / "evidence/runtime-cleanup.txt").is_symlink(),
+               "historical v1 evidence required")
+    ci.require("profile" not in result
+               and result["passed"] is True
                and result["scope"] == "local_native_compute_only"
                and result["hardware_acceptance"] == "not_established"
                and result["cloud_authority"] == "not_admitted"
                and result["benchmark"] == "not_measured"
                and result["workload"] == "tiny"
-               and result["modes"] == list(modes), "wrong local result")
-    records = result["records"]
-    ci.require(8 <= len(records) <= 64 and "result.json" not in records,
-               "invalid earlier record set")
+               and result["modes"] == list(ci.MODES),
+               "wrong local result")
     for name, expected in records.items():
         ci.require(Path(name).name == name and name.endswith(".json")
                    and name not in (".json", "..json"), "invalid record name")
-        ci.require(ci.digest(root / "evidence" / name) == expected, "local record changed")
-    required = {"build.json", "build-start.json", "boot-inputs.json", "package.json"}
-    required.update(mode + "-compute.json" for mode in modes)
-    if version == 2:
-        required.update({
-            "qcow2-finalization-intent.json", "qcow2-finalization.json",
-            "qcow2-acceptance.json", "fixed-vhd-derivation-intent.json",
-            "fixed-vhd-derivation-gate.json",
-            "fixed-vhd-derivation.json", "final-inspection.json",
-        })
-    ci.require(required <= records.keys(), "incomplete local records")
+        ci.require(ci.digest(root / "evidence" / name) == expected,
+                   "local record changed")
     return records
 
 
-def export(runtime, output):
+def _python_v2_records(root, result, start):
+    policy = _local_policy()
+    ci.require(ci.producer_inputs(
+        root.parent, start["consumer_inputs"]) == start,
+        "producer inputs changed")
+    evidence = {path.name for path in (root / "evidence").iterdir()}
+    accepted_evidence = policy.V2_EVIDENCE | {"result.json"}
+    ci.require(
+        set(result) == {
+            "schema_version", "profile", "scope", "passed",
+            "hardware_acceptance", "cloud_authority", "benchmark",
+            "workload", "modes", "records"}
+        and result["profile"] == ci.CURRENT_PROFILE
+        and result["passed"] is True
+        and result["scope"] == "local_native_compute_only"
+        and result["hardware_acceptance"] == "not_established"
+        and result["cloud_authority"] == "not_admitted"
+        and result["benchmark"] == "not_measured"
+        and result["workload"] == "tiny"
+        and result["modes"] == list(ci.SIX_MODES)
+        and type(result["records"]) is dict
+        and result["records"].keys() == policy.V2_EVIDENCE
+        and evidence in (
+            accepted_evidence,
+            accepted_evidence | {"command-public-validator-build.json"}),
+        "invalid Python local v2 records")
+    for name, expected in result["records"].items():
+        ci.require(ci.digest(root / "evidence" / name) == expected,
+                   "local record changed")
+    return result["records"]
+
+
+def _local_result(root):
+    result = ci.document(root / "evidence/result.json")
+    ci.require(type(result) is dict
+               and type(result.get("schema_version")) is int
+               and result["schema_version"] in (1, 2),
+               "unsupported local result version")
+    return result
+
+
+def _selected_records(root, result):
+    if result["schema_version"] == 1:
+        accepted, records = None, _historical_v1_records(root, result)
+    else:
+        start = ci.document(root / "evidence/build-start.json")
+        ci.require(
+            type(start) is dict
+            and type(start.get("consumer_inputs")) is dict
+            and type(start["consumer_inputs"].get("files")) is dict
+            and type(start["consumer_inputs"]["files"].get(
+                "command-supervisor")) is dict,
+            "local v2 producer custody required")
+        supervisor = start["consumer_inputs"]["files"][
+            "command-supervisor"].get("path")
+        if supervisor == str(root / "supervisor/bin/wamr-ci-supervisor"):
+            accepted, records = None, _python_v2_records(root, result, start)
+        else:
+            ci.require(
+                supervisor == str(root.parent / "controller/bin/uk-wamr-native-ci"),
+                "unsupported local v2 producer")
+            accepted, records = _native_local_result(root)
+    ci.require(_local_result(root) == result, "local result changed")
+    return accepted, records
+
+
+def result_records(root):
+    unused_accepted, records = _selected_records(root, _local_result(root))
+    return records
+
+
+def export(runtime, output, *, on_phase=None):
+    """Use the pinned producer's reader; never downgrade a native refusal."""
+    def phase(name):
+        if on_phase is not None:
+            on_phase(name)
+
     private(runtime)
     private(output.parent)
     root = runtime / "compute"
-    records = result_records(root)
-    result = ci.document(root / "evidence/result.json")
+    phase("records")
+    result = _local_result(root)
     version = result["schema_version"]
-    modes = ci.MODES if version == 1 else ci.SIX_MODES
+    accepted, records = _selected_records(root, result)
+    modes = ci.MODES if version == 1 else (
+        ci.SIX_MODES if accepted is None else tuple(accepted["modes"]))
     names = NAMES if version == 1 else V2_NAMES
     expected = ci.document(root / "evidence/build-start.json")
     legacy_supervision = "command_supervisor" not in expected
@@ -955,11 +1070,15 @@ def export(runtime, output):
                 expected["consumer_inputs"])
             ci.COMMAND_ENVIRONMENT[
                 "WAMR_CI_SUPERVISOR"] = supervisor_path
+    phase("custody")
     before = ci.producer_inputs(runtime, expected["consumer_inputs"])
     ci.require(before == expected,
                "producer inputs changed")
+    phase("build")
     build = ci.check_build()
     ci.require(build == ci.document(root / "evidence/build.json"), "build changed")
+    if accepted is not None:
+        ci.require(build["source"] == accepted["source"], "native source changed")
     inputs = ci.document(root / "evidence/boot-inputs.json")
     tools = {"package_tool": root / "tools/bin/wamr-ci-package",
              "local_boot_tool": root / "tools/bin/uk-hyperv-local-boot",
@@ -967,6 +1086,7 @@ def export(runtime, output):
              "ovmf_code": runtime / "firmware/code.fd",
              "ovmf_vars": runtime / "firmware/vars.fd",
              "efi": ci.APP / "build" / ci.EFI}
+    phase("boots")
     ci.boot_input_state(runtime, tools, expected=inputs)
     for i, mode in enumerate(modes):
         checked = ci.check_boot(
@@ -995,6 +1115,7 @@ def export(runtime, output):
     inspect_stage = (
         "handoff-inspect-legacy"
         if legacy_supervision else "handoff-inspect")
+    phase("inspect")
     inspected_output, inspected_command = ci.execute(
         output, inspect_stage,
         [tools["package_tool"], "inspect", ci.APP / "build" / ci.EFI, root / "package"],
@@ -1075,6 +1196,7 @@ def export(runtime, output):
                    "handoff copy changed")
         return saved
 
+    phase("copy")
     artifacts = [
         retain(path, output / "artifacts" / name)
         for name, path in zip(names, paths)
@@ -1091,6 +1213,7 @@ def export(runtime, output):
                 ("compute", root / "evidence" / (mode + "-compute.json")))}))
     evidence = [retain(root / "evidence" / name, output / "evidence" / name)
                 for name in sorted(records)]
+    phase("recheck")
     ci.require(result_records(root) == records and ci.check_build() == build
                and ci.producer_inputs(
                    runtime, expected["consumer_inputs"]) == before,
@@ -1140,6 +1263,7 @@ def export(runtime, output):
                     by_name["final_inspection"]["sha256"],
             },
         )
+    phase("publish")
     ci.save(output / "bundle.json", bundle)
     return bundle
 

@@ -20,6 +20,138 @@ pub fn main(init: std.process.Init) void {
         stdout.interface.writeAll(encoded) catch refused(init.io);
         return;
     }
+    if (command.action == .records) {
+        const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
+        const root = command.runtime orelse command.stage_root.?;
+        const directory = controller.layout.runtime(init.io, root) catch refused(init.io);
+        defer directory.close(init.io);
+        var accepted = if (command.runtime != null)
+            controller.accepted_run.openAndValidate(
+                allocator,
+                init.io,
+                init.minimal.environ,
+                &directory,
+                root,
+                repository,
+            ) catch |err| failed(init.io, "records", "", err)
+        else
+            controller.accepted_run.openImportedStage(
+                allocator,
+                init.io,
+                &directory,
+                root,
+            ) catch |err| failed(init.io, "records", "", err);
+        defer accepted.deinit();
+        accepted.revalidate() catch |err| failed(init.io, "records", "", err);
+        const encoded = accepted.handoffV1() catch |err| failed(init.io, "records", "", err);
+        var stdout = std.Io.File.stdout().writerStreaming(init.io, &.{});
+        stdout.interface.writeAll(encoded) catch refused(init.io);
+        return;
+    }
+    if (command.action == .@"local-consumer-custody") {
+        const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
+        var signal = controller.build_pipeline.installCancellation() catch refused(init.io);
+        defer signal.deinit();
+        controller.local_consumer_custody.run(
+            allocator,
+            init.io,
+            repository,
+            command.runtime.?,
+            &signal,
+        ) catch |err| failed(init.io, @tagName(command.action), "", err);
+        return;
+    }
+    if (command.action == .@"supervisor-import-identity") {
+        const stage = @tagName(command.action);
+        const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
+        const root = command.stage_root.?;
+        const directory = controller.layout.runtime(init.io, root) catch refused(init.io);
+        defer directory.close(init.io);
+        var signal = controller.build_pipeline.installCancellation() catch refused(init.io);
+        defer signal.deinit();
+        var accepted = controller.accepted_run.openImportedStage(
+            allocator,
+            init.io,
+            &directory,
+            root,
+        ) catch |err| failed(init.io, stage, "", err);
+        defer accepted.deinit();
+        controller.import_supervisor_identity.run(
+            allocator,
+            init.io,
+            &accepted,
+            repository,
+            command.git.?,
+            command.supervisor.?,
+            command.output.?,
+            &signal,
+        ) catch |err| failed(init.io, stage, "", err);
+        return;
+    }
+    if (command.action == .@"import-validator-build" or command.action == .@"import-native-revalidation") {
+        const stage = @tagName(command.action);
+        const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
+        const root = command.stage_root.?;
+        const directory = controller.layout.runtime(init.io, root) catch refused(init.io);
+        defer directory.close(init.io);
+        var signal = controller.build_pipeline.installCancellation() catch refused(init.io);
+        defer signal.deinit();
+        var accepted = controller.accepted_run.openImportedStage(
+            allocator,
+            init.io,
+            &directory,
+            root,
+        ) catch |err| failed(init.io, stage, "", err);
+        defer accepted.deinit();
+        controller.import_validator_build.run(
+            allocator,
+            init.io,
+            &accepted,
+            repository,
+            command.output.?,
+            command.action == .@"import-native-revalidation",
+            &signal,
+        ) catch |err| failed(init.io, stage, "", err);
+        return;
+    }
+    if (command.action == .@"handoff-inspect" or command.action == .@"public-validator-build") {
+        const stage = @tagName(command.action);
+        const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
+        const root = command.runtime.?;
+        const runtime = controller.layout.runtime(init.io, root) catch refused(init.io);
+        defer runtime.close(init.io);
+        var signal = controller.build_pipeline.installCancellation() catch refused(init.io);
+        defer signal.deinit();
+        var accepted = controller.accepted_run.openAndValidateWithSignal(
+            allocator,
+            init.io,
+            init.minimal.environ,
+            &runtime,
+            root,
+            repository,
+            &signal,
+        ) catch |err| failed(init.io, stage, "", err);
+        defer accepted.deinit();
+        const result = switch (command.action) {
+            .@"handoff-inspect" => controller.handoff_inspect.run(
+                allocator,
+                init.io,
+                &accepted,
+                command.output.?,
+                &signal,
+            ),
+            .@"public-validator-build" => controller.public_validator_build.run(
+                allocator,
+                init.io,
+                &accepted,
+                command.output.?,
+                &signal,
+            ),
+            else => unreachable,
+        };
+        _ = result catch |err| failed(init.io, stage, "", err);
+        return;
+    }
     const runtime = controller.layout.runtime(init.io, command.runtime.?) catch refused(init.io);
     defer runtime.close(init.io);
     const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
@@ -59,6 +191,13 @@ pub fn main(init: std.process.Init) void {
             controller.boot_pipeline.diagnostics(&boot_context) catch |err| failed(init.io, "diagnostics", "", err);
         },
         .describe => unreachable,
+        .records => unreachable,
+        .@"local-consumer-custody" => unreachable,
+        .@"handoff-inspect" => unreachable,
+        .@"public-validator-build" => unreachable,
+        .@"supervisor-import-identity" => unreachable,
+        .@"import-validator-build" => unreachable,
+        .@"import-native-revalidation" => unreachable,
     }
 }
 
@@ -67,7 +206,15 @@ fn usage(io: std.Io) noreturn {
     stderr.interface.writeAll(
         "usage: uk-wamr-native-ci build --runtime ABS --wamr-source ABS\n" ++
             "       uk-wamr-native-ci boot|diagnostics --runtime ABS\n" ++
-            "       uk-wamr-native-ci describe --output json-v1\n",
+            "       uk-wamr-native-ci describe --output json-v1\n" ++
+            "       uk-wamr-native-ci records --runtime ABS --output handoff-v1\n" ++
+            "       uk-wamr-native-ci records --stage-root ABS --transport trusted-inner-zip --output handoff-v1\n" ++
+            "       uk-wamr-native-ci local-consumer-custody --runtime ABS\n" ++
+            "       uk-wamr-native-ci handoff-inspect --runtime ABS --output ABS\n" ++
+            "       uk-wamr-native-ci public-validator-build --runtime ABS --output ABS\n" ++
+            "       uk-wamr-native-ci supervisor-import-identity --stage-root ABS --supervisor ABS --git ABS --output ABS\n" ++
+            "       uk-wamr-native-ci import-validator-build --stage-root ABS --output ABS\n" ++
+            "       uk-wamr-native-ci import-native-revalidation --stage-root ABS --output ABS\n",
     ) catch {};
     std.process.exit(2);
 }
