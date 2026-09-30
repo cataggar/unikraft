@@ -118,6 +118,11 @@ real read-only `vpc` boots). It returns `OfflineAdmission` or an explicit
 It copies pinned Miz, native runner, and QEMU bytes from verified file
 descriptors into a fresh owner-only directory before execution; that
 directory and the private Git runtime require nonreplaceable ancestors.
+QEMU must be the pinned release binary with its release `share/` directory
+beside it: exactly `kvmvapic.bin` and `vgabios-stdvga.bin`, the option ROMs
+that the runner's fixed q35/KVM command loads, are copied into the private
+`share/` directory and pinned by `qemu_support_sha256`. A distribution QEMU
+that resolves ROMs from `../share/qemu` is not supported.
 The caller must authenticate the reviewed build and tool pins independently;
 a self-reported build receipt or saved local-boot report is insufficient.
 No private pins, images, QEMU installation, or build proof are supplied here.

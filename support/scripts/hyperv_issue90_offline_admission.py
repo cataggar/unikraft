@@ -5,6 +5,7 @@ from the reviewed source and config; neither this module nor a self-reported
 receipt can establish that review. No pins or private inputs are shipped here.
 Source executable parents need not be trusted: only descriptor-copied,
 reviewed bytes execute under owner-only, nonreplaceable directory ancestry.
+The pinned QEMU's required option ROMs are copied and pinned the same way.
 The private Git runtime also requires nonreplaceable ancestry. The legacy
 #90 prepare/live gates remain closed.
 """
@@ -37,6 +38,10 @@ MODES = (
     ("raw", "x2apic", False), ("raw", "legacy-apic", True),
     ("vhd", "x2apic", False), ("vhd", "legacy-apic", True),
 )
+# The native runner's fixed q35/KVM argv loads exactly these option ROMs; the
+# pinned QEMU release resolves them from the share/ directory beside its binary.
+QEMU_SUPPORT_FILES = ("kvmvapic.bin", "vgabios-stdvga.bin")
+QEMU_SUPPORT_MAX = 1024 * 1024
 REPORT_FIELDS = {
     "schema_version", "scope", "acceptance", "passed", "consumed",
     "cleanup_complete", "input_unchanged", "serial_valid",
@@ -61,6 +66,7 @@ class ReviewPins:
     qemu_sha256: str
     ovmf_code_sha256: str
     ovmf_vars_sha256: str
+    qemu_support_sha256: str
 
 
 @dataclass(frozen=True)
@@ -133,7 +139,7 @@ def _pins(value):
         "tree_sha256", "physical_sha256", "config_sha256", "git_runtime_sha256",
         "build_receipt_sha256", "efi_sha256", "raw_sha256", "vhd_sha256",
         "miz_sha256", "runner_sha256", "qemu_sha256",
-        "ovmf_code_sha256", "ovmf_vars_sha256",
+        "ovmf_code_sha256", "ovmf_vars_sha256", "qemu_support_sha256",
     ):
         azure.require_sha256(getattr(value, field), field)
 
@@ -177,6 +183,39 @@ def _stage_executable(source, destination, maximum, expected_sha256):
     with destination.open("rb") as program:
         if program.read(4) != b"\x7fELF":
             raise ValueError("Private executable is not a native ELF")
+    return destination
+
+
+def qemu_support_sha256(directory, *, private=False):
+    """Digest the exact QEMU option ROMs that independent review must pin."""
+    records = []
+    for name in QEMU_SUPPORT_FILES:
+        path = directory / name
+        sha = _file(path, QEMU_SUPPORT_MAX, private=private)
+        records.append({
+            "name": name, "sha256": sha, "size": path.stat().st_size,
+        })
+    return hashlib.sha256(azure.canonical_json(records)).hexdigest()
+
+
+def _stage_qemu_support(source, destination, expected_sha256):
+    if qemu_support_sha256(source) != expected_sha256:
+        raise ValueError("QEMU support files differ from independent review")
+    destination.mkdir(mode=0o700, exist_ok=False)
+    for name in QEMU_SUPPORT_FILES:
+        path = source / name
+        size = path.stat().st_size
+        azure.copy_regular_file(
+            path, destination / name, size,
+            _file(path, QEMU_SUPPORT_MAX),
+        )
+        (destination / name).chmod(0o400)
+    if (sorted(os.listdir(destination)) != sorted(QEMU_SUPPORT_FILES)
+            or qemu_support_sha256(destination, private=True)
+            != expected_sha256):
+        raise ValueError(
+            "Private QEMU support copy differs from independent review"
+        )
     return destination
 
 
@@ -454,6 +493,10 @@ def admit(inputs: OfflineInputs) -> OfflineAdmission | OfflineRefusal:
                 256 * 1024 * 1024, reviewed.qemu_sha256,
             ),
         )
+        qemu_support = _stage_qemu_support(
+            inputs.qemu.parent / "share", executable_dir / "share",
+            reviewed.qemu_support_sha256,
+        )
         stage = "packaging"
         _check_packaging(staged.miz, state_dir, efi_sha, efi["size"], vhd)
         stage = "boots"
@@ -491,7 +534,13 @@ def admit(inputs: OfflineInputs) -> OfflineAdmission | OfflineRefusal:
                 or _file(staged.runner, 256 * 1024 * 1024, private=True,
                          executable=True) != reviewed.runner_sha256
                 or _file(staged.qemu, 256 * 1024 * 1024, private=True,
-                         executable=True) != reviewed.qemu_sha256):
+                         executable=True) != reviewed.qemu_sha256
+                or qemu_support_sha256(inputs.qemu.parent / "share")
+                != reviewed.qemu_support_sha256
+                or sorted(os.listdir(qemu_support))
+                != sorted(QEMU_SUPPORT_FILES)
+                or qemu_support_sha256(qemu_support, private=True)
+                != reviewed.qemu_support_sha256):
             raise ValueError("Booted image changed during local verification")
         return OfflineAdmission(
             state["run_id"], state["operation_id"], reviewed.head_commit,
