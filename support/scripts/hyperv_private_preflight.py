@@ -151,17 +151,22 @@ GUARDED_CONTRACT_SCHEMA = (
     "unikraft.hyperv.guarded-v2-pristine-unavailable"
 )
 GUARDED_PRODUCER_SCHEMA = "unikraft.hyperv.guarded-producer-pin"
-GUARDED_PRODUCER_SCHEMA_VERSION = 4
-# Include the reviewed native WAMR build sources without changing guarded
-# purpose, approval requirements, or the complete source-closure coverage.
+GUARDED_PRODUCER_SCHEMA_VERSION = 5
+GUARDED_PRODUCER_DIRECTORY_EXCLUSIONS = {
+    "support/build": ("wamr-native-ci",),
+}
+# Keep these independently enforced pins aligned with the reviewed guarded
+# producer source set. Schema 5 records support/build without the separate
+# WAMR native CI controller subtree; that subtree must still be a plain
+# non-symlink directory, and no other guarded closure has exclusions.
 GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "71cf06dfdb6b798d1fd969e9121d5f164af9ebfac8028c61d964afff8dcd7e56"
+            "109e7345aff40fed3feaa9bf51bd09fc8f20c34493409447a10feb2b0b5d501b"
         ),
-        "size": 3749301,
-        "files": 278,
+        "size": 1780570,
+        "files": 217,
     },
     "support/kconfig": {
         "name": "support/kconfig",
@@ -1005,6 +1010,9 @@ def verify_guarded_producer_sources(repository):
         if directory_record(
             repository / relative, relative,
             "Guarded producer execution closure",
+            exclude_top_level_subtrees=(
+                GUARDED_PRODUCER_DIRECTORY_EXCLUSIONS.get(relative, ())
+            ),
         ) != expected:
             raise ValueError(
                 "Guarded producer differs from the reviewed V2 contract"
@@ -1735,17 +1743,56 @@ def regular_record(path, name, description):
     }
 
 
-def directory_record(path, name, description):
+def directory_record(
+    path, name, description, *, exclude_top_level_subtrees=()
+):
     original = Path(path)
     metadata = original.lstat()
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
         raise ValueError(f"{description} must be a non-symlink directory")
     root = original.resolve(strict=True)
+    exclusions = tuple(exclude_top_level_subtrees)
+    for excluded in exclusions:
+        if (
+            not isinstance(excluded, str)
+            or not excluded
+            or Path(excluded).parts != (excluded,)
+        ):
+            raise ValueError(f"{description} has an invalid exclusion")
+        excluded_path = root / excluded
+        try:
+            excluded_metadata = excluded_path.lstat()
+        except FileNotFoundError:
+            raise ValueError(
+                f"{description} excluded subtree must be a "
+                "non-symlink directory"
+            ) from None
+        if (
+            stat.S_ISLNK(excluded_metadata.st_mode)
+            or not stat.S_ISDIR(excluded_metadata.st_mode)
+        ):
+            raise ValueError(
+                f"{description} excluded subtree must be a "
+                "non-symlink directory"
+            )
+    excluded_top_levels = frozenset(exclusions)
+    if excluded_top_levels:
+        entries = []
+        for entry in sorted(root.iterdir()):
+            if entry.name in excluded_top_levels:
+                continue
+            entries.append(entry)
+            if stat.S_ISDIR(entry.lstat().st_mode):
+                entries.extend(entry.rglob("*"))
+        entries = sorted(entries)
+    else:
+        entries = sorted(root.rglob("*"))
     digest = hashlib.sha256()
     count = 0
     total = 0
-    for entry in sorted(root.rglob("*")):
-        relative = entry.relative_to(root).as_posix()
+    for entry in entries:
+        relative_path = entry.relative_to(root)
+        relative = relative_path.as_posix()
         metadata = entry.lstat()
         if stat.S_ISLNK(metadata.st_mode):
             raise ValueError(f"{description} contains a symlink")

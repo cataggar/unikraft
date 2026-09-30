@@ -19,7 +19,11 @@ test "Python contract golden is canonical and matches native literal tables" {
     try expectLiteral(root, "schema", "uk.wamr.handoff-contract-golden");
     try expectLiteral(root, "authority", profile.authority);
     try expectLiteral(root, "canonicalization", profile.canonicalization);
+    try expectLimits(root.get("limits") orelse return error.MissingGolden);
+    try expectProfiles(root.get("profiles") orelse return error.MissingGolden);
+    try expectHistoricalSources(root.get("historical_sources") orelse return error.MissingGolden);
     const tables = root.get("tables").?.object;
+    try expectBootKeys(tables, "boot_keys");
     try expectStringArray(tables, "artifact_names_v1", &layout.artifact_names_v1);
     try expectStringArray(tables, "artifact_names_v2", &layout.artifact_names_v2);
     try expectStringArray(tables, "evidence_v1", &layout.evidence_v1);
@@ -35,6 +39,22 @@ test "Python contract golden is canonical and matches native literal tables" {
     try std.testing.expectEqual(@as(usize, 24), layout.bootMemberCount(.tiny_qcow2_derived_vhd_v2));
     try std.testing.expectEqual(@as(usize, 85), layout.expectedZipMemberCount(.tiny_qcow2_derived_vhd_v2));
     try std.testing.expect(layout.expectedZipMemberCount(.tiny_qcow2_derived_vhd_v2) <= layout.max_members);
+    const schemas = root.get("schemas").?.object;
+    try expectStringArray(schemas, "artifact", &contracts.schema_fields.artifact);
+    try expectStringArray(schemas, "manifest_member", &contracts.schema_fields.manifest_member);
+    try expectStringArray(schemas, "boot", &contracts.schema_fields.boot);
+    try expectStringArray(schemas, "identity", &contracts.schema_fields.identity);
+    try expectStringArray(schemas, "local_image_handoff_v1", &contracts.schema_fields.local_image_handoff_v1);
+    try expectStringArray(schemas, "local_image_handoff_v2", &contracts.schema_fields.local_image_handoff_v2);
+    try expectStringArray(schemas, "public_source_manifest_v1", &contracts.schema_fields.public_source_manifest_v1);
+    try expectStringArray(schemas, "public_source_manifest_v2", &contracts.schema_fields.public_source_manifest_v2);
+    try expectStringArray(schemas, "public_source_transport_v2", &contracts.schema_fields.public_source_transport_v2);
+    try expectStringArray(schemas, "direct_compute_candidate", &contracts.schema_fields.direct_compute_candidate);
+    try expectStringArray(schemas, "direct_compute_admission_v2", &contracts.schema_fields.direct_compute_admission_v2);
+    try expectStringArray(schemas, "run", &contracts.schema_fields.run);
+    try expectStringArray(schemas, "lineage", &contracts.schema_fields.lineage);
+    try expectStringArray(schemas, "public_context", &contracts.schema_fields.public_context);
+    try expectStringArray(schemas, "approval", &contracts.schema_fields.approval);
 }
 
 test "closed external handoff, manifest, transport, candidate and admission contracts" {
@@ -74,6 +94,22 @@ test "unknown fields, versions, authority and lineage substitutions fail closed"
     const bundle = try replaceOwned(a, try sampleBundle(a, .tiny_qcow2_derived_vhd_v2), "\"raw_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"", "\"raw_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"");
     defer a.free(bundle);
     try expectRefused(contracts.validateLocalImageHandoff, bundle);
+
+    const bare = try replaceOwned(a, try sampleBundle(a, .frozen_tiny_v1), "\"path\":\"artifacts/efi\"", "\"path\":\"efi\"");
+    defer a.free(bare);
+    try expectRefused(contracts.validateLocalImageHandoff, bare);
+
+    const swapped = try replaceOwned(a, try sampleBundle(a, .tiny_qcow2_derived_vhd_v2), "\"path\":\"evidence/boot-inputs.json\"", "\"path\":\"evidence/build-start.json\"");
+    defer a.free(swapped);
+    try expectRefused(contracts.validateLocalImageHandoff, swapped);
+
+    const big = try oversizedBundle(a);
+    defer a.free(big);
+    try expectRefused(contracts.validateLocalImageHandoff, big);
+
+    const big_manifest = try oversizedManifest(a);
+    defer a.free(big_manifest);
+    try expectRefused(contracts.validatePublicSourceManifest, big_manifest);
 }
 
 fn sampleBundle(a: std.mem.Allocator, compatibility: profile.Compatibility) ![]u8 {
@@ -89,7 +125,7 @@ fn sampleBundle(a: std.mem.Allocator, compatibility: profile.Compatibility) ![]u
     try w.writeAll("\"artifacts\":[");
     for (layout.artifactNames(compatibility), 0..) |name, i| {
         if (i != 0) try w.writeByte(',');
-        try writeArtifact(w, name, 1);
+        try writeMemberArtifact(w, "artifacts", name, 1);
     }
     try w.writeAll("],\"boots\":[");
     for (profile.modes(compatibility), 0..) |mode, i| {
@@ -98,14 +134,16 @@ fn sampleBundle(a: std.mem.Allocator, compatibility: profile.Compatibility) ![]u
         inline for (.{ "serial", "request", "report", "compute" }, 0..) |key, j| {
             if (j != 0) try w.writeByte(',');
             try w.print("\"{s}\":", .{key});
-            try writeArtifact(w, key, 1);
+            var path_buffer: [128]u8 = undefined;
+            const path = try std.fmt.bufPrint(&path_buffer, "boots/{s}/{s}", .{ @tagName(mode), key });
+            try writeArtifact(w, path, 1);
         }
         try w.writeByte('}');
     }
     try w.writeAll("],\"evidence\":[");
     for (layout.evidenceNames(compatibility), 0..) |name, i| {
         if (i != 0) try w.writeByte(',');
-        try writeArtifact(w, name, 1);
+        try writeMemberArtifact(w, "evidence", name, 1);
     }
     try w.writeAll("]}\n");
     return out.toOwnedSlice();
@@ -169,11 +207,17 @@ fn writeIdentityField(w: *std.Io.Writer) !void {
 }
 
 fn writeLineage(w: *std.Io.Writer) !void {
-    try w.print("\"lineage\":{{\"raw_sha256\":\"{s}\",\"accepted_qcow2_sha256\":\"{s}\",\"derived_vhd_sha256\":\"{s}\",\"qcow2_finalization_sha256\":\"{s}\",\"qcow2_acceptance_sha256\":\"{s}\",\"fixed_vhd_derivation_gate_sha256\":\"{s}\",\"fixed_vhd_derivation_sha256\":\"{s}\",\"final_inspection_sha256\":\"{s}\"}},", .{ sha, sha, sha, sha, sha, sha, sha, sha });
+    try w.print("\"lineage\":{{\"raw_sha256\":\"{s}\",\"accepted_qcow2_sha256\":\"{s}\",\"derived_vhd_sha256\":\"{s}\",\"qcow2_finalization_sha256\":\"{s}\",\"qcow2_acceptance_sha256\":\"{s}\",\"fixed_vhd_derivation_sha256\":\"{s}\",\"fixed_vhd_derivation_gate_sha256\":\"{s}\",\"final_inspection_sha256\":\"{s}\"}},", .{ sha, sha, sha, sha, sha, sha, sha, sha });
+}
+
+fn writeMemberArtifact(w: *std.Io.Writer, prefix: []const u8, name: []const u8, size: u64) !void {
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ prefix, name });
+    try writeArtifact(w, path, size);
 }
 
 fn writeArtifact(w: *std.Io.Writer, path: []const u8, size: u64) !void {
-    try w.print("{{\"path\":\"{s}\",\"sha256\":\"{s}\",\"size\":{}}}", .{ path, sha, size });
+    try w.print("{{\"path\":\"{s}\",\"size\":{},\"sha256\":\"{s}\"}}", .{ path, size, sha });
 }
 
 fn validateStatic(comptime f: anytype, bytes: []const u8) !void {
@@ -194,6 +238,24 @@ fn replaceOwned(a: std.mem.Allocator, source: []u8, old: []const u8, new: []cons
     return std.mem.replaceOwned(u8, a, source, old, new);
 }
 
+fn oversizedBundle(a: std.mem.Allocator) ![]u8 {
+    const raw_big = try std.fmt.allocPrint(a, "\"path\":\"artifacts/raw\",\"size\":{},\"sha256\":\"{s}\"", .{ layout.max_large_artifact_bytes, sha });
+    defer a.free(raw_big);
+    const qcow2_big = try std.fmt.allocPrint(a, "\"path\":\"artifacts/qcow2\",\"size\":{},\"sha256\":\"{s}\"", .{ layout.max_large_artifact_bytes, sha });
+    defer a.free(qcow2_big);
+    const first = try replaceOwned(a, try sampleBundle(a, .tiny_qcow2_derived_vhd_v2), "\"path\":\"artifacts/raw\",\"size\":1,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"", raw_big);
+    return replaceOwned(a, first, "\"path\":\"artifacts/qcow2\",\"size\":1,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"", qcow2_big);
+}
+
+fn oversizedManifest(a: std.mem.Allocator) ![]u8 {
+    const raw_big = try std.fmt.allocPrint(a, "\"artifacts/raw\":{{\"size\":{},\"sha256\":\"{s}\"}}", .{ layout.max_large_artifact_bytes, sha });
+    defer a.free(raw_big);
+    const qcow2_big = try std.fmt.allocPrint(a, "\"artifacts/qcow2\":{{\"size\":{},\"sha256\":\"{s}\"}}", .{ layout.max_large_artifact_bytes, sha });
+    defer a.free(qcow2_big);
+    const first = try replaceOwned(a, try sampleManifest(a, .tiny_qcow2_derived_vhd_v2), "\"artifacts/raw\":{\"size\":1,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}", raw_big);
+    return replaceOwned(a, first, "\"artifacts/qcow2\":{\"size\":1,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}", qcow2_big);
+}
+
 fn expectStringArray(map: std.json.ObjectMap, key: []const u8, expected: []const []const u8) !void {
     const items = (map.get(key) orelse return error.MissingGolden).array.items;
     try std.testing.expectEqual(expected.len, items.len);
@@ -206,8 +268,75 @@ fn expectGeneratedMembers(map: std.json.ObjectMap, key: []const u8, compatibilit
     try expectStringArray(map, key, expected);
 }
 
+fn expectLimits(value: std.json.Value) !void {
+    const limits = value.object;
+    try expectInt(limits, "max_members", layout.max_members);
+    try expectInt(limits, "max_total_bytes", layout.max_total_bytes);
+    try expectInt(limits, "json_bytes", layout.max_json_bytes);
+    try expectInt(limits, "serial_bytes", layout.max_serial_bytes);
+    try expectInt(limits, "large_artifact_bytes", layout.max_large_artifact_bytes);
+    try expectInt(limits, "v1_zip_members", layout.v1_zip_member_count);
+    try expectInt(limits, "v2_zip_members", layout.v2_zip_member_count);
+}
+
+fn expectProfiles(value: std.json.Value) !void {
+    const items = value.array.items;
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    try expectProfile(items[0].object, .frozen_tiny_v1, "tiny-v1", false);
+    try expectProfile(items[1].object, .tiny_qcow2_derived_vhd_v2, "tiny-v2", true);
+}
+
+fn expectProfile(map: std.json.ObjectMap, compatibility: profile.Compatibility, name: []const u8, production: bool) !void {
+    try expectInt(map, "version", compatibility.version());
+    try expectLiteral(map, "compatibility", name);
+    if (profile.profileName(compatibility)) |profile_name|
+        try expectLiteral(map, "profile", profile_name)
+    else
+        try std.testing.expect((map.get("profile") orelse return error.MissingGolden) == .null);
+    try std.testing.expectEqual(production, (map.get("production") orelse return error.MissingGolden).bool);
+    try expectLiteral(map, "workload", profile.workload);
+    try expectModeArray(map, "modes", compatibility);
+    try expectInt(map, "artifact_count", layout.artifactNames(compatibility).len);
+    try expectInt(map, "evidence_count", layout.evidenceNames(compatibility).len);
+    try expectInt(map, "boot_member_count", layout.bootMemberCount(compatibility));
+    try expectInt(map, "zip_member_count", layout.expectedZipMemberCount(compatibility));
+}
+
+fn expectHistoricalSources(value: std.json.Value) !void {
+    const sources = value.object;
+    try expectSourceArray(sources, "legacy_v1_without_external_archive_digest", &profile.legacy_v1_without_external_archive_digest);
+    try expectSourceArray(sources, "pre_supervisor_with_external_archive_digest", &profile.pre_supervisor_with_external_archive_digest);
+}
+
+fn expectSourceArray(map: std.json.ObjectMap, key: []const u8, expected: []const profile.SourceIdentity) !void {
+    const items = (map.get(key) orelse return error.MissingGolden).array.items;
+    try std.testing.expectEqual(expected.len, items.len);
+    for (items, expected) |item, source| {
+        const object_map = item.object;
+        try expectLiteral(object_map, "revision", source.revision);
+        try expectLiteral(object_map, "tree", source.tree);
+    }
+}
+
+fn expectBootKeys(map: std.json.ObjectMap, key: []const u8) !void {
+    const items = (map.get(key) orelse return error.MissingGolden).array.items;
+    try std.testing.expectEqual(layout.boot_keys.len, items.len);
+    for (items, layout.boot_keys) |item, boot_key| try std.testing.expectEqualStrings(@tagName(boot_key), try c.string(item));
+}
+
+fn expectModeArray(map: std.json.ObjectMap, key: []const u8, compatibility: profile.Compatibility) !void {
+    const items = (map.get(key) orelse return error.MissingGolden).array.items;
+    const modes = profile.modes(compatibility);
+    try std.testing.expectEqual(modes.len, items.len);
+    for (items, modes) |item, mode| try std.testing.expectEqualStrings(@tagName(mode), try c.string(item));
+}
+
 fn expectLiteral(map: std.json.ObjectMap, key: []const u8, expected: []const u8) !void {
     try std.testing.expectEqualStrings(expected, try c.string(map.get(key) orelse return error.MissingGolden));
+}
+
+fn expectInt(map: std.json.ObjectMap, key: []const u8, expected: anytype) !void {
+    try std.testing.expectEqual(@as(@TypeOf(expected), expected), try c.integer(@TypeOf(expected), map.get(key) orelse return error.MissingGolden));
 }
 
 fn generatedPublicMembers(a: std.mem.Allocator, compatibility: profile.Compatibility) ![]const []const u8 {

@@ -66,17 +66,22 @@ GUARDED_CONTRACT_SCHEMA = (
     "unikraft.hyperv.guarded-v2-pristine-unavailable"
 )
 GUARDED_PRODUCER_SCHEMA = "unikraft.hyperv.guarded-producer-pin"
-GUARDED_PRODUCER_SCHEMA_VERSION = 4
-# Keep these independently enforced pins aligned with the reviewed controller
-# source set; this does not expand the guarded platform-only contract.
+GUARDED_PRODUCER_SCHEMA_VERSION = 5
+GUARDED_PRODUCER_DIRECTORY_EXCLUSIONS = {
+    "support/build": ("wamr-native-ci",),
+}
+# Keep these independently enforced pins aligned with the reviewed guarded
+# producer source set. Schema 5 records support/build without the separate
+# WAMR native CI controller subtree; that subtree must still be a plain
+# non-symlink directory, and no other guarded closure has exclusions.
 GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "71cf06dfdb6b798d1fd969e9121d5f164af9ebfac8028c61d964afff8dcd7e56"
+            "109e7345aff40fed3feaa9bf51bd09fc8f20c34493409447a10feb2b0b5d501b"
         ),
-        "size": 3749301,
-        "files": 278,
+        "size": 1780570,
+        "files": 217,
     },
     "support/kconfig": {
         "name": "support/kconfig",
