@@ -65,13 +65,6 @@ jobs:
           fi
           mkdir -p .d
 
-      - name: Exercise the production source-custody limits explicitly
-        timeout-minutes: 15
-        run: |
-          set -euo pipefail
-          export PYTHONDONTWRITEBYTECODE=1
-          python3 support/build/wamr-native-ci/tests/source_custody_production_limits.py
-
       - name: Set up the existing verified native downloader
         uses: cataggar/ghr/actions/setup@114926d37d3825e63bede2ccc7ce56b67eda7495
         with:
@@ -92,6 +85,25 @@ jobs:
         with:
           ghr-version: v0.8.0
           tools: cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Exercise the production source-custody limits explicitly
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          source_root="${RUNNER_TEMP}/wamr-source-custody-limits"
+          test ! -e "${source_root}"
+          git worktree add --detach "${source_root}" HEAD
+          cleanup() { git worktree remove --force -- "${source_root}"; }
+          trap cleanup EXIT
+          mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-source-custody-limits-cache"
+          ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-source-custody-limits-cache" \
+            zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
+            -Doptimize=ReleaseSafe -j2 test-controller-limits
+          (
+            cd "${source_root}"
+            export PYTHONDONTWRITEBYTECODE=1
+            python3 -B support/build/wamr-native-ci/tests/source_custody_production_limits.py
+          )
 
       - name: Exercise native controller, custody limits, and package-boot fixtures in an isolated x86 worktree
         timeout-minutes: 15

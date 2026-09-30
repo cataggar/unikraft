@@ -11,13 +11,13 @@ const plan = @import("command_plan.zig");
 const records = @import("records.zig");
 const source = @import("source_custody.zig");
 
-const python_sources = [_][]const u8{
+pub const historical_supervisor_sources = [_][]const u8{
     "support/build/wamr-native-ci/build.zig.zon",
     "support/build/wamr-native-ci/run.py",
     "support/build/wamr-native-ci/supervisor.build.zig",
     "support/build/wamr-native-ci/supervisor.zig",
-    "support/tools/hyperv/core.zig",
     "support/tools/hyperv/contracts.zig",
+    "support/tools/hyperv/core.zig",
     "support/tools/hyperv/diagnostics.zig",
     "support/tools/hyperv/private_files.zig",
     "support/tools/hyperv/process-command-v1.json",
@@ -26,6 +26,17 @@ const python_sources = [_][]const u8{
     "support/tools/hyperv/sha256.zig",
     "support/tools/hyperv/sha256_clear_upper.S",
 };
+
+pub fn supervisorSourceContentClosure(allocator: std.mem.Allocator, io: std.Io, repository: []const u8, git: []const u8) ![64]u8 {
+    var hash = core.Sha256.init(.{});
+    hash.update("uk.wamr.command-supervisor-source-v1-content\x00");
+    for (historical_supervisor_sources) |name| {
+        const manifest = try source.trackedManifest(allocator, io, repository, git, name);
+        defer manifest.deinit(allocator);
+        try physical.bind(allocator, &hash, .{ name, manifest.bytes, manifest.sha256 });
+    }
+    return physical.hex(&hash);
+}
 
 fn get(value: std.json.Value, key: []const u8) !std.json.Value {
     if (value != .object) return error.InvalidImportIdentity;
@@ -56,8 +67,8 @@ fn contained(path: []const u8, root: []const u8) bool {
 
 pub fn validateSourceNames(records_map: std.json.Value) !void {
     if (records_map != .object) return error.InvalidImportIdentity;
-    if (records_map.object.count() == python_sources.len) {
-        for (python_sources) |name|
+    if (records_map.object.count() == historical_supervisor_sources.len) {
+        for (historical_supervisor_sources) |name|
             _ = try get(records_map, name);
     } else if (records_map.object.count() == source.closure.len) {
         for (source.closure) |entry|
@@ -241,7 +252,10 @@ pub fn run(
     var raw = try files.readSensitiveFile(io, allocator, pinned_start.file, records.max_record_bytes, .private);
     defer raw.deinit();
     var document = try contracts.Document.parse(allocator, raw.bytes(), .{
-        .bytes = records.max_record_bytes, .depth = 32, .items = 4096, .tokens = 65536,
+        .bytes = records.max_record_bytes,
+        .depth = 32,
+        .items = 4096,
+        .tokens = 65536,
     });
     defer document.deinit();
     try document.requireCanonical(allocator, raw.bytes());
@@ -312,7 +326,10 @@ pub fn run(
         !std.mem.eql(u8, &record.sha256, &observed_sha))
         return error.CommandOutputChanged;
     const checked = try accepted_run.validateCommandBinding(
-        allocator, record_raw.bytes(), .@"supervisor-import-identity", .trusted_inner_zip,
+        allocator,
+        record_raw.bytes(),
+        .@"supervisor-import-identity",
+        .trusted_inner_zip,
     );
     const log_path = try std.fs.path.join(allocator, &.{ output, "private/supervisor-import-identity.log" });
     const log = try physical.readFile(io, log_path, 1025, true);

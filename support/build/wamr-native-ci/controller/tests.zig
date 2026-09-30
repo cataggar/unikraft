@@ -1245,6 +1245,9 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
     try std.testing.expectEqual(cli.Action.build, build.action);
     try std.testing.expectEqualStrings("/wamr", build.wamr_source.?);
     try std.testing.expectEqual(cli.Action.describe, (try cli.parse(&.{ "uk-wamr-native-ci", "describe", "--output", "json-v1" })).action);
+    const source_closure = try cli.parse(&.{ "uk-wamr-native-ci", "supervisor-source-closure", "--git", "/usr/bin/git", "--output", "sha256-v1" });
+    try std.testing.expectEqual(cli.Action.@"supervisor-source-closure", source_closure.action);
+    try std.testing.expectEqualStrings("/usr/bin/git", source_closure.git.?);
     try std.testing.expectEqual(cli.Action.boot, (try cli.parse(&.{ "uk-wamr-native-ci", "boot", "--runtime", "/runtime" })).action);
     try std.testing.expectEqual(cli.Action.diagnostics, (try cli.parse(&.{ "uk-wamr-native-ci", "diagnostics", "--runtime", "/runtime" })).action);
     const local_records = try cli.parse(&.{ "uk-wamr-native-ci", "records", "--output", "handoff-v1", "--runtime", "/runtime" });
@@ -1318,6 +1321,12 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
         &.{ "uk-wamr-native-ci", "records", "--runtime", "/root/../runtime", "--output", "handoff-v1" },
         &.{ "uk-wamr-native-ci", "describe" },
         &.{ "uk-wamr-native-ci", "describe", "--output", "text" },
+        &.{ "uk-wamr-native-ci", "supervisor-source-closure" },
+        &.{ "uk-wamr-native-ci", "supervisor-source-closure", "--output", "sha256-v1" },
+        &.{ "uk-wamr-native-ci", "supervisor-source-closure", "--git", "git", "--output", "sha256-v1" },
+        &.{ "uk-wamr-native-ci", "supervisor-source-closure", "--git", "/usr/bin/git" },
+        &.{ "uk-wamr-native-ci", "supervisor-source-closure", "--output", "json-v1" },
+        &.{ "uk-wamr-native-ci", "supervisor-source-closure", "--output", "sha256-v1", "--git", "/usr/bin/git", "--runtime", "/runtime" },
         &.{ "uk-wamr-native-ci", "boot", "--runtime", "/runtime", "--wamr-source", "/wamr" },
         &.{ "uk-wamr-native-ci", "build", "--runtime", "/runtime" },
         &.{ "uk-wamr-native-ci", "build", "--runtime", "/runtime", "--wamr-source", "../wamr" },
@@ -1337,17 +1346,22 @@ test "import identity source allowlist matches the historical supervisor source 
         \\import importlib.util, json, sys
         \\spec=importlib.util.spec_from_file_location("ci",sys.argv[1])
         \\ci=importlib.util.module_from_spec(spec); spec.loader.exec_module(ci)
-        \\sys.stdout.write(json.dumps(ci.SUPERVISOR_SOURCE_FILES))
+        \\sys.stdout.write(json.dumps({
+        \\    "names": ci.SUPERVISOR_SOURCE_FILES,
+        \\    "closure": ci.supervisor_source_map()["content_closure_sha256"],
+        \\}))
     ;
-    const witness = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" });
+    const witness_path = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" });
     const output = try std.process.run(a, std.testing.io, .{
-        .argv = &.{ options.python_executable, "-B", "-c", script, witness },
+        .argv = &.{ options.python_executable, "-B", "-c", script, witness_path },
         .cwd = .{ .path = options.repository_root },
         .stdout_limit = .limited(8192),
         .stderr_limit = .limited(4096),
     });
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, output.term);
-    const names = try std.json.parseFromSliceLeaky(std.json.Value, a, output.stdout, .{});
+    const witness_json = try std.json.parseFromSliceLeaky(std.json.Value, a, output.stdout, .{});
+    try std.testing.expect(witness_json == .object);
+    const names = witness_json.object.get("names").?;
     try std.testing.expect(names == .array);
     var selected = std.json.Value{ .object = .empty };
     var modified = std.json.Value{ .object = .empty };
@@ -1362,6 +1376,119 @@ test "import identity source allowlist matches the historical supervisor source 
     for (controller.source_custody.closure) |entry|
         try native.object.put(a, entry.name, .null);
     try controller.import_supervisor_identity.validateSourceNames(native);
+    const closure = try controller.import_supervisor_identity.supervisorSourceContentClosure(a, std.testing.io, options.repository_root, options.git_executable);
+    try std.testing.expectEqualStrings(witness_json.object.get("closure").?.string, closure[0..]);
+}
+
+fn writeRelativeFixtureFile(io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: []const u8) !void {
+    if (std.fs.path.dirname(name)) |parent| try dir.createDirPath(io, parent);
+    try writeFixtureFile(io, dir, name, bytes);
+}
+
+fn writeSupervisorSourceFixture(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, skip: ?[]const u8) !void {
+    for (controller.import_supervisor_identity.historical_supervisor_sources) |relative| {
+        if (skip) |skipped| if (std.mem.eql(u8, relative, skipped)) continue;
+        const bytes = try std.fmt.allocPrint(allocator, "fixture:{s}\n", .{relative});
+        defer allocator.free(bytes);
+        try writeRelativeFixtureFile(io, dir, relative, bytes);
+    }
+}
+
+fn appendRelativeFixtureFile(io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: []const u8) !void {
+    const file = try dir.openFile(io, name, .{ .mode = .write_only });
+    defer file.close(io);
+    const size = (try file.stat(io)).size;
+    try file.writePositionalAll(io, bytes, size);
+}
+
+test "supervisor source closure requires tracked clean Git blobs" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const base_path = try allocator.dupe(u8, options.fixture_root);
+    defer allocator.free(base_path);
+    const base = try std.Io.Dir.openDirAbsolute(io, base_path, .{ .iterate = true });
+    defer base.close(io);
+    const name = try std.fmt.allocPrint(allocator, "supervisor-source-fixture-{d}", .{std.os.linux.getpid()});
+    defer allocator.free(name);
+    try base.createDir(io, name, .fromMode(0o700));
+    defer base.deleteTree(io, name) catch @panic("supervisor source fixture cleanup failed");
+    const repo = try base.openDir(io, name, .{ .iterate = true });
+    defer repo.close(io);
+    const path = try std.fs.path.join(allocator, &.{ base_path, name });
+    defer allocator.free(path);
+    try writeSupervisorSourceFixture(allocator, io, repo, null);
+    try fixtureGit(allocator, path, &.{ options.git_executable, "init", "-q" });
+    try fixtureGit(allocator, path, &.{ options.git_executable, "add", "-A" });
+    try fixtureGit(allocator, path, &.{
+        options.git_executable, "-c",  "user.name=Fixture",         "-c", "user.email=fixture@example.invalid",
+        "commit",               "-qm", "supervisor source fixture",
+    });
+    _ = try controller.import_supervisor_identity.supervisorSourceContentClosure(allocator, io, path, options.git_executable);
+    try appendRelativeFixtureFile(
+        io,
+        repo,
+        "support/build/wamr-native-ci/supervisor.zig",
+        "dirty\n",
+    );
+    try std.testing.expectError(error.SourceChanged, controller.import_supervisor_identity.supervisorSourceContentClosure(
+        allocator,
+        io,
+        path,
+        options.git_executable,
+    ));
+
+    const untracked_name = try std.fmt.allocPrint(allocator, "supervisor-source-untracked-{d}", .{std.os.linux.getpid()});
+    defer allocator.free(untracked_name);
+    try base.createDir(io, untracked_name, .fromMode(0o700));
+    defer base.deleteTree(io, untracked_name) catch @panic("supervisor untracked fixture cleanup failed");
+    const untracked_repo = try base.openDir(io, untracked_name, .{ .iterate = true });
+    defer untracked_repo.close(io);
+    const untracked_path = try std.fs.path.join(allocator, &.{ base_path, untracked_name });
+    defer allocator.free(untracked_path);
+    try writeSupervisorSourceFixture(allocator, io, untracked_repo, "support/build/wamr-native-ci/supervisor.zig");
+    try fixtureGit(allocator, untracked_path, &.{ options.git_executable, "init", "-q" });
+    try fixtureGit(allocator, untracked_path, &.{ options.git_executable, "add", "-A" });
+    try fixtureGit(allocator, untracked_path, &.{
+        options.git_executable, "-c",  "user.name=Fixture",         "-c", "user.email=fixture@example.invalid",
+        "commit",               "-qm", "supervisor source fixture",
+    });
+    try writeRelativeFixtureFile(io, untracked_repo, "support/build/wamr-native-ci/supervisor.zig", "untracked\n");
+    try std.testing.expectError(error.UntrackedManifest, controller.import_supervisor_identity.supervisorSourceContentClosure(
+        allocator,
+        io,
+        untracked_path,
+        options.git_executable,
+    ));
+    try untracked_repo.deleteFile(io, "support/build/wamr-native-ci/supervisor.zig");
+    try std.testing.expectError(error.UntrackedManifest, controller.import_supervisor_identity.supervisorSourceContentClosure(
+        allocator,
+        io,
+        untracked_path,
+        options.git_executable,
+    ));
+
+    const missing_name = try std.fmt.allocPrint(allocator, "supervisor-source-missing-{d}", .{std.os.linux.getpid()});
+    defer allocator.free(missing_name);
+    try base.createDir(io, missing_name, .fromMode(0o700));
+    defer base.deleteTree(io, missing_name) catch @panic("supervisor missing fixture cleanup failed");
+    const missing_repo = try base.openDir(io, missing_name, .{ .iterate = true });
+    defer missing_repo.close(io);
+    const missing_path = try std.fs.path.join(allocator, &.{ base_path, missing_name });
+    defer allocator.free(missing_path);
+    try writeSupervisorSourceFixture(allocator, io, missing_repo, null);
+    try fixtureGit(allocator, missing_path, &.{ options.git_executable, "init", "-q" });
+    try fixtureGit(allocator, missing_path, &.{ options.git_executable, "add", "-A" });
+    try fixtureGit(allocator, missing_path, &.{
+        options.git_executable, "-c",  "user.name=Fixture",         "-c", "user.email=fixture@example.invalid",
+        "commit",               "-qm", "supervisor source fixture",
+    });
+    try missing_repo.deleteFile(io, "support/build/wamr-native-ci/supervisor.zig");
+    try std.testing.expectError(error.FileNotFound, controller.import_supervisor_identity.supervisorSourceContentClosure(
+        allocator,
+        io,
+        missing_path,
+        options.git_executable,
+    ));
 }
 
 test "canonical bytes and domain-separated file versus record identity" {
@@ -2244,8 +2371,14 @@ fn copyFixtureExecutable(io: std.Io, a: std.mem.Allocator, path: []const u8, dir
 }
 
 fn fixtureGit(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) !void {
+    const command = try allocator.alloc([]const u8, argv.len + 4);
+    defer allocator.free(command);
+    command[0] = argv[0];
+    const git_config = [_][]const u8{ "-c", "gc.auto=0", "-c", "maintenance.auto=false" };
+    @memcpy(command[1..5], &git_config);
+    @memcpy(command[5..], argv[1..]);
     const result = std.process.run(allocator, std.testing.io, .{
-        .argv = argv,
+        .argv = command,
         .cwd = .{ .path = cwd },
         .stdout_limit = .limited(4096),
         .stderr_limit = .limited(4096),

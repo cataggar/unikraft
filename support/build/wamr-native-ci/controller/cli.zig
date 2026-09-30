@@ -2,7 +2,7 @@
 const std = @import("std");
 const files = @import("hyperv_core").private_files;
 
-pub const Action = enum { build, boot, diagnostics, describe, records, @"local-consumer-custody", @"handoff-inspect", @"public-validator-build", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation" };
+pub const Action = enum { build, boot, diagnostics, describe, @"supervisor-source-closure", records, @"local-consumer-custody", @"handoff-inspect", @"public-validator-build", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation" };
 pub const Command = struct {
     action: Action,
     runtime: ?[]const u8 = null,
@@ -21,6 +21,26 @@ pub fn parse(args: []const []const u8) !Command {
             !std.mem.eql(u8, args[3], "json-v1"))
             return error.InvalidUsage;
         return .{ .action = action };
+    }
+    if (action == .@"supervisor-source-closure") {
+        if (args.len != 6) return error.InvalidUsage;
+        var result = Command{ .action = action };
+        var output = false;
+        var i: usize = 2;
+        while (i < args.len) : (i += 2) {
+            const flag = args[i];
+            const value = args[i + 1];
+            if (std.mem.eql(u8, flag, "--git") and result.git == null) {
+                files.absoluteFilePath(value) catch return error.InvalidUsage;
+                result.git = value;
+            } else if (std.mem.eql(u8, flag, "--output") and !output and
+                std.mem.eql(u8, value, "sha256-v1"))
+            {
+                output = true;
+            } else return error.InvalidUsage;
+        }
+        if (result.git == null or !output) return error.InvalidUsage;
+        return result;
     }
     if (action == .@"local-consumer-custody") {
         if (args.len != 4 or !std.mem.eql(u8, args[2], "--runtime"))
