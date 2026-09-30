@@ -118,11 +118,16 @@ real read-only `vpc` boots). It returns `OfflineAdmission` or an explicit
 It copies pinned Miz, native runner, and QEMU bytes from verified file
 descriptors into a fresh owner-only directory before execution; that
 directory and the private Git runtime require nonreplaceable ancestors.
-QEMU must be the pinned release binary with its release `share/` directory
-beside it: exactly `kvmvapic.bin` and `vgabios-stdvga.bin`, the option ROMs
-that the runner's fixed q35/KVM command loads, are copied into the private
-`share/` directory and pinned by `qemu_support_sha256`. A distribution QEMU
-that resolves ROMs from `../share/qemu` is not supported.
+QEMU must provide a real `vpc` block driver; the pinned `cataggar/qemu`
+release used by `prepare` omits it (that path boots the fixed VHD through the
+raw driver), so it cannot pass the `vpc` boots. The runner's fixed q35/KVM
+command loads exactly `kvmvapic.bin` and `vgabios-stdvga.bin`, which QEMU
+resolves relative to its own directory. `OfflineInputs.qemu_support` names
+those two files as `[../]share/[dir/]<rom>` paths: the default is the
+relocatable `share/` layout, while a distribution QEMU in `/usr/bin` typically
+needs `../share/qemu/kvmvapic.bin` and `../share/seavgabios/vgabios-stdvga.bin`.
+Runner and QEMU are copied into a private `bin/` directory, the ROMs into the
+same relative paths, and `qemu_support_sha256` pins each path, size and hash.
 The caller must authenticate the reviewed build and tool pins independently;
 a self-reported build receipt or saved local-boot report is insufficient.
 No private pins, images, QEMU installation, or build proof are supplied here.
