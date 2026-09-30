@@ -139,6 +139,15 @@ unspecified target before creating a slot. `describe --output json-v1`
 reports that fixed target and the embedded source-content closure without
 accessing a runtime or granting boot authority.
 
+The protected native-compute workflow installs this same portable controller
+from the checked-out source after pinned Zig setup at
+`/d/wamr-ci/wamr-native-controller/controller/bin/uk-wamr-native-ci`. That
+path is the production bootstrap target for the remaining build/boot cutover
+slices, and the workflow obtains the recorded executable target from native
+`describe --output json-v1` instead of importing `run.py`. The separate
+`/d/wamr-ci/wamr-differential-controller` install name remains limited to the
+paired differential fault jobs.
+
 The native custody library now exposes clean Git tracked-object/physical
 source and ignored-output checks, fixed-revision create-only WAMR archive
 sealing, Bison and consumer-input-v2 file/tree/ELF-runtime custody, and pinned
