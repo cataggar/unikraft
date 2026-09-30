@@ -24,7 +24,7 @@ python3 support/build/wamr-native-ci/run.py boot --runtime "$1"
 
 source_root=/d/wamr-ci/wamr-differential-sources
 comparison_root=/d/wamr-ci/wamr-differential
-controller=/d/wamr-ci/wamr-differential-controller/controller/bin/uk-wamr-native-ci
+controller=/d/wamr-ci/wamr-native-controller/controller/bin/uk-wamr-native-ci
 python_source="${source_root}/python"
 native_source="${source_root}/native"
 shopt -s nullglob dotglob

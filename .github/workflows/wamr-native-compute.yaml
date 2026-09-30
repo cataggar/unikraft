@@ -14,6 +14,9 @@ jobs:
   wamr-native-compute:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
+    env:
+      WAMR_NATIVE_CONTROLLER_ROOT: /d/wamr-ci/wamr-native-controller
+      WAMR_CI_CONTROLLER: /d/wamr-ci/wamr-native-controller/controller/bin/uk-wamr-native-ci
     outputs:
       inner-zip-sha256: ${{ steps.public_binding.outputs.inner_zip_sha256 }}
       inner-zip-bytes: ${{ steps.public_binding.outputs.inner_zip_bytes }}
@@ -123,14 +126,22 @@ jobs:
               PYTHONPATH="${source_root}/support/build/wamr-native-ci/tests:${source_root}/support/build/wamr-native-ci" \
               python3 -B -m unittest -q test_differential_parity.DeterministicContracts
           )
-          controller_root=/d/wamr-ci/wamr-differential-controller
+
+      - name: Install the production portable native controller
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          umask 077
+          controller_root="${WAMR_NATIVE_CONTROLLER_ROOT:?}"
           test ! -e "${controller_root}"
           mkdir -m 0700 -- "${controller_root}"
-          ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
-            zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
+          mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-native-controller-cache"
+          ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-native-controller-cache" \
+            zig build --build-file support/build/wamr-native-ci/build.zig \
               -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=ReleaseSafe \
               -Dcontroller-runtime="${controller_root}" -j2 install-controller
-          test -x "${controller_root}/controller/bin/uk-wamr-native-ci"
+          rm -rf support/build/wamr-native-ci/.zig-cache support/build/wamr-native-ci/zig-pkg
+          test -x "${WAMR_CI_CONTROLLER:?}"
 
       - name: Record the runner CPU and portable executable target
         run: |
@@ -152,17 +163,24 @@ jobs:
           fi
           echo "Runner CPU model: ${model:-unknown}"
           echo "Zig native CPU: ${zig_cpu}"
-          python3 -B - <<'PY'
-          import importlib.util
-          from pathlib import Path
+          controller="${WAMR_CI_CONTROLLER:?}"
+          test -x "${controller}"
+          describe="$("${controller}" describe --output json-v1)"
+          recorded_target="$(python3 -B -c '
+          import json
+          import sys
 
-          path = Path("support/build/wamr-native-ci/run.py").resolve()
-          spec = importlib.util.spec_from_file_location("wamr_native_ci", path)
-          module = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(module)
-          print("Recorded supervisor/validator target:",
-                " ".join(module.RECORDED_EXECUTABLE_TARGET))
-          PY
+          payload = json.load(sys.stdin)
+          target = payload.get("recorded_executable_target")
+          if (payload.get("schema") != "uk.wamr.native-ci-describe" or
+              payload.get("schema_version") != 1 or
+              not isinstance(target, list) or
+              not target or
+              not all(isinstance(item, str) for item in target)):
+              raise SystemExit("native controller describe returned an invalid target")
+          print(" ".join(target))
+          ' <<< "${describe}")"
+          echo "Recorded supervisor/validator target: ${recorded_target}"
 
       - name: Acquire the existing native LLVM distribution
         uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495
@@ -253,7 +271,7 @@ jobs:
         timeout-minutes: 20
         run: |
           set -euo pipefail
-          controller=/d/wamr-ci/wamr-differential-controller/controller/bin/uk-wamr-native-ci
+          controller="${WAMR_CI_CONTROLLER:?}"
           root=/d/wamr-ci/wamr-native-runtime
           "${controller}" local-consumer-custody --runtime "${root}"
 
@@ -261,7 +279,7 @@ jobs:
         id: public_bundle
         timeout-minutes: 15
         env:
-          WAMR_CI_CONTROLLER: /d/wamr-ci/wamr-differential-controller/controller/bin/uk-wamr-native-ci
+          WAMR_CI_CONTROLLER: /d/wamr-ci/wamr-native-controller/controller/bin/uk-wamr-native-ci
           GITHUB_REPOSITORY_VISIBILITY: ${{ github.event.repository.private == false && 'public' || 'private' }}
           WAMR_CI_RUNTIME: /d/wamr-ci/wamr-native-runtime
         run: |
@@ -431,7 +449,7 @@ jobs:
           ARTIFACT_URL: ${{ steps.public_upload.outputs.artifact-url }}
           REDOWNLOAD_DIR: ${{ steps.public_redownload.outputs.destination }}
           SOURCE_TREE: ${{ steps.public_bundle.outputs.source_tree }}
-          WAMR_CI_CONTROLLER: /d/wamr-ci/wamr-differential-controller/controller/bin/uk-wamr-native-ci
+          WAMR_CI_CONTROLLER: /d/wamr-ci/wamr-native-controller/controller/bin/uk-wamr-native-ci
         run: |
           set -euo pipefail
           export PYTHONDONTWRITEBYTECODE=1
@@ -632,7 +650,7 @@ jobs:
           imported=/d/wamr-ci/wamr-native-runtime/compute/public-source/exact-redownload/success
           stage="${RUNNER_TEMP}/wamr-inner-stage"
           output="${RUNNER_TEMP}/wamr-imported-handoff-v1.json"
-          controller=/d/wamr-ci/wamr-differential-controller/controller/bin/uk-wamr-native-ci
+          controller="${WAMR_CI_CONTROLLER:?}"
           test -x "${controller}"
           test ! -e "${stage}"
           test ! -e "${output}"
