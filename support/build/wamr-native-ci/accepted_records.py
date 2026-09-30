@@ -315,6 +315,48 @@ def handoff_inspect(runtime, output):
     return output / "private/handoff-inspect.log", output / "evidence/command-handoff-inspect.json"
 
 
+def import_native_revalidation(stage_root, output):
+    """Build and run the fixed native validator for a pristine trusted v2 stage."""
+    stage_root, output = map(Path, (stage_root, output))
+    refusal = "native controller import revalidation refused"
+    try:
+        stage_root = _absolute(stage_root)
+        _absolute(output.parent)
+    except (OSError, ValueError) as error:
+        raise ValueError(refusal) from error
+    if (not output.is_absolute()
+            or os.path.normpath(str(output)) != str(output)
+            or os.path.lexists(output)):
+        _refuse(refusal)
+    raw, stderr_seen = _controller_command((
+        "import-native-revalidation",
+        "--stage-root", str(stage_root), "--output", str(output)), refusal)
+    if raw or stderr_seen:
+        _refuse(refusal)
+    try:
+        for path in (output, output / "private", output / "evidence"):
+            info = path.lstat()
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) != 0o700):
+                _refuse(refusal)
+        for path, bound in (
+                (output / "private/import-native-revalidation.log", 4096),
+                (output / "evidence/command-import-native-revalidation.json",
+                 MAX_RECORDS_BYTES)):
+            info = path.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                    or not 0 < info.st_size <= bound):
+                _refuse(refusal)
+        if (output / "private/import-native-revalidation.log").read_bytes() != (
+                b"Compute handoff revalidated; authority=not_admitted.\n"):
+            _refuse(refusal)
+    except OSError as error:
+        raise ValueError(refusal) from error
+    return output
+
+
 def local_runtime(runtime):
     """Local handoff requires native v2; historical v1 is import-only."""
     runtime = _absolute(runtime)

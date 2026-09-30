@@ -152,6 +152,54 @@ class NativeRecordBridge(unittest.TestCase):
                     bridge.supervisor_import_identity(
                         stage, supervisor, git, output)
 
+    def test_imported_native_revalidation_requires_private_native_evidence(self):
+        bridge = public_bundle.accepted_records
+        root, controller = self.controller_fixture(
+            "import os, pathlib, sys\n"
+            "output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
+            "mode = os.environ['WAMR_CI_TEST_MODE']\n"
+            "if mode == 'failed': sys.exit(1)\n"
+            "if mode == 'missing': sys.exit(0)\n"
+            "output.mkdir(mode=0o700)\n"
+            "for name in ('private', 'evidence', 'public-source', 'cache', 'global-cache'):\n"
+            "    (output / name).mkdir(mode=0o700)\n"
+            "validator = output / 'public-source/tools/bin/uk-wamr-direct-validate'\n"
+            "validator.parent.mkdir(mode=0o700, parents=True)\n"
+            "validator.write_bytes(b'\\x7fELF\\x02\\x01' + b'x' * 32)\n"
+            "validator.chmod(0o500)\n"
+            "files = {\n"
+            "  'private/import-validator-build.log': b'build',\n"
+            "  'private/import-native-revalidation.log': b'Compute handoff revalidated; authority=not_admitted.\\n',\n"
+            "  'private/candidate-bundle.json': b'{}\\n',\n"
+            "  'evidence/command-import-validator-build.json': b'{}',\n"
+            "  'evidence/command-import-native-revalidation.json': b'{}',\n"
+            "}\n"
+            "for name, data in files.items():\n"
+            "    path = output / name\n"
+            "    path.write_bytes(data)\n"
+            "    path.chmod(0o644 if mode == 'public' else 0o600)\n"
+            "if mode == 'stdout': os.write(1, b'unexpected')\n"
+            "if mode == 'stderr': os.write(2, b'unexpected')\n")
+        stage = root / "stage"
+        stage.mkdir(mode=0o700)
+        with mock.patch.dict(os.environ, {
+                bridge.CONTROLLER_ENV: str(controller),
+                "WAMR_CI_TEST_MODE": "accepted"}):
+            output = root / "accepted"
+            self.assertEqual(
+                bridge.import_native_revalidation(stage, output), output)
+            with mock.patch.object(bridge.subprocess, "Popen") as spawn, \
+                    self.assertRaisesRegex(ValueError, "revalidation refused"):
+                bridge.import_native_revalidation(stage, output)
+            spawn.assert_not_called()
+        for mode in ("failed", "missing", "public", "stdout", "stderr"):
+            with self.subTest(mode=mode), mock.patch.dict(os.environ, {
+                    bridge.CONTROLLER_ENV: str(controller),
+                    "WAMR_CI_TEST_MODE": mode}):
+                output = root / mode
+                with self.assertRaisesRegex(ValueError, "revalidation refused"):
+                    bridge.import_native_revalidation(stage, output)
+
     def test_oversized_native_stdout_and_stderr_are_killed_and_reaped(self):
         bridge = public_bundle.accepted_records
         for descriptor in (1, 2):
@@ -673,6 +721,186 @@ class NativeRecordBridge(unittest.TestCase):
                 [call.args[1] for call in run.call_args_list],
                 ["supervisor-import-identity", "native-revalidation"])
 
+    def test_trusted_v2_import_routes_revalidation_to_native_before_candidate(self):
+        root, unused_controller = self.controller_fixture("")
+        del unused_controller
+        sha256 = hashlib.sha256(b"x").hexdigest()
+        item = lambda path: {"path": path, "size": 1, "sha256": sha256}
+        v2_names = (
+            "efi", "debug_elf", "bootinfo", "raw", "qcow2", "vhd",
+            "runtime", "compiler", "wasm", "cwasm", "config",
+            "runtime_identity", "image_identity", "local_result", "package",
+            "build", "build_start", "boot_inputs",
+            "qcow2_finalization_intent", "qcow2_finalization",
+            "qcow2_acceptance", "fixed_vhd_derivation_intent",
+            "fixed_vhd_derivation_gate", "fixed_vhd_derivation",
+            "final_inspection", "cleanup")
+        artifacts = [item("artifacts/" + name) for name in v2_names]
+        by_name = dict(zip(v2_names, artifacts))
+        boots = [{
+            "mode": mode,
+            **{
+                key: item(f"boots/{mode}/{key}")
+                for key in public_bundle.BOOT_KEYS
+            },
+        } for mode in ci.SIX_MODES]
+        evidence = [
+            item("evidence/" + name)
+            for name in sorted(public_bundle.V2_EVIDENCE)
+        ]
+        source = {
+            "repository": "cataggar/unikraft",
+            "run_id": "123",
+            "run_attempt": "1",
+            "source_revision": "1" * 40,
+            "source_tree": "2" * 40,
+            "wamr_revision": ci.REVISION,
+        }
+        bundle = {
+            "schema": "uk.wamr.local-image-handoff",
+            "version": 2,
+            "profile": ci.CURRENT_PROFILE,
+            "authority": "not_admitted",
+            "source_revision": source["source_revision"],
+            "source_tree": source["source_tree"],
+            "run": {
+                key: source[key]
+                for key in ("repository", "run_id", "run_attempt")
+            },
+            "identity": {
+                "wamr_revision": ci.REVISION,
+                **{
+                    name + "_sha256": sha256
+                    for name in (
+                        "wasm", "cwasm", "runtime", "compiler", "config")
+                },
+            },
+            "lineage": {
+                "raw_sha256": by_name["raw"]["sha256"],
+                "accepted_qcow2_sha256": by_name["qcow2"]["sha256"],
+                "derived_vhd_sha256": by_name["vhd"]["sha256"],
+                "qcow2_finalization_sha256":
+                    by_name["qcow2_finalization"]["sha256"],
+                "qcow2_acceptance_sha256":
+                    by_name["qcow2_acceptance"]["sha256"],
+                "fixed_vhd_derivation_gate_sha256":
+                    by_name["fixed_vhd_derivation_gate"]["sha256"],
+                "fixed_vhd_derivation_sha256":
+                    by_name["fixed_vhd_derivation"]["sha256"],
+                "final_inspection_sha256":
+                    by_name["final_inspection"]["sha256"],
+            },
+            "artifacts": artifacts,
+            "boots": boots,
+            "evidence": evidence,
+        }
+        handoff = types.SimpleNamespace(
+            ci=ci, NAMES=(), V2_NAMES=v2_names, private=mock.Mock(),
+            FAILURE_STAGE="")
+        selected = public_bundle.members(handoff, bundle)
+        manifest = {
+            "schema": "uk.wamr.public-source-bundle",
+            "version": 2,
+            "profile": ci.CURRENT_PROFILE,
+            "authority": "not_admitted",
+            "source": source,
+            "members": {
+                name: {"size": value["size"], "sha256": value["sha256"]}
+                for name, value in selected.items()
+            },
+        }
+        archive = root / "trusted-v2.zip"
+        with zipfile.ZipFile(
+                archive, "w", compression=zipfile.ZIP_STORED,
+                allowZip64=False) as output:
+            for name in sorted(selected):
+                info = zipfile.ZipInfo(name)
+                info.create_system = 3
+                info.external_attr = (stat.S_IFREG | 0o600) << 16
+                output.writestr(info, b"x")
+            for name, value in (
+                    ("bundle.json", bundle),
+                    ("public-source.json", manifest)):
+                info = zipfile.ZipInfo(name)
+                info.create_system = 3
+                info.external_attr = (stat.S_IFREG | 0o600) << 16
+                output.writestr(info, public_bundle.encoded(value))
+        archive.chmod(0o600)
+        accepted = {
+            "context": "trusted-inner-zip",
+            "compatibility": "tiny-v2",
+            "source": {
+                "revision": source["source_revision"],
+                "tree": source["source_tree"],
+            },
+            "result": {"sha256": by_name["local_result"]["sha256"]},
+            "records": [
+                {"name": Path(record["path"]).name, "sha256": record["sha256"]}
+                for record in evidence
+            ],
+        }
+        output = root / "success"
+
+        def native_revalidation(stage, native_output):
+            self.assertEqual(stage, output)
+            self.assertFalse((stage / "transport.json").exists())
+            self.assertFalse((stage / "candidate-bundle.json").exists())
+            return Path(native_output)
+
+        with mock.patch.object(
+                public_bundle.accepted_records, "imported_stage",
+                return_value=accepted) as imported, \
+                mock.patch.object(
+                    public_bundle.accepted_records,
+                    "supervisor_import_identity",
+                    side_effect=lambda unused_stage, unused_supervisor,
+                        unused_git, output: Path(output)) as identity, \
+                mock.patch.object(
+                    public_bundle.accepted_records,
+                    "import_native_revalidation",
+                    side_effect=native_revalidation) as revalidation, \
+                mock.patch.object(
+                    public_bundle, "publication_records") as records, \
+                mock.patch.object(
+                    public_bundle, "native",
+                    side_effect=AssertionError(
+                        "Python revalidated trusted v2 import")):
+            public_bundle.import_bundle(
+                handoff, archive, output, source, ci.digest(archive),
+                root / "validator", root / "supervisor",
+                artifact_id="123", container_digest="0" * 64)
+        imported.assert_called_once_with(output)
+        identity.assert_called_once()
+        revalidation.assert_called_once()
+        records.assert_called_once()
+        self.assertTrue((output / "transport.json").exists())
+        self.assertTrue((output / "candidate-bundle.json").exists())
+        self.assertTrue((output / "bundle.json").exists())
+        refused = root / "refused"
+        with mock.patch.object(
+                public_bundle.accepted_records, "imported_stage",
+                return_value=accepted), \
+                mock.patch.object(
+                    public_bundle.accepted_records,
+                    "supervisor_import_identity",
+                    side_effect=lambda unused_stage, unused_supervisor,
+                        unused_git, output: Path(output)), \
+                mock.patch.object(
+                    public_bundle.accepted_records,
+                    "import_native_revalidation",
+                    side_effect=ValueError(
+                        "native controller import revalidation refused")):
+            with self.assertRaisesRegex(ValueError, "revalidation refused"):
+                public_bundle.import_bundle(
+                    handoff, archive, refused, source, ci.digest(archive),
+                    root / "validator", root / "supervisor",
+                    artifact_id="123", container_digest="0" * 64)
+        self.assertEqual(
+            handoff.FAILURE_STAGE, "public-import-native-revalidation")
+        self.assertFalse((refused / "transport.json").exists())
+        self.assertFalse((refused / "candidate-bundle.json").exists())
+        self.assertFalse((refused / "bundle.json").exists())
+
     def test_real_archive_requires_native_acceptance_before_publication(self):
         bridge = public_bundle.accepted_records
         stage = os.environ.get("WAMR_CI_NATIVE_IMPORT_FIXTURE")
@@ -714,7 +942,11 @@ class NativeRecordBridge(unittest.TestCase):
                 mock.patch.object(
                     bridge, "supervisor_import_identity",
                     side_effect=lambda unused_stage, unused_supervisor,
-                        unused_git, output: Path(output)) as identity:
+                        unused_git, output: Path(output)) as identity, \
+                mock.patch.object(
+                    bridge, "import_native_revalidation",
+                    side_effect=lambda unused_stage, output: Path(output)
+                ) as revalidation:
             with self.assertRaisesRegex(RuntimeError, "after native acceptance"):
                 public_bundle.import_bundle(
                     handoff, archive, output, source, ci.digest(archive),
@@ -722,7 +954,11 @@ class NativeRecordBridge(unittest.TestCase):
                     artifact_id="123", container_digest="0" * 64)
         self.assertEqual(handoff.FAILURE_STAGE, "public-import-records")
         identity.assert_called_once()
+        revalidation.assert_called_once()
         self.assertTrue((root / "import-native-identity").is_dir())
+        self.assertEqual(
+            revalidation.call_args.args[1],
+            root / "import-native-identity/revalidation")
         self.assertTrue((output / "candidate-bundle.json").exists())
         self.assertFalse((output / "bundle.json").exists())
         with mock.patch.object(
@@ -763,6 +999,27 @@ class NativeRecordBridge(unittest.TestCase):
         self.assertFalse((identity_refused / "transport.json").exists())
         self.assertFalse((identity_refused / "candidate-bundle.json").exists())
         self.assertFalse((identity_refused / "bundle.json").exists())
+        revalidation_refused = root / "native-revalidation-refused"
+        with mock.patch.object(
+                bridge, "supervisor_import_identity",
+                side_effect=lambda unused_stage, unused_supervisor,
+                    unused_git, output: Path(output)), \
+                mock.patch.object(
+                    bridge, "import_native_revalidation",
+                    side_effect=ValueError(
+                        "native controller import revalidation refused")):
+            with self.assertRaisesRegex(ValueError, "revalidation refused"):
+                public_bundle.import_bundle(
+                    handoff, archive, revalidation_refused, source,
+                    ci.digest(archive), Path("/unused/validator"),
+                    Path("/unused/supervisor"), artifact_id="123",
+                    container_digest="0" * 64)
+        self.assertEqual(
+            handoff.FAILURE_STAGE, "public-import-native-revalidation")
+        self.assertFalse((revalidation_refused / "transport.json").exists())
+        self.assertFalse(
+            (revalidation_refused / "candidate-bundle.json").exists())
+        self.assertFalse((revalidation_refused / "bundle.json").exists())
 
 
 class Contract(unittest.TestCase):

@@ -1713,7 +1713,7 @@ def import_bundle(
             Path(item["path"]).name: item["sha256"]
             for item in bundle["evidence"]
         })
-    native_identity = None
+    native_revalidation = None
     if bundle["version"] == 2:
         require(expected_archive_sha256 is not None
                 and type(artifact_id) is str
@@ -1721,9 +1721,12 @@ def import_bundle(
                 and type(container_digest) is str)
         digest_string(container_digest)
         handoff.FAILURE_STAGE = "public-import-native-supervisor-identity"
-        native_identity = accepted_records.supervisor_import_identity(
+        accepted_records.supervisor_import_identity(
             output, supervisor, handoff.ci.tool("git"),
             identity_parent / "accepted")
+        handoff.FAILURE_STAGE = "public-import-native-revalidation"
+        native_revalidation = accepted_records.import_native_revalidation(
+            output, identity_parent / "revalidation")
         handoff.ci.save(output / "transport.json", {
             "schema": "uk.wamr.public-source-transport",
             "version": 2,
@@ -1744,11 +1747,14 @@ def import_bundle(
         handoff, output, expected, "trusted_inner_zip",
         "candidate-bundle.json",
         native_accepted=accepted if bundle["version"] == 2 else None)
-    handoff.FAILURE_STAGE = "public-import-revalidation"
-    native(
-        handoff, validator, supervisor,
-        output / "candidate-bundle.json", expected,
-        native_identity=native_identity)
+    if bundle["version"] == 2:
+        require(native_revalidation is not None)
+        handoff.private(native_revalidation)
+    else:
+        handoff.FAILURE_STAGE = "public-import-revalidation"
+        native(
+            handoff, validator, supervisor,
+            output / "candidate-bundle.json", expected)
     # Only a fully revalidated import publishes the operator-facing bundle.
     handoff.ci.save(output / "bundle.json", bundle)
     return bundle

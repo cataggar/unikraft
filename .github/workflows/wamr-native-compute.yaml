@@ -523,6 +523,9 @@ jobs:
             --supervisor "${supervisor}" \
             --artifact-id "${ARTIFACT_ID}" \
             --container-digest "${CONTAINER_DIGEST}"
+          native_revalidation="${import_root}/success-native-identity/revalidation"
+          test -s "${native_revalidation}/private/import-native-revalidation.log"
+          test -s "${native_revalidation}/evidence/command-import-native-revalidation.json"
           python3 support/build/wamr-native-ci/handoff.py candidate \
             --bundle "${import_root}/success/bundle.json" \
             --output "${import_root}/candidate-scope.json"
@@ -742,84 +745,6 @@ jobs:
                       {"kind": "path", "role": "command-supervisor", "relative": ""},
                       {"kind": "literal", "value": "--identity"}]):
               raise SystemExit("native imported supervisor identity record refused")
-          PY
-          imported_validator="${identity_parent}/validator"
-          test ! -e "${imported_validator}"
-          "${controller}" import-validator-build \
-            --stage-root "${stage}" --output "${imported_validator}"
-          test -x "${imported_validator}/public-source/tools/bin/uk-wamr-direct-validate"
-          python3 -B - "${imported_validator}" <<'PY'
-          import hashlib
-          import json
-          from pathlib import Path
-          import sys
-
-          root = Path(sys.argv[1])
-          log = (root / "private/import-validator-build.log").read_bytes()
-          record = json.loads(
-              (root / "evidence/command-import-validator-build.json").read_bytes())
-          binary = (root / "public-source/tools/bin/uk-wamr-direct-validate").read_bytes()
-          if (record["scope"] != "command_diagnostic_not_acceptance"
-                  or record["stage"] != "import-validator-build"
-                  or record["exit_code"] != 0
-                  or record["bytes"] != len(log)
-                  or record["sha256"] != hashlib.sha256(log).hexdigest()
-                  or record["supervisor"]["request"]["native_executable"]["path"] != {
-                      "kind": "path", "role": "tool:zig", "relative": ""}
-                  or binary[:6] != b"\x7fELF\x02\x01"
-                  or binary[18:20] != b"\x3e\x00"):
-              raise SystemExit("native imported validator build record refused")
-          PY
-          revalidation="${identity_parent}/revalidation"
-          test ! -e "${revalidation}"
-          "${controller}" import-native-revalidation \
-            --stage-root "${stage}" --output "${revalidation}"
-          python3 -B - "${stage}" "${revalidation}" <<'PY'
-          import hashlib
-          import json
-          from pathlib import Path
-          import sys
-
-          stage, root = (Path(arg) for arg in sys.argv[1:])
-          portable = json.loads((stage / "portable-bundle.json").read_bytes())
-          candidate_path = root / "private/candidate-bundle.json"
-          candidate_raw = candidate_path.read_bytes()
-          candidate = json.loads(candidate_raw)
-          for original, member in zip(portable["artifacts"], candidate["artifacts"], strict=True):
-              original["path"] = str(stage / original["path"])
-              if member != original:
-                  raise SystemExit("native revalidation artifact candidate refused")
-          for original, member in zip(portable["evidence"], candidate["evidence"], strict=True):
-              original["path"] = str(stage / original["path"])
-              if member != original:
-                  raise SystemExit("native revalidation evidence candidate refused")
-          for original, member in zip(portable["boots"], candidate["boots"], strict=True):
-              for part in ("serial", "request", "report", "compute"):
-                  original[part]["path"] = str(stage / original[part]["path"])
-              if member != original:
-                  raise SystemExit("native revalidation boot candidate refused")
-          if candidate != portable or candidate_raw != (
-                  json.dumps(candidate, sort_keys=True, separators=(",", ":")).encode() + b"\n"):
-              raise SystemExit("native revalidation candidate refused")
-          log = (root / "private/import-native-revalidation.log").read_bytes()
-          record = json.loads(
-              (root / "evidence/command-import-native-revalidation.json").read_bytes())
-          expected = b"Compute handoff revalidated; authority=not_admitted.\n"
-          request = record["supervisor"]["request"]
-          if (log != expected or record["scope"] != "command_diagnostic_not_acceptance"
-                  or record["stage"] != "import-native-revalidation"
-                  or record["exit_code"] != 0
-                  or record["bytes"] != len(log)
-                  or record["sha256"] != hashlib.sha256(log).hexdigest()
-                  or record["supervisor"]["result"]["command"]["stdout"]["bytes"] != len(expected)
-                  or record["supervisor"]["result"]["command"]["stderr"]["bytes"] != 0
-                  or request["native_executable"]["path"] != {
-                      "kind": "path", "role": "input:validator", "relative": ""}
-                  or request["argv"] != [
-                      {"kind": "path", "role": "input:validator", "relative": ""},
-                      {"kind": "literal", "value": "handoff"},
-                      {"kind": "path", "role": "input:bundle", "relative": ""}]):
-              raise SystemExit("native revalidation command refused")
           PY
           tampered="${identity_parent}/tampered-supervisor"
           test ! -e "${tampered}"
