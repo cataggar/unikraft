@@ -1056,49 +1056,62 @@ def export(runtime, output, *, on_phase=None):
     modes = ci.MODES if version == 1 else (
         ci.SIX_MODES if accepted is None else tuple(accepted["modes"]))
     names = NAMES if version == 1 else V2_NAMES
+    native_produced = accepted is not None
     expected = ci.document(root / "evidence/build-start.json")
-    legacy_supervision = "command_supervisor" not in expected
-    if not legacy_supervision:
-        ci.COMMAND_ENVIRONMENT.update(ci.bind_command_tools(
-            expected["consumer_inputs"]))
-    else:
-        ci.COMMAND_ENVIRONMENT.clear()
-        ci.COMMAND_TOOL_PATHS.clear()
-        supervisor_path = ci.bind_command_supervisor(
-            expected["consumer_inputs"])
-        ci.COMMAND_ENVIRONMENT["WAMR_CI_SUPERVISOR"] = supervisor_path
-    phase("custody")
-    before = ci.producer_inputs(runtime, expected["consumer_inputs"])
-    ci.require(before == expected,
-               "producer inputs changed")
-    phase("build")
-    build = ci.check_build()
-    ci.require(build == ci.document(root / "evidence/build.json"), "build changed")
-    if accepted is not None:
+    if native_produced:
+        build = ci.document(root / "evidence/build.json")
         ci.require(build["source"] == accepted["source"], "native source changed")
-    inputs = ci.document(root / "evidence/boot-inputs.json")
-    tools = {"package_tool": root / "tools/bin/wamr-ci-package",
-             "local_boot_tool": root / "tools/bin/uk-hyperv-local-boot",
-             "qemu": runtime / "bin/qemu-system-x86_64",
-             "ovmf_code": runtime / "firmware/code.fd",
-             "ovmf_vars": runtime / "firmware/vars.fd",
-             "efi": ci.APP / "build" / ci.EFI}
-    phase("boots")
-    ci.boot_input_state(runtime, tools, expected=inputs)
-    for i, mode in enumerate(modes):
-        checked = ci.check_boot(
-            ci.config_for(runtime, root, i, modes), build["runtime"], inputs,
-            consumer_inputs=expected["consumer_inputs"])
-        ci.require(checked == ci.document(root / "evidence" / (mode + "-compute.json")),
-                   "physical local result changed")
-    ci.require_build_custody(runtime, before)
-    phase("inspect")
-    inspected_output, unused_inspected_command = (
-        accepted_records.handoff_inspect(
-            runtime, output, legacy=legacy_supervision))
-    del unused_inspected_command
-    for name in ("artifacts", "boots"):
-        (output / name).mkdir(mode=0o700)
+        phase("inspect")
+        inspected_output, unused_inspected_command = (
+            accepted_records.handoff_inspect(runtime, output))
+        del unused_inspected_command
+        for name in ("artifacts", "boots"):
+            (output / name).mkdir(mode=0o700)
+    else:
+        legacy_supervision = "command_supervisor" not in expected
+        if (not legacy_supervision
+                and "command-supervisor" in expected["consumer_inputs"]["files"]):
+            ci.COMMAND_ENVIRONMENT.update(ci.bind_command_tools(
+                expected["consumer_inputs"]))
+        elif legacy_supervision:
+            ci.COMMAND_ENVIRONMENT.clear()
+            ci.COMMAND_TOOL_PATHS.clear()
+            supervisor_path = ci.bind_command_supervisor(
+                expected["consumer_inputs"])
+            ci.COMMAND_ENVIRONMENT["WAMR_CI_SUPERVISOR"] = supervisor_path
+        phase("custody")
+        before = ci.producer_inputs(runtime, expected["consumer_inputs"])
+        ci.require(before == expected,
+                   "producer inputs changed")
+        phase("build")
+        build = ci.check_build()
+        ci.require(build == ci.document(root / "evidence/build.json"), "build changed")
+        inputs = ci.document(root / "evidence/boot-inputs.json")
+        tools = {"package_tool": root / "tools/bin/wamr-ci-package",
+                 "local_boot_tool": root / "tools/bin/uk-hyperv-local-boot",
+                 "qemu": runtime / "bin/qemu-system-x86_64",
+                 "ovmf_code": runtime / "firmware/code.fd",
+                 "ovmf_vars": runtime / "firmware/vars.fd",
+                 "efi": ci.APP / "build" / ci.EFI}
+        phase("boots")
+        ci.boot_input_state(runtime, tools, expected=inputs)
+        for i, mode in enumerate(modes):
+            checked = ci.check_boot(
+                ci.config_for(runtime, root, i, modes), build["runtime"], inputs,
+                consumer_inputs=expected["consumer_inputs"])
+            ci.require(checked == ci.document(root / "evidence" / (mode + "-compute.json")),
+                       "physical local result changed")
+        ci.require_build_custody(runtime, before)
+        if legacy_supervision and ci.COMMAND_SUPERVISOR_PATH is not None:
+            ci.COMMAND_ENVIRONMENT[
+                "WAMR_CI_SUPERVISOR"] = ci.COMMAND_SUPERVISOR_PATH
+        phase("inspect")
+        inspected_output, unused_inspected_command = (
+            accepted_records.handoff_inspect(
+                runtime, output, legacy=legacy_supervision))
+        del unused_inspected_command
+        for name in ("artifacts", "boots"):
+            (output / name).mkdir(mode=0o700)
     inspected = ci.document(inspected_output)
     packaged = ci.document(root / "evidence/package.json")
     ci.require(inspected["producer_sha256"] == packaged["producer_sha256"]
@@ -1170,11 +1183,15 @@ def export(runtime, output, *, on_phase=None):
     evidence = [retain(root / "evidence" / name, output / "evidence" / name)
                 for name in sorted(records)]
     phase("recheck")
-    ci.require(result_records(root) == records and ci.check_build() == build
-               and ci.producer_inputs(
-                   runtime, expected["consumer_inputs"]) == before,
-               "inputs changed during handoff")
-    ci.boot_input_state(runtime, tools, content=True, expected=inputs)
+    if native_produced:
+        ci.require(result_records(root) == records,
+                   "inputs changed during handoff")
+    else:
+        ci.require(result_records(root) == records and ci.check_build() == build
+                   and ci.producer_inputs(
+                       runtime, expected["consumer_inputs"]) == before,
+                   "inputs changed during handoff")
+        ci.boot_input_state(runtime, tools, content=True, expected=inputs)
     by_name = dict(zip(names, artifacts))
     bundle = {
         "schema": "uk.wamr.local-image-handoff", "version": 1,

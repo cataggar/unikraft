@@ -246,6 +246,40 @@ class NativeRecordBridge(unittest.TestCase):
                 bridge.import_native_revalidation(stage, output), output)
         command.assert_called_once()
 
+    def test_public_validator_build_uses_dedicated_timeout(self):
+        bridge = public_bundle.accepted_records
+        root, unused_controller = self.controller_fixture("")
+        del unused_controller
+        runtime = root / "runtime"
+        runtime.mkdir(mode=0o700)
+        output = root / "validator"
+
+        def accepted(arguments, refusal, *, timeout_seconds=None):
+            self.assertEqual(arguments, (
+                "public-validator-build",
+                "--runtime", str(runtime), "--output", str(output)))
+            self.assertEqual(
+                refusal, "native public validator build refused")
+            self.assertEqual(
+                timeout_seconds, bridge.VALIDATOR_BUILD_TIMEOUT_SECONDS)
+            self.assertNotEqual(timeout_seconds, bridge.RECORDS_TIMEOUT_SECONDS)
+            output.mkdir(mode=0o700)
+            (output / "private").mkdir(mode=0o700)
+            (output / "evidence").mkdir(mode=0o700)
+            for path, content in (
+                    (output / "private/public-validator-build.log", b""),
+                    (output / "evidence/command-public-validator-build.json",
+                     b"{}")):
+                path.write_bytes(content)
+                path.chmod(0o600)
+            return b"", False
+
+        with mock.patch.object(
+                bridge, "_controller_command", side_effect=accepted) as command:
+            self.assertEqual(
+                bridge.public_validator_build(runtime, output), output)
+        command.assert_called_once()
+
     def test_oversized_native_stdout_and_stderr_are_killed_and_reaped(self):
         bridge = public_bundle.accepted_records
         for descriptor in (1, 2):
@@ -852,7 +886,9 @@ class NativeRecordBridge(unittest.TestCase):
         expected_source = {
             "revision": source["source_revision"], "tree": source["source_tree"]}
         bundle = {"version": 2, "evidence": [
-            {"path": "evidence/command-build.json", "sha256": "3" * 64}]}
+            {"path": "evidence/command-build.json", "sha256": "3" * 64}],
+            "artifacts": [
+                {"path": "artifacts/local_result", "sha256": "7" * 64}]}
         documents = {
             "candidate-bundle.json": bundle,
             "artifacts/local_result": {
@@ -863,6 +899,8 @@ class NativeRecordBridge(unittest.TestCase):
         }
         native = {
             "context": "trusted-inner-zip", "compatibility": "tiny-v2",
+            "profile": ci.CURRENT_PROFILE, "result": {"sha256": "7" * 64},
+            "runtime_inputs": [],
             "source": expected_source, "records": [
                 {"name": "command-build.json", "sha256": "3" * 64}]}
 
@@ -878,7 +916,9 @@ class NativeRecordBridge(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "bundle refused"):
                 public_bundle.publication_records(*args)
             for changed in (
+                    {"context": "local-runtime", "runtime_inputs": [{}]},
                     {"source": {"revision": "4" * 40, "tree": "5" * 40}},
+                    {"result": {"sha256": "8" * 64}},
                     {"records": [{"name": "command-build.json",
                                   "sha256": "6" * 64}]}):
                 with self.assertRaisesRegex(ValueError, "bundle refused"):
@@ -886,6 +926,95 @@ class NativeRecordBridge(unittest.TestCase):
                         *args, native_accepted=native | changed)
             with self.assertRaisesRegex(RuntimeError, "native gate passed"):
                 public_bundle.publication_records(*args, native_accepted=native)
+
+    def test_producer_direct_commands_require_local_native_acceptance(self):
+        source = {"source_revision": "1" * 40, "source_tree": "2" * 40}
+        expected_source = {
+            "revision": source["source_revision"], "tree": source["source_tree"]}
+        bundle = {"version": 2, "evidence": [
+            {"path": "evidence/command-build.json", "sha256": "3" * 64}],
+            "artifacts": [
+                {"path": "artifacts/local_result", "sha256": "7" * 64}]}
+        documents = {
+            "bundle.json": bundle,
+            "artifacts/local_result": {
+                "records": public_bundle.V2_EVIDENCE, "schema_version": 2,
+                "passed": True, "cloud_authority": "not_admitted",
+                "modes": list(ci.SIX_MODES), "profile": ci.CURRENT_PROFILE},
+            "artifacts/build": {"source": expected_source},
+        }
+        native = {
+            "context": "local-runtime", "compatibility": "tiny-v2",
+            "profile": ci.CURRENT_PROFILE, "result": {"sha256": "7" * 64},
+            "runtime_inputs": [{}],
+            "source": expected_source, "records": [
+                {"name": "command-build.json", "sha256": "3" * 64}]}
+
+        def document(path):
+            relative = path.relative_to(HERE).as_posix()
+            if relative == "evidence/build-start.json":
+                raise RuntimeError("native gate passed")
+            return documents[relative]
+
+        with mock.patch.object(ci, "document", side_effect=document):
+            args = (types.SimpleNamespace(ci=ci), HERE, source,
+                    "producer_direct", "bundle.json")
+            for changed in (
+                    {"context": "trusted-inner-zip", "runtime_inputs": []},
+                    {"source": {"revision": "4" * 40, "tree": "5" * 40}},
+                    {"result": {"sha256": "8" * 64}},
+                    {"records": [{"name": "command-build.json",
+                                  "sha256": "6" * 64}]}):
+                with self.assertRaisesRegex(ValueError, "bundle refused"):
+                    public_bundle.publication_records(
+                        *args, native_accepted=native | changed)
+            with self.assertRaisesRegex(RuntimeError, "native gate passed"):
+                public_bundle.publication_records(*args, native_accepted=native)
+
+    def test_pack_native_producer_uses_local_runtime_records(self):
+        root, unused_controller = self.controller_fixture("")
+        del unused_controller
+        stage = root / "runtime/compute/public-source/handoff"
+        stage.mkdir(parents=True, mode=0o700)
+        archive = root / "archive/tiny-aot-public-source.zip"
+        archive.parent.mkdir(mode=0o700)
+        source = {
+            "repository": "cataggar/unikraft",
+            "run_id": "123", "run_attempt": "1",
+            "source_revision": "1" * 40, "source_tree": "2" * 40,
+            "wamr_revision": ci.REVISION,
+        }
+        bundle = {
+            "version": 2,
+            "source_revision": source["source_revision"],
+            "source_tree": source["source_tree"],
+            "identity": {"wamr_revision": ci.REVISION},
+            "run": {
+                "repository": source["repository"],
+                "run_id": source["run_id"],
+                "run_attempt": source["run_attempt"],
+            },
+        }
+        accepted = {"context": "local-runtime"}
+        handoff = types.SimpleNamespace(
+            ci=ci, private=mock.Mock(), FAILURE_STAGE="")
+        with mock.patch.object(ci, "document", return_value=bundle), \
+                mock.patch.object(public_bundle, "members", return_value={}), \
+                mock.patch.object(
+                    public_bundle.accepted_records, "local_runtime",
+                    return_value=accepted) as local_runtime, \
+                mock.patch.object(
+                    public_bundle, "publication_records",
+                    side_effect=RuntimeError("records checked")) as records:
+            with self.assertRaisesRegex(RuntimeError, "records checked"):
+                public_bundle.pack(
+                    handoff, stage, archive, source,
+                    root / "validator", root / "supervisor",
+                    producer="native")
+        local_runtime.assert_called_once_with(stage.parents[2])
+        records.assert_called_once_with(
+            handoff, stage, source, "producer_direct",
+            native_accepted=accepted)
 
     def test_imported_v1_command_records_fail_closed(self):
         source = {"source_revision": "1" * 40, "source_tree": "2" * 40}
@@ -1057,10 +1186,26 @@ class NativeRecordBridge(unittest.TestCase):
                 for key in public_bundle.BOOT_KEYS
             },
         } for mode in ci.SIX_MODES]
-        evidence = [
-            item("evidence/" + name)
-            for name in sorted(public_bundle.V2_EVIDENCE)
-        ]
+        producer_runtime = root / "producer-runtime"
+        build_start = public_bundle.encoded({
+            "consumer_inputs": {"files": {
+                "command-supervisor": {"path": str(
+                    producer_runtime
+                    / "compute/supervisor/bin/wamr-ci-supervisor")},
+            }},
+        })
+        contents = {"evidence/build-start.json": build_start}
+        evidence = []
+        for name in sorted(public_bundle.V2_EVIDENCE):
+            path = "evidence/" + name
+            if name == "build-start.json":
+                evidence.append({
+                    "path": path,
+                    "size": len(build_start),
+                    "sha256": hashlib.sha256(build_start).hexdigest(),
+                })
+            else:
+                evidence.append(item(path))
         source = {
             "repository": "cataggar/unikraft",
             "run_id": "123",
@@ -1130,7 +1275,7 @@ class NativeRecordBridge(unittest.TestCase):
                 info = zipfile.ZipInfo(name)
                 info.create_system = 3
                 info.external_attr = (stat.S_IFREG | 0o600) << 16
-                output.writestr(info, b"x")
+                output.writestr(info, contents.get(name, b"x"))
             for name, value in (
                     ("bundle.json", bundle),
                     ("public-source.json", manifest)):
@@ -2297,6 +2442,7 @@ class Evidence(unittest.TestCase):
 
     def test_public_start_routes_custody_to_native_before_binding(self):
         runtime = self.root / "public-runtime"
+        supervisor = str(runtime / "compute/supervisor/bin/wamr-ci-supervisor")
         (runtime / "compute/evidence").mkdir(parents=True, mode=0o700)
         consumer = {
             "schema": "uk.wamr.consumer-input-custody",
@@ -2307,7 +2453,7 @@ class Evidence(unittest.TestCase):
                     for name in ci.HOST_TOOLS
                 },
                 "wamr-source-archive": {"path": "/trusted/wamr.tar"},
-                "command-supervisor": {"path": "/trusted/supervisor"},
+                "command-supervisor": {"path": supervisor},
             },
             "trees": {},
         }
@@ -2595,6 +2741,7 @@ class Evidence(unittest.TestCase):
         (repository / ".d").mkdir(parents=True, mode=0o700)
         runtime = self.root / "fresh-runtime"
         (runtime / "compute/evidence").mkdir(parents=True, mode=0o700)
+        supervisor = str(runtime / "compute/supervisor/bin/wamr-ci-supervisor")
         consumer = {
             "files": {
                 **{
@@ -2606,7 +2753,7 @@ class Evidence(unittest.TestCase):
                     for name in ci.HOST_TOOLS
                 },
                 "command-supervisor": {
-                    "path": "/trusted/supervisor",
+                    "path": supervisor,
                     "metadata": [1, 2, stat.S_IFREG | 0o500,
                                  1, 1, 1, 1, 1, 1],
                 },
@@ -2636,7 +2783,7 @@ class Evidence(unittest.TestCase):
 
         def execute(*unused, **kwargs):
             self.assertEqual(
-                ci.COMMAND_SUPERVISOR_PATH, "/trusted/supervisor")
+                ci.COMMAND_SUPERVISOR_PATH, supervisor)
             self.assertNotIn("allow_bootstrap", kwargs)
             events.append("validator")
             return self.root / "unused-validator.log", validator_record
@@ -2710,11 +2857,57 @@ class Evidence(unittest.TestCase):
             ci.COMMAND_ENVIRONMENT.clear()
             ci.COMMAND_ENVIRONMENT.update(original_environment)
 
+    def test_native_publication_uses_native_validator_builder_without_fallback(self):
+        repository = self.root / "native-publication"
+        (repository / ".d").mkdir(parents=True, mode=0o700)
+        runtime = self.root / "native-publication-runtime"
+        publication = runtime / "compute/public-source"
+        publication.mkdir(parents=True, mode=0o700)
+        start = {"source": {"revision": "1" * 40, "tree": "2" * 40},
+                 "consumer_inputs": {"files": {
+                     "command-supervisor": {
+                         "path": str(runtime / "controller/bin/uk-wamr-native-ci")},
+                 }}}
+        source = {
+            "repository": "cataggar/unikraft",
+            "run_id": "123", "run_attempt": "1",
+            "source_revision": "1" * 40, "source_tree": "2" * 40,
+            "wamr_revision": ci.REVISION,
+        }
+        handoff = mock.Mock()
+        handoff.ci = ci
+        handoff.export.return_value = {"version": 2}
+        with mock.patch.object(ci, "REPO", repository), \
+                mock.patch.object(
+                    ci, "COMMAND_SUPERVISOR_PATH",
+                    str(runtime / "controller/bin/uk-wamr-native-ci")), \
+                mock.patch.object(public_bundle, "ci_runtime", return_value=runtime), \
+                mock.patch.object(
+                    public_bundle, "accepted_public_build_start",
+                    return_value=start), \
+                mock.patch.object(public_bundle, "ci_context", return_value=source), \
+                mock.patch.object(ci, "read", return_value=b"primary=0 cleanup=0\n"), \
+                mock.patch.object(ci, "execute") as python_execute, \
+                mock.patch.object(
+                    public_bundle.accepted_records, "public_validator_build") as native_build, \
+                mock.patch.object(
+                    public_bundle.accepted_records, "local_runtime",
+                    return_value={"source": start["source"]}), \
+                mock.patch.object(
+                    public_bundle.accepted_records, "_completed_output"), \
+                mock.patch.object(public_bundle, "pack", return_value="f" * 64), \
+                mock.patch.object(public_bundle, "import_bundle"):
+            public_bundle.publish_ci(handoff)
+        native_build.assert_called_once_with(
+            runtime, publication / "validator-build")
+        python_execute.assert_not_called()
+
     def test_publication_refuses_bootstrap_validator_record_before_export(self):
         repository = self.root / "bootstrap-publication"
         (repository / ".d").mkdir(parents=True, mode=0o700)
         runtime = self.root / "bootstrap-runtime"
         (runtime / "compute/evidence").mkdir(parents=True, mode=0o700)
+        supervisor = str(runtime / "compute/supervisor/bin/wamr-ci-supervisor")
         consumer = {
             "files": {
                 **{
@@ -2726,7 +2919,7 @@ class Evidence(unittest.TestCase):
                     for name in ci.HOST_TOOLS
                 },
                 "command-supervisor": {
-                    "path": "/trusted/supervisor",
+                    "path": supervisor,
                     "metadata": [1, 2, stat.S_IFREG | 0o500,
                                  1, 1, 1, 1, 1, 1],
                 },

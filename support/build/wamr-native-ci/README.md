@@ -1,6 +1,6 @@
 # Credential-free tiny native WAMR PR gate
 
-## Native package and boot chain (unpublished caller)
+## Native package and boot chain (production caller)
 
 The installed controller now implements `boot --runtime ABS` as a closed,
 local-only `tiny_exact_v2` chain. It first refuses hosts without readable and
@@ -28,10 +28,10 @@ and prevents every subsequent transition. Public success contains exactly
 the v2 six-mode record set, `final-inspection.json`, then `result.json` last
 without self-hashing. Historical four-mode v1 is read-only; there is no
 caller-selected downgrade. `diagnostics --runtime ABS` emits allowlisted
-redacted observations only, never acceptance. `run.py` remains the
-authoritative production caller and differential reference until the later
-parity/bridge/cutover PRs; production callers, wrappers and authority are
-unchanged.
+redacted observations only, never acceptance. The protected production
+workflow now invokes the installed portable controller for build, boot and
+diagnostics; `run.py` remains only as the Python differential reference and
+historical compatibility reader until its later removal slices.
 
 ## Native record-consumer bridge (Python still performs the handoff)
 
@@ -55,12 +55,13 @@ runs trusted-v2 native revalidation through the native controller; default,
 off-runner, and historical trusted-v2 imports retain Python supervised-stage
 revalidation with the caller-supplied validator. Native-produced v2 local
 handoff requires native acceptance before using its result-record hashes and
-source identity; the Python build and boot checks still run. A
-Python-produced local run retains the pinned Python source-custody path for
-result-record selection. It is accepted by the native controller only for the
-v2 handoff inspection route; historical v1 local handoff inspection is
-confined to the explicit legacy action. `records --runtime` and
-`public-validator-build --runtime` remain native-produced local-runtime gates.
+source identity, and its local inspection is routed through the recorded
+runtime controller. A Python-produced local run retains the pinned Python
+source-custody path for result-record selection; it is accepted by the native
+controller only for the v2 handoff inspection route; historical v1 local
+handoff inspection is confined to the explicit legacy action. `records
+--runtime`, `public-validator-build --runtime` and
+`local-consumer-custody --runtime` remain native-produced local-runtime gates.
 The separately validated `command-public-validator-build.json` may appear in
 Python-produced evidence after acceptance; it is not part of the 33 pinned
 result records or the exported archive. Other extra evidence is refused.
@@ -96,11 +97,10 @@ refusal. `public-validator-build --runtime
 ABS --output ABS` accepts native-produced local runtimes only, using the
 recorded Zig tool and controller to build the fixed x86_64 validator in an
 independent private output, retaining its bounded command evidence without
-modifying the accepted runtime or publishing an archive. The protected
-production runtime is still Python-produced, so its public-validator build
-remains on the Python supervisor path until a native owner for Python-produced
-local records lands; there is no refusal-triggered fallback from the native
-command. Python remains the production local handoff caller;
+modifying the accepted runtime or publishing an archive. The production public
+bundle path selects the native or Python owner solely from the recorded
+`build-start.json` supervisor path; native-produced runs never fall back to
+Python after a native refusal.
 `supervisor-import-identity --stage-root ABS --supervisor ABS --git ABS
 --output ABS` is a separate support-only operation for a clean, trusted
 imported v2 inner stage. It checks the recorded supervisor source files
@@ -109,13 +109,12 @@ closure against the imported consumer records, then supervises `--identity`
 under the fixed plan. Its owner-only output is outside the imported stage and
 checkout. Trusted v2 imports invoke this operation before writing
 transport/candidate records; the default Python revalidation path reuses that
-native identity instead of repeating the identity command through Python.
-Python still owns publication policy, local public-validator supervision,
-off-runner trusted-v2 revalidation, and legacy/producer-direct identity and
-revalidation checks. Historical/imported source and consumer compatibility
-paths remain Python-owned where the native local producer proof does not
-apply. Remaining production/historical supervised handoff stages need native
-owners before `run.py` can be removed.
+native identity instead of repeating the identity command through Python; the
+protected native revalidation path also avoids a Python handoff between
+validator build and execution. Python still owns publication policy and
+legacy/producer-direct compatibility checks; native-produced local runs use
+the native records, handoff-inspect, public-validator-build and
+local-consumer-custody owners.
 `import-validator-build --stage-root ABS --output ABS` is a support-only
 trusted-v2 companion for a pristine imported stage. It accepts no caller
 selected executable: it requires the current clean physical checkout to
@@ -146,10 +145,12 @@ trusted-v2 imports (including the documented off-runner operator flow),
 historical revisions, unavailable recorded-tool imports, v1 imports, and
 producer-direct/local revalidation remain Python-owned because they either need
 the caller-supplied validator or do not satisfy the pristine same-revision
-trusted-stage preconditions.
+trusted-stage preconditions. Native-produced production imports bind the
+recorded controller identity and direct validator built by
+`public-validator-build --runtime`.
 `local-consumer-custody --runtime ABS --expected-build-start-sha256 HEX
 --expected-boot-inputs-sha256 HEX` is the production owner for a completed
-Python-produced v2 runtime's local checkout/source and build/boot consumer-input
+v2 runtime's local checkout/source and build/boot consumer-input
 custody *before* the managed QEMU loader is removed. The public source-bundle
 path hashes the exact `build-start.json` and `boot-inputs.json` bytes it read,
 passes those digests into the native owner, and reuses the same proof on later
@@ -182,9 +183,9 @@ accessing a runtime or granting boot authority.
 
 The protected native-compute workflow installs this same portable controller
 from the checked-out source after pinned Zig setup at
-`/d/wamr-ci/wamr-native-controller/controller/bin/uk-wamr-native-ci`. That
-path is the production bootstrap target for the remaining build/boot cutover
-slices, and the workflow obtains the recorded executable target from native
+`/d/wamr-ci/wamr-native-runtime/controller/bin/uk-wamr-native-ci`. That
+path is the production build/boot/diagnostics controller; the workflow obtains
+the recorded executable target from native
 `describe --output json-v1` instead of importing `run.py`. The separate
 `/d/wamr-ci/wamr-differential-controller` install name remains limited to the
 paired differential fault jobs.
@@ -236,16 +237,16 @@ without exposing private supervised-command output. On failure it runs the
 host test binary directly for diagnostic errors while keeping the original
 gate failed. The Python
 `tests/source_custody_production_limits.py` remains paired with the native
-limit fixture while production `build` still invokes `run.py`.
+limit fixture while production `build` uses the installed native controller.
 
 `build --runtime ABS --wamr-source ABS`, `boot --runtime ABS`, and
 `diagnostics --runtime ABS` are available only through the installed
 native controller. Native stage failures report only a static Zig error name
 alongside the failed stage; dependency restoration also reports a static
 operation label. Command output and private paths remain in bounded private
-logs. Production workflow callers continue using the Python controller;
-there is no fallback, boot cutover, or change in acceptance authority before
-the later parity and cutover PRs. The closed
+logs. Production workflow callers use the same installed controller path for
+build, boot and diagnostics; there is no fallback to `run.py` after a native
+refusal and no change in cloud authority. The closed
 `tiny_exact_v2` production type has six ordered raw/QCOW2/VPC modes;
 the four-mode v1 type is read-only compatibility. No caller-selectable profile,
 CoreMark mode, Azure entry, or alternate validator is installed.
@@ -472,9 +473,9 @@ Private state directories are `0700`, identity/config/diagnostic files
 are `0600`, and any failed or partial build is a refusal, never a boot,
 cloud, or workload-acceptance result. The installed native producer's
 golden/fault/integration tests are `zig build --build-file
-support/apps/wamr-aot/build.zig test-unit test-integration`; serial
-validation and controller/boot/handoff Python belong to subsequent
-#188/#186/#187/#189 cutovers, not to this producer.
+support/apps/wamr-aot/build.zig test-unit test-integration`; Azure
+admission, broader workload validation and final `run.py` removal remain
+separate follow-up slices, not producer-side fallbacks.
 Recorded indirect executable variables are replaced inside the supervisor by
 paths to its retained descriptors. The reviewed self-reexecuting package and
 local-boot tools ignore inherited retained-self values unless the original
@@ -716,9 +717,9 @@ The other fixture independently mutates the last serial and the derived VHD
 after final inspection, requiring both to refuse before `result.json`.
 Both fixtures' local-boot request/report/serial inputs are expressly synthetic:
 they do not launch QEMU, prove KVM, or run the full build/source custody.
-An actual native six-guest success gate requires a separate fresh x86/KVM CI worktree
-and runtime with the pinned tools, archive, QEMU and firmware; the existing
-production Python job remains authoritative until its scheduled cutover.
+An actual native six-guest success gate requires the protected production
+x86/KVM CI worktree and runtime with the pinned tools, archive, QEMU and
+firmware; these synthetic fixtures remain non-authoritative.
 The Python fixtures use the actual native packaging helper and pinned miz
 with a synthetic **nonbootable** PE, plus synthetic compute/log records.
 They check full raw/QCOW2/VHD/footer hashes, physical reload,
@@ -757,12 +758,12 @@ pinned tools and WAMR source, an empty private `.d` output role in each
 worktree, an owner-only runtime template and portable controller, and
 accessible x86 KVM. The protected x86 job installs that
 controller from its isolated fixture worktree into a separate private root,
-then runs one paired six-mode success case after the Python production boot
+then runs one paired six-mode success case after the native production boot
 within the same managed, non-root KVM process. An unexplained difference fails
 the job before the public bundle is published. Unequal build records fail before
 the paired boots; only equal builds proceed to six-mode boot comparison.
 Passing this one case does not
-grant native production authority or invoke Azure. Once the production job
+change production acceptance authority or invoke Azure. Once the production job
 passes, four separate bounded, credential-free x86/KVM matrix jobs run paired
 `build-start-tamper`, `missing-build`, `occupied-boot-slot`, and
 `prior-build-output` cases from fresh worktrees. Each retains strict fault
@@ -794,8 +795,9 @@ strings and line tables. The single checked Zig object member is then extracted
 and repacked by pinned `zig ar` under a stable basename: the original archive's
 long-name table embeds the absolute, checkout-dependent Zig cache path. Symbols
 and relocations required for linking remain.
-The CI production build commands set `WAMR_CI_PORTABLE_CONFIG=1` for the Python
-and native controllers. The native image builder forwards it to the root Zig facade,
+The CI production build command and the paired differential build comparison
+set `WAMR_CI_PORTABLE_CONFIG=1` for the native and Python controllers. The
+native image builder forwards it to the root Zig facade,
 which gives both Kconfig solvers the same inert defaults for `CONFIG_UK_BASE`
 and `CONFIG_UK_APP`; Make still uses the actual checkout and application paths
 for source discovery and compilation. Make also derives paired `HOSTUTC` from

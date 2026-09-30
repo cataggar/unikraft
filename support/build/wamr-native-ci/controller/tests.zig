@@ -515,7 +515,7 @@ fn handoffInspectFixtures() !void {
 
     const validator_plan = plan.spec(.@"public-validator-build");
     try std.testing.expectEqualStrings("tool:zig", validator_plan.executable);
-    try std.testing.expectEqual(@as(u32, 600), validator_plan.seconds);
+    try std.testing.expectEqual(@as(u32, 1800), validator_plan.seconds);
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), validator_plan.output_limit);
     try std.testing.expectEqualStrings(
         try std.fs.path.join(a, &.{ output, "public-source/tools" }),
@@ -1408,6 +1408,17 @@ test "local consumer custody recaptures exact files trees and ancestry" {
         error.UnexpectedInputPath,
         controller.local_consumer_custody.Fixture.fixedRolePath(a, substituted, "qemu", fixture_path, "bin/qemu-system-x86_64"),
     );
+    var native_paths = std.json.Value{ .object = .empty };
+    for ([_]struct { role: []const u8, relative: []const u8 }{
+        .{ .role = "command-supervisor", .relative = "controller/bin/uk-wamr-native-ci" },
+        .{ .role = "local_boot_tool", .relative = "compute/local-boot-tools/bin/uk-hyperv-local-boot" },
+        .{ .role = "log_validator", .relative = "compute/tools/bin/uk-wamr-log-validate" },
+    }) |item| {
+        var entry = std.json.Value{ .object = .empty };
+        try entry.object.put(a, "path", .{ .string = try std.fs.path.join(a, &.{ fixture_path, item.relative }) });
+        try native_paths.object.put(a, item.role, entry);
+        try controller.local_consumer_custody.Fixture.fixedRolePath(a, native_paths, item.role, fixture_path, item.relative);
+    }
     const changed = try root.openFile(io, "input", .{ .mode = .write_only });
     try changed.writePositionalAll(io, "modified", 0);
     try changed.sync(io);

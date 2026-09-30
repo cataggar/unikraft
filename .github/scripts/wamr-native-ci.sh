@@ -20,11 +20,12 @@ revision="$(git rev-parse HEAD)" || refuse source-revision
 [[ -w /dev/kvm ]] || refuse kvm-write
 # The job deadline bounds orchestration; every trusted leaf command has its own
 # absolute primary and cleanup deadlines in the native supervisor.
-python3 support/build/wamr-native-ci/run.py boot --runtime "$1"
+controller=/d/wamr-ci/wamr-native-runtime/controller/bin/uk-wamr-native-ci
+[[ -x "${controller}" ]] || refuse native-controller-unavailable
+"${controller}" boot --runtime "$1"
 
 source_root=/d/wamr-ci/wamr-differential-sources
 comparison_root=/d/wamr-ci/wamr-differential
-controller=/d/wamr-ci/wamr-native-controller/controller/bin/uk-wamr-native-ci
 python_source="${source_root}/python"
 native_source="${source_root}/native"
 shopt -s nullglob dotglob

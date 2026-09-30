@@ -108,9 +108,12 @@ fn buildRoles(
         try addRuntime(allocator, io, &allowed, try recordedPath(files_map, role));
     }
     for ([_]struct { role: []const u8, relative: []const u8 }{
-        .{ .role = "command-supervisor", .relative = "compute/supervisor/bin/wamr-ci-supervisor" },
+        .{ .role = "command-supervisor", .relative = "controller/bin/uk-wamr-native-ci" },
         .{ .role = "native:wamr-aot-build", .relative = "compute/tools/bin/uk-wamr-aot-build" },
         .{ .role = "native:wamr-log-validate", .relative = "compute/tools/bin/uk-wamr-log-validate" },
+        .{ .role = "native:wamr-native-ci-fixtures", .relative = "compute/tools/bin/wamr-native-ci-fixtures" },
+        .{ .role = "native:wamr-ci-package", .relative = "compute/tools/bin/wamr-ci-package" },
+        .{ .role = "native:wamr-ci-supervisor-fixture", .relative = "compute/tools/bin/wamr-ci-supervisor-fixture" },
         .{ .role = "wamr-source-archive", .relative = "custody/wamr-source.tar" },
     }) |item| {
         try addRole(&allowed, item.role);
@@ -161,7 +164,8 @@ fn bootRoles(
     defer allowed.deinit();
     for ([_]struct { role: []const u8, root: []const u8, relative: []const u8 }{
         .{ .role = "efi", .root = repository, .relative = "support/apps/wamr-aot/build/wamr_hyperv-x86_64-efi" },
-        .{ .role = "local_boot_tool", .root = runtime, .relative = "compute/tools/bin/uk-hyperv-local-boot" },
+        .{ .role = "local_boot_tool", .root = runtime, .relative = "compute/local-boot-tools/bin/uk-hyperv-local-boot" },
+        .{ .role = "log_validator", .root = runtime, .relative = "compute/tools/bin/uk-wamr-log-validate" },
         .{ .role = "package_tool", .root = runtime, .relative = "compute/tools/bin/wamr-ci-package" },
         .{ .role = "qemu", .root = runtime, .relative = "bin/qemu-system-x86_64" },
         .{ .role = "ovmf_code", .root = runtime, .relative = "firmware/code.fd" },
@@ -170,6 +174,7 @@ fn bootRoles(
         try addRole(&allowed, item.role);
         try fixedPath(allocator, files_map, item.role, item.root, item.relative);
         if (std.mem.eql(u8, item.role, "local_boot_tool") or
+            std.mem.eql(u8, item.role, "log_validator") or
             std.mem.eql(u8, item.role, "package_tool") or
             std.mem.eql(u8, item.role, "qemu"))
         {

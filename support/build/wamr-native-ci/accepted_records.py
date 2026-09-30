@@ -14,7 +14,8 @@ import time
 HERE = Path(__file__).resolve().parent
 MAX_RECORDS_BYTES = 2 * 1024 * 1024
 RECORDS_TIMEOUT_SECONDS = 600
-IMPORT_NATIVE_REVALIDATION_TIMEOUT_SECONDS = 1500
+VALIDATOR_BUILD_TIMEOUT_SECONDS = 2100
+IMPORT_NATIVE_REVALIDATION_TIMEOUT_SECONDS = VALIDATOR_BUILD_TIMEOUT_SECONDS
 CONTROLLER_ENV = "WAMR_CI_CONTROLLER"
 
 
@@ -229,6 +230,51 @@ def _records(context, arguments):
     return _decode(raw, context)
 
 
+def _completed_output(output, stage, log_bound, refusal):
+    try:
+        output = _absolute(output)
+        for path in (output, output / "private", output / "evidence"):
+            info = path.lstat()
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) != 0o700):
+                _refuse(refusal)
+        for path, bound in (
+                (output / f"private/{stage}.log", log_bound),
+                (output / f"evidence/command-{stage}.json",
+                 MAX_RECORDS_BYTES)):
+            minimum = 0 if path.name.endswith(".log") else 1
+            info = path.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                    or not minimum <= info.st_size <= bound):
+                _refuse(refusal)
+    except OSError as error:
+        raise ValueError(refusal) from error
+    return output
+
+
+def _runtime_output(
+        runtime, output, command, stage, log_bound, refusal,
+        timeout_seconds=None):
+    runtime, output = map(Path, (runtime, output))
+    try:
+        runtime = _absolute(runtime)
+        _absolute(output.parent)
+    except (OSError, ValueError) as error:
+        raise ValueError(refusal) from error
+    if (not output.is_absolute()
+            or os.path.normpath(str(output)) != str(output)
+            or os.path.lexists(output)):
+        _refuse(refusal)
+    raw, stderr_seen = _controller_command((
+        command, "--runtime", str(runtime), "--output", str(output)), refusal,
+        timeout_seconds=timeout_seconds)
+    if raw or stderr_seen:
+        _refuse(refusal)
+    return _completed_output(output, stage, log_bound, refusal)
+
+
 def imported_stage(stage_root):
     """Ask the native importer to validate the exact extracted inner tree."""
     stage_root = _absolute(stage_root)
@@ -389,3 +435,11 @@ def local_runtime(runtime):
     if value["compatibility"] != "tiny-v2" or not value["runtime_inputs"]:
         _refuse()
     return value
+
+
+def public_validator_build(runtime, output):
+    """Build the public validator for a native-produced run without fallback."""
+    return _runtime_output(
+        runtime, output, "public-validator-build", "public-validator-build",
+        8 * 1024 * 1024 + 1, "native public validator build refused",
+        timeout_seconds=VALIDATOR_BUILD_TIMEOUT_SECONDS)

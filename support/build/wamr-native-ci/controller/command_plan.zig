@@ -167,7 +167,7 @@ pub fn spec(stage: Stage) Spec {
         .@"public-validator-build", .@"import-validator-build" => .{
             .stage = stage,
             .executable = "tool:zig",
-            .seconds = 600,
+            .seconds = 1800,
             .output_limit = 8 * 1024 * 1024,
             .argv = &.{
                 zig,                                                                                     .{ .literal = "build" },                                      .{ .literal = "--build-file" },
