@@ -772,6 +772,14 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             runner.GUARDED_PRODUCER_SCHEMA_VERSION,
         )
         self.assertEqual(
+            {"support/build": ("wamr-native-ci",)},
+            preflight.GUARDED_PRODUCER_DIRECTORY_EXCLUSIONS,
+        )
+        self.assertEqual(
+            preflight.GUARDED_PRODUCER_DIRECTORY_EXCLUSIONS,
+            runner.GUARDED_PRODUCER_DIRECTORY_EXCLUSIONS,
+        )
+        self.assertEqual(
             preflight.GUARDED_PRODUCER_CLOSURES,
             runner.GUARDED_PRODUCER_CLOSURES,
         )
@@ -781,6 +789,10 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                     preflight.directory_record(
                         SUPPORT.parent / relative, relative,
                         "Guarded producer execution closure",
+                        exclude_top_level_subtrees=(
+                            preflight.GUARDED_PRODUCER_DIRECTORY_EXCLUSIONS
+                            .get(relative, ())
+                        ),
                     ),
                     expected,
                 )
@@ -841,6 +853,77 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                     ],
                     SUPPORT.parent / relative,
                 )
+
+    def test_guarded_support_build_pin_excludes_wamr_native_ci(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shutil.copytree(
+                SUPPORT.parent / "support" / "build",
+                root / "support" / "build",
+            )
+
+            def record():
+                return preflight.directory_record(
+                    root / "support" / "build",
+                    "support/build",
+                    "Guarded producer execution closure",
+                    exclude_top_level_subtrees=(
+                        preflight.GUARDED_PRODUCER_DIRECTORY_EXCLUSIONS[
+                            "support/build"
+                        ]
+                    ),
+                )
+
+            baseline = record()
+            excluded = (
+                root / "support" / "build" / "wamr-native-ci" / "README.md"
+            )
+            excluded.write_bytes(excluded.read_bytes() + b"\nignored\n")
+            self.assertEqual(record(), baseline)
+
+            covered = root / "support" / "build" / "Makefile.build"
+            covered.write_bytes(covered.read_bytes() + b"\ncovered := 1\n")
+            self.assertNotEqual(record(), baseline)
+
+            excluded_root = (
+                root / "support" / "build" / "wamr-native-ci"
+            )
+            shutil.rmtree(excluded_root)
+            os.symlink("../scripts", excluded_root)
+            with self.assertRaisesRegex(
+                ValueError, "excluded subtree must be a non-symlink directory"
+            ):
+                record()
+
+    def test_guarded_producer_does_not_reference_wamr_native_ci(self):
+        root = SUPPORT.parent
+        guarded_paths = {
+            *preflight.GUARDED_BUILD_CONTROL_FILES,
+            *preflight.GUARDED_EXECUTED_HELPER_FILES,
+            *preflight.GUARDED_PRODUCER_FILES,
+            "Config.uk",
+            "Makefile",
+            "Makefile.uk",
+            "build.zig",
+            "build.zig.zon",
+        }
+        support_build = root / "support" / "build"
+        for entry in support_build.iterdir():
+            if entry.is_file() and (
+                entry.name.startswith("Makefile.")
+                or entry.suffix in {".zig", ".py"}
+            ):
+                guarded_paths.add(entry.relative_to(root).as_posix())
+        hyperv_tools = root / "support" / "tools" / "hyperv"
+        for entry in hyperv_tools.iterdir():
+            if entry.is_file():
+                guarded_paths.add(entry.relative_to(root).as_posix())
+
+        for relative in sorted(guarded_paths):
+            with self.subTest(relative=relative):
+                path = root / relative
+                self.assertTrue(path.is_file(), relative)
+                self.assertNotIn(b"wamr-native-ci", path.read_bytes())
 
     def test_guarded_matcher_mutations_fail_before_packaging(self):
         mutation_targets = (

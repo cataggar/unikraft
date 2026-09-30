@@ -1000,7 +1000,10 @@ The exact pre-supervisor merged sources
 `3c6d5d98dc5736d86e97884184b26be39c3f11d5`, with their literal recorded
 trees, remain compatible with the same fixed 20-evidence/55-file archive
 shape without a command-supervisor record. Any other current source must carry
-the native supervisor result fields and guarded producer maps.
+the native supervisor result fields. WAMR native CI source-only changes no
+longer require guarded Hyper-V producer map repins: that pin excludes this
+subtree, while the WAMR controller's own source custody and supervisor
+source-closure pins remain separate.
 Symlinks/hardlinks, duplicate/extra/absolute/traversal members, compression,
 oversize inputs and known credential/account/approval patterns are refused.
 
