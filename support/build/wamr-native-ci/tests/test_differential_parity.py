@@ -91,6 +91,7 @@ NATIVE_SOURCE_FILES = (
     "support/build/wamr-native-ci/controller/install.zig",
     "support/build/wamr-native-ci/controller/install_target_tests.zig",
     "support/build/wamr-native-ci/controller/layout.zig",
+    "support/build/wamr-native-ci/controller/local_consumer_custody.zig",
     "support/build/wamr-native-ci/controller/main.zig",
     "support/build/wamr-native-ci/controller/portable_main.zig",
     "support/build/wamr-native-ci/controller/profile.zig",

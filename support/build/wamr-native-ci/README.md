@@ -112,6 +112,15 @@ exact success stdout, empty stderr, bounded log, and command binding are
 checked before returning. A caller cannot select a validator or manifest.
 Historical imports and the production revalidation caller still use Python;
 this support stage does not transfer publication or admission authority.
+`local-consumer-custody --runtime ABS` is a support-only read-only probe
+for a completed Python-produced v2 runtime *before* the managed QEMU loader
+is removed. It compares the clean current checkout's full physical source
+custody and both recorded build/boot consumer sets against fresh native
+captures, including exact executable loader roles, input tree contents and
+physical ancestry. It emits no public or acceptance record and does not
+replace Python's dependency, supervisor, packaging, or production policy
+checks. An extracted historical archive cannot satisfy this local proof
+after the original consumer files or loader are removed.
 
 ## Native controller preparation (unpublished build path)
 

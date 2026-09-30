@@ -2,7 +2,7 @@
 const std = @import("std");
 const files = @import("hyperv_core").private_files;
 
-pub const Action = enum { build, boot, diagnostics, describe, records, @"handoff-inspect", @"public-validator-build", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation" };
+pub const Action = enum { build, boot, diagnostics, describe, records, @"local-consumer-custody", @"handoff-inspect", @"public-validator-build", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation" };
 pub const Command = struct {
     action: Action,
     runtime: ?[]const u8 = null,
@@ -21,6 +21,12 @@ pub fn parse(args: []const []const u8) !Command {
             !std.mem.eql(u8, args[3], "json-v1"))
             return error.InvalidUsage;
         return .{ .action = action };
+    }
+    if (action == .@"local-consumer-custody") {
+        if (args.len != 4 or !std.mem.eql(u8, args[2], "--runtime"))
+            return error.InvalidUsage;
+        files.absoluteFilePath(args[3]) catch return error.InvalidUsage;
+        return .{ .action = action, .runtime = args[3] };
     }
     if (action == .records) {
         if (args.len != 6 and args.len != 8) return error.InvalidUsage;

@@ -48,6 +48,19 @@ pub fn main(init: std.process.Init) void {
         stdout.interface.writeAll(encoded) catch refused(init.io);
         return;
     }
+    if (command.action == .@"local-consumer-custody") {
+        const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
+        var signal = controller.build_pipeline.installCancellation() catch refused(init.io);
+        defer signal.deinit();
+        controller.local_consumer_custody.run(
+            allocator,
+            init.io,
+            repository,
+            command.runtime.?,
+            &signal,
+        ) catch |err| failed(init.io, @tagName(command.action), "", err);
+        return;
+    }
     if (command.action == .@"supervisor-import-identity") {
         const stage = @tagName(command.action);
         const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
@@ -179,6 +192,7 @@ pub fn main(init: std.process.Init) void {
         },
         .describe => unreachable,
         .records => unreachable,
+        .@"local-consumer-custody" => unreachable,
         .@"handoff-inspect" => unreachable,
         .@"public-validator-build" => unreachable,
         .@"supervisor-import-identity" => unreachable,
@@ -195,6 +209,7 @@ fn usage(io: std.Io) noreturn {
             "       uk-wamr-native-ci describe --output json-v1\n" ++
             "       uk-wamr-native-ci records --runtime ABS --output handoff-v1\n" ++
             "       uk-wamr-native-ci records --stage-root ABS --transport trusted-inner-zip --output handoff-v1\n" ++
+            "       uk-wamr-native-ci local-consumer-custody --runtime ABS\n" ++
             "       uk-wamr-native-ci handoff-inspect --runtime ABS --output ABS\n" ++
             "       uk-wamr-native-ci public-validator-build --runtime ABS --output ABS\n" ++
             "       uk-wamr-native-ci supervisor-import-identity --stage-root ABS --supervisor ABS --git ABS --output ABS\n" ++

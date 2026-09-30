@@ -1152,6 +1152,65 @@ test "imported handoff member rebasing preserves only safe expected relative pat
     }
 }
 
+test "local consumer custody recaptures exact files trees and ancestry" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "local-consumer-custody-{d}", .{std.os.linux.getpid()});
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("local consumer fixture cleanup failed");
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    try writeFixtureFile(io, root, "input", "original");
+    try root.createDir(io, "tree", .fromMode(0o700));
+    const tree = try root.openDir(io, "tree", .{ .iterate = true });
+    defer tree.close(io);
+    try writeFixtureFile(io, tree, "member", "member");
+    const fixture_path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    const file_path = try std.fs.path.join(a, &.{ fixture_path, "input" });
+    const tree_path = try std.fs.path.join(a, &.{ fixture_path, "tree" });
+    var original = try controller.input_custody.capture(a, io, &.{
+        .{ .role = "tool:git", .path = file_path },
+    }, &.{
+        .{ .role = "zig", .path = tree_path },
+    });
+    defer original.deinit(a);
+    const encoded = try original.canonical(a);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, encoded, .{ .parse_numbers = false });
+    defer parsed.deinit();
+    try controller.local_consumer_custody.Fixture.recaptureDocument(a, io, parsed.value);
+
+    var allowed: std.StringHashMap(void) = .init(a);
+    defer allowed.deinit();
+    try allowed.put("tool:git", {});
+    try controller.local_consumer_custody.Fixture.exactRoleSet(&allowed, parsed.value.object.get("files").?);
+    var unexpected = std.json.Value{ .object = .empty };
+    try unexpected.object.put(a, "tool:other", .null);
+    try std.testing.expectError(
+        error.UnexpectedInputRole,
+        controller.local_consumer_custody.Fixture.exactRoleSet(&allowed, unexpected),
+    );
+    var substituted = std.json.Value{ .object = .empty };
+    var substituted_file = std.json.Value{ .object = .empty };
+    try substituted_file.object.put(a, "path", .{ .string = "/untrusted/qemu" });
+    try substituted.object.put(a, "qemu", substituted_file);
+    try std.testing.expectError(
+        error.UnexpectedInputPath,
+        controller.local_consumer_custody.Fixture.fixedRolePath(a, substituted, "qemu", fixture_path, "bin/qemu-system-x86_64"),
+    );
+    const changed = try root.openFile(io, "input", .{ .mode = .write_only });
+    try changed.writePositionalAll(io, "modified", 0);
+    try changed.sync(io);
+    changed.close(io);
+    try std.testing.expectError(
+        error.RecordedCustodyChanged,
+        controller.local_consumer_custody.Fixture.recaptureDocument(a, io, parsed.value),
+    );
+}
+
 test "imported validator retains runtime paths after the source buffer is released" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1194,6 +1253,9 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
     const imported_records = try cli.parse(&.{ "uk-wamr-native-ci", "records", "--stage-root", "/stage", "--transport", "trusted-inner-zip", "--output", "handoff-v1" });
     try std.testing.expectEqual(cli.Action.records, imported_records.action);
     try std.testing.expectEqualStrings("/stage", imported_records.stage_root.?);
+    const local_custody = try cli.parse(&.{ "uk-wamr-native-ci", "local-consumer-custody", "--runtime", "/runtime" });
+    try std.testing.expectEqual(cli.Action.@"local-consumer-custody", local_custody.action);
+    try std.testing.expectEqualStrings("/runtime", local_custody.runtime.?);
     const inspection = try cli.parse(&.{ "uk-wamr-native-ci", "handoff-inspect", "--output", "/private/inspection", "--runtime", "/runtime" });
     try std.testing.expectEqual(cli.Action.@"handoff-inspect", inspection.action);
     try std.testing.expectEqualStrings("/runtime", inspection.runtime.?);
@@ -1231,6 +1293,9 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
         &.{ "uk-wamr-native-ci", "public-validator-build", "--output", "/private/validator", "--runtime", "/runtime", "--profile", "tiny" },
         &.{ "uk-wamr-native-ci", "public-validator-build", "--stage-root", "/stage", "--output", "/private/validator" },
         &.{ "uk-wamr-native-ci", "import-validator-build", "--stage-root", "/stage" },
+        &.{ "uk-wamr-native-ci", "local-consumer-custody", "--stage-root", "/stage" },
+        &.{ "uk-wamr-native-ci", "local-consumer-custody", "--runtime", "/runtime", "--output", "/result" },
+        &.{ "uk-wamr-native-ci", "local-consumer-custody", "--runtime", "/runtime/../other" },
         &.{ "uk-wamr-native-ci", "import-validator-build", "--runtime", "/runtime", "--output", "/private/validator" },
         &.{ "uk-wamr-native-ci", "import-validator-build", "--stage-root", "/stage", "--output", "/stage/../validator" },
         &.{ "uk-wamr-native-ci", "import-validator-build", "--stage-root", "/stage", "--output", "/private/validator", "--zig", "/arbitrary/zig" },

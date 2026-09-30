@@ -16,6 +16,7 @@ pub const import_validator_build = @import("import_validator_build.zig");
 pub const public_validator_build = @import("public_validator_build.zig");
 pub const input_custody = @import("input_custody.zig");
 pub const layout = @import("layout.zig");
+pub const local_consumer_custody = @import("local_consumer_custody.zig");
 pub const profile = @import("profile.zig");
 pub const records = @import("records.zig");
 pub const source_custody = @import("source_custody.zig");
