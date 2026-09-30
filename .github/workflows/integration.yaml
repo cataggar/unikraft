@@ -1,8 +1,10 @@
 name: integration
 
 on:
+  # zig16 does not require pull requests to be up to date before merging, so
+  # every push re-runs the matrix on the combined result of serial merges.
   push:
-    branches: [staging, stable]
+    branches: [staging, stable, zig16]
     paths-ignore: ['*.md']
 
   # No `paths-ignore` here: the job contexts of this workflow are meant to be
@@ -26,6 +28,12 @@ on:
         required: false
         type: boolean
         default: false
+
+# Only the newest zig16 push needs a post-merge verdict; it covers every
+# earlier merge. Pull request, staging, stable and dispatch runs are unchanged.
+concurrency:
+  group: ${{ github.event_name == 'push' && github.ref == 'refs/heads/zig16' && 'integration-zig16-push' || format('integration-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/zig16' }}
 
 jobs:
   libc-test:
