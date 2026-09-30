@@ -5,6 +5,7 @@ from dataclasses import fields, replace
 import hashlib
 import importlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -149,48 +150,98 @@ class OfflineAdmissionTest(unittest.TestCase):
                 process.assert_not_called()
                 self.assertFalse(staged.exists())
 
-    def qemu_share(self):
-        share = self.state_dir.parent / "qemu-release" / "share"
-        share.mkdir(mode=0o700, parents=True)
-        for name in admission.QEMU_SUPPORT_FILES:
-            (share / name).write_bytes(name.encode() + b" option rom")
-            (share / name).chmod(0o444)
-        (share / "bios-256k.bin").write_bytes(b"not staged")
-        private = self.state_dir / "offline-executables"
-        private.mkdir(mode=0o700)
-        return share, private / "share", admission.qemu_support_sha256(share)
+    DISTRO_SUPPORT = (
+        "../share/qemu/kvmvapic.bin", "../share/seavgabios/vgabios-stdvga.bin",
+    )
+
+    def qemu_layout(self, support, name="qemu-release"):
+        qemu_dir = self.state_dir.parent / name / "bin"
+        qemu_dir.mkdir(mode=0o700, parents=True)
+        for relative in support:
+            rom = Path(os.path.normpath(qemu_dir / relative))
+            rom.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            rom.write_bytes(rom.name.encode() + b" option rom")
+            rom.chmod(0o444)
+            (rom.parent / "bios-256k.bin").write_bytes(b"not staged")
+        private_bin = self.state_dir / f"offline-{name}" / "bin"
+        private_bin.mkdir(mode=0o700, parents=True)
+        return (
+            qemu_dir, private_bin,
+            admission.qemu_support_sha256(qemu_dir, support),
+        )
 
     def test_qemu_support_roms_are_pinned_and_privately_staged(self):
-        share, destination, expected = self.qemu_share()
-        staged = admission._stage_qemu_support(share, destination, expected)
-        self.assertEqual(
-            sorted(path.name for path in staged.iterdir()),
-            sorted(admission.QEMU_SUPPORT_FILES),
-        )
-        for name in admission.QEMU_SUPPORT_FILES:
-            self.assertEqual(
-                (staged / name).read_bytes(), (share / name).read_bytes()
-            )
-            self.assertEqual((staged / name).stat().st_mode & 0o777, 0o400)
-        self.assertEqual(
-            admission.qemu_support_sha256(staged, private=True), expected
-        )
+        digests = set()
+        for name, support in (
+            ("pinned-release", admission.PINNED_QEMU_SUPPORT),
+            ("distribution", self.DISTRO_SUPPORT),
+        ):
+            with self.subTest(layout=name):
+                qemu_dir, private_bin, expected = self.qemu_layout(support, name)
+                digests.add(expected)
+                staged = admission._stage_qemu_support(
+                    qemu_dir, support, private_bin, expected,
+                )
+                self.assertEqual(
+                    admission._private_files(private_bin.parent),
+                    {os.path.normpath(f"bin/{relative}") for relative in support},
+                )
+                for relative in support:
+                    source = Path(os.path.normpath(qemu_dir / relative))
+                    copy = Path(os.path.normpath(private_bin / relative))
+                    self.assertIn(copy, staged)
+                    self.assertEqual(copy.read_bytes(), source.read_bytes())
+                    self.assertEqual(copy.stat().st_mode & 0o777, 0o400)
+                self.assertEqual(admission.qemu_support_sha256(
+                    private_bin, support, private=True,
+                ), expected)
+                self.assertEqual(admission.qemu_support_sha256(
+                    qemu_dir, tuple(reversed(support)),
+                ), expected)
+        self.assertEqual(len(digests), 2)
+
+    def test_qemu_support_layout_is_bounded_to_reviewed_roms(self):
+        vga = "share/vgabios-stdvga.bin"
+        for support in (
+            list(admission.PINNED_QEMU_SUPPORT),
+            admission.PINNED_QEMU_SUPPORT[:1],
+            ("share/kvmvapic.bin", "share/kvmvapic.bin"),
+            ("share/kvmvapic.bin", "share/bios-256k.bin"),
+            ("/usr/share/kvmvapic.bin", vga),
+            ("../../share/kvmvapic.bin", vga),
+            ("share/../kvmvapic.bin", vga),
+            ("./share/kvmvapic.bin", vga),
+            ("share//kvmvapic.bin", vga),
+            ("lib/kvmvapic.bin", vga),
+            ("share/a/b/kvmvapic.bin", vga),
+            ("kvmvapic.bin", vga),
+            (b"share/kvmvapic.bin", vga),
+        ):
+            with self.subTest(support=support):
+                with self.assertRaisesRegex(ValueError, "layout is invalid"):
+                    admission._support_layout(support)
 
     def test_unreviewed_or_missing_qemu_support_roms_refuse(self):
-        share, destination, expected = self.qemu_share()
-        rom = share / admission.QEMU_SUPPORT_FILES[0]
+        support = self.DISTRO_SUPPORT
+        qemu_dir, private_bin, expected = self.qemu_layout(support)
+        rom = Path(os.path.normpath(qemu_dir / support[0]))
         rom.chmod(0o644)
         rom.write_bytes(b"unreviewed option rom")
         with self.assertRaisesRegex(ValueError, "QEMU support files differ"):
-            admission._stage_qemu_support(share, destination, expected)
-        self.assertFalse(destination.exists())
+            admission._stage_qemu_support(
+                qemu_dir, support, private_bin, expected,
+            )
+        self.assertEqual(admission._private_files(private_bin.parent), set())
         rom.unlink()
         with self.assertRaises(FileNotFoundError):
-            admission._stage_qemu_support(share, destination, expected)
-        self.assertFalse(destination.exists())
+            admission._stage_qemu_support(
+                qemu_dir, support, private_bin, expected,
+            )
+        self.assertEqual(admission._private_files(private_bin.parent), set())
 
     def test_qemu_support_swap_before_copy_refuses(self):
-        share, destination, expected = self.qemu_share()
+        support = admission.PINNED_QEMU_SUPPORT
+        qemu_dir, private_bin, expected = self.qemu_layout(support)
         copy = admission.azure.copy_regular_file
 
         def swap_before_copy(src, dst, size, _):
@@ -202,7 +253,20 @@ class OfflineAdmissionTest(unittest.TestCase):
             admission.azure, "copy_regular_file", side_effect=swap_before_copy,
         ):
             with self.assertRaisesRegex(ValueError, "Private QEMU support copy"):
-                admission._stage_qemu_support(share, destination, expected)
+                admission._stage_qemu_support(
+                    qemu_dir, support, private_bin, expected,
+                )
+
+    def test_private_custody_listing_refuses_symlinks(self):
+        root = self.state_dir / "offline-executables"
+        (root / "bin").mkdir(mode=0o700, parents=True)
+        (root / "miz").write_bytes(b"miz")
+        self.assertEqual(admission._private_files(root), {"miz"})
+        (root / "bin" / "share").symlink_to(
+            self.build_dir, target_is_directory=True,
+        )
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            admission._private_files(root)
 
     def test_runner_launch_executes_private_bytes_after_source_swap(self):
         original_runner, runner, _ = self.staged_tool("runner")

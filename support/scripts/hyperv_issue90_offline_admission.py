@@ -38,10 +38,12 @@ MODES = (
     ("raw", "x2apic", False), ("raw", "legacy-apic", True),
     ("vhd", "x2apic", False), ("vhd", "legacy-apic", True),
 )
-# The native runner's fixed q35/KVM argv loads exactly these option ROMs; the
-# pinned QEMU release resolves them from the share/ directory beside its binary.
+# The native runner's fixed q35/KVM argv loads exactly these option ROMs. QEMU
+# resolves them relative to its executable directory: the pinned release uses
+# share/ beside its binary, while distribution builds use ../share/<dir>.
 QEMU_SUPPORT_FILES = ("kvmvapic.bin", "vgabios-stdvga.bin")
 QEMU_SUPPORT_MAX = 1024 * 1024
+PINNED_QEMU_SUPPORT = ("share/kvmvapic.bin", "share/vgabios-stdvga.bin")
 REPORT_FIELDS = {
     "schema_version", "scope", "acceptance", "passed", "consumed",
     "cleanup_complete", "input_unchanged", "serial_valid",
@@ -80,6 +82,7 @@ class OfflineInputs:
     ovmf_code: Path
     ovmf_vars: Path
     reviewed: ReviewPins | None
+    qemu_support: tuple[str, ...] = PINNED_QEMU_SUPPORT
 
 
 @dataclass(frozen=True)
@@ -186,37 +189,77 @@ def _stage_executable(source, destination, maximum, expected_sha256):
     return destination
 
 
-def qemu_support_sha256(directory, *, private=False):
-    """Digest the exact QEMU option ROMs that independent review must pin."""
+def _support_layout(support):
+    """Validate QEMU-relative option ROM paths: [../]share/[dir/]<rom>."""
+    if type(support) is not tuple or len(support) != len(QEMU_SUPPORT_FILES):
+        raise ValueError("QEMU support layout is invalid")
+    names = []
+    for relative in support:
+        if not isinstance(relative, str):
+            raise ValueError("QEMU support layout is invalid")
+        parts = relative.split("/")
+        body = parts[1:] if parts[0] == ".." else parts
+        if (not 2 <= len(body) <= 3 or body[0] != "share"
+                or any(part in ("", ".", "..") for part in body)):
+            raise ValueError("QEMU support layout is invalid")
+        names.append(body[-1])
+    if sorted(names) != sorted(QEMU_SUPPORT_FILES):
+        raise ValueError("QEMU support layout is invalid")
+    return tuple(sorted(support, key=lambda relative: relative.rsplit("/", 1)[1]))
+
+
+def _support_path(directory, relative):
+    return Path(os.path.normpath(directory / relative))
+
+
+def qemu_support_sha256(qemu_directory, support, *, private=False):
+    """Digest the exact QEMU option ROM layout that independent review pins."""
     records = []
-    for name in QEMU_SUPPORT_FILES:
-        path = directory / name
+    for relative in _support_layout(support):
+        path = _support_path(qemu_directory, relative)
         sha = _file(path, QEMU_SUPPORT_MAX, private=private)
         records.append({
-            "name": name, "sha256": sha, "size": path.stat().st_size,
+            "path": relative, "sha256": sha, "size": path.stat().st_size,
         })
     return hashlib.sha256(azure.canonical_json(records)).hexdigest()
 
 
-def _stage_qemu_support(source, destination, expected_sha256):
-    if qemu_support_sha256(source) != expected_sha256:
+def _stage_qemu_support(qemu_directory, support, private_bin, expected_sha256):
+    if qemu_support_sha256(qemu_directory, support) != expected_sha256:
         raise ValueError("QEMU support files differ from independent review")
-    destination.mkdir(mode=0o700, exist_ok=False)
-    for name in QEMU_SUPPORT_FILES:
-        path = source / name
-        size = path.stat().st_size
+    root = private_bin.parent
+    staged = []
+    for relative in _support_layout(support):
+        source = _support_path(qemu_directory, relative)
+        destination = _support_path(private_bin, relative)
+        current = root
+        for part in destination.parent.relative_to(root).parts:
+            current = current / part
+            current.mkdir(mode=0o700, exist_ok=True)
+        size = source.stat().st_size
         azure.copy_regular_file(
-            path, destination / name, size,
-            _file(path, QEMU_SUPPORT_MAX),
+            source, destination, size, _file(source, QEMU_SUPPORT_MAX),
         )
-        (destination / name).chmod(0o400)
-    if (sorted(os.listdir(destination)) != sorted(QEMU_SUPPORT_FILES)
-            or qemu_support_sha256(destination, private=True)
-            != expected_sha256):
+        destination.chmod(0o400)
+        staged.append(destination)
+    if qemu_support_sha256(private_bin, support, private=True) != expected_sha256:
         raise ValueError(
             "Private QEMU support copy differs from independent review"
         )
-    return destination
+    return tuple(staged)
+
+
+def _private_files(root):
+    files = set()
+    for current, directories, names in os.walk(root):
+        for name in (*directories, *names):
+            if (Path(current) / name).is_symlink():
+                raise ValueError("Private executable custody contains a symlink")
+        files.update(
+            (Path(current) / name).relative_to(root).as_posix()
+            for name in names
+        )
+    return files
 
 
 def _seed_proofs(directory, state):
@@ -475,9 +518,14 @@ def admit(inputs: OfflineInputs) -> OfflineAdmission | OfflineRefusal:
                 inputs.miz, inputs.runner, inputs.qemu
             )) != expected:
                 raise ValueError("Tool differs from independent review")
+        if (qemu_support_sha256(inputs.qemu.parent, inputs.qemu_support)
+                != reviewed.qemu_support_sha256):
+            raise ValueError("QEMU support files differ from independent review")
         executable_dir = state_dir / "offline-executables"
         executable_dir.mkdir(mode=0o700, exist_ok=False)
         _trusted_execution_parent(executable_dir)
+        private_bin = executable_dir / "bin"
+        private_bin.mkdir(mode=0o700)
         staged = replace(
             inputs,
             miz=_stage_executable(
@@ -485,18 +533,24 @@ def admit(inputs: OfflineInputs) -> OfflineAdmission | OfflineRefusal:
                 256 * 1024 * 1024, reviewed.miz_sha256,
             ),
             runner=_stage_executable(
-                inputs.runner, executable_dir / "runner",
+                inputs.runner, private_bin / "runner",
                 256 * 1024 * 1024, reviewed.runner_sha256,
             ),
             qemu=_stage_executable(
-                inputs.qemu, executable_dir / "qemu-system-x86_64",
+                inputs.qemu, private_bin / "qemu-system-x86_64",
                 256 * 1024 * 1024, reviewed.qemu_sha256,
             ),
         )
-        qemu_support = _stage_qemu_support(
-            inputs.qemu.parent / "share", executable_dir / "share",
-            reviewed.qemu_support_sha256,
-        )
+        private_files = {
+            "miz", "bin/runner", "bin/qemu-system-x86_64",
+            *(path.relative_to(executable_dir).as_posix()
+              for path in _stage_qemu_support(
+                  inputs.qemu.parent, inputs.qemu_support, private_bin,
+                  reviewed.qemu_support_sha256,
+              )),
+        }
+        if _private_files(executable_dir) != private_files:
+            raise ValueError("Private executable custody has unexpected files")
         stage = "packaging"
         _check_packaging(staged.miz, state_dir, efi_sha, efi["size"], vhd)
         stage = "boots"
@@ -535,12 +589,12 @@ def admit(inputs: OfflineInputs) -> OfflineAdmission | OfflineRefusal:
                          executable=True) != reviewed.runner_sha256
                 or _file(staged.qemu, 256 * 1024 * 1024, private=True,
                          executable=True) != reviewed.qemu_sha256
-                or qemu_support_sha256(inputs.qemu.parent / "share")
+                or qemu_support_sha256(inputs.qemu.parent, inputs.qemu_support)
                 != reviewed.qemu_support_sha256
-                or sorted(os.listdir(qemu_support))
-                != sorted(QEMU_SUPPORT_FILES)
-                or qemu_support_sha256(qemu_support, private=True)
-                != reviewed.qemu_support_sha256):
+                or _private_files(executable_dir) != private_files
+                or qemu_support_sha256(
+                    private_bin, inputs.qemu_support, private=True,
+                ) != reviewed.qemu_support_sha256):
             raise ValueError("Booted image changed during local verification")
         return OfflineAdmission(
             state["run_id"], state["operation_id"], reviewed.head_commit,
