@@ -232,6 +232,47 @@ class NativeRecordBridge(unittest.TestCase):
         self.assertEqual(json.loads(arguments.read_text()), [
             "records", "--runtime", str(runtime), "--output", "handoff-v1"])
 
+    def test_handoff_inspect_uses_native_command_without_fallback(self):
+        bridge = public_bundle.accepted_records
+        root, controller = self.controller_fixture(
+            "import json, os, pathlib, sys\n"
+            "open(os.environ['WAMR_CI_TEST_ARGS'], 'w').write("
+            "json.dumps(sys.argv[1:]))\n"
+            "output = pathlib.Path(sys.argv[sys.argv.index('--output') + 1])\n"
+            "mode = os.environ['WAMR_CI_TEST_MODE']\n"
+            "if mode == 'failed': sys.exit(1)\n"
+            "output.mkdir(mode=0o700)\n"
+            "for name in ('private', 'evidence'):\n"
+            "    (output / name).mkdir(mode=0o700)\n"
+            "for name, data in (('private/handoff-inspect.log', b'{}'),\n"
+            "                   ('evidence/command-handoff-inspect.json', b'{}')):\n"
+            "    path = output / name\n"
+            "    path.write_bytes(data)\n"
+            "    path.chmod(0o600)\n")
+        runtime = root / "runtime"
+        runtime.mkdir(mode=0o700)
+        output = root / "handoff"
+        arguments = root / "arguments.json"
+        with mock.patch.dict(os.environ, {
+                bridge.CONTROLLER_ENV: str(controller),
+                "WAMR_CI_TEST_ARGS": str(arguments),
+                "WAMR_CI_TEST_MODE": "ok"}):
+            log, record = bridge.handoff_inspect(runtime, output)
+        self.assertEqual(log, output / "private/handoff-inspect.log")
+        self.assertEqual(record, output / "evidence/command-handoff-inspect.json")
+        self.assertEqual(json.loads(arguments.read_text()), [
+            "handoff-inspect", "--runtime", str(runtime),
+            "--output", str(output)])
+        refused = root / "refused"
+        with mock.patch.dict(os.environ, {
+                bridge.CONTROLLER_ENV: str(controller),
+                "WAMR_CI_TEST_ARGS": str(arguments),
+                "WAMR_CI_TEST_MODE": "failed"}):
+            with self.assertRaisesRegex(
+                    ValueError, "native controller handoff inspect refused"):
+                bridge.handoff_inspect(runtime, refused)
+        self.assertFalse(refused.exists())
+
     def test_native_v1_view_cannot_be_relabeled_v2(self):
         bridge = public_bundle.accepted_records
         handoff = self.handoff_module()
@@ -436,6 +477,65 @@ class NativeRecordBridge(unittest.TestCase):
             self.assertEqual(phases, ["records"])
             digest.assert_not_called()
             build.assert_not_called()
+        self.assertFalse(output.exists())
+
+    def test_python_v2_export_routes_handoff_inspect_to_native_without_fallback(self):
+        handoff = self.handoff_module()
+        root, unused_controller = self.controller_fixture("")
+        del unused_controller
+        runtime = root / "runtime"
+        runtime.mkdir(mode=0o700)
+        (runtime / "compute").mkdir(mode=0o700)
+        evidence = runtime / "compute/evidence"
+        evidence.mkdir(mode=0o700)
+        supervisor = runtime / "compute/supervisor/bin/wamr-ci-supervisor"
+        start = {
+            "command_supervisor": {},
+            "consumer_inputs": {"files": {
+                "command-supervisor": {"path": str(supervisor)},
+            }},
+        }
+        source = {"revision": "1" * 40, "tree": "2" * 40}
+        build = {"source": source, "runtime": {}}
+        inputs = {"files": {}}
+        handoff.ci.save(evidence / "result.json", {"schema_version": 2})
+        handoff.ci.save(evidence / "build-start.json", start)
+        handoff.ci.save(evidence / "build.json", build)
+        handoff.ci.save(evidence / "boot-inputs.json", inputs)
+        for mode in handoff.ci.SIX_MODES:
+            handoff.ci.save(evidence / f"{mode}-compute.json", {})
+        phases = []
+        output = root / "handoff"
+        with mock.patch.object(
+                handoff, "_selected_records",
+                return_value=(None, {"build-start.json": "0" * 64})), \
+                mock.patch.object(
+                    handoff.ci, "bind_command_tools"), \
+                mock.patch.object(
+                    handoff.ci, "producer_inputs", return_value=start), \
+                mock.patch.object(
+                    handoff.ci, "check_build", return_value=build), \
+                mock.patch.object(
+                    handoff.ci, "boot_input_state"), \
+                mock.patch.object(
+                    handoff.ci, "check_boot", return_value={}), \
+                mock.patch.object(
+                    handoff.ci, "require_build_custody"), \
+                mock.patch.object(
+                    handoff.ci, "consumer_file_records", return_value={}), \
+                mock.patch.object(handoff.ci, "COMMAND_SUPERVISOR_PATH", None), \
+                mock.patch.object(
+                    handoff.ci, "execute") as execute, \
+                mock.patch.object(
+                    handoff.accepted_records, "handoff_inspect",
+                    side_effect=ValueError(
+                        "native controller handoff inspect refused")) as native:
+            with self.assertRaisesRegex(
+                    ValueError, "native controller handoff inspect refused"):
+                handoff.export(runtime, output, on_phase=phases.append)
+        self.assertIn("inspect", phases)
+        native.assert_called_once_with(runtime, output)
+        execute.assert_not_called()
         self.assertFalse(output.exists())
 
     def test_real_local_run_requires_completed_runtime(self):
@@ -3724,6 +3824,29 @@ source/generated/
                 with self.assertRaises(ci.Refusal):
                     ci.validate_supervised_command_binding(
                         record, stage, changed_identities)
+
+    def test_handoff_inspect_accepts_distinct_native_controller_supervisor_role(self):
+        record, identities = self.supervised_binding("handoff-inspect")
+        role = "native:handoff-inspect-controller"
+        identities[role] = {
+            **copy.deepcopy(identities["command-supervisor"]),
+            "content_sha256": hashlib.sha256(role.encode("ascii")).hexdigest(),
+            "inode": 99,
+        }
+        request = record["supervisor"]["request"]
+        request["supervisor"] = {
+            "path": ci.command_path(role),
+            "identity": copy.deepcopy(identities[role]),
+        }
+        self.rehash_supervised_binding(record)
+        ci.validate_supervised_command_binding(
+            record, "handoff-inspect", identities)
+
+        changed = copy.deepcopy(identities)
+        changed[role]["content_sha256"] = "0" * 64
+        with self.assertRaises(ci.Refusal):
+            ci.validate_supervised_command_binding(
+                record, "handoff-inspect", changed)
 
     def test_prepared_validator_supervision_is_closed_and_identity_bound(self):
         for stage, legacy in (("log-validator-x2apic", "forbidden"),

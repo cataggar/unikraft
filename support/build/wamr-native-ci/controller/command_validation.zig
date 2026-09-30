@@ -6,6 +6,8 @@ const Sha256 = core.Sha256;
 const plan = @import("command_plan.zig");
 const records = @import("records.zig");
 
+const handoff_controller_role = "native:handoff-inspect-controller";
+
 pub const EvidenceContext = enum { local_runtime, trusted_inner_zip };
 pub const ValidatedCommand = struct {
     stage: plan.Stage,
@@ -81,7 +83,13 @@ fn matchBinding(a: std.mem.Allocator, observed: std.json.Value, expected: plan.B
 
 const PlanVariant = enum { native, historical_import };
 
-fn matchPlan(a: std.mem.Allocator, request: std.json.Value, stage: plan.Stage, variant: PlanVariant) !void {
+fn matchPlan(
+    a: std.mem.Allocator,
+    request: std.json.Value,
+    stage: plan.Stage,
+    variant: PlanVariant,
+    context: EvidenceContext,
+) !void {
     const selected = plan.spec(stage);
     const argv = try get(request, "argv");
     const historical = variant == .historical_import;
@@ -118,7 +126,15 @@ fn matchPlan(a: std.mem.Allocator, request: std.json.Value, stage: plan.Stage, v
         try matchBinding(a, try get(observed, "value"), entry.value);
     }
     try matchBinding(a, try get(request, "cwd"), .{ .path = .{ .role = "source" } });
-    try matchIdentified(a, try get(request, "supervisor"), "command-supervisor");
+    const supervisor = try get(request, "supervisor");
+    if (context == .local_runtime and stage == .@"handoff-inspect") {
+        matchIdentified(a, supervisor, "command-supervisor") catch |err| {
+            if (err == error.OutOfMemory) return err;
+            try matchIdentified(a, supervisor, handoff_controller_role);
+        };
+    } else {
+        try matchIdentified(a, supervisor, "command-supervisor");
+    }
     try matchIdentified(a, try get(request, "native_executable"), if (wrapper) "command-supervisor" else if (historical and stage == .fixtures) "tool:python3" else selected.executable);
     try matchIdentified(a, try get(request, "command_executable"), if (historical and stage == .fixtures) "tool:python3" else selected.executable);
     const interpreter = try get(request, "interpreter");
@@ -274,9 +290,9 @@ pub fn validate(
     if (try num(u8, try get(request, "version")) != 1 or
         try num(u8, try get(request, "binding_version")) != 1) return error.InvalidCommand;
     const variant: PlanVariant = blk: {
-        matchPlan(a, request, stage, .native) catch |err| {
+        matchPlan(a, request, stage, .native, context) catch |err| {
             if (context == .local_runtime or err == error.OutOfMemory) return err;
-            try matchPlan(a, request, stage, .historical_import);
+            try matchPlan(a, request, stage, .historical_import, context);
             break :blk .historical_import;
         };
         break :blk .native;

@@ -11,6 +11,10 @@ const records = @import("records.zig");
 
 const image = "support/apps/wamr-aot/build/wamr_hyperv-x86_64-efi";
 
+pub fn supervisorRole(accepted: *accepted_run.AcceptedRun) []const u8 {
+    return if (accepted.local_producer == .python) accepted_run.handoff_controller_role else "command-supervisor";
+}
+
 fn inputPath(accepted: *accepted_run.AcceptedRun, role: []const u8, expected: ?[]const u8) ![]const u8 {
     var found: ?[]const u8 = null;
     for (accepted.runtime_inputs) |input| {
@@ -37,7 +41,14 @@ pub fn bind(accepted: *accepted_run.AcceptedRun, output: []const u8) !plan.Roots
     }
     const package_tool = try std.fs.path.join(a, &.{ compute, "tools/bin/wamr-ci-package" });
     const efi = try std.fs.path.join(a, &.{ repository, image });
-    const supervisor = try std.fs.path.join(a, &.{ accepted.root, "controller/bin/uk-wamr-native-ci" });
+    const supervisor = try std.fs.path.join(a, &.{ accepted.root, switch (accepted.local_producer) {
+        .native => "controller/bin/uk-wamr-native-ci",
+        .python => "compute/supervisor/bin/wamr-ci-supervisor",
+    } });
+    const handoff_controller = if (accepted.local_producer == .python) blk: {
+        const current = try std.Io.Dir.realPathFileAbsoluteAlloc(accepted.io, "/proc/self/exe", a);
+        break :blk try inputPath(accepted, accepted_run.handoff_controller_role, current);
+    } else "";
     return .{
         .source_root = repository,
         .runtime = accepted.root,
@@ -49,6 +60,7 @@ pub fn bind(accepted: *accepted_run.AcceptedRun, output: []const u8) !plan.Roots
         .package_tool = try inputPath(accepted, "package_tool", package_tool),
         .validator = try inputPath(accepted, "native:wamr-log-validate", null),
         .efi = try inputPath(accepted, "efi", efi),
+        .handoff_controller = handoff_controller,
         .tools = tools,
     };
 }
@@ -128,6 +140,7 @@ pub fn run(
         .private_dir = private,
         .evidence_dir = evidence,
         .cancel = if (signal) |active| active.flag() else null,
+        .supervisor_role = supervisorRole(accepted),
         .capture_stdout = true,
     });
     defer allocator.free(outcome.stdout);

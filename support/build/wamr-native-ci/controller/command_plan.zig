@@ -294,6 +294,7 @@ pub const Roots = struct {
     identity: []const u8 = "",
     direct_validator: []const u8 = "",
     bundle: []const u8 = "",
+    handoff_controller: []const u8 = "",
     tools: [inputs.host_tools.len][]const u8,
 
     pub fn get(self: Roots, role: []const u8) ![]const u8 {
@@ -304,6 +305,7 @@ pub const Roots = struct {
         if (std.mem.eql(u8, role, "tool:zig")) return self.zig;
         if (std.mem.eql(u8, role, "tool-tree:zig")) return std.fs.path.dirname(self.zig) orelse error.UnboundCommandRole;
         if (std.mem.eql(u8, role, "command-supervisor")) return self.supervisor;
+        if (std.mem.eql(u8, role, "native:handoff-inspect-controller") and self.handoff_controller.len != 0) return self.handoff_controller;
         if (std.mem.eql(u8, role, "native:wamr-aot-build")) return self.producer;
         if (std.mem.eql(u8, role, "native:wamr-native-ci-fixtures")) return self.fixture_runner orelse error.UnboundCommandRole;
         if (std.mem.eql(u8, role, "native:wamr-log-validate")) return self.validator;

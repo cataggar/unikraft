@@ -51,9 +51,12 @@ boot, changes authority, or makes a partially checked manifest an accepted run.
 The public bundle importer now requires this native check before publishing
 its candidate, while retaining the Python publication and supervised-stage
 validation. Native-produced v2 local handoff requires native acceptance before using its
-result-record hashes and source identity; the Python build, boot and inspection
-checks still run. A Python-produced local run instead retains the pinned
-Python source-custody path until the protected production caller is switched.
+result-record hashes and source identity; the Python build and boot checks
+still run. A Python-produced local run retains the pinned Python
+source-custody path for result-record selection. It is accepted by the native
+controller only for the non-legacy v2 handoff inspection route; `records
+--runtime` and `public-validator-build --runtime` remain native-produced
+local-runtime gates.
 The separately validated `command-public-validator-build.json` may appear in
 Python-produced evidence after acceptance; it is not part of the 33 pinned
 result records or the exported archive. Other extra evidence is refused.
@@ -68,16 +71,23 @@ For a trusted v2 import, the native accepted-run records gate validates the
 imported command bindings before Python applies archive and publication policy;
 Python no longer reinterprets those imported command records. Producer-direct
 publication and legacy v1 import retain their existing Python command checks.
-`handoff-inspect --runtime ABS --output ABS` is a support-only stage for
-native-produced v2 runs. It uses the runtime-installed recorded controller
-and pinned package/EFI inputs, then retains its bounded private log and
-command record in a create-only owner-only output beneath an existing private
-parent outside the runtime's pinned input ancestors. It neither exports an
-image nor accepts a Python-produced runtime. `public-validator-build --runtime
-ABS --output ABS` similarly uses the recorded Zig tool and controller to
-build the fixed x86_64 validator in an independent private output, retaining
-its bounded command evidence without modifying the accepted runtime or
-publishing an archive. Python remains the production handoff caller;
+`handoff-inspect --runtime ABS --output ABS` is the native owner of the
+non-legacy v2 local handoff inspection. It accepts either native-produced v2
+runtimes or Python-produced v2 runtimes whose recorded supervisor, source and
+consumer custody can be recaptured, then uses the pinned package/EFI inputs
+and retains its bounded private log and command record in a create-only
+owner-only output beneath an existing private parent outside the runtime's
+pinned input ancestors. For Python-produced runs the command record names the
+actually running native controller as `native:handoff-inspect-controller`;
+the recorded Python `command-supervisor` remains a recaptured input, but is
+not labeled as the native supervisor. The stage neither exports an image nor
+falls back to Python after refusal; `handoff-inspect-legacy` remains
+Python-owned for historical supervision. `public-validator-build --runtime
+ABS --output ABS` accepts native-produced local runtimes only, using the
+recorded Zig tool and controller to build the fixed x86_64 validator in an
+independent private output, retaining its bounded command evidence without
+modifying the accepted runtime or publishing an archive. Python remains the
+production handoff caller;
 `supervisor-import-identity --stage-root ABS --supervisor ABS --git ABS
 --output ABS` is a separate support-only operation for a clean, trusted
 imported v2 inner stage. It checks the recorded supervisor source files
