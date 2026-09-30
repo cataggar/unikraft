@@ -256,11 +256,14 @@ Run the solve command with the controlled tool path shown above rather than an
 ambient developer shell. `python3` then resolves from the pinned runtime, the
 parser wrappers resolve first, source versioning uses the selected Git runtime,
 LLVM tools retain their symbolic command names, and the Make-backed facade
-uses the absolute `$MAKE` supplied by `-Dmake-command`.
+uses the absolute `$MAKE` supplied by `-Dmake-command`. Solve at the exact
+committed `HEAD` you will build: the solved configuration records the source
+version, and `build-private` rejects a configuration that its build rewrites.
 
 Then let the controller invoke the fixed native builder itself. It first
 copies and preflights the complete Git runtime, then uses only that relocated
-copy for source snapshots and Make's symbolic `git` invocation. The receipt
+copy for source snapshots and Make's symbolic `git` invocation. Make also
+receives the same absolute `--zig` path as `ZIG` for Hyper-V Zig objects. The receipt
 fingerprints the complete Git runtime, compiler, LLVM, Make, Python, parser
 tools and Bison data. Git configuration, hook, helper, fsmonitor, and
 repository-selection environment overrides are removed; system/global config
