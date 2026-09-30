@@ -122,15 +122,26 @@ pub fn main(init: std.process.Init) void {
         defer runtime.close(init.io);
         var signal = controller.build_pipeline.installCancellation() catch refused(init.io);
         defer signal.deinit();
-        var accepted = controller.accepted_run.openAndValidateWithSignal(
-            allocator,
-            init.io,
-            init.minimal.environ,
-            &runtime,
-            root,
-            repository,
-            &signal,
-        ) catch |err| failed(init.io, stage, "", err);
+        var accepted = if (command.action == .@"handoff-inspect")
+            controller.accepted_run.openAndValidateForHandoffInspectWithSignal(
+                allocator,
+                init.io,
+                init.minimal.environ,
+                &runtime,
+                root,
+                repository,
+                &signal,
+            ) catch |err| failed(init.io, stage, "", err)
+        else
+            controller.accepted_run.openAndValidateWithSignal(
+                allocator,
+                init.io,
+                init.minimal.environ,
+                &runtime,
+                root,
+                repository,
+                &signal,
+            ) catch |err| failed(init.io, stage, "", err);
         defer accepted.deinit();
         const result = switch (command.action) {
             .@"handoff-inspect" => controller.handoff_inspect.run(

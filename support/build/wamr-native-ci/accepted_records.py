@@ -276,6 +276,45 @@ def supervisor_import_identity(stage_root, supervisor, git, output):
     return output
 
 
+def handoff_inspect(runtime, output):
+    """Run the native owner for the v2 local handoff inspection stage."""
+    runtime, output = map(Path, (runtime, output))
+    refusal = "native controller handoff inspect refused"
+    try:
+        runtime = _absolute(runtime)
+        _absolute(output.parent)
+    except (OSError, ValueError) as error:
+        raise ValueError(refusal) from error
+    if (not output.is_absolute()
+            or os.path.normpath(str(output)) != str(output)
+            or os.path.lexists(output)):
+        _refuse(refusal)
+    raw, stderr_seen = _controller_command((
+        "handoff-inspect", "--runtime", str(runtime),
+        "--output", str(output)), refusal)
+    if raw or stderr_seen:
+        _refuse(refusal)
+    try:
+        for path in (output, output / "private", output / "evidence"):
+            info = path.lstat()
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) != 0o700):
+                _refuse(refusal)
+        for path, bound in (
+                (output / "private/handoff-inspect.log", 64 * 1024),
+                (output / "evidence/command-handoff-inspect.json",
+                 MAX_RECORDS_BYTES)):
+            info = path.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != os.geteuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600
+                    or not 0 < info.st_size <= bound):
+                _refuse(refusal)
+    except OSError as error:
+        raise ValueError(refusal) from error
+    return output / "private/handoff-inspect.log", output / "evidence/command-handoff-inspect.json"
+
+
 def local_runtime(runtime):
     """Local handoff requires native v2; historical v1 is import-only."""
     runtime = _absolute(runtime)

@@ -247,7 +247,7 @@ jobs:
           export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
           bash .github/scripts/hyperv-qemu-candidate-runtime.sh "${root}" compute
 
-      - name: Keep the Python-produced local handoff on its pinned source path
+      - name: Keep Python-produced local records on their pinned source path
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -292,6 +292,8 @@ jobs:
           export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
           result="$(python3 support/build/wamr-native-ci/handoff.py public-source-bundle)"
           printf '%s\n' "${result}"
+          test -s "${root}/compute/public-source/handoff/private/handoff-inspect.log"
+          test -s "${root}/compute/public-source/handoff/evidence/command-handoff-inspect.json"
           archive_sha256="$(
             printf '%s\n' "${result}" |
               sed -n 's/^Public source archive SHA-256: //p'

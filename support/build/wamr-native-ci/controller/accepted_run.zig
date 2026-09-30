@@ -13,11 +13,15 @@ const plan = @import("command_plan.zig");
 const command = @import("command_validation.zig");
 const limits = @import("custody_limits.zig");
 const validator = @import("wamr_log_validator");
+const local_consumer = @import("local_consumer_custody.zig");
 
 pub const EvidenceContext = command.EvidenceContext;
 pub const ValidatedCommand = command.ValidatedCommand;
 pub const Stage = plan.Stage;
 pub const SourceIdentity = struct { revision: []const u8, tree: []const u8 };
+pub const LocalProducer = enum { native, python };
+pub const handoff_controller_role = "native:handoff-inspect-controller";
+const LocalOpenPolicy = enum { native_only, handoff_inspect };
 pub const ResultRecord = struct {
     relative_path: []const u8,
     bytes: u64,
@@ -130,6 +134,7 @@ pub const AcceptedRun = struct {
     root: []const u8,
     repository: ?[]const u8,
     environ: ?std.process.Environ,
+    local_producer: LocalProducer = .native,
 
     pub fn deinit(self: *AcceptedRun) void {
         self.arena.deinit();
@@ -196,7 +201,10 @@ pub const AcceptedRun = struct {
 
     pub fn revalidateWithSignal(self: *AcceptedRun, signal: ?*core.process.SignalCancellation) !void {
         if (self.context == .local_runtime) {
-            try revalidateLocal(self, signal);
+            if (self.local_producer == .python)
+                try revalidateLocalPython(self, signal)
+            else
+                try revalidateLocal(self, signal);
         } else {
             try revalidateImported(self);
         }
@@ -249,7 +257,7 @@ pub fn openAndValidate(
     root: []const u8,
     repository: []const u8,
 ) !AcceptedRun {
-    return openAndValidateWithSignal(allocator, io, environ, runtime, root, repository, null);
+    return openAndValidateWithPolicy(allocator, io, environ, runtime, root, repository, null, .native_only);
 }
 
 pub fn openAndValidateWithSignal(
@@ -260,6 +268,31 @@ pub fn openAndValidateWithSignal(
     root: []const u8,
     repository: []const u8,
     signal: ?*core.process.SignalCancellation,
+) !AcceptedRun {
+    return openAndValidateWithPolicy(allocator, io, environ, runtime, root, repository, signal, .native_only);
+}
+
+pub fn openAndValidateForHandoffInspectWithSignal(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: std.process.Environ,
+    runtime: *const files.Directory,
+    root: []const u8,
+    repository: []const u8,
+    signal: ?*core.process.SignalCancellation,
+) !AcceptedRun {
+    return openAndValidateWithPolicy(allocator, io, environ, runtime, root, repository, signal, .handoff_inspect);
+}
+
+fn openAndValidateWithPolicy(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: std.process.Environ,
+    runtime: *const files.Directory,
+    root: []const u8,
+    repository: []const u8,
+    signal: ?*core.process.SignalCancellation,
+    policy: LocalOpenPolicy,
 ) !AcceptedRun {
     try files.absoluteFilePath(root);
     try files.absoluteFilePath(repository);
@@ -287,7 +320,12 @@ pub fn openAndValidateWithSignal(
     try loadResult(&accepted);
     if (accepted.compatibility != .tiny_v2_qcow2_derived_vhd)
         return error.UnsupportedLocalLegacyRun;
-    try revalidateLocal(&accepted, signal);
+    accepted.local_producer = try localProducer(&accepted);
+    if (accepted.local_producer == .python and policy != .handoff_inspect)
+        return error.UnsupportedLocalProducer;
+    try accepted.revalidateWithSignal(signal);
+    if (accepted.local_producer == .python)
+        try appendHandoffControllerInput(&accepted);
     try collectArtifacts(&accepted);
     return accepted;
 }
@@ -431,16 +469,25 @@ fn loadResult(self: *AcceptedRun) !void {
     defer directory.close(self.io);
     var iterator = directory.iterate();
     var count: usize = 0;
+    var local_validator_record = false;
     while (try iterator.next(self.io)) |entry| {
         if (count > 64 or (self.context == .trusted_inner_zip and
             std.mem.eql(u8, entry.name, "result.json")))
             return error.UnexpectedEvidence;
+        if (self.context == .local_runtime and
+            std.mem.eql(u8, entry.name, "command-public-validator-build.json"))
+        {
+            local_validator_record = true;
+            count += 1;
+            continue;
+        }
         if (!value.records.contains(entry.name) and
             !(self.context == .local_runtime and std.mem.eql(u8, entry.name, "result.json")))
             return error.UnexpectedEvidence;
         count += 1;
     }
-    if (count != value.records.count() + @intFromBool(self.context == .local_runtime))
+    if (count != value.records.count() + @intFromBool(self.context == .local_runtime) +
+        @intFromBool(local_validator_record))
         return error.MissingEvidence;
     var pinned: std.ArrayList(PinnedRecord) = .empty;
     var records_iterator = value.records.iterator();
@@ -480,6 +527,19 @@ fn loadResult(self: *AcceptedRun) !void {
     }
 }
 
+fn localProducer(self: *AcceptedRun) !LocalProducer {
+    if (self.context != .local_runtime) return error.InvalidContext;
+    const a = self.allocator();
+    const start = try canonicalFile(self, try recordPath(self, "build-start.json"), records.max_record_bytes);
+    const supervisor = try get(try get(try get(start, "consumer_inputs"), "files"), "command-supervisor");
+    const path = try text(try get(supervisor, "path"));
+    const native = try join(a, &.{ self.root, "controller/bin/uk-wamr-native-ci" });
+    if (std.mem.eql(u8, path, native)) return .native;
+    const python = try join(a, &.{ self.root, "compute/supervisor/bin/wamr-ci-supervisor" });
+    if (std.mem.eql(u8, path, python)) return .python;
+    return error.UnsupportedLocalProducer;
+}
+
 fn revalidateLocal(self: *AcceptedRun, signal: ?*core.process.SignalCancellation) !void {
     if (signal) |active| return revalidateLocalWithSignal(self, active);
     var installed = try build.installCancellation();
@@ -513,7 +573,7 @@ fn revalidateLocalWithSignal(self: *AcceptedRun, signal: *core.process.SignalCan
     };
     defer boot_context.pinned.deinit();
     try boot.revalidateComplete(&boot_context, result);
-    try validateCommands(self, false);
+    try validateCommands(self, false, false);
     const current = try physical.readFile(self.io, try resultPath(self), records.max_record_bytes, true);
     if (!std.meta.eql(current.sha256, self.result.sha256) or current.bytes != self.result.bytes)
         return error.ResultChanged;
@@ -524,6 +584,132 @@ fn revalidateLocalWithSignal(self: *AcceptedRun, signal: *core.process.SignalCan
     }
     if (self.runtime_inputs.len == 0)
         try collectRuntimeInputs(self, &context, &boot_context);
+}
+
+fn revalidateLocalPython(self: *AcceptedRun, signal: ?*core.process.SignalCancellation) !void {
+    if (signal) |active| return revalidateLocalPythonWithSignal(self, active);
+    var installed = try build.installCancellation();
+    defer installed.deinit();
+    return revalidateLocalPythonWithSignal(self, &installed);
+}
+
+fn revalidateLocalPythonWithSignal(self: *AcceptedRun, signal: *core.process.SignalCancellation) !void {
+    const a = self.allocator();
+    const raw = try canonicalFile(self, try resultPath(self), records.max_record_bytes);
+    const result = try records.readResult(raw);
+    if (result.set != self.compatibility or result.set != .tiny_v2_qcow2_derived_vhd)
+        return error.InvalidResult;
+    try local_consumer.run(
+        a,
+        self.io,
+        self.repository orelse return error.InvalidContext,
+        self.root,
+        signal,
+    );
+    try validateCommands(self, false, true);
+    const current = try physical.readFile(self.io, try resultPath(self), records.max_record_bytes, true);
+    if (!std.meta.eql(current.sha256, self.result.sha256) or current.bytes != self.result.bytes)
+        return error.ResultChanged;
+    for (self.records) |item| {
+        const observed = try physical.readFile(self.io, try recordPath(self, item.name), records.max_record_bytes, true);
+        if (!std.meta.eql(observed.sha256, item.sha256) or observed.bytes != item.bytes)
+            return error.RecordChanged;
+    }
+    if (self.runtime_inputs.len == 0)
+        try collectRecordedRuntimeInputs(self);
+}
+
+fn collectRecordedRuntimeInputs(self: *AcceptedRun) !void {
+    const a = self.allocator();
+    var result: std.ArrayList(PinnedInput) = .empty;
+    const start = try canonicalFile(self, try recordPath(self, "build-start.json"), records.max_record_bytes);
+    try collectCustodyInputs(self, try get(start, "consumer_inputs"), &result);
+    const boot_inputs = try canonicalFile(self, try recordPath(self, "boot-inputs.json"), records.max_record_bytes);
+    try collectCustodyInputs(self, boot_inputs, &result);
+    if (result.items.len > 512) return error.InputLimit;
+    self.runtime_inputs = try result.toOwnedSlice(a);
+}
+
+fn appendHandoffControllerInput(self: *AcceptedRun) !void {
+    const a = self.allocator();
+    for (self.runtime_inputs) |input|
+        if (std.mem.eql(u8, input.role, handoff_controller_role))
+            return error.DuplicateInputRole;
+    const path = try std.Io.Dir.realPathFileAbsoluteAlloc(self.io, "/proc/self/exe", a);
+    const observed = try physical.readFile(self.io, path, limits.input_file, false);
+    if (@as(u64, @intCast(observed.metadata[2])) & 0o111 == 0)
+        return error.UnsafeFile;
+    const updated = try a.alloc(PinnedInput, self.runtime_inputs.len + 1);
+    @memcpy(updated[0..self.runtime_inputs.len], self.runtime_inputs);
+    updated[self.runtime_inputs.len] = .{
+        .role = handoff_controller_role,
+        .path = path,
+        .snapshot = .{
+            .bytes = observed.bytes,
+            .sha256 = observed.sha256,
+            .metadata = observed.metadata,
+        },
+    };
+    self.runtime_inputs = updated;
+}
+
+fn collectCustodyInputs(
+    self: *AcceptedRun,
+    expected: std.json.Value,
+    result: *std.ArrayList(PinnedInput),
+) !void {
+    const a = self.allocator();
+    const files_value = try get(expected, "files");
+    const trees_value = try get(expected, "trees");
+    if (files_value != .object or trees_value != .object) return error.InvalidInputCustody;
+    const file_bindings = try a.alloc(inputs.Binding, files_value.object.count());
+    defer a.free(file_bindings);
+    const tree_bindings = try a.alloc(inputs.Binding, trees_value.object.count());
+    defer a.free(tree_bindings);
+    for (files_value.object.keys(), files_value.object.values(), 0..) |role, item, index| {
+        file_bindings[index] = .{ .role = role, .path = try text(try get(item, "path")) };
+    }
+    for (trees_value.object.keys(), trees_value.object.values(), 0..) |role, item, index| {
+        tree_bindings[index] = .{ .role = role, .path = try text(try get(item, "path")) };
+    }
+    var current = try inputs.capture(a, self.io, file_bindings, tree_bindings);
+    defer current.deinit(a);
+    const recorded = try records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, expected, .{}));
+    const observed = try current.canonical(a);
+    if (!std.mem.eql(u8, recorded, observed)) return error.InputChanged;
+    for (current.files) |item| {
+        const observed_file = try physical.readFile(self.io, item.path, limits.input_file, false);
+        if (!std.meta.eql(observed_file.metadata, item.metadata) or
+            !std.meta.eql(observed_file.sha256, item.sha256))
+            return error.InputChanged;
+        try result.append(a, .{
+            .role = item.role,
+            .path = item.path,
+            .snapshot = .{
+                .bytes = observed_file.bytes,
+                .sha256 = observed_file.sha256,
+                .metadata = observed_file.metadata,
+            },
+        });
+    }
+    for (current.trees) |tree| {
+        const root = physical.metadata(try physical.directory(self.io, tree.path, false));
+        try result.append(a, .{
+            .role = try std.fmt.allocPrint(a, "tree:{s}", .{tree.role}),
+            .path = tree.path,
+            .snapshot = .{
+                .bytes = @intCast(tree.bytes),
+                .sha256 = tree.content_sha256,
+                .metadata = root,
+                .tree = .{
+                    .files = tree.files,
+                    .directories = tree.directories,
+                    .symlinks = tree.symlinks,
+                    .physical_sha256 = tree.physical_sha256,
+                },
+            },
+        });
+    }
 }
 
 pub fn validateCommandBinding(
@@ -567,17 +753,20 @@ pub fn validateLocalPostRunCommand(self: *AcceptedRun, raw: []const u8, stage: S
     const record = document.value();
     const checked = try command.validate(a, record, stage, .local_runtime);
     const request = try get(try get(record, "supervisor"), "request");
+    const supervisor = try get(request, "supervisor");
+    try checkPostRunSupervisorRole(self, supervisor, stage);
     const start = try canonicalFile(self, try recordPath(self, "build-start.json"), records.max_record_bytes);
     const boot_inputs = try canonicalFile(self, try recordPath(self, "boot-inputs.json"), records.max_record_bytes);
-    for ([_][]const u8{ "supervisor", "native_executable", "command_executable" }) |key|
-        try checkRoleIdentity(try get(request, key), start, boot_inputs);
+    try checkPostRunRoleIdentity(self, supervisor, start, boot_inputs, stage);
+    for ([_][]const u8{ "native_executable", "command_executable" }) |key|
+        try checkPostRunRoleIdentity(self, try get(request, key), start, boot_inputs, stage);
     const retained = try get(request, "retained_executables");
     for (retained.array.items) |binding|
-        try checkRoleIdentity(binding, start, boot_inputs);
+        try checkPostRunRoleIdentity(self, binding, start, boot_inputs, stage);
     return checked;
 }
 
-fn validateCommands(self: *AcceptedRun, legacy: bool) !void {
+fn validateCommands(self: *AcceptedRun, legacy: bool, allow_historical_local: bool) !void {
     const start = if (legacy) std.json.Value.null else try canonicalFile(self, try recordPath(self, "build-start.json"), records.max_record_bytes);
     const boot_inputs = if (legacy) std.json.Value.null else try canonicalFile(self, try recordPath(self, "boot-inputs.json"), records.max_record_bytes);
     for (self.records) |item| {
@@ -598,7 +787,10 @@ fn validateCommands(self: *AcceptedRun, legacy: bool) !void {
             if (over != .bool or over.bool or markers != .array or markers.array.items.len != 0)
                 return error.InvalidCommand;
         } else {
-            _ = try command.validate(self.allocator(), value, stage, self.context);
+            if (command.validate(self.allocator(), value, stage, self.context)) |_| {} else |err| {
+                if (!allow_historical_local or err == error.OutOfMemory) return err;
+                _ = try command.validate(self.allocator(), value, stage, .trusted_inner_zip);
+            }
             if (self.context == .local_runtime) {
                 const log = try join(self.allocator(), &.{ self.root, "compute/private", try std.fmt.allocPrint(self.allocator(), "{s}.log", .{stage_name}) });
                 const observed = try physical.readFile(self.io, log, plan.spec(stage).output_limit + 1, true);
@@ -626,6 +818,10 @@ fn checkRoleIdentity(binding: std.json.Value, start: std.json.Value, boot_inputs
         try get(try get(boot_inputs, "files"), role["input:".len..])
     else
         try get(try get(try get(start, "consumer_inputs"), "files"), role);
+    try checkRecordIdentity(binding, record);
+}
+
+fn checkRecordIdentity(binding: std.json.Value, record: std.json.Value) !void {
     const identity = try get(binding, "identity");
     try equal(try text(try get(identity, "content_sha256")), try text(try get(record, "sha256")));
     const metadata = try get(record, "metadata");
@@ -646,6 +842,58 @@ fn checkRoleIdentity(binding: std.json.Value, start: std.json.Value, boot_inputs
         try number(i64, try get(identity, "ctime_seconds")) != @divFloor(ctime, std.time.ns_per_s) or
         try number(u32, try get(identity, "mtime_nanoseconds")) != @mod(mtime, std.time.ns_per_s) or
         try number(u32, try get(identity, "ctime_nanoseconds")) != @mod(ctime, std.time.ns_per_s))
+        return error.InvalidCommandIdentity;
+}
+
+fn checkPinnedInputIdentity(self: *AcceptedRun, binding: std.json.Value, role: []const u8) !void {
+    const identity = try get(binding, "identity");
+    for (self.runtime_inputs) |input| {
+        if (!std.mem.eql(u8, input.role, role)) continue;
+        try equal(try text(try get(identity, "content_sha256")), &input.snapshot.sha256);
+        const metadata = input.snapshot.metadata;
+        const raw_device: u64 = @intCast(metadata[0]);
+        const major = (raw_device >> 8 & 0xfff) | (raw_device >> 32 & ~@as(u64, 0xfff));
+        const minor = (raw_device & 0xff) | (raw_device >> 12 & ~@as(u64, 0xff));
+        const mtime = metadata[7];
+        const ctime = metadata[8];
+        if (try number(u64, try get(identity, "device_major")) != major or
+            try number(u64, try get(identity, "device_minor")) != minor or
+            try number(u64, try get(identity, "inode")) != @as(u64, @intCast(metadata[1])) or
+            try number(u64, try get(identity, "mode")) != @as(u64, @intCast(metadata[2])) or
+            try number(u64, try get(identity, "uid")) != @as(u64, @intCast(metadata[3])) or
+            try number(u64, try get(identity, "size")) != @as(u64, @intCast(metadata[6])) or
+            try number(i64, try get(identity, "mtime_seconds")) != @as(i64, @intCast(@divFloor(mtime, std.time.ns_per_s))) or
+            try number(i64, try get(identity, "ctime_seconds")) != @as(i64, @intCast(@divFloor(ctime, std.time.ns_per_s))) or
+            try number(u32, try get(identity, "mtime_nanoseconds")) != @as(u32, @intCast(@mod(mtime, std.time.ns_per_s))) or
+            try number(u32, try get(identity, "ctime_nanoseconds")) != @as(u32, @intCast(@mod(ctime, std.time.ns_per_s))))
+            return error.InvalidCommandIdentity;
+        return;
+    }
+    return error.MissingInput;
+}
+
+fn checkPostRunRoleIdentity(
+    self: *AcceptedRun,
+    binding: std.json.Value,
+    start: std.json.Value,
+    boot_inputs: std.json.Value,
+    stage: Stage,
+) !void {
+    const path = try get(binding, "path");
+    const role = try text(try get(path, "role"));
+    if (stage == .@"handoff-inspect" and std.mem.eql(u8, role, handoff_controller_role))
+        return checkPinnedInputIdentity(self, binding, role);
+    return checkRoleIdentity(binding, start, boot_inputs);
+}
+
+fn checkPostRunSupervisorRole(self: *AcceptedRun, binding: std.json.Value, stage: Stage) !void {
+    const path = try get(binding, "path");
+    const role = try text(try get(path, "role"));
+    const expected = if (stage == .@"handoff-inspect" and self.local_producer == .python)
+        handoff_controller_role
+    else
+        "command-supervisor";
+    if (!std.mem.eql(u8, role, expected))
         return error.InvalidCommandIdentity;
 }
 
@@ -852,7 +1100,7 @@ fn revalidateImported(self: *AcceptedRun) !void {
     if (actual_result.bytes != self.result.bytes or
         !std.meta.eql(actual_result.sha256, self.result.sha256))
         return error.ResultChanged;
-    try validateCommands(self, legacy);
+    try validateCommands(self, legacy, false);
     try verifyImportedEvidence(self, portable);
 }
 

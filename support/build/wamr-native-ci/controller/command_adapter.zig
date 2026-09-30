@@ -28,6 +28,7 @@ pub const Request = struct {
     private_dir: std.Io.Dir,
     evidence_dir: std.Io.Dir,
     cancel: ?*const std.atomic.Value(bool) = null,
+    supervisor_role: []const u8 = "command-supervisor",
     test_seconds: ?u32 = null,
     test_output_limit: ?usize = null,
     test_replacement: ?[]const u8 = null,
@@ -206,7 +207,7 @@ fn create(io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: []const u8) !voi
 
 pub fn openPinnedTool(io: std.Io, path: []const u8, role: []const u8) !files.RetainedFile {
     const large_roles = [_][]const u8{
-        "tool:zig",        "tool:llvm-nm",      "tool:llvm-objcopy",
+        "tool:zig",          "tool:llvm-nm",      "tool:llvm-objcopy",
         "tool:llvm-objdump", "tool:llvm-readelf", "tool:llvm-strip",
     };
     var large = false;
@@ -247,7 +248,8 @@ pub fn execute(allocator: Allocator, io: std.Io, request: Request) !Outcome {
     defer pinned.close(io);
     var executable = try process.Executable.fromFile(io, pinned.file);
     defer executable.close(io);
-    var supervisor = try files.RetainedFile.open(io, request.roots.supervisor, .tool);
+    const supervisor_path = try request.roots.get(request.supervisor_role);
+    var supervisor = try files.RetainedFile.open(io, supervisor_path, .tool);
     defer supervisor.close(io);
     var controller_executable = try process.Executable.fromFile(io, supervisor.file);
     defer controller_executable.close(io);
@@ -427,7 +429,7 @@ pub fn execute(allocator: Allocator, io: std.Io, request: Request) !Outcome {
         .argv = try array(a, argv_public.items),
         .environment = try array(a, env_public.items),
         .cwd = try binding(a, .{ .path = .{ .role = "source" } }),
-        .supervisor = try identified(a, "command-supervisor", controller_executable.identity),
+        .supervisor = try identified(a, request.supervisor_role, controller_executable.identity),
         .native_executable = try identified(a, selected.executable, executable.identity),
         .command_executable = try identified(a, selected.executable, executable.identity),
         .interpreter = @as(?Value, null),

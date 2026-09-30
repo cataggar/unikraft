@@ -3018,8 +3018,11 @@ def validate_supervised_command_binding(
         validate_native_executable_identity(
             request["interpreter"]["identity"],
             "invalid supervised command binding")
-    require(request["supervisor"]["path"]
-            == command_path("command-supervisor")
+    supervisor_paths = [command_path("command-supervisor")]
+    if stage == "handoff-inspect":
+        supervisor_paths.append(command_path("native:handoff-inspect-controller"))
+    require(any(request["supervisor"]["path"] == path
+                for path in supervisor_paths)
             and native_u64(
                 request["issued_ns"],
                 "invalid supervised command binding") == request["issued_ns"]
