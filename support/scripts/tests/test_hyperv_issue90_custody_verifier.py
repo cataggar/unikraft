@@ -116,7 +116,7 @@ class CustodyVerifierTests(unittest.TestCase):
             self.state_dir, root / "build", root / "images",
             root / "miz", root / "runner", root / "qemu",
             root / "ovmf-code", root / "ovmf-vars",
-            admission.ReviewPins("a" * 40, *("b" * 64 for _ in range(13))),
+            admission.ReviewPins("a" * 40, *("b" * 64 for _ in range(14))),
         )
         self.v = verifier.Verifier(
             self.inputs, self.fixture.expected,

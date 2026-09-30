@@ -33,7 +33,7 @@ class OfflineAdmissionTest(unittest.TestCase):
         self.build_dir.mkdir(mode=0o700)
         self.image_dir.mkdir(mode=0o700)
         self.pins = admission.ReviewPins(
-            "a" * 40, *("b" * 64 for _ in range(13))
+            "a" * 40, *("b" * 64 for _ in range(14))
         )
 
     def inputs(self, reviewed=None):
@@ -148,6 +148,61 @@ class OfflineAdmissionTest(unittest.TestCase):
                         )
                 process.assert_not_called()
                 self.assertFalse(staged.exists())
+
+    def qemu_share(self):
+        share = self.state_dir.parent / "qemu-release" / "share"
+        share.mkdir(mode=0o700, parents=True)
+        for name in admission.QEMU_SUPPORT_FILES:
+            (share / name).write_bytes(name.encode() + b" option rom")
+            (share / name).chmod(0o444)
+        (share / "bios-256k.bin").write_bytes(b"not staged")
+        private = self.state_dir / "offline-executables"
+        private.mkdir(mode=0o700)
+        return share, private / "share", admission.qemu_support_sha256(share)
+
+    def test_qemu_support_roms_are_pinned_and_privately_staged(self):
+        share, destination, expected = self.qemu_share()
+        staged = admission._stage_qemu_support(share, destination, expected)
+        self.assertEqual(
+            sorted(path.name for path in staged.iterdir()),
+            sorted(admission.QEMU_SUPPORT_FILES),
+        )
+        for name in admission.QEMU_SUPPORT_FILES:
+            self.assertEqual(
+                (staged / name).read_bytes(), (share / name).read_bytes()
+            )
+            self.assertEqual((staged / name).stat().st_mode & 0o777, 0o400)
+        self.assertEqual(
+            admission.qemu_support_sha256(staged, private=True), expected
+        )
+
+    def test_unreviewed_or_missing_qemu_support_roms_refuse(self):
+        share, destination, expected = self.qemu_share()
+        rom = share / admission.QEMU_SUPPORT_FILES[0]
+        rom.chmod(0o644)
+        rom.write_bytes(b"unreviewed option rom")
+        with self.assertRaisesRegex(ValueError, "QEMU support files differ"):
+            admission._stage_qemu_support(share, destination, expected)
+        self.assertFalse(destination.exists())
+        rom.unlink()
+        with self.assertRaises(FileNotFoundError):
+            admission._stage_qemu_support(share, destination, expected)
+        self.assertFalse(destination.exists())
+
+    def test_qemu_support_swap_before_copy_refuses(self):
+        share, destination, expected = self.qemu_share()
+        copy = admission.azure.copy_regular_file
+
+        def swap_before_copy(src, dst, size, _):
+            src.chmod(0o644)
+            src.write_bytes(b"S" * size)
+            return copy(src, dst, size, hashlib.sha256(b"S" * size).hexdigest())
+
+        with mock.patch.object(
+            admission.azure, "copy_regular_file", side_effect=swap_before_copy,
+        ):
+            with self.assertRaisesRegex(ValueError, "Private QEMU support copy"):
+                admission._stage_qemu_support(share, destination, expected)
 
     def test_runner_launch_executes_private_bytes_after_source_swap(self):
         original_runner, runner, _ = self.staged_tool("runner")
