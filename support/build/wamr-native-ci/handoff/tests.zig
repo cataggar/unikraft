@@ -11,6 +11,12 @@ const zip = handoff.zip;
 const golden = @embedFile("goldens/contracts-profile-layout.json");
 const zip_multi_golden = @embedFile("goldens/zip-stored-multi.zip");
 const zip_empty_golden = @embedFile("goldens/zip-stored-empty.zip");
+const zip_pack_v1_golden = @embedFile("goldens/zip-pack-v1.zip");
+const zip_pack_v2_golden = @embedFile("goldens/zip-pack-v2.zip");
+const zip_pack_v1_bundle = @embedFile("goldens/zip-pack-v1-bundle.json");
+const zip_pack_v1_public_source = @embedFile("goldens/zip-pack-v1-public-source.json");
+const zip_pack_v2_bundle = @embedFile("goldens/zip-pack-v2-bundle.json");
+const zip_pack_v2_public_source = @embedFile("goldens/zip-pack-v2-public-source.json");
 const root_bound_v1_golden = @embedFile("goldens/root-bound-v1.json");
 const root_bound_v2_golden = @embedFile("goldens/root-bound-v2.json");
 const root_bound_stage = "/opt/wamr-handoff-golden-stage";
@@ -157,18 +163,23 @@ test "unknown fields, versions, authority and lineage substitutions fail closed"
 }
 
 test "Python ZIP32 goldens are byte-identical and accepted by strict native codec" {
-    const multi_entries = [_]zip.Entry{
+    const multi_entries = [_]zip.SliceEntry{
         .{ .name = "alpha.txt", .bytes = "alpha\n", .limit = 1024 },
         .{ .name = "dir/nested.bin", .bytes = "\x00stored bytes\n", .limit = 1024 },
         .{ .name = "omega.dat", .bytes = "last member", .limit = 1024 },
     };
     try expectZipGolden(zip_multi_golden, &multi_entries);
 
-    const empty_entries = [_]zip.Entry{
+    const empty_entries = [_]zip.SliceEntry{
         .{ .name = "empty.bin", .bytes = "", .limit = 1024 },
         .{ .name = "nonempty.txt", .bytes = "non-empty\n", .limit = 1024 },
     };
     try expectZipGolden(zip_empty_golden, &empty_entries);
+}
+
+test "real Python pack goldens are byte-identical and accepted by strict native codec" {
+    try expectPackGolden(.frozen_tiny_v1, zip_pack_v1_golden, zip_pack_v1_bundle, zip_pack_v1_public_source);
+    try expectPackGolden(.tiny_qcow2_derived_vhd_v2, zip_pack_v2_golden, zip_pack_v2_bundle, zip_pack_v2_public_source);
 }
 
 test "Python-written root-bound local handoff goldens validate only with their root" {
@@ -183,7 +194,7 @@ test "strict ZIP32 reader refuses malformed archives with typed errors" {
     const base = try writeZipBytes(a, &entries, &archive_hash);
     defer a.free(base);
     var expected_storage: [zip.max_members]zip.ExpectedMember = undefined;
-    const expected = try zip.expectedFromEntries(&entries, &expected_storage);
+    const expected = try zip.expectedFromSlices(&entries, &expected_storage);
     const offsets = zipOffsets(&entries);
 
     try expectZipErrorOwned(error.TrailingBytes, try withSuffix(a, base, "x"), expected, archive_hash);
@@ -196,6 +207,7 @@ test "strict ZIP32 reader refuses malformed archives with typed errors" {
     try expectZipErrorOwned(error.UnsupportedCompression, try patchedU16(a, base, offsets.central[0] + 10, 8), expected, archive_hash);
     try expectZipErrorOwned(error.Encrypted, try patchedU16(a, base, offsets.central[0] + 8, 1), expected, archive_hash);
     try expectZipErrorOwned(error.DataDescriptor, try patchedU16(a, base, offsets.central[0] + 8, 8), expected, archive_hash);
+    try expectZipErrorOwned(error.UnsupportedFlags, try patchedU16(a, base, offsets.central[0] + 8, 0x0800), expected, archive_hash);
     try expectZipErrorOwned(error.Zip64, try patchedU32(a, base, offsets.central[0] + 20, 0xffffffff), expected, archive_hash);
     try expectZipErrorOwned(error.NameMismatch, try patchedByte(a, base, offsets.local_name[0], 'c'), expected, archive_hash);
     try expectZipErrorOwned(error.HeaderMismatch, try patchedU32(a, base, offsets.local[0] + 14, 0), expected, archive_hash);
@@ -207,7 +219,27 @@ test "strict ZIP32 reader refuses malformed archives with typed errors" {
     try expectZipErrorOwned(error.OutOfBounds, try patchedU32(a, base, offsets.central[1] + 42, @intCast(offsets.local[1] + 1)), expected, archive_hash);
     try expectZipErrorOwned(error.WrongMode, try patchedU32(a, base, offsets.central[0] + 38, @as(u32, 0o100644) << 16), expected, archive_hash);
     try expectZipErrorOwned(error.WrongCreateSystem, try patchedU16(a, base, offsets.central[0] + 4, 20), expected, archive_hash);
+    try expectZipErrorOwned(error.WrongVersion, try patchedU16(a, base, offsets.central[0] + 4, (@as(u16, zip.create_system_unix) << 8) | 21), expected, archive_hash);
     try expectZipErrorOwned(error.WrongTimestamp, try patchedU16(a, base, offsets.central[0] + 14, 0x0022), expected, archive_hash);
+    try expectZipErrorOwned(error.WrongInternalAttributes, try patchedU16(a, base, offsets.central[0] + 36, 1), expected, archive_hash);
+    try expectZipErrorOwned(error.DiskUnsupported, try patchedU16(a, base, offsets.eocd + 4, 1), expected, archive_hash);
+    const wrong_count = try a.dupe(u8, base);
+    putU16(wrong_count, offsets.eocd + 8, 3);
+    putU16(wrong_count, offsets.eocd + 10, 3);
+    try expectZipErrorOwned(error.UnexpectedMemberCount, wrong_count, expected, archive_hash);
+    try expectZipErrorOwned(error.Truncated, try patchedU16(a, base, offsets.central[0] + 28, 0xffff), expected, archive_hash);
+    try expectZipErrorOwned(error.InvalidZip, try patchedByte(a, base, offsets.eocd, 0), expected, archive_hash);
+    const truncated_cuts = [_]usize{
+        0,
+        1,
+        29,
+        offsets.local[1] + 29,
+        offsets.central[0] + 45,
+        offsets.eocd + 21,
+    };
+    for (truncated_cuts) |cut| {
+        try expectZipRefused(base[0..cut], expected, zip.sha256(base[0..cut]));
+    }
     const swapped = [_]zip.ExpectedMember{ expected[1], expected[0] };
     try expectZipError(error.OrderMismatch, base, &swapped, archive_hash);
     var bad_member_digest = [_]zip.ExpectedMember{ expected[0], expected[1] };
@@ -227,56 +259,147 @@ test "strict ZIP32 name, count and limit refusals are deterministic" {
         try expectMalformedZipName(name);
     }
 
-    const duplicate = [_]zip.Entry{
+    const duplicate = [_]zip.SliceEntry{
         .{ .name = "dup.txt", .bytes = "", .limit = 1 },
         .{ .name = "dup.txt", .bytes = "", .limit = 1 },
     };
-    var digest: [32]u8 = undefined;
-    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
-    defer out.deinit();
-    try std.testing.expectError(error.DuplicateName, zip.writeArchive(&out.writer, &duplicate, &digest));
+    try expectSliceWriteError(error.DuplicateName, &duplicate);
 
-    const collision = [_]zip.Entry{
+    const collision = [_]zip.SliceEntry{
         .{ .name = "fold.txt", .bytes = "", .limit = 1 },
         .{ .name = "FOLD.txt", .bytes = "", .limit = 1 },
     };
-    try std.testing.expectError(error.NameCollision, zip.writeArchive(&out.writer, &collision, &digest));
+    try expectSliceWriteError(error.NameCollision, &collision);
     try expectReaderCasefoldDuplicate();
 
-    const too_large = [_]zip.Entry{.{ .name = "tiny.txt", .bytes = "xx", .limit = 1 }};
-    try std.testing.expectError(error.TooLarge, zip.writeArchive(&out.writer, &too_large, &digest));
+    const too_large = [_]zip.SliceEntry{.{ .name = "tiny.txt", .bytes = "xx", .limit = 1 }};
+    try expectSliceWriteError(error.TooLarge, &too_large);
 
     var many_names: [zip.max_members + 1][8]u8 = undefined;
-    var many_entries: [zip.max_members + 1]zip.Entry = undefined;
+    var many_entries: [zip.max_members + 1]zip.SliceEntry = undefined;
     for (&many_entries, 0..) |*entry, i| {
         const name = try std.fmt.bufPrint(&many_names[i], "m{d:0>3}", .{i});
         entry.* = .{ .name = name, .bytes = "", .limit = 1 };
     }
-    try std.testing.expectError(error.TooManyMembers, zip.writeArchive(&out.writer, &many_entries, &digest));
+    try expectSliceWriteError(error.TooManyMembers, &many_entries);
+}
+
+test "strict ZIP32 writer streams and removes failed file output" {
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    const dir_name = "handoff-zip-stream-test";
+    cwd.deleteTree(io, dir_name) catch {};
+    try cwd.createDir(io, dir_name, .fromMode(0o700));
+    defer cwd.deleteTree(io, dir_name) catch {};
+    const dir = try cwd.openDir(io, dir_name, .{ .follow_symlinks = false });
+    defer dir.close(io);
+
+    var actual_long = std.Io.Reader.fixed("xx");
+    var digest: [32]u8 = undefined;
+    const size_mismatch = [_]zip.Entry{.{
+        .name = "bad.txt",
+        .reader = &actual_long,
+        .size = 1,
+        .crc32 = zip.crc32("x"),
+        .sha256 = zip.sha256("x"),
+        .limit = 16,
+    }};
+    try std.testing.expectError(error.SizeMismatch, zip.writeArchiveFile(io, dir, "bad-size.zip", &size_mismatch, &digest));
+    try std.testing.expectError(error.FileNotFound, dir.openFile(io, "bad-size.zip", .{}));
+
+    var actual_crc = std.Io.Reader.fixed("x");
+    const crc_mismatch = [_]zip.Entry{.{
+        .name = "bad.txt",
+        .reader = &actual_crc,
+        .size = 1,
+        .crc32 = 0,
+        .sha256 = zip.sha256("x"),
+        .limit = 16,
+    }};
+    try std.testing.expectError(error.CrcMismatch, zip.writeArchiveFile(io, dir, "bad-crc.zip", &crc_mismatch, &digest));
+    try std.testing.expectError(error.FileNotFound, dir.openFile(io, "bad-crc.zip", .{}));
+}
+
+test "strict ZIP32 reader accepts EOCD with central offset matching EOCD signature bytes" {
+    const a = std.testing.allocator;
+    const name = "pad.bin";
+    const central_offset: usize = 0x06054b50;
+    const data_start = 30 + name.len;
+    const data_len = central_offset - data_start;
+    const central_size = 46 + name.len;
+    const eocd = central_offset + central_size;
+    const total_len = eocd + 22;
+    var bytes = try a.alloc(u8, total_len);
+    defer a.free(bytes);
+    @memset(bytes, 0);
+
+    const member = bytes[data_start..central_offset];
+    const member_crc = zip.crc32(member);
+    const member_sha = zip.sha256(member);
+
+    putU32(bytes, 0, 0x04034b50);
+    putU16(bytes, 4, zip.version_needed);
+    putU16(bytes, 6, zip.flags);
+    putU16(bytes, 8, zip.method_stored);
+    putU16(bytes, 10, zip.dos_time_midnight);
+    putU16(bytes, 12, zip.dos_date_1980_01_01);
+    putU32(bytes, 14, member_crc);
+    putU32(bytes, 18, @intCast(data_len));
+    putU32(bytes, 22, @intCast(data_len));
+    putU16(bytes, 26, name.len);
+    @memcpy(bytes[30..][0..name.len], name);
+
+    putU32(bytes, central_offset, 0x02014b50);
+    putU16(bytes, central_offset + 4, zip.version_made_by);
+    putU16(bytes, central_offset + 6, zip.version_needed);
+    putU16(bytes, central_offset + 8, zip.flags);
+    putU16(bytes, central_offset + 10, zip.method_stored);
+    putU16(bytes, central_offset + 12, zip.dos_time_midnight);
+    putU16(bytes, central_offset + 14, zip.dos_date_1980_01_01);
+    putU32(bytes, central_offset + 16, member_crc);
+    putU32(bytes, central_offset + 20, @intCast(data_len));
+    putU32(bytes, central_offset + 24, @intCast(data_len));
+    putU16(bytes, central_offset + 28, name.len);
+    putU16(bytes, central_offset + 36, zip.internal_attr);
+    putU32(bytes, central_offset + 38, zip.external_attr_regular_0600);
+    @memcpy(bytes[central_offset + 46 ..][0..name.len], name);
+
+    putU32(bytes, eocd, 0x06054b50);
+    putU16(bytes, eocd + 8, 1);
+    putU16(bytes, eocd + 10, 1);
+    putU32(bytes, eocd + 12, @intCast(central_size));
+    putU32(bytes, eocd + 16, @intCast(central_offset));
+
+    const expected = [_]zip.ExpectedMember{.{
+        .name = name,
+        .size = data_len,
+        .sha256 = member_sha,
+        .limit = data_len,
+    }};
+    try zip.verifyArchive(bytes, .{ .members = &expected, .archive_sha256 = zip.sha256(bytes) });
 }
 
 test "strict ZIP32 fuzz mutations never become acceptable" {
-    const entries = [_]zip.Entry{
+    const entries = [_]zip.SliceEntry{
         .{ .name = "alpha.txt", .bytes = "alpha\n", .limit = 1024 },
         .{ .name = "dir/nested.bin", .bytes = "\x00stored bytes\n", .limit = 1024 },
         .{ .name = "omega.dat", .bytes = "last member", .limit = 1024 },
     };
     var expected_storage: [zip.max_members]zip.ExpectedMember = undefined;
-    const expected = try zip.expectedFromEntries(&entries, &expected_storage);
-    const digest = zip.sha256(zip_multi_golden);
+    const expected = try zip.expectedFromSlices(&entries, &expected_storage);
     const a = std.testing.allocator;
     var state: u64 = 0x18702a5eed;
     for (0..256) |i| {
         const next = fuzzNext(&state);
         if ((next & 1) == 0) {
             const cut = @as(usize, @intCast(fuzzNext(&state) % (zip_multi_golden.len - 1)));
-            try expectZipRefused(zip_multi_golden[0..cut], expected, digest);
+            try expectZipRefused(zip_multi_golden[0..cut], expected, zip.sha256(zip_multi_golden[0..cut]));
         } else {
             const mutated = try a.dupe(u8, zip_multi_golden);
             defer a.free(mutated);
             const pos = @as(usize, @intCast(fuzzNext(&state) % mutated.len));
             mutated[pos] ^= @as(u8, @intCast((i % 251) + 1));
-            try expectZipRefused(mutated, expected, digest);
+            try expectZipRefused(mutated, expected, zip.sha256(mutated));
         }
     }
 }
@@ -446,7 +569,7 @@ fn oversizedManifest(a: std.mem.Allocator) ![]u8 {
     return replaceOwned(a, first, "\"artifacts/qcow2\":{\"size\":1,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}", qcow2_big);
 }
 
-fn expectZipGolden(golden_bytes: []const u8, entries: []const zip.Entry) !void {
+fn expectZipGolden(golden_bytes: []const u8, entries: []const zip.SliceEntry) !void {
     const a = std.testing.allocator;
     var archive_hash: [32]u8 = undefined;
     const actual = try writeZipBytes(a, entries, &archive_hash);
@@ -454,8 +577,44 @@ fn expectZipGolden(golden_bytes: []const u8, entries: []const zip.Entry) !void {
     try std.testing.expectEqualSlices(u8, golden_bytes, actual);
     try std.testing.expectEqualSlices(u8, &zip.sha256(golden_bytes), &archive_hash);
     var expected_storage: [zip.max_members]zip.ExpectedMember = undefined;
-    const expected = try zip.expectedFromEntries(entries, &expected_storage);
+    const expected = try zip.expectedFromSlices(entries, &expected_storage);
     try zip.verifyArchive(golden_bytes, .{ .members = expected, .archive_sha256 = zip.sha256(golden_bytes) });
+}
+
+fn expectPackGolden(
+    compatibility: profile.Compatibility,
+    golden_bytes: []const u8,
+    bundle_bytes: []const u8,
+    manifest_bytes: []const u8,
+) !void {
+    const a = std.testing.allocator;
+    const names = try generatedPublicMembers(a, compatibility);
+    defer freeMembers(a, names);
+    try std.testing.expectEqual(layout.expectedZipMemberCount(compatibility), names.len);
+    var entries: [zip.max_members]zip.SliceEntry = undefined;
+    for (names, 0..) |name, i| {
+        const bytes =
+            if (std.mem.eql(u8, name, "bundle.json"))
+                bundle_bytes
+            else if (std.mem.eql(u8, name, "public-source.json"))
+                manifest_bytes
+            else
+                "x";
+        entries[i] = .{ .name = name, .bytes = bytes, .limit = packMemberLimit(name) };
+    }
+    try expectZipGolden(golden_bytes, entries[0..names.len]);
+}
+
+fn packMemberLimit(name: []const u8) u64 {
+    if (std.mem.eql(u8, name, "bundle.json") or std.mem.eql(u8, name, "public-source.json"))
+        return layout.max_json_bytes;
+    if (std.mem.startsWith(u8, name, "boots/") and std.mem.endsWith(u8, name, "/serial"))
+        return layout.max_serial_bytes;
+    if (std.mem.startsWith(u8, name, "artifacts/"))
+        return layout.artifactLimit(name["artifacts/".len..]);
+    if (std.mem.endsWith(u8, name, "/config") or std.mem.eql(u8, name, "artifacts/config"))
+        return layout.max_config_bytes;
+    return layout.max_large_artifact_bytes;
 }
 
 fn expectRootBoundGolden(bytes: []const u8, compatibility: profile.Compatibility) !void {
@@ -465,18 +624,55 @@ fn expectRootBoundGolden(bytes: []const u8, compatibility: profile.Compatibility
     try std.testing.expectEqual(compatibility, try contracts.validateLocalImageHandoffWithRoot(document.value(), root_bound_stage));
 }
 
-fn baseZipEntries() [2]zip.Entry {
+fn baseZipEntries() [2]zip.SliceEntry {
     return .{
         .{ .name = "a.txt", .bytes = "A", .limit = 16 },
         .{ .name = "b.txt", .bytes = "BB", .limit = 16 },
     };
 }
 
-fn writeZipBytes(a: std.mem.Allocator, entries: []const zip.Entry, archive_hash: *[32]u8) ![]u8 {
+fn writeZipBytes(a: std.mem.Allocator, entries: []const zip.SliceEntry, archive_hash: *[32]u8) ![]u8 {
     var out = std.Io.Writer.Allocating.init(a);
     defer out.deinit();
-    try zip.writeArchive(&out.writer, entries, archive_hash);
+    var readers: [zip.max_members + 1]std.Io.Reader = undefined;
+    var streaming: [zip.max_members + 1]zip.Entry = undefined;
+    const converted = try streamingEntries(entries, &readers, &streaming);
+    try zip.writeArchive(&out.writer, converted, archive_hash);
     return out.toOwnedSlice();
+}
+
+fn expectSliceWriteError(expected_error: anyerror, entries: []const zip.SliceEntry) !void {
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+    var digest: [32]u8 = undefined;
+    var readers: [zip.max_members + 1]std.Io.Reader = undefined;
+    var streaming: [zip.max_members + 1]zip.Entry = undefined;
+    const converted = try streamingEntries(entries, &readers, &streaming);
+    try std.testing.expectError(expected_error, zip.writeArchive(&out.writer, converted, &digest));
+}
+
+fn streamingEntries(
+    entries: []const zip.SliceEntry,
+    readers: []std.Io.Reader,
+    streaming: []zip.Entry,
+) ![]const zip.Entry {
+    if (readers.len < entries.len or streaming.len < entries.len) return error.InvalidFixture;
+    for (entries, 0..) |entry, i| {
+        readers[i] = std.Io.Reader.fixed(entry.bytes);
+        streaming[i] = entryFromSlice(entry, &readers[i]);
+    }
+    return streaming[0..entries.len];
+}
+
+fn entryFromSlice(entry: zip.SliceEntry, reader: *std.Io.Reader) zip.Entry {
+    return .{
+        .name = entry.name,
+        .reader = reader,
+        .size = entry.bytes.len,
+        .crc32 = zip.crc32(entry.bytes),
+        .sha256 = zip.sha256(entry.bytes),
+        .limit = entry.limit,
+    };
 }
 
 const ZipOffsets = struct {
@@ -487,7 +683,7 @@ const ZipOffsets = struct {
     eocd: usize,
 };
 
-fn zipOffsets(entries: []const zip.Entry) ZipOffsets {
+fn zipOffsets(entries: []const zip.SliceEntry) ZipOffsets {
     var result: ZipOffsets = .{
         .count = entries.len,
         .local = undefined,
@@ -531,12 +727,12 @@ fn expectMalformedZipName(name: []const u8) !void {
         @memset(name_buffer[0..name.len], 'n');
         break :blk name_buffer[0..name.len];
     };
-    const entries = [_]zip.Entry{.{ .name = valid_name, .bytes = "x", .limit = 16 }};
+    const entries = [_]zip.SliceEntry{.{ .name = valid_name, .bytes = "x", .limit = 16 }};
     var digest: [32]u8 = undefined;
     const base = try writeZipBytes(a, &entries, &digest);
     defer a.free(base);
     var expected_storage: [zip.max_members]zip.ExpectedMember = undefined;
-    const expected = try zip.expectedFromEntries(&entries, &expected_storage);
+    const expected = try zip.expectedFromSlices(&entries, &expected_storage);
     const offsets = zipOffsets(&entries);
     const mutated = try a.dupe(u8, base);
     if (name.len == 0) {
@@ -549,7 +745,7 @@ fn expectMalformedZipName(name: []const u8) !void {
 
 fn expectReaderCasefoldDuplicate() !void {
     const a = std.testing.allocator;
-    const entries = [_]zip.Entry{
+    const entries = [_]zip.SliceEntry{
         .{ .name = "fold.txt", .bytes = "x", .limit = 16 },
         .{ .name = "gold.txt", .bytes = "y", .limit = 16 },
     };
@@ -557,7 +753,7 @@ fn expectReaderCasefoldDuplicate() !void {
     const base = try writeZipBytes(a, &entries, &digest);
     defer a.free(base);
     var expected_storage: [zip.max_members]zip.ExpectedMember = undefined;
-    const expected = try zip.expectedFromEntries(&entries, &expected_storage);
+    const expected = try zip.expectedFromSlices(&entries, &expected_storage);
     const offsets = zipOffsets(&entries);
     const mutated = try a.dupe(u8, base);
     @memcpy(mutated[offsets.central[1] + 46 ..][0.."FOLD.txt".len], "FOLD.txt");

@@ -62,9 +62,18 @@ pub const ZipError = error{
     UnexpectedMemberCount,
 };
 
-pub const WriteError = ZipError || std.Io.Writer.Error;
+pub const WriteError = ZipError || std.Io.Writer.Error || std.Io.Reader.ShortError;
 
 pub const Entry = struct {
+    name: []const u8,
+    reader: *std.Io.Reader,
+    size: u64,
+    crc32: u32,
+    sha256: [Sha256.digest_length]u8,
+    limit: u64,
+};
+
+pub const SliceEntry = struct {
     name: []const u8,
     bytes: []const u8,
     limit: u64,
@@ -97,6 +106,10 @@ pub fn sha256(bytes: []const u8) [Sha256.digest_length]u8 {
     return out;
 }
 
+pub fn crc32(bytes: []const u8) u32 {
+    return Crc32.hash(bytes);
+}
+
 pub fn writeArchive(writer: *std.Io.Writer, entries: []const Entry, archive_sha256: *[Sha256.digest_length]u8) WriteError!void {
     if (entries.len > max_members) return error.TooManyMembers;
     try validateEntryNames(entries);
@@ -104,26 +117,25 @@ pub fn writeArchive(writer: *std.Io.Writer, entries: []const Entry, archive_sha2
     var out = CountingWriter.init(writer);
     var metas: [max_members]MemberMeta = undefined;
     var total_uncompressed: u64 = 0;
+    var buffer: [64 * 1024]u8 = undefined;
 
     for (entries, 0..) |entry, i| {
-        if (entry.bytes.len > entry.limit) return error.TooLarge;
-        if (entry.bytes.len > std.math.maxInt(u32)) return error.Zip64;
-        total_uncompressed = addBounded(total_uncompressed, entry.bytes.len) catch return error.TooLarge;
+        if (entry.size > entry.limit) return error.TooLarge;
+        if (entry.size > std.math.maxInt(u32)) return error.Zip64;
+        total_uncompressed = addBounded(total_uncompressed, entry.size) catch return error.TooLarge;
         if (total_uncompressed > max_archive_bytes) return error.TooLarge;
         const local_offset = try u32FromPos(out.pos);
-        const size: u32 = @intCast(entry.bytes.len);
-        const crc = Crc32.hash(entry.bytes);
-        const member_sha = sha256(entry.bytes);
+        const size: u32 = @intCast(entry.size);
         metas[i] = .{
             .name = entry.name,
             .size = size,
-            .crc32 = crc,
-            .sha256 = member_sha,
+            .crc32 = entry.crc32,
+            .sha256 = entry.sha256,
             .local_offset = local_offset,
             .limit = entry.limit,
         };
-        try writeLocalHeader(&out, entry.name, size, crc);
-        try out.writeAll(entry.bytes);
+        try writeLocalHeader(&out, entry.name, size, entry.crc32);
+        try streamEntryData(&out, entry, &buffer);
     }
 
     const central_offset = try u32FromPos(out.pos);
@@ -135,10 +147,47 @@ pub fn writeArchive(writer: *std.Io.Writer, entries: []const Entry, archive_sha2
     out.final(archive_sha256);
 }
 
+pub fn writeArchiveFile(io: std.Io, dir: std.Io.Dir, path: []const u8, entries: []const Entry, archive_sha256: *[Sha256.digest_length]u8) !void {
+    const file = try dir.createFile(io, path, .{
+        .exclusive = true,
+        .read = true,
+        .permissions = .fromMode(0o600),
+    });
+    var keep = false;
+    errdefer if (!keep) dir.deleteFile(io, path) catch {};
+    defer file.close(io);
+    var file_buffer: [8 * 1024]u8 = undefined;
+    var file_writer = file.writer(io, &file_buffer);
+    try writeArchive(&file_writer.interface, entries, archive_sha256);
+    try file_writer.flush();
+    try file.sync(io);
+    try (std.Io.File{ .handle = dir.handle, .flags = .{ .nonblocking = false } }).sync(io);
+    keep = true;
+}
+
 pub fn expectedFromEntries(entries: []const Entry, out: []ExpectedMember) ZipError![]const ExpectedMember {
     if (out.len < entries.len) return error.InvalidZip;
     if (entries.len > max_members) return error.TooManyMembers;
     try validateEntryNames(entries);
+    var total: u64 = 0;
+    for (entries, 0..) |entry, i| {
+        if (entry.size > entry.limit) return error.TooLarge;
+        total = addBounded(total, entry.size) catch return error.TooLarge;
+        if (total > max_archive_bytes) return error.TooLarge;
+        out[i] = .{
+            .name = entry.name,
+            .size = entry.size,
+            .sha256 = entry.sha256,
+            .limit = entry.limit,
+        };
+    }
+    return out[0..entries.len];
+}
+
+pub fn expectedFromSlices(entries: []const SliceEntry, out: []ExpectedMember) ZipError![]const ExpectedMember {
+    if (out.len < entries.len) return error.InvalidZip;
+    if (entries.len > max_members) return error.TooManyMembers;
+    try validateSliceEntryNames(entries);
     var total: u64 = 0;
     for (entries, 0..) |entry, i| {
         if (entry.bytes.len > entry.limit) return error.TooLarge;
@@ -202,6 +251,15 @@ fn validateEntryNames(entries: []const Entry) ZipError!void {
     }
 }
 
+fn validateSliceEntryNames(entries: []const SliceEntry) ZipError!void {
+    var names: [max_members][]const u8 = undefined;
+    for (entries, 0..) |entry, i| {
+        try validateName(entry.name);
+        try checkNameCollision(names[0..i], entry.name);
+        names[i] = entry.name;
+    }
+}
+
 fn validateExpectedMembers(members: []const ExpectedMember) ZipError!void {
     if (members.len > max_members) return error.TooManyMembers;
     var names: [max_members][]const u8 = undefined;
@@ -231,8 +289,11 @@ fn asciiCaseEql(a: []const u8, b: []const u8) bool {
 
 fn parseAndVerify(bytes: []const u8, expected: []const ExpectedMember) ZipError!void {
     if (bytes.len < eocd_len) return error.Truncated;
-    const last_eocd = std.mem.lastIndexOf(u8, bytes, &eocd_sig_bytes) orelse return error.InvalidZip;
-    if (last_eocd + eocd_len > bytes.len) return error.Truncated;
+    const last_eocd = bytes.len - eocd_len;
+    if (!std.mem.eql(u8, bytes[last_eocd..][0..4], &eocd_sig_bytes)) {
+        if (std.mem.lastIndexOf(u8, bytes, &eocd_sig_bytes) != null) return error.TrailingBytes;
+        return error.InvalidZip;
+    }
 
     const eocd = parseEocd(bytes[last_eocd..][0..eocd_len]);
     if (eocd.comment_len != 0) return error.ArchiveComment;
@@ -506,6 +567,28 @@ fn writeEndRecord(out: *CountingWriter, count: u16, central_size: u32, central_o
     try out.writeU32(central_size);
     try out.writeU32(central_offset);
     try out.writeU16(0);
+}
+
+fn streamEntryData(out: *CountingWriter, entry: Entry, buffer: []u8) WriteError!void {
+    var remaining = entry.size;
+    var crc = Crc32.init();
+    var member_sha = Sha256.init(.{});
+    while (remaining > 0) {
+        const chunk_len: usize = @intCast(@min(remaining, buffer.len));
+        const read = try entry.reader.readSliceShort(buffer[0..chunk_len]);
+        if (read == 0) return error.SizeMismatch;
+        const chunk = buffer[0..read];
+        crc.update(chunk);
+        member_sha.update(chunk);
+        try out.writeAll(chunk);
+        remaining -= read;
+    }
+    var extra: [1]u8 = undefined;
+    if (try entry.reader.readSliceShort(&extra) != 0) return error.SizeMismatch;
+    if (crc.final() != entry.crc32) return error.CrcMismatch;
+    var actual_sha: [Sha256.digest_length]u8 = undefined;
+    member_sha.final(&actual_sha);
+    if (!std.mem.eql(u8, &actual_sha, &entry.sha256)) return error.DigestMismatch;
 }
 
 const CountingWriter = struct {

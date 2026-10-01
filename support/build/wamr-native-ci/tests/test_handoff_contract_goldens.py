@@ -5,7 +5,7 @@
 Regenerate intentionally with:
   python3 -B support/build/wamr-native-ci/tests/test_handoff_contract_goldens.py --write
 """
-import contextlib, copy, importlib.util, io, json, os, shutil, stat, sys, tempfile, unittest, zipfile
+import contextlib, copy, hashlib, importlib.util, io, json, os, shutil, stat, sys, tempfile, unittest, zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -14,6 +14,13 @@ FIXTURES = WAMR_CI / "tests/fixtures/differential"
 GOLDEN = WAMR_CI / "handoff/goldens/contracts-profile-layout.json"
 ZIP_MULTI = WAMR_CI / "handoff/goldens/zip-stored-multi.zip"
 ZIP_EMPTY = WAMR_CI / "handoff/goldens/zip-stored-empty.zip"
+PACK_V1 = WAMR_CI / "handoff/goldens/zip-pack-v1.zip"
+PACK_V2 = WAMR_CI / "handoff/goldens/zip-pack-v2.zip"
+PACK_V1_BUNDLE = WAMR_CI / "handoff/goldens/zip-pack-v1-bundle.json"
+PACK_V1_PUBLIC_SOURCE = WAMR_CI / "handoff/goldens/zip-pack-v1-public-source.json"
+PACK_V2_BUNDLE = WAMR_CI / "handoff/goldens/zip-pack-v2-bundle.json"
+PACK_V2_PUBLIC_SOURCE = WAMR_CI / "handoff/goldens/zip-pack-v2-public-source.json"
+PACK_HASHES = WAMR_CI / "handoff/goldens/zip-pack-hashes.json"
 ROOT_BOUND_V1 = WAMR_CI / "handoff/goldens/root-bound-v1.json"
 ROOT_BOUND_V2 = WAMR_CI / "handoff/goldens/root-bound-v2.json"
 ROOT_BOUND_STAGE = "/opt/wamr-handoff-golden-stage"
@@ -194,13 +201,32 @@ def packed_records(handoff, public_bundle, version):
             with archive.open("rb") as handle:
                 public_bundle.verify_archive_descriptor(handoff, handle.fileno(), source, archive_sha256)
             with zipfile.ZipFile(archive) as zipped:
-                bundle = public_bundle.decode(zipped.read("bundle.json"))
-                manifest = public_bundle.decode(zipped.read("public-source.json"))
-            return {"bundle": bundle, "manifest": manifest, "source": source}
+                bundle_raw = zipped.read("bundle.json")
+                manifest_raw = zipped.read("public-source.json")
+                bundle = public_bundle.decode(bundle_raw)
+                manifest = public_bundle.decode(manifest_raw)
+            archive_bytes = archive.read_bytes()
+            return {
+                "bundle": bundle,
+                "manifest": manifest,
+                "source": source,
+                "archive": archive_bytes,
+                "archive_sha256": archive_sha256,
+                "bundle_raw": bundle_raw,
+                "manifest_raw": manifest_raw,
+            }
         finally:
             public_bundle.publication_records = original_publication_records
             public_bundle.inspect_tree = original_inspect_tree
             public_bundle.native = original_native
+
+
+def pack_hashes(packed):
+    value = {
+        "zip-pack-v1.zip": hashlib.sha256(packed[1]["archive"]).hexdigest(),
+        "zip-pack-v2.zip": hashlib.sha256(packed[2]["archive"]).hexdigest(),
+    }
+    return json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
 
 
 def max_accepted_member_size(handoff, public_bundle, version, member, upper):
@@ -380,6 +406,14 @@ class HandoffContractGoldens(unittest.TestCase):
         self.assertEqual(ZIP_MULTI.read_bytes(), zip_multi_golden())
         self.assertEqual(ZIP_EMPTY.read_bytes(), zip_empty_golden())
         handoff, public_bundle = load("handoff"), load("public_bundle")
+        packed = {version: packed_records(handoff, public_bundle, version) for version in (1, 2)}
+        self.assertEqual(PACK_V1.read_bytes(), packed[1]["archive"])
+        self.assertEqual(PACK_V2.read_bytes(), packed[2]["archive"])
+        self.assertEqual(PACK_V1_BUNDLE.read_bytes(), packed[1]["bundle_raw"])
+        self.assertEqual(PACK_V1_PUBLIC_SOURCE.read_bytes(), packed[1]["manifest_raw"])
+        self.assertEqual(PACK_V2_BUNDLE.read_bytes(), packed[2]["bundle_raw"])
+        self.assertEqual(PACK_V2_PUBLIC_SOURCE.read_bytes(), packed[2]["manifest_raw"])
+        self.assertEqual(PACK_HASHES.read_text(encoding="utf-8"), pack_hashes(packed))
         self.assertEqual(ROOT_BOUND_V1.read_bytes(), root_bound_bundle(handoff, public_bundle, 1))
         self.assertEqual(ROOT_BOUND_V2.read_bytes(), root_bound_bundle(handoff, public_bundle, 2))
 
@@ -427,6 +461,14 @@ if __name__ == "__main__":
         ZIP_MULTI.write_bytes(zip_multi_golden())
         ZIP_EMPTY.write_bytes(zip_empty_golden())
         handoff, public_bundle = load("handoff"), load("public_bundle")
+        packed = {version: packed_records(handoff, public_bundle, version) for version in (1, 2)}
+        PACK_V1.write_bytes(packed[1]["archive"])
+        PACK_V2.write_bytes(packed[2]["archive"])
+        PACK_V1_BUNDLE.write_bytes(packed[1]["bundle_raw"])
+        PACK_V1_PUBLIC_SOURCE.write_bytes(packed[1]["manifest_raw"])
+        PACK_V2_BUNDLE.write_bytes(packed[2]["bundle_raw"])
+        PACK_V2_PUBLIC_SOURCE.write_bytes(packed[2]["manifest_raw"])
+        PACK_HASHES.write_text(pack_hashes(packed), encoding="utf-8")
         ROOT_BOUND_V1.write_bytes(root_bound_bundle(handoff, public_bundle, 1))
         ROOT_BOUND_V2.write_bytes(root_bound_bundle(handoff, public_bundle, 2))
     else:
