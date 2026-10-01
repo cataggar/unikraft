@@ -69,6 +69,9 @@ class FakeAzure:
         self.pinned_reads = 0
         self.serial_noise = ""
         self.calls = []
+        self.granted = set()
+        self.fail_grant = False
+        self.revoked = set()
         self.disk_uuids = {
             role: str(uuid.uuid5(uuid.NAMESPACE_DNS, role)) for role in lane.ROLES
         }
@@ -96,31 +99,38 @@ class FakeAzure:
         return resource
 
     def disk(self, role):
+        # Shapes follow redacted Azure CLI 2.90.0 upload-disk responses.
+        uploaded = role in self.revoked
         result = {
             **self.resource(role),
             "uniqueId": self.disk_uuids[role],
-            "sku": {"name": "StandardSSD_LRS"},
-            "diskSizeBytes": lane.azure.VIRTUAL_SIZE if role == "os" else lane.DISK_BYTES,
-            "diskSizeGb": 1 if role == "os" else 4,
+            "sku": {"name": "StandardSSD_LRS", "tier": "Standard"},
             "creationData": {
                 "createOption": "Upload",
                 "uploadSizeBytes": (lane.azure.VIRTUAL_SIZE if role == "os"
                                     else lane.DISK_BYTES) + 512,
             },
-            "hyperVGeneration": "V2" if role == "os" else None,
-            "osType": "Linux" if role == "os" else None,
             "provisioningState": "Succeeded",
-            "diskState": "Attached" if self.deployed else "Unattached",
-            "managedBy": lane.resource_id(self.state, "vm") if self.deployed else None,
+            "diskState": (("Attached" if self.deployed else "Unattached")
+                          if uploaded else "ActiveUpload"
+                          if role in self.granted else "ReadyToUpload"),
         }
+        if uploaded:
+            result["diskSizeBytes"] = (lane.azure.VIRTUAL_SIZE if role == "os"
+                                       else lane.DISK_BYTES)
+            result["diskSizeGB"] = 1 if role == "os" else 4
+        if role == "os":
+            result.update(hyperVGeneration="V2", osType="Linux")
+        if self.deployed:
+            result["managedBy"] = lane.resource_id(self.state, "vm")
         if self.tamper == ("disk-uuid", role) and self.deployed:
             result["uniqueId"] = str(uuid.uuid5(uuid.NAMESPACE_DNS, "replaced"))
-        if self.tamper == ("disk-size", role):
+        if self.tamper == ("disk-size", role) and "diskSizeBytes" in result:
             result["diskSizeBytes"] += 512
         if self.tamper == ("disk-size-missing", role):
-            del result["diskSizeBytes"]
+            result.pop("diskSizeBytes", None)
         if self.tamper == ("disk-gib-missing", role):
-            del result["diskSizeGb"]
+            result.pop("diskSizeGB", None)
         if self.tamper == ("disk-uuid-missing", role):
             del result["uniqueId"]
         if self.tamper == ("disk-upload-size-missing", role):
@@ -129,12 +139,16 @@ class FakeAzure:
             result["creationData"]["uploadSizeBytes"] += 512
         if self.tamper == ("disk-upload-option", role):
             result["creationData"]["createOption"] = "Empty"
-        if self.tamper == ("disk-gib", role):
-            result["diskSizeGb"] += 1
+        if self.tamper == ("disk-gib", role) and "diskSizeGB" in result:
+            result["diskSizeGB"] += 1
         if self.tamper == ("disk-generation", role):
             result["hyperVGeneration"] = "V1"
         if self.tamper == ("disk-owner", role):
             result["tags"]["issue90-run"] = "foreign"
+        if self.tamper == ("disk-adopted", role):
+            result.update(diskState="Unattached", diskSizeGB=1 if role == "os" else 4,
+                          diskSizeBytes=(lane.azure.VIRTUAL_SIZE if role == "os"
+                                         else lane.DISK_BYTES))
         return result
 
     def deployment(self):
@@ -261,6 +275,13 @@ class FakeAzure:
             properties["storageProfile"]["osDisk"]["deleteOption"] = "Delete"
         return {**resource, "properties": properties}
 
+    def disk_role(self, args):
+        return {
+            self.state["prefix"] + {"os": "-os", "data0": "-data0",
+                                    "data7": "-data7"}[role]: role
+            for role in lane.ROLES
+        }[args[args.index("--name") + 1]]
+
     def az(self, args, *, subscription, private, timeout):
         assert subscription == self.state["subscription"] and private and timeout > 0
         action = tuple(args[:3])
@@ -327,15 +348,17 @@ class FakeAzure:
                 raise lane.azure.AzureCliTimeout(["disk", "create"])
             return self.disk(role)
         if action[:2] == ("disk", "show"):
-            return self.disk({
-                self.state["prefix"] + {"os": "-os", "data0": "-data0",
-                                        "data7": "-data7"}[role]: role
-                for role in lane.ROLES
-            }[args[args.index("--name") + 1]])
+            return self.disk(self.disk_role(args))
         if action[:2] == ("disk", "grant-access"):
+            if self.fail_grant:
+                raise lane.azure.AzureCliTimeout(["disk", "grant-access"])
+            self.granted.add(self.disk_role(args))
             return {"accessSAS": "https://upload.blob.core.windows.net/disk?sig=synthetic"}
         if action[:2] == ("disk", "revoke-access"):
-            return {}
+            role = self.disk_role(args)
+            if role in self.granted:
+                self.revoked.add(role)
+            return None
         if action == ("deployment", "group", "create"):
             assert self.created == list(lane.ROLES)
             self.deployed = True
@@ -982,6 +1005,7 @@ class Issue90TopologyTest(unittest.TestCase):
         self._run_refused()
 
     def test_upload_proof_requires_exact_size_option_and_generation(self):
+        self.fake.revoked.update(lane.ROLES)
         for tamper in ("disk-upload-size", "disk-upload-option", "disk-gib",
                        "disk-generation"):
             with self.subTest(tamper=tamper):
@@ -996,6 +1020,82 @@ class Issue90TopologyTest(unittest.TestCase):
             self.assertEqual(lane.TopologyRun(self.state, self.directory)
                              .validate_disk_response(role, self.fake.disk(role)),
                              self.fake.disk_uuids[role])
+
+    def test_cli_upload_create_response_omits_sizes_until_revoked(self):
+        run = lane.TopologyRun(self.state, self.directory)
+        for role in lane.ROLES:
+            with self.subTest(role=role):
+                created = self.fake.disk(role)
+                self.assertEqual(created["diskState"], "ReadyToUpload")
+                self.assertFalse({"diskSizeBytes", "diskSizeGB", "diskSizeGb"}
+                                 & set(created))
+                self.assertEqual(run.validate_disk_response(role, created, created=True),
+                                 self.fake.disk_uuids[role])
+                self.fake.granted.add(role)
+                self.assertEqual(run.validate_disk_response(role, self.fake.disk(role)),
+                                 self.fake.disk_uuids[role])
+                self.fake.revoked.add(role)
+                shown = self.fake.disk(role)
+                self.assertEqual(shown["diskState"], "Unattached")
+                self.assertNotIn("diskSizeGb", shown)
+                self.assertEqual(run.validate_disk_response(role, shown),
+                                 self.fake.disk_uuids[role])
+                with self.assertRaises(RuntimeError):
+                    run.validate_disk_response(role, shown, created=True)
+
+    def test_create_response_must_be_ready_to_upload(self):
+        run = lane.TopologyRun(self.state, self.directory)
+        for state in ("ActiveUpload", "Unattached", None):
+            with self.subTest(state=state):
+                disk = self.fake.disk("data0")
+                if state is None:
+                    del disk["diskState"]
+                else:
+                    disk["diskState"] = state
+                with self.assertRaises(RuntimeError):
+                    run.validate_disk_response("data0", disk, created=True)
+        self.fake.tamper = ("disk-adopted", "data0")
+        with self.assertRaises(RuntimeError):
+            run.validate_disk_response("data0", self.fake.disk("data0"), created=True)
+
+    def test_present_upload_state_sizes_must_be_exact(self):
+        run = lane.TopologyRun(self.state, self.directory)
+        size = lane.DISK_BYTES
+        for fields in ({"diskSizeBytes": size + 512},
+                       {"diskSizeBytes": size},
+                       {"diskSizeGB": 4},
+                       {"diskSizeGb": 4},
+                       {"diskSizeBytes": size, "diskSizeGB": 5},
+                       {"diskSizeBytes": str(size), "diskSizeGB": 4},
+                       {"diskSizeBytes": size, "diskSizeGB": True}):
+            with self.subTest(fields=fields):
+                with self.assertRaises(RuntimeError):
+                    run.validate_disk_response(
+                        "data0", {**self.fake.disk("data0"), **fields}, created=True
+                    )
+        self.assertEqual(run.validate_disk_response(
+            "data0", {**self.fake.disk("data0"), "diskSizeBytes": size,
+                      "diskSizeGB": 4}, created=True), self.fake.disk_uuids["data0"])
+
+    def test_terminal_disk_accepts_either_gib_spelling_but_not_conflicts(self):
+        run = lane.TopologyRun(self.state, self.directory)
+        self.fake.revoked.add("data0")
+        shown = self.fake.disk("data0")
+        legacy = {key: value for key, value in shown.items() if key != "diskSizeGB"}
+        legacy["diskSizeGb"] = 4
+        for disk in (shown, legacy, {**shown, "diskSizeGb": 4}):
+            self.assertEqual(run.validate_disk_response("data0", disk),
+                             self.fake.disk_uuids["data0"])
+        for disk in ({**shown, "diskSizeGb": 5},
+                     {key: value for key, value in shown.items()
+                      if key not in ("diskSizeBytes",)},
+                     {key: value for key, value in shown.items()
+                      if key not in ("diskSizeGB",)},
+                     {key: value for key, value in shown.items()
+                      if key not in ("diskSizeBytes", "diskSizeGB")}):
+            with self.subTest(keys=sorted(disk)):
+                with self.assertRaises(RuntimeError):
+                    run.validate_disk_response("data0", disk)
 
     def test_os_disk_must_attach_original_not_create_from_image(self):
         self.fake.tamper = ("vm-os-create", "vm")
@@ -1274,6 +1374,17 @@ class Issue90TopologyTest(unittest.TestCase):
         self.assertEqual(set(lane.load(self.directory)["disks"]), {"os"})
         self.assertTrue(self.fake.deleted)
         self.assertFalse((self.directory / "acceptance.json").exists())
+
+    def test_never_granted_ready_to_upload_disk_can_be_cleaned_up(self):
+        self.fake.fail_grant = True
+        checks = self._patch_cloud()
+        with checks[0], checks[1], checks[2], checks[3], checks[4]:
+            with self.assertRaisesRegex(RuntimeError, "cleanup completed"):
+                lane.run(self.directory, self.state["subscription"],
+                         lane.envelope_sha(self.state))
+        self.assertEqual(set(lane.load(self.directory)["disks"]), {"os"})
+        self.assertEqual(self.fake.revoked, set())
+        self.assertTrue(self.fake.deleted)
 
     def test_proven_deployment_vm_read_timeout_recovers_from_saved_correlation(self):
         self.fake.fail_vm_show_once = True

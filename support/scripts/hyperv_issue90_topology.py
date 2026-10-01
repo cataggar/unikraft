@@ -51,6 +51,7 @@ OUTPUT_ROLES = {
     "nsgId": "nsg",
 }
 GIB = 1024**3
+UPLOAD_STATES = ("ReadyToUpload", "ActiveUpload")
 MAX_RUNTIME = 3600
 CLEANUP_HEADROOM = 2400
 MAX_SERIAL = 4 * 1024 * 1024
@@ -721,14 +722,22 @@ class TopologyRun:
             raise RuntimeError(f"Refusing a replaced, attached elsewhere or wrong-size {role} disk")
         return proof
 
-    def validate_disk_response(self, role, disk):
+    def validate_disk_response(self, role, disk, *, created=False):
         owned(self.state, disk, role)
         size = (azure.VIRTUAL_SIZE if role == "os" else DISK_BYTES)
         creation = disk.get("creationData")
-        if (type(disk.get("diskSizeBytes")) is not int
-                or disk["diskSizeBytes"] != size
-                or type(disk.get("diskSizeGb")) is not int
-                or disk["diskSizeGb"] != (size + GIB - 1) // GIB
+        state = disk.get("diskState")
+        # Azure CLI 2.90 omits both size fields until an upload is revoked and
+        # then reports diskSizeGB; older SDK-based commands used diskSizeGb.
+        gib = [disk[key] for key in ("diskSizeGB", "diskSizeGb") if key in disk]
+        sized = "diskSizeBytes" in disk or bool(gib) or state not in UPLOAD_STATES
+        if (not isinstance(state, str)
+                or (created and state != "ReadyToUpload")
+                or (sized and (
+                    type(disk.get("diskSizeBytes")) is not int
+                    or disk["diskSizeBytes"] != size or not gib
+                    or any(type(value) is not int
+                           or value != (size + GIB - 1) // GIB for value in gib)))
                 or not isinstance(creation, dict)
                 or creation.get("createOption") != "Upload"
                 or type(creation.get("uploadSizeBytes")) is not int
@@ -821,7 +830,7 @@ class TopologyRun:
             arguments += ["--os-type", "Linux", "--hyper-v-generation", "V2"]
         disk = self.az(arguments, timeout=600)
         proof = {"id": resource_id(self.state, role),
-                 "uuid": self.validate_disk_response(role, disk)}
+                 "uuid": self.validate_disk_response(role, disk, created=True)}
         if proof["uuid"] in {item["uuid"] for item in self.state.get("disks", {}).values()}:
             raise RuntimeError("Azure returned duplicate disk UUIDs")
         self.record(f"uploading-{role}",

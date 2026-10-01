@@ -933,9 +933,10 @@ actual Azure CLI create/show records. The official
 [upload](https://github.com/Azure/azure-rest-api-specs/blob/main/specification/compute/resource-manager/Microsoft.Compute/Compute/ComputeDisk/examples/2025-01-02/diskExamples/Disk_Create_UploadDisk.json)
 and [disk GET](https://github.com/Azure/azure-rest-api-specs/blob/main/specification/compute/resource-manager/Microsoft.Compute/Compute/ComputeDisk/examples/2025-01-02/diskExamples/Disk_Get.json)
 examples omit both `uniqueId` and `diskSizeBytes`; the offline checks require
-them and fail closed if the selected CLI/region omits either. CLI field
-presence and size/UUID/deployment response values still need redacted real
-response proof before any live use.
+them and fail closed if the selected CLI/region omits either. Disk
+create/show field presence is now captured below; deployment, VM and
+security response values still need redacted real response proof before any
+live use.
 
 Offline inspection of installed Azure CLI 2.90.0 and its
 [public release sources](https://github.com/Azure/azure-cli/tree/azure-cli-2.90.0/src/azure-cli/azure/cli/command_modules)
@@ -943,7 +944,7 @@ confirms that `az disk create` maps `--upload-type Upload` and
 `--upload-size-bytes` (including the VHD footer) to a Compute `2025-01-02`
 disk PUT. Both [create](https://github.com/Azure/azure-cli/blob/azure-cli-2.90.0/src/azure-cli/azure/cli/command_modules/vm/aaz/latest/disk/_create.py)
 and [show](https://github.com/Azure/azure-cli/blob/azure-cli-2.90.0/src/azure-cli/azure/cli/command_modules/vm/aaz/latest/disk/_show.py)
-flatten disk properties for JSON output, with model fields for `diskSizeGb`,
+flatten disk properties for JSON output, with model fields for `diskSizeGB`,
 `diskSizeBytes`, `uniqueId`, and `creationData.uploadSizeBytes`. Those models
 do **not** guarantee that the service returns the optional fields or the
 expected values. `az deployment group create/show` use
@@ -954,6 +955,24 @@ version to the [generic resource GET](https://github.com/Azure/azure-cli/blob/az
 the pinned Compute schema documents a `Standard` security type, but there
 is no real VM response here. None of these offline command/model checks
 substitutes for approved, private, redacted create/show records.
+
+An authorized disposable `northeurope` capture with Azure CLI 2.90.0 recorded
+private, redacted upload-disk responses for one Gen2 Linux OS disk and one
+4 GiB data disk; no VM, network or deployment was created and the owned group
+was deleted. The `az disk create --upload-type Upload` response reported
+`provisioningState` `Succeeded`, `diskState` `ReadyToUpload`, `uniqueId`, the
+exact `creationData.uploadSizeBytes` and the expected SKU/generation/OS type,
+but **neither** `diskSizeBytes` nor `diskSizeGB`/`diskSizeGb`; a `disk show`
+before upload was the same. `grant-access` returned only `accessSAS` and
+`revoke-access` returned no JSON. After revocation `disk show` reported
+`Unattached`, exact `diskSizeBytes`, and `diskSizeGB` (not `diskSizeGb`), and
+the explicit `2025-01-02` generic resource read matched the size, UUID and
+tags. The controller therefore requires `ReadyToUpload` for its create
+receipt, allows size fields to be absent only while a disk is
+`ReadyToUpload` or `ActiveUpload` (any present value must still be exact),
+and otherwise requires exact `diskSizeBytes` plus at least one integer GiB
+spelling, with every present spelling exact. Deployment, VM, pinned
+security and serial response shapes remain uncaptured.
 
 The separate private builder can bind the physical tracked Git tree, solved
 configuration, tool fingerprints, and built EFI in a two-pass receipt. Its
