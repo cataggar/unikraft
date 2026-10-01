@@ -971,8 +971,39 @@ tags. The controller therefore requires `ReadyToUpload` for its create
 receipt, allows size fields to be absent only while a disk is
 `ReadyToUpload` or `ActiveUpload` (any present value must still be exact),
 and otherwise requires exact `diskSizeBytes` plus at least one integer GiB
-spelling, with every present spelling exact. Deployment, VM, pinned
-security and serial response shapes remain uncaptured.
+spelling, with every present spelling exact.
+
+A second authorized disposable `northeurope` capture deployed the candidate
+dummy template with zero-content Gen2 dummy and acceptance-OS VHDs (no guest
+code ran), deallocated the VM after 75 seconds, swapped the OS disk while
+deallocated with `az vm update --os-disk`, and deleted the owner-checked
+group. `az deployment group create` returned synchronously with `Succeeded`
+and the same body as `show`; its `outputResources` entries carry `id` plus
+read-only `resourceGroup`, `resourceType` and null `apiVersion`, `extension`
+and `identifiers`. `az vm show` flattens VM properties and NIC options
+(`id`, `primary`, `deleteOption`, `resourceGroup`) and has no power state;
+`az vm show -d` adds the display text `powerState` (`VM running` or
+`VM deallocated`); the pinned `2025-11-01` read nests NIC options under
+`properties` and reported exactly `securityProfile: {securityType: Standard}`.
+`az vm deallocate` printed no JSON, and `az vm get-instance-view` reported
+exactly `ProvisioningState/succeeded` and `PowerState/deallocated`. A disk
+attached to the deallocated VM reported `diskState` `Reserved` and
+`managedBy` naming the exact VM ID; the attached state of a running VM was
+not captured. NSG rules add read-only `etag`, `id`, `type`, `resourceGroup`,
+`provisioningState` and empty plural prefix/port/ASG lists. The controller and
+offline custody validator accept exactly these read-only shapes and nothing
+wider.
+
+The same capture showed that the subscription's Azure Policy modifies VMs:
+deployment added two policy tags and a system-assigned managed identity, and
+`az vm update` added a user-assigned identity from a separate policy-managed
+resource group. No VM extension appeared during the short capture. NSGs
+cannot block IMDS, so guest code could request tokens for such identities.
+Both the controller and the custody validator therefore reject any VM
+`identity`, and the controller's exact owner-tag check also rejects the extra
+tags. A live run in a subscription with such a policy fails closed and its
+cleanup needs manual owner verification. Accepting a policy footprint needs a
+separate reviewed decision; it is not inferred from this capture.
 
 The separate private builder can bind the physical tracked Git tree, solved
 configuration, tool fingerprints, and built EFI in a two-pass receipt. Its
@@ -1032,7 +1063,11 @@ original VM UUID and the four ARM-created VM/network children; **those child
 GETs are observations, not original child PUT receipts**. The complete
 inventory includes the dummy and final OS disks, and the observed deallocated
 VM must still attach the dummy and exactly the approved private NIC while the
-final OS disk is unattached. All four disk UUIDs/attachments are reobserved
+final OS disk is unattached. VM observations may be flattened CLI `vm show`
+bodies (NIC options at the attachment's top level) or REST bodies (options
+nested under `properties`), but no VM observation may carry a managed
+`identity`. A deallocated observation requires the `az vm show -d`
+`powerState` text `VM deallocated`. All four disk UUIDs/attachments are reobserved
 at handoff, including both seeded data disks; every observed VM and current
 disk must carry the independently expected run/operation tags. An inventory
 label or ARM ID alone cannot replace these checks.
@@ -1041,9 +1076,11 @@ HANDED_OFF binds PREPARED, the settled deallocation and dummy-to-final swap,
 the unchanged VM/disk identities, exactly one attached approved private NIC,
 the final private network, full inventory including the now-unattached dummy,
 a fresh one-use challenge and an expiring window. The swap response, swap
-settlement and final VM observation each require matching run/operation tags;
-a deallocation *outcome* need not contain resource tags but must not
-contradict them if present. The HANDOFF `no_prior_acceptance_boot` and
+settlement and final VM observation each require matching run/operation tags.
+Because `az vm deallocate` prints no JSON, the deallocation outcome is the
+`az vm get-instance-view` body: it must name the original VM ID and UUID,
+carry the run/operation tags, have no managed identity, and report exactly
+`ProvisioningState/succeeded` and `PowerState/deallocated`. The HANDOFF `no_prior_acceptance_boot` and
 `exclusive_no_writer` fields are **signed custodian assertions**, not Azure
 or cryptographic proofs.
 The original swap must report success, or be pending with `swap_tracking`

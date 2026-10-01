@@ -215,9 +215,10 @@ class FakeAzure:
                 ],
             },
             "securityProfile": {"securityType": "Standard"},
+            # Azure CLI 2.90 `vm show` flattens NIC attachment options.
             "networkProfile": {"networkInterfaces": [
-                {"id": lane.resource_id(self.state, "nic"),
-                 "properties": {"primary": True, "deleteOption": "Delete"}}
+                {"id": lane.resource_id(self.state, "nic"), "primary": True,
+                 "deleteOption": "Delete", "resourceGroup": self.state["prefix"] + "-rg"}
             ]},
         }
         if self.tamper == ("vm-lun", "data7"):
@@ -231,10 +232,21 @@ class FakeAzure:
         if self.tamper == ("vm-data-cache", "vm"):
             vm["storageProfile"]["dataDisks"][1]["caching"] = "ReadWrite"
         if self.tamper == ("vm-nic-delete", "vm"):
-            vm["networkProfile"]["networkInterfaces"][0]["properties"]["deleteOption"] = "Detach"
+            vm["networkProfile"]["networkInterfaces"][0]["deleteOption"] = "Detach"
+        if self.tamper == ("vm-nic-nested", "vm"):
+            nic = vm["networkProfile"]["networkInterfaces"][0]
+            nic["properties"] = {"primary": nic.pop("primary"),
+                                 "deleteOption": nic.pop("deleteOption")}
+        if self.tamper == ("vm-identity", "vm"):
+            vm["identity"] = self.managed_identity()
         if self.tamper == ("security-missing", "vm-show"):
             del vm["securityProfile"]
         return vm
+
+    @staticmethod
+    def managed_identity():
+        return {"type": "SystemAssigned", "principalId": str(uuid.uuid4()),
+                "tenantId": str(uuid.uuid4())}
 
     def pinned_vm(self):
         vm = self.vm()
@@ -243,9 +255,17 @@ class FakeAzure:
             "vmId": self.vm_uuid, "provisioningState": "Succeeded",
             "hardwareProfile": vm["hardwareProfile"],
             "storageProfile": copy.deepcopy(vm["storageProfile"]),
-            "networkProfile": copy.deepcopy(vm["networkProfile"]),
+            "networkProfile": {"networkInterfaces": [{
+                "id": nic["id"], "resourceGroup": nic["resourceGroup"],
+                "properties": nic.get("properties") or {
+                    "primary": nic["primary"], "deleteOption": nic["deleteOption"],
+                },
+            } for nic in vm["networkProfile"]["networkInterfaces"]]},
             "securityProfile": {"securityType": "Standard"},
         }
+        if self.tamper == ("security-nic-flat", "pinned"):
+            nic = properties["networkProfile"]["networkInterfaces"][0]
+            nic.update(nic.pop("properties"))
         if self.tamper == ("security-missing", "pinned"):
             del properties["securityProfile"]
         if self.tamper == ("security-forged", "pinned"):
@@ -273,6 +293,8 @@ class FakeAzure:
             resource["type"] = "Microsoft.Compute/disks"
         if self.tamper == ("security-os-delete", "pinned"):
             properties["storageProfile"]["osDisk"]["deleteOption"] = "Delete"
+        if self.tamper == ("security-identity", "pinned"):
+            resource["identity"] = self.managed_identity()
         return {**resource, "properties": properties}
 
     def disk_role(self, args):
@@ -954,7 +976,8 @@ class Issue90TopologyTest(unittest.TestCase):
             "uuid": self.fake.vm_uuid, "disks": disk_proofs,
         }
         for tamper in ("security-uuid", "security-os-disk", "security-nic",
-                       "security-operation", "security-type"):
+                       "security-nic-flat", "security-operation", "security-type",
+                       "security-identity"):
             with self.subTest(tamper=tamper):
                 self.fake.tamper = (tamper, "pinned")
                 with mock.patch.object(
@@ -1112,6 +1135,33 @@ class Issue90TopologyTest(unittest.TestCase):
     def test_nic_must_delete_with_vm(self):
         self.fake.tamper = ("vm-nic-delete", "vm")
         self._run_refused()
+
+    def test_cli_vm_show_nic_options_must_be_flattened(self):
+        self.fake.tamper = ("vm-nic-nested", "vm")
+        self._run_refused()
+
+    def test_vm_managed_identity_is_refused(self):
+        # Observed tenant policy can add identities that guest IMDS requests could use.
+        self.fake.tamper = ("vm-identity", "vm")
+        self._run_refused()
+
+    def test_pinned_vm_managed_identity_is_refused(self):
+        self.fake.tamper = ("security-identity", "pinned")
+        self._run_refused()
+
+    def test_nic_attachment_shapes_follow_cli_and_pinned_rest_sources(self):
+        run = lane.TopologyRun(self.state, self.directory)
+        cli = self.fake.vm()["networkProfile"]["networkInterfaces"][0]
+        rest = self.fake.pinned_vm()["properties"]["networkProfile"]["networkInterfaces"][0]
+        self.assertTrue(run.valid_nic_attachment(cli, rest=False))
+        self.assertTrue(run.valid_nic_attachment(rest, rest=True))
+        self.assertFalse(run.valid_nic_attachment(cli, rest=True))
+        self.assertFalse(run.valid_nic_attachment(rest, rest=False))
+        for field, value in (("primary", False), ("deleteOption", "Detach"),
+                             ("networkSecurityGroup", {"id": "foreign"})):
+            with self.subTest(field=field):
+                self.assertFalse(run.valid_nic_attachment({**cli, field: value},
+                                                          rest=False))
 
     def test_pinned_os_disk_delete_option_must_remain_detach(self):
         self.fake.tamper = ("security-os-delete", "pinned")
