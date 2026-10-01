@@ -2,7 +2,7 @@
 const std = @import("std");
 const files = @import("hyperv_core").private_files;
 
-pub const Action = enum { build, boot, diagnostics, describe, @"supervisor-source-closure", records, @"local-consumer-custody", @"handoff-inspect", @"public-validator-build", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation" };
+pub const Action = enum { build, boot, diagnostics, describe, @"supervisor-source-closure", records, @"local-consumer-custody", @"handoff-inspect", @"handoff-inspect-legacy", @"public-validator-build", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation" };
 pub const Command = struct {
     action: Action,
     runtime: ?[]const u8 = null,
@@ -117,7 +117,7 @@ pub fn parse(args: []const []const u8) !Command {
         if (result.stage_root == null or result.output == null) return error.InvalidUsage;
         return result;
     }
-    if (action == .@"handoff-inspect" or action == .@"public-validator-build") {
+    if (action == .@"handoff-inspect" or action == .@"handoff-inspect-legacy" or action == .@"public-validator-build") {
         if (args.len != 6) return error.InvalidUsage;
         var result = Command{ .action = action };
         var i: usize = 2;

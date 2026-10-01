@@ -24,6 +24,7 @@ pub const Stage = enum {
     @"log-validator-x2apic",
     @"log-validator-legacy",
     @"handoff-inspect",
+    @"handoff-inspect-legacy",
     @"public-validator-build",
     @"supervisor-import-identity",
     @"import-validator-build",
@@ -115,7 +116,7 @@ fn bootArgv(comptime mode: profile.Mode) []const Binding {
 
 pub fn isBoot(stage: Stage) bool {
     return switch (stage) {
-        .package, .@"raw-x2apic", .@"raw-legacy-apic", .@"finalize-qcow2", .@"qcow2-x2apic", .@"qcow2-legacy-apic", .@"derive-fixed-vhd", .@"vpc-x2apic", .@"vpc-legacy-apic", .inspect, .@"handoff-inspect" => true,
+        .package, .@"raw-x2apic", .@"raw-legacy-apic", .@"finalize-qcow2", .@"qcow2-x2apic", .@"qcow2-legacy-apic", .@"derive-fixed-vhd", .@"vpc-x2apic", .@"vpc-legacy-apic", .inspect, .@"handoff-inspect", .@"handoff-inspect-legacy" => true,
         else => false,
     };
 }
@@ -153,7 +154,7 @@ pub fn spec(stage: Stage) Spec {
         } },
         .package => packageSpec(.package),
         .inspect => packageSpec(.inspect),
-        .@"handoff-inspect" => .{
+        .@"handoff-inspect", .@"handoff-inspect-legacy" => .{
             .stage = stage,
             .executable = "input:package_tool",
             .seconds = 150,
@@ -342,7 +343,7 @@ pub fn environment(allocator: std.mem.Allocator, stage: Stage) ![]EnvironmentBin
     var bindings: std.ArrayList(EnvironmentBinding) = .empty;
     errdefer bindings.deinit(allocator);
     if (isValidator(stage)) return bindings.toOwnedSlice(allocator);
-    if (stage == .@"supervisor-import-identity") {
+    if (stage == .@"supervisor-import-identity" or stage == .@"handoff-inspect-legacy") {
         try bindings.appendSlice(allocator, &.{
             .{ .name = "HOME", .value = .{ .path = .{ .role = "work", .relative = "private" } } },
             .{ .name = "LANG", .value = .{ .literal = "C" } },

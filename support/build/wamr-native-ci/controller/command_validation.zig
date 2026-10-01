@@ -25,7 +25,10 @@ fn text(value: std.json.Value) ![]const u8 {
 }
 
 fn num(comptime T: type, value: std.json.Value) !T {
-    return contracts.integer(T, value);
+    return contracts.integer(T, value) catch |err| switch (err) {
+        error.IntegerOverflow => error.InvalidCommand,
+        else => err,
+    };
 }
 
 fn eq(a: []const u8, b: []const u8) !void {
@@ -182,7 +185,7 @@ fn identity(value: std.json.Value) !void {
         return error.InvalidCommand;
     _ = try num(u32, try get(value, "device_major"));
     _ = try num(u32, try get(value, "device_minor"));
-    _ = try num(u32, try get(value, "mode"));
+    _ = try num(u16, try get(value, "mode"));
     _ = try num(u32, try get(value, "uid"));
     _ = try num(i64, try get(value, "mtime_seconds"));
     _ = try num(i64, try get(value, "ctime_seconds"));
@@ -221,9 +224,28 @@ fn outputCommitment(stdout: std.json.Value, stderr: std.json.Value) ![64]u8 {
     return std.fmt.bytesToHex(hash.finalResult(), .lower);
 }
 
-fn matchRetained(a: std.mem.Allocator, request: std.json.Value, command: std.json.Value) !void {
+fn retainedEnvironment(name: []const u8) bool {
+    return std.mem.eql(u8, name, "M4") or
+        std.mem.eql(u8, name, "WAMR_CI_GIT") or
+        std.mem.eql(u8, name, "WAMR_CI_SUPERVISOR") or
+        std.mem.eql(u8, name, "WAMR_CI_LAUNCH_EXECUTABLE") or
+        std.mem.eql(u8, name, "WAMR_CI_PYTHON") or
+        std.mem.eql(u8, name, "WAMR_CI_LOG_VALIDATE") or
+        std.mem.startsWith(u8, name, "WAMR_CI_TOOL_");
+}
+
+fn matchRetained(a: std.mem.Allocator, request: std.json.Value, command: std.json.Value, stage: plan.Stage) !void {
     const retained = try get(request, "retained_executables");
     if (retained != .array or retained.array.items.len > 64) return error.InvalidCommand;
+    const expected_bindings = try plan.environment(a, stage);
+    defer plan.freeEnvironment(a, expected_bindings);
+    var expected: std.StringHashMap(void) = .init(a);
+    defer expected.deinit();
+    for (expected_bindings) |entry| {
+        if (entry.value == .path and retainedEnvironment(entry.name))
+            try expected.put(entry.name, {});
+    }
+    if (retained.array.items.len != expected.count()) return error.InvalidCommand;
     const copied = try get(command, "retained_executables");
     const first = try records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, retained, .{}));
     const second = try records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, copied, .{}));
@@ -235,13 +257,14 @@ fn matchRetained(a: std.mem.Allocator, request: std.json.Value, command: std.jso
         const name = try text(try get(entry, "name"));
         if (name.len == 0 or !std.mem.lessThan(u8, previous, name))
             return error.InvalidCommand;
+        if (!expected.contains(name)) return error.InvalidCommand;
         previous = name;
         var found = false;
         for (environment.array.items) |env| {
             if (!std.mem.eql(u8, try text(try get(env, "name")), name)) continue;
             const actual = try records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, try get(entry, "path"), .{}));
-            const expected = try records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, try get(env, "value"), .{}));
-            try eq(actual, expected);
+            const retained_path = try records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, try get(env, "value"), .{}));
+            try eq(actual, retained_path);
             found = true;
             break;
         }
@@ -258,6 +281,26 @@ pub fn validate(
     stage: plan.Stage,
     context: EvidenceContext,
 ) !ValidatedCommand {
+    return validateWithProfile(a, record, stage, context);
+}
+
+pub fn validateLegacyV1(
+    a: std.mem.Allocator,
+    record: std.json.Value,
+    stage: plan.Stage,
+    context: EvidenceContext,
+) !ValidatedCommand {
+    if (context != .local_runtime or stage != .@"handoff-inspect-legacy")
+        return error.InvalidCommand;
+    return validateWithProfile(a, record, stage, context);
+}
+
+fn validateWithProfile(
+    a: std.mem.Allocator,
+    record: std.json.Value,
+    stage: plan.Stage,
+    context: EvidenceContext,
+) !ValidatedCommand {
     try exact(record, &.{
         "scope",      "stage",               "exit_code",  "bytes", "sha256", "sha256_scope",
         "over_limit", "known_error_markers", "supervisor",
@@ -268,6 +311,10 @@ pub fn validate(
     const size = try num(u64, try get(record, "bytes"));
     const hash = try requireDigest(try get(record, "sha256"));
     try eq(try text(try get(record, "sha256_scope")), if (size == 0) "reproducible_empty" else "transport_authenticated_observation");
+    if (size == 0) {
+        const empty = std.fmt.bytesToHex(records.fileIdentity(""), .lower);
+        try eq(hash, &empty);
+    }
     try yes(try get(record, "over_limit"), false);
     const markers = try get(record, "known_error_markers");
     if (markers != .array or markers.array.items.len != 0) return error.InvalidCommand;
@@ -356,7 +403,7 @@ pub fn validate(
     try pair(try get(command, "primary"));
     try pair(try get(command, "termination"));
     try sameJson(a, try get(command, "executable"), try get(try get(request, "native_executable"), "identity"));
-    try matchRetained(a, request, command);
+    try matchRetained(a, request, command, stage);
     for ([_][]const u8{ "primary_events", "cleanup_events", "reap_events" }) |name| {
         if (try num(u64, try get(command, name)) >
             try num(u64, try get(limits, name))) return error.InvalidCommand;
@@ -364,9 +411,15 @@ pub fn validate(
     const descendants = try get(command, "descendants");
     try exact(descendants, &.{ "adopted", "identity_validated", "limit_exceeded", "observed", "untracked" });
     const observed = try num(u16, try get(descendants, "observed"));
+    const primary_events = try num(u32, try get(command, "primary_events"));
+    const cleanup_events = try num(u32, try get(command, "cleanup_events"));
+    const reap_events = try num(u16, try get(command, "reap_events"));
     if (observed > try num(u16, try get(limits, "descendants")) or
         try num(u16, try get(descendants, "identity_validated")) != observed or
-        try num(u16, try get(descendants, "adopted")) > observed) return error.InvalidCommand;
+        try num(u16, try get(descendants, "adopted")) > observed or
+        primary_events < core.process.command_complete_primary_events_min or
+        cleanup_events < core.process.command_complete_cleanup_events_min or
+        reap_events != observed + 2) return error.InvalidCommand;
     try yes(try get(descendants, "limit_exceeded"), false);
     try yes(try get(descendants, "untracked"), false);
     const stdout = try get(command, "stdout");
@@ -377,7 +430,12 @@ pub fn validate(
     try exact(output, &.{ "bytes", "combined_sha256", "commitment_sha256", "digest_scope" });
     if (try num(u64, try get(output, "bytes")) != size or
         stdout_size + stderr_size != size) return error.InvalidCommand;
-    try eq(try text(try get(output, "combined_sha256")), hash);
+    const combined_hash = try requireDigest(try get(output, "combined_sha256"));
+    try eq(combined_hash, hash);
+    if (size == 0) {
+        const empty = std.fmt.bytesToHex(records.fileIdentity(""), .lower);
+        try eq(combined_hash, &empty);
+    }
     try eq(try text(try get(output, "digest_scope")), try text(try get(record, "sha256_scope")));
     const committed = try outputCommitment(stdout, stderr);
     try eq(try text(try get(output, "commitment_sha256")), &committed);

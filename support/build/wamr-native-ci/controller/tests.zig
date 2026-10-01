@@ -182,7 +182,7 @@ fn handoffInspectFixtures() !void {
     };
     defer accepted.deinit();
     try std.testing.expectError(error.InvalidContext, controller.handoff_inspect.bind(&accepted, "/output"));
-    try std.testing.expectError(error.InvalidContext, controller.handoff_inspect.run(a, io, &accepted, "/output", null));
+    try std.testing.expectError(error.InvalidContext, controller.handoff_inspect.run(a, io, &accepted, "/output", false, null));
     try std.testing.expectError(error.InvalidContext, controller.public_validator_build.run(a, io, &accepted, "/output", null));
     accepted.context = .local_runtime;
     accepted.repository = "/source";
@@ -294,6 +294,7 @@ fn handoffInspectFixtures() !void {
     accepted.root = root;
     accepted.repository = source;
     accepted.runtime_inputs = &pinned;
+    try expectInvalidHandoffRun(a, io, &accepted, try std.fs.path.join(a, &.{ root, "native-v2-legacy-refused" }), true);
     const bound = try controller.handoff_inspect.bind(&accepted, output);
     try std.testing.expectEqualStrings("command-supervisor", controller.handoff_inspect.supervisorRole(&accepted));
     try std.testing.expectEqualStrings(records_controller, bound.supervisor);
@@ -307,6 +308,7 @@ fn handoffInspectFixtures() !void {
     try std.testing.expectError(error.InputChanged, controller.handoff_inspect.bind(&accepted, output));
     accepted.local_producer = .python;
     const python_bound = try controller.handoff_inspect.bind(&accepted, output);
+    try expectInvalidHandoffRun(a, io, &accepted, try std.fs.path.join(a, &.{ root, "python-v2-legacy-refused" }), true);
     try std.testing.expectEqualStrings(controller.accepted_run.handoff_controller_role, controller.handoff_inspect.supervisorRole(&accepted));
     try std.testing.expectEqualStrings(original_supervisor, python_bound.supervisor);
     try std.testing.expectEqualStrings(handoff_controller, python_bound.handoff_controller);
@@ -1478,6 +1480,7 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
     try std.testing.expectEqualStrings("/trusted/supervisor", imported_identity.supervisor.?);
     const rejected = [_][]const []const u8{
         &.{"uk-wamr-native-ci"},
+        &.{ "uk-wamr-native-ci", "supervised-command-record", "--record", "/record", "--identities", "/ids", "--stage", "adapter", "--transport", "trusted-inner-zip", "--profile", "tiny-aot-two-boot" },
         &.{ "uk-wamr-native-ci", "handoff-inspect", "--runtime", "/runtime" },
         &.{ "uk-wamr-native-ci", "handoff-inspect", "--runtime", "/runtime", "--output", "/private/../inspection" },
         &.{ "uk-wamr-native-ci", "handoff-inspect", "--runtime", "/runtime", "--output", "/private/inspection", "--profile", "tiny" },
@@ -1738,6 +1741,357 @@ test "historical v2 supervised bindings use the closed imported producer contrac
         verified += 1;
     }
     try std.testing.expectEqual(@as(usize, 18), verified);
+}
+
+test "legacy handoff inspect command fixture matches Python strictness" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const script =
+        \\import copy, importlib.util, sys
+        \\s=importlib.util.spec_from_file_location("witness",sys.argv[1])
+        \\m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+        \\e=m.Evidence()
+        \\profile="tiny-aot-two-boot"
+        \\stage="handoff-inspect-legacy"
+        \\transport="producer_direct"
+        \\record,identities=e.supervised_binding(stage,profile=profile)
+        \\def check(record):
+        \\    m.ci.validate_supervised_command_binding(record,stage,identities,transport_context=transport,profile=profile)
+        \\check(record)
+        \\mutations={}
+        \\def refuse(name, changed, rehash=True):
+        \\    if rehash:
+        \\        e.rehash_supervised_binding(changed)
+        \\    try:
+        \\        check(changed)
+        \\    except m.ci.Refusal:
+        \\        mutations[name]=changed
+        \\    else:
+        \\        raise AssertionError(name+" admitted")
+        \\changed=copy.deepcopy(record)
+        \\changed["supervisor"]["request"]["retained_executables"]=[]
+        \\changed["supervisor"]["result"]["command"]["retained_executables"]=[]
+        \\refuse("retained-empty", changed)
+        \\changed=copy.deepcopy(record)
+        \\changed["sha256"]="0"*64
+        \\refuse("record-empty-sha", changed, rehash=False)
+        \\changed=copy.deepcopy(record)
+        \\changed["supervisor"]["result"]["command"]["output"]["combined_sha256"]="0"*64
+        \\refuse("output-empty-sha", changed)
+        \\changed=copy.deepcopy(record)
+        \\non_empty="1"*64
+        \\changed["sha256"]=non_empty
+        \\changed["supervisor"]["result"]["command"]["output"]["combined_sha256"]=non_empty
+        \\refuse("zero-bytes-non-empty-hash", changed)
+        \\changed=copy.deepcopy(record)
+        \\changed["supervisor"]["request"]["supervisor"]["identity"]["mode"]=65536
+        \\refuse("identity-mode-u16", changed)
+        \\sys.stdout.buffer.write(m.ci.canonical_json({"accepted":record,"mutations":mutations}))
+    ;
+    const witness = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/tests/test_adapter.py" });
+    const response = try std.process.run(a, std.testing.io, .{
+        .argv = &.{ options.python_executable, "-B", "-c", script, witness },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(2 * 1024 * 1024),
+        .stderr_limit = .limited(4096),
+    });
+    if (response.term != .exited or response.term.exited != 0)
+        std.debug.print("v1 command witness: {s}\n", .{response.stderr});
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, response.term);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, response.stdout, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false });
+    defer parsed.deinit();
+    const accepted = try fixtureField(parsed.value, "accepted");
+    const mutations = try fixtureField(parsed.value, "mutations");
+    const checked = try controller.command_validation.validateLegacyV1(
+        a,
+        accepted,
+        .@"handoff-inspect-legacy",
+        .local_runtime,
+    );
+    try std.testing.expectEqual(controller.command_plan.Stage.@"handoff-inspect-legacy", checked.stage);
+    var refused_count: usize = 0;
+    for (mutations.object.values()) |record| {
+        try std.testing.expectError(error.InvalidCommand, controller.command_validation.validateLegacyV1(
+            a,
+            record,
+            .@"handoff-inspect-legacy",
+            .local_runtime,
+        ));
+        refused_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 5), refused_count);
+    try std.testing.expectError(error.InvalidCommand, controller.command_validation.validateLegacyV1(
+        a,
+        accepted,
+        .@"handoff-inspect",
+        .local_runtime,
+    ));
+    try std.testing.expectError(error.InvalidCommand, controller.command_validation.validateLegacyV1(
+        a,
+        accepted,
+        .@"handoff-inspect-legacy",
+        .trusted_inner_zip,
+    ));
+}
+
+fn fixtureField(value: std.json.Value, name: []const u8) !std.json.Value {
+    if (value != .object) return error.InvalidFixture;
+    return value.object.get(name) orelse error.InvalidFixture;
+}
+
+fn canonicalJsonValue(a: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    return controller.records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, value, .{}));
+}
+
+fn writeCanonicalValue(io: std.Io, dir: std.Io.Dir, name: []const u8, a: std.mem.Allocator, value: std.json.Value) ![]const u8 {
+    const raw = try canonicalJsonValue(a, value);
+    try writeFixtureFile(io, dir, name, raw);
+    return raw;
+}
+
+fn expectInvalidLocalPostRun(
+    accepted: *controller.accepted_run.AcceptedRun,
+    raw: []const u8,
+    stage: controller.command_plan.Stage,
+) !void {
+    _ = controller.accepted_run.validateLocalPostRunCommand(accepted, raw, stage) catch |err| switch (err) {
+        error.InvalidContext, error.InvalidCommand, error.InvalidCommandIdentity => return,
+        else => return err,
+    };
+    return error.InvalidRouteAccepted;
+}
+
+fn expectInvalidHandoffRun(
+    a: std.mem.Allocator,
+    io: std.Io,
+    accepted: *controller.accepted_run.AcceptedRun,
+    output: []const u8,
+    legacy: bool,
+) !void {
+    _ = controller.handoff_inspect.run(a, io, accepted, output, legacy, null) catch |err| switch (err) {
+        error.InvalidContext, error.InvalidCommand, error.InvalidCommandIdentity => return,
+        else => return err,
+    };
+    return error.InvalidRouteAccepted;
+}
+
+fn legacyHandoffInspectLiveFixture() !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "legacy-handoff-inspect-{d}", .{std.os.linux.getpid()});
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("legacy handoff fixture cleanup failed");
+    const fixture_dir = try parent.openDir(io, name, .{ .iterate = true });
+    defer fixture_dir.close(io);
+    const root = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    const output_parent_name = try std.fmt.allocPrint(a, "{s}-outputs", .{name});
+    try parent.createDir(io, output_parent_name, .fromMode(0o700));
+    defer parent.deleteTree(io, output_parent_name) catch @panic("legacy handoff output cleanup failed");
+    const output_parent = try std.fs.path.join(a, &.{ options.fixture_root, output_parent_name });
+    const source = try std.fs.path.join(a, &.{ root, "source" });
+    const compute = try std.fs.path.join(a, &.{ root, "compute" });
+    try fixture_dir.createDir(io, "source", .fromMode(0o700));
+    try fixture_dir.createDir(io, "compute", .fromMode(0o700));
+    try fixture_dir.createDir(io, "bin", .fromMode(0o700));
+    try fixture_dir.createDir(io, "firmware", .fromMode(0o700));
+    const compute_root = try fixture_dir.openDir(io, "compute", .{ .iterate = true });
+    defer compute_root.close(io);
+    try compute_root.createDir(io, "evidence", .fromMode(0o700));
+    try compute_root.createDir(io, "package", .fromMode(0o700));
+    try compute_root.createDir(io, "tools", .fromMode(0o700));
+    try compute_root.createDir(io, "host-tools", .fromMode(0o700));
+    try compute_root.createDir(io, "supervisor", .fromMode(0o700));
+    const compute_tools = try compute_root.openDir(io, "tools", .{ .iterate = true });
+    defer compute_tools.close(io);
+    try compute_tools.createDir(io, "bin", .fromMode(0o700));
+    const compute_supervisor = try compute_root.openDir(io, "supervisor", .{ .iterate = true });
+    defer compute_supervisor.close(io);
+    try compute_supervisor.createDir(io, "bin", .fromMode(0o700));
+    try fixture_dir.createDirPath(io, "source/support/apps/wamr-aot/build/artifacts");
+    const source_build_path = try std.fs.path.join(a, &.{ source, "support/apps/wamr-aot/build" });
+    const source_artifacts_path = try std.fs.path.join(a, &.{ source, "support/apps/wamr-aot/build/artifacts" });
+    const source_app_path = try std.fs.path.join(a, &.{ source, "support/apps/wamr-aot" });
+    const package_path = try std.fs.path.join(a, &.{ compute, "package" });
+    const evidence_path = try std.fs.path.join(a, &.{ compute, "evidence" });
+    const tools_bin_path = try std.fs.path.join(a, &.{ compute, "tools/bin" });
+    const host_tools_path = try std.fs.path.join(a, &.{ compute, "host-tools" });
+    const supervisor_bin_path = try std.fs.path.join(a, &.{ compute, "supervisor/bin" });
+    const bin_path = try std.fs.path.join(a, &.{ root, "bin" });
+    const firmware_path = try std.fs.path.join(a, &.{ root, "firmware" });
+    const source_build = try std.Io.Dir.openDirAbsolute(io, source_build_path, .{ .iterate = true });
+    defer source_build.close(io);
+    const source_artifacts = try std.Io.Dir.openDirAbsolute(io, source_artifacts_path, .{ .iterate = true });
+    defer source_artifacts.close(io);
+    const source_app = try std.Io.Dir.openDirAbsolute(io, source_app_path, .{ .iterate = true });
+    defer source_app.close(io);
+    const compute_package = try std.Io.Dir.openDirAbsolute(io, package_path, .{ .iterate = true });
+    defer compute_package.close(io);
+    const evidence = try std.Io.Dir.openDirAbsolute(io, evidence_path, .{ .iterate = true });
+    defer evidence.close(io);
+    const tools_bin = try std.Io.Dir.openDirAbsolute(io, tools_bin_path, .{ .iterate = true });
+    defer tools_bin.close(io);
+    const host_tools_dir = try std.Io.Dir.openDirAbsolute(io, host_tools_path, .{ .iterate = true });
+    defer host_tools_dir.close(io);
+    const supervisor_bin = try std.Io.Dir.openDirAbsolute(io, supervisor_bin_path, .{ .iterate = true });
+    defer supervisor_bin.close(io);
+    const bin = try std.Io.Dir.openDirAbsolute(io, bin_path, .{ .iterate = true });
+    defer bin.close(io);
+    const firmware = try std.Io.Dir.openDirAbsolute(io, firmware_path, .{ .iterate = true });
+    defer firmware.close(io);
+
+    try writeFixtureFile(io, source_build, "wamr_hyperv-x86_64-efi", "efi");
+    try writeFixtureFile(io, source_build, "wamr_hyperv-x86_64-efi.dbg", "dbg");
+    try writeFixtureFile(io, source_build, "wamr_hyperv-x86_64-efi.bootinfo", "bootinfo");
+    try writeFixtureFile(io, source_artifacts, "libwamr-aot.a", "runtime");
+    try writeFixtureFile(io, source_artifacts, "wamrc", "compiler");
+    try writeFixtureFile(io, source_artifacts, "tiny.wasm", "wasm");
+    try writeFixtureFile(io, source_artifacts, "tiny.cwasm", "cwasm");
+    try writeFixtureFile(io, source_artifacts, "identity.json", "{}\n");
+    try writeFixtureFile(io, source_build, "image-identity.json", "{}\n");
+    try writeFixtureFile(io, source_app, ".config", "CONFIG_APP=y\n");
+    try writeFixtureFile(io, compute_package, "unikraft.raw", "raw");
+    try writeFixtureFile(io, compute_package, "unikraft.vhd", "vhd");
+    try writeFixtureFile(io, compute_package, "unikraft-derived.vhd", "vhd");
+    try writeFixtureFile(io, firmware, "code.fd", "code");
+    try writeFixtureFile(io, firmware, "vars.fd", "vars");
+    const package_value = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"image\":{\"efi\":{\"size\":3}},\"producer_sha256\":\"fixture\"}", .{});
+    const package_json = try writeCanonicalValue(io, evidence, "package.json", a, package_value);
+
+    const executable = try std.fs.path.resolve(a, &.{ options.repository_root, options.command_fixture });
+    const bound_tool = try std.Io.Dir.realPathFileAbsoluteAlloc(io, "/usr/bin/true", a);
+    try copyFixtureExecutable(io, a, executable, tools_bin, "wamr-ci-package");
+    var host_tool_paths: [controller.input_custody.host_tools.len][]const u8 = undefined;
+    for (controller.input_custody.host_tools, 0..) |tool, i| {
+        try copyFixtureExecutable(io, a, bound_tool, host_tools_dir, tool);
+        host_tool_paths[i] = try std.fs.path.join(a, &.{ compute, "host-tools", tool });
+    }
+    try copyFixtureExecutable(io, a, bound_tool, supervisor_bin, "wamr-ci-supervisor");
+    try copyFixtureExecutable(io, a, bound_tool, bin, "qemu-system-x86_64");
+    const package_tool = try std.fs.path.join(a, &.{ compute, "tools/bin/wamr-ci-package" });
+    const supervisor = try std.fs.path.join(a, &.{ compute, "supervisor/bin/wamr-ci-supervisor" });
+    const efi = try std.fs.path.join(a, &.{ source, "support/apps/wamr-aot/build/wamr_hyperv-x86_64-efi" });
+    const qemu = try std.fs.path.join(a, &.{ root, "bin/qemu-system-x86_64" });
+    const ovmf_code = try std.fs.path.join(a, &.{ root, "firmware/code.fd" });
+    const ovmf_vars = try std.fs.path.join(a, &.{ root, "firmware/vars.fd" });
+
+    for (controller.profile.modes(.tiny_v1_legacy)) |mode| {
+        const boot_name = try std.fmt.allocPrint(a, "boot-{s}", .{@tagName(mode)});
+        try compute_root.createDir(io, boot_name, .fromMode(0o700));
+        const boot_dir = try compute_root.openDir(io, boot_name, .{ .iterate = true });
+        defer boot_dir.close(io);
+        try writeFixtureFile(io, boot_dir, "hyperv-efi-boot.log", "serial\n");
+        try writeFixtureFile(io, boot_dir, "request.json", "{}\n");
+        try writeFixtureFile(io, boot_dir, "report.json", "{}\n");
+        const compute_name = try std.fmt.allocPrint(a, "{s}-compute.json", .{@tagName(mode)});
+        const compute_value = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"accepted\":true}", .{});
+        _ = try writeCanonicalValue(io, evidence, compute_name, a, compute_value);
+    }
+
+    var start_bindings: [controller.input_custody.host_tools.len + 1]controller.input_custody.Binding = undefined;
+    for (controller.input_custody.host_tools, 0..) |tool, i|
+        start_bindings[i] = .{ .role = try std.fmt.allocPrint(a, "tool:{s}", .{tool}), .path = host_tool_paths[i] };
+    start_bindings[controller.input_custody.host_tools.len] = .{ .role = "command-supervisor", .path = supervisor };
+    var start_custody = try controller.input_custody.capture(a, io, &start_bindings, &.{});
+    defer start_custody.deinit(a);
+    const start_custody_raw = try start_custody.canonical(a);
+    const consumer_inputs = try std.json.parseFromSliceLeaky(std.json.Value, a, start_custody_raw, .{ .parse_numbers = false });
+    const legacy_source = .{
+        .revision = "993e4d0d394c08202c0d0c57ea97450a19a4f394",
+        .tree = "54f8e118146c78c24e7c802657c6ec62b268a5de",
+    };
+    var start = std.json.Value{ .object = .empty };
+    try start.object.put(a, "source", try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, legacy_source, .{}), .{}));
+    try start.object.put(a, "consumer_inputs", consumer_inputs);
+    _ = try writeCanonicalValue(io, evidence, "build-start.json", a, start);
+
+    var build = std.json.Value{ .object = .empty };
+    try build.object.put(a, "source", try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, legacy_source, .{}), .{}));
+    _ = try writeCanonicalValue(io, evidence, "build.json", a, build);
+
+    const boot_bindings = [_]controller.input_custody.Binding{
+        .{ .role = "package_tool", .path = package_tool },
+        .{ .role = "local_boot_tool", .path = bound_tool },
+        .{ .role = "qemu", .path = qemu },
+        .{ .role = "ovmf_code", .path = ovmf_code },
+        .{ .role = "ovmf_vars", .path = ovmf_vars },
+        .{ .role = "efi", .path = efi },
+    };
+    var boot_custody = try controller.input_custody.capture(a, io, &boot_bindings, &.{});
+    defer boot_custody.deinit(a);
+    const boot_custody_raw = try boot_custody.canonical(a);
+    const boot_inputs = try std.json.parseFromSliceLeaky(std.json.Value, a, boot_custody_raw, .{ .parse_numbers = false });
+    _ = try writeCanonicalValue(io, evidence, "boot-inputs.json", a, boot_inputs);
+
+    var records_map = std.json.Value{ .object = .empty };
+    for ([_][]const u8{
+        "build-start.json",
+        "build.json",
+        "boot-inputs.json",
+        "package.json",
+        "raw-x2apic-compute.json",
+        "raw-legacy-apic-compute.json",
+        "vpc-x2apic-compute.json",
+        "vpc-legacy-apic-compute.json",
+    }) |record_name| {
+        const path = try std.fs.path.join(a, &.{ compute, "evidence", record_name });
+        const observed = try controller.custody_files.readFile(io, path, controller.records.max_record_bytes, true);
+        try records_map.object.put(a, record_name, .{ .string = try a.dupe(u8, &observed.sha256) });
+    }
+    var result = std.json.Value{ .object = .empty };
+    try result.object.put(a, "schema_version", .{ .integer = 1 });
+    try result.object.put(a, "scope", .{ .string = "local_native_compute_only" });
+    try result.object.put(a, "passed", .{ .bool = true });
+    try result.object.put(a, "hardware_acceptance", .{ .string = "not_established" });
+    try result.object.put(a, "cloud_authority", .{ .string = "not_admitted" });
+    try result.object.put(a, "benchmark", .{ .string = "not_measured" });
+    try result.object.put(a, "workload", .{ .string = "tiny" });
+    var modes = std.json.Value{ .array = std.array_list.Managed(std.json.Value).init(a) };
+    for (controller.profile.modes(.tiny_v1_legacy)) |mode|
+        try modes.array.append(.{ .string = @tagName(mode) });
+    try result.object.put(a, "modes", modes);
+    try result.object.put(a, "records", records_map);
+    _ = try writeCanonicalValue(io, evidence, "result.json", a, result);
+
+    const runtime_dir = try controller.layout.runtime(io, root);
+    defer runtime_dir.close(io);
+    var accepted = try controller.accepted_run.openAndValidateForHandoffInspectWithSignal(
+        a,
+        io,
+        std.process.Environ.empty,
+        &runtime_dir,
+        root,
+        source,
+        null,
+    );
+    defer accepted.deinit();
+    try std.testing.expectEqual(controller.profile.CompatibleRecordSet.tiny_v1_legacy, accepted.compatibility);
+    try expectInvalidHandoffRun(a, io, &accepted, try std.fs.path.join(a, &.{ output_parent, "wrong-v1-output" }), false);
+    const output = try std.fs.path.join(a, &.{ output_parent, "legacy-output" });
+    const checked = try controller.handoff_inspect.run(a, io, &accepted, output, true, null);
+    try std.testing.expectEqual(controller.command_plan.Stage.@"handoff-inspect-legacy", checked.stage);
+    try std.testing.expectEqual(@as(u64, package_json.len), checked.output_bytes);
+    const record_path = try std.fs.path.join(a, &.{ output, "evidence/command-handoff-inspect-legacy.json" });
+    const record = try controller.custody_files.readFile(io, record_path, controller.records.max_record_bytes, true);
+    const raw = try a.alloc(u8, @intCast(record.bytes));
+    const record_file = try std.Io.Dir.openFileAbsolute(io, record_path, .{ .follow_symlinks = false });
+    defer record_file.close(io);
+    try std.testing.expectEqual(raw.len, try record_file.readPositionalAll(io, raw, 0));
+    try expectInvalidLocalPostRun(&accepted, raw, .@"handoff-inspect");
+    var mutated = try std.json.parseFromSlice(std.json.Value, a, raw, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false });
+    defer mutated.deinit();
+    mutated.value.object.getPtr("sha256").?.* = .{ .string = "0000000000000000000000000000000000000000000000000000000000000000" };
+    const mutated_raw = try canonicalJsonValue(a, mutated.value);
+    try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateLocalPostRunCommand(&accepted, mutated_raw, .@"handoff-inspect-legacy"));
+
+    var wrong = accepted;
+    wrong.compatibility = .tiny_v2_qcow2_derived_vhd;
+    try expectInvalidHandoffRun(a, io, &wrong, try std.fs.path.join(a, &.{ output_parent, "wrong-v2-output" }), true);
+    try expectInvalidLocalPostRun(&wrong, raw, .@"handoff-inspect-legacy");
 }
 
 fn fixture(allocator: std.mem.Allocator, v2: bool, commands: bool) ![]u8 {
@@ -3560,4 +3914,5 @@ test "native command refuses changed executable after use and retains failed rec
 
 test "handoff inspect supervises original roles, captures output and refuses missing custody" {
     try handoffInspectFixtures();
+    try legacyHandoffInspectLiveFixture();
 }

@@ -1396,6 +1396,8 @@ def publication_records(
                     and re.fullmatch(r"[0-9a-f]{64}", item["sha256"]))
             if not pre_supervisor:
                 command_stage = name[len("command-"):-len(".json")]
+                if version == 1 and transport_context == "trusted_inner_zip":
+                    require(False)
                 supervised_command_record(
                     ci, item, command_stage, role_identities,
                     transport_context, profile=profile)

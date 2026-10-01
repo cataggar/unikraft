@@ -279,8 +279,8 @@ def supervisor_import_identity(stage_root, supervisor, git, output):
     return output
 
 
-def handoff_inspect(runtime, output):
-    """Run the native owner for the v2 local handoff inspection stage."""
+def handoff_inspect(runtime, output, *, legacy=False):
+    """Run the native owner for the local handoff inspection stage."""
     runtime, output = map(Path, (runtime, output))
     refusal = "native controller handoff inspect refused"
     try:
@@ -292,8 +292,11 @@ def handoff_inspect(runtime, output):
             or os.path.normpath(str(output)) != str(output)
             or os.path.lexists(output)):
         _refuse(refusal)
+    action = "handoff-inspect-legacy" if legacy else "handoff-inspect"
+    log_name = action + ".log"
+    record_name = "command-" + action + ".json"
     raw, stderr_seen = _controller_command((
-        "handoff-inspect", "--runtime", str(runtime),
+        action, "--runtime", str(runtime),
         "--output", str(output)), refusal)
     if raw or stderr_seen:
         _refuse(refusal)
@@ -304,9 +307,8 @@ def handoff_inspect(runtime, output):
                     or stat.S_IMODE(info.st_mode) != 0o700):
                 _refuse(refusal)
         for path, bound in (
-                (output / "private/handoff-inspect.log", 64 * 1024),
-                (output / "evidence/command-handoff-inspect.json",
-                 MAX_RECORDS_BYTES)):
+                (output / "private" / log_name, 64 * 1024),
+                (output / "evidence" / record_name, MAX_RECORDS_BYTES)):
             info = path.lstat()
             if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
                     or info.st_uid != os.geteuid()
@@ -315,7 +317,7 @@ def handoff_inspect(runtime, output):
                 _refuse(refusal)
     except OSError as error:
         raise ValueError(refusal) from error
-    return output / "private/handoff-inspect.log", output / "evidence/command-handoff-inspect.json"
+    return output / "private" / log_name, output / "evidence" / record_name
 
 
 def import_native_revalidation(stage_root, output):

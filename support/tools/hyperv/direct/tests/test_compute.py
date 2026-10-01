@@ -1037,10 +1037,35 @@ class Compute(unittest.TestCase):
                 self.assertTrue(content)
                 return producer
 
+            def native_handoff_inspect(actual_runtime, output, *, legacy=False):
+                self.assertEqual(actual_runtime, runtime)
+                self.assertTrue(legacy)
+                output.mkdir(mode=0o700)
+                (output / "private").mkdir(mode=0o700)
+                (output / "evidence").mkdir(mode=0o700)
+                inspected = root / "evidence/package.json"
+                command = output / "evidence/command-handoff-inspect-legacy.json"
+                (output / "private/handoff-inspect-legacy.log").write_bytes(
+                    inspected.read_bytes())
+                (output / "private/handoff-inspect-legacy.log").chmod(0o600)
+                write(command, {
+                    "scope": "command_diagnostic_not_acceptance",
+                    "stage": "handoff-inspect-legacy",
+                    "exit_code": 0,
+                    "bytes": inspected.stat().st_size,
+                    "sha256": ci.digest(inspected),
+                    "over_limit": False,
+                    "known_error_markers": [],
+                })
+                return output / "private/handoff-inspect-legacy.log", command
+
             with mock.patch.object(ci, "check_build", return_value=build), \
                     mock.patch.object(
                         ci, "producer_inputs", autospec=True,
-                        side_effect=mocked_producer_inputs):
+                        side_effect=mocked_producer_inputs), \
+                    mock.patch.object(
+                        handoff.accepted_records, "handoff_inspect",
+                        side_effect=native_handoff_inspect):
                 with mock.patch.object(ci, "require_build_custody"):
                     handoff.export(runtime, handoff_parent / "handoff")
         self.assertEqual((root / "evidence/result.json").read_bytes(), original)

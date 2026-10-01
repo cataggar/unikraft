@@ -126,7 +126,7 @@ pub fn main(init: std.process.Init) void {
         ) catch |err| failed(init.io, stage, "", err);
         return;
     }
-    if (command.action == .@"handoff-inspect" or command.action == .@"public-validator-build") {
+    if (command.action == .@"handoff-inspect" or command.action == .@"handoff-inspect-legacy" or command.action == .@"public-validator-build") {
         const stage = @tagName(command.action);
         const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
         const root = command.runtime.?;
@@ -134,7 +134,7 @@ pub fn main(init: std.process.Init) void {
         defer runtime.close(init.io);
         var signal = controller.build_pipeline.installCancellation() catch refused(init.io);
         defer signal.deinit();
-        var accepted = if (command.action == .@"handoff-inspect")
+        var accepted = if (command.action == .@"handoff-inspect" or command.action == .@"handoff-inspect-legacy")
             controller.accepted_run.openAndValidateForHandoffInspectWithSignal(
                 allocator,
                 init.io,
@@ -161,6 +161,15 @@ pub fn main(init: std.process.Init) void {
                 init.io,
                 &accepted,
                 command.output.?,
+                false,
+                &signal,
+            ),
+            .@"handoff-inspect-legacy" => controller.handoff_inspect.run(
+                allocator,
+                init.io,
+                &accepted,
+                command.output.?,
+                true,
                 &signal,
             ),
             .@"public-validator-build" => controller.public_validator_build.run(
@@ -218,6 +227,7 @@ pub fn main(init: std.process.Init) void {
         .records => unreachable,
         .@"local-consumer-custody" => unreachable,
         .@"handoff-inspect" => unreachable,
+        .@"handoff-inspect-legacy" => unreachable,
         .@"public-validator-build" => unreachable,
         .@"supervisor-import-identity" => unreachable,
         .@"import-validator-build" => unreachable,
@@ -236,6 +246,7 @@ fn usage(io: std.Io) noreturn {
             "       uk-wamr-native-ci records --stage-root ABS --transport trusted-inner-zip --output handoff-v1\n" ++
             "       uk-wamr-native-ci local-consumer-custody --runtime ABS\n" ++
             "       uk-wamr-native-ci handoff-inspect --runtime ABS --output ABS\n" ++
+            "       uk-wamr-native-ci handoff-inspect-legacy --runtime ABS --output ABS\n" ++
             "       uk-wamr-native-ci public-validator-build --runtime ABS --output ABS\n" ++
             "       uk-wamr-native-ci supervisor-import-identity --stage-root ABS --supervisor ABS --git ABS --output ABS\n" ++
             "       uk-wamr-native-ci import-validator-build --stage-root ABS --output ABS\n" ++

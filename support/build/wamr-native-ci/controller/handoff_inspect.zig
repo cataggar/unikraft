@@ -26,9 +26,16 @@ fn inputPath(accepted: *accepted_run.AcceptedRun, role: []const u8, expected: ?[
     return found orelse error.MissingInput;
 }
 
+fn optionalInputPath(accepted: *accepted_run.AcceptedRun, role: []const u8) []const u8 {
+    for (accepted.runtime_inputs) |input| {
+        if (std.mem.eql(u8, input.role, role)) return input.path;
+    }
+    return "";
+}
+
 pub fn bind(accepted: *accepted_run.AcceptedRun, output: []const u8) !plan.Roots {
     if (accepted.context != .local_runtime or accepted.repository == null or
-        accepted.compatibility != .tiny_v2_qcow2_derived_vhd)
+        (accepted.compatibility != .tiny_v2_qcow2_derived_vhd and accepted.compatibility != .tiny_v1_legacy))
         return error.InvalidContext;
     try files.absoluteFilePath(output);
     const a = accepted.arena.allocator();
@@ -55,10 +62,10 @@ pub fn bind(accepted: *accepted_run.AcceptedRun, output: []const u8) !plan.Roots
         .work = output,
         .compute = compute,
         .zig = tools[9],
-        .producer = try inputPath(accepted, "native:wamr-aot-build", null),
+        .producer = optionalInputPath(accepted, "native:wamr-aot-build"),
         .supervisor = try inputPath(accepted, "command-supervisor", supervisor),
         .package_tool = try inputPath(accepted, "package_tool", package_tool),
-        .validator = try inputPath(accepted, "native:wamr-log-validate", null),
+        .validator = optionalInputPath(accepted, "native:wamr-log-validate"),
         .efi = try inputPath(accepted, "efi", efi),
         .handoff_controller = handoff_controller,
         .tools = tools,
@@ -104,9 +111,12 @@ pub fn run(
     io: std.Io,
     accepted: *accepted_run.AcceptedRun,
     output: []const u8,
+    legacy: bool,
     signal: ?*core.process.SignalCancellation,
 ) !@import("command_validation.zig").ValidatedCommand {
     if (accepted.context != .local_runtime or accepted.repository == null)
+        return error.InvalidContext;
+    if (legacy != (accepted.compatibility == .tiny_v1_legacy))
         return error.InvalidContext;
     try accepted.revalidateWithSignal(signal);
     const roots = try bind(accepted, output);
@@ -136,11 +146,11 @@ pub fn run(
 
     const outcome = try adapter.execute(allocator, io, .{
         .roots = roots,
-        .stage = .@"handoff-inspect",
+        .stage = if (legacy) .@"handoff-inspect-legacy" else .@"handoff-inspect",
         .private_dir = private,
         .evidence_dir = evidence,
         .cancel = if (signal) |active| active.flag() else null,
-        .supervisor_role = supervisorRole(accepted),
+        .supervisor_role = if (legacy) "command-supervisor" else supervisorRole(accepted),
         .capture_stdout = true,
     });
     defer allocator.free(outcome.stdout);
@@ -149,7 +159,7 @@ pub fn run(
         return error.StageRefused;
     try matchPackage(allocator, outcome.stdout, original.bytes());
 
-    const record_path = try std.fs.path.join(allocator, &.{ output, "evidence/command-handoff-inspect.json" });
+    const record_path = try std.fs.path.join(allocator, &.{ output, if (legacy) "evidence/command-handoff-inspect-legacy.json" else "evidence/command-handoff-inspect.json" });
     defer allocator.free(record_path);
     const record = try physical.readFile(io, record_path, records.max_record_bytes, true);
     const raw = try allocator.alloc(u8, @intCast(record.bytes));
@@ -163,7 +173,7 @@ pub fn run(
         !std.mem.eql(u8, &record.sha256, &observed_sha256))
         return error.CommandOutputChanged;
     try pinned_record.verify(io);
-    const checked = try accepted_run.validateLocalHandoffCommand(accepted, raw);
+    const checked = try accepted_run.validateLocalPostRunCommand(accepted, raw, if (legacy) .@"handoff-inspect-legacy" else .@"handoff-inspect");
     const stdout_sha256 = std.fmt.bytesToHex(records.fileIdentity(outcome.stdout), .lower);
     if (checked.output_bytes != outcome.stdout.len or
         !std.mem.eql(u8, &checked.output_sha256, &stdout_sha256))
