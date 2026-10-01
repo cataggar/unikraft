@@ -962,14 +962,8 @@ jobs:
           -Dtest-root="${compute_fixture_root}" \
           -Doptimize=ReleaseSafe test install
         supervisor_source_closure="$(
-          python3 - <<'PY'
-        import sys
-
-        sys.path.insert(0, "support/build/wamr-native-ci")
-        import run
-
-        print(run.supervisor_source_map()["content_closure_sha256"])
-        PY
+          "${root}/compute-tools/bin/uk-wamr-native-ci" \
+            supervisor-source-closure --git /usr/bin/git --output sha256-v1
         )"
         zig build \
           --build-file support/build/wamr-native-ci/supervisor.build.zig -j2 \

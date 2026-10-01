@@ -198,13 +198,14 @@ test runs in a separate clean worktree in the protected gate, never during
 the supervised production adapter build. Custody link and depth fixtures use
 the selected cache even when production sets `ZIG_LOCAL_CACHE_DIR` outside
 the checkout.
-The protected x86 job exercises `test-controller` first in a separate clean
-worktree, keeping its test dependencies and cache outside the production
-source checkout; this reports fixture failures without exposing private
-supervised-command output. On failure it runs the host test binary directly
-for diagnostic errors while keeping the original gate failed.
-`python3 -m unittest support/build/wamr-native-ci/tests/source_custody_production_limits.py`
-remains the independent full-size source-boundary oracle until cutover.
+The protected x86 job exercises `test-controller-limits` and then
+`test-controller` in separate clean worktrees, keeping test dependencies and
+cache outside the production source checkout; this reports fixture failures
+without exposing private supervised-command output. On failure it runs the
+host test binary directly for diagnostic errors while keeping the original
+gate failed. The Python
+`tests/source_custody_production_limits.py` remains paired with the native
+limit fixture while production `build` still invokes `run.py`.
 
 `build --runtime ABS --wamr-source ABS`, `boot --runtime ABS`, and
 `diagnostics --runtime ABS` are available only through the installed
@@ -638,17 +639,14 @@ cp support/tools/hyperv/local_boot/build.zig \
 zig build --build-file .d/wamr-ci-check/restore/build.zig --fetch=all \
   --cache-dir .d/wamr-ci-check/cache \
   --global-cache-dir .d/wamr-ci-check/global-cache -j2
+zig build --build-file support/build/wamr-native-ci/build.zig \
+  --system "$PWD/.d/wamr-ci-check/restore/zig-pkg" \
+  --cache-dir .d/wamr-ci-check/cache --prefix "$PWD/.d/wamr-ci-check/out" \
+  -Dtest-root="$PWD/.d/wamr-ci-check/fixtures" \
+  -Doptimize=ReleaseSafe -j2 test install
 SUPERVISOR_SOURCE_SHA256="$(
-  PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
-import importlib.util
-from pathlib import Path
-
-path = Path("support/build/wamr-native-ci/run.py").resolve()
-spec = importlib.util.spec_from_file_location("wamr_native_ci", path)
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-print(module.supervisor_source_map()["content_closure_sha256"])
-PY
+  "$PWD/.d/wamr-ci-check/out/bin/uk-wamr-native-ci" \
+    supervisor-source-closure --git "$(command -v git)" --output sha256-v1
 )"
 zig build --build-file support/build/wamr-native-ci/supervisor.build.zig \
   --system "$PWD/.d/wamr-ci-check/restore/zig-pkg" \
@@ -657,11 +655,6 @@ zig build --build-file support/build/wamr-native-ci/supervisor.build.zig \
   --prefix "$PWD/.d/wamr-ci-check/supervisor" \
   -Dsource-closure-sha256="$SUPERVISOR_SOURCE_SHA256" \
   -Doptimize=ReleaseSafe -j2 install
-zig build --build-file support/build/wamr-native-ci/build.zig \
-  --system "$PWD/.d/wamr-ci-check/restore/zig-pkg" \
-  --cache-dir .d/wamr-ci-check/cache --prefix "$PWD/.d/wamr-ci-check/out" \
-  -Dtest-root="$PWD/.d/wamr-ci-check/fixtures" \
-  -Doptimize=ReleaseSafe -j2 test install
 WAMR_CI_PACKAGE="$PWD/.d/wamr-ci-check/out/bin/wamr-ci-package" \
 WAMR_CI_LOG_VALIDATE="$PWD/.d/wamr-ci-check/out/bin/uk-wamr-log-validate" \
 WAMR_CI_SUPERVISOR="$PWD/.d/wamr-ci-check/supervisor/bin/wamr-ci-supervisor" \
@@ -1082,11 +1075,12 @@ original requests), and uses the production native checker before publishing
 a usable `bundle.json`. Its plan remains `authority=not_admitted`; new final
 artifact-bound human approval is required.
 
-The expensive production-boundary module
-`tests/source_custody_production_limits.py` is intentionally excluded from
-default discovery and runs explicitly in protected CI. Its single PID-scoped
-`/d` fixture combines 131,072-entry and 8-GiB sparse-file exact/excess checks,
-constructs real exact/first-excess 8-MiB Git ignored inventories, and covers
-the 1,024-byte path, 64-component and 128-root diagnostic boundaries. It uses
-sparse allocation, emits no large payloads, and removes only its exact fixture
-directory.
+The native `test-controller-limits` production-boundary fixture is the
+protected CI source-custody limit check. It covers the historical Python
+script's frozen ignored-output constants, exact/excess 131,072-entry and
+8-GiB sparse-file limits, exact/excess 8-MiB Git ignored inventories,
+1,024-byte path, 64-component depth and 128-root diagnostic boundaries, and
+adds tracked-source entry, byte, file-size and unsafe-type boundaries. The
+Python `tests/source_custody_production_limits.py` remains intentionally
+excluded from default discovery and runs explicitly in protected CI as long
+as production `run.py build` still owns the build path.

@@ -2679,9 +2679,14 @@ class HypervWorkflowTest(unittest.TestCase):
             'test "$(stat -c \'%a\' -- "${compute_fixture_root}")" = 700',
             '-Dtest-root="${compute_fixture_root}"',
             "-Doptimize=ReleaseSafe test install",
+            '"${root}/compute-tools/bin/uk-wamr-native-ci"',
+            "supervisor-source-closure --git /usr/bin/git --output sha256-v1",
         ):
             self.assertIn(required, step)
-        for forbidden in ("|| true", "continue-on-error:", "-Dtest-filter="):
+        for forbidden in (
+            "|| true", "continue-on-error:", "-Dtest-filter=",
+            "import run", "supervisor_source_map()",
+        ):
             self.assertNotIn(forbidden, step)
 
         build = (
@@ -2699,6 +2704,20 @@ class HypervWorkflowTest(unittest.TestCase):
         native = (
             SUPPORT.parent / ".github/workflows/wamr-native-compute.yaml"
         ).read_text()
+        self.assertLess(
+            native.index("      - name: Install the existing pinned Zig compiler\n"),
+            native.index("      - name: Exercise the production source-custody limits explicitly\n"),
+        )
+        source_limits = native.split(
+            "      - name: Exercise the production source-custody limits explicitly\n",
+            1,
+        )[1].split("\n      - name:", 1)[0]
+        for required in (
+            "git worktree add --detach",
+            "test-controller-limits",
+            "source_custody_production_limits.py",
+        ):
+            self.assertIn(required, source_limits)
         for required in (
             "for name in llvm-readelf llvm-strip; do",
             'target="$(readlink -f "${alias}")"',

@@ -20,6 +20,18 @@ pub fn main(init: std.process.Init) void {
         stdout.interface.writeAll(encoded) catch refused(init.io);
         return;
     }
+    if (command.action == .@"supervisor-source-closure") {
+        const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
+        const closure = controller.import_supervisor_identity.supervisorSourceContentClosure(
+            allocator,
+            init.io,
+            repository,
+            command.git.?,
+        ) catch |err| failed(init.io, @tagName(command.action), "", err);
+        var stdout = std.Io.File.stdout().writerStreaming(init.io, &.{});
+        stdout.interface.print("{s}\n", .{closure[0..]}) catch refused(init.io);
+        return;
+    }
     if (command.action == .records) {
         const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
         const root = command.runtime orelse command.stage_root.?;
@@ -202,6 +214,7 @@ pub fn main(init: std.process.Init) void {
             controller.boot_pipeline.diagnostics(&boot_context) catch |err| failed(init.io, "diagnostics", "", err);
         },
         .describe => unreachable,
+        .@"supervisor-source-closure" => unreachable,
         .records => unreachable,
         .@"local-consumer-custody" => unreachable,
         .@"handoff-inspect" => unreachable,
@@ -218,6 +231,7 @@ fn usage(io: std.Io) noreturn {
         "usage: uk-wamr-native-ci build --runtime ABS --wamr-source ABS\n" ++
             "       uk-wamr-native-ci boot|diagnostics --runtime ABS\n" ++
             "       uk-wamr-native-ci describe --output json-v1\n" ++
+            "       uk-wamr-native-ci supervisor-source-closure --git /usr/bin/git --output sha256-v1\n" ++
             "       uk-wamr-native-ci records --runtime ABS --output handoff-v1\n" ++
             "       uk-wamr-native-ci records --stage-root ABS --transport trusted-inner-zip --output handoff-v1\n" ++
             "       uk-wamr-native-ci local-consumer-custody --runtime ABS\n" ++

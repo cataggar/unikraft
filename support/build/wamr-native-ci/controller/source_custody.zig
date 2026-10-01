@@ -655,6 +655,7 @@ pub fn trackedManifest(
         return error.InvalidGitOutput;
     const listing = try gitOutput(allocator, io, repo, git, &.{ "ls-tree", "-z", "HEAD", "--", relative }, 2048, null);
     defer allocator.free(listing);
+    if (listing.len == 0) return error.UntrackedManifest;
     const matches = try trackedMap(allocator, listing, if (std.mem.eql(u8, format, "sha1")) 40 else 64);
     defer allocator.free(matches);
     if (matches.len != 1 or !std.mem.eql(u8, matches[0].path, relative) or std.mem.eql(u8, matches[0].mode, "120000"))
