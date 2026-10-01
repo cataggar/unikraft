@@ -425,8 +425,7 @@ def require_preprovision(raw, *, approver_public_key, expected, plan, now):
 
 def serial_status(text):
     """Classify a boot-log snapshot: failed, complete, final or None."""
-    lines = [azure.ANSI_ESCAPE.sub("", line).replace("\0", "").strip()
-             for line in text.splitlines()]
+    lines = topology.serial_lines(text)
     for line in lines:
         if (line.startswith(SERIAL_FAILURE_PREFIXES)
                 or any(marker in line for marker in SERIAL_FAILURES)
@@ -1540,8 +1539,7 @@ class _AcceptanceRun:
                 }
                 for role, device in parsed["guest_devices"].items()
             }
-            lines = [azure.ANSI_ESCAPE.sub("", line).replace("\0", "").strip()
-                     for line in self.serial_text.splitlines()]
+            lines = topology.serial_lines(self.serial_text)
             boots = 1 if lines.count("UK_HYPERV_PLATFORM_READY") == 1 else 0
             serial = self.serial_text.encode("utf-8")
             receipt = self.start_receipt["sha256"]
