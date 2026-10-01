@@ -1197,9 +1197,9 @@ upload. The VHD
 upload checks the local file's digest and size before sending any bytes. If
 the journaled dummy VM runtime exceeds the approved budget, the run refuses
 the OS swap. Azure can briefly report `Updating` even after a write returned
-`Succeeded`. So each VM read that the records require to be `Succeeded` (the
-deployment child VM, dummy, deallocation, swap-settlement and final reads) is
-polled up to 30 times, 10 seconds apart, while the VM reports `Creating`,
+`Succeeded`. So each VM state read recorded as evidence (the deployment
+child VM, dummy, deallocation, swap-settlement and final reads) is polled
+until `Succeeded`, up to 30 times, 10 seconds apart, while the VM reports `Creating`,
 `Updating` or `Migrating`. Every unsettled read is journaled as
 `<step>.unsettled-<n>`, and only the settled read becomes evidence. Any other
 state fails closed. The tool then signs and verifies the records; the handoff
