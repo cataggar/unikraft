@@ -970,15 +970,51 @@ class LiveGateTests(unittest.TestCase):
         self.assertEqual(self.fake.calls,
                          [("group", "exists", "--name", "uk90-rg")])
 
-    def test_unconfirmed_group_create_is_not_deleted(self):
+    def test_failed_group_create_is_probed_before_cleanup(self):
         self.prepare()
         self.fake.fail_once[("group", "create")] = RuntimeError("create timed out")
         result = self.run_live()
         self.assertFalse(result.passed)
+        self.assertEqual(result.cleanup, "not-created")
+        self.assertEqual([call[:2] for call in self.fake.calls],
+                         [("group", "exists"), ("group", "create"),
+                          ("group", "exists")])
+
+    def test_group_created_despite_create_error_is_deleted_when_owned(self):
+        self.prepare()
+
+        def fail_after_create(args):
+            if args[:2] == ["group", "create"]:
+                self.fake.after = None
+                raise RuntimeError("create response lost")
+
+        self.fake.after = fail_after_create
+        result = self.run_live()
+        self.assertFalse(result.passed)
+        self.assertEqual(result.cleanup, "deleted")
+        self.assertFalse(self.fake.group_present)
+        self.assertIn(("group", "delete"),
+                      [call[:2] for call in self.fake.calls])
+
+    def test_unprovable_group_probe_is_unconfirmed_and_not_deleted(self):
+        self.prepare()
+        self.fake.fail_once[("group", "create")] = RuntimeError("create timed out")
+        original = self.fake.dispatch
+        probes = []
+
+        def dispatch(args):
+            if args[:2] == ["group", "exists"] and probes:
+                return self.fake.response("maybe")
+            if args[:2] == ["group", "exists"]:
+                probes.append(args)
+            return original(args)
+
+        self.fake.dispatch = dispatch
+        result = self.run_live()
         self.assertEqual(result.cleanup, "unconfirmed")
         self.assertIn("manually", result.cleanup_reason)
-        self.assertEqual([call[:2] for call in self.fake.calls],
-                         [("group", "exists"), ("group", "create")])
+        self.assertNotIn(("group", "delete"),
+                         [call[:2] for call in self.fake.calls])
 
     def test_upload_failure_revokes_and_cleans_up(self):
         self.prepare()

@@ -721,17 +721,31 @@ def azure_vhd_upload(role, path, sas, digest, size):
 
 
 def cleanup_disposable(recorder, plan):
-    """Delete only the group this journal proved it created and still owns."""
+    """Delete only a group this journal proved new that still carries this
+    run's exact owner tags and only owned resources."""
     journal = Journal(recorder.journal_path)
-    if "group.create" not in journal.by_step:
-        if ("group.precheck" in journal.by_step
-                and _journal_value(recorder, journal, "group.precheck") is False):
-            return CleanupResult("unconfirmed")
+    proven_new = (
+        "group.precheck" in journal.by_step
+        and _journal_value(recorder, journal, "group.precheck") is False
+    )
+    if not proven_new:
+        if "group.create" in journal.by_step:
+            raise CleanupRefused(
+                "Group pre-existence check did not prove a new group"
+            )
         return CleanupResult("not-created")
-    if _journal_value(recorder, journal, "group.precheck") is not False:
-        raise CleanupRefused("Group pre-existence check did not prove a new group")
     group_id = plan.expected.resource_ids["group"]
     group = plan.group_name()
+    if "group.create" not in journal.by_step:
+        # The absence precheck passed but create failed or timed out. A group
+        # now present must still carry this run's exact owner tags below.
+        probe = recorder.az("cleanup.probe", [
+            "group", "exists", "--name", group,
+        ]).value
+        if probe is False:
+            return CleanupResult("not-created")
+        if probe is not True:
+            return CleanupResult("unconfirmed")
     shown = recorder.az("cleanup.group", ["group", "show", "--name", group]).value
     tags = shown.get("tags") if isinstance(shown, dict) else None
     if (not isinstance(shown, dict) or not isinstance(shown.get("id"), str)
@@ -924,8 +938,8 @@ def _live_cleanup(directory, plan, runner, clock, private):
         return "failed", sanitize_reason(error, private)
     if result.status == "unconfirmed":
         return result.status, (
-            "Group create was attempted but not confirmed; no deletion was "
-            "attempted, so check the subscription manually"
+            "Group creation could be neither confirmed nor ruled out; no "
+            "deletion was attempted, so check the subscription manually"
         )
     return result.status, None
 
