@@ -24,7 +24,18 @@ ROOT = Path(__file__).resolve().parents[4]
 WAMR_CI = ROOT / "support/build/wamr-native-ci"
 GOLDEN = WAMR_CI / "authority/goldens/contracts.json"
 SCENARIOS = WAMR_CI / "authority/goldens/python-scenarios.json"
-SCRATCH = WAMR_CI / "tests/.authority-contract-work"
+
+def scratch_root():
+    explicit = os.environ.get("WAMR_AUTHORITY_CONTRACT_SCRATCH")
+    if explicit:
+        return Path(explicit)
+    zig_cache = os.environ.get("ZIG_LOCAL_CACHE_DIR")
+    if zig_cache:
+        return Path(zig_cache) / "authority-contract-work"
+    return Path.home() / ".cache/wamr-authority-contract-work"
+
+
+SCRATCH = scratch_root()
 AUTHORITY_COMMANDS = (
     "prepare-azure-runtime",
     "plan",
