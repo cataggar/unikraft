@@ -843,8 +843,11 @@ establishes the first local tiny-compute observation.
 physical Bison/consumer/dependency/supervision fault fixtures, frozen v1/v2
 result-parser goldens, and the #187 handoff/public-bundle contract golden.
 The handoff library also contains the private retained-copy primitive and
-non-resumable v2 export state skeleton; Python remains the production publisher
-until the later cutover.
+the non-resumable v2 export custody state machine; Python remains the production
+publisher until the later cutover. Export consumes the controller's typed
+accepted-run API and supervised handoff inspection, never a Python replay or
+a second controller acceptance implementation. Native export produces only v2;
+the literal historical v1 layouts remain read-only compatibility.
 `test-controller-limits`, `test-controller-fault-parity`,
 `test-differential-records`, and `test-handoff-contracts` run those suites separately.
 The neutral v1/v2 fixture constructors in `tests/controller_record_fixtures.py`
@@ -884,6 +887,58 @@ use an absolute `--build-file`, fresh private caches and an explicit private
 `-Dtest-root` for `test-pipeline`. Native test/fixture-runner coverage owns the
 controller's six-mode order, records, custody, supervision, reap and poison
 semantics; no Python controller reference decides those outcomes.
+
+### Private export custody
+
+`handoff.export_state.run()` owns the complete attempt and releases its
+descriptors, accepted-run arena and installed cancellation handler on every
+exit. Its phase-token API borrows that same owner: call `deinit()` exactly once,
+including after refusal, and do not use tokens afterwards or deinitialize an
+active owner. Transitions serialize concurrent aliases. Copied tokens cannot
+replay a consumed phase, manufacture a later phase, recover a failed attempt,
+or republish a successful attempt.
+
+Export reserves a fresh owner-private 0700 output outside the runtime.
+An existing directory, file or symlink refuses; it is never adopted or
+overwritten. Selected artifacts, boots and evidence are copied create-only as
+0600 files. Original source files, their ancestors, file inputs, input-tree
+roots, the inspection command record, output files and lock anchors remain
+pinned until the attempt ends. Copies hash both sides, sync files and created
+directories, reopen the created inode and compare custody snapshots including
+gid. Publication barriers revalidate the accepted run, source pins, selected
+source directories, exact output membership, sealed destination directories,
+copied bytes and canonical root-bound manifest.
+
+The manifest is staged and reopened as `private/export/handoff.json` before
+validation. Bounded phase/failure journals and publication intent also stay in
+that private directory, outside the frozen public member table. Cancellation,
+mutation, I/O failure or lost custody irreversibly poison an attempt once
+reservation has started. Partial files and private evidence are retained, not
+automatically removed. A retry needs a new path after operator review; there is
+no resume or retry-in-place.
+
+`bundle.json` is the final create-only durable publication. Known failures
+before publication leave no final bundle. The shared durable publisher
+distinguishes `not_committed`, `publication_unknown`, `visible_not_durable`
+and `durable`: a real post-link sync/cleanup failure may leave a visible file,
+and even a durable commit can fail subsequent custody revalidation. Neither
+case reports export success or permits reuse. Preserve the poisoned evidence;
+never interpret file existence or the staged manifest as acceptance and never
+unlink an ambiguous publication as an unsafe rollback.
+
+`zig build --build-file handoff.build.zig test --summary all` and
+`zig build test-handoff-contracts --summary all` exercise the complete export
+transitions, retained ownership, descriptor cleanup, phase/copy/durability and
+allocation faults, cancellation, swaps/symlinks/hardlinks and binary secret-scan
+boundaries.
+They invoke actual Python `handoff.export()` to compare all 83 selected v2
+members, canonical manifests after local-root rebasing and accepted result
+identity, and check Python reuse/I/O/producer-binding refusals. This complete
+typed fixture is synthetic and nonbootable: controller acceptance and expensive
+supervised build/boot/inspection boundaries are substituted only in tests.
+Real record decoding, typed pinning, copy/hash, filesystem barriers and
+publication execute. The fixture is not live guest/KVM or production controller
+acceptance evidence and does not authorize production cutover or Azure.
 
 ### Historical reproducibility work retained after differential retirement
 

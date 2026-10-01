@@ -350,6 +350,8 @@ pub fn build(b: *std.Build) void {
     }) catch @panic("cannot resolve private handoff test root");
     const handoff_options = b.addOptions();
     handoff_options.addOption([]const u8, "fixture_root", handoff_fixture_root);
+    handoff_options.addOptionPath("python_oracle", b.path("tests/test_handoff_contract_goldens.py"));
+    handoff_options.addOptionPath("accepted_result_fixture", b.path("tests/fixtures/differential/accepted-v2.json"));
     handoff_contracts.root_module.addOptions("test_options", handoff_options);
     const handoff_contracts_run = b.addRunArtifact(handoff_contracts);
     const handoff_python_goldens = b.addSystemCommand(&.{ "python3", "-B" });

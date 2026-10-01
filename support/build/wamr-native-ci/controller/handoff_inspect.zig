@@ -106,6 +106,19 @@ pub fn matchPackage(a: std.mem.Allocator, observed_raw: []const u8, package_raw:
     }
 }
 
+pub const RetainedInspection = struct {
+    allocator: std.mem.Allocator,
+    command: @import("command_validation.zig").ValidatedCommand,
+    record: files.RetainedFile,
+
+    pub fn deinit(self: *RetainedInspection, io: std.Io) void {
+        const path = self.record.path;
+        self.record.close(io);
+        self.allocator.free(path);
+        self.* = undefined;
+    }
+};
+
 pub fn run(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -114,6 +127,19 @@ pub fn run(
     legacy: bool,
     signal: ?*core.process.SignalCancellation,
 ) !@import("command_validation.zig").ValidatedCommand {
+    var inspected = try runRetained(allocator, io, accepted, output, legacy, signal);
+    defer inspected.deinit(io);
+    return inspected.command;
+}
+
+pub fn runRetained(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    accepted: *accepted_run.AcceptedRun,
+    output: []const u8,
+    legacy: bool,
+    signal: ?*core.process.SignalCancellation,
+) !RetainedInspection {
     if (accepted.context != .local_runtime or accepted.repository == null)
         return error.InvalidContext;
     if (legacy != (accepted.compatibility == .tiny_v1_legacy))
@@ -160,12 +186,12 @@ pub fn run(
     try matchPackage(allocator, outcome.stdout, original.bytes());
 
     const record_path = try std.fs.path.join(allocator, &.{ output, if (legacy) "evidence/command-handoff-inspect-legacy.json" else "evidence/command-handoff-inspect.json" });
-    defer allocator.free(record_path);
+    errdefer allocator.free(record_path);
     const record = try physical.readFile(io, record_path, records.max_record_bytes, true);
     const raw = try allocator.alloc(u8, @intCast(record.bytes));
     defer allocator.free(raw);
     var pinned_record = try files.RetainedFile.open(io, record_path, .private);
-    defer pinned_record.close(io);
+    errdefer pinned_record.close(io);
     if (try pinned_record.file.readPositionalAll(io, raw, 0) != raw.len)
         return error.CommandOutputChanged;
     const observed_sha256 = std.fmt.bytesToHex(records.fileIdentity(raw), .lower);
@@ -183,5 +209,5 @@ pub fn run(
     try original_tool.verify(io);
     try original_efi.verify(io);
     try original_package.verify(io);
-    return checked;
+    return .{ .allocator = allocator, .command = checked, .record = pinned_record };
 }

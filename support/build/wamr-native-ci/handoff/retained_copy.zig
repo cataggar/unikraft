@@ -16,7 +16,7 @@ pub const Budget = struct {
     limit: u64 = aggregate_budget,
 
     pub fn reserve(self: *Budget, bytes: u64) !void {
-        if (bytes == 0 or bytes > self.limit or self.used > self.limit - bytes)
+        if (self.limit > aggregate_budget or bytes == 0 or bytes > self.limit or self.used > self.limit - bytes)
             return error.CopyBudgetExceeded;
         self.used += bytes;
     }
@@ -29,11 +29,14 @@ pub const TestFault = enum {
     before_file_sync,
     before_parent_sync,
     mutate_source_after_first_chunk,
+    cancel_after_first_chunk,
+    replace_destination_before_reopen,
 };
 
 pub const Options = struct {
     scan: SensitiveScan = .disabled,
     fault: TestFault = .none,
+    cancel: ?*const std.atomic.Value(bool) = null,
 };
 
 pub const Result = struct {
@@ -75,10 +78,16 @@ pub fn copyRetained(
     budget: ?*Budget,
     options: Options,
 ) !Result {
+    if (options.fault != .none and !builtin.is_test) return error.InvalidFault;
+    try checkCancellation(options.cancel);
     try validateRelative(relative);
     try files.absoluteFilePath(destination_root_path);
+    try validatePrivateDir(destination_root);
+    const root_snapshot = try directorySnapshot(destination_root);
+    try verifyRoot(io, destination_root_path, root_snapshot);
     const before = retained.file_snapshot;
     try validateSource(before, limit);
+    try verifyRetained(io, retained);
     if (budget) |active| try active.reserve(before.size);
 
     const destination_path = try std.fs.path.join(allocator, &.{ destination_root_path, relative });
@@ -99,6 +108,7 @@ pub fn copyRetained(
         var offset: u64 = 0;
         var injected = false;
         while (offset < before.size) {
+            try checkCancellation(options.cancel);
             const want: usize = @intCast(@min(buffer.len, before.size - offset));
             const count = try retained.file.readPositionalAll(io, buffer[0..want], offset);
             if (count == 0) return error.FileChanged;
@@ -112,12 +122,18 @@ pub fn copyRetained(
                 try mutateSourceForTest(io, retained.path);
                 injected = true;
             }
+            if (!injected and options.fault == .cancel_after_first_chunk) {
+                const cancel = options.cancel orelse return error.InvalidFault;
+                @constCast(cancel).store(true, .release);
+                injected = true;
+            }
         }
         if (try retained.file.readPositionalAll(io, buffer[0..1], offset) != 0)
             return error.FileChanged;
         if (!sameCustodySnapshot(before, try files.snapshot(retained.file)))
             return error.FileChanged;
         try retained.verify(io);
+        try verifyRetained(io, retained);
         const source_digest = std.fmt.bytesToHex(hasher.finalResult(), .lower);
         if (options.fault == .before_file_sync) {
             if (!builtin.is_test) return error.InvalidFault;
@@ -129,11 +145,35 @@ pub fn copyRetained(
             return error.AmbiguousWrite;
         }
         try syncDir(io, parent.dir);
+        try checkCancellation(options.cancel);
         const destination_snapshot = try files.snapshot(created.*);
         try validateDestination(destination_snapshot, before.size);
-        const observed = try hashOpened(io, parent.dir, leaf, before.size, limit);
+        if (options.fault == .replace_destination_before_reopen) {
+            try parent.dir.rename(leaf, parent.dir, "replaced-copy", io);
+            const replacement = try parent.dir.createFile(io, leaf, .{
+                .exclusive = true,
+                .read = true,
+                .permissions = .fromMode(0o600),
+            });
+            defer replacement.close(io);
+            var at: u64 = 0;
+            while (at < before.size) {
+                const want: usize = @intCast(@min(buffer.len, before.size - at));
+                if (try created.readPositionalAll(io, buffer[0..want], at) != want) return error.CopyChanged;
+                try replacement.writePositionalAll(io, buffer[0..want], at);
+                at += want;
+            }
+            try replacement.sync(io);
+        }
+        const observed = try hashOpened(io, parent.dir, leaf, destination_snapshot, limit, options.cancel);
         if (!std.mem.eql(u8, &source_digest, &observed))
             return error.CopyChanged;
+        var named = try files.RetainedFile.open(io, destination_path, .private);
+        defer named.close(io);
+        if (!sameCustodySnapshot(destination_snapshot, named.file_snapshot))
+            return error.CopyChanged;
+        try verifyRetained(io, &named);
+        try verifyRoot(io, destination_root_path, root_snapshot);
         return .{
             .path = destination_path,
             .size = before.size,
@@ -193,12 +233,18 @@ fn ensureParent(io: std.Io, root: std.Io.Dir, relative: []const u8) !Parent {
     var close_current = false;
     errdefer if (close_current) current.close(io);
     while (parts.next()) |next| {
+        var created = true;
         current.createDir(io, component, .fromMode(0o700)) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
+            error.PathAlreadyExists => created = false,
             else => return err,
         };
         const child = try current.openDir(io, component, .{ .follow_symlinks = false, .iterate = true });
+        errdefer child.close(io);
         try validatePrivateDir(child);
+        if (created) {
+            try syncDir(io, child);
+            try syncDir(io, current);
+        }
         if (close_current) current.close(io);
         current = child;
         close_current = true;
@@ -214,16 +260,19 @@ fn validatePrivateDir(dir: std.Io.Dir) !void {
         return error.UnsafeDestination;
 }
 
-fn hashOpened(io: std.Io, parent: std.Io.Dir, name: []const u8, size: u64, limit: u64) ![64]u8 {
+fn hashOpened(io: std.Io, parent: std.Io.Dir, name: []const u8, expected: files.Snapshot, limit: u64, cancel: ?*const std.atomic.Value(bool)) ![64]u8 {
+    const size = expected.size;
     if (size == 0 or size > limit) return error.UnsafeDestination;
     const file = try parent.openFile(io, name, .{ .follow_symlinks = false });
     defer file.close(io);
     const snapshot = try files.snapshot(file);
     try validateDestination(snapshot, size);
+    if (!sameCustodySnapshot(expected, snapshot)) return error.CopyChanged;
     var hasher = Sha256.init(.{});
     var buffer: [chunk_size]u8 = undefined;
     var offset: u64 = 0;
     while (offset < size) {
+        try checkCancellation(cancel);
         const count = try file.readPositionalAll(io, buffer[0..@intCast(@min(buffer.len, size - offset))], offset);
         if (count == 0) return error.CopyChanged;
         hasher.update(buffer[0..count]);
@@ -240,25 +289,75 @@ fn syncDir(io: std.Io, dir: std.Io.Dir) !void {
     try (std.Io.File{ .handle = dir.handle, .flags = .{ .nonblocking = false } }).sync(io);
 }
 
-fn sameCustodySnapshot(a: files.Snapshot, b: files.Snapshot) bool {
-    return files.sameSnapshot(a, b) and a.gid == b.gid;
+pub fn sameCustodySnapshot(a: files.Snapshot, b: files.Snapshot) bool {
+    return a.mask.GID and b.mask.GID and files.sameSnapshot(a, b) and a.gid == b.gid;
 }
 
-const Scanner = struct {
+pub fn checkCancellation(cancel: ?*const std.atomic.Value(bool)) !void {
+    if (cancel) |flag| if (flag.load(.acquire)) return error.Cancelled;
+}
+
+pub fn directorySnapshot(dir: std.Io.Dir) !files.Snapshot {
+    return files.snapshot(.{ .handle = dir.handle, .flags = .{ .nonblocking = false } });
+}
+
+pub fn sameDirectory(a: files.Snapshot, b: files.Snapshot) bool {
+    return a.mask.GID and b.mask.GID and a.ino == b.ino and a.dev_major == b.dev_major and a.dev_minor == b.dev_minor and
+        a.mode == b.mode and a.uid == b.uid and a.gid == b.gid;
+}
+
+pub fn verifyRoot(io: std.Io, path: []const u8, expected: files.Snapshot) !void {
+    const named = try files.Directory.open(io, path);
+    defer named.close(io);
+    if (!sameDirectory(expected, try directorySnapshot(named.dir))) return error.UnsafeDestination;
+}
+
+pub fn verifyRetained(io: std.Io, retained: *const files.RetainedFile) !void {
+    try retained.verify(io);
+    if (!sameCustodySnapshot(retained.file_snapshot, try files.snapshot(retained.file)))
+        return error.FileChanged;
+    var named = try files.RetainedFile.open(io, retained.path, retained.policy);
+    defer named.close(io);
+    if (!sameCustodySnapshot(retained.file_snapshot, named.file_snapshot) or
+        retained.directory_count != named.directory_count) return error.FileChanged;
+    for (0..retained.directory_count) |i| {
+        if (!sameDirectory(retained.directory_snapshots[i], try directorySnapshot(retained.directories[i])) or
+            !sameDirectory(retained.directory_snapshots[i], named.directory_snapshots[i]))
+            return error.FileChanged;
+    }
+}
+
+pub fn hashRetained(io: std.Io, retained: *const files.RetainedFile, limit: u64, cancel: ?*const std.atomic.Value(bool)) ![64]u8 {
+    try validateSource(retained.file_snapshot, limit);
+    try verifyRetained(io, retained);
+    var hasher = Sha256.init(.{});
+    var buffer: [chunk_size]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < retained.file_snapshot.size) {
+        try checkCancellation(cancel);
+        const want: usize = @intCast(@min(buffer.len, retained.file_snapshot.size - offset));
+        const count = try retained.file.readPositionalAll(io, buffer[0..want], offset);
+        if (count != want) return error.FileChanged;
+        hasher.update(buffer[0..count]);
+        offset += count;
+    }
+    if (try retained.file.readPositionalAll(io, buffer[0..1], offset) != 0) return error.FileChanged;
+    try verifyRetained(io, retained);
+    return std.fmt.bytesToHex(hasher.finalResult(), .lower);
+}
+
+pub const Scanner = struct {
     tail: [scan_tail]u8 = undefined,
     tail_len: usize = 0,
 
-    fn observe(self: *Scanner, chunk: []const u8) !void {
+    pub fn observe(self: *Scanner, chunk: []const u8) !void {
+        if (chunk.len > chunk_size) return error.InvalidScanChunk;
+        var scan: [scan_tail + chunk_size]u8 = undefined;
+        @memcpy(scan[0..self.tail_len], self.tail[0..self.tail_len]);
+        @memcpy(scan[self.tail_len..][0..chunk.len], chunk);
         for (sensitive_patterns) |pattern| {
-            if (std.mem.indexOf(u8, chunk, pattern) != null)
+            if (std.mem.indexOf(u8, scan[0 .. self.tail_len + chunk.len], pattern) != null)
                 return error.SensitivePattern;
-            const max_overlap = @min(@min(self.tail_len, pattern.len - 1), chunk.len);
-            var overlap: usize = 1;
-            while (overlap <= max_overlap) : (overlap += 1) {
-                if (std.mem.eql(u8, self.tail[self.tail_len - overlap .. self.tail_len], pattern[0..overlap]) and
-                    std.mem.startsWith(u8, chunk, pattern[overlap..]))
-                    return error.SensitivePattern;
-            }
         }
         if (chunk.len >= scan_tail) {
             @memcpy(self.tail[0..], chunk[chunk.len - scan_tail ..]);
