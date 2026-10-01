@@ -41,6 +41,16 @@ fn fixedPath(
         return error.UnexpectedInputPath;
 }
 
+fn buildStartDigest(bytes: []const u8, expected: contracts.Sha256) !void {
+    if (!std.meta.eql(records.fileIdentity(bytes), expected))
+        return error.BuildStartDigestMismatch;
+}
+
+fn bootInputsDigest(bytes: []const u8, expected: contracts.Sha256) !void {
+    if (!std.meta.eql(records.fileIdentity(bytes), expected))
+        return error.BootInputsDigestMismatch;
+}
+
 fn addRole(allowed: *std.StringHashMap(void), role: []const u8) !void {
     if (allowed.contains(role)) return error.DuplicateInputRole;
     try allowed.put(role, {});
@@ -73,6 +83,7 @@ fn exactRoles(allowed: *std.StringHashMap(void), map: std.json.Value) !void {
 fn buildRoles(
     allocator: std.mem.Allocator,
     io: std.Io,
+    repository: []const u8,
     runtime: []const u8,
     start: std.json.Value,
     signal: ?*core.process.SignalCancellation,
@@ -120,7 +131,17 @@ fn buildRoles(
     const zig_root = std.fs.path.dirname(try recordedPath(files_map, "tool:zig")) orelse return error.UnsafePath;
     if (!std.mem.eql(u8, try recordedPath(tree_map, "zig"), zig_root))
         return error.UnexpectedInputPath;
-    _ = try recordedPath(tree_map, "python-stdlib");
+    try notCancelled(signal);
+    const expected_stdlib = try inputs.pythonStdlib(
+        allocator,
+        io,
+        repository,
+        try recordedPath(files_map, "tool:python3"),
+        if (signal) |active| active.flag() else null,
+    );
+    defer allocator.free(expected_stdlib);
+    if (!std.mem.eql(u8, try recordedPath(tree_map, "python-stdlib"), expected_stdlib))
+        return error.UnexpectedInputPath;
 }
 
 fn bootRoles(
@@ -186,6 +207,33 @@ fn recapture(allocator: std.mem.Allocator, io: std.Io, expected: std.json.Value)
 }
 
 pub const Fixture = if (@import("builtin").is_test) struct {
+    pub fn requireBuildStartDigest(bytes: []const u8, expected: contracts.Sha256) !void {
+        try buildStartDigest(bytes, expected);
+    }
+
+    pub fn requireBootInputsDigest(bytes: []const u8, expected: contracts.Sha256) !void {
+        try bootInputsDigest(bytes, expected);
+    }
+
+    pub fn requirePythonStdlibTree(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        repository: []const u8,
+        files_map: std.json.Value,
+        tree_map: std.json.Value,
+    ) !void {
+        const expected_stdlib = try inputs.pythonStdlib(
+            allocator,
+            io,
+            repository,
+            try recordedPath(files_map, "tool:python3"),
+            null,
+        );
+        defer allocator.free(expected_stdlib);
+        if (!std.mem.eql(u8, try recordedPath(tree_map, "python-stdlib"), expected_stdlib))
+            return error.UnexpectedInputPath;
+    }
+
     pub fn recaptureDocument(allocator: std.mem.Allocator, io: std.Io, expected: std.json.Value) !void {
         try recapture(allocator, io, expected);
     }
@@ -210,6 +258,8 @@ pub fn run(
     io: std.Io,
     repository: []const u8,
     runtime: []const u8,
+    expected_build_start_sha256: contracts.Sha256,
+    expected_boot_inputs_sha256: contracts.Sha256,
     signal: ?*core.process.SignalCancellation,
 ) !void {
     try files.absoluteFilePath(repository);
@@ -221,6 +271,7 @@ pub fn run(
     defer pinned_start.close(io);
     var start_bytes = try files.readSensitiveFile(io, allocator, pinned_start.file, records.max_record_bytes, .private);
     defer start_bytes.deinit();
+    try buildStartDigest(start_bytes.bytes(), expected_build_start_sha256);
     var start_doc = try contracts.Document.parse(allocator, start_bytes.bytes(), .{
         .bytes = records.max_record_bytes,
         .depth = 32,
@@ -239,6 +290,7 @@ pub fn run(
     defer pinned_boot.close(io);
     var boot_bytes = try files.readSensitiveFile(io, allocator, pinned_boot.file, records.max_record_bytes, .private);
     defer boot_bytes.deinit();
+    try bootInputsDigest(boot_bytes.bytes(), expected_boot_inputs_sha256);
     var boot_doc = try contracts.Document.parse(allocator, boot_bytes.bytes(), .{
         .bytes = records.max_record_bytes,
         .depth = 32,
@@ -257,7 +309,7 @@ pub fn run(
     const before = try source.source(allocator, io, repository, git_path);
     try sameValue(allocator, try get(start, "source"), .{ .revision = before.revision, .tree = before.tree });
     try sameValue(allocator, try get(start, "source_custody"), before.custody);
-    try buildRoles(allocator, io, runtime, start, signal);
+    try buildRoles(allocator, io, repository, runtime, start, signal);
     try bootRoles(allocator, io, repository, runtime, boot, signal);
     try notCancelled(signal);
     try recapture(allocator, io, consumer);

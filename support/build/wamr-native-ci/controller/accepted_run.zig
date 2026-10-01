@@ -606,6 +606,8 @@ fn revalidateLocalPythonWithSignal(self: *AcceptedRun, signal: *core.process.Sig
         self.io,
         self.repository orelse return error.InvalidContext,
         self.root,
+        try contracts.parseSha256(try text(result.records.get("build-start.json") orelse return error.MissingRecord)),
+        try contracts.parseSha256(try text(result.records.get("boot-inputs.json") orelse return error.MissingRecord)),
         signal,
     );
     try validateCommands(self, false, true);

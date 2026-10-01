@@ -1375,6 +1375,20 @@ test "local consumer custody recaptures exact files trees and ancestry" {
     var parsed = try std.json.parseFromSlice(std.json.Value, a, encoded, .{ .parse_numbers = false });
     defer parsed.deinit();
     try controller.local_consumer_custody.Fixture.recaptureDocument(a, io, parsed.value);
+    const digest_hex = std.fmt.bytesToHex(controller.records.fileIdentity(encoded), .lower);
+    const digest = try core.contracts.parseSha256(&digest_hex);
+    try controller.local_consumer_custody.Fixture.requireBuildStartDigest(encoded, digest);
+    try controller.local_consumer_custody.Fixture.requireBootInputsDigest(encoded, digest);
+    var other_digest = digest;
+    other_digest[0] ^= 1;
+    try std.testing.expectError(
+        error.BuildStartDigestMismatch,
+        controller.local_consumer_custody.Fixture.requireBuildStartDigest(encoded, other_digest),
+    );
+    try std.testing.expectError(
+        error.BootInputsDigestMismatch,
+        controller.local_consumer_custody.Fixture.requireBootInputsDigest(encoded, other_digest),
+    );
 
     var allowed: std.StringHashMap(void) = .init(a);
     defer allowed.deinit();
@@ -1401,6 +1415,32 @@ test "local consumer custody recaptures exact files trees and ancestry" {
     try std.testing.expectError(
         error.RecordedCustodyChanged,
         controller.local_consumer_custody.Fixture.recaptureDocument(a, io, parsed.value),
+    );
+}
+
+test "local consumer custody rejects non-stdlib python tree path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const python = try std.Io.Dir.realPathFileAbsoluteAlloc(io, options.python_executable, a);
+    var files_map = std.json.Value{ .object = .empty };
+    var python_record = std.json.Value{ .object = .empty };
+    try python_record.object.put(a, "path", .{ .string = python });
+    try files_map.object.put(a, "tool:python3", python_record);
+    var tree_map = std.json.Value{ .object = .empty };
+    var stdlib_record = std.json.Value{ .object = .empty };
+    try stdlib_record.object.put(a, "path", .{ .string = "/not-the-recorded-python-stdlib" });
+    try tree_map.object.put(a, "python-stdlib", stdlib_record);
+    try std.testing.expectError(
+        error.UnexpectedInputPath,
+        controller.local_consumer_custody.Fixture.requirePythonStdlibTree(
+            a,
+            io,
+            options.repository_root,
+            files_map,
+            tree_map,
+        ),
     );
 }
 
@@ -1449,9 +1489,21 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
     const imported_records = try cli.parse(&.{ "uk-wamr-native-ci", "records", "--stage-root", "/stage", "--transport", "trusted-inner-zip", "--output", "handoff-v1" });
     try std.testing.expectEqual(cli.Action.records, imported_records.action);
     try std.testing.expectEqualStrings("/stage", imported_records.stage_root.?);
-    const local_custody = try cli.parse(&.{ "uk-wamr-native-ci", "local-consumer-custody", "--runtime", "/runtime" });
+    const empty_digest = std.fmt.bytesToHex(controller.records.fileIdentity("{}\n"), .lower);
+    const local_custody = try cli.parse(&.{
+        "uk-wamr-native-ci",             "local-consumer-custody", "--runtime",                     "/runtime",
+        "--expected-build-start-sha256", &empty_digest,            "--expected-boot-inputs-sha256", &empty_digest,
+    });
     try std.testing.expectEqual(cli.Action.@"local-consumer-custody", local_custody.action);
     try std.testing.expectEqualStrings("/runtime", local_custody.runtime.?);
+    try std.testing.expectEqualDeep(
+        try core.contracts.parseSha256(&empty_digest),
+        local_custody.expected_build_start_sha256.?,
+    );
+    try std.testing.expectEqualDeep(
+        try core.contracts.parseSha256(&empty_digest),
+        local_custody.expected_boot_inputs_sha256.?,
+    );
     const inspection = try cli.parse(&.{ "uk-wamr-native-ci", "handoff-inspect", "--output", "/private/inspection", "--runtime", "/runtime" });
     try std.testing.expectEqual(cli.Action.@"handoff-inspect", inspection.action);
     try std.testing.expectEqualStrings("/runtime", inspection.runtime.?);
@@ -1490,7 +1542,12 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
         &.{ "uk-wamr-native-ci", "public-validator-build", "--output", "/private/validator", "--runtime", "/runtime", "--profile", "tiny" },
         &.{ "uk-wamr-native-ci", "public-validator-build", "--stage-root", "/stage", "--output", "/private/validator" },
         &.{ "uk-wamr-native-ci", "import-validator-build", "--stage-root", "/stage" },
+        &.{ "uk-wamr-native-ci", "local-consumer-custody", "--runtime", "/runtime" },
         &.{ "uk-wamr-native-ci", "local-consumer-custody", "--stage-root", "/stage" },
+        &.{
+            "uk-wamr-native-ci",             "local-consumer-custody", "--runtime",                     "/runtime",
+            "--expected-build-start-sha256", "bad",                    "--expected-boot-inputs-sha256", &empty_digest,
+        },
         &.{ "uk-wamr-native-ci", "local-consumer-custody", "--runtime", "/runtime", "--output", "/result" },
         &.{ "uk-wamr-native-ci", "local-consumer-custody", "--runtime", "/runtime/../other" },
         &.{ "uk-wamr-native-ci", "import-validator-build", "--runtime", "/runtime", "--output", "/private/validator" },

@@ -69,6 +69,8 @@ pub fn main(init: std.process.Init) void {
             init.io,
             repository,
             command.runtime.?,
+            command.expected_build_start_sha256.?,
+            command.expected_boot_inputs_sha256.?,
             &signal,
         ) catch |err| failed(init.io, @tagName(command.action), "", err);
         return;
@@ -244,7 +246,7 @@ fn usage(io: std.Io) noreturn {
             "       uk-wamr-native-ci supervisor-source-closure --git /usr/bin/git --output sha256-v1\n" ++
             "       uk-wamr-native-ci records --runtime ABS --output handoff-v1\n" ++
             "       uk-wamr-native-ci records --stage-root ABS --transport trusted-inner-zip --output handoff-v1\n" ++
-            "       uk-wamr-native-ci local-consumer-custody --runtime ABS\n" ++
+            "       uk-wamr-native-ci local-consumer-custody --runtime ABS --expected-build-start-sha256 HEX --expected-boot-inputs-sha256 HEX\n" ++
             "       uk-wamr-native-ci handoff-inspect --runtime ABS --output ABS\n" ++
             "       uk-wamr-native-ci handoff-inspect-legacy --runtime ABS --output ABS\n" ++
             "       uk-wamr-native-ci public-validator-build --runtime ABS --output ABS\n" ++

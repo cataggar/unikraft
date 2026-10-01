@@ -630,9 +630,26 @@ def ci_context(handoff, start):
                         wamr_revision=ci.REVISION))
 
 
-def native_public_build_custody(handoff, runtime, stage):
+class VerifiedPublicBuildStart:
+    def __init__(self, start, build_start_sha256, boot_inputs_sha256):
+        self.start = start
+        self.build_start_sha256 = build_start_sha256
+        self.boot_inputs_sha256 = boot_inputs_sha256
+
+
+def public_build_start_proof(ci, runtime):
+    raw = ci.read(runtime / "compute/evidence/build-start.json", MAX_JSON)
+    start = json.loads(raw, object_pairs_hook=ci.unique)
+    boot_inputs = ci.read(runtime / "compute/evidence/boot-inputs.json", MAX_JSON)
+    return VerifiedPublicBuildStart(
+        start, hashlib.sha256(raw).hexdigest(),
+        hashlib.sha256(boot_inputs).hexdigest())
+
+
+def native_public_build_custody(handoff, runtime, custody, stage):
     handoff.FAILURE_STAGE = stage
-    accepted_records.local_consumer_custody(runtime)
+    accepted_records.local_consumer_custody(
+        runtime, custody.build_start_sha256, custody.boot_inputs_sha256)
 
 
 def consumer_file_path(start, role):
@@ -667,10 +684,11 @@ def verify_public_build_side_checks(handoff, runtime, start, source, stage_prefi
 
 def accepted_public_build_start(handoff, runtime):
     ci = handoff.ci
+    custody = public_build_start_proof(ci, runtime)
     native_public_build_custody(
-        handoff, runtime, "public-build-start-native-custody")
+        handoff, runtime, custody, "public-build-start-native-custody")
     handoff.FAILURE_STAGE = "public-build-start-shape"
-    start = ci.document(runtime / "compute/evidence/build-start.json")
+    start = custody.start
     require(set(start) == {
         "source", "source_custody", "tools", "bison_data",
         "dependencies", "consumer_inputs", "command_supervisor",
@@ -690,7 +708,7 @@ def accepted_public_build_start(handoff, runtime):
     handoff.FAILURE_STAGE = "public-build-start-command-bind"
     ci.COMMAND_ENVIRONMENT.update(
         ci.bind_command_tools(start["consumer_inputs"]))
-    return start
+    return custody
 
 
 def members(handoff, bundle, root=None):
@@ -1701,7 +1719,8 @@ def publish_ci(handoff):
     runtime = ci_runtime(handoff.ci)
     handoff.FAILURE_STAGE = "public-result-records"
     handoff.result_records(runtime / "compute")
-    start = accepted_public_build_start(handoff, runtime)
+    build_start = accepted_public_build_start(handoff, runtime)
+    start = build_start.start
     handoff.FAILURE_STAGE = "public-context-entry"
     source = ci_context(handoff, start)
     publication = runtime / "compute/public-source"
@@ -1746,7 +1765,8 @@ def publish_ci(handoff):
             handoff.ci, recorded, "public-validator-build",
             role_identities, "producer_direct")
         native_public_build_custody(
-            handoff, runtime, "public-validator-build-native-custody")
+            handoff, runtime, build_start,
+            "public-validator-build-native-custody")
         verify_public_build_side_checks(
             handoff, runtime, start, source, "public-validator-build")
         require(ci_context(handoff, start) == source)
