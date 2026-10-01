@@ -987,6 +987,7 @@ class TopologyRun:
         data = storage.get("dataDisks")
         nics = (vm.get("networkProfile") or {}).get("networkInterfaces")
         if (require_uuid(vm.get("vmId")) != proof["uuid"]
+                or vm.get("identity") is not None
                 or (vm.get("hardwareProfile") or {}).get("vmSize") != "Standard_D2s_v5"
                 or storage.get("diskControllerType") != "SCSI"
                 or not self.valid_os_attachment(storage.get("osDisk"), proof)
@@ -995,7 +996,7 @@ class TopologyRun:
                 != {0, 7}
                 or any(not self.valid_data_attachment(entry, proof) for entry in data)
                 or not isinstance(nics, list) or len(nics) != 1
-                or not self.valid_nic_attachment(nics[0])
+                or not self.valid_nic_attachment(nics[0], rest=False)
                 or (vm.get("securityProfile") is not None
                     and (not isinstance(vm["securityProfile"], dict)
                          or vm["securityProfile"].get("securityType") != "Standard"))):
@@ -1032,14 +1033,19 @@ class TopologyRun:
             and disk.get("deleteOption") == "Detach"
         )
 
-    def valid_nic_attachment(self, nic):
+    def valid_nic_attachment(self, nic, *, rest):
+        # Pinned REST reads nest NIC options; Azure CLI 2.90 `vm show` flattens them.
+        if not isinstance(nic, dict):
+            return False
+        options = nic.get("properties") if rest else nic
         return (
-            isinstance(nic, dict)
+            set(nic) <= ({"id", "properties", "resourceGroup"} if rest
+                         else {"id", "primary", "deleteOption", "resourceGroup"})
             and str(nic.get("id", "")).lower()
             == resource_id(self.state, "nic").lower()
-            and isinstance(nic.get("properties"), dict)
-            and nic["properties"].get("primary") is True
-            and nic["properties"].get("deleteOption") == "Delete"
+            and isinstance(options, dict)
+            and options.get("primary") is True
+            and options.get("deleteOption") == "Delete"
         )
 
     def verify_vm_security(self, proof, *, cleanup=False):
@@ -1062,6 +1068,7 @@ class TopologyRun:
         security = properties.get("securityProfile")
         if (
             require_uuid(properties.get("vmId")) != proof["uuid"]
+            or resource.get("identity") is not None
             or properties.get("provisioningState") != "Succeeded"
             or not isinstance(hardware, dict)
             or hardware.get("vmSize") != "Standard_D2s_v5"
@@ -1074,7 +1081,7 @@ class TopologyRun:
             or any(not self.valid_data_attachment(entry, proof) for entry in data)
             or not isinstance(interfaces, list)
             or len(interfaces) != 1
-            or not self.valid_nic_attachment(interfaces[0])
+            or not self.valid_nic_attachment(interfaces[0], rest=True)
             or not isinstance(security, dict)
             or not set(security).issubset({
                 "securityType", "encryptionAtHost", "encryptionIdentity",

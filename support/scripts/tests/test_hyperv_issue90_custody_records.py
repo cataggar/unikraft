@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+import uuid
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -109,7 +110,9 @@ class Fixture:
                     }),
                 })
         self.network = {role: self.put(self.resource(role)) for role in ("nic", "vnet", "nsg")}
+        self.dummy_child = self.put(self.vm("dummy", deallocated=False))
         self.dummy_vm = self.put(self.vm("dummy"))
+        self.final_child = self.put(self.vm("os", deallocated=False))
         self.final_vm = self.put(self.vm("os"))
         self.prepared_dummy = self.put({
             **self.resource("dummy"), "managedBy": ids["vm"],
@@ -137,7 +140,7 @@ class Fixture:
             "seed_sha256": self.expected.seed_sha256,
             "template_sha256": self.expected.template_sha256,
             "direct_receipts": self.direct,
-            "children": {"vm": self.dummy_vm, **self.network},
+            "children": {"vm": self.dummy_child, **self.network},
             "inventory": self.inventory,
             "dummy_vm": self.dummy_vm,
             "dummy_disk": self.prepared_dummy,
@@ -152,16 +155,14 @@ class Fixture:
                 "challenge": "d" * 32,
                 "expires_at_utc": "2026-09-29T04:31:00Z",
                 "final_envelope_sha256": self.expected.final_envelope_sha256,
-                "deallocation": self.put({
-                    "id": ids["vm"], "vmId": self.uuids["vm"], "status": "Succeeded",
-                }),
-                "swap": self.final_vm,
+                "deallocation": self.put(self.instance_view()),
+                "swap": self.final_child,
                 "swap_tracking": None,
-                "swap_settlement": self.final_vm,
+                "swap_settlement": self.final_child,
                 "vm": self.final_vm, "dummy": self.dummy, "os": self.os,
                 "data_disks": self.data_disks,
                 "inventory": self.inventory,
-                "children": {"vm": self.final_vm, **self.network},
+                "children": {"vm": self.final_child, **self.network},
                 "no_prior_acceptance_boot": True, "exclusive_no_writer": True,
                 "running_seconds": 10,
             },
@@ -227,7 +228,12 @@ class Fixture:
                     "operationId": {"type": "String", "value": self.expected.operation_id},
                 },
                 "outputResources": [
-                    {"id": self.ids[child]} for child in custody.CHILDREN
+                    {"apiVersion": None, "extension": None,
+                     "id": self.ids[child], "identifiers": None,
+                     "resourceGroup": self.ids["group"].split("/")[4],
+                     "resourceType": "/".join(
+                         self.ids[child].split("/providers/")[1].split("/")[:2])}
+                    for child in custody.CHILDREN
                 ],
                 "outputs": {
                     **{name: {"value": self.ids[target]} for name, target in {
@@ -271,6 +277,13 @@ class Fixture:
                     "destinationPortRange": "*",
                     "sourceAddressPrefix": "*",
                     "destinationAddressPrefix": "*",
+                    "id": self.ids["nsg"] + f"/securityRules/DenyAll{direction}",
+                    "etag": 'W/"synthetic"',
+                    "type": "Microsoft.Network/networkSecurityGroups/securityRules",
+                    "provisioningState": "Succeeded",
+                    "resourceGroup": self.ids["group"].split("/")[4],
+                    "sourcePortRanges": [], "destinationPortRanges": [],
+                    "sourceAddressPrefixes": [], "destinationAddressPrefixes": [],
                 }
                 for direction, priority in (("Inbound", 4095), ("Outbound", 4096))
             ]
@@ -278,15 +291,17 @@ class Fixture:
             result["vmId"] = self.uuids["vm"]
         return result
 
-    def vm(self, os_role):
+    def vm(self, os_role, *, deallocated=True):
+        # Azure CLI 2.90 `vm show` flattens NIC options; `vm show -d` adds powerState.
         result = self.resource("vm")
+        if deallocated:
+            result["powerState"] = "VM deallocated"
         result.update({
-            "powerState": "deallocated",
             "hardwareProfile": {"vmSize": "Standard_D2s_v5"},
             "securityProfile": {"securityType": "Standard"},
             "networkProfile": {"networkInterfaces": [{
-                "id": self.ids["nic"],
-                "properties": {"primary": True, "deleteOption": "Delete"},
+                "id": self.ids["nic"], "primary": True, "deleteOption": "Delete",
+                "resourceGroup": self.ids["group"].split("/")[4],
             }]},
             "storageProfile": {
                 "diskControllerType": "SCSI",
@@ -298,6 +313,27 @@ class Fixture:
             },
         })
         return result
+
+    def instance_view(self, codes=("ProvisioningState/succeeded",
+                                   "PowerState/deallocated")):
+        return {
+            **self.vm("dummy", deallocated=False),
+            "instanceView": {"statuses": [
+                {"code": code, "level": "Info"} for code in codes
+            ]},
+        }
+
+    @staticmethod
+    def rest_vm(vm):
+        nic = vm["networkProfile"]["networkInterfaces"][0]
+        properties = {key: value for key, value in vm.items()
+                      if key not in ("id", "tags", "powerState")}
+        properties["networkProfile"] = {"networkInterfaces": [{
+            "id": nic["id"], "resourceGroup": nic["resourceGroup"],
+            "properties": {"primary": nic["primary"],
+                           "deleteOption": nic["deleteOption"]},
+        }]}
+        return {"id": vm["id"], "tags": vm["tags"], "properties": properties}
 
     def tracking(self, original):
         operation = {
@@ -742,17 +778,74 @@ class CustodyRecordsTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "run tags"):
                     self.handoff()
 
-    def test_deallocation_outcome_cannot_contradict_vm_run_tags(self):
-        outcome = {
-            "id": self.fixture.ids["vm"],
-            "vmId": self.fixture.uuids["vm"],
-            "status": "Succeeded",
-            "tags": {"issue90-run": "foreign",
-                     "issue90-operation": self.fixture.expected.operation_id},
-        }
-        self.fixture.handoff["evidence"]["deallocation"] = self.fixture.put(outcome)
-        with self.assertRaisesRegex(ValueError, "Deallocation outcome.*run tags"):
-            self.handoff(handoff=self.fixture.sign(self.fixture.handoff))
+    def test_deallocation_instance_view_requires_vm_run_tags(self):
+        for missing in (False, True):
+            with self.subTest(missing=missing):
+                self.fixture = Fixture()
+                outcome = self.fixture.instance_view()
+                if missing:
+                    del outcome["tags"]
+                else:
+                    outcome["tags"]["issue90-run"] = "foreign"
+                self.fixture.handoff["evidence"]["deallocation"] = self.fixture.put(outcome)
+                with self.assertRaisesRegex(ValueError,
+                                            "Deallocation instance view.*run tags"):
+                    self.handoff(handoff=self.fixture.sign(self.fixture.handoff))
+
+    def test_deallocation_requires_captured_instance_view_power_state(self):
+        for codes in (
+            (),
+            ("ProvisioningState/succeeded",),
+            ("PowerState/deallocated",),
+            ("ProvisioningState/succeeded", "PowerState/running"),
+            ("ProvisioningState/succeeded", "PowerState/deallocating"),
+            ("ProvisioningState/succeeded", "PowerState/deallocated",
+             "PowerState/running"),
+            ("ProvisioningState/failed", "PowerState/deallocated"),
+            ("ProvisioningState/succeeded", "PowerState/deallocated",
+             "OSState/generalized"),
+        ):
+            with self.subTest(codes=codes):
+                self.fixture = Fixture()
+                self.fixture.handoff["evidence"]["deallocation"] = self.fixture.put(
+                    self.fixture.instance_view(codes)
+                )
+                with self.assertRaisesRegex(ValueError, "Deallocation and original OS swap"):
+                    self.handoff(handoff=self.fixture.sign(self.fixture.handoff))
+        for outcome in (
+            {"id": self.fixture.ids["vm"], "vmId": self.fixture.uuids["vm"],
+             "status": "Succeeded"},
+            {**self.fixture.instance_view(), "instanceView": {"statuses": [
+                "PowerState/deallocated", "ProvisioningState/succeeded"]}},
+            {**self.fixture.instance_view(), "vmId": self.fixture.uuids["os"]},
+        ):
+            with self.subTest(outcome=sorted(outcome)):
+                self.fixture = Fixture()
+                self.fixture.handoff["evidence"]["deallocation"] = self.fixture.put(outcome)
+                with self.assertRaisesRegex(ValueError, "Deallocation and original OS swap"):
+                    self.handoff(handoff=self.fixture.sign(self.fixture.handoff))
+        self.fixture = Fixture()
+        self.fixture.handoff["evidence"]["deallocation"] = self.fixture.put(
+            self.fixture.instance_view(("PowerState/deallocated",
+                                        "ProvisioningState/succeeded"))
+        )
+        raw = self.fixture.sign(self.fixture.handoff)
+        self.assertEqual(self.handoff(handoff=raw), self.fixture.sha(raw))
+
+    def test_observed_power_state_uses_cli_show_details_text(self):
+        for stage, field in (("prepared", "dummy_vm"), ("handoff", "vm")):
+            for power in ("deallocated", "VM running", "VM stopped", None):
+                with self.subTest(stage=stage, power=power):
+                    self.fixture = Fixture()
+                    vm = self.fixture.vm("dummy" if stage == "prepared" else "os")
+                    if power is None:
+                        del vm["powerState"]
+                    else:
+                        vm["powerState"] = power
+                    getattr(self.fixture, stage)["evidence"][field] = self.fixture.put(vm)
+                    self.fixture.resign_prepared()
+                    with self.assertRaisesRegex(ValueError, "observed deallocated"):
+                        self.handoff()
 
     def test_lost_original_swap_or_deallocation_response_refuses_handoff(self):
         for field in ("swap", "deallocation"):
@@ -892,7 +985,8 @@ class CustodyRecordsTests(unittest.TestCase):
             ("handoff", "swap", "os"),
             ("handoff", "vm", "os"),
         ):
-            for attachment in ("foreign", "missing", "extra", "wrong-primary"):
+            for attachment in ("foreign", "missing", "extra", "wrong-primary",
+                               "wrong-delete", "nested-in-cli", "unknown-field"):
                 with self.subTest(stage=stage, field=field, attachment=attachment):
                     self.fixture = Fixture()
                     vm = self.fixture.vm(os_role)
@@ -903,8 +997,17 @@ class CustodyRecordsTests(unittest.TestCase):
                         nics.clear()
                     elif attachment == "extra":
                         nics.append({"id": self.fixture.ids["nic"] + "-public"})
+                    elif attachment == "wrong-primary":
+                        nics[0]["primary"] = False
+                    elif attachment == "wrong-delete":
+                        nics[0]["deleteOption"] = "Detach"
+                    elif attachment == "nested-in-cli":
+                        nics[0]["properties"] = {
+                            "primary": nics[0].pop("primary"),
+                            "deleteOption": nics[0].pop("deleteOption"),
+                        }
                     else:
-                        nics[0]["properties"]["primary"] = False
+                        nics[0]["networkSecurityGroup"] = {"id": "foreign"}
                     ref = self.fixture.put(vm)
                     if field == "children":
                         getattr(self.fixture, stage)["evidence"]["children"]["vm"] = ref
@@ -913,6 +1016,105 @@ class CustodyRecordsTests(unittest.TestCase):
                     self.fixture.resign_prepared()
                     with self.assertRaisesRegex(ValueError, "private NIC attachment"):
                         self.handoff()
+
+    def test_vm_observations_reject_managed_identities(self):
+        # Observed tenant policy can add identities that guest IMDS requests could use.
+        identities = (
+            {"type": "SystemAssigned", "principalId": str(uuid.uuid4()),
+             "tenantId": str(uuid.uuid4())},
+            {"type": "SystemAssigned, UserAssigned", "principalId": str(uuid.uuid4()),
+             "tenantId": str(uuid.uuid4()), "userAssignedIdentities": {
+                 "/subscriptions/x/resourceGroups/y/providers/"
+                 "Microsoft.ManagedIdentity/userAssignedIdentities/z": {}}},
+        )
+        for stage, field, os_role in (
+            ("prepared", "children", "dummy"),
+            ("prepared", "dummy_vm", "dummy"),
+            ("handoff", "children", "os"),
+            ("handoff", "swap", "os"),
+            ("handoff", "vm", "os"),
+        ):
+            with self.subTest(stage=stage, field=field):
+                self.fixture = Fixture()
+                vm = self.fixture.vm(os_role)
+                vm["identity"] = identities[0]
+                ref = self.fixture.put(vm)
+                if field == "children":
+                    getattr(self.fixture, stage)["evidence"]["children"]["vm"] = ref
+                else:
+                    getattr(self.fixture, stage)["evidence"][field] = ref
+                self.fixture.resign_prepared()
+                with self.assertRaisesRegex(ValueError, "managed identity"):
+                    self.handoff()
+        # Real user-assigned identity keys are resource IDs beyond the parser key limit.
+        for identity, reason in zip(identities, ("Deallocation and original OS swap",
+                                                 "Custody JSON key exceeds limit")):
+            with self.subTest(deallocation=identity["type"]):
+                self.fixture = Fixture()
+                view = self.fixture.instance_view()
+                view["identity"] = identity
+                self.fixture.handoff["evidence"]["deallocation"] = self.fixture.put(view)
+                with self.assertRaisesRegex(ValueError, reason):
+                    self.handoff(handoff=self.fixture.sign(self.fixture.handoff))
+
+    def test_rest_vm_observation_requires_nested_nic_options(self):
+        rest = Fixture.rest_vm(self.fixture.vm("os", deallocated=False))
+        self.fixture.handoff["evidence"]["children"]["vm"] = self.fixture.put(rest)
+        raw = self.fixture.sign(self.fixture.handoff)
+        self.assertEqual(self.handoff(handoff=raw), self.fixture.sha(raw))
+        self.fixture = Fixture()
+        rest = Fixture.rest_vm(self.fixture.vm("os", deallocated=False))
+        nic = rest["properties"]["networkProfile"]["networkInterfaces"][0]
+        nic.update(nic.pop("properties"))
+        self.fixture.handoff["evidence"]["children"]["vm"] = self.fixture.put(rest)
+        with self.assertRaisesRegex(ValueError, "private NIC attachment"):
+            self.handoff(handoff=self.fixture.sign(self.fixture.handoff))
+
+    def test_cli_output_resources_allow_only_exact_read_only_fields(self):
+        bare = self.fixture.resource("deployment")
+        for item in bare["properties"]["outputResources"]:
+            for key in ("apiVersion", "extension", "identifiers",
+                        "resourceGroup", "resourceType"):
+                del item[key]
+        self.fixture.direct["deployment"]["create"] = self.fixture.put(bare)
+        self.fixture.direct["deployment"]["terminal"] = self.fixture.put(bare)
+        self.fixture.resign_prepared()
+        self.assertEqual(self.handoff(), self.fixture.sha(self.fixture.handoff_raw))
+        for field, value in (
+            ("apiVersion", "2025-11-01"), ("extension", {"name": "x"}),
+            ("identifiers", [{"name": "vm"}]), ("resourceGroup", "other-rg"),
+            ("resourceType", "Microsoft.Compute/disks"), ("symbolicName", "vm"),
+        ):
+            with self.subTest(field=field):
+                self.fixture = Fixture()
+                deployment = self.fixture.resource("deployment")
+                deployment["properties"]["outputResources"][0][field] = value
+                self.fixture.direct["deployment"]["create"] = self.fixture.put(deployment)
+                self.fixture.direct["deployment"]["terminal"] = self.fixture.put(deployment)
+                self.fixture.resign_prepared()
+                with self.assertRaisesRegex(ValueError, "output inventory"):
+                    self.handoff()
+
+    def test_cli_nsg_rule_read_only_fields_cannot_widen_rules(self):
+        for field, value in (
+            ("sourceAddressPrefixes", ["Internet"]),
+            ("destinationAddressPrefixes", ["AzurePlatformDNS"]),
+            ("sourcePortRanges", ["1-65535"]),
+            ("destinationPortRanges", ["443"]),
+            ("provisioningState", "Updating"),
+            ("type", "Microsoft.Network/networkSecurityGroups/defaultSecurityRules"),
+            ("id", "/foreign/securityRules/DenyAllInbound"),
+            ("etag", 1),
+            ("sourceApplicationSecurityGroups", [{"id": "asg"}]),
+            ("description", "allow"),
+        ):
+            with self.subTest(field=field):
+                self.fixture = Fixture()
+                nsg = self.fixture.resource("nsg")
+                nsg["securityRules"][0][field] = value
+                self.fixture.handoff["evidence"]["children"]["nsg"] = self.fixture.put(nsg)
+                with self.assertRaisesRegex(ValueError, "exact inbound/outbound"):
+                    self.handoff(handoff=self.fixture.sign(self.fixture.handoff))
 
     def test_no_in_memory_or_absent_registry_can_claim_success(self):
         for registry in (None, {}, object()):

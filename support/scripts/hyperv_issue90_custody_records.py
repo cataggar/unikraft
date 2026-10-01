@@ -47,6 +47,16 @@ NSG_DENY_RULES = (
     _deny_rule("Inbound", 4095),
     _deny_rule("Outbound", 4096),
 )
+# Azure CLI 2.90 `network nsg show` adds these read-only fields to each rule.
+NSG_RULE_EXTRAS = (
+    "id", "etag", "type", "provisioningState", "resourceGroup",
+    "sourcePortRanges", "destinationPortRanges",
+    "sourceAddressPrefixes", "destinationAddressPrefixes",
+)
+# Azure CLI 2.90 deployment outputResources items.
+OUTPUT_RESOURCE_FIELDS = (
+    "id", "apiVersion", "extension", "identifiers", "resourceGroup", "resourceType",
+)
 MAX_RECORD = 64 * 1024
 MAX_ARCHIVE = 64 * 1024
 MAX_TOTAL_ARCHIVE = 512 * 1024
@@ -410,8 +420,8 @@ def _children(observations, expected, archive, vm_uuid, os_role):
     nsg = resources["nsg"]
     rules = nsg.get("securityRules")
     if (not isinstance(rules, list) or len(rules) != len(NSG_DENY_RULES)
-            or any(rule not in NSG_DENY_RULES for rule in rules)
-            or rules[0] == rules[1]):
+            or any(not _nsg_rule(rule, expected) for rule in rules)
+            or rules[0]["name"] == rules[1]["name"]):
         raise ValueError("Deployment NSG lacks the exact inbound/outbound wildcard Deny pair")
     configs = nic.get("ipConfigurations")
     subnets = vnet.get("subnets")
@@ -439,6 +449,46 @@ def _children(observations, expected, archive, vm_uuid, os_role):
         raise ValueError("Deployment children do not have the approved private network")
 
 
+def _nsg_rule(rule, expected):
+    if not isinstance(rule, dict) or not set(rule) <= set(NSG_DENY_RULES[0]) | set(NSG_RULE_EXTRAS):
+        return False
+    core = {key: rule.get(key) for key in NSG_DENY_RULES[0]}
+    return (core in NSG_DENY_RULES
+            and all(rule.get(key, []) == [] for key in (
+                "sourcePortRanges", "destinationPortRanges",
+                "sourceAddressPrefixes", "destinationAddressPrefixes"))
+            and rule.get("provisioningState", "Succeeded") == "Succeeded"
+            and rule.get("type", "Microsoft.Network/networkSecurityGroups/securityRules")
+            == "Microsoft.Network/networkSecurityGroups/securityRules"
+            and rule.get("id", expected.resource_ids["nsg"] + "/securityRules/"
+                         + rule["name"])
+            == expected.resource_ids["nsg"] + "/securityRules/" + rule["name"]
+            and all(isinstance(rule.get(key, ""), str)
+                    for key in ("etag", "resourceGroup")))
+
+
+def _resource_group(resource_id):
+    parts = resource_id.split("/")
+    return parts[4] if len(parts) > 4 and parts[3].lower() == "resourcegroups" else None
+
+
+def _resource_type(resource_id):
+    provider = resource_id.split("/providers/", 1)[-1].split("/")
+    return "/".join(provider[:2]) if len(provider) == 3 else None
+
+
+def _output_resource(item):
+    return (isinstance(item, dict) and "id" in item
+            and set(item) <= set(OUTPUT_RESOURCE_FIELDS)
+            and isinstance(item["id"], str)
+            and all(item.get(key) is None
+                    for key in ("apiVersion", "extension", "identifiers"))
+            and item.get("resourceGroup", _resource_group(item["id"]))
+            == _resource_group(item["id"])
+            and item.get("resourceType", _resource_type(item["id"]))
+            == _resource_type(item["id"]))
+
+
 def _inventory(ref, expected, archive, identities, vm_uuid):
     value = _exact(archive.read(ref, "Complete inventory"), ("resources",), "Inventory")
     items = value["resources"]
@@ -459,10 +509,13 @@ def _vm_attachment(value, expected, vm_uuid, os_role):
     if not isinstance(value, dict) or value.get("id") != expected.resource_ids["vm"]:
         raise ValueError("VM observation has wrong identity")
     _run_tags(value, expected, "VM observation")
+    if value.get("identity") is not None:
+        raise ValueError("VM observation has a managed identity")
     props = _props(value)
     storage = props.get("storageProfile")
     network = props.get("networkProfile")
     interfaces = network.get("networkInterfaces") if isinstance(network, dict) else None
+    nic = interfaces[0] if isinstance(interfaces, list) and interfaces else None
     if (props.get("vmId") != vm_uuid or not isinstance(storage, dict)
             or storage.get("diskControllerType") != "SCSI"
             or not isinstance(props.get("securityProfile"), dict)
@@ -470,11 +523,9 @@ def _vm_attachment(value, expected, vm_uuid, os_role):
             or not isinstance(props.get("hardwareProfile"), dict)
             or props["hardwareProfile"].get("vmSize") != "Standard_D2s_v5"
             or not isinstance(interfaces, list) or len(interfaces) != 1
-            or not isinstance(interfaces[0], dict)
-            or interfaces[0].get("id") != expected.resource_ids["nic"]
-            or not isinstance(interfaces[0].get("properties"), dict)
-            or interfaces[0]["properties"].get("primary") is not True
-            or interfaces[0]["properties"].get("deleteOption") != "Delete"):
+            or not isinstance(nic, dict)
+            or nic.get("id") != expected.resource_ids["nic"]
+            or not _nic_attachment(nic, rest="properties" in value)):
         raise ValueError("VM UUID, storage profile or private NIC attachment differs")
     disk = storage.get("osDisk")
     data = storage.get("dataDisks")
@@ -487,6 +538,37 @@ def _vm_attachment(value, expected, vm_uuid, os_role):
                 for item in data} != {0: expected.resource_ids["data0"],
                                      7: expected.resource_ids["data7"]}):
         raise ValueError("VM original data disks or OS attachment differs")
+
+
+def _nic_attachment(nic, *, rest):
+    # REST bodies nest attachment options; CLI 2.90 `vm show` flattens them.
+    if rest:
+        options = nic.get("properties")
+        allowed = {"id", "properties", "resourceGroup"}
+    else:
+        options = nic
+        allowed = {"id", "primary", "deleteOption", "resourceGroup"}
+    return (set(nic) <= allowed and isinstance(options, dict)
+            and options.get("primary") is True
+            and options.get("deleteOption") == "Delete")
+
+
+def _deallocated(value):
+    # `az vm show -d` reports the instance-view power state as display text.
+    return isinstance(value, dict) and _props(value).get("powerState") == "VM deallocated"
+
+
+def _deallocation_view(value, expected, vm_uuid):
+    # `az vm deallocate` prints no JSON; `az vm get-instance-view` is the outcome.
+    view = value.get("instanceView") if isinstance(value, dict) else None
+    statuses = view.get("statuses") if isinstance(view, dict) else None
+    if not isinstance(statuses, list) or not all(isinstance(item, dict) for item in statuses):
+        return False
+    return (value.get("id") == expected.resource_ids["vm"]
+            and value.get("vmId") == vm_uuid
+            and value.get("identity") is None
+            and sorted(str(item.get("code")) for item in statuses)
+            == ["PowerState/deallocated", "ProvisioningState/succeeded"])
 
 
 def _current_disk(role, ref, expected, archive, identities, attached):
@@ -538,8 +620,7 @@ def _prepared(body, expected, archive):
     if (not isinstance(outputs, dict) or set(outputs) != set(roles) | {"vmUuid"}
             or not isinstance(output_resources, list)
             or len(output_resources) != len(CHILDREN)
-            or any(not isinstance(item, dict) or set(item) != {"id"}
-                   for item in output_resources)
+            or any(not _output_resource(item) for item in output_resources)
             or {item["id"] for item in output_resources}
             != {expected.resource_ids[role] for role in CHILDREN}
             or any(not isinstance(outputs[name], dict)
@@ -567,7 +648,7 @@ def _prepared(body, expected, archive):
     _inventory(evidence["inventory"], expected, archive, identities, vm_uuid)
     dummy_vm = archive.read(evidence["dummy_vm"], "Original dummy VM attachment")
     _vm_attachment(dummy_vm, expected, vm_uuid, "dummy")
-    if _props(dummy_vm).get("powerState") != "deallocated":
+    if not _deallocated(dummy_vm):
         raise ValueError("PREPARED VM must be observed deallocated")
     _current_disk("dummy", evidence["dummy_disk"], expected, archive, identities, True)
     _current_disk("os", evidence["os_disk"], expected, archive, identities, False)
@@ -603,15 +684,11 @@ def _handoff(body, expected, archive, identities, vm_uuid, prepared_sha, now, fr
     swap = archive.read(evidence["swap"], "Original OS swap response")
     settled = archive.read(evidence["swap_settlement"], "Settled OS swap")
     vm = archive.read(evidence["vm"], "Final VM observation")
-    if (not isinstance(deallocation, dict)
-            or deallocation.get("id") != expected.resource_ids["vm"]
-            or deallocation.get("vmId") != vm_uuid
-            or deallocation.get("status") != "Succeeded"
+    if (not _deallocation_view(deallocation, expected, vm_uuid)
             or not isinstance(swap, dict) or not isinstance(settled, dict)
             or _state(settled) != "Succeeded" or _state(vm) != "Succeeded"):
         raise ValueError("Deallocation and original OS swap are not settled")
-    if "tags" in deallocation:
-        _run_tags(deallocation, expected, "Deallocation outcome")
+    _run_tags(deallocation, expected, "Deallocation instance view")
     swap_state = _state(swap)
     tracking = evidence["swap_tracking"]
     if swap_state == "Succeeded":
@@ -630,7 +707,7 @@ def _handoff(body, expected, archive, identities, vm_uuid, prepared_sha, now, fr
     _current_data_disks(evidence["data_disks"], expected, archive, identities)
     _children(evidence["children"], expected, archive, vm_uuid, "os")
     _inventory(evidence["inventory"], expected, archive, identities, vm_uuid)
-    if not isinstance(vm, dict) or _props(vm).get("powerState") != "deallocated":
+    if not _deallocated(vm):
         raise ValueError("Handoff VM must be observed deallocated")
     return evidence["challenge"], expires
 
