@@ -1195,8 +1195,9 @@ the journaled dummy VM runtime exceeds the approved budget, the run refuses
 the OS swap. The tool then signs and verifies the records; the handoff
 expires by `not_after_utc`.
 
-Cleanup always runs, without a deadline, whenever this journal recorded
-`group create`. It deletes the group only if:
+Cleanup always runs, without a deadline, whenever this journal proved the group
+name was free before `group create`. If `group create` failed or timed out,
+cleanup first probes `group exists`. It deletes the group only if:
 
 - the group's ID and owner tags match;
 - every listed resource is inside the group and tagged with this run and
