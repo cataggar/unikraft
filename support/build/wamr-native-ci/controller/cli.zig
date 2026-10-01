@@ -2,18 +2,13 @@
 const std = @import("std");
 const files = @import("hyperv_core").private_files;
 
-pub const Action = enum { build, boot, diagnostics, describe, @"supervisor-source-closure", records, @"local-consumer-custody", @"handoff-inspect", @"handoff-inspect-legacy", @"public-validator-build", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation", @"supervised-command-record" };
+pub const Action = enum { build, boot, diagnostics, describe, @"supervisor-source-closure", records, @"local-consumer-custody", @"handoff-inspect", @"handoff-inspect-legacy", @"public-validator-build", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation" };
 pub const Command = struct {
     action: Action,
     runtime: ?[]const u8 = null,
     wamr_source: ?[]const u8 = null,
     stage_root: ?[]const u8 = null,
     output: ?[]const u8 = null,
-    record: ?[]const u8 = null,
-    identities: ?[]const u8 = null,
-    stage: ?[]const u8 = null,
-    transport: ?[]const u8 = null,
-    profile: ?[]const u8 = null,
     supervisor: ?[]const u8 = null,
     git: ?[]const u8 = null,
 };
@@ -138,32 +133,6 @@ pub fn parse(args: []const []const u8) !Command {
             } else return error.InvalidUsage;
         }
         if (result.runtime == null or result.output == null) return error.InvalidUsage;
-        return result;
-    }
-    if (action == .@"supervised-command-record") {
-        if (args.len != 12) return error.InvalidUsage;
-        var result = Command{ .action = action };
-        var i: usize = 2;
-        while (i < args.len) : (i += 2) {
-            const flag = args[i];
-            const value = args[i + 1];
-            if (std.mem.eql(u8, flag, "--record") and result.record == null) {
-                files.absoluteFilePath(value) catch return error.InvalidUsage;
-                result.record = value;
-            } else if (std.mem.eql(u8, flag, "--identities") and result.identities == null) {
-                files.absoluteFilePath(value) catch return error.InvalidUsage;
-                result.identities = value;
-            } else if (std.mem.eql(u8, flag, "--stage") and result.stage == null) {
-                result.stage = value;
-            } else if (std.mem.eql(u8, flag, "--transport") and result.transport == null) {
-                result.transport = value;
-            } else if (std.mem.eql(u8, flag, "--profile") and result.profile == null) {
-                result.profile = value;
-            } else return error.InvalidUsage;
-        }
-        if (result.record == null or result.identities == null or result.stage == null or
-            result.transport == null or result.profile == null)
-            return error.InvalidUsage;
         return result;
     }
     if (args.len < 4 or args.len > 6 or args.len % 2 != 0) return error.InvalidUsage;

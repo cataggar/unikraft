@@ -229,58 +229,6 @@ def _records(context, arguments):
     return _decode(raw, context)
 
 
-def supervised_command_record(
-        record_path, stage, role_identities, transport_context, profile):
-    """Ask the native controller to validate an imported v1 command record."""
-    record_path = Path(record_path)
-    refusal = "native controller command record refused"
-    try:
-        record_path = _absolute(record_path)
-        if transport_context != "trusted_inner_zip":
-            _refuse(refusal)
-        parent = record_path.parents[1]
-        if record_path.parent.name != "evidence" or not parent.name:
-            _refuse(refusal)
-        _absolute(parent)
-    except (IndexError, OSError, ValueError) as error:
-        raise ValueError(refusal) from error
-    scratch = parent.with_name(parent.name + "-native-command-records")
-    try:
-        if scratch.exists():
-            _refuse(refusal)
-        scratch.mkdir(mode=0o700)
-        identities = scratch / "identities.json"
-        raw = (json.dumps(
-            role_identities, ensure_ascii=False, allow_nan=False,
-            sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-        if not raw or len(raw) > MAX_RECORDS_BYTES:
-            _refuse(refusal)
-        with identities.open("xb") as output:
-            os.fchmod(output.fileno(), 0o600)
-            output.write(raw)
-            output.flush()
-            os.fsync(output.fileno())
-        raw_out, stderr_seen = _controller_command((
-            "supervised-command-record",
-            "--record", str(record_path),
-            "--identities", str(identities),
-            "--stage", stage,
-            "--transport", "trusted-inner-zip",
-            "--profile", profile), refusal)
-        if raw_out or stderr_seen:
-            _refuse(refusal)
-    except (OSError, TypeError, ValueError, subprocess.SubprocessError) as error:
-        raise ValueError(refusal) from error
-    finally:
-        try:
-            if scratch.exists():
-                for child in scratch.iterdir():
-                    child.unlink()
-                scratch.rmdir()
-        except OSError:
-            pass
-
-
 def imported_stage(stage_root):
     """Ask the native importer to validate the exact extracted inner tree."""
     stage_root = _absolute(stage_root)

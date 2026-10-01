@@ -73,8 +73,8 @@ selection, with public-source publication and trusted import passing separately.
 For a trusted v2 import, the native accepted-run records gate validates the
 imported command bindings before Python applies archive and publication policy;
 Python no longer reinterprets those imported command records. Trusted v1
-imports with supervisor records use the same native command validator through
-the closed `supervised-command-record` bridge; pre-supervisor v1 imports keep
+imports with supervisor command records are fail-closed by the native
+imported-stage gate and publication policy; pre-supervisor v1 imports keep
 their historical no-supervisor behavior. Producer-direct publication retains
 its existing Python command checks.
 `handoff-inspect --runtime ABS --output ABS` is the native owner of the
@@ -82,15 +82,17 @@ non-legacy local handoff inspection, and `handoff-inspect-legacy --runtime
 ABS --output ABS` owns the historical v1 output names
 `private/handoff-inspect-legacy.log` and
 `evidence/command-handoff-inspect-legacy.json`. They accept native-produced
-v2 runtimes, Python-produced v2 runtimes, or synthetic/historical v1 runtimes
-whose recorded supervisor, source and consumer custody can be recaptured, then
+v2 runtimes and Python-produced v2 runtimes through `handoff-inspect` only, or
+synthetic/historical v1 runtimes through `handoff-inspect-legacy` only, when
+the recorded supervisor, source and consumer custody can be recaptured. They
 use the pinned package/EFI inputs and retain bounded private logs and command
 records in a create-only owner-only output beneath an existing private parent
 outside the runtime's pinned input ancestors. For Python-produced v2 runs the
 command record names the actually running native controller as
-`native:handoff-inspect-controller`; historical legacy inspection keeps the
-recorded `command-supervisor` role. The stages neither export an image nor
-fall back to Python after refusal. `public-validator-build --runtime
+`native:handoff-inspect-controller`; historical legacy inspection requires the
+recorded `command-supervisor` role instead of an ambient compatibility
+supervisor. The stages neither export an image nor fall back to Python after
+refusal. `public-validator-build --runtime
 ABS --output ABS` accepts native-produced local runtimes only, using the
 recorded Zig tool and controller to build the fixed x86_64 validator in an
 independent private output, retaining its bounded command evidence without

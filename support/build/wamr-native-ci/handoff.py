@@ -1058,18 +1058,6 @@ def export(runtime, output, *, on_phase=None):
     names = NAMES if version == 1 else V2_NAMES
     expected = ci.document(root / "evidence/build-start.json")
     legacy_supervision = "command_supervisor" not in expected
-    if (not legacy_supervision
-            and "command-supervisor" in expected["consumer_inputs"]["files"]):
-        ci.COMMAND_ENVIRONMENT.update(ci.bind_command_tools(
-            expected["consumer_inputs"]))
-    elif legacy_supervision:
-        ci.COMMAND_ENVIRONMENT.clear()
-        ci.COMMAND_TOOL_PATHS.clear()
-        if "command-supervisor" in expected["consumer_inputs"]["files"]:
-            supervisor_path = ci.bind_command_supervisor(
-                expected["consumer_inputs"])
-            ci.COMMAND_ENVIRONMENT[
-                "WAMR_CI_SUPERVISOR"] = supervisor_path
     phase("custody")
     before = ci.producer_inputs(runtime, expected["consumer_inputs"])
     ci.require(before == expected,
@@ -1095,20 +1083,6 @@ def export(runtime, output, *, on_phase=None):
         ci.require(checked == ci.document(root / "evidence" / (mode + "-compute.json")),
                    "physical local result changed")
     ci.require_build_custody(runtime, before)
-    input_records = ci.consumer_file_records(expected["consumer_inputs"])
-    input_records.update(ci.consumer_file_records(inputs))
-    compatibility_supervisor = None
-    if ci.COMMAND_SUPERVISOR_PATH is not None:
-        supervisor_path = str(Path(
-            ci.COMMAND_SUPERVISOR_PATH).resolve(strict=True))
-        if supervisor_path not in input_records:
-            compatibility_supervisor = ci.record_input_paths(
-                {"command-supervisor": Path(supervisor_path)}, {})
-            input_records.update(ci.consumer_file_records(
-                compatibility_supervisor))
-    if legacy_supervision and ci.COMMAND_SUPERVISOR_PATH is not None:
-        ci.COMMAND_ENVIRONMENT[
-            "WAMR_CI_SUPERVISOR"] = ci.COMMAND_SUPERVISOR_PATH
     phase("inspect")
     inspected_output, unused_inspected_command = (
         accepted_records.handoff_inspect(
@@ -1122,10 +1096,6 @@ def export(runtime, output, *, on_phase=None):
                and all(inspected["image"][key] == value
                        for key, value in packaged["image"].items()),
                "physical package changed")
-    if compatibility_supervisor is not None:
-        ci.record_input_paths(
-            {"command-supervisor": Path(ci.COMMAND_SUPERVISOR_PATH)}, {},
-            expected=compatibility_supervisor)
     legacy_paths = (
         ci.APP / "build" / ci.EFI, ci.APP / "build" / (ci.EFI + ".dbg"),
         ci.APP / "build" / (ci.EFI + ".bootinfo"), root / "package/unikraft.raw",

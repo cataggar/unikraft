@@ -126,26 +126,6 @@ pub fn main(init: std.process.Init) void {
         ) catch |err| failed(init.io, stage, "", err);
         return;
     }
-    if (command.action == .@"supervised-command-record") {
-        const stage = std.meta.stringToEnum(controller.command_plan.Stage, command.stage.?) orelse usage(init.io);
-        const context: controller.command_validation.EvidenceContext =
-            if (std.mem.eql(u8, command.transport.?, "trusted-inner-zip"))
-                .trusted_inner_zip
-            else if (std.mem.eql(u8, command.transport.?, "producer-direct"))
-                .local_runtime
-            else
-                usage(init.io);
-        _ = controller.accepted_run.validateSupervisedCommandRecordFile(
-            allocator,
-            init.io,
-            command.record.?,
-            command.identities.?,
-            stage,
-            context,
-            command.profile.?,
-        ) catch |err| failed(init.io, @tagName(command.action), "", err);
-        return;
-    }
     if (command.action == .@"handoff-inspect" or command.action == .@"handoff-inspect-legacy" or command.action == .@"public-validator-build") {
         const stage = @tagName(command.action);
         const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
@@ -252,7 +232,6 @@ pub fn main(init: std.process.Init) void {
         .@"supervisor-import-identity" => unreachable,
         .@"import-validator-build" => unreachable,
         .@"import-native-revalidation" => unreachable,
-        .@"supervised-command-record" => unreachable,
     }
 }
 
@@ -271,8 +250,7 @@ fn usage(io: std.Io) noreturn {
             "       uk-wamr-native-ci public-validator-build --runtime ABS --output ABS\n" ++
             "       uk-wamr-native-ci supervisor-import-identity --stage-root ABS --supervisor ABS --git ABS --output ABS\n" ++
             "       uk-wamr-native-ci import-validator-build --stage-root ABS --output ABS\n" ++
-            "       uk-wamr-native-ci import-native-revalidation --stage-root ABS --output ABS\n" ++
-            "       uk-wamr-native-ci supervised-command-record --record ABS --identities ABS --stage NAME --transport trusted-inner-zip --profile tiny-aot-two-boot\n",
+            "       uk-wamr-native-ci import-native-revalidation --stage-root ABS --output ABS\n",
     ) catch {};
     std.process.exit(2);
 }

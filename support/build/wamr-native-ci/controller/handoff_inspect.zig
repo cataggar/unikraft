@@ -116,6 +116,8 @@ pub fn run(
 ) !@import("command_validation.zig").ValidatedCommand {
     if (accepted.context != .local_runtime or accepted.repository == null)
         return error.InvalidContext;
+    if (legacy != (accepted.compatibility == .tiny_v1_legacy))
+        return error.InvalidContext;
     try accepted.revalidateWithSignal(signal);
     const roots = try bind(accepted, output);
     var original_tool = try files.RetainedFile.open(io, roots.package_tool, .tool);

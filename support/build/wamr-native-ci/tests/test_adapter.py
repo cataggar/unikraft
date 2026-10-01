@@ -390,51 +390,6 @@ class NativeRecordBridge(unittest.TestCase):
             "handoff-inspect-legacy", "--runtime", str(runtime),
             "--output", str(output)])
 
-    def test_v1_imported_command_record_uses_native_without_fallback(self):
-        bridge = public_bundle.accepted_records
-        root, controller = self.controller_fixture(
-            "import json, os, pathlib, sys\n"
-            "open(os.environ['WAMR_CI_TEST_ARGS'], 'w').write("
-            "json.dumps(sys.argv[1:]))\n"
-            "identities = pathlib.Path("
-            "sys.argv[sys.argv.index('--identities') + 1])\n"
-            "open(os.environ['WAMR_CI_TEST_IDENTITIES'], 'wb').write("
-            "identities.read_bytes())\n"
-            "sys.exit(int(os.environ.get('WAMR_CI_TEST_EXIT', '0')))\n")
-        stage = root / "stage"
-        evidence = stage / "evidence"
-        evidence.mkdir(mode=0o700, parents=True)
-        record = evidence / "command-adapter.json"
-        record.write_bytes(b"{}\n")
-        record.chmod(0o600)
-        arguments = root / "arguments.json"
-        identities_copy = root / "identities-copy.json"
-        identities = {"command-supervisor": {"content_sha256": "0" * 64}}
-        with mock.patch.dict(os.environ, {
-                bridge.CONTROLLER_ENV: str(controller),
-                "WAMR_CI_TEST_ARGS": str(arguments),
-                "WAMR_CI_TEST_IDENTITIES": str(identities_copy)}):
-            bridge.supervised_command_record(
-                record, "adapter", identities, "trusted_inner_zip",
-                "tiny-aot-two-boot")
-        self.assertEqual(json.loads(arguments.read_text()), [
-            "supervised-command-record", "--record", str(record),
-            "--identities", str(stage) + "-native-command-records/identities.json",
-            "--stage", "adapter", "--transport", "trusted-inner-zip",
-            "--profile", "tiny-aot-two-boot"])
-        self.assertEqual(json.loads(identities_copy.read_text()), identities)
-        self.assertFalse((root / "stage-native-command-records").exists())
-        with mock.patch.dict(os.environ, {
-                bridge.CONTROLLER_ENV: str(controller),
-                "WAMR_CI_TEST_ARGS": str(arguments),
-                "WAMR_CI_TEST_IDENTITIES": str(identities_copy),
-                "WAMR_CI_TEST_EXIT": "1"}), \
-                self.assertRaisesRegex(
-                    ValueError, "native controller command record refused"):
-            bridge.supervised_command_record(
-                record, "adapter", identities, "trusted_inner_zip",
-                "tiny-aot-two-boot")
-
     def test_native_v1_view_cannot_be_relabeled_v2(self):
         bridge = public_bundle.accepted_records
         handoff = self.handoff_module()
@@ -827,7 +782,7 @@ class NativeRecordBridge(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "native gate passed"):
                 public_bundle.publication_records(*args, native_accepted=native)
 
-    def test_imported_v1_command_records_use_native_validator(self):
+    def test_imported_v1_command_records_fail_closed(self):
         source = {"source_revision": "1" * 40, "source_tree": "2" * 40}
         expected_source = {
             "revision": source["source_revision"], "tree": source["source_tree"]}
@@ -898,17 +853,11 @@ class NativeRecordBridge(unittest.TestCase):
                 mock.patch.object(
                     public_bundle, "supervised_command_record",
                     side_effect=AssertionError("Python fallback")), \
-                mock.patch.object(
-                    public_bundle.accepted_records,
-                    "supervised_command_record",
-                    side_effect=RuntimeError("native v1 gate")) as native:
-            with self.assertRaisesRegex(RuntimeError, "native v1 gate"):
+                self.assertRaisesRegex(
+                    ValueError, "public-source bundle refused"):
                 public_bundle.publication_records(
                     handoff, HERE, source, "trusted_inner_zip",
                     "candidate-bundle.json")
-        native.assert_called_once_with(
-            HERE / "evidence/command-adapter.json", "adapter",
-            mock.ANY, "trusted_inner_zip", "tiny-aot-two-boot")
 
     def test_native_import_identity_replaces_only_python_identity_command(self):
         root, unused_controller = self.controller_fixture("")

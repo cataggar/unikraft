@@ -779,56 +779,6 @@ pub fn validateCommandBinding(
     return command.validate(a, document.value(), stage, context);
 }
 
-pub fn validateSupervisedCommandRecordFile(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    record_path: []const u8,
-    identities_path: []const u8,
-    stage: Stage,
-    context: EvidenceContext,
-    profile_name: []const u8,
-) !ValidatedCommand {
-    try files.absoluteFilePath(record_path);
-    try files.absoluteFilePath(identities_path);
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var record_file = try files.RetainedFile.open(io, record_path, .private);
-    defer record_file.close(io);
-    var raw = try files.readSensitiveFile(io, a, record_file.file, records.max_record_bytes, .private);
-    defer raw.deinit();
-    var document = try contracts.Document.parse(a, raw.bytes(), .{
-        .bytes = records.max_record_bytes,
-        .depth = 32,
-        .items = 4096,
-        .tokens = 65536,
-    });
-    defer document.deinit();
-    try document.requireCanonical(a, raw.bytes());
-    try record_file.verify(io);
-    var identities_file = try files.RetainedFile.open(io, identities_path, .private);
-    defer identities_file.close(io);
-    var identity_raw = try files.readSensitiveFile(io, a, identities_file.file, records.max_record_bytes, .private);
-    defer identity_raw.deinit();
-    var identities_document = try contracts.Document.parse(a, identity_raw.bytes(), .{
-        .bytes = records.max_record_bytes,
-        .depth = 8,
-        .items = 1024,
-        .tokens = 16384,
-    });
-    defer identities_document.deinit();
-    try identities_document.requireCanonical(a, identity_raw.bytes());
-    try identities_file.verify(io);
-    const checked = if (std.mem.eql(u8, profile_name, "tiny-aot-two-boot"))
-        try command.validateLegacyV1(a, document.value(), stage, context)
-    else if (std.mem.eql(u8, profile_name, "qcow2-derived-vhd"))
-        try command.validate(a, document.value(), stage, context)
-    else
-        return error.UnsupportedRecordSet;
-    try command.validateRoleIdentities(a, document.value(), identities_document.value());
-    return checked;
-}
-
 pub fn validateLocalHandoffCommand(self: *AcceptedRun, raw: []const u8) !ValidatedCommand {
     return validateLocalPostRunCommand(self, raw, .@"handoff-inspect");
 }
@@ -838,6 +788,10 @@ pub fn validateLocalPostRunCommand(self: *AcceptedRun, raw: []const u8, stage: S
         return error.InvalidContext;
     if (stage != .@"handoff-inspect" and stage != .@"handoff-inspect-legacy" and stage != .@"public-validator-build")
         return error.InvalidCommand;
+    if ((stage == .@"handoff-inspect-legacy") != (self.compatibility == .tiny_v1_legacy))
+        return error.InvalidContext;
+    if (stage == .@"handoff-inspect" and self.compatibility != .tiny_v2_qcow2_derived_vhd)
+        return error.InvalidContext;
     const a = self.allocator();
     var document = try contracts.Document.parse(a, raw, .{
         .bytes = records.max_record_bytes,
@@ -993,6 +947,8 @@ fn checkPostRunRoleIdentity(
 fn checkPostRunSupervisorRole(self: *AcceptedRun, binding: std.json.Value, stage: Stage) !void {
     const path = try get(binding, "path");
     const role = try text(try get(path, "role"));
+    if ((stage == .@"handoff-inspect-legacy") != (self.compatibility == .tiny_v1_legacy))
+        return error.InvalidCommandIdentity;
     const expected = if (stage == .@"handoff-inspect" and self.local_producer == .python)
         handoff_controller_role
     else

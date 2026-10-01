@@ -9,7 +9,6 @@ const records = @import("records.zig");
 const handoff_controller_role = "native:handoff-inspect-controller";
 
 pub const EvidenceContext = enum { local_runtime, trusted_inner_zip };
-const ContractProfile = enum { current, legacy_v1 };
 pub const ValidatedCommand = struct {
     stage: plan.Stage,
     output_bytes: u64,
@@ -26,7 +25,10 @@ fn text(value: std.json.Value) ![]const u8 {
 }
 
 fn num(comptime T: type, value: std.json.Value) !T {
-    return contracts.integer(T, value);
+    return contracts.integer(T, value) catch |err| switch (err) {
+        error.IntegerOverflow => error.InvalidCommand,
+        else => err,
+    };
 }
 
 fn eq(a: []const u8, b: []const u8) !void {
@@ -84,67 +86,12 @@ fn matchBinding(a: std.mem.Allocator, observed: std.json.Value, expected: plan.B
 
 const PlanVariant = enum { native, historical_import };
 
-fn legacyV1BootArgv(a: std.mem.Allocator, stage: plan.Stage) ![]plan.Binding {
-    const source_name = switch (stage) {
-        .@"raw-x2apic", .@"raw-legacy-apic" => "unikraft.raw",
-        .@"vpc-x2apic", .@"vpc-legacy-apic" => "unikraft.vhd",
-        else => return error.InvalidCommand,
-    };
-    const source_flag = switch (stage) {
-        .@"raw-x2apic", .@"raw-legacy-apic" => "--raw-disk",
-        .@"vpc-x2apic", .@"vpc-legacy-apic" => "--fixed-vhd",
-        else => unreachable,
-    };
-    const legacy = stage == .@"raw-legacy-apic" or stage == .@"vpc-legacy-apic";
-    var result: std.ArrayList(plan.Binding) = .empty;
-    try result.appendSlice(a, &.{
-        .{ .path = .{ .role = "input:local_boot_tool" } },
-        .{ .literal = source_flag },
-        .{ .path = .{ .role = "work", .relative = try std.fmt.allocPrint(a, "package/{s}", .{source_name}) } },
-        .{ .literal = "--qemu" },
-        .{ .path = .{ .role = "input:qemu" } },
-        .{ .literal = "--ovmf-code" },
-        .{ .path = .{ .role = "input:ovmf_code" } },
-        .{ .literal = "--ovmf-vars" },
-        .{ .path = .{ .role = "input:ovmf_vars" } },
-        .{ .literal = "--work-dir" },
-        .{ .path = .{ .role = "work", .relative = try std.fmt.allocPrint(a, "boot-{s}", .{@tagName(stage)}) } },
-        .{ .literal = "--expect" },
-        .{ .literal = "WAMR_NATIVE_AOT_OK answer=42 teardown=0" },
-        .{ .literal = "--expect-main-return" },
-        .{ .literal = "0" },
-        .{ .literal = "--cpus" },
-        .{ .literal = "1" },
-        .{ .literal = "--timeout" },
-        .{ .literal = "60" },
-    });
-    if (legacy) try result.append(a, .{ .literal = "--disable-x2apic" });
-    if (legacy) try result.appendSlice(a, &.{
-        .{ .literal = "--require-marker" },
-        .{ .literal = "Using legacy xAPIC MMIO" },
-    });
-    const forbidden = [_][]const u8{
-        "HYPERV_ACCEPTANCE",        "UK_HYPERV_IO_READY", "UK_HYPERV_NETWORK_APP_READY",
-        "UK_HYPERV_PLATFORM_READY", "WAMR_NATIVE_WASI=",  "WAMR_NATIVE_AOT_FAIL",
-    };
-    for (forbidden) |marker| try result.appendSlice(a, &.{
-        .{ .literal = "--forbid-marker" },
-        .{ .literal = marker },
-    });
-    if (!legacy) try result.appendSlice(a, &.{
-        .{ .literal = "--forbid-marker" },
-        .{ .literal = "Using legacy xAPIC MMIO" },
-    });
-    return result.toOwnedSlice(a);
-}
-
 fn matchPlan(
     a: std.mem.Allocator,
     request: std.json.Value,
     stage: plan.Stage,
     variant: PlanVariant,
     context: EvidenceContext,
-    contract_profile: ContractProfile,
 ) !void {
     const selected = plan.spec(stage);
     const argv = try get(request, "argv");
@@ -159,14 +106,7 @@ fn matchPlan(
         .{ .path = .{ .role = "source", .relative = "support/build/wamr-native-ci/tests" } },
         .{ .literal = "-v" },
     };
-    const expected_argv = if (historical and stage == .fixtures)
-        historical_fixture
-    else if (historical and contract_profile == .legacy_v1 and
-        (stage == .@"raw-x2apic" or stage == .@"raw-legacy-apic" or
-            stage == .@"vpc-x2apic" or stage == .@"vpc-legacy-apic"))
-        try legacyV1BootArgv(a, stage)
-    else
-        selected.argv;
+    const expected_argv = if (historical and stage == .fixtures) historical_fixture else selected.argv;
     if (argv != .array or argv.array.items.len != expected_argv.len + @as(usize, @intFromBool(wrapper)) * 2)
         return error.InvalidCommand;
     if (wrapper) {
@@ -245,7 +185,7 @@ fn identity(value: std.json.Value) !void {
         return error.InvalidCommand;
     _ = try num(u32, try get(value, "device_major"));
     _ = try num(u32, try get(value, "device_minor"));
-    _ = try num(u32, try get(value, "mode"));
+    _ = try num(u16, try get(value, "mode"));
     _ = try num(u32, try get(value, "uid"));
     _ = try num(i64, try get(value, "mtime_seconds"));
     _ = try num(i64, try get(value, "ctime_seconds"));
@@ -284,9 +224,28 @@ fn outputCommitment(stdout: std.json.Value, stderr: std.json.Value) ![64]u8 {
     return std.fmt.bytesToHex(hash.finalResult(), .lower);
 }
 
-fn matchRetained(a: std.mem.Allocator, request: std.json.Value, command: std.json.Value) !void {
+fn retainedEnvironment(name: []const u8) bool {
+    return std.mem.eql(u8, name, "M4") or
+        std.mem.eql(u8, name, "WAMR_CI_GIT") or
+        std.mem.eql(u8, name, "WAMR_CI_SUPERVISOR") or
+        std.mem.eql(u8, name, "WAMR_CI_LAUNCH_EXECUTABLE") or
+        std.mem.eql(u8, name, "WAMR_CI_PYTHON") or
+        std.mem.eql(u8, name, "WAMR_CI_LOG_VALIDATE") or
+        std.mem.startsWith(u8, name, "WAMR_CI_TOOL_");
+}
+
+fn matchRetained(a: std.mem.Allocator, request: std.json.Value, command: std.json.Value, stage: plan.Stage) !void {
     const retained = try get(request, "retained_executables");
     if (retained != .array or retained.array.items.len > 64) return error.InvalidCommand;
+    const expected_bindings = try plan.environment(a, stage);
+    defer plan.freeEnvironment(a, expected_bindings);
+    var expected: std.StringHashMap(void) = .init(a);
+    defer expected.deinit();
+    for (expected_bindings) |entry| {
+        if (entry.value == .path and retainedEnvironment(entry.name))
+            try expected.put(entry.name, {});
+    }
+    if (retained.array.items.len != expected.count()) return error.InvalidCommand;
     const copied = try get(command, "retained_executables");
     const first = try records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, retained, .{}));
     const second = try records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, copied, .{}));
@@ -298,13 +257,14 @@ fn matchRetained(a: std.mem.Allocator, request: std.json.Value, command: std.jso
         const name = try text(try get(entry, "name"));
         if (name.len == 0 or !std.mem.lessThan(u8, previous, name))
             return error.InvalidCommand;
+        if (!expected.contains(name)) return error.InvalidCommand;
         previous = name;
         var found = false;
         for (environment.array.items) |env| {
             if (!std.mem.eql(u8, try text(try get(env, "name")), name)) continue;
             const actual = try records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, try get(entry, "path"), .{}));
-            const expected = try records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, try get(env, "value"), .{}));
-            try eq(actual, expected);
+            const retained_path = try records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, try get(env, "value"), .{}));
+            try eq(actual, retained_path);
             found = true;
             break;
         }
@@ -321,7 +281,7 @@ pub fn validate(
     stage: plan.Stage,
     context: EvidenceContext,
 ) !ValidatedCommand {
-    return validateWithProfile(a, record, stage, context, .current);
+    return validateWithProfile(a, record, stage, context);
 }
 
 pub fn validateLegacyV1(
@@ -330,7 +290,9 @@ pub fn validateLegacyV1(
     stage: plan.Stage,
     context: EvidenceContext,
 ) !ValidatedCommand {
-    return validateWithProfile(a, record, stage, context, .legacy_v1);
+    if (context != .local_runtime or stage != .@"handoff-inspect-legacy")
+        return error.InvalidCommand;
+    return validateWithProfile(a, record, stage, context);
 }
 
 fn validateWithProfile(
@@ -338,7 +300,6 @@ fn validateWithProfile(
     record: std.json.Value,
     stage: plan.Stage,
     context: EvidenceContext,
-    contract_profile: ContractProfile,
 ) !ValidatedCommand {
     try exact(record, &.{
         "scope",      "stage",               "exit_code",  "bytes", "sha256", "sha256_scope",
@@ -350,6 +311,10 @@ fn validateWithProfile(
     const size = try num(u64, try get(record, "bytes"));
     const hash = try requireDigest(try get(record, "sha256"));
     try eq(try text(try get(record, "sha256_scope")), if (size == 0) "reproducible_empty" else "transport_authenticated_observation");
+    if (size == 0) {
+        const empty = std.fmt.bytesToHex(records.fileIdentity(""), .lower);
+        try eq(hash, &empty);
+    }
     try yes(try get(record, "over_limit"), false);
     const markers = try get(record, "known_error_markers");
     if (markers != .array or markers.array.items.len != 0) return error.InvalidCommand;
@@ -372,9 +337,9 @@ fn validateWithProfile(
     if (try num(u8, try get(request, "version")) != 1 or
         try num(u8, try get(request, "binding_version")) != 1) return error.InvalidCommand;
     const variant: PlanVariant = blk: {
-        matchPlan(a, request, stage, .native, context, contract_profile) catch |err| {
+        matchPlan(a, request, stage, .native, context) catch |err| {
             if (context == .local_runtime or err == error.OutOfMemory) return err;
-            try matchPlan(a, request, stage, .historical_import, context, contract_profile);
+            try matchPlan(a, request, stage, .historical_import, context);
             break :blk .historical_import;
         };
         break :blk .native;
@@ -438,7 +403,7 @@ fn validateWithProfile(
     try pair(try get(command, "primary"));
     try pair(try get(command, "termination"));
     try sameJson(a, try get(command, "executable"), try get(try get(request, "native_executable"), "identity"));
-    try matchRetained(a, request, command);
+    try matchRetained(a, request, command, stage);
     for ([_][]const u8{ "primary_events", "cleanup_events", "reap_events" }) |name| {
         if (try num(u64, try get(command, name)) >
             try num(u64, try get(limits, name))) return error.InvalidCommand;
@@ -465,7 +430,12 @@ fn validateWithProfile(
     try exact(output, &.{ "bytes", "combined_sha256", "commitment_sha256", "digest_scope" });
     if (try num(u64, try get(output, "bytes")) != size or
         stdout_size + stderr_size != size) return error.InvalidCommand;
-    try eq(try text(try get(output, "combined_sha256")), hash);
+    const combined_hash = try requireDigest(try get(output, "combined_sha256"));
+    try eq(combined_hash, hash);
+    if (size == 0) {
+        const empty = std.fmt.bytesToHex(records.fileIdentity(""), .lower);
+        try eq(combined_hash, &empty);
+    }
     try eq(try text(try get(output, "digest_scope")), try text(try get(record, "sha256_scope")));
     const committed = try outputCommitment(stdout, stderr);
     try eq(try text(try get(output, "commitment_sha256")), &committed);
@@ -487,42 +457,6 @@ fn validateWithProfile(
     var output_hash: [64]u8 = undefined;
     @memcpy(&output_hash, hash);
     return .{ .stage = stage, .output_bytes = size, .output_sha256 = output_hash };
-}
-
-pub fn validateRoleIdentities(
-    a: std.mem.Allocator,
-    record: std.json.Value,
-    role_identities: std.json.Value,
-) !void {
-    if (role_identities != .object) return error.InvalidCommandIdentity;
-    const request = try get(try get(record, "supervisor"), "request");
-    for ([_]std.json.Value{
-        try get(request, "supervisor"),
-        try get(request, "native_executable"),
-        try get(request, "command_executable"),
-    }) |binding_value| try validateRoleIdentity(a, binding_value, role_identities);
-    const interpreter = try get(request, "interpreter");
-    if (interpreter != .null) try validateRoleIdentity(a, interpreter, role_identities);
-    const retained = try get(request, "retained_executables");
-    if (retained != .array) return error.InvalidCommandIdentity;
-    for (retained.array.items) |binding_value|
-        try validateRoleIdentity(a, binding_value, role_identities);
-}
-
-fn validateRoleIdentity(
-    a: std.mem.Allocator,
-    binding_value: std.json.Value,
-    role_identities: std.json.Value,
-) !void {
-    const path = try get(binding_value, "path");
-    try eq(try text(try get(path, "kind")), "path");
-    const role = try text(try get(path, "role"));
-    const expected = role_identities.object.get(role) orelse return error.InvalidCommandIdentity;
-    const actual_json = try std.json.Stringify.valueAlloc(a, try get(binding_value, "identity"), .{});
-    const expected_json = try std.json.Stringify.valueAlloc(a, expected, .{});
-    const actual = try records.canonicalAlloc(a, actual_json);
-    const wanted = try records.canonicalAlloc(a, expected_json);
-    try eq(actual, wanted);
 }
 
 fn sameJson(a: std.mem.Allocator, first: std.json.Value, second: std.json.Value) !void {
