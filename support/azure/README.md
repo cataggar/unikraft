@@ -997,13 +997,27 @@ wider.
 The same capture showed that the subscription's Azure Policy modifies VMs:
 deployment added two policy tags and a system-assigned managed identity, and
 `az vm update` added a user-assigned identity from a separate policy-managed
-resource group. No VM extension appeared during the short capture. NSGs
-cannot block IMDS, so guest code could request tokens for such identities.
-Both the controller and the custody validator therefore reject any VM
-`identity`, and the controller's exact owner-tag check also rejects the extra
-tags. A live run in a subscription with such a policy fails closed and its
-cleanup needs manual owner verification. Accepting a policy footprint needs a
-separate reviewed decision; it is not inferred from this capture.
+resource group. The generic `2025-11-01` read reports a system-assigned
+identity with `userAssignedIdentities: null`. No VM extension appeared during
+the short capture. NSGs cannot block IMDS, so guest code could request tokens
+for such identities. By default the controller and custody validator reject
+any VM `identity`, and the exact owner-tag check rejects extra VM tags; a live
+run in such a subscription then fails closed and its cleanup needs manual
+owner verification.
+
+An operator may instead pin the exact footprint privately when planning:
+`plan --azure-policy POLICY.json` stores
+`{"vm_tags": {...}, "user_assigned_identity": ID-or-null}` in the private
+state and in the approved resource envelope. The 1–4 pinned tags cannot shadow
+an owner tag (case-insensitively); the identity must be a full user-assigned
+identity ID in another resource group of the planned subscription. With a pin,
+VM observations may carry only those tags with their exact values, and either
+no identity, a system-assigned identity, or a system-assigned identity plus
+exactly the pinned user-assigned identity. Other resources keep exact owner
+tags. The custody `Expected.azure_policy` must equal the admitted plan's pin.
+The pin accepts a known IMDS token exposure for the reviewed guest; it does
+not prove what those identities can access. Keep the pin and the identity ID
+private.
 
 The separate private builder can bind the physical tracked Git tree, solved
 configuration, tool fingerprints, and built EFI in a two-pass receipt. Its
@@ -1040,7 +1054,8 @@ The predecessor hashes the **entire signed envelope**. `Expected` supplies the
 run, independently selected handoff challenge, resource paths, reviewed image
 and dummy VHD digests, both seed digests,
 source-provenance and revised dummy-OS-template digests, exact final envelope,
-and pre-provision approval hash independently of the records. Neither an
+pre-provision approval hash and optional private Azure policy pin independently
+of the records. Neither an
 approval nor a trusted key may be selected from a record under examination.
 
 PREPARED requires the original group, four uploaded disk, and deployment
@@ -1066,7 +1081,7 @@ VM must still attach the dummy and exactly the approved private NIC while the
 final OS disk is unattached. VM observations may be flattened CLI `vm show`
 bodies (NIC options at the attachment's top level) or REST bodies (options
 nested under `properties`), but no VM observation may carry a managed
-`identity`. A deallocated observation requires the `az vm show -d`
+`identity` outside the pinned `Expected.azure_policy` footprint. A deallocated observation requires the `az vm show -d`
 `powerState` text `VM deallocated`. All four disk UUIDs/attachments are reobserved
 at handoff, including both seeded data disks; every observed VM and current
 disk must carry the independently expected run/operation tags. An inventory
@@ -1079,7 +1094,7 @@ a fresh one-use challenge and an expiring window. The swap response, swap
 settlement and final VM observation each require matching run/operation tags.
 Because `az vm deallocate` prints no JSON, the deallocation outcome is the
 `az vm get-instance-view` body: it must name the original VM ID and UUID,
-carry the run/operation tags, have no managed identity, and report exactly
+carry the run/operation tags, have no unpinned managed identity, and report exactly
 `ProvisioningState/succeeded` and `PowerState/deallocated`. The HANDOFF `no_prior_acceptance_boot` and
 `exclusive_no_writer` fields are **signed custodian assertions**, not Azure
 or cryptographic proofs.

@@ -72,6 +72,8 @@ class FakeAzure:
         self.granted = set()
         self.fail_grant = False
         self.revoked = set()
+        self.policy_tags = {}
+        self.policy_identity = None
         self.disk_uuids = {
             role: str(uuid.uuid5(uuid.NAMESPACE_DNS, role)) for role in lane.ROLES
         }
@@ -96,6 +98,10 @@ class FakeAzure:
         }
         if self.tamper == ("disk-owner", role) and role in self.created:
             resource["tags"]["issue90-run"] = "foreign"
+        if role == "vm":
+            resource["tags"].update(self.policy_tags)
+            if self.policy_identity is not None:
+                resource["identity"] = copy.deepcopy(self.policy_identity)
         return resource
 
     def disk(self, role):
@@ -295,6 +301,8 @@ class FakeAzure:
             properties["storageProfile"]["osDisk"]["deleteOption"] = "Delete"
         if self.tamper == ("security-identity", "pinned"):
             resource["identity"] = self.managed_identity()
+        if (resource.get("identity") or {}).get("type") == "SystemAssigned":
+            resource["identity"]["userAssignedIdentities"] = None
         return {**resource, "properties": properties}
 
     def disk_role(self, args):
@@ -1148,6 +1156,143 @@ class Issue90TopologyTest(unittest.TestCase):
     def test_pinned_vm_managed_identity_is_refused(self):
         self.fake.tamper = ("security-identity", "pinned")
         self._run_refused()
+
+    def _policy(self):
+        return {
+            "vm_tags": {"policy-pack": "nonprod", "platform.optin": "true"},
+            "user_assigned_identity": (
+                f"/subscriptions/{self.state['subscription']}/resourceGroups/"
+                "PolicyRG/providers/Microsoft.ManagedIdentity/"
+                "userAssignedIdentities/PolicyUA-northeurope"
+            ),
+        }
+
+    def _policy_identity(self, *, user=True):
+        identity = {"type": "SystemAssigned", "principalId": str(uuid.uuid4()),
+                    "tenantId": str(uuid.uuid4())}
+        if user:
+            identity["type"] = "SystemAssigned, UserAssigned"
+            identity["userAssignedIdentities"] = {
+                self._policy()["user_assigned_identity"]: {}
+            }
+        return identity
+
+    def _pin_policy(self):
+        self.state["azure_policy"] = self._policy()
+        lane.save(self.directory, self.state)
+
+    def _policy_run(self, *, user):
+        self._pin_policy()
+        self.fake.policy_tags = dict(self._policy()["vm_tags"])
+        self.fake.policy_identity = self._policy_identity(user=user)
+        checks = self._patch_cloud()
+        with checks[0], checks[1], checks[2], checks[3], checks[4]:
+            receipt = lane.run(self.directory, self.state["subscription"],
+                               lane.envelope_sha(self.state))
+        self.assertEqual(receipt["result"], "PASS")
+        self.assertTrue(self.fake.deleted)
+
+    def test_pinned_policy_system_identity_allows_a_complete_run(self):
+        self._policy_run(user=False)
+
+    def test_pinned_policy_user_identity_allows_a_complete_run(self):
+        self._policy_run(user=True)
+
+    def test_policy_footprint_is_refused_unless_pinned(self):
+        self.fake.policy_tags = dict(self._policy()["vm_tags"])
+        self._run_refused()
+
+    def test_pinned_policy_refuses_a_foreign_user_identity(self):
+        self._pin_policy()
+        self.fake.policy_tags = dict(self._policy()["vm_tags"])
+        identity = self._policy_identity()
+        identity["userAssignedIdentities"] = {
+            self._policy()["user_assigned_identity"] + "-other": {}
+        }
+        self.fake.policy_identity = identity
+        self._run_refused()
+
+    def test_policy_owner_tags_and_identities_are_exact(self):
+        policy = self._policy()
+        state = {**self.state, "azure_policy": policy}
+        owner = lane.tags(state, "vm")
+        self.assertTrue(lane.owner_tags(state, owner, "vm"))
+        self.assertTrue(lane.owner_tags(state, {**owner, "policy-pack": "nonprod"}, "vm"))
+        self.assertFalse(lane.owner_tags(self.state, {**owner, "policy-pack": "nonprod"},
+                                         "vm"))
+        for tags in ({**owner, "policy-pack": "prod"}, {**owner, "other": "x"},
+                     {**owner, "issue90-run": "foreign"},
+                     {key: value for key, value in owner.items() if key != "purpose"}):
+            with self.subTest(tags=tags):
+                self.assertFalse(lane.owner_tags(state, tags, "vm"))
+        self.assertFalse(lane.owner_tags(state, {**lane.tags(state, "nic"),
+                                                 "policy-pack": "nonprod"}, "nic"))
+        system = self._policy_identity(user=False)
+        user = self._policy_identity()
+        key = policy["user_assigned_identity"]
+        self.assertTrue(lane.vm_identity_allowed(None, None))
+        self.assertTrue(lane.vm_identity_allowed(policy, None))
+        self.assertTrue(lane.vm_identity_allowed(policy, system))
+        self.assertTrue(lane.vm_identity_allowed(
+            policy, {**system, "userAssignedIdentities": None}))
+        self.assertTrue(lane.vm_identity_allowed(policy, user))
+        self.assertTrue(lane.vm_identity_allowed(policy, {
+            **user, "userAssignedIdentities": {key.lower(): {
+                "clientId": None, "principalId": str(uuid.uuid4())}}}))
+        self.assertFalse(lane.vm_identity_allowed(None, system))
+        self.assertFalse(lane.vm_identity_allowed(
+            {**policy, "user_assigned_identity": None}, user))
+        for identity in (
+            {**system, "type": "UserAssigned"},
+            {**system, "principalId": "not-a-uuid"},
+            {**system, "extra": True},
+            {**system, "userAssignedIdentities": {}},
+            {**system, "userAssignedIdentities": {key: {}}},
+            {**user, "type": "SystemAssigned"},
+            {**user, "userAssignedIdentities": {}},
+            {**user, "userAssignedIdentities": {key: {}, key + "2": {}}},
+            {**user, "userAssignedIdentities": {key: {"clientId": "x"}}},
+            {**user, "userAssignedIdentities": {key: {
+                "clientId": None, "principalId": None, "extra": None}}},
+        ):
+            with self.subTest(identity=identity):
+                self.assertFalse(lane.vm_identity_allowed(policy, identity))
+
+    def test_plan_pins_a_validated_private_policy_allowance(self):
+        policy = self._policy()
+        parent = self.directory.parent
+        for invalid in (
+            {**policy, "extra": 1},
+            {"vm_tags": policy["vm_tags"]},
+            {**policy, "vm_tags": {}},
+            {**policy, "vm_tags": {"Issue90-Run": "x"}},
+            {**policy, "vm_tags": {"a": "1", "A": "2"}},
+            {**policy, "vm_tags": {"a": 1}},
+            {**policy, "user_assigned_identity": policy["user_assigned_identity"]
+             .replace(self.state["subscription"], str(uuid.uuid4()))},
+            {**policy, "user_assigned_identity": "relative/identity"},
+        ):
+            with self.subTest(policy=invalid):
+                directory = parent / uuid.uuid4().hex
+                with self.assertRaisesRegex(ValueError, "Azure policy"):
+                    lane.plan(directory, self.state["subscription"], invalid)
+                self.assertFalse(directory.exists())
+        directory = parent / uuid.uuid4().hex
+        self.addCleanup(shutil.rmtree, directory, True)
+        state = lane.plan(directory, self.state["subscription"], {
+            **policy, "user_assigned_identity": None})
+        self.assertEqual(lane.load(directory)["azure_policy"]["vm_tags"],
+                         policy["vm_tags"])
+        in_group = {**policy, "user_assigned_identity": (
+            f"{lane.group_id(state)}/providers/Microsoft.ManagedIdentity/"
+            "userAssignedIdentities/PolicyUA")}
+        with self.assertRaisesRegex(ValueError, "Azure policy"):
+            lane.validate_azure_policy(in_group, state["subscription"],
+                                       state["prefix"] + "-rg")
+        self.assertIsNone(self.state["azure_policy"])
+        self.assertIsNone(lane.envelope(self.state)["azure_policy"])
+        self._pin_policy()
+        self.assertEqual(lane.envelope(lane.load(self.directory))["azure_policy"], policy)
 
     def test_nic_attachment_shapes_follow_cli_and_pinned_rest_sources(self):
         run = lane.TopologyRun(self.state, self.directory)

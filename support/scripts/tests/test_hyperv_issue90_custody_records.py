@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Synthetic signed #90 custody records; no Azure calls or operator keys."""
 
+from copy import deepcopy
 from datetime import datetime, timezone
 from dataclasses import replace
 import hashlib
@@ -34,7 +35,8 @@ def signature_key(key):
 
 
 class Fixture:
-    def __init__(self, state=None, expected_changes=None):
+    def __init__(self, state=None, expected_changes=None, vm_identity=None):
+        self.vm_identity = vm_identity
         self.signer = Ed25519PrivateKey.generate()
         self.witness = Ed25519PrivateKey.generate()
         self.archive = {}
@@ -208,6 +210,8 @@ class Fixture:
                 "issue90-run": self.expected.run_id,
                 "issue90-operation": self.expected.operation_id,
             }
+        if role == "vm" and self.vm_identity is not None:
+            result["identity"] = deepcopy(self.vm_identity)
         if role in ("dummy", "os", "data0", "data7"):
             result["uniqueId"] = self.uuids[role]
             size = (azure.VIRTUAL_SIZE if role in ("dummy", "os")
@@ -1044,18 +1048,63 @@ class CustodyRecordsTests(unittest.TestCase):
                 else:
                     getattr(self.fixture, stage)["evidence"][field] = ref
                 self.fixture.resign_prepared()
-                with self.assertRaisesRegex(ValueError, "managed identity"):
+                with self.assertRaisesRegex(ValueError, "unpinned managed identity"):
                     self.handoff()
-        # Real user-assigned identity keys are resource IDs beyond the parser key limit.
-        for identity, reason in zip(identities, ("Deallocation and original OS swap",
-                                                 "Custody JSON key exceeds limit")):
+        for identity in identities:
             with self.subTest(deallocation=identity["type"]):
                 self.fixture = Fixture()
                 view = self.fixture.instance_view()
                 view["identity"] = identity
                 self.fixture.handoff["evidence"]["deallocation"] = self.fixture.put(view)
-                with self.assertRaisesRegex(ValueError, reason):
+                with self.assertRaisesRegex(ValueError, "Deallocation and original OS swap"):
                     self.handoff(handoff=self.fixture.sign(self.fixture.handoff))
+
+    def _policy(self, subscription="11111111-1111-4111-8111-111111111111"):
+        return {
+            "vm_tags": {"policy-pack": "nonprod"},
+            "user_assigned_identity": (
+                f"/subscriptions/{subscription}/resourceGroups/PolicyRG/providers/"
+                "Microsoft.ManagedIdentity/userAssignedIdentities/PolicyUA-northeurope"
+            ),
+        }
+
+    def _policy_identity(self):
+        # A real policy identity key is a full ARM ID longer than 80 characters.
+        return {
+            "type": "SystemAssigned, UserAssigned",
+            "principalId": str(uuid.uuid4()), "tenantId": str(uuid.uuid4()),
+            "userAssignedIdentities": {self._policy()["user_assigned_identity"]: {}},
+        }
+
+    def test_pinned_policy_identity_is_accepted_in_every_vm_observation(self):
+        self.fixture = Fixture(expected_changes={"azure_policy": self._policy()},
+                               vm_identity=self._policy_identity())
+        vm = self.fixture.archive[self.fixture.handoff["evidence"]["vm"]["sha256"]]
+        self.assertIn(b"userAssignedIdentities", vm)
+        self.assertEqual(self.handoff(), self.fixture.sha(self.fixture.handoff_raw))
+
+    def test_policy_identity_is_refused_without_the_exact_pin(self):
+        foreign = self._policy()
+        foreign["user_assigned_identity"] = foreign["user_assigned_identity"].replace(
+            "PolicyUA", "OtherUA")
+        for changes in ({}, {"azure_policy": foreign},
+                        {"azure_policy": {**self._policy(),
+                                          "user_assigned_identity": None}}):
+            with self.subTest(changes=changes):
+                self.fixture = Fixture(expected_changes=changes,
+                                       vm_identity=self._policy_identity())
+                with self.assertRaisesRegex(ValueError, "unpinned managed identity"):
+                    self.handoff()
+
+    def test_expected_policy_allowance_is_validated(self):
+        for policy in (
+            {"vm_tags": {"policy-pack": "nonprod"}},
+            {**self._policy(), "vm_tags": {"issue90-run": "x"}},
+            self._policy(subscription=str(uuid.uuid4())),
+        ):
+            with self.subTest(policy=policy):
+                with self.assertRaisesRegex(ValueError, "Azure policy"):
+                    replace(Fixture().expected, azure_policy=policy).validate()
 
     def test_rest_vm_observation_requires_nested_nic_options(self):
         rest = Fixture.rest_vm(self.fixture.vm("os", deallocated=False))
