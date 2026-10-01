@@ -1139,9 +1139,8 @@ custody format above. It can generate self-held test Ed25519 keys, record an
 injectable `az`-like runner's original stdout bytes into a private
 content-addressed archive plus append-only journal, assemble PREPARED and
 HANDED_OFF envelopes from those observations, and call `inspect_handoff(...)`
-against an independently supplied `Expected`. Its live entry point is
-intentionally closed and raises before any Azure call; tests drive the phase
-sequence with fakes only.
+against an independently supplied `Expected`. Tests drive the phase sequence
+with fakes only.
 
 `hyperv_issue90_custodian.py keys <private-dir>` creates a new 0700 directory
 and refuses to reuse an existing one. It writes one 0600 raw private key and one
@@ -1160,6 +1159,54 @@ journaled deployment/deallocation timestamps unless an explicit larger value is
 supplied. A private `azure_policy` pin in the supplied `Expected` context is
 honored exactly as by the topology controller; without it, any policy-added VM
 identity is refused.
+
+The `live` entry point exists **only for one signed disposable dry run**
+(zero-content VHDs, everything deleted afterwards). **Acceptance remains
+unavailable**: any approval mode other than `disposable-dry-run` is refused,
+and without a valid approval `live` refuses before any Azure call.
+`approve-dry-run` writes a new 0600 approval: canonical JSON
+`{"body", "signature"}`, where the signature is Ed25519 over
+`uk-hyperv-issue90-custodian-live-approval-v1\n` plus the canonical body. The
+body has exactly `schema`, `version` (1), `mode`, `subscription_sha256`,
+`location` (`northeurope`), `run_id`, `operation_id`, `group_id`,
+`not_before_utc`, `not_after_utc`, `max_vm_running_seconds` (1..3600),
+`cleanup` (`delete-owned-group`) and `nonce`. It takes the run, operation and
+group from an `--expected-json` whose preprovision digest may be a
+placeholder, then prints the approval digest. The caller must set
+`Expected.preprovision_authorization_sha256` to that digest.
+
+Before any Azure call, `live` checks the following. The approval must be a
+private file, signed by an approver key that differs from the custodian key.
+It must be bound to the SHA-256 of the private subscription UUID, the exact
+expected run, operation and group, and the plan's region. Every expected
+resource ID must lie inside that group. The current time must fall inside a
+positive window of at most 300 minutes. `Expected` must carry the approval's
+digest, the ARM template bytes must match `Expected.template_sha256`, and the
+custodian key pair must match. The records directory and replay registry must
+not already hold this run's records or claims. A replay-registry claim then
+consumes the approval once.
+
+Every `az` call is pinned with `--subscription`; the journal records argv
+without it. After `not_after_utc`, the runner refuses further calls.
+`az group exists` must report `false` before `group create`, so an existing
+group is never adopted. A failed upload still revokes write access. The VHD
+upload checks the local file's digest and size before sending any bytes. If
+the journaled dummy VM runtime exceeds the approved budget, the run refuses
+the OS swap. The tool then signs and verifies the records; the handoff
+expires by `not_after_utc`.
+
+Cleanup always runs, without a deadline, whenever this journal recorded
+`group create`. It deletes the group only if:
+
+- the group's ID and owner tags match;
+- every listed resource is inside the group and tagged with this run and
+  operation.
+
+It deallocates an undeallocated VM best-effort, then requires
+`group exists` to report `false`. The run passes only if verification
+passed **and** the group was deleted. Output is PASS/FAIL with a sanitized
+reason and the cleanup status. If self-held **TEST-ONLY** keys are used,
+they are not independent custody.
 
 ### Separate offline dummy-OS ARM candidate (not a deployment approval)
 
