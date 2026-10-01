@@ -45,6 +45,47 @@ pub const policy = struct {
     pub const os_disk_hour_microusd: u64 = 250_000;
     pub const estimated_cost_upper_bound_microusd: u64 = 9_500_000;
     pub const repository_maximum_cost_microusd: u64 = 100_000_000;
+    pub const resources = struct {
+        pub const vm_count: u8 = 1;
+        pub const os_disk_count: u8 = 1;
+        pub const data_disk_count: u8 = 0;
+        pub const public_ip_count: u8 = 0;
+        pub const boot_count: u8 = 2;
+        pub const maximum_parallelism: u8 = 1;
+        pub const generation: u8 = 2;
+        pub const os_disk_sku = "StandardSSD_LRS";
+        pub const os_disk_capacity_bytes: u64 = fixed_vhd_capacity_bytes;
+        pub const network = "private_no_default_outbound";
+    };
+    pub const substitution = struct {
+        pub const source = false;
+        pub const image = false;
+        pub const topology = false;
+        pub const workload = false;
+    };
+    pub const cleanup = struct {
+        pub const exact_owned_resources_only = true;
+        pub const delete_owned_resource_group = true;
+        pub const independent_absence_observation = true;
+        pub const replacement_resources = false;
+    };
+};
+
+pub const uuid = struct {
+    pub const normalization_inputs = [_][]const u8{
+        "00000000000040008000000000000001",
+        "{00000000-0000-4000-8000-000000000001}",
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-00000000000A",
+    };
+    pub const normalization_outputs = [_][]const u8{
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-00000000000a",
+    };
+    pub const generated_attempt_id = "00000000-0000-4000-8000-000000000101";
+    pub const generated_ledger_id = "00000000-0000-4000-8000-000000000102";
 };
 
 pub const cli = struct {
@@ -103,9 +144,9 @@ pub const schema_fields = struct {
     pub const azure_runtime_isolation = [_][]const u8{ "python_home", "module_layout", "extensions", "dynamic_extension_install", "user_site", "site_import", "bytecode_writes", "path_environment", "startup_hooks", "loader_environment", "host_loader_fallback", "package_restore" };
     pub const ledger = [_][]const u8{ "schema", "version", "purpose", "campaign_id", "ledger_id", "directory", "initialization_required", "initial_state_sha256", "marker_sha256" };
     pub const ledger_directory = [_][]const u8{ "device_major", "device_minor", "inode", "uid", "mode" };
-    pub const run = [_][]const u8{ "repository", "run_id", "run_attempt" };
+    pub const run = [_][]const u8{ "repository", "run_attempt", "run_id" };
     pub const identity = [_][]const u8{ "wamr_revision", "wasm_sha256", "cwasm_sha256", "runtime_sha256", "compiler_sha256", "config_sha256" };
-    pub const lineage = [_][]const u8{ "raw_sha256", "accepted_qcow2_sha256", "derived_vhd_sha256", "qcow2_finalization_sha256", "qcow2_acceptance_sha256", "fixed_vhd_derivation_sha256", "fixed_vhd_derivation_gate_sha256", "final_inspection_sha256" };
+    pub const lineage = [_][]const u8{ "accepted_qcow2_sha256", "derived_vhd_sha256", "final_inspection_sha256", "fixed_vhd_derivation_gate_sha256", "fixed_vhd_derivation_sha256", "qcow2_acceptance_sha256", "qcow2_finalization_sha256", "raw_sha256" };
     pub const resources = [_][]const u8{ "vm_count", "os_disk_count", "data_disk_count", "public_ip_count", "boot_count", "maximum_parallelism", "generation", "os_disk_sku", "os_disk_capacity_bytes", "network" };
     pub const substitution = [_][]const u8{ "source", "image", "topology", "workload" };
     pub const cleanup = [_][]const u8{ "exact_owned_resources_only", "delete_owned_resource_group", "independent_absence_observation", "replacement_resources" };
@@ -115,8 +156,8 @@ pub const schema_fields = struct {
     pub const approval_limits = [_][]const u8{ "runtime_seconds", "cleanup_seconds", "operation_seconds", "maximum_parallelism", "boot_count", "retry_count" };
     pub const plan = [_][]const u8{ "schema", "version", "purpose", "profile", "authority", "canonicalization", "created_unix", "attempt_id", "campaign_id", "campaign_profile", "ledger_path", "ledger", "subscription", "location", "prefix", "vm_size", "serial_mode", "runtime_seconds", "cleanup_seconds", "operation_seconds", "poll_seconds", "source_revision", "source_tree", "run", "identity", "lineage", "candidate", "bundle", "public_bundle", "transport", "qcow2", "os_vhd", "vhd_bytes", "vhd_capacity_bytes", "artifact_id", "inner_zip_sha256", "container_digest", "resources", "retry_count", "substitution", "cleanup", "cost", "tools", "azure_runtime_document", "azure_runtime" };
     pub const approval_template = [_][]const u8{ "schema", "version", "decision", "plan_sha256", "attempt_id", "campaign_id", "ledger_id", "ledger_initialization_required", "candidate_sha256", "estimated_cost_upper_bound_microusd", "maximum_authorized_cost_microusd", "limits", "azure_runtime" };
-    pub const authorization = [_][]const u8{ "schema", "version", "plan_sha256", "attempt_id", "campaign_id", "ledger_id", "ledger_initialization_required", "candidate_sha256", "estimated_cost_upper_bound_microusd", "maximum_authorized_cost_microusd", "limits", "azure_runtime", "approver", "reference", "recorded_unix", "expires_unix", "decision" };
-    pub const admission = [_][]const u8{ "purpose", "profile", "canonicalization", "created_unix", "attempt_id", "campaign_id", "campaign_profile", "ledger_path", "ledger", "subscription", "location", "prefix", "vm_size", "serial_mode", "runtime_seconds", "cleanup_seconds", "operation_seconds", "poll_seconds", "source_revision", "source_tree", "run", "identity", "lineage", "candidate", "bundle", "public_bundle", "transport", "qcow2", "os_vhd", "vhd_bytes", "vhd_capacity_bytes", "artifact_id", "inner_zip_sha256", "container_digest", "resources", "retry_count", "substitution", "cleanup", "cost", "tools", "azure_runtime_document", "azure_runtime", "schema", "version", "authority", "plan", "authorization", "approval" };
+    pub const authorization = [_][]const u8{ "schema", "version", "decision", "plan_sha256", "attempt_id", "campaign_id", "ledger_id", "ledger_initialization_required", "candidate_sha256", "estimated_cost_upper_bound_microusd", "maximum_authorized_cost_microusd", "limits", "azure_runtime", "approver", "reference", "recorded_unix", "expires_unix" };
+    pub const admission = [_][]const u8{ "artifact_id", "attempt_id", "azure_runtime", "azure_runtime_document", "bundle", "campaign_id", "campaign_profile", "candidate", "canonicalization", "cleanup", "cleanup_seconds", "container_digest", "cost", "created_unix", "identity", "inner_zip_sha256", "ledger", "ledger_path", "lineage", "location", "operation_seconds", "os_vhd", "poll_seconds", "prefix", "profile", "public_bundle", "purpose", "qcow2", "resources", "retry_count", "run", "runtime_seconds", "serial_mode", "source_revision", "source_tree", "subscription", "substitution", "tools", "transport", "vhd_bytes", "vhd_capacity_bytes", "vm_size", "schema", "version", "authority", "plan", "authorization", "approval" };
     pub const admission_approval = [_][]const u8{ "approver", "reference", "approved_unix", "expires_unix" };
 };
 

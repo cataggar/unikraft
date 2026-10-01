@@ -9,7 +9,7 @@ const golden = @embedFile("goldens/contracts.json");
 const scenarios = @embedFile("goldens/python-scenarios.json");
 
 const golden_fields = struct {
-    pub const root = [_][]const u8{ "schema", "schema_version", "authority_domain", "canonicalization", "cli", "limits", "policy", "azure_runtime", "schemas", "canonical_records", "uuid_normalization", "generated_ids" };
+    pub const root = [_][]const u8{ "schema", "schema_version", "authority_domain", "canonicalization", "cli", "limits", "policy", "azure_runtime", "schemas", "canonical_records", "uuid_normalization", "generated_ids", "live_success_scenarios", "live_refusal_scenarios" };
     pub const cli_root = [_][]const u8{ "commands", "exit_contract" };
     pub const command = [_][]const u8{ "options", "required", "optional", "repeated_required", "repeated_optional" };
     pub const exit_contract = [_][]const u8{ "help_exit", "malformed_exit", "refusal_exit", "refusal_stdout", "refusal_stderr", "success_exit", "success_stdout", "validator_probe_streams_public" };
@@ -20,6 +20,9 @@ const golden_fields = struct {
     pub const manifest = [_][]const u8{ "header", "directory", "file", "loader", "parent", "sample" };
     pub const records = [_][]const u8{ "azure_runtime", "plan", "approval_template", "authorization_approved", "authorization_denied", "admission" };
     pub const inventory = [_][]const u8{ "schema", "schema_version", "sources", "source_counts", "count", "scenarios" };
+    pub const uuid_normalization = [_][]const u8{ "input", "normalized" };
+    pub const generated_ids = [_][]const u8{ "attempt_id", "ledger_id" };
+    pub const live_refusal = [_][]const u8{ "name", "refused", "exception", "reason", "output_file_appeared", "outputs" };
 };
 
 test "Python authority golden is canonical and matches native literal tables" {
@@ -36,6 +39,8 @@ test "Python authority golden is canonical and matches native literal tables" {
     try expectAzureRuntime(root.get("azure_runtime") orelse return error.MissingGolden);
     try expectSchemas(root.get("schemas") orelse return error.MissingGolden);
     try expectCanonicalRecords(root.get("canonical_records") orelse return error.MissingGolden);
+    try expectUuid(root);
+    try expectLiveRefusals(root.get("live_refusal_scenarios") orelse return error.MissingGolden);
 }
 
 test "authority contract helper boundaries are frozen" {
@@ -93,6 +98,8 @@ fn expectCli(value: std.json.Value) !void {
     try expectLiteral(exits, "success_stdout", contracts.success_stdout);
     try expectLiteral(exits, "refusal_stderr", contracts.refusal_stderr);
     try expectLiteral(exits, "refusal_stdout", "");
+    try expectExitMap(exits, "help_exit", 0);
+    try expectExitMap(exits, "malformed_exit", 2);
     try expectInt(exits, "success_exit", @as(u8, 0));
     try expectInt(exits, "refusal_exit", @as(u8, 1));
     try std.testing.expect(!(exits.get("validator_probe_streams_public") orelse return error.MissingGolden).bool);
@@ -119,6 +126,41 @@ fn expectCommand(commands: std.json.ObjectMap, name: []const u8, required: []con
     }
 }
 
+fn expectExitMap(map: std.json.ObjectMap, key: []const u8, expected: u8) !void {
+    const exits = try c.exactFields(map.get(key) orelse return error.MissingGolden, &contracts.cli.commands);
+    for (contracts.cli.commands) |command| try expectInt(exits, command, expected);
+}
+
+fn expectResources(value: std.json.Value) !void {
+    const resources = try c.exactFields(value, &contracts.schema_fields.resources);
+    try expectInt(resources, "vm_count", contracts.policy.resources.vm_count);
+    try expectInt(resources, "os_disk_count", contracts.policy.resources.os_disk_count);
+    try expectInt(resources, "data_disk_count", contracts.policy.resources.data_disk_count);
+    try expectInt(resources, "public_ip_count", contracts.policy.resources.public_ip_count);
+    try expectInt(resources, "boot_count", contracts.policy.resources.boot_count);
+    try expectInt(resources, "maximum_parallelism", contracts.policy.resources.maximum_parallelism);
+    try expectInt(resources, "generation", contracts.policy.resources.generation);
+    try expectLiteral(resources, "os_disk_sku", contracts.policy.resources.os_disk_sku);
+    try expectInt(resources, "os_disk_capacity_bytes", contracts.policy.resources.os_disk_capacity_bytes);
+    try expectLiteral(resources, "network", contracts.policy.resources.network);
+}
+
+fn expectSubstitution(value: std.json.Value) !void {
+    const substitution = try c.exactFields(value, &contracts.schema_fields.substitution);
+    try expectBool(substitution, "source", contracts.policy.substitution.source);
+    try expectBool(substitution, "image", contracts.policy.substitution.image);
+    try expectBool(substitution, "topology", contracts.policy.substitution.topology);
+    try expectBool(substitution, "workload", contracts.policy.substitution.workload);
+}
+
+fn expectCleanup(value: std.json.Value) !void {
+    const cleanup = try c.exactFields(value, &contracts.schema_fields.cleanup);
+    try expectBool(cleanup, "exact_owned_resources_only", contracts.policy.cleanup.exact_owned_resources_only);
+    try expectBool(cleanup, "delete_owned_resource_group", contracts.policy.cleanup.delete_owned_resource_group);
+    try expectBool(cleanup, "independent_absence_observation", contracts.policy.cleanup.independent_absence_observation);
+    try expectBool(cleanup, "replacement_resources", contracts.policy.cleanup.replacement_resources);
+}
+
 fn expectPolicy(value: std.json.Value) !void {
     const root = try c.exactFields(value, &golden_fields.policy_root);
     try expectLiteral(root, "purpose", contracts.policy.purpose);
@@ -135,6 +177,9 @@ fn expectPolicy(value: std.json.Value) !void {
     try expectInt(root, "fixed_vhd_bytes", contracts.policy.fixed_vhd_bytes);
     try expectInt(root, "fixed_vhd_capacity_bytes", contracts.policy.fixed_vhd_capacity_bytes);
     try expectInt(root, "retry_count", contracts.policy.retry_count);
+    try expectResources(root.get("resources") orelse return error.MissingGolden);
+    try expectSubstitution(root.get("substitution") orelse return error.MissingGolden);
+    try expectCleanup(root.get("cleanup") orelse return error.MissingGolden);
     const cost = try c.exactFields(root.get("cost") orelse return error.MissingGolden, &golden_fields.cost_policy);
     try expectLiteral(cost, "unit", contracts.policy.cost_unit);
     try expectLiteral(cost, "policy", contracts.policy.cost_policy);
@@ -181,6 +226,33 @@ fn expectCanonicalRecords(value: std.json.Value) !void {
     defer template.deinit();
     const fields = template.value().object;
     try expectLiteral(fields, "plan_sha256", &hex);
+}
+
+fn expectUuid(root: std.json.ObjectMap) !void {
+    const items = (root.get("uuid_normalization") orelse return error.MissingGolden).array.items;
+    try std.testing.expectEqual(contracts.uuid.normalization_inputs.len, items.len);
+    for (items, 0..) |item, index| {
+        const m = try c.exactFields(item, &golden_fields.uuid_normalization);
+        try expectLiteral(m, "input", contracts.uuid.normalization_inputs[index]);
+        try expectLiteral(m, "normalized", contracts.uuid.normalization_outputs[index]);
+    }
+    const generated = try c.exactFields(root.get("generated_ids") orelse return error.MissingGolden, &golden_fields.generated_ids);
+    try expectLiteral(generated, "attempt_id", contracts.uuid.generated_attempt_id);
+    try expectLiteral(generated, "ledger_id", contracts.uuid.generated_ledger_id);
+}
+
+fn expectLiveRefusals(value: std.json.Value) !void {
+    const items = value.array.items;
+    try std.testing.expect(items.len >= 16);
+    for (items) |item| {
+        const m = try c.exactFields(item, &golden_fields.live_refusal);
+        try expectBool(m, "refused", true);
+        try expectLiteral(m, "exception", "wamr_native_ci.Refusal");
+        try expectBool(m, "output_file_appeared", false);
+        _ = try c.string(m.get("name") orelse return error.MissingGolden);
+        _ = try c.string(m.get("reason") orelse return error.MissingGolden);
+        _ = (m.get("outputs") orelse return error.MissingGolden).object;
+    }
 }
 
 fn expectRecord(records: std.json.ObjectMap, key: []const u8, fields: []const []const u8, schema: []const u8) ![]const u8 {
@@ -240,4 +312,8 @@ fn expectLiteral(map: std.json.ObjectMap, key: []const u8, expected: []const u8)
 
 fn expectInt(map: std.json.ObjectMap, key: []const u8, expected: anytype) !void {
     try std.testing.expectEqual(@as(@TypeOf(expected), expected), try c.integer(@TypeOf(expected), map.get(key) orelse return error.MissingGolden));
+}
+
+fn expectBool(map: std.json.ObjectMap, key: []const u8, expected: bool) !void {
+    try std.testing.expectEqual(expected, (map.get(key) orelse return error.MissingGolden).bool);
 }
