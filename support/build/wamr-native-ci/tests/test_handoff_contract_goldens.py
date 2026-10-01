@@ -5,13 +5,18 @@
 Regenerate intentionally with:
   python3 -B support/build/wamr-native-ci/tests/test_handoff_contract_goldens.py --write
 """
-import copy, importlib.util, json, os, sys, tempfile, unittest, zipfile
+import contextlib, copy, importlib.util, io, json, os, shutil, stat, sys, tempfile, unittest, zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
 WAMR_CI = ROOT / "support/build/wamr-native-ci"
 FIXTURES = WAMR_CI / "tests/fixtures/differential"
 GOLDEN = WAMR_CI / "handoff/goldens/contracts-profile-layout.json"
+ZIP_MULTI = WAMR_CI / "handoff/goldens/zip-stored-multi.zip"
+ZIP_EMPTY = WAMR_CI / "handoff/goldens/zip-stored-empty.zip"
+ROOT_BOUND_V1 = WAMR_CI / "handoff/goldens/root-bound-v1.json"
+ROOT_BOUND_V2 = WAMR_CI / "handoff/goldens/root-bound-v2.json"
+ROOT_BOUND_STAGE = "/opt/wamr-handoff-golden-stage"
 SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 REV = "0123456789012345678901234567890123456789"
 UUID = "00000000-0000-4000-8000-000000000001"
@@ -26,6 +31,50 @@ def load(name):
 
 def artifact(path, size=1):
     return {"path": path, "size": size, "sha256": SHA}
+
+
+def scratch_parent():
+    path = ROOT / ".zig-cache/handoff-python-goldens"
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+    return path
+
+
+@contextlib.contextmanager
+def private_tempdir(prefix):
+    raw = tempfile.mkdtemp(prefix=prefix, dir=scratch_parent())
+    try:
+        root = Path(raw).resolve()
+        os.chmod(root, 0o700)
+        yield root
+    finally:
+        shutil.rmtree(raw, ignore_errors=True)
+
+
+def zip_fixture(entries):
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_STORED, allowZip64=False) as zipped:
+        for name, raw in entries:
+            info = zipfile.ZipInfo(name)
+            info.create_system = 3
+            info.external_attr = (stat.S_IFREG | 0o600) << 16
+            zipped.writestr(info, raw)
+    return out.getvalue()
+
+
+def zip_multi_golden():
+    return zip_fixture((
+        ("alpha.txt", b"alpha\n"),
+        ("dir/nested.bin", b"\x00stored bytes\n"),
+        ("omega.dat", b"last member"),
+    ))
+
+
+def zip_empty_golden():
+    return zip_fixture((
+        ("empty.bin", b""),
+        ("nonempty.txt", b"non-empty\n"),
+    ))
 
 
 def source_context(public_bundle, handoff):
@@ -125,9 +174,7 @@ def materialize_bundle(handoff, public_bundle, stage, version):
 
 
 def packed_records(handoff, public_bundle, version):
-    with tempfile.TemporaryDirectory(prefix="handoff-contract-pack-") as raw:
-        root = Path(raw).resolve()
-        os.chmod(root, 0o700)
+    with private_tempdir("handoff-contract-pack-") as root:
         stage = root / "stage"
         stage.mkdir(mode=0o700)
         out = root / "out"
@@ -182,9 +229,7 @@ def artifact_limits(handoff, public_bundle, version):
 
 
 def candidate_records(handoff, public_bundle, version):
-    with tempfile.TemporaryDirectory(prefix="handoff-contract-") as raw:
-        root = Path(raw).resolve()
-        os.chmod(root, 0o700)
+    with private_tempdir("handoff-contract-") as root:
         stage = root / "stage"
         stage.mkdir(mode=0o700)
         bundle = materialize_bundle(handoff, public_bundle, stage, version)
@@ -212,6 +257,33 @@ def candidate_records(handoff, public_bundle, version):
             if version == 2 else None
         )
         return candidate, admission, transport
+
+
+def root_bound_bundle(handoff, public_bundle, version):
+    with private_tempdir("handoff-contract-root-bound-") as root:
+        stage = root / "stage"
+        stage.mkdir(mode=0o700)
+        bundle = materialize_bundle(handoff, public_bundle, stage, version)
+        selected = public_bundle.members(handoff, bundle, stage)
+        assert len(selected) + 2 == (
+            public_bundle.V1_ZIP_MEMBERS if version == 1 else public_bundle.V2_ZIP_MEMBERS)
+        actual = stage.as_posix()
+
+    def normalize(value):
+        if isinstance(value, dict):
+            return {
+                key: (ROOT_BOUND_STAGE + raw[len(actual):]
+                      if key == "path" and isinstance(raw := item, str)
+                      and raw.startswith(actual + "/") else normalize(item))
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [normalize(item) for item in value]
+        return value
+
+    normalized = normalize(bundle)
+    public_bundle.members(handoff, normalized, Path(ROOT_BOUND_STAGE))
+    return public_bundle.encoded(normalized)
 
 
 def contract_golden():
@@ -305,6 +377,11 @@ def contract_golden():
 class HandoffContractGoldens(unittest.TestCase):
     def test_python_oracle_matches_checked_in_golden(self):
         self.assertEqual(GOLDEN.read_text(encoding="utf-8"), contract_golden())
+        self.assertEqual(ZIP_MULTI.read_bytes(), zip_multi_golden())
+        self.assertEqual(ZIP_EMPTY.read_bytes(), zip_empty_golden())
+        handoff, public_bundle = load("handoff"), load("public_bundle")
+        self.assertEqual(ROOT_BOUND_V1.read_bytes(), root_bound_bundle(handoff, public_bundle, 1))
+        self.assertEqual(ROOT_BOUND_V2.read_bytes(), root_bound_bundle(handoff, public_bundle, 2))
 
     def test_python_members_match_zig_sample_verdicts(self):
         handoff, public_bundle = load("handoff"), load("public_bundle")
@@ -327,9 +404,7 @@ class HandoffContractGoldens(unittest.TestCase):
 
     def test_python_accepts_real_root_bound_handoff_and_v1_candidate(self):
         handoff, public_bundle = load("handoff"), load("public_bundle")
-        with tempfile.TemporaryDirectory(prefix="handoff-contract-root-") as raw:
-            root = Path(raw).resolve()
-            os.chmod(root, 0o700)
+        with private_tempdir("handoff-contract-root-") as root:
             stage = root / "stage"
             stage.mkdir(mode=0o700)
             bundle = materialize_bundle(handoff, public_bundle, stage, 2)
@@ -349,5 +424,10 @@ class HandoffContractGoldens(unittest.TestCase):
 if __name__ == "__main__":
     if sys.argv[1:] == ["--write"]:
         GOLDEN.write_text(contract_golden(), encoding="utf-8")
+        ZIP_MULTI.write_bytes(zip_multi_golden())
+        ZIP_EMPTY.write_bytes(zip_empty_golden())
+        handoff, public_bundle = load("handoff"), load("public_bundle")
+        ROOT_BOUND_V1.write_bytes(root_bound_bundle(handoff, public_bundle, 1))
+        ROOT_BOUND_V2.write_bytes(root_bound_bundle(handoff, public_bundle, 2))
     else:
         unittest.main()
