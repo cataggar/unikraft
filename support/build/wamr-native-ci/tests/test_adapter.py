@@ -606,10 +606,17 @@ class NativeRecordBridge(unittest.TestCase):
         evidence = runtime / "compute/evidence"
         evidence.mkdir(mode=0o700)
         supervisor = runtime / "compute/supervisor/bin/wamr-ci-supervisor"
+        expected_tools = {
+            name: f"/recorded/{name}" for name in handoff.ci.HOST_TOOLS
+        }
         start = {
             "command_supervisor": {},
             "consumer_inputs": {"files": {
                 "command-supervisor": {"path": str(supervisor)},
+                **{
+                    "tool:" + name: {"path": path}
+                    for name, path in expected_tools.items()
+                },
             }},
         }
         source = {"revision": "1" * 40, "tree": "2" * 40}
@@ -623,11 +630,22 @@ class NativeRecordBridge(unittest.TestCase):
             handoff.ci.save(evidence / f"{mode}-compute.json", {})
         phases = []
         output = root / "handoff"
+
+        def check_boot_binding(*unused_args, **unused_kwargs):
+            self.assertEqual(
+                handoff.ci.COMMAND_SUPERVISOR_PATH, str(supervisor))
+            self.assertEqual(handoff.ci.COMMAND_TOOL_PATHS, expected_tools)
+            self.assertEqual(
+                handoff.ci.COMMAND_ENVIRONMENT["WAMR_CI_SUPERVISOR"],
+                str(supervisor))
+            self.assertEqual(
+                handoff.ci.COMMAND_ENVIRONMENT["WAMR_CI_TOOL_GIT"],
+                expected_tools["git"])
+            return {}
+
         with mock.patch.object(
                 handoff, "_selected_records",
                 return_value=(None, {"build-start.json": "0" * 64})), \
-                mock.patch.object(
-                    handoff.ci, "bind_command_tools"), \
                 mock.patch.object(
                     handoff.ci, "producer_inputs", return_value=start), \
                 mock.patch.object(
@@ -635,12 +653,17 @@ class NativeRecordBridge(unittest.TestCase):
                 mock.patch.object(
                     handoff.ci, "boot_input_state"), \
                 mock.patch.object(
-                    handoff.ci, "check_boot", return_value={}), \
+                    handoff.ci, "check_boot",
+                    side_effect=check_boot_binding), \
                 mock.patch.object(
                     handoff.ci, "require_build_custody"), \
                 mock.patch.object(
                     handoff.ci, "consumer_file_records", return_value={}), \
                 mock.patch.object(handoff.ci, "COMMAND_SUPERVISOR_PATH", None), \
+                mock.patch.dict(
+                    handoff.ci.COMMAND_TOOL_PATHS, {}, clear=True), \
+                mock.patch.dict(
+                    handoff.ci.COMMAND_ENVIRONMENT, {}, clear=True), \
                 mock.patch.object(
                     handoff.ci, "execute") as execute, \
                 mock.patch.object(
@@ -665,11 +688,17 @@ class NativeRecordBridge(unittest.TestCase):
         runtime.mkdir(mode=0o700)
         compute.mkdir(mode=0o700)
         evidence.mkdir(mode=0o700)
+        supervisor = runtime / "compute/supervisor/bin/wamr-ci-supervisor"
         source = {
             "revision": "3c6d5d98dc5736d86e97884184b26be39c3f11d5",
             "tree": "feb57a66615a6083378c7261e1e53c37730e0650",
         }
-        start = {"source": source, "consumer_inputs": {"files": {}}}
+        start = {
+            "source": source,
+            "consumer_inputs": {"files": {
+                "command-supervisor": {"path": str(supervisor)},
+            }},
+        }
         build = {"source": source, "runtime": {}}
         for name in public_bundle.EVIDENCE:
             handoff.ci.save(evidence / name, (
@@ -693,17 +722,32 @@ class NativeRecordBridge(unittest.TestCase):
         })
         phases = []
         output = root / "handoff"
+
+        def check_boot_binding(*unused_args, **unused_kwargs):
+            self.assertEqual(
+                handoff.ci.COMMAND_SUPERVISOR_PATH, str(supervisor))
+            self.assertEqual(handoff.ci.COMMAND_TOOL_PATHS, {})
+            self.assertEqual(handoff.ci.COMMAND_ENVIRONMENT, {
+                "WAMR_CI_SUPERVISOR": str(supervisor),
+            })
+            return {}
+
         with mock.patch.object(
                 handoff.ci, "producer_inputs", return_value=start), \
                 mock.patch.object(
                     handoff.ci, "check_build", return_value=build), \
                 mock.patch.object(handoff.ci, "boot_input_state"), \
                 mock.patch.object(
-                    handoff.ci, "check_boot", return_value={}), \
+                    handoff.ci, "check_boot",
+                    side_effect=check_boot_binding), \
                 mock.patch.object(handoff.ci, "require_build_custody"), \
                 mock.patch.object(
                     handoff.ci, "consumer_file_records", return_value={}), \
                 mock.patch.object(handoff.ci, "COMMAND_SUPERVISOR_PATH", None), \
+                mock.patch.dict(
+                    handoff.ci.COMMAND_TOOL_PATHS, {}, clear=True), \
+                mock.patch.dict(
+                    handoff.ci.COMMAND_ENVIRONMENT, {}, clear=True), \
                 mock.patch.object(handoff.ci, "execute") as execute, \
                 mock.patch.object(
                     handoff.accepted_records, "handoff_inspect",
@@ -716,6 +760,35 @@ class NativeRecordBridge(unittest.TestCase):
         native.assert_called_once_with(runtime, output, legacy=True)
         execute.assert_not_called()
         self.assertFalse(output.exists())
+
+    def test_legacy_export_requires_recorded_command_supervisor(self):
+        handoff = self.handoff_module()
+        root, unused_controller = self.controller_fixture("")
+        del unused_controller
+        runtime = root / "runtime"
+        compute = runtime / "compute"
+        evidence = compute / "evidence"
+        runtime.mkdir(mode=0o700)
+        compute.mkdir(mode=0o700)
+        evidence.mkdir(mode=0o700)
+        start = {"consumer_inputs": {"files": {}}}
+        handoff.ci.save(evidence / "result.json", {"schema_version": 1})
+        handoff.ci.save(evidence / "build-start.json", start)
+        phases = []
+        with mock.patch.object(
+                handoff, "_selected_records", return_value=(None, {})), \
+                mock.patch.object(
+                    handoff.ci, "producer_inputs") as custody, \
+                mock.patch.object(handoff.ci, "COMMAND_SUPERVISOR_PATH", None), \
+                mock.patch.dict(
+                    handoff.ci.COMMAND_TOOL_PATHS, {}, clear=True), \
+                mock.patch.dict(
+                    handoff.ci.COMMAND_ENVIRONMENT, {}, clear=True), \
+                self.assertRaisesRegex(
+                    handoff.ci.Refusal, "missing command supervisor input"):
+            handoff.export(runtime, root / "handoff", on_phase=phases.append)
+        self.assertEqual(phases, ["records"])
+        custody.assert_not_called()
 
     def test_real_local_run_requires_completed_runtime(self):
         runtime = os.environ.get("WAMR_CI_NATIVE_LOCAL_RUNTIME")

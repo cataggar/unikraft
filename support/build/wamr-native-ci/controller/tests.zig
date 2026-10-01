@@ -1780,6 +1780,11 @@ test "legacy handoff inspect command fixture matches Python strictness" {
         \\changed["supervisor"]["result"]["command"]["output"]["combined_sha256"]="0"*64
         \\refuse("output-empty-sha", changed)
         \\changed=copy.deepcopy(record)
+        \\non_empty="1"*64
+        \\changed["sha256"]=non_empty
+        \\changed["supervisor"]["result"]["command"]["output"]["combined_sha256"]=non_empty
+        \\refuse("zero-bytes-non-empty-hash", changed)
+        \\changed=copy.deepcopy(record)
         \\changed["supervisor"]["request"]["supervisor"]["identity"]["mode"]=65536
         \\refuse("identity-mode-u16", changed)
         \\sys.stdout.buffer.write(m.ci.canonical_json({"accepted":record,"mutations":mutations}))
@@ -1815,7 +1820,7 @@ test "legacy handoff inspect command fixture matches Python strictness" {
         ));
         refused_count += 1;
     }
-    try std.testing.expectEqual(@as(usize, 4), refused_count);
+    try std.testing.expectEqual(@as(usize, 5), refused_count);
     try std.testing.expectError(error.InvalidCommand, controller.command_validation.validateLegacyV1(
         a,
         accepted,

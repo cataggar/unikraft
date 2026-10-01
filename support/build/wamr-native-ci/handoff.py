@@ -1058,6 +1058,15 @@ def export(runtime, output, *, on_phase=None):
     names = NAMES if version == 1 else V2_NAMES
     expected = ci.document(root / "evidence/build-start.json")
     legacy_supervision = "command_supervisor" not in expected
+    if not legacy_supervision:
+        ci.COMMAND_ENVIRONMENT.update(ci.bind_command_tools(
+            expected["consumer_inputs"]))
+    else:
+        ci.COMMAND_ENVIRONMENT.clear()
+        ci.COMMAND_TOOL_PATHS.clear()
+        supervisor_path = ci.bind_command_supervisor(
+            expected["consumer_inputs"])
+        ci.COMMAND_ENVIRONMENT["WAMR_CI_SUPERVISOR"] = supervisor_path
     phase("custody")
     before = ci.producer_inputs(runtime, expected["consumer_inputs"])
     ci.require(before == expected,
