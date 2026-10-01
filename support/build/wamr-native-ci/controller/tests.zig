@@ -182,7 +182,7 @@ fn handoffInspectFixtures() !void {
     };
     defer accepted.deinit();
     try std.testing.expectError(error.InvalidContext, controller.handoff_inspect.bind(&accepted, "/output"));
-    try std.testing.expectError(error.InvalidContext, controller.handoff_inspect.run(a, io, &accepted, "/output", null));
+    try std.testing.expectError(error.InvalidContext, controller.handoff_inspect.run(a, io, &accepted, "/output", false, null));
     try std.testing.expectError(error.InvalidContext, controller.public_validator_build.run(a, io, &accepted, "/output", null));
     accepted.context = .local_runtime;
     accepted.repository = "/source";
@@ -1738,6 +1738,111 @@ test "historical v2 supervised bindings use the closed imported producer contrac
         verified += 1;
     }
     try std.testing.expectEqual(@as(usize, 18), verified);
+}
+
+test "synthetic v1 supervised command fixtures match the Python oracle" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const script =
+        \\import copy, importlib.util, sys
+        \\s=importlib.util.spec_from_file_location("witness",sys.argv[1])
+        \\m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+        \\e=m.Evidence()
+        \\profile="tiny-aot-two-boot"
+        \\stages=("adapter","local-boot-tool","fixtures","prepare","config","native-image","package","raw-x2apic","raw-legacy-apic","vpc-x2apic","vpc-legacy-apic","inspect","handoff-inspect","handoff-inspect-legacy")
+        \\def check(item):
+        \\    m.ci.validate_supervised_command_binding(item["record"],item["stage"],item["identities"],transport_context=item["transport"],profile=profile)
+        \\accepted={}
+        \\mutations={}
+        \\for stage in stages:
+        \\    transport="producer_direct" if stage.startswith("handoff-inspect") else "trusted_inner_zip"
+        \\    record, identities=e.supervised_binding(stage, profile=profile)
+        \\    item={"stage":stage,"transport":transport,"record":record,"identities":identities}
+        \\    check(item)
+        \\    accepted[stage]=item
+        \\    changed=copy.deepcopy(item)
+        \\    changed["record"]["supervisor"]["request"]["limits"]["stdout_bytes"]+=1
+        \\    e.rehash_supervised_binding(changed["record"])
+        \\    try:
+        \\        check(changed)
+        \\    except m.ci.Refusal:
+        \\        pass
+        \\    else:
+        \\        raise AssertionError(stage+" limit mutation admitted")
+        \\    mutations[stage+"/limit"]=changed
+        \\    changed=copy.deepcopy(item)
+        \\    role=sorted(changed["identities"])[0]
+        \\    changed["identities"][role]["content_sha256"]="0"*64
+        \\    try:
+        \\        check(changed)
+        \\    except m.ci.Refusal:
+        \\        pass
+        \\    else:
+        \\        raise AssertionError(stage+" identity mutation admitted")
+        \\    mutations[stage+"/identity"]=changed
+        \\sys.stdout.buffer.write(m.ci.canonical_json({"accepted":accepted,"mutations":mutations}))
+    ;
+    const witness = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/tests/test_adapter.py" });
+    const response = try std.process.run(a, std.testing.io, .{
+        .argv = &.{ options.python_executable, "-B", "-c", script, witness },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(2 * 1024 * 1024),
+        .stderr_limit = .limited(4096),
+    });
+    if (response.term != .exited or response.term.exited != 0)
+        std.debug.print("v1 command witness: {s}\n", .{response.stderr});
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, response.term);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, response.stdout, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false });
+    defer parsed.deinit();
+    const accepted = try fixtureField(parsed.value, "accepted");
+    const mutations = try fixtureField(parsed.value, "mutations");
+    var accepted_count: usize = 0;
+    for (accepted.object.values()) |item| {
+        try validateLegacyV1Fixture(a, item);
+        accepted_count += 1;
+    }
+    var refused_count: usize = 0;
+    for (mutations.object.values()) |item| {
+        validateLegacyV1Fixture(a, item) catch |err| switch (err) {
+            error.InvalidCommand, error.InvalidCommandIdentity => {
+                refused_count += 1;
+                continue;
+            },
+            else => return err,
+        };
+        return error.MutatedLegacyFixtureAccepted;
+    }
+    try std.testing.expectEqual(@as(usize, 14), accepted_count);
+    try std.testing.expectEqual(@as(usize, 28), refused_count);
+}
+
+fn fixtureField(value: std.json.Value, name: []const u8) !std.json.Value {
+    if (value != .object) return error.InvalidFixture;
+    return value.object.get(name) orelse error.InvalidFixture;
+}
+
+fn fixtureString(value: std.json.Value) ![]const u8 {
+    if (value != .string) return error.InvalidFixture;
+    return value.string;
+}
+
+fn fixtureContext(value: std.json.Value) !controller.command_validation.EvidenceContext {
+    const name = try fixtureString(value);
+    if (std.mem.eql(u8, name, "trusted_inner_zip")) return .trusted_inner_zip;
+    if (std.mem.eql(u8, name, "producer_direct")) return .local_runtime;
+    return error.InvalidFixture;
+}
+
+fn validateLegacyV1Fixture(a: std.mem.Allocator, item: std.json.Value) !void {
+    const stage_name = try fixtureString(try fixtureField(item, "stage"));
+    const stage = std.meta.stringToEnum(controller.command_plan.Stage, stage_name) orelse return error.UnexpectedStage;
+    const context = try fixtureContext(try fixtureField(item, "transport"));
+    const record = try fixtureField(item, "record");
+    const identities = try fixtureField(item, "identities");
+    const checked = try controller.command_validation.validateLegacyV1(a, record, stage, context);
+    try std.testing.expectEqual(stage, checked.stage);
+    try controller.command_validation.validateRoleIdentities(a, record, identities);
 }
 
 fn fixture(allocator: std.mem.Allocator, v2: bool, commands: bool) ![]u8 {

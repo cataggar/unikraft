@@ -9,6 +9,7 @@ const records = @import("records.zig");
 const handoff_controller_role = "native:handoff-inspect-controller";
 
 pub const EvidenceContext = enum { local_runtime, trusted_inner_zip };
+const ContractProfile = enum { current, legacy_v1 };
 pub const ValidatedCommand = struct {
     stage: plan.Stage,
     output_bytes: u64,
@@ -83,12 +84,67 @@ fn matchBinding(a: std.mem.Allocator, observed: std.json.Value, expected: plan.B
 
 const PlanVariant = enum { native, historical_import };
 
+fn legacyV1BootArgv(a: std.mem.Allocator, stage: plan.Stage) ![]plan.Binding {
+    const source_name = switch (stage) {
+        .@"raw-x2apic", .@"raw-legacy-apic" => "unikraft.raw",
+        .@"vpc-x2apic", .@"vpc-legacy-apic" => "unikraft.vhd",
+        else => return error.InvalidCommand,
+    };
+    const source_flag = switch (stage) {
+        .@"raw-x2apic", .@"raw-legacy-apic" => "--raw-disk",
+        .@"vpc-x2apic", .@"vpc-legacy-apic" => "--fixed-vhd",
+        else => unreachable,
+    };
+    const legacy = stage == .@"raw-legacy-apic" or stage == .@"vpc-legacy-apic";
+    var result: std.ArrayList(plan.Binding) = .empty;
+    try result.appendSlice(a, &.{
+        .{ .path = .{ .role = "input:local_boot_tool" } },
+        .{ .literal = source_flag },
+        .{ .path = .{ .role = "work", .relative = try std.fmt.allocPrint(a, "package/{s}", .{source_name}) } },
+        .{ .literal = "--qemu" },
+        .{ .path = .{ .role = "input:qemu" } },
+        .{ .literal = "--ovmf-code" },
+        .{ .path = .{ .role = "input:ovmf_code" } },
+        .{ .literal = "--ovmf-vars" },
+        .{ .path = .{ .role = "input:ovmf_vars" } },
+        .{ .literal = "--work-dir" },
+        .{ .path = .{ .role = "work", .relative = try std.fmt.allocPrint(a, "boot-{s}", .{@tagName(stage)}) } },
+        .{ .literal = "--expect" },
+        .{ .literal = "WAMR_NATIVE_AOT_OK answer=42 teardown=0" },
+        .{ .literal = "--expect-main-return" },
+        .{ .literal = "0" },
+        .{ .literal = "--cpus" },
+        .{ .literal = "1" },
+        .{ .literal = "--timeout" },
+        .{ .literal = "60" },
+    });
+    if (legacy) try result.append(a, .{ .literal = "--disable-x2apic" });
+    if (legacy) try result.appendSlice(a, &.{
+        .{ .literal = "--require-marker" },
+        .{ .literal = "Using legacy xAPIC MMIO" },
+    });
+    const forbidden = [_][]const u8{
+        "HYPERV_ACCEPTANCE",        "UK_HYPERV_IO_READY", "UK_HYPERV_NETWORK_APP_READY",
+        "UK_HYPERV_PLATFORM_READY", "WAMR_NATIVE_WASI=",  "WAMR_NATIVE_AOT_FAIL",
+    };
+    for (forbidden) |marker| try result.appendSlice(a, &.{
+        .{ .literal = "--forbid-marker" },
+        .{ .literal = marker },
+    });
+    if (!legacy) try result.appendSlice(a, &.{
+        .{ .literal = "--forbid-marker" },
+        .{ .literal = "Using legacy xAPIC MMIO" },
+    });
+    return result.toOwnedSlice(a);
+}
+
 fn matchPlan(
     a: std.mem.Allocator,
     request: std.json.Value,
     stage: plan.Stage,
     variant: PlanVariant,
     context: EvidenceContext,
+    contract_profile: ContractProfile,
 ) !void {
     const selected = plan.spec(stage);
     const argv = try get(request, "argv");
@@ -103,7 +159,14 @@ fn matchPlan(
         .{ .path = .{ .role = "source", .relative = "support/build/wamr-native-ci/tests" } },
         .{ .literal = "-v" },
     };
-    const expected_argv = if (historical and stage == .fixtures) historical_fixture else selected.argv;
+    const expected_argv = if (historical and stage == .fixtures)
+        historical_fixture
+    else if (historical and contract_profile == .legacy_v1 and
+        (stage == .@"raw-x2apic" or stage == .@"raw-legacy-apic" or
+            stage == .@"vpc-x2apic" or stage == .@"vpc-legacy-apic"))
+        try legacyV1BootArgv(a, stage)
+    else
+        selected.argv;
     if (argv != .array or argv.array.items.len != expected_argv.len + @as(usize, @intFromBool(wrapper)) * 2)
         return error.InvalidCommand;
     if (wrapper) {
@@ -258,6 +321,25 @@ pub fn validate(
     stage: plan.Stage,
     context: EvidenceContext,
 ) !ValidatedCommand {
+    return validateWithProfile(a, record, stage, context, .current);
+}
+
+pub fn validateLegacyV1(
+    a: std.mem.Allocator,
+    record: std.json.Value,
+    stage: plan.Stage,
+    context: EvidenceContext,
+) !ValidatedCommand {
+    return validateWithProfile(a, record, stage, context, .legacy_v1);
+}
+
+fn validateWithProfile(
+    a: std.mem.Allocator,
+    record: std.json.Value,
+    stage: plan.Stage,
+    context: EvidenceContext,
+    contract_profile: ContractProfile,
+) !ValidatedCommand {
     try exact(record, &.{
         "scope",      "stage",               "exit_code",  "bytes", "sha256", "sha256_scope",
         "over_limit", "known_error_markers", "supervisor",
@@ -290,9 +372,9 @@ pub fn validate(
     if (try num(u8, try get(request, "version")) != 1 or
         try num(u8, try get(request, "binding_version")) != 1) return error.InvalidCommand;
     const variant: PlanVariant = blk: {
-        matchPlan(a, request, stage, .native, context) catch |err| {
+        matchPlan(a, request, stage, .native, context, contract_profile) catch |err| {
             if (context == .local_runtime or err == error.OutOfMemory) return err;
-            try matchPlan(a, request, stage, .historical_import, context);
+            try matchPlan(a, request, stage, .historical_import, context, contract_profile);
             break :blk .historical_import;
         };
         break :blk .native;
@@ -364,9 +446,15 @@ pub fn validate(
     const descendants = try get(command, "descendants");
     try exact(descendants, &.{ "adopted", "identity_validated", "limit_exceeded", "observed", "untracked" });
     const observed = try num(u16, try get(descendants, "observed"));
+    const primary_events = try num(u32, try get(command, "primary_events"));
+    const cleanup_events = try num(u32, try get(command, "cleanup_events"));
+    const reap_events = try num(u16, try get(command, "reap_events"));
     if (observed > try num(u16, try get(limits, "descendants")) or
         try num(u16, try get(descendants, "identity_validated")) != observed or
-        try num(u16, try get(descendants, "adopted")) > observed) return error.InvalidCommand;
+        try num(u16, try get(descendants, "adopted")) > observed or
+        primary_events < core.process.command_complete_primary_events_min or
+        cleanup_events < core.process.command_complete_cleanup_events_min or
+        reap_events != observed + 2) return error.InvalidCommand;
     try yes(try get(descendants, "limit_exceeded"), false);
     try yes(try get(descendants, "untracked"), false);
     const stdout = try get(command, "stdout");
@@ -399,6 +487,42 @@ pub fn validate(
     var output_hash: [64]u8 = undefined;
     @memcpy(&output_hash, hash);
     return .{ .stage = stage, .output_bytes = size, .output_sha256 = output_hash };
+}
+
+pub fn validateRoleIdentities(
+    a: std.mem.Allocator,
+    record: std.json.Value,
+    role_identities: std.json.Value,
+) !void {
+    if (role_identities != .object) return error.InvalidCommandIdentity;
+    const request = try get(try get(record, "supervisor"), "request");
+    for ([_]std.json.Value{
+        try get(request, "supervisor"),
+        try get(request, "native_executable"),
+        try get(request, "command_executable"),
+    }) |binding_value| try validateRoleIdentity(a, binding_value, role_identities);
+    const interpreter = try get(request, "interpreter");
+    if (interpreter != .null) try validateRoleIdentity(a, interpreter, role_identities);
+    const retained = try get(request, "retained_executables");
+    if (retained != .array) return error.InvalidCommandIdentity;
+    for (retained.array.items) |binding_value|
+        try validateRoleIdentity(a, binding_value, role_identities);
+}
+
+fn validateRoleIdentity(
+    a: std.mem.Allocator,
+    binding_value: std.json.Value,
+    role_identities: std.json.Value,
+) !void {
+    const path = try get(binding_value, "path");
+    try eq(try text(try get(path, "kind")), "path");
+    const role = try text(try get(path, "role"));
+    const expected = role_identities.object.get(role) orelse return error.InvalidCommandIdentity;
+    const actual_json = try std.json.Stringify.valueAlloc(a, try get(binding_value, "identity"), .{});
+    const expected_json = try std.json.Stringify.valueAlloc(a, expected, .{});
+    const actual = try records.canonicalAlloc(a, actual_json);
+    const wanted = try records.canonicalAlloc(a, expected_json);
+    try eq(actual, wanted);
 }
 
 fn sameJson(a: std.mem.Allocator, first: std.json.Value, second: std.json.Value) !void {

@@ -229,6 +229,58 @@ def _records(context, arguments):
     return _decode(raw, context)
 
 
+def supervised_command_record(
+        record_path, stage, role_identities, transport_context, profile):
+    """Ask the native controller to validate an imported v1 command record."""
+    record_path = Path(record_path)
+    refusal = "native controller command record refused"
+    try:
+        record_path = _absolute(record_path)
+        if transport_context != "trusted_inner_zip":
+            _refuse(refusal)
+        parent = record_path.parents[1]
+        if record_path.parent.name != "evidence" or not parent.name:
+            _refuse(refusal)
+        _absolute(parent)
+    except (IndexError, OSError, ValueError) as error:
+        raise ValueError(refusal) from error
+    scratch = parent.with_name(parent.name + "-native-command-records")
+    try:
+        if scratch.exists():
+            _refuse(refusal)
+        scratch.mkdir(mode=0o700)
+        identities = scratch / "identities.json"
+        raw = (json.dumps(
+            role_identities, ensure_ascii=False, allow_nan=False,
+            sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        if not raw or len(raw) > MAX_RECORDS_BYTES:
+            _refuse(refusal)
+        with identities.open("xb") as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(raw)
+            output.flush()
+            os.fsync(output.fileno())
+        raw_out, stderr_seen = _controller_command((
+            "supervised-command-record",
+            "--record", str(record_path),
+            "--identities", str(identities),
+            "--stage", stage,
+            "--transport", "trusted-inner-zip",
+            "--profile", profile), refusal)
+        if raw_out or stderr_seen:
+            _refuse(refusal)
+    except (OSError, TypeError, ValueError, subprocess.SubprocessError) as error:
+        raise ValueError(refusal) from error
+    finally:
+        try:
+            if scratch.exists():
+                for child in scratch.iterdir():
+                    child.unlink()
+                scratch.rmdir()
+        except OSError:
+            pass
+
+
 def imported_stage(stage_root):
     """Ask the native importer to validate the exact extracted inner tree."""
     stage_root = _absolute(stage_root)
@@ -279,8 +331,8 @@ def supervisor_import_identity(stage_root, supervisor, git, output):
     return output
 
 
-def handoff_inspect(runtime, output):
-    """Run the native owner for the v2 local handoff inspection stage."""
+def handoff_inspect(runtime, output, *, legacy=False):
+    """Run the native owner for the local handoff inspection stage."""
     runtime, output = map(Path, (runtime, output))
     refusal = "native controller handoff inspect refused"
     try:
@@ -292,8 +344,11 @@ def handoff_inspect(runtime, output):
             or os.path.normpath(str(output)) != str(output)
             or os.path.lexists(output)):
         _refuse(refusal)
+    action = "handoff-inspect-legacy" if legacy else "handoff-inspect"
+    log_name = action + ".log"
+    record_name = "command-" + action + ".json"
     raw, stderr_seen = _controller_command((
-        "handoff-inspect", "--runtime", str(runtime),
+        action, "--runtime", str(runtime),
         "--output", str(output)), refusal)
     if raw or stderr_seen:
         _refuse(refusal)
@@ -304,9 +359,8 @@ def handoff_inspect(runtime, output):
                     or stat.S_IMODE(info.st_mode) != 0o700):
                 _refuse(refusal)
         for path, bound in (
-                (output / "private/handoff-inspect.log", 64 * 1024),
-                (output / "evidence/command-handoff-inspect.json",
-                 MAX_RECORDS_BYTES)):
+                (output / "private" / log_name, 64 * 1024),
+                (output / "evidence" / record_name, MAX_RECORDS_BYTES)):
             info = path.lstat()
             if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
                     or info.st_uid != os.geteuid()
@@ -315,7 +369,7 @@ def handoff_inspect(runtime, output):
                 _refuse(refusal)
     except OSError as error:
         raise ValueError(refusal) from error
-    return output / "private/handoff-inspect.log", output / "evidence/command-handoff-inspect.json"
+    return output / "private" / log_name, output / "evidence" / record_name
 
 
 def import_native_revalidation(stage_root, output):

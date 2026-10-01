@@ -1109,44 +1109,13 @@ def export(runtime, output, *, on_phase=None):
     if legacy_supervision and ci.COMMAND_SUPERVISOR_PATH is not None:
         ci.COMMAND_ENVIRONMENT[
             "WAMR_CI_SUPERVISOR"] = ci.COMMAND_SUPERVISOR_PATH
-    inspect_stage = (
-        "handoff-inspect-legacy"
-        if legacy_supervision else "handoff-inspect")
-    native_inspect = version == 2 and not legacy_supervision
     phase("inspect")
-    if native_inspect:
-        inspected_output, unused_inspected_command = (
-            accepted_records.handoff_inspect(runtime, output))
-        del unused_inspected_command
-        for name in ("artifacts", "boots"):
-            (output / name).mkdir(mode=0o700)
-    else:
-        output.mkdir(mode=0o700)
-        for name in ("private", "evidence", "artifacts", "boots"):
-            (output / name).mkdir(mode=0o700)
-        inspected_output, inspected_command = ci.execute(
-            output, inspect_stage,
-            [tools["package_tool"], "inspect", ci.APP / "build" / ci.EFI, root / "package"],
-            150, 64 * 1024, input_records=input_records,
-            path_roles={
-                "input:package_tool": tools["package_tool"],
-                "compute": root,
-            })
-        ci.validate_supervised_command_binding(
-            inspected_command, inspect_stage, {
-                "command-supervisor": ci.native_executable_identity(
-                    input_records[str(Path(
-                        ci.COMMAND_SUPERVISOR_PATH).resolve(strict=True))]),
-                **({} if legacy_supervision else {
-                    "tool:" + name: ci.native_executable_identity(
-                        expected["consumer_inputs"]["files"]["tool:" + name])
-                    for name in ci.HOST_TOOLS
-                }),
-                "input:package_tool": ci.native_executable_identity(
-                    inputs["files"]["package_tool"]),
-            }, profile=(
-                ci.CURRENT_PROFILE
-                if version == 2 else "tiny-aot-two-boot"))
+    inspected_output, unused_inspected_command = (
+        accepted_records.handoff_inspect(
+            runtime, output, legacy=legacy_supervision))
+    del unused_inspected_command
+    for name in ("artifacts", "boots"):
+        (output / name).mkdir(mode=0o700)
     inspected = ci.document(inspected_output)
     packaged = ci.document(root / "evidence/package.json")
     ci.require(inspected["producer_sha256"] == packaged["producer_sha256"]

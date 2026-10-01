@@ -201,7 +201,9 @@ pub const AcceptedRun = struct {
 
     pub fn revalidateWithSignal(self: *AcceptedRun, signal: ?*core.process.SignalCancellation) !void {
         if (self.context == .local_runtime) {
-            if (self.local_producer == .python)
+            if (self.compatibility == .tiny_v1_legacy)
+                try revalidateLocalLegacy(self)
+            else if (self.local_producer == .python)
                 try revalidateLocalPython(self, signal)
             else
                 try revalidateLocal(self, signal);
@@ -318,9 +320,9 @@ fn openAndValidateWithPolicy(
     accepted.root = try accepted.allocator().dupe(u8, root);
     accepted.repository = try accepted.allocator().dupe(u8, repository);
     try loadResult(&accepted);
-    if (accepted.compatibility != .tiny_v2_qcow2_derived_vhd)
+    if (accepted.compatibility != .tiny_v2_qcow2_derived_vhd and policy != .handoff_inspect)
         return error.UnsupportedLocalLegacyRun;
-    accepted.local_producer = try localProducer(&accepted);
+    accepted.local_producer = if (accepted.compatibility == .tiny_v1_legacy) .python else try localProducer(&accepted);
     if (accepted.local_producer == .python and policy != .handoff_inspect)
         return error.UnsupportedLocalProducer;
     try accepted.revalidateWithSignal(signal);
@@ -619,6 +621,51 @@ fn revalidateLocalPythonWithSignal(self: *AcceptedRun, signal: *core.process.Sig
         try collectRecordedRuntimeInputs(self);
 }
 
+fn revalidateLocalLegacy(self: *AcceptedRun) !void {
+    const raw = try canonicalFile(self, try resultPath(self), records.max_record_bytes);
+    const result = try records.readResult(raw);
+    if (result.set != self.compatibility or result.set != .tiny_v1_legacy)
+        return error.InvalidResult;
+    if (!preSupervisorSource(self.source))
+        return error.UnsupportedLegacySource;
+    const evidence_path = try join(self.allocator(), &.{ self.root, "compute/evidence" });
+    const evidence = try files.openDirectory(self.io, evidence_path, .private);
+    defer evidence.close(self.io);
+    var iterator = evidence.iterate();
+    var count: usize = 0;
+    while (try iterator.next(self.io)) |entry| {
+        if (entry.kind != .file) return error.UnexpectedEvidence;
+        if (std.mem.eql(u8, entry.name, "result.json")) {
+            count += 1;
+            continue;
+        }
+        if (!result.records.contains(entry.name)) return error.UnexpectedEvidence;
+        count += 1;
+    }
+    if (count != result.records.count() + 1) return error.MissingEvidence;
+    for (self.records) |item| {
+        const observed = try physical.readFile(self.io, try recordPath(self, item.name), records.max_record_bytes, true);
+        if (!std.meta.eql(observed.sha256, item.sha256) or observed.bytes != item.bytes)
+            return error.RecordChanged;
+    }
+    const current = try physical.readFile(self.io, try resultPath(self), records.max_record_bytes, true);
+    if (!std.meta.eql(current.sha256, self.result.sha256) or current.bytes != self.result.bytes)
+        return error.ResultChanged;
+    const qcow2 = try join(self.allocator(), &.{ self.root, "compute/package/unikraft.qcow2" });
+    if (exists(self.io, qcow2)) return error.UnsupportedLegacySource;
+    const cleanup = try join(self.allocator(), &.{ self.root, "evidence/runtime-cleanup.txt" });
+    if (exists(self.io, cleanup)) return error.UnsupportedLegacySource;
+    try validateCommands(self, true, false);
+    if (self.runtime_inputs.len == 0)
+        try collectRecordedRuntimeInputs(self);
+}
+
+fn exists(io: std.Io, path: []const u8) bool {
+    var file = std.Io.Dir.openFileAbsolute(io, path, .{ .follow_symlinks = false }) catch return false;
+    file.close(io);
+    return true;
+}
+
 fn collectRecordedRuntimeInputs(self: *AcceptedRun) !void {
     const a = self.allocator();
     var result: std.ArrayList(PinnedInput) = .empty;
@@ -732,6 +779,56 @@ pub fn validateCommandBinding(
     return command.validate(a, document.value(), stage, context);
 }
 
+pub fn validateSupervisedCommandRecordFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    record_path: []const u8,
+    identities_path: []const u8,
+    stage: Stage,
+    context: EvidenceContext,
+    profile_name: []const u8,
+) !ValidatedCommand {
+    try files.absoluteFilePath(record_path);
+    try files.absoluteFilePath(identities_path);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var record_file = try files.RetainedFile.open(io, record_path, .private);
+    defer record_file.close(io);
+    var raw = try files.readSensitiveFile(io, a, record_file.file, records.max_record_bytes, .private);
+    defer raw.deinit();
+    var document = try contracts.Document.parse(a, raw.bytes(), .{
+        .bytes = records.max_record_bytes,
+        .depth = 32,
+        .items = 4096,
+        .tokens = 65536,
+    });
+    defer document.deinit();
+    try document.requireCanonical(a, raw.bytes());
+    try record_file.verify(io);
+    var identities_file = try files.RetainedFile.open(io, identities_path, .private);
+    defer identities_file.close(io);
+    var identity_raw = try files.readSensitiveFile(io, a, identities_file.file, records.max_record_bytes, .private);
+    defer identity_raw.deinit();
+    var identities_document = try contracts.Document.parse(a, identity_raw.bytes(), .{
+        .bytes = records.max_record_bytes,
+        .depth = 8,
+        .items = 1024,
+        .tokens = 16384,
+    });
+    defer identities_document.deinit();
+    try identities_document.requireCanonical(a, identity_raw.bytes());
+    try identities_file.verify(io);
+    const checked = if (std.mem.eql(u8, profile_name, "tiny-aot-two-boot"))
+        try command.validateLegacyV1(a, document.value(), stage, context)
+    else if (std.mem.eql(u8, profile_name, "qcow2-derived-vhd"))
+        try command.validate(a, document.value(), stage, context)
+    else
+        return error.UnsupportedRecordSet;
+    try command.validateRoleIdentities(a, document.value(), identities_document.value());
+    return checked;
+}
+
 pub fn validateLocalHandoffCommand(self: *AcceptedRun, raw: []const u8) !ValidatedCommand {
     return validateLocalPostRunCommand(self, raw, .@"handoff-inspect");
 }
@@ -739,7 +836,7 @@ pub fn validateLocalHandoffCommand(self: *AcceptedRun, raw: []const u8) !Validat
 pub fn validateLocalPostRunCommand(self: *AcceptedRun, raw: []const u8, stage: Stage) !ValidatedCommand {
     if (self.context != .local_runtime or self.repository == null)
         return error.InvalidContext;
-    if (stage != .@"handoff-inspect" and stage != .@"public-validator-build")
+    if (stage != .@"handoff-inspect" and stage != .@"handoff-inspect-legacy" and stage != .@"public-validator-build")
         return error.InvalidCommand;
     const a = self.allocator();
     var document = try contracts.Document.parse(a, raw, .{
@@ -751,7 +848,10 @@ pub fn validateLocalPostRunCommand(self: *AcceptedRun, raw: []const u8, stage: S
     defer document.deinit();
     try document.requireCanonical(a, raw);
     const record = document.value();
-    const checked = try command.validate(a, record, stage, .local_runtime);
+    const checked = if (self.compatibility == .tiny_v1_legacy)
+        try command.validateLegacyV1(a, record, stage, .local_runtime)
+    else
+        try command.validate(a, record, stage, .local_runtime);
     const request = try get(try get(record, "supervisor"), "request");
     const supervisor = try get(request, "supervisor");
     try checkPostRunSupervisorRole(self, supervisor, stage);
@@ -787,7 +887,11 @@ fn validateCommands(self: *AcceptedRun, legacy: bool, allow_historical_local: bo
             if (over != .bool or over.bool or markers != .array or markers.array.items.len != 0)
                 return error.InvalidCommand;
         } else {
-            if (command.validate(self.allocator(), value, stage, self.context)) |_| {} else |err| {
+            const validated = if (self.compatibility == .tiny_v1_legacy)
+                command.validateLegacyV1(self.allocator(), value, stage, self.context)
+            else
+                command.validate(self.allocator(), value, stage, self.context);
+            if (validated) |_| {} else |err| {
                 if (!allow_historical_local or err == error.OutOfMemory) return err;
                 _ = try command.validate(self.allocator(), value, stage, .trusted_inner_zip);
             }
@@ -1007,7 +1111,7 @@ fn revalidateImported(self: *AcceptedRun) !void {
     try equal(try text(try get(portable, "source_tree")), self.source.tree);
     if (version == 2)
         try equal(try text(try get(portable, "profile")), "qcow2-derived-vhd");
-    const legacy = version == 1 and legacySource(self.source);
+    const legacy = version == 1 and preSupervisorSource(self.source);
     if (version == 1 and !legacy) return error.UnsupportedLegacySource;
     const manifest = try canonicalFile(self, try join(a, &.{ self.root, "public-source.json" }), 64 * 1024);
     _ = try contracts.exactFields(manifest, if (version == 1)
@@ -1168,7 +1272,7 @@ fn verifyBundleItem(
     try equal(&observed.sha256, try text(try get(member, "sha256")));
 }
 
-fn legacySource(source: SourceIdentity) bool {
+fn preSupervisorSource(source: SourceIdentity) bool {
     const pairs = [_]SourceIdentity{
         .{ .revision = "993e4d0d394c08202c0d0c57ea97450a19a4f394", .tree = "54f8e118146c78c24e7c802657c6ec62b268a5de" },
         .{ .revision = "34e5c88a165c4da878b3122b8b91716116d65d4b", .tree = "54f8e118146c78c24e7c802657c6ec62b268a5de" },
