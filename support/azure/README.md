@@ -1157,7 +1157,9 @@ returns the actual uploaded SHA-256 and byte count matching the reviewed input,
 inventory summaries are derived from a real `resource list` observation with no
 extra or missing resources, and HANDOFF `running_seconds` is derived from
 journaled deployment/deallocation timestamps unless an explicit larger value is
-supplied.
+supplied. A private `azure_policy` pin in the supplied `Expected` context is
+honored exactly as by the topology controller; without it, any policy-added VM
+identity is refused.
 
 ### Separate offline dummy-OS ARM candidate (not a deployment approval)
 

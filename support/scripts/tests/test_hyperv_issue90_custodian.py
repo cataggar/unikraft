@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Offline custodian tooling tests; fakes only, never Azure."""
 
+from dataclasses import fields, replace
 from datetime import datetime, timedelta, timezone
 import importlib
 from pathlib import Path
@@ -10,6 +11,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import test_hyperv_issue90_custody_records as custody_tests
 from test_hyperv_issue90_custody_records import Fixture
 
 custodian = importlib.import_module("hyperv_issue90_custodian")
@@ -224,6 +226,34 @@ class CustodianToolTests(unittest.TestCase):
         self.assertTrue(result.passed, result.reason)
         self.assertEqual([item[0] for item in uploads], list(custodian.DISKS))
         self.assertTrue(all(item[2] == SAS for item in uploads))
+
+    def test_pinned_policy_footprint_verifies_and_round_trips(self):
+        policy_case = custody_tests.CustodyRecordsTests()
+        policy = policy_case._policy()
+        self.fixture = Fixture(expected_changes={"azure_policy": policy},
+                               vm_identity=policy_case._policy_identity())
+        mapping = {
+            field.name: getattr(self.fixture.expected, field.name)
+            for field in fields(custody.Expected)
+        }
+        self.assertEqual(custodian.expected_from_mapping(mapping),
+                         self.fixture.expected)
+        keys, _fake, _uploads, assembler = self.build()
+        prepared, handoff = self.write_records(
+            assembler, keys["custodian"]["private_key"],
+        )
+        verify = lambda expected, name: custodian.verify_handoff(
+            prepared, handoff, expected=expected,
+            public_key=keys["custodian"]["public_key"],
+            archive_dir=self.root / "custodian/archive",
+            registry_dir=self.registry(name), now=NOW,
+        )
+        result = verify(self.fixture.expected, "registry")
+        self.assertTrue(result.passed, result.reason)
+        unpinned = replace(self.fixture.expected, azure_policy=None)
+        result = verify(unpinned, "unpinned")
+        self.assertFalse(result.passed)
+        self.assertIn("unpinned managed identity", result.reason)
 
     def test_original_stdout_bytes_are_archived_verbatim(self):
         raw = b'{ "z" : 2,\n  "a" : 1 }\n'
