@@ -3,7 +3,7 @@
 
 from collections.abc import Mapping
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 import hashlib
 import importlib
 import re
@@ -122,6 +122,43 @@ def _identity(prepared, archive, custodian_key):
         (role, receipts[role]["id"], receipts[role]["uuid"])
         for role in DISKS
     )
+
+
+def reproducible_offline_sha256(offline):
+    """Hash an offline admission without its per-boot serial/report digests.
+
+    Real boot serials carry timestamps, so every admit() run yields new
+    serial and report digests; every other admitted field must still match.
+    """
+    if type(offline) is admission.OfflineAdmission:
+        value = asdict(offline)
+    elif isinstance(offline, Mapping):
+        value = dict(offline)
+    else:
+        raise ValueError("An offline admission or its field mapping is required")
+    names = {item.name for item in fields(admission.OfflineAdmission)}
+    boot_names = {item.name for item in fields(admission.BootEvidence)}
+    seed_names = {item.name for item in fields(admission.SeedEvidence)}
+    boots = value.get("boots")
+    seeds = value.get("seeds")
+    if (set(value) != names or not isinstance(boots, (list, tuple))
+            or not isinstance(seeds, (list, tuple))
+            or any(not isinstance(item, Mapping) or set(item) != boot_names
+                   for item in boots)
+            or any(not isinstance(item, Mapping) or set(item) != seed_names
+                   for item in seeds)):
+        raise ValueError("Offline admission fields are missing or unknown")
+    value["seeds"] = [dict(item) for item in seeds]
+    value["boots"] = [
+        {key: item[key] for key in item
+         if key not in ("serial_sha256", "report_sha256")}
+        for item in boots
+    ]
+    try:
+        raw = azure.canonical_json(value)
+    except (TypeError, ValueError):
+        raise ValueError("Offline admission is not JSON-serializable") from None
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _freeze(value):
@@ -354,9 +391,8 @@ class Verifier:
                     or approval["efi_sha256"] != offline.efi_sha256
                     or approval["raw_sha256"] != offline.raw_sha256
                     or approval["miz_sha256"] != offline.miz_sha256
-                    or approval["offline_sha256"] != hashlib.sha256(
-                        azure.canonical_json(asdict(offline))
-                    ).hexdigest()
+                    or approval["offline_sha256"]
+                    != reproducible_offline_sha256(offline)
                     or approval["seed_sha256"] != self.expected.seed_sha256
                     or approval["resource_ids"] != self.expected.resource_ids
                     or approval["template_sha256"] != self.expected.template_sha256
@@ -491,9 +527,8 @@ class Verifier:
                     }
                     or approval["reviewed_image_sha256"]
                     != preboot.offline.vhd_sha256
-                    or approval["offline_sha256"] != hashlib.sha256(
-                        azure.canonical_json(asdict(preboot.offline))
-                    ).hexdigest()
+                    or approval["offline_sha256"]
+                    != reproducible_offline_sha256(preboot.offline)
                     or approval["seed_sha256"] != self.expected.seed_sha256
                     or type(approval["remaining_seconds"]) is not int
                     or approval["remaining_seconds"] != 3600 - preboot.consumed_seconds

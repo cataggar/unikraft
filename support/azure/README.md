@@ -1344,10 +1344,14 @@ with Ed25519 over
 All carry the exact run/operation IDs and whole-second UTC issue time;
 extra/missing fields, unknown intervals, incomplete ledgers, stale records,
 unbound hashes, noncanonical signatures and missing archive bytes refuse.
-Preprovision predates PREPARED and binds the **entire offline admission hash**
-and its reviewed head/source, config, EFI, raw, VHD and Miz digests; both
-seed hashes, dummy VHD, reviewed dummy template, envelope and all ten
-original resource IDs. Assurance is issued at/after HANDED_OFF and binds
+Preprovision predates PREPARED and binds the **reproducible offline
+admission hash** and its reviewed head/source, config, EFI, raw, VHD and Miz
+digests; both seed hashes, dummy VHD, reviewed dummy template, envelope and
+all ten original resource IDs. The reproducible hash,
+`reproducible_offline_sha256(offline)`, is the SHA-256 of the canonical
+admission JSON with only each boot's `serial_sha256` and `report_sha256`
+removed: real boot serials carry timestamps, so a later `admit()` cannot
+reproduce them, while every other admission field must still match. Assurance is issued at/after HANDED_OFF and binds
 the handoff/preprovision digests, independent no-writer and no-prior-boot
 assertions, bounded RBAC and boot-history archive digests, original VM/disk
 UUIDs, fresh pre-dispatch serial baseline and generation, and a **complete**
