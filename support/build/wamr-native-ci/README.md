@@ -48,25 +48,27 @@ fixture covers older allowlisted v1 evidence; the current v2 import is also
 exercised against a retained protected archive. Neither form executes build or
 boot, changes authority, or makes a partially checked manifest an accepted run.
 
-The public bundle importer now requires this native check before publishing
-its candidate, while retaining the Python publication and supervised-stage
-validation. Native-produced v2 local handoff requires native acceptance before using its
-result-record hashes and source identity; the Python build and boot checks
-still run. A Python-produced local run retains the pinned Python
-source-custody path for result-record selection. It is accepted by the native
-controller only for the non-legacy v2 handoff inspection route; `records
---runtime` and `public-validator-build --runtime` remain native-produced
-local-runtime gates.
+The public bundle importer now requires this native imported-records check
+before publishing its candidate, while retaining the Python publication policy.
+Only the protected in-job import that passes `--native-import-revalidation`
+runs trusted-v2 native revalidation through the native controller; default,
+off-runner, and historical trusted-v2 imports retain Python supervised-stage
+revalidation with the caller-supplied validator. Native-produced v2 local
+handoff requires native acceptance before using its result-record hashes and
+source identity; the Python build and boot checks still run. A
+Python-produced local run retains the pinned Python source-custody path for
+result-record selection. It is accepted by the native controller only for the
+non-legacy v2 handoff inspection route; `records --runtime` and
+`public-validator-build --runtime` remain native-produced local-runtime gates.
 The separately validated `command-public-validator-build.json` may appear in
 Python-produced evidence after acceptance; it is not part of the 33 pinned
 result records or the exported archive. Other extra evidence is refused.
 Historical v1 retains its pinned-source compatibility path; native-produced v2
 never falls back to Python after a native refusal. The caller must
-independently authenticate the executable
-provided by `WAMR_CI_CONTROLLER`; owner and mode checks alone do not prove
-its provenance. Protected paired boots have exercised the completed native
-local-record replay and Python record selection, with public-source
-publication and trusted import passing separately.
+independently authenticate the executable provided by `WAMR_CI_CONTROLLER`;
+owner and mode checks alone do not prove its provenance. Protected paired boots
+have exercised the completed native local-record replay and Python record
+selection, with public-source publication and trusted import passing separately.
 For a trusted v2 import, the native accepted-run records gate validates the
 imported command bindings before Python applies archive and publication policy;
 Python no longer reinterprets those imported command records. Producer-direct
@@ -86,18 +88,23 @@ Python-owned for historical supervision. `public-validator-build --runtime
 ABS --output ABS` accepts native-produced local runtimes only, using the
 recorded Zig tool and controller to build the fixed x86_64 validator in an
 independent private output, retaining its bounded command evidence without
-modifying the accepted runtime or publishing an archive. Python remains the
-production handoff caller;
+modifying the accepted runtime or publishing an archive. The protected
+production runtime is still Python-produced, so its public-validator build
+remains on the Python supervisor path until a native owner for Python-produced
+local records lands; there is no refusal-triggered fallback from the native
+command. Python remains the production local handoff caller;
 `supervisor-import-identity --stage-root ABS --supervisor ABS --git ABS
 --output ABS` is a separate support-only operation for a clean, trusted
 imported v2 inner stage. It checks the recorded supervisor source files
 against the imported Git revision and the supplied executable and loader
 closure against the imported consumer records, then supervises `--identity`
 under the fixed plan. Its owner-only output is outside the imported stage and
-checkout. Trusted v2 import now invokes this operation before writing
-transport/candidate records and does not repeat the identity command through
-Python. Python still owns publication policy, source/consumer recapture,
-production validator supervision, and legacy/producer-direct identity checks.
+checkout. Trusted v2 imports invoke this operation before writing
+transport/candidate records; the default Python revalidation path reuses that
+native identity instead of repeating the identity command through Python.
+Python still owns publication policy, source/consumer recapture, local
+public-validator supervision, off-runner trusted-v2 revalidation, and
+legacy/producer-direct identity and revalidation checks.
 Remaining checkout/consumer custody and production/historical supervised
 handoff stages need native owners before `run.py` can be removed.
 `import-validator-build --stage-root ABS --output ABS` is a support-only
@@ -108,20 +115,29 @@ recorded Git and Zig executables, loader files, and Zig installation tree to
 retain their imported consumer content. It supervises the fixed x86_64 direct-validator build in
 a separate owner-only output and checks its ELF and bounded private command
 evidence. A historical revision or unavailable recorded tool refuses this
-operation; trusted historical imports still follow the existing Python
-revalidation path. This does not yet change the production import caller or
-make the built binary a published bundle member.
-`import-native-revalidation --stage-root ABS --output ABS` is a support-only
-trusted-v2 companion that builds that fixed direct validator and supervises its
-`handoff` verification in the same native invocation. It constructs a private
-canonical candidate outside the pristine imported stage by rebasing only the
-exact artifact, boot, and evidence member paths already validated against the
+operation. The standalone build command remains support-only. The protected
+workflow's same-job trusted-v2 import passes the explicit
+`import-public-source-bundle --native-import-revalidation` option to use the
+combined `import-native-revalidation` operation so the validator is built and
+retained through execution without a Python handoff between them.
+`import-native-revalidation --stage-root ABS --output ABS` builds that fixed
+direct validator and supervises its `handoff` verification in the same native
+invocation for trusted v2 imports whose pristine stage matches the current
+checkout and recorded tool custody. It constructs a private canonical
+candidate outside the pristine imported stage by rebasing only the exact
+artifact, boot, and evidence member paths already validated against the
 imported portable bundle; neither the candidate nor the validator is a public
 bundle member. The validator is retained from build through execution and its
 exact success stdout, empty stderr, bounded log, and command binding are
-checked before returning. A caller cannot select a validator or manifest.
-Historical imports and the production revalidation caller still use Python;
-this support stage does not transfer publication or admission authority.
+checked before returning. A caller cannot select a validator or manifest. The
+protected in-job import path invokes this native operation only when the
+explicit handoff option is present, before writing transport or candidate
+records; native refusal fails the import with no Python fallback. Default
+trusted-v2 imports (including the documented off-runner operator flow),
+historical revisions, unavailable recorded-tool imports, v1 imports, and
+producer-direct/local revalidation remain Python-owned because they either need
+the caller-supplied validator or do not satisfy the pristine same-revision
+trusted-stage preconditions.
 `local-consumer-custody --runtime ABS` is a support-only read-only probe
 for a completed Python-produced v2 runtime *before* the managed QEMU loader
 is removed. It compares the clean current checkout's full physical source

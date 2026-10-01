@@ -1659,7 +1659,9 @@ def verify_archive(handoff, archive, expected, expected_archive_sha256):
 
 def import_bundle(
         handoff, archive, output, expected, expected_archive_sha256,
-        validator, supervisor, artifact_id=None, container_digest=None):
+        validator, supervisor, artifact_id=None, container_digest=None,
+        native_import_revalidation=False):
+    require(type(native_import_revalidation) is bool)
     handoff.private(output.parent)
     with retained_archive(
             handoff, archive, expected_archive_sha256) as (
@@ -1713,6 +1715,7 @@ def import_bundle(
             Path(item["path"]).name: item["sha256"]
             for item in bundle["evidence"]
         })
+    native_revalidation = None
     native_identity = None
     if bundle["version"] == 2:
         require(expected_archive_sha256 is not None
@@ -1721,9 +1724,13 @@ def import_bundle(
                 and type(container_digest) is str)
         digest_string(container_digest)
         handoff.FAILURE_STAGE = "public-import-native-supervisor-identity"
-        native_identity = accepted_records.supervisor_import_identity(
-            output, supervisor, handoff.ci.tool("git"),
-            identity_parent / "accepted")
+        native_identity = identity_parent / "accepted"
+        accepted_records.supervisor_import_identity(
+            output, supervisor, handoff.ci.tool("git"), native_identity)
+        if native_import_revalidation:
+            handoff.FAILURE_STAGE = "public-import-native-revalidation"
+            native_revalidation = accepted_records.import_native_revalidation(
+                output, identity_parent / "revalidation")
         handoff.ci.save(output / "transport.json", {
             "schema": "uk.wamr.public-source-transport",
             "version": 2,
@@ -1737,18 +1744,24 @@ def import_bundle(
             "container_digest": container_digest,
         })
     else:
-        require(artifact_id is None and container_digest is None)
+        require(artifact_id is None and container_digest is None
+                and not native_import_revalidation)
     handoff.ci.save(output / "candidate-bundle.json", bundle)
     handoff.FAILURE_STAGE = "public-import-records"
     publication_records(
         handoff, output, expected, "trusted_inner_zip",
         "candidate-bundle.json",
         native_accepted=accepted if bundle["version"] == 2 else None)
-    handoff.FAILURE_STAGE = "public-import-revalidation"
-    native(
-        handoff, validator, supervisor,
-        output / "candidate-bundle.json", expected,
-        native_identity=native_identity)
+    if bundle["version"] == 2 and native_import_revalidation:
+        require(native_revalidation is not None)
+        handoff.private(native_revalidation)
+    else:
+        require(native_revalidation is None)
+        handoff.FAILURE_STAGE = "public-import-revalidation"
+        native(
+            handoff, validator, supervisor,
+            output / "candidate-bundle.json", expected,
+            native_identity=native_identity)
     # Only a fully revalidated import publishes the operator-facing bundle.
     handoff.ci.save(output / "bundle.json", bundle)
     return bundle

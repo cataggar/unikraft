@@ -1956,6 +1956,10 @@ def main():
     imp.add_argument("--supervisor", type=Path, required=True)
     imp.add_argument("--artifact-id")
     imp.add_argument("--container-digest")
+    imp.add_argument(
+        "--native-import-revalidation", action="store_true",
+        help=("Use the closed native import-native-revalidation stage for "
+              "same-job trusted v2 imports; refusal fails the import"))
     args = parser.parse_args()
     os.umask(0o077)
     if args.command == "export":
@@ -2029,7 +2033,8 @@ def main():
                     sys.modules[__name__], args.archive, args.output, expected,
                     args.expected_archive_sha256, args.validator,
                     args.supervisor, args.artifact_id,
-                    args.container_digest)
+                    args.container_digest,
+                    native_import_revalidation=args.native_import_revalidation)
     print("Compute private contract prepared; no Azure operations.")
 
 
