@@ -1468,9 +1468,11 @@ class _interrupt_on_termination:
                     if hasattr(signal, name))
 
     def __enter__(self):
-        self.previous = {
-            number: signal.signal(number, self._raise) for number in self.SIGNALS
-        }
+        self.previous = {}
+        for number in self.SIGNALS:
+            if signal.getsignal(number) is signal.SIG_IGN:
+                continue  # Respect nohup and other inherited ignores.
+            self.previous[number] = signal.signal(number, self._raise)
         return self
 
     def __exit__(self, *_exc):
@@ -1478,8 +1480,11 @@ class _interrupt_on_termination:
             signal.signal(number, handler)
         return False
 
-    @staticmethod
-    def _raise(number, _frame):
+    def _raise(self, number, _frame):
+        # Fire once: later signals must not abort the owned cleanup, and the
+        # cleanup az children inherit the ignore disposition.
+        for item in self.previous:
+            signal.signal(item, signal.SIG_IGN)
         raise KeyboardInterrupt(f"signal {number}")
 
 

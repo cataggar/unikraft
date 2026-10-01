@@ -1104,13 +1104,30 @@ class LiveGateTests(unittest.TestCase):
         self.assertIn("disk.data0.revoke", self.journal().by_step)
         self.assert_deleted(result)
 
-    def test_termination_signals_raise_keyboard_interrupt(self):
+    def test_termination_signals_raise_keyboard_interrupt_once(self):
         previous = signal.getsignal(signal.SIGTERM)
         with self.assertRaises(KeyboardInterrupt):
             with custodian._interrupt_on_termination():
                 os.kill(os.getpid(), signal.SIGTERM)
                 time.sleep(1)
         self.assertIs(signal.getsignal(signal.SIGTERM), previous)
+        with custodian._interrupt_on_termination():
+            with self.assertRaises(KeyboardInterrupt):
+                os.kill(os.getpid(), signal.SIGHUP)
+                time.sleep(1)
+            self.assertIs(signal.getsignal(signal.SIGHUP), signal.SIG_IGN)
+            self.assertIs(signal.getsignal(signal.SIGTERM), signal.SIG_IGN)
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(0.1)
+
+    def test_termination_handler_respects_inherited_ignore(self):
+        previous = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        self.addCleanup(signal.signal, signal.SIGHUP, previous)
+        with custodian._interrupt_on_termination():
+            self.assertIs(signal.getsignal(signal.SIGHUP), signal.SIG_IGN)
+            os.kill(os.getpid(), signal.SIGHUP)
+            time.sleep(0.1)
+        self.assertIs(signal.getsignal(signal.SIGHUP), signal.SIG_IGN)
 
     def test_runtime_over_budget_refuses_swap_and_cleans_up(self):
         self.prepare(self.body(max_vm_running_seconds=30))

@@ -1210,7 +1210,8 @@ cleanup first probes `group exists`. It deletes the group only if:
 It deallocates an undeallocated VM best-effort and retries `disk
 revoke-access` on every listed owned disk without a journaled revoke (an
 active SAS blocks deletion). It then requires `group exists` to report
-`false`. A `KeyboardInterrupt`, or a SIGTERM/SIGHUP received by the CLI, is
+`false`. A `KeyboardInterrupt`, or the first SIGTERM/SIGHUP received by the
+CLI (later ones are ignored, and an inherited `nohup` ignore is kept), is
 reported as a failure after cleanup instead of skipping it; SIGKILL or host
 loss still requires checking the subscription by hand. The run passes only if verification
 passed **and** the group was deleted. Output is PASS/FAIL with a sanitized
