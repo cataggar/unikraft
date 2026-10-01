@@ -339,7 +339,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("handoff/tests.zig"),
             .target = b.graph.host,
             .optimize = optimize,
-            .imports = &.{.{ .name = "hyperv_core", .module = host_core }},
+            .imports = &.{
+                .{ .name = "hyperv_core", .module = host_core },
+                .{ .name = "wamr_controller", .module = host_controller },
+            },
         }),
     });
     const handoff_contracts_run = b.addRunArtifact(handoff_contracts);

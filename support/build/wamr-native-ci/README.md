@@ -842,6 +842,9 @@ establishes the first local tiny-compute observation.
 `test-controller` now includes native source-custody production limits, twelve
 physical Bison/consumer/dependency/supervision fault fixtures, frozen v1/v2
 result-parser goldens, and the #187 handoff/public-bundle contract golden.
+The handoff library also contains the private retained-copy primitive and
+non-resumable v2 export state skeleton; Python remains the production publisher
+until the later cutover.
 `test-controller-limits`, `test-controller-fault-parity`,
 `test-differential-records`, and `test-handoff-contracts` run those suites separately.
 The neutral v1/v2 fixture constructors in `tests/controller_record_fixtures.py`

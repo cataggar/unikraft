@@ -11,12 +11,45 @@ pub fn build(b: *std.Build) void {
     });
     if (target.result.cpu.arch == .x86_64)
         core.addAssemblyFile(b.path("../../tools/hyperv/sha256_clear_upper.S"));
+    const serial = b.createModule(.{
+        .root_source_file = b.path("../../tools/hyperv/local_boot/serial.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "hyperv_core", .module = core }},
+    });
+    const validator = b.createModule(.{
+        .root_source_file = b.path("../../apps/wamr-aot/validator/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = core },
+            .{ .name = "local_boot_serial", .module = serial },
+        },
+    });
+    const source_closure = b.createModule(.{
+        .root_source_file = b.path("../../controller_source_closure.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const controller = b.createModule(.{
+        .root_source_file = b.path("controller/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = core },
+            .{ .name = "wamr_log_validator", .module = validator },
+            .{ .name = "controller_source_closure", .module = source_closure },
+        },
+    });
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("handoff/tests.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "hyperv_core", .module = core }},
+            .imports = &.{
+                .{ .name = "hyperv_core", .module = core },
+                .{ .name = "wamr_controller", .module = controller },
+            },
         }),
     });
     const run = b.addRunArtifact(tests);

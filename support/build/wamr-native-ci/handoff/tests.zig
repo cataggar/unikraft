@@ -5,7 +5,9 @@ const c = core.contracts;
 const handoff = @import("root.zig");
 const contracts = handoff.contracts;
 const layout = handoff.layout;
+const native_export = handoff.export_state;
 const profile = handoff.profile;
+const retained_copy = handoff.retained_copy;
 const zip = handoff.zip;
 
 const golden = @embedFile("goldens/contracts-profile-layout.json");
@@ -19,6 +21,7 @@ const zip_pack_v2_bundle = @embedFile("goldens/zip-pack-v2-bundle.json");
 const zip_pack_v2_public_source = @embedFile("goldens/zip-pack-v2-public-source.json");
 const root_bound_v1_golden = @embedFile("goldens/root-bound-v1.json");
 const root_bound_v2_golden = @embedFile("goldens/root-bound-v2.json");
+const export_bundle_v2_golden = @embedFile("goldens/export-bundle-v2.json");
 const root_bound_stage = "/opt/wamr-handoff-golden-stage";
 const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const rev = "0123456789012345678901234567890123456789";
@@ -185,6 +188,158 @@ test "real Python pack goldens are byte-identical and accepted by strict native 
 test "Python-written root-bound local handoff goldens validate only with their root" {
     try expectRootBoundGolden(root_bound_v1_golden, .frozen_tiny_v1);
     try expectRootBoundGolden(root_bound_v2_golden, .tiny_qcow2_derived_vhd_v2);
+}
+
+test "native v2 handoff manifest builder is byte-identical to Python export-shaped golden" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const bytes = try native_export.Test.buildRootBoundBundleV2(
+        arena.allocator(),
+        root_bound_stage,
+        "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+    );
+    try expectEqualManifest(export_bundle_v2_golden, bytes);
+}
+
+test "retained copy hashes, fsyncs and reopens a private member" {
+    var fixture = try CopyFixture.init("success");
+    defer fixture.deinit();
+    try fixture.writeSource("input.bin", "member-bytes\n");
+    var retained = try core.private_files.RetainedFile.open(std.testing.io, fixture.source_path, .private);
+    defer retained.close(std.testing.io);
+    var budget: retained_copy.Budget = .{};
+    const copied = try retained_copy.copyRetained(
+        std.testing.allocator,
+        std.testing.io,
+        &retained,
+        fixture.output.dir,
+        fixture.output_path,
+        "artifacts/efi",
+        layout.max_json_bytes,
+        &budget,
+        .{},
+    );
+    defer std.testing.allocator.free(copied.path);
+    try std.testing.expectEqual(@as(u64, 13), copied.size);
+    try std.testing.expectEqual(@as(u64, 13), budget.used);
+    const observed = try fixture.readOutput("artifacts/efi", 64);
+    defer std.testing.allocator.free(observed);
+    try std.testing.expectEqualStrings("member-bytes\n", observed);
+}
+
+test "retained copy refuses sensitive public pattern across chunk boundary" {
+    var fixture = try CopyFixture.init("sensitive");
+    defer fixture.deinit();
+    const pattern = "Authorization: Bearer ";
+    const bytes = try std.testing.allocator.alloc(u8, 64 * 1024 + pattern.len);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes, 'a');
+    @memcpy(bytes[64 * 1024 - 7 .. 64 * 1024], pattern[0..7]);
+    @memcpy(bytes[64 * 1024 .. 64 * 1024 + pattern.len - 7], pattern[7..]);
+    try fixture.writeSource("input.bin", bytes);
+    var retained = try core.private_files.RetainedFile.open(std.testing.io, fixture.source_path, .private);
+    defer retained.close(std.testing.io);
+    var budget: retained_copy.Budget = .{};
+    try std.testing.expectError(error.SensitivePattern, retained_copy.copyRetained(
+        std.testing.allocator,
+        std.testing.io,
+        &retained,
+        fixture.output.dir,
+        fixture.output_path,
+        "evidence/build.json",
+        layout.max_large_artifact_bytes,
+        &budget,
+        .{ .scan = .public_bundle },
+    ));
+}
+
+test "retained copy refuses budget overflow and existing output" {
+    var fixture = try CopyFixture.init("budget-existing");
+    defer fixture.deinit();
+    try fixture.writeSource("input.bin", "12345");
+    var retained = try core.private_files.RetainedFile.open(std.testing.io, fixture.source_path, .private);
+    defer retained.close(std.testing.io);
+    var small: retained_copy.Budget = .{ .limit = 4 };
+    try std.testing.expectError(error.CopyBudgetExceeded, retained_copy.copyRetained(
+        std.testing.allocator,
+        std.testing.io,
+        &retained,
+        fixture.output.dir,
+        fixture.output_path,
+        "artifacts/efi",
+        layout.max_json_bytes,
+        &small,
+        .{},
+    ));
+    try fixture.writeOutput("artifacts/efi", "old");
+    var budget: retained_copy.Budget = .{};
+    try std.testing.expectError(error.OutputExists, retained_copy.copyRetained(
+        std.testing.allocator,
+        std.testing.io,
+        &retained,
+        fixture.output.dir,
+        fixture.output_path,
+        "artifacts/efi",
+        layout.max_json_bytes,
+        &budget,
+        .{},
+    ));
+}
+
+test "retained copy poisons source mutation and ambiguous durability faults" {
+    var fixture = try CopyFixture.init("faults");
+    defer fixture.deinit();
+    const bytes = try std.testing.allocator.alloc(u8, 70 * 1024);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes, 'm');
+    try fixture.writeSource("input.bin", bytes);
+    var retained = try core.private_files.RetainedFile.open(std.testing.io, fixture.source_path, .private);
+    defer retained.close(std.testing.io);
+    var budget: retained_copy.Budget = .{};
+    try std.testing.expectError(error.FileChanged, retained_copy.copyRetained(
+        std.testing.allocator,
+        std.testing.io,
+        &retained,
+        fixture.output.dir,
+        fixture.output_path,
+        "artifacts/raw",
+        layout.max_large_artifact_bytes,
+        &budget,
+        .{ .fault = .mutate_source_after_first_chunk },
+    ));
+
+    try fixture.writeSource("second.bin", "durability");
+    var second = try core.private_files.RetainedFile.open(std.testing.io, fixture.second_source_path, .private);
+    defer second.close(std.testing.io);
+    try std.testing.expectError(error.AmbiguousWrite, retained_copy.copyRetained(
+        std.testing.allocator,
+        std.testing.io,
+        &second,
+        fixture.output.dir,
+        fixture.output_path,
+        "artifacts/vhd",
+        layout.max_json_bytes,
+        null,
+        .{ .fault = .before_file_sync },
+    ));
+}
+
+test "handoff manifest publish fault is poisoned before bundle is visible" {
+    var fixture = try CopyFixture.init("publish-fault");
+    defer fixture.deinit();
+    try std.testing.expectError(error.AmbiguousWrite, native_export.Test.publishBundleForTest(
+        std.testing.io,
+        fixture.output.dir,
+        "{}\n",
+        .before_file_sync,
+    ));
+    const bundle_path = try std.fs.path.join(std.testing.allocator, &.{ fixture.output_path, "bundle.json" });
+    defer std.testing.allocator.free(bundle_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.openFileAbsolute(
+        std.testing.io,
+        bundle_path,
+        .{ .mode = .read_only, .follow_symlinks = false },
+    ));
 }
 
 test "strict ZIP32 reader refuses malformed archives with typed errors" {
@@ -946,4 +1101,147 @@ fn generatedPublicMembers(a: std.mem.Allocator, compatibility: profile.Compatibi
 fn freeMembers(a: std.mem.Allocator, members: []const []const u8) void {
     for (members) |member| a.free(member);
     a.free(members);
+}
+
+fn expectEqualManifest(expected: []const u8, actual: []const u8) !void {
+    if (std.mem.eql(u8, expected, actual)) return;
+    const end = @min(expected.len, actual.len);
+    var index: usize = 0;
+    while (index < end and expected[index] == actual[index]) : (index += 1) {}
+    const start = index - @min(index, 96);
+    const stop_expected = @min(expected.len, index + 96);
+    const stop_actual = @min(actual.len, index + 96);
+    std.debug.print(
+        "manifest diff at byte {d}: expected 0x{x:0>2}, actual 0x{x:0>2}\nexpected: {s}\nactual:   {s}\n",
+        .{
+            index,
+            if (index < expected.len) expected[index] else 0,
+            if (index < actual.len) actual[index] else 0,
+            expected[start..stop_expected],
+            actual[start..stop_actual],
+        },
+    );
+    return error.TestExpectedEqual;
+}
+
+var copy_fixture_counter: usize = 0;
+
+const CopyFixture = struct {
+    rel_path: []const u8,
+    source_path: []const u8,
+    second_source_path: []const u8,
+    output_path: []const u8,
+    source_dir: std.Io.Dir,
+    output: core.private_files.Directory,
+
+    fn init(label: []const u8) !CopyFixture {
+        const a = std.testing.allocator;
+        const io = std.testing.io;
+        var cwd = std.Io.Dir.cwd();
+        try cwd.createDirPath(io, ".zig-cache/handoff-export-tests");
+        var parent = try cwd.openDir(io, ".zig-cache/handoff-export-tests", .{ .iterate = true });
+        defer parent.close(io);
+        copy_fixture_counter += 1;
+        const leaf = try std.fmt.allocPrint(a, "{s}-{d}-{d}", .{ label, std.os.linux.getpid(), copy_fixture_counter });
+        defer a.free(leaf);
+        try parent.createDir(io, leaf, .fromMode(0o700));
+        const rel_path = try std.fs.path.join(a, &.{ ".zig-cache/handoff-export-tests", leaf });
+        var root = try parent.openDir(io, leaf, .{ .iterate = true });
+        defer root.close(io);
+        try root.createDir(io, "source", .fromMode(0o700));
+        try root.createDir(io, "output", .fromMode(0o700));
+        const source_dir = try root.openDir(io, "source", .{ .iterate = true });
+        const root_path = try cwd.realPathFileAlloc(io, rel_path, a);
+        defer a.free(root_path);
+        const source_path = try std.fs.path.join(a, &.{ root_path, "source/input.bin" });
+        const second_source_path = try std.fs.path.join(a, &.{ root_path, "source/second.bin" });
+        const output_path = try std.fs.path.join(a, &.{ root_path, "output" });
+        const output = try core.private_files.Directory.open(io, output_path);
+        return .{
+            .rel_path = rel_path,
+            .source_path = source_path,
+            .second_source_path = second_source_path,
+            .output_path = output_path,
+            .source_dir = source_dir,
+            .output = output,
+        };
+    }
+
+    fn deinit(self: *CopyFixture) void {
+        const a = std.testing.allocator;
+        const io = std.testing.io;
+        self.output.close(io);
+        self.source_dir.close(io);
+        std.Io.Dir.cwd().deleteTree(io, self.rel_path) catch @panic("handoff copy fixture cleanup failed");
+        a.free(self.rel_path);
+        a.free(self.source_path);
+        a.free(self.second_source_path);
+        a.free(self.output_path);
+        self.* = undefined;
+    }
+
+    fn writeSource(self: *CopyFixture, name: []const u8, bytes: []const u8) !void {
+        try writeFile(std.testing.io, self.source_dir, name, bytes);
+    }
+
+    fn writeOutput(self: *CopyFixture, relative: []const u8, bytes: []const u8) !void {
+        var parent = try testEnsureParent(std.testing.io, self.output.dir, relative);
+        defer parent.close(std.testing.io);
+        try writeFile(std.testing.io, parent.dir, std.fs.path.basename(relative), bytes);
+    }
+
+    fn readOutput(self: *CopyFixture, relative: []const u8, limit: usize) ![]const u8 {
+        const path = try std.fs.path.join(std.testing.allocator, &.{ self.output_path, relative });
+        defer std.testing.allocator.free(path);
+        const file = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{ .mode = .read_only, .follow_symlinks = false });
+        defer file.close(std.testing.io);
+        const stat = try file.stat(std.testing.io);
+        if (stat.size > limit) return error.FileTooLarge;
+        const data = try std.testing.allocator.alloc(u8, @intCast(stat.size));
+        errdefer std.testing.allocator.free(data);
+        try std.testing.expectEqual(data.len, try file.readPositionalAll(std.testing.io, data, 0));
+        return data;
+    }
+};
+
+const TestParent = struct {
+    dir: std.Io.Dir,
+    close_dir: bool,
+
+    fn close(self: *TestParent, io: std.Io) void {
+        if (self.close_dir) self.dir.close(io);
+        self.* = undefined;
+    }
+};
+
+fn testEnsureParent(io: std.Io, root: std.Io.Dir, relative: []const u8) !TestParent {
+    var parts = std.mem.splitScalar(u8, relative, '/');
+    var component = parts.next() orelse return error.InvalidPath;
+    var current = root;
+    var close_current = false;
+    errdefer if (close_current) current.close(io);
+    while (parts.next()) |next| {
+        current.createDir(io, component, .fromMode(0o700)) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+        const child = try current.openDir(io, component, .{ .iterate = true, .follow_symlinks = false });
+        if (close_current) current.close(io);
+        current = child;
+        close_current = true;
+        component = next;
+    }
+    return .{ .dir = current, .close_dir = close_current };
+}
+
+fn writeFile(io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: []const u8) !void {
+    const file = try dir.createFile(io, name, .{
+        .exclusive = true,
+        .read = true,
+        .permissions = .fromMode(0o600),
+    });
+    defer file.close(io);
+    try file.writePositionalAll(io, bytes, 0);
+    try file.sync(io);
+    try (std.Io.File{ .handle = dir.handle, .flags = .{ .nonblocking = false } }).sync(io);
 }

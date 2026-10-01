@@ -23,6 +23,7 @@ PACK_V2_PUBLIC_SOURCE = WAMR_CI / "handoff/goldens/zip-pack-v2-public-source.jso
 PACK_HASHES = WAMR_CI / "handoff/goldens/zip-pack-hashes.json"
 ROOT_BOUND_V1 = WAMR_CI / "handoff/goldens/root-bound-v1.json"
 ROOT_BOUND_V2 = WAMR_CI / "handoff/goldens/root-bound-v2.json"
+EXPORT_BUNDLE_V2 = WAMR_CI / "handoff/goldens/export-bundle-v2.json"
 ROOT_BOUND_STAGE = "/opt/wamr-handoff-golden-stage"
 SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 REV = "0123456789012345678901234567890123456789"
@@ -312,6 +313,36 @@ def root_bound_bundle(handoff, public_bundle, version):
     return public_bundle.encoded(normalized)
 
 
+def export_bundle_v2(handoff, public_bundle):
+    with private_tempdir("handoff-export-bundle-") as root:
+        stage = root / "stage"
+        stage.mkdir(mode=0o700)
+        bundle = materialize_bundle(handoff, public_bundle, stage, 2)
+        by_name = dict(zip(handoff.V2_NAMES, bundle["artifacts"]))
+        bundle["identity"] = {
+            "wamr_revision": handoff.ci.REVISION,
+            **{name + "_sha256": by_name[name]["sha256"]
+               for name in ("wasm", "cwasm", "runtime", "compiler", "config")},
+        }
+        actual = stage.as_posix()
+
+    def normalize(value):
+        if isinstance(value, dict):
+            return {
+                key: (ROOT_BOUND_STAGE + raw[len(actual):]
+                      if key == "path" and isinstance(raw := item, str)
+                      and raw.startswith(actual + "/") else normalize(item))
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [normalize(item) for item in value]
+        return value
+
+    normalized = normalize(bundle)
+    public_bundle.members(handoff, normalized, Path(ROOT_BOUND_STAGE))
+    return public_bundle.encoded(normalized)
+
+
 def contract_golden():
     handoff, public_bundle = load("handoff"), load("public_bundle")
     packed = {version: packed_records(handoff, public_bundle, version) for version in (1, 2)}
@@ -416,6 +447,7 @@ class HandoffContractGoldens(unittest.TestCase):
         self.assertEqual(PACK_HASHES.read_text(encoding="utf-8"), pack_hashes(packed))
         self.assertEqual(ROOT_BOUND_V1.read_bytes(), root_bound_bundle(handoff, public_bundle, 1))
         self.assertEqual(ROOT_BOUND_V2.read_bytes(), root_bound_bundle(handoff, public_bundle, 2))
+        self.assertEqual(EXPORT_BUNDLE_V2.read_bytes(), export_bundle_v2(handoff, public_bundle))
 
     def test_python_members_match_zig_sample_verdicts(self):
         handoff, public_bundle = load("handoff"), load("public_bundle")
@@ -471,5 +503,6 @@ if __name__ == "__main__":
         PACK_HASHES.write_text(pack_hashes(packed), encoding="utf-8")
         ROOT_BOUND_V1.write_bytes(root_bound_bundle(handoff, public_bundle, 1))
         ROOT_BOUND_V2.write_bytes(root_bound_bundle(handoff, public_bundle, 2))
+        EXPORT_BUNDLE_V2.write_bytes(export_bundle_v2(handoff, public_bundle))
     else:
         unittest.main()
