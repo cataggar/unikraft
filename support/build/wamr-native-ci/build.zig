@@ -350,6 +350,22 @@ pub fn build(b: *std.Build) void {
     handoff_step.dependOn(&handoff_python_goldens.step);
     controller_step.dependOn(&handoff_contracts_run.step);
     controller_step.dependOn(&handoff_python_goldens.step);
+    const authority_contracts = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("authority/tests.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "hyperv_core", .module = host_core }},
+        }),
+    });
+    const authority_contracts_run = b.addRunArtifact(authority_contracts);
+    const authority_python_goldens = b.addSystemCommand(&.{ "python3", "-B" });
+    authority_python_goldens.addFileArg(b.path("tests/test_authority_contract_goldens.py"));
+    const authority_step = b.step("test-authority-contracts", "Run native/Python authority contract goldens");
+    authority_step.dependOn(&authority_contracts_run.step);
+    authority_step.dependOn(&authority_python_goldens.step);
+    controller_step.dependOn(&authority_contracts_run.step);
+    controller_step.dependOn(&authority_python_goldens.step);
     const tests = b.addTest(.{ .root_module = root });
     const unit_tests = b.addRunArtifact(tests);
     const unit_step = b.step("test-unit", "Test the compute packaging adapter command boundary");
@@ -423,6 +439,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&record_goldens_run.step);
     test_step.dependOn(&handoff_contracts_run.step);
     test_step.dependOn(&handoff_python_goldens.step);
+    test_step.dependOn(&authority_contracts_run.step);
+    test_step.dependOn(&authority_python_goldens.step);
 }
 
 fn validatorIdentity(
