@@ -31,18 +31,28 @@ LOG_VALIDATE = os.environ.get("WAMR_CI_LOG_VALIDATE")
 spec = importlib.util.spec_from_file_location("wamr_ci", HERE / "run.py")
 ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ci)
-if SUPERVISOR is not None:
-    ci.COMMAND_SUPERVISOR_PATH = str(
-        Path(SUPERVISOR).resolve(strict=True))
+SUPERVISOR_PATH = (
+    str(Path(SUPERVISOR).resolve(strict=True))
+    if SUPERVISOR is not None else None)
 bundle_spec = importlib.util.spec_from_file_location(
     "wamr_public_bundle", HERE / "public_bundle.py")
 public_bundle = importlib.util.module_from_spec(bundle_spec)
 bundle_spec.loader.exec_module(public_bundle)
-ci.COMMAND_TOOL_PATHS.update({
+ENV_COMMAND_TOOL_PATHS = {
     name: os.environ["WAMR_CI_TOOL_" + name.upper().replace("-", "_")]
     for name in ci.HOST_TOOLS
     if "WAMR_CI_TOOL_" + name.upper().replace("-", "_") in os.environ
-})
+}
+
+
+def reset_command_bindings():
+    ci.COMMAND_SUPERVISOR_PATH = SUPERVISOR_PATH
+    ci.COMMAND_TOOL_PATHS.clear()
+    ci.COMMAND_TOOL_PATHS.update(ENV_COMMAND_TOOL_PATHS)
+    ci.COMMAND_ENVIRONMENT.clear()
+
+
+reset_command_bindings()
 
 
 class NativeRecordBridge(unittest.TestCase):
@@ -1575,6 +1585,7 @@ class PhysicalPackage(unittest.TestCase):
     """Run the actual native adapter + pinned miz on a nonbootable synthetic PE."""
 
     def setUp(self):
+        reset_command_bindings()
         self.root = Path(tempfile.mkdtemp(prefix="wamr-native-ci-"))
         self.root.chmod(0o700)
         self.addCleanup(shutil.rmtree, self.root)
@@ -1668,6 +1679,7 @@ class PhysicalPackage(unittest.TestCase):
 
 class Evidence(unittest.TestCase):
     def setUp(self):
+        reset_command_bindings()
         self.root = Path(tempfile.mkdtemp(prefix="wamr-native-ci-"))
         self.root.chmod(0o700)
         self.addCleanup(shutil.rmtree, self.root)
