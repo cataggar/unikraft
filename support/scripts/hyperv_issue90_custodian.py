@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """#90 custodian recorder and signed handoff assembler.
 
-Live Azure use is limited to one signed, disposable dry run; acceptance is
-not available.
+Live Azure use here is limited to one signed, disposable dry run. The
+owner-attested acceptance lane lives in hyperv_issue90_acceptance.py behind
+its own signed acceptance approval, pre-provision statement and verifier.
 """
 
 from dataclasses import MISSING, dataclass, fields
@@ -46,18 +47,27 @@ HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 PRIVATE_TOKEN = re.compile(
     r"(?:https?://|sig=|accessSAS|access[Ss][Aa][Ss])", re.IGNORECASE,
 )
+SAS_TOKEN = re.compile(
+    r"(?:[?&]sig=|accessSAS|\.blob\.core\.windows\.net)", re.IGNORECASE,
+)
+TEXT_LIMIT = 4 * 1024 * 1024
+TEXT_STORE_LIMIT = 64 * 1024 * 1024
+TEXT_MANIFEST_SCHEMA = "uk-hyperv-issue90-custodian-stdout-v1"
 NO_LIVE_APPROVAL = (
     "Live #90 custodian Azure access is disabled without a valid signed "
-    "disposable dry-run approval; acceptance mode is not available"
+    "disposable dry-run approval; acceptance needs its separate signed "
+    "acceptance approval and pre-provision statement"
 )
 LIVE_APPROVAL_SCHEMA = "uk-hyperv-issue90-custodian-live-approval-v1"
 LIVE_MODE = "disposable-dry-run"
+LIVE_ACCEPTANCE_MODE = "acceptance"
 LIVE_CLEANUP = "delete-owned-group"
 LIVE_APPROVAL_FIELDS = (
     "schema", "version", "mode", "subscription_sha256", "location", "run_id",
     "operation_id", "group_id", "not_before_utc", "not_after_utc",
     "max_vm_running_seconds", "cleanup", "nonce",
 )
+ACCEPTANCE_APPROVAL_FIELDS = (*LIVE_APPROVAL_FIELDS, "preprovision_sha256")
 LIVE_APPROVAL_LIMIT = 4096
 LIVE_WINDOW = timedelta(minutes=300)
 HANDOFF_LIFETIME = timedelta(minutes=30)
@@ -226,6 +236,28 @@ class ArchiveStore:
         return {"sha256": digest, "size": len(raw)}
 
 
+class TextStore:
+    """Content-addressed private store for text stdout above the blob limit."""
+
+    def __init__(self, directory):
+        self.directory = _ensure_private_dir(directory)
+
+    def put(self, raw):
+        if not isinstance(raw, bytes) or len(raw) > TEXT_LIMIT:
+            raise ValueError("Custodian text observation exceeds its byte limit")
+        digest = hashlib.sha256(raw).hexdigest()
+        path = self.directory / digest
+        if os.path.lexists(path):
+            if _read_private_file(path, TEXT_LIMIT, "Custodian text blob") != raw:
+                raise ValueError("Custodian text digest collision or tampering")
+        else:
+            total = sum(item.lstat().st_size for item in self.directory.iterdir())
+            if total + len(raw) > TEXT_STORE_LIMIT:
+                raise ValueError("Custodian text store exceeds its total byte limit")
+            _write_private_file(path, raw)
+        return {"schema": TEXT_MANIFEST_SCHEMA, "sha256": digest, "size": len(raw)}
+
+
 class Journal:
     def __init__(self, path):
         self.path = Path(path)
@@ -280,6 +312,33 @@ class CustodianRecorder:
             if attempt < SETTLE_ATTEMPTS:
                 self.sleep(SETTLE_INTERVAL_SECONDS)
         raise ValueError(f"{step} did not settle within the polling budget")
+
+    def az_text(self, step, argv, *, timeout=120):
+        """Record a text read such as a boot log; its stdout need not be JSON.
+
+        The original stdout is archived (above the blob limit, a private
+        side store keeps it and the journal references a small manifest).
+        A JSON string output is decoded; other output must be UTF-8 text.
+        """
+        _check_step(step)
+        started = _precise_timestamp(self.clock())
+        result = self.runner(list(argv), timeout=timeout)
+        completed = _precise_timestamp(self.clock())
+        raw = result.stdout if isinstance(result, RunnerResult) else result
+        if not isinstance(raw, bytes) or len(raw) > TEXT_LIMIT:
+            raise ValueError(f"{step} stdout must be bounded bytes")
+        text = _stdout_text(raw, step)
+        if SAS_TOKEN.search(text) or SAS_TOKEN.search(
+                raw.decode("utf-8", "replace")):
+            raise ValueError(f"{step} output carried a storage access token")
+        stored = raw
+        if len(raw) > custody.MAX_ARCHIVE:
+            stored = azure.canonical_json(
+                TextStore(self.directory / "text").put(raw),
+            )
+        return self._store(step, stored, text, argv, redacted=False,
+                           synthetic=False, started_at_utc=started,
+                           completed_at_utc=completed)
 
     def _call(self, step, argv, timeout):
         # Write-access revocation must still reach Azure after the window.
@@ -576,14 +635,19 @@ def read_subscription(path):
 
 def approval_body(*, subscription, run_id, operation_id, group_id,
                   not_before_utc, not_after_utc, max_vm_running_seconds,
-                  location=LOCATION, nonce=None):
+                  location=LOCATION, nonce=None, mode=LIVE_MODE,
+                  preprovision_sha256=None):
     subscription = custody._uuid(subscription, "Subscription")
     if not_before_utc is None or not_after_utc is None:
         raise ValueError("Live approval window bounds are required")
+    if (mode == LIVE_ACCEPTANCE_MODE) != (preprovision_sha256 is not None):
+        raise ValueError(
+            "Only an acceptance approval binds a pre-provision statement digest"
+        )
     body = {
         "schema": LIVE_APPROVAL_SCHEMA,
         "version": 1,
-        "mode": LIVE_MODE,
+        "mode": mode,
         "subscription_sha256": _subscription_sha256(subscription),
         "location": location,
         "run_id": run_id,
@@ -595,13 +659,15 @@ def approval_body(*, subscription, run_id, operation_id, group_id,
         "cleanup": LIVE_CLEANUP,
         "nonce": nonce or secrets.token_hex(16),
     }
-    _approval_shape(body)
+    if mode == LIVE_ACCEPTANCE_MODE:
+        body["preprovision_sha256"] = preprovision_sha256
+    _approval_shape(body, mode)
     _approval_group_prefix(group_id, subscription)
     return body
 
 
 def sign_live_approval(body, approver_private_key):
-    _approval_shape(body)
+    _approval_shape(body, _body_mode(body))
     signature = _private_key(approver_private_key).sign(_approval_message(body))
     return azure.canonical_json({"body": body, "signature": signature.hex()})
 
@@ -627,9 +693,39 @@ def require_live_custodian_approval(approval_raw=None, *, approver_public_key=No
         raise LiveApprovalRefused(f"Live approval refused: {error}") from None
 
 
+def require_live_acceptance_approval(approval_raw=None, *, preprovision_raw=None,
+                                     approver_public_key=None,
+                                     custodian_public_key=None, expected=None,
+                                     plan=None, subscription=None, now=None):
+    """Check a signed acceptance approval bound to one pre-provision statement.
+
+    Unlike the dry run, Expected.preprovision_authorization_sha256 must be
+    the digest of the approver's pre-provision statement, which the approval
+    also binds; the statement's own content is checked by the acceptance lane.
+    """
+    if not approval_raw or not preprovision_raw or any(value is None for value in (
+        approver_public_key, custodian_public_key, expected, plan,
+        subscription, now,
+    )):
+        raise LiveApprovalRefused(NO_LIVE_APPROVAL)
+    try:
+        return _require_live_approval(
+            approval_raw, approver_public_key, custodian_public_key,
+            expected, plan, subscription, now, mode=LIVE_ACCEPTANCE_MODE,
+            preprovision_raw=preprovision_raw,
+        )
+    except LiveApprovalRefused:
+        raise
+    except Exception as error:
+        raise LiveApprovalRefused(
+            f"Live acceptance approval refused: {error}"
+        ) from None
+
+
 def _require_live_approval(approval_raw, approver_public_key,
                            custodian_public_key, expected, plan,
-                           subscription, now):
+                           subscription, now, *, mode=LIVE_MODE,
+                           preprovision_raw=None):
     if not isinstance(approval_raw, bytes) or len(approval_raw) > LIVE_APPROVAL_LIMIT:
         raise ValueError("Live approval exceeds its byte limit")
     record = azure.require_exact_fields(
@@ -651,7 +747,7 @@ def _require_live_approval(approval_raw, approver_public_key,
         )
     except (InvalidSignature, ValueError):
         raise ValueError("Invalid live approval signature") from None
-    not_before, not_after = _approval_shape(body)
+    not_before, not_after = _approval_shape(body, mode)
     subscription = custody._uuid(subscription, "Subscription")
     if body["subscription_sha256"] != _subscription_sha256(subscription):
         raise ValueError("Live approval is bound to a different subscription")
@@ -673,10 +769,21 @@ def _require_live_approval(approval_raw, approver_public_key,
     now = custody._now(now)
     if not not_before <= now <= not_after:
         raise ValueError("Current time is outside the approved live window")
-    if (expected.preprovision_authorization_sha256
-            != hashlib.sha256(approval_raw).hexdigest()):
+    if mode == LIVE_MODE:
+        if (expected.preprovision_authorization_sha256
+                != hashlib.sha256(approval_raw).hexdigest()):
+            raise ValueError(
+                "Expected preprovision authorization digest differs from the live approval"
+            )
+        return body
+    if (not isinstance(preprovision_raw, bytes)
+            or expected.preprovision_authorization_sha256
+            != hashlib.sha256(preprovision_raw).hexdigest()
+            or body["preprovision_sha256"]
+            != expected.preprovision_authorization_sha256):
         raise ValueError(
-            "Expected preprovision authorization digest differs from the live approval"
+            "Expected preprovision authorization digest differs from the "
+            "signed pre-provision statement or the acceptance approval"
         )
     return body
 
@@ -685,16 +792,34 @@ def _approval_message(body):
     return (LIVE_APPROVAL_SCHEMA + "\n").encode("ascii") + azure.canonical_json(body)
 
 
-def _approval_shape(body):
-    azure.require_exact_fields(body, LIVE_APPROVAL_FIELDS, "Live approval body")
+def _body_mode(body):
+    if isinstance(body, dict) and body.get("mode") == LIVE_ACCEPTANCE_MODE:
+        return LIVE_ACCEPTANCE_MODE
+    return LIVE_MODE
+
+
+def _approval_shape(body, mode=LIVE_MODE):
+    if mode not in (LIVE_MODE, LIVE_ACCEPTANCE_MODE):
+        raise ValueError("Unknown live approval mode")
+    azure.require_exact_fields(
+        body,
+        ACCEPTANCE_APPROVAL_FIELDS if mode == LIVE_ACCEPTANCE_MODE
+        else LIVE_APPROVAL_FIELDS,
+        "Live approval body",
+    )
     if (body["schema"] != LIVE_APPROVAL_SCHEMA
             or type(body["version"]) is not int or body["version"] != 1):
         raise ValueError("Live approval schema or version is not supported")
-    if body["mode"] != LIVE_MODE:
+    if body["mode"] != mode:
+        if mode == LIVE_ACCEPTANCE_MODE:
+            raise ValueError("Live approval is not an acceptance approval")
         raise ValueError(
             "Only the disposable dry-run live mode is available; acceptance "
             "and every other live mode are not authorized"
         )
+    if mode == LIVE_ACCEPTANCE_MODE:
+        custody._sha(body["preprovision_sha256"],
+                     "Acceptance pre-provision statement digest")
     if body["cleanup"] != LIVE_CLEANUP:
         raise ValueError("Live approval must require deleting the owned group")
     if body["location"] != LOCATION:
@@ -863,7 +988,7 @@ def run_live(approval=None, *, approver_public_key=None,
              expected=None, plan=None, subscription=None, directory=None,
              records_dir=None, registry_dir=None, runner=None,
              cleanup_runner=None, upload=None, clock=None):
-    """Run one signed disposable dry run; acceptance is never available."""
+    """Run one signed disposable dry run; acceptance is never run here."""
     clock = clock or _utc_now
     if approval is None:
         raise LiveApprovalRefused(NO_LIVE_APPROVAL)
@@ -1374,7 +1499,7 @@ def main(argv=None):
     verify.add_argument("--now")
     approve = sub.add_parser(
         "approve-dry-run",
-        help="sign a disposable dry-run live approval (acceptance unavailable)",
+        help="sign a disposable dry-run live approval (dry run only)",
     )
     approve.add_argument("--expected-json", required=True, type=Path)
     approve.add_argument("--subscription-file", required=True, type=Path)
@@ -1384,7 +1509,7 @@ def main(argv=None):
     approve.add_argument("--max-vm-running-seconds", required=True, type=int)
     approve.add_argument("--output", required=True, type=Path)
     live = sub.add_parser(
-        "live", help="run one signed disposable dry run (acceptance unavailable)",
+        "live", help="run one signed disposable dry run (dry run only)",
     )
     live.add_argument("--approval", required=True, type=Path)
     live.add_argument("--approver-public-key", required=True, type=Path)
@@ -1718,6 +1843,23 @@ def _parse_stdout(raw, label):
     if not raw.strip():
         return None
     return azure.parse_strict_json(raw, label)
+
+
+def _stdout_text(raw, label):
+    if not raw.strip():
+        return ""
+    try:
+        value = azure.parse_strict_json(raw, label)
+    except ValueError:
+        value = _MISSING
+    if isinstance(value, str):
+        return value
+    if value is not _MISSING:
+        raise ValueError(f"{label} output is JSON but not a text string")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError(f"{label} output is not UTF-8 text") from None
 
 
 def _timestamp(value=None):
