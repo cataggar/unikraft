@@ -9,7 +9,7 @@ const golden = @embedFile("goldens/contracts.json");
 const scenarios = @embedFile("goldens/python-scenarios.json");
 
 const golden_fields = struct {
-    pub const root = [_][]const u8{ "schema", "schema_version", "authority_domain", "canonicalization", "cli", "limits", "policy", "azure_runtime", "schemas", "canonical_records", "uuid_normalization", "generated_ids", "live_success_scenarios", "live_refusal_scenarios" };
+    pub const root = [_][]const u8{ "schema", "schema_version", "authority_domain", "canonicalization", "cli", "limits", "policy", "azure_runtime", "schemas", "canonical_records", "uuid_normalization", "uuid_rejection", "generated_ids", "live_success_scenarios", "live_refusal_scenarios", "runtime_bound_scenarios" };
     pub const cli_root = [_][]const u8{ "commands", "exit_contract" };
     pub const command = [_][]const u8{ "options", "required", "optional", "repeated_required", "repeated_optional" };
     pub const exit_contract = [_][]const u8{ "help_exit", "malformed_exit", "refusal_exit", "refusal_stdout", "refusal_stderr", "success_exit", "success_stdout", "validator_probe_streams_public" };
@@ -21,6 +21,8 @@ const golden_fields = struct {
     pub const records = [_][]const u8{ "azure_runtime", "plan", "approval_template", "authorization_approved", "authorization_denied", "admission" };
     pub const inventory = [_][]const u8{ "schema", "schema_version", "sources", "source_counts", "count", "scenarios" };
     pub const uuid_normalization = [_][]const u8{ "input", "normalized" };
+    pub const uuid_rejection = [_][]const u8{ "field", "input", "refused", "reason", "output_file_appeared" };
+    pub const runtime_bound = [_][]const u8{ "name", "limit", "accepted_at_limit", "refused_above_limit", "reason" };
     pub const generated_ids = [_][]const u8{ "attempt_id", "ledger_id" };
     pub const live_refusal = [_][]const u8{ "name", "refused", "exception", "reason", "output_file_appeared", "outputs" };
 };
@@ -41,6 +43,7 @@ test "Python authority golden is canonical and matches native literal tables" {
     try expectCanonicalRecords(root.get("canonical_records") orelse return error.MissingGolden);
     try expectUuid(root);
     try expectLiveRefusals(root.get("live_refusal_scenarios") orelse return error.MissingGolden);
+    try expectRuntimeBounds(root.get("runtime_bound_scenarios") orelse return error.MissingGolden);
 }
 
 test "authority contract helper boundaries are frozen" {
@@ -60,9 +63,9 @@ test "Python authority scenario inventory is checked and sorted" {
     const root = try c.exactFields(document.value(), &golden_fields.inventory);
     try expectLiteral(root, "schema", "uk.wamr.authority-python-scenario-inventory");
     try expectInt(root, "schema_version", @as(u8, 1));
-    try expectInt(root, "count", @as(u16, 172));
+    try expectInt(root, "count", @as(u16, 174));
     const items = (root.get("scenarios") orelse return error.MissingGolden).array.items;
-    try std.testing.expectEqual(@as(usize, 172), items.len);
+    try std.testing.expectEqual(@as(usize, 174), items.len);
     var previous: []const u8 = "";
     for (items) |item| {
         const current = try c.string(item);
@@ -207,7 +210,20 @@ fn expectAzureRuntime(value: std.json.Value) !void {
 fn expectSchemas(value: std.json.Value) !void {
     const m = value.object;
     inline for (comptime std.meta.declarations(contracts.schema_fields)) |decl| {
-        try expectStringArray(m, decl.name, &@field(contracts.schema_fields, decl.name));
+        const expected = &@field(contracts.schema_fields, decl.name);
+        const items = (m.get(decl.name) orelse return error.MissingGolden).array.items;
+        try std.testing.expectEqual(expected.len, items.len);
+        var previous: []const u8 = "";
+        for (items) |item| {
+            const name = try c.string(item);
+            try std.testing.expect(std.mem.lessThan(u8, previous, name));
+            previous = name;
+            var found = false;
+            for (expected) |field| {
+                if (std.mem.eql(u8, name, field)) found = true;
+            }
+            try std.testing.expect(found);
+        }
     }
 }
 
@@ -236,9 +252,49 @@ fn expectUuid(root: std.json.ObjectMap) !void {
         try expectLiteral(m, "input", contracts.uuid.normalization_inputs[index]);
         try expectLiteral(m, "normalized", contracts.uuid.normalization_outputs[index]);
     }
+    const rejected = (root.get("uuid_rejection") orelse return error.MissingGolden).array.items;
+    try std.testing.expectEqual(contracts.uuid.rejection_fields.len * contracts.uuid.rejection_inputs.len, rejected.len);
+    for (contracts.uuid.rejection_fields, 0..) |field, field_index| {
+        for (contracts.uuid.rejection_inputs, 0..) |input, input_index| {
+            const m = try c.exactFields(rejected[field_index * contracts.uuid.rejection_inputs.len + input_index], &golden_fields.uuid_rejection);
+            try expectLiteral(m, "field", field);
+            try expectLiteral(m, "input", input);
+            try expectBool(m, "refused", true);
+            try expectLiteral(m, "reason", "canonical plan UUID required");
+            try expectBool(m, "output_file_appeared", false);
+        }
+    }
     const generated = try c.exactFields(root.get("generated_ids") orelse return error.MissingGolden, &golden_fields.generated_ids);
     try expectLiteral(generated, "attempt_id", contracts.uuid.generated_attempt_id);
     try expectLiteral(generated, "ledger_id", contracts.uuid.generated_ledger_id);
+}
+
+fn expectRuntimeBounds(value: std.json.Value) !void {
+    const items = value.array.items;
+    const names = [_][]const u8{ "files", "directories", "bytes", "directory_depth", "file_depth", "scan_files", "scan_directories", "scan_bytes", "scan_depth", "file_bytes", "loader_files", "manifest_bytes" };
+    const limits = [_]u64{
+        contracts.limits.runtime_files,
+        contracts.limits.runtime_directories,
+        contracts.limits.runtime_bytes,
+        contracts.limits.runtime_depth,
+        contracts.limits.runtime_depth,
+        contracts.limits.runtime_files,
+        contracts.limits.runtime_directories,
+        contracts.limits.runtime_bytes,
+        contracts.limits.runtime_depth,
+        contracts.limits.runtime_file_bytes,
+        contracts.limits.runtime_loader_files,
+        contracts.limits.runtime_manifest_bytes,
+    };
+    try std.testing.expectEqual(names.len, items.len);
+    for (items, names, limits) |item, name, limit| {
+        const m = try c.exactFields(item, &golden_fields.runtime_bound);
+        try expectLiteral(m, "name", name);
+        try expectInt(m, "limit", limit);
+        try expectBool(m, "accepted_at_limit", true);
+        try expectBool(m, "refused_above_limit", true);
+        _ = try c.string(m.get("reason") orelse return error.MissingGolden);
+    }
 }
 
 fn expectLiveRefusals(value: std.json.Value) !void {

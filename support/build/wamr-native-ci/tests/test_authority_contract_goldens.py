@@ -18,7 +18,9 @@ import shutil
 import stat
 import subprocess
 import sys
+import types
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[4]
 WAMR_CI = ROOT / "support/build/wamr-native-ci"
@@ -28,11 +30,11 @@ SCENARIOS = WAMR_CI / "authority/goldens/python-scenarios.json"
 def scratch_root():
     explicit = os.environ.get("WAMR_AUTHORITY_CONTRACT_SCRATCH")
     if explicit:
-        return Path(explicit)
+        return Path(explicit).resolve()
     zig_cache = os.environ.get("ZIG_LOCAL_CACHE_DIR")
     if zig_cache:
-        return Path(zig_cache) / "authority-contract-work"
-    return Path.home() / ".cache/wamr-authority-contract-work"
+        return Path(zig_cache).resolve() / "authority-contract-work"
+    return ROOT / ".d/authority-contract-work"
 
 
 SCRATCH = scratch_root()
@@ -58,6 +60,7 @@ CREATED = 1_800_000_000
 RECORDED = 1_800_000_100
 PROBE_SENTINEL = b"AUTHORITY-PROBE-SENTINEL"
 _ORIGINAL_SHA256 = hashlib.sha256
+_ORIGINAL_SUBPROCESS_RUN = subprocess.run
 
 
 def remove_tree(path):
@@ -83,10 +86,13 @@ def remove_tree(path):
     shutil.rmtree(path)
 
 
-def load(name):
+def load(name, source=None):
     spec = importlib.util.spec_from_file_location(name, WAMR_CI / f"{name}.py")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    if source is None:
+        spec.loader.exec_module(module)
+    else:
+        exec(compile(source, str(WAMR_CI / f"{name}.py"), "exec"), module.__dict__)
     return module
 
 
@@ -108,9 +114,6 @@ def digest_bytes(data):
 
 def digest_label(label):
     return digest_bytes(("authority-contract:" + label).encode("utf-8"))
-
-
-
 
 def native_cost_coefficients():
     source = (ROOT / "support/tools/hyperv/direct/compute.zig").read_text(encoding="utf-8")
@@ -165,7 +168,7 @@ class StableSha256:
 class AuthorityOracle:
     def __init__(self, handoff):
         self.handoff = handoff
-        self.root = SCRATCH
+        self.root = SCRATCH / ("case-" + os.urandom(16).hex())
         self.anchor = self.root / "authority"
         self.uid = 1000
         self.gid = 1000
@@ -179,8 +182,9 @@ class AuthorityOracle:
         self.tool_paths = {}
 
     def reset(self):
-        remove_tree(self.root)
-        self.anchor.mkdir(mode=0o700, parents=True)
+        SCRATCH.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.root.mkdir(mode=0o700)
+        self.anchor.mkdir(mode=0o700)
 
     def logical(self, path):
         raw = os.fspath(path)
@@ -264,9 +268,6 @@ class AuthorityOracle:
     def private(self, path):
         del path
 
-    def native_validate(self, validator, *arguments):
-        del validator, arguments
-
     def native_json(self, validator, *arguments):
         del validator
         self.handoff.ci.require(
@@ -291,6 +292,23 @@ class AuthorityOracle:
             "initial_state_sha256": digest_label("ledger-initial"),
             "marker_sha256": digest_label("ledger-marker"),
         }
+
+    def validator_process(self, arguments, **kwargs):
+        del kwargs
+        self.handoff.ci.require(
+            self.logical(arguments[0]) == "/authority/bin/uk-wamr-direct-validate",
+            "unexpected process in offline authority oracle")
+        command = arguments[1]
+        if command == "ledger-proposal":
+            output = canonical_json(
+                self.handoff, self.native_json(*arguments)).encode("utf-8")
+        else:
+            self.handoff.ci.require(
+                command in ("azure-runtime", "candidate", "plan", "authorization", "admission"),
+                "unexpected validator command in offline authority oracle")
+            output = PROBE_SENTINEL + b"\n"
+        return types.SimpleNamespace(
+            returncode=0, stdout=output, stderr=PROBE_SENTINEL + b"\n")
 
     def safe_source_tree(self, path):
         return self.physical(path)
@@ -374,8 +392,6 @@ class AuthorityOracle:
         original_sha256 = hashlib.sha256
         originals = {
             "private": handoff.private,
-            "native_validate": handoff.native_validate,
-            "native_json": handoff.native_json,
             "candidate_plan": handoff.candidate_plan,
             "artifact": handoff.artifact,
             "executable_artifact": handoff.executable_artifact,
@@ -393,6 +409,7 @@ class AuthorityOracle:
             "uuid4": handoff.uuid.uuid4,
             "time": handoff.time.time,
             "geteuid": handoff.os.geteuid,
+            "subprocess_run": handoff.subprocess.run,
         }
 
         def stable_sha256(data=b""):
@@ -408,8 +425,6 @@ class AuthorityOracle:
             return originals["require_tool_bindings"](*args, **kwargs)
 
         handoff.private = self.private
-        handoff.native_validate = self.native_validate
-        handoff.native_json = self.native_json
         handoff.candidate_plan = self.candidate_plan
         handoff.artifact = self.artifact
         handoff.executable_artifact = self.executable_artifact
@@ -427,14 +442,13 @@ class AuthorityOracle:
         handoff.uuid.uuid4 = self.next_uuid
         handoff.time.time = lambda: CREATED
         handoff.os.geteuid = lambda: self.uid
+        handoff.subprocess.run = self.validator_process
         hashlib.sha256 = stable_sha256
         Path.lstat = lambda path_self: self.fake_lstat(original_path_lstat, path_self)
         try:
             yield
         finally:
             handoff.private = originals["private"]
-            handoff.native_validate = originals["native_validate"]
-            handoff.native_json = originals["native_json"]
             handoff.candidate_plan = originals["candidate_plan"]
             handoff.artifact = originals["artifact"]
             handoff.executable_artifact = originals["executable_artifact"]
@@ -452,6 +466,7 @@ class AuthorityOracle:
             handoff.uuid.uuid4 = originals["uuid4"]
             handoff.time.time = originals["time"]
             handoff.os.geteuid = originals["geteuid"]
+            handoff.subprocess.run = originals["subprocess_run"]
             hashlib.sha256 = original_sha256
             Path.lstat = original_path_lstat
 
@@ -790,7 +805,7 @@ def cli_surface(handoff):
 
 def run_handoff(*args):
     env = {"PYTHONDONTWRITEBYTECODE": "1", "LC_ALL": "C"}
-    completed = subprocess.run(
+    completed = _ORIGINAL_SUBPROCESS_RUN(
         [sys.executable, "-B", str(WAMR_CI / "handoff.py"), *args],
         cwd=ROOT,
         env=env,
@@ -882,7 +897,7 @@ def schemas(values):
     template = values["approval_template"]
     authorization = values["authorization_approved"]
     admission = values["admission"]
-    return {
+    fields = {
         "artifact": list(plan["candidate"].keys()),
         "azure_runtime": list(runtime.keys()),
         "azure_runtime_limits": list(runtime["limits"].keys()),
@@ -906,6 +921,7 @@ def schemas(values):
         "admission": list(admission.keys()),
         "admission_approval": list(admission["approval"].keys()),
     }
+    return {name: sorted(keys) for name, keys in fields.items()}
 
 
 def binary_max(success, high):
@@ -923,6 +939,7 @@ def binary_max(success, high):
 def derive_live_probes(handoff, oracle, base):
     refusals = []
     successes = []
+    uuid_rejections = []
 
     def auth_success(name, **kwargs):
         try:
@@ -970,6 +987,11 @@ def derive_live_probes(handoff, oracle, base):
         ("reference-del", {"reference": "bad" + chr(0x7f)}),
         ("reference-over", {"reference": "r" * (reference_max + 1)}),
         ("approval-window-zero-recorded", {"recorded_unix": 0, "expires_unix": window_max}),
+        ("approval-window-negative-recorded", {"recorded_unix": -1, "expires_unix": 1}),
+        ("approval-window-equal", {"expires_unix": RECORDED}),
+        ("approval-window-reversed", {"expires_unix": RECORDED - 1}),
+        ("approval-window-bool", {"recorded_unix": True, "expires_unix": 2}),
+        ("approval-window-float", {"recorded_unix": float(RECORDED)}),
         ("approval-window-over", {"expires_unix": RECORDED + window_max + 1}),
     ):
         case = oracle.anchor / "private/cases" / name / "authorization.json"
@@ -978,6 +1000,28 @@ def derive_live_probes(handoff, oracle, base):
             lambda kwargs=kwargs, name=name: oracle.authorization_case(
                 name, base["plan_path"], base["template_path"], **kwargs),
             {"authorization": case})
+    for field in ("approver", "reference"):
+        for control in range(0x20):
+            name = f"{field}-c0-{control:02x}"
+            add_refusal(
+                name,
+                lambda field=field, control=control, name=name: oracle.authorization_case(
+                    name, base["plan_path"], base["template_path"],
+                    **{field: "bad" + chr(control)}),
+                {"authorization": oracle.anchor / "private/cases" / name / "authorization.json"})
+        maximum = approver_max if field == "approver" else reference_max
+        name = f"{field}-utf8-max-accepted"
+        case = oracle.authorization_case(
+            name, base["plan_path"], base["template_path"],
+            **{field: "é" * (maximum // 2)})
+        successes.append({"name": name, "output": oracle.logical(case["authorization_path"]), "file": "authorization.json"})
+        name = f"{field}-utf8-over"
+        add_refusal(
+            name,
+            lambda field=field, maximum=maximum, name=name: oracle.authorization_case(
+                name, base["plan_path"], base["template_path"],
+                **{field: "é" * (maximum // 2) + "a"}),
+            {"authorization": oracle.anchor / "private/cases" / name / "authorization.json"})
     denied = oracle.authorization_case(
         "denied-for-admission", base["plan_path"], base["template_path"],
         decision="denied")
@@ -992,8 +1036,19 @@ def derive_live_probes(handoff, oracle, base):
         ("uuid-attempt-invalid", {"attempt_id": "not-a-uuid"}),
         ("uuid-campaign-invalid", {"campaign_id": "not-a-uuid"}),
         ("uuid-subscription-invalid", {"subscription": "not-a-uuid"}),
+        ("uuid-ledger-invalid", {"ledger_id": "not-a-uuid"}),
         ("cost-under-estimate", {"maximum": handoff.ESTIMATED_COST_UPPER_BOUND_MICROUSD - 1}),
         ("cost-over-repository", {"maximum": handoff.REPOSITORY_MAXIMUM_COST_MICROUSD + 1}),
+        ("cost-bool", {"maximum": True}),
+        ("cost-float", {"maximum": float(handoff.ESTIMATED_COST_UPPER_BOUND_MICROUSD)}),
+        ("cost-string", {"maximum": str(handoff.ESTIMATED_COST_UPPER_BOUND_MICROUSD)}),
+        ("prefix-under", {"prefix": "a" * 5}),
+        ("prefix-over", {"prefix": "a" * 33}),
+        ("prefix-uppercase", {"prefix": "Invalid"}),
+        ("prefix-control", {"prefix": "bad\nprefix"}),
+        ("created-zero", {"created_unix": 0}),
+        ("created-negative", {"created_unix": -1}),
+        ("created-bool", {"created_unix": True}),
     ):
         base_path = oracle.anchor / "private/cases" / name
         add_refusal(
@@ -1003,6 +1058,24 @@ def derive_live_probes(handoff, oracle, base):
                 "plan": base_path / "plan.json",
                 "template": base_path / "template.json",
                 "candidate": base_path / "candidate.json",
+            })
+    for field in ("attempt_id", "campaign_id", "ledger_id", "subscription"):
+        for index, raw in enumerate((
+            "", "0" * 31, "g" * 32,
+            "00000000-0000-4000-8000-000000000001\n",
+            "urn:uuid:not-a-uuid",
+        )):
+            name = f"uuid-{field}-reject-{index}"
+            base_path = oracle.anchor / "private/cases" / name
+            outcome = add_refusal(
+                name,
+                lambda field=field, raw=raw, name=name: oracle.plan_case(name, **{field: raw}),
+                {key: base_path / filename for key, filename in (
+                    ("plan", "plan.json"), ("template", "template.json"), ("candidate", "candidate.json"))})
+            uuid_rejections.append({
+                "field": field, "input": raw, "refused": outcome["refused"],
+                "reason": outcome["reason"],
+                "output_file_appeared": outcome["output_file_appeared"],
             })
     cost_min = oracle.plan_case(
         "cost-min-accepted",
@@ -1016,9 +1089,14 @@ def derive_live_probes(handoff, oracle, base):
         "{00000000-0000-4000-8000-000000000001}",
         "00000000-0000-4000-8000-000000000001",
         "00000000-0000-4000-8000-00000000000A",
+        "urn:uuid:00000000-0000-4000-8000-00000000000A",
     )):
         plan = oracle.plan_case(
-            f"uuid-normalize-{index}", attempt_id=raw)["plan"]
+            f"uuid-normalize-{index}", attempt_id=raw, campaign_id=raw,
+            ledger_id=raw, subscription=raw)["plan"]
+        if not all(plan[key] == plan["attempt_id"] for key in ("campaign_id", "subscription")) \
+                or plan["ledger"]["ledger_id"] != plan["attempt_id"]:
+            raise AssertionError("UUID fields normalize differently")
         uuid_cases.append({"input": raw, "normalized": plan["attempt_id"]})
     oracle.uuid_queue = [GENERATED_ATTEMPT, GENERATED_LEDGER]
     generated = oracle.plan_case(
@@ -1038,6 +1116,7 @@ def derive_live_probes(handoff, oracle, base):
         "success_scenarios": successes,
         "refusal_scenarios": refusals,
         "uuid_normalization": uuid_cases,
+        "uuid_rejection": uuid_rejections,
         "generated_ids": {
             "attempt_id": generated["attempt_id"],
             "ledger_id": generated["ledger"]["ledger_id"],
@@ -1045,8 +1124,156 @@ def derive_live_probes(handoff, oracle, base):
     }
 
 
-def authority_contract_golden():
-    handoff = load("handoff")
+def runtime_bound_probes(handoff, oracle, inputs):
+    results = []
+
+    def probe(name, limit, operation):
+        operation(limit)
+        try:
+            operation(limit + 1)
+        except handoff.ci.Refusal as error:
+            refused = True
+            reason = str(error)
+        else:
+            refused = False
+            reason = None
+        results.append({
+            "name": name, "limit": limit, "accepted_at_limit": True,
+            "refused_above_limit": refused, "reason": reason,
+        })
+
+    root = oracle.anchor / "budget"
+
+    def files(count):
+        budget = handoff._RuntimeCopyBudget(root)
+        budget.files = count - 1
+        budget.file(root / "file", 1)
+
+    def directories(count):
+        budget = handoff._RuntimeCopyBudget(root)
+        budget.directories = count - 1
+        budget.directory(root / "directory")
+
+    def aggregate_bytes(size):
+        budget = handoff._RuntimeCopyBudget(root)
+        budget.bytes = size - 1
+        budget.file(root / "file", 1)
+
+    def directory_depth(count):
+        budget = handoff._RuntimeCopyBudget(root)
+        budget.directory(root.joinpath(*(["directory"] * count)))
+
+    def file_depth(count):
+        budget = handoff._RuntimeCopyBudget(root)
+        budget.file(root.joinpath(*(["directory"] * count), "file"), 1)
+
+    probe("files", handoff.AZURE_RUNTIME_MAX_FILES, files)
+    probe("directories", handoff.AZURE_RUNTIME_MAX_DIRECTORIES, directories)
+    probe("bytes", handoff.AZURE_RUNTIME_MAX_BYTES, aggregate_bytes)
+    probe("directory_depth", handoff.AZURE_RUNTIME_MAX_DEPTH, directory_depth)
+    probe("file_depth", handoff.AZURE_RUNTIME_MAX_DEPTH, file_depth)
+
+    scan_root = oracle.anchor / "scan-bound"
+    scan_root.mkdir(mode=0o700)
+    scan_file = oracle.write_input("scan-bound/file", b"real scan content\n", 0o400)
+    original_lstat = Path.lstat
+    scanned_digest = oracle.digest(scan_file)
+
+    def scan_bound(kind, count):
+        @contextlib.contextmanager
+        def scandir(path):
+            path = Path(path)
+            if kind == "files" and path == scan_root:
+                names = (f"file-{index}" for index in range(count))
+            elif kind == "directories" and path == scan_root:
+                names = (f"directory-{index}" for index in range(count - 1))
+            elif kind == "bytes" and path == scan_root:
+                names = (f"file-{index}" for index in range(
+                    (count + handoff.AZURE_RUNTIME_MAX_FILE_BYTES - 1) // handoff.AZURE_RUNTIME_MAX_FILE_BYTES))
+            elif kind == "depth":
+                depth = len(path.relative_to(scan_root).parts)
+                names = ("directory",) if depth < count else ()
+            else:
+                names = ()
+            yield (types.SimpleNamespace(name=name) for name in names)
+
+        def lstat(path):
+            if path == scan_root:
+                return original_lstat(path)
+            relative = path.relative_to(scan_root)
+            directory = kind in ("directories", "depth")
+            size = 1
+            if kind == "bytes":
+                index = int(path.name.removeprefix("file-"))
+                size = min(handoff.AZURE_RUNTIME_MAX_FILE_BYTES,
+                           count - index * handoff.AZURE_RUNTIME_MAX_FILE_BYTES)
+            return FakeStat(
+                mode=stat.S_IFDIR | 0o500 if directory else stat.S_IFREG | 0o400,
+                size=4096 if directory else size,
+                path_key="/authority/scan-bound/" + relative.as_posix())
+
+        # Virtual entries scale counts/sizes, but use real fixture content hashes.
+        with mock.patch.object(handoff.os, "scandir", scandir), \
+                mock.patch.object(Path, "lstat", lstat), \
+                mock.patch.object(handoff.ci, "digest", lambda unused: scanned_digest):
+            handoff._scan_azure_runtime(scan_root, scan_file, scan_file, ())
+
+    for name, limit in (
+        ("files", handoff.AZURE_RUNTIME_MAX_FILES),
+        ("directories", handoff.AZURE_RUNTIME_MAX_DIRECTORIES),
+        ("bytes", handoff.AZURE_RUNTIME_MAX_BYTES),
+        ("depth", handoff.AZURE_RUNTIME_MAX_DEPTH),
+    ):
+        probe("scan_" + name, limit,
+              lambda count, name=name: scan_bound(name, count))
+
+    def file_bytes(size):
+        def lstat(path):
+            info = original_lstat(path)
+            if path == scan_file:
+                info.st_size = size
+            return info
+
+        with mock.patch.object(Path, "lstat", lstat):
+            handoff._scan_azure_runtime(scan_root, scan_file, scan_file, ())
+
+    probe("file_bytes", handoff.AZURE_RUNTIME_MAX_FILE_BYTES, file_bytes)
+
+    def prepare(name):
+        return handoff.prepare_azure_runtime(
+            oracle.anchor / "private" / name,
+            oracle.tool_paths["azure"], oracle.tool_paths["az_python"],
+            inputs["stdlib"], package_roots=(inputs["package_root"],),
+            data_roots=(inputs["data_root"],),
+            validator=oracle.tool_paths["validator"])
+
+    def loader_files(count):
+        dependencies = {
+            f"fixture-{index:03d}.so": oracle.tool_paths["libpython"]
+            for index in range(count - 1)
+        }
+        with mock.patch.object(handoff, "_elf_dependencies", lambda unused: dependencies):
+            prepare(f"loader-bound-{count}")
+
+    probe("loader_files", handoff.AZURE_RUNTIME_MAX_LOADER_FILES, loader_files)
+    original_scan = handoff._scan_azure_runtime
+
+    def manifest_bytes(size):
+        def scan(*args):
+            result = original_scan(*args)
+            # Exercise the publication size gate without allocating a huge tree.
+            result["records"] = [b"M" * size]
+            return result
+
+        with mock.patch.object(handoff, "_scan_azure_runtime", scan):
+            prepare(f"manifest-bound-{size}")
+
+    probe("manifest_bytes", handoff.AZURE_RUNTIME_MAX_MANIFEST_BYTES, manifest_bytes)
+    return results
+
+
+def authority_contract_golden(handoff=None):
+    handoff = load("handoff") if handoff is None else handoff
     oracle = AuthorityOracle(handoff)
     oracle.reset()
     try:
@@ -1138,9 +1365,11 @@ def authority_contract_golden():
                     key: canonical_json(handoff, item) for key, item in values.items()
                 },
                 "uuid_normalization": probes["uuid_normalization"],
+                "uuid_rejection": probes["uuid_rejection"],
                 "generated_ids": probes["generated_ids"],
                 "live_success_scenarios": probes["success_scenarios"],
                 "live_refusal_scenarios": probes["refusal_scenarios"],
+                "runtime_bound_scenarios": runtime_bound_probes(handoff, oracle, inputs),
             }
             return canonical_file(value)
     finally:
@@ -1180,6 +1409,16 @@ def scenario_inventory_golden():
 
 
 class AuthorityContractGoldens(unittest.TestCase):
+    def test_oracle_preserves_existing_scratch_parent_contents(self):
+        SCRATCH.mkdir(mode=0o700, parents=True, exist_ok=True)
+        marker = SCRATCH / ("retained-" + os.urandom(16).hex())
+        marker.write_bytes(b"unrelated retained evidence\n")
+        try:
+            authority_contract_golden()
+            self.assertEqual(b"unrelated retained evidence\n", marker.read_bytes())
+        finally:
+            marker.unlink()
+
     def test_python_oracle_matches_checked_in_contract_golden(self):
         self.assertEqual(GOLDEN.read_text(encoding="utf-8"), authority_contract_golden())
 
@@ -1205,10 +1444,79 @@ class AuthorityContractGoldens(unittest.TestCase):
             self.assertEqual("wamr_native_ci.Refusal", scenario["exception"], scenario["name"])
             self.assertFalse(scenario["output_file_appeared"], scenario["name"])
 
+    def test_runtime_bounds_accept_exactly_the_limit_and_refuse_above(self):
+        contract = json.loads(authority_contract_golden())
+        for scenario in contract["runtime_bound_scenarios"]:
+            self.assertTrue(scenario["accepted_at_limit"], scenario["name"])
+            self.assertTrue(scenario["refused_above_limit"], scenario["name"])
+
+
+def mutate_function(source, function, before, after):
+    node = ast.parse(source)
+    for name in function.split("."):
+        node = next(child for child in node.body if isinstance(child, (ast.FunctionDef, ast.ClassDef))
+                    and child.name == name)
+    lines = source.splitlines(keepends=True)
+    body = "".join(lines[node.lineno - 1:node.end_lineno])
+    if body.count(before) != 1:
+        raise AssertionError(f"mutation anchor changed: {function}: {before}")
+    return "".join(lines[:node.lineno - 1]) + body.replace(before, after, 1) + "".join(lines[node.end_lineno:])
+
+
+BEHAVIORAL_MUTATIONS = (
+    ("plan-boot-count", "plan", '"boot_count": 2', '"boot_count": 3'),
+    ("plan-runtime", "plan", '"runtime_seconds": 3600', '"runtime_seconds": 3599'),
+    ("plan-substitution", "plan", '"source": False', '"source": True'),
+    ("plan-cleanup", "plan", '"independent_absence_observation": True', '"independent_absence_observation": False'),
+    ("approver-bound", "record_authorization", 'len(approver.encode()) <= 128', 'len(approver.encode()) <= 129'),
+    ("authorization-window", "record_authorization", 'expires_unix - recorded_unix <= 3600', 'expires_unix - recorded_unix <= 3601'),
+    ("admission-authority", "admission", '"authority": "approved"', '"authority": "not_admitted"'),
+    ("runtime-content-digest", "_scan_azure_runtime", 'f"C\\t{kind}\\t{relative}', 'f"X\\t{kind}\\t{relative}'),
+)
+BOUNDARY_MUTATIONS = (
+    ("runtime-files-bound", "_RuntimeCopyBudget", "self.files <= AZURE_RUNTIME_MAX_FILES", "True"),
+    ("runtime-directories-bound", "_RuntimeCopyBudget", "self.directories <= AZURE_RUNTIME_MAX_DIRECTORIES", "True"),
+    ("runtime-bytes-bound", "_RuntimeCopyBudget", "self.bytes <= AZURE_RUNTIME_MAX_BYTES", "True"),
+    ("runtime-directory-depth-bound", "_RuntimeCopyBudget.directory", "and depth <= AZURE_RUNTIME_MAX_DEPTH,", "and True,"),
+    ("runtime-file-depth-bound", "_RuntimeCopyBudget.file", "and depth <= AZURE_RUNTIME_MAX_DEPTH,", "and True,"),
+    ("runtime-file-bytes-bound", "_scan_azure_runtime", "<= AZURE_RUNTIME_MAX_FILE_BYTES,", "<= AZURE_RUNTIME_MAX_FILE_BYTES + 1,"),
+    ("runtime-loader-bound", "prepare_azure_runtime", "len(dependency_sources) <= AZURE_RUNTIME_MAX_LOADER_FILES", "True"),
+    ("runtime-manifest-bound", "prepare_azure_runtime", "manifest.stat().st_size <= AZURE_RUNTIME_MAX_MANIFEST_BYTES", "True"),
+    ("scan-files-bound", "_scan_azure_runtime", "file_count <= AZURE_RUNTIME_MAX_FILES", "True"),
+    ("scan-directories-bound", "_scan_azure_runtime", "directory_count <= AZURE_RUNTIME_MAX_DIRECTORIES", "True"),
+    ("scan-bytes-bound", "_scan_azure_runtime", "total_bytes <= AZURE_RUNTIME_MAX_BYTES", "True"),
+    ("scan-depth-bound", "_scan_azure_runtime", "observed_depth <= AZURE_RUNTIME_MAX_DEPTH", "True"),
+)
+
+
+class AuthorityContractMutations(unittest.TestCase):
+    report = False
+
+    def test_representative_behavioral_mutations_fail_golden_verification(self):
+        source = (WAMR_CI / "handoff.py").read_text(encoding="utf-8")
+        expected = GOLDEN.read_text(encoding="utf-8")
+        for name, function, before, after in BEHAVIORAL_MUTATIONS + BOUNDARY_MUTATIONS:
+            with self.subTest(mutation=name):
+                mutant = load("handoff", mutate_function(source, function, before, after))
+                try:
+                    actual = authority_contract_golden(mutant)
+                except mutant.ci.Refusal:
+                    if self.report:
+                        print(f"DETECTED {name}: changed success/refusal")
+                    continue
+                self.assertNotEqual(expected, actual, f"undetected mutation: {name}")
+                if self.report:
+                    print(f"DETECTED {name}: golden mismatch")
+
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["--write"]:
         GOLDEN.write_text(authority_contract_golden(), encoding="utf-8")
         SCENARIOS.write_text(scenario_inventory_golden(), encoding="utf-8")
+    elif sys.argv[1:] == ["--mutations"]:
+        AuthorityContractMutations.report = True
+        result = unittest.TextTestRunner(verbosity=2).run(
+            unittest.defaultTestLoader.loadTestsFromTestCase(AuthorityContractMutations))
+        raise SystemExit(not result.wasSuccessful())
     else:
         unittest.main()

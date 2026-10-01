@@ -77,12 +77,22 @@ pub const uuid = struct {
         "{00000000-0000-4000-8000-000000000001}",
         "00000000-0000-4000-8000-000000000001",
         "00000000-0000-4000-8000-00000000000A",
+        "urn:uuid:00000000-0000-4000-8000-00000000000A",
     };
     pub const normalization_outputs = [_][]const u8{
         "00000000-0000-4000-8000-000000000001",
         "00000000-0000-4000-8000-000000000001",
         "00000000-0000-4000-8000-000000000001",
         "00000000-0000-4000-8000-00000000000a",
+        "00000000-0000-4000-8000-00000000000a",
+    };
+    pub const rejection_fields = [_][]const u8{ "attempt_id", "campaign_id", "ledger_id", "subscription" };
+    pub const rejection_inputs = [_][]const u8{
+        "",
+        "0000000000000000000000000000000",
+        "gggggggggggggggggggggggggggggggg",
+        "00000000-0000-4000-8000-000000000001\n",
+        "urn:uuid:not-a-uuid",
     };
     pub const generated_attempt_id = "00000000-0000-4000-8000-000000000101";
     pub const generated_ledger_id = "00000000-0000-4000-8000-000000000102";
