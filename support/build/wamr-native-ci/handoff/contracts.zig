@@ -15,18 +15,18 @@ pub const json_limits = c.Limits{
 
 pub const schema_fields = struct {
     pub const artifact = [_][]const u8{ "path", "sha256", "size" };
-    pub const manifest_member = [_][]const u8{ "size", "sha256" };
-    pub const boot = [_][]const u8{ "mode", "serial", "request", "report", "compute" };
-    pub const identity = [_][]const u8{ "wamr_revision", "wasm_sha256", "cwasm_sha256", "runtime_sha256", "compiler_sha256", "config_sha256" };
-    pub const local_image_handoff_v1 = [_][]const u8{ "schema", "version", "authority", "source_revision", "source_tree", "identity", "artifacts", "boots", "evidence" };
-    pub const local_image_handoff_v2 = [_][]const u8{ "schema", "version", "authority", "source_revision", "source_tree", "identity", "artifacts", "boots", "evidence", "profile", "run", "lineage" };
-    pub const public_source_manifest_v1 = [_][]const u8{ "schema", "version", "authority", "source", "members" };
-    pub const public_source_manifest_v2 = [_][]const u8{ "schema", "version", "authority", "source", "members", "profile" };
+    pub const manifest_member = [_][]const u8{ "sha256", "size" };
+    pub const boot = [_][]const u8{ "compute", "mode", "report", "request", "serial" };
+    pub const identity = [_][]const u8{ "compiler_sha256", "config_sha256", "cwasm_sha256", "runtime_sha256", "wamr_revision", "wasm_sha256" };
+    pub const local_image_handoff_v1 = [_][]const u8{ "artifacts", "authority", "boots", "evidence", "identity", "schema", "source_revision", "source_tree", "version" };
+    pub const local_image_handoff_v2 = [_][]const u8{ "artifacts", "authority", "boots", "evidence", "identity", "lineage", "profile", "run", "schema", "source_revision", "source_tree", "version" };
+    pub const public_source_manifest_v1 = [_][]const u8{ "authority", "members", "schema", "source", "version" };
+    pub const public_source_manifest_v2 = [_][]const u8{ "authority", "members", "profile", "schema", "source", "version" };
     pub const public_source_transport_v2 = [_][]const u8{ "schema", "version", "repository", "run_id", "run_attempt", "source_revision", "source_tree", "inner_zip_sha256", "artifact_id", "container_digest" };
     pub const direct_compute_candidate = [_][]const u8{ "schema", "version", "purpose", "authority", "approval", "attempt_id", "subscription", "location", "prefix", "vm_size", "serial_mode", "runtime_seconds", "cleanup_seconds", "operation_seconds", "poll_seconds", "source_revision", "source_tree", "identity", "os_vhd", "bundle" };
     pub const direct_compute_admission_v2 = [_][]const u8{ "authority", "lineage", "profile", "public_bundle", "run", "schema", "source_revision", "source_tree", "transport", "version" };
-    pub const run = [_][]const u8{ "repository", "run_id", "run_attempt" };
-    pub const lineage = [_][]const u8{ "raw_sha256", "accepted_qcow2_sha256", "derived_vhd_sha256", "qcow2_finalization_sha256", "qcow2_acceptance_sha256", "fixed_vhd_derivation_sha256", "fixed_vhd_derivation_gate_sha256", "final_inspection_sha256" };
+    pub const run = [_][]const u8{ "repository", "run_attempt", "run_id" };
+    pub const lineage = [_][]const u8{ "accepted_qcow2_sha256", "derived_vhd_sha256", "final_inspection_sha256", "fixed_vhd_derivation_gate_sha256", "fixed_vhd_derivation_sha256", "qcow2_acceptance_sha256", "qcow2_finalization_sha256", "raw_sha256" };
     pub const public_context = [_][]const u8{ "repository", "run_id", "run_attempt", "source_revision", "source_tree", "wamr_revision" };
     pub const approval = [_][]const u8{ "direct_specialized_gen2", "os_only_private", "two_boots_only", "cleanup_owned_group", "exact_image_and_local_bundle_reviewed", "fresh_final_approval", "approved_unix", "expires_unix" };
 };
@@ -41,11 +41,16 @@ pub fn parseCanonical(allocator: std.mem.Allocator, bytes: []const u8) !c.Docume
 }
 
 pub fn validateLocalImageHandoff(value: std.json.Value) !profile.Compatibility {
+    return validateLocalImageHandoffWithRoot(value, null);
+}
+
+pub fn validateLocalImageHandoffWithRoot(value: std.json.Value, root: ?[]const u8) !profile.Compatibility {
+    if (root) |path| if (path.len == 0) return error.InvalidPath;
     const initial = try object(value);
     const version = try integer(u8, initial, "version");
     return switch (version) {
-        1 => validateBundleV1(value),
-        2 => validateBundleV2(value),
+        1 => validateBundleV1(value, root),
+        2 => validateBundleV2(value, root),
         else => error.UnsupportedVersion,
     };
 }
@@ -88,9 +93,16 @@ pub fn validateDirectComputeCandidate(value: std.json.Value) !profile.Compatibil
     try literal(fields, "purpose", if (compatibility == .frozen_tiny_v1) "tiny-aot-two-boot" else profile.current_profile);
     try validateApproval(fields.get("approval").?);
     try uuid(try string(fields, "attempt_id"));
-    _ = try string(fields, "subscription");
+    const subscription = try string(fields, "subscription");
     try literal(fields, "location", "northeurope");
-    try boundedName(try string(fields, "prefix"));
+    const prefix = try string(fields, "prefix");
+    if (compatibility == .frozen_tiny_v1) {
+        if (!std.mem.eql(u8, subscription, "FINAL-APPROVED-SUBSCRIPTION-UUID") or
+            !std.mem.eql(u8, prefix, "FINAL-APPROVED-FRESH-NAME"))
+            return error.InvalidCandidateScope;
+    } else {
+        try boundedName(prefix);
+    }
     try literal(fields, "vm_size", "Standard_D2s_v5");
     try literal(fields, "serial_mode", "azure_cumulative");
     if (try integer(u32, fields, "runtime_seconds") != 3600 or
@@ -120,22 +132,22 @@ pub fn validateDirectComputeAdmissionV2(value: std.json.Value) !void {
     try validateArtifact(fields.get("transport").?, layout.max_json_bytes);
 }
 
-fn validateBundleV1(value: std.json.Value) !profile.Compatibility {
+fn validateBundleV1(value: std.json.Value, root: ?[]const u8) !profile.Compatibility {
     const fields = try c.exactFields(value, &schema_fields.local_image_handoff_v1);
-    try commonBundle(fields, .frozen_tiny_v1);
+    try commonBundle(fields, .frozen_tiny_v1, root);
     return .frozen_tiny_v1;
 }
 
-fn validateBundleV2(value: std.json.Value) !profile.Compatibility {
+fn validateBundleV2(value: std.json.Value, root: ?[]const u8) !profile.Compatibility {
     const fields = try c.exactFields(value, &schema_fields.local_image_handoff_v2);
-    try commonBundle(fields, .tiny_qcow2_derived_vhd_v2);
+    try commonBundle(fields, .tiny_qcow2_derived_vhd_v2, root);
     try literal(fields, "profile", profile.current_profile);
     try validateRun(fields.get("run").?);
     try validateLineage(fields.get("lineage").?, fields.get("artifacts").?);
     return .tiny_qcow2_derived_vhd_v2;
 }
 
-fn commonBundle(fields: std.json.ObjectMap, compatibility: profile.Compatibility) !void {
+fn commonBundle(fields: std.json.ObjectMap, compatibility: profile.Compatibility, root: ?[]const u8) !void {
     try literal(fields, "schema", "uk.wamr.local-image-handoff");
     if (try integer(u8, fields, "version") != compatibility.version()) return error.UnsupportedVersion;
     try literal(fields, "authority", profile.authority);
@@ -143,13 +155,13 @@ fn commonBundle(fields: std.json.ObjectMap, compatibility: profile.Compatibility
     try hex(try string(fields, "source_tree"), 40);
     try validateIdentity(fields.get("identity").?);
     var total: u64 = 0;
-    total = try addBounded(total, try validateArtifacts(fields.get("artifacts").?, compatibility));
-    total = try addBounded(total, try validateBoots(fields.get("boots").?, compatibility));
-    total = try addBounded(total, try validateEvidence(fields.get("evidence").?, compatibility));
+    total = try addBounded(total, try validateArtifacts(fields.get("artifacts").?, compatibility, root));
+    total = try addBounded(total, try validateBoots(fields.get("boots").?, compatibility, root));
+    total = try addBounded(total, try validateEvidence(fields.get("evidence").?, compatibility, root));
     if (total > max_selected_member_bytes) return error.InvalidTotalSize;
 }
 
-fn validateArtifacts(value: std.json.Value, compatibility: profile.Compatibility) !u64 {
+fn validateArtifacts(value: std.json.Value, compatibility: profile.Compatibility, root: ?[]const u8) !u64 {
     const items = try array(value);
     const names = layout.artifactNames(compatibility);
     if (items.len != names.len) return error.InvalidArtifacts;
@@ -157,12 +169,12 @@ fn validateArtifacts(value: std.json.Value, compatibility: profile.Compatibility
     for (items, names) |item, name| {
         var path_buffer: [64]u8 = undefined;
         const expected = try std.fmt.bufPrint(&path_buffer, "artifacts/{s}", .{name});
-        total = try addBounded(total, try validateArtifactPath(item, expected, layout.artifactLimit(name)));
+        total = try addBounded(total, try validateArtifactPath(item, root, expected, layout.artifactLimit(name)));
     }
     return total;
 }
 
-fn validateBoots(value: std.json.Value, compatibility: profile.Compatibility) !u64 {
+fn validateBoots(value: std.json.Value, compatibility: profile.Compatibility, root: ?[]const u8) !u64 {
     const items = try array(value);
     const modes = profile.modes(compatibility);
     if (items.len != modes.len) return error.InvalidBoots;
@@ -173,13 +185,13 @@ fn validateBoots(value: std.json.Value, compatibility: profile.Compatibility) !u
         inline for (.{ "serial", "request", "report", "compute" }) |name| {
             var path_buffer: [128]u8 = undefined;
             const expected = try std.fmt.bufPrint(&path_buffer, "boots/{s}/{s}", .{ @tagName(mode), name });
-            total = try addBounded(total, try validateArtifactPath(fields.get(name).?, expected, if (std.mem.eql(u8, name, "serial")) layout.max_serial_bytes else layout.max_json_bytes));
+            total = try addBounded(total, try validateArtifactPath(fields.get(name).?, root, expected, if (std.mem.eql(u8, name, "serial")) layout.max_serial_bytes else layout.max_json_bytes));
         }
     }
     return total;
 }
 
-fn validateEvidence(value: std.json.Value, compatibility: profile.Compatibility) !u64 {
+fn validateEvidence(value: std.json.Value, compatibility: profile.Compatibility, root: ?[]const u8) !u64 {
     const items = try array(value);
     const names = layout.evidenceNames(compatibility);
     if (items.len != names.len) return error.InvalidEvidence;
@@ -187,7 +199,7 @@ fn validateEvidence(value: std.json.Value, compatibility: profile.Compatibility)
     for (items, names) |item, name| {
         var path_buffer: [128]u8 = undefined;
         const expected = try std.fmt.bufPrint(&path_buffer, "evidence/{s}", .{name});
-        total = try addBounded(total, try validateArtifactPath(item, expected, layout.max_json_bytes));
+        total = try addBounded(total, try validateArtifactPath(item, root, expected, layout.max_json_bytes));
     }
     return total;
 }
@@ -262,10 +274,20 @@ fn validateArtifact(value: std.json.Value, maximum: u64) !void {
     _ = try artifactFields(value, maximum);
 }
 
-fn validateArtifactPath(value: std.json.Value, expected_path: []const u8, maximum: u64) !u64 {
+fn validateArtifactPath(value: std.json.Value, root: ?[]const u8, expected_path: []const u8, maximum: u64) !u64 {
     const fields = try artifactFields(value, maximum);
-    if (!std.mem.eql(u8, fields.path, expected_path)) return error.InvalidPath;
+    if (!pathMatchesMember(fields.path, root, expected_path)) return error.InvalidPath;
     return fields.size;
+}
+
+fn pathMatchesMember(path: []const u8, root: ?[]const u8, member: []const u8) bool {
+    const base = root orelse return std.mem.eql(u8, path, member);
+    if (std.mem.eql(u8, base, "/"))
+        return path.len == member.len + 1 and path[0] == '/' and std.mem.eql(u8, path[1..], member);
+    return path.len == base.len + 1 + member.len and
+        std.mem.startsWith(u8, path, base) and
+        path[base.len] == '/' and
+        std.mem.eql(u8, path[base.len + 1 ..], member);
 }
 
 fn artifactFields(value: std.json.Value, maximum: u64) !struct { path: []const u8, size: u64 } {
