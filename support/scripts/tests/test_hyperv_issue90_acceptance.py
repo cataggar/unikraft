@@ -681,6 +681,12 @@ class SerialStatusTests(unittest.TestCase):
         self.assertEqual(acceptance.serial_status(
             "\x1b[0mHYPERV_TOPOLOGY FINAL PASS devices=3\nmain returned 0\n"),
             "complete")
+        self.assertEqual(acceptance.serial_status(
+            "HYPERV_TOPOLOGY FINAL PASS devices=3\r\n\0[    0.421860] Info: "
+            "[libukboot] <boot.c @  544> \0main returned 0\r\n"), "complete")
+        self.assertEqual(acceptance.serial_status(
+            "[    0.421860] Info: [libukboot] <boot.c @  544> "
+            "main returned 2\r\n"), "failed")
         for text in ("HYPERV_TOPOLOGY FINAL FAIL x\n", "main returned 3\n",
                      "[ 1.0] Unikraft Crash\n",
                      "UK_HYPERV_ACCEPTANCE_UNAVAILABLE: x\n"):

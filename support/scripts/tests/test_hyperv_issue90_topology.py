@@ -886,6 +886,27 @@ class Issue90TopologyTest(unittest.TestCase):
         self.assertNotIn("UEFI non-topology line", lane.redacted_serial(noisy))
         self.assertEqual(lane.redacted_serial(noisy), serial(self.state))
 
+    def test_serial_accepts_libukboot_info_prefixed_main_result(self):
+        # Real boot diagnostics: CRLF, NUL padding and the uk_pr_info header.
+        prefix = "[    0.421860] Info: [libukboot] <boot.c @  544> \0"
+        azure_text = serial(self.state).replace(
+            "main returned 0", prefix + "main returned 0",
+        ).replace("\n", "\r\n\0")
+        proof = lane.parse_serial(azure_text, self.state)
+        self.assertEqual(proof["observed_devices"], 3)
+        self.assertEqual(lane.redacted_serial(azure_text), serial(self.state))
+        for invalid in (
+            azure_text.replace("main returned 0", "main returned 1"),
+            azure_text.replace("[libukboot] <boot.c", "[libother] <boot.c"),
+            azure_text.replace("HYPERV_TOPOLOGY RESULT PASS",
+                               "HYPERV_TOPOLOGY RESULT PASS\r\nmain returned 0"),
+            azure_text.replace(prefix + "main returned 0",
+                               prefix + "main returned 0 extra"),
+        ):
+            with self.subTest(invalid=invalid[-160:]):
+                with self.assertRaises(ValueError):
+                    lane.parse_serial(invalid, self.state)
+
     def test_extra_host_disk_is_skipped_but_counted_not_accepted_as_data(self):
         extra = (
             "HYPERV_TOPOLOGY TARGET INFO id=13 controller=1 channel=9 "

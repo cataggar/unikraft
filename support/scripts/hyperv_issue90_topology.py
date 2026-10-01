@@ -84,6 +84,10 @@ SKIP = re.compile(
 FINAL = re.compile(
     r"HYPERV_TOPOLOGY FINAL PASS devices=(\d+) os=1 data0=1 data_nonzero=1"
 )
+MAIN_RETURNED = re.compile(
+    r"\[ *\d+\.\d{6}\] Info: \[libukboot\] <boot\.c @ +\d+> +"
+    r"(main returned -?\d+)"
+)
 PRIVATE_SERIAL = re.compile(
     r"[0-9a-fA-F]{32,}|"
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -630,11 +634,20 @@ def envelope_sha(state):
     return hashlib.sha256(azure.canonical_json(envelope(state))).hexdigest()
 
 
+def serial_lines(text):
+    """Normalize serial lines; unwrap libukboot's info-level main result."""
+    lines = []
+    for line in text.splitlines():
+        line = azure.ANSI_ESCAPE.sub("", line).replace("\0", "").strip()
+        match = MAIN_RETURNED.fullmatch(line)
+        lines.append(match[1] if match else line)
+    return lines
+
+
 def parse_serial(text, state):
     if not isinstance(text, str) or len(text.encode("utf-8")) > MAX_SERIAL:
         raise ValueError("Azure boot diagnostics are invalid or too large")
-    lines = [azure.ANSI_ESCAPE.sub("", line).replace("\0", "").strip()
-             for line in text.splitlines()]
+    lines = serial_lines(text)
     normalized = "\n".join(lines)
     if PRIVATE_SERIAL.search(normalized) or any(
         identity in normalized.lower()
@@ -746,8 +759,7 @@ def redacted_serial(text):
         "UK_HYPERV_PLATFORM_READY", "UK_HYPERV_TOPOLOGY_READ_OK",
         "HYPERV_TOPOLOGY RESULT PASS", "main returned 0",
     }
-    lines = [azure.ANSI_ESCAPE.sub("", line).replace("\0", "").strip()
-             for line in text.splitlines()]
+    lines = serial_lines(text)
     return "\n".join(line for line in lines if (
         line in markers or any(pattern.fullmatch(line) for pattern in (
             INFO, OS_READ, DATA_READ, SKIP, FINAL
