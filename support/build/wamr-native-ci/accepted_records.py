@@ -320,6 +320,16 @@ def handoff_inspect(runtime, output, *, legacy=False):
     return output / "private" / log_name, output / "evidence" / record_name
 
 
+def local_consumer_custody(runtime):
+    """Recapture local Python-produced source and consumer custody natively."""
+    runtime = _absolute(runtime)
+    refusal = "native controller local consumer custody refused"
+    raw, stderr_seen = _controller_command((
+        "local-consumer-custody", "--runtime", str(runtime)), refusal)
+    if raw or stderr_seen:
+        _refuse(refusal)
+
+
 def import_native_revalidation(stage_root, output):
     """Build and run the fixed native validator for a pristine trusted v2 stage."""
     stage_root, output = map(Path, (stage_root, output))

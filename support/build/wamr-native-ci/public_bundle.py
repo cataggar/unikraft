@@ -618,8 +618,10 @@ def ci_context(handoff, start):
             and os.environ.get("GITHUB_WORKFLOW_REF", "").startswith(
                 "cataggar/unikraft/.github/workflows/wamr-native-compute.yaml@"))
     handoff.FAILURE_STAGE = "public-context-source"
-    source = ci.source()
-    require(ci.source_identity(source) == start["source"]
+    source = start["source"]
+    require(set(source) == {"revision", "tree"}
+            and digest_string(source["revision"], (40,))
+            and digest_string(source["tree"], (40,))
             and os.environ.get("GITHUB_SHA") == source["revision"])
     handoff.FAILURE_STAGE = "public-context-binding"
     return context(dict(repository="cataggar/unikraft", run_id=os.environ["GITHUB_RUN_ID"],
@@ -628,94 +630,45 @@ def ci_context(handoff, start):
                         wamr_revision=ci.REVISION))
 
 
-def require_public_consumer_paths(handoff, runtime, consumer_inputs):
+def native_public_build_custody(handoff, runtime, stage):
+    handoff.FAILURE_STAGE = stage
+    accepted_records.local_consumer_custody(runtime)
+
+
+def consumer_file_path(start, role):
+    consumer = start["consumer_inputs"]
+    require(type(consumer) is dict and type(consumer.get("files")) is dict)
+    record = consumer["files"].get(role)
+    require(type(record) is dict and type(record.get("path")) is str
+            and record["path"].startswith("/"))
+    return record["path"]
+
+
+def verify_public_build_side_checks(handoff, runtime, start, source, stage_prefix):
     ci = handoff.ci
-    files = consumer_inputs["files"]
-    handoff.FAILURE_STAGE = "public-build-start-path-roles"
-    required_files = (
-        {f"tool:{name}" for name in ci.HOST_TOOLS}
-        | {
-            "wamr-source-archive",
-            "command-supervisor",
-            ci.WAMR_AOT_BUILD_ROLE,
-        })
-    require(required_files <= set(files))
-    handoff.FAILURE_STAGE = "public-build-start-path-binaries"
-    supervisor = (
-        runtime / "compute/supervisor/bin/wamr-ci-supervisor").resolve(
-            strict=True)
-    wamr_aot_build = (
-        runtime / ci.WAMR_AOT_BUILD_RELATIVE).resolve(strict=True)
-    validator_path = runtime / ci.WAMR_LOG_VALIDATOR_RELATIVE
-    ci.require(ci.WAMR_LOG_VALIDATOR_ROLE in files or
-               not (validator_path.exists() or validator_path.is_symlink()),
-               "installed log validator missing from consumer custody")
-    log_validator = (
-        validator_path.resolve(strict=True)
-        if ci.WAMR_LOG_VALIDATOR_ROLE in files else None)
-    require(files["command-supervisor"]["path"] == str(supervisor)
-            and files[ci.WAMR_AOT_BUILD_ROLE]["path"]
-            == str(wamr_aot_build)
-            and (log_validator is None or
-                 files[ci.WAMR_LOG_VALIDATOR_ROLE]["path"] == str(log_validator))
-            and files["wamr-source-archive"]["path"]
-            == str((runtime / "custody/wamr-source.tar").resolve(
-                strict=True)))
-    handoff.FAILURE_STAGE = "public-build-start-path-runtime"
-    runtime_paths = set()
-    for name in ci.HOST_TOOLS:
-        runtime_paths.update(ci.executable_runtime_paths(
-            Path(files["tool:" + name]["path"])))
-    runtime_paths.update(ci.executable_runtime_paths(supervisor))
-    runtime_paths.update(ci.executable_runtime_paths(wamr_aot_build))
-    if log_validator is not None:
-        runtime_paths.update(ci.executable_runtime_paths(log_validator))
-        required_files.add(ci.WAMR_LOG_VALIDATOR_ROLE)
-    expected_files = required_files | {
-        "runtime:" + str(path) for path in runtime_paths
-    }
-    require(set(files) == expected_files)
-    handoff.FAILURE_STAGE = "public-build-start-path-trees"
-    trees = consumer_inputs["trees"]
-    require(set(trees) == {"bison", "python-stdlib", "zig", "llvm"}
-            and trees["bison"]["path"]
-            == str((runtime / "bison").resolve(strict=True))
-            and trees["zig"]["path"]
-            == str(Path(files["tool:zig"]["path"]).parent)
-            and trees["llvm"]["path"]
-            == str((runtime / "llvm").resolve(strict=True))
-            and trees["python-stdlib"]["path"]
-            == str(Path(ci.sysconfig.get_paths()["stdlib"]).resolve(
-                strict=True)))
-    return consumer_inputs
-
-
-def public_consumer_custody_stage(handoff, kind, role):
-    if kind == "file":
-        if role in {f"tool:{name}" for name in handoff.ci.HOST_TOOLS}:
-            label = role.replace(":", "-")
-        elif role.startswith("runtime:"):
-            label = "runtime"
-        elif role in {
-                "command-supervisor", "wamr-source-archive",
-                handoff.ci.WAMR_AOT_BUILD_ROLE,
-                handoff.ci.WAMR_LOG_VALIDATOR_ROLE}:
-            label = {
-                handoff.ci.WAMR_AOT_BUILD_ROLE: "native-build",
-                handoff.ci.WAMR_LOG_VALIDATOR_ROLE: "native-validator",
-            }.get(role, role)
-        else:
-            label = "other-file"
-    elif kind == "tree":
-        label = role if role in {
-            "bison", "python-stdlib", "zig", "llvm"} else "other-tree"
-    else:
-        label = "aggregate"
-    handoff.FAILURE_STAGE = "public-build-start-consumer-custody-" + label
+    handoff.FAILURE_STAGE = stage_prefix + "-command-supervisor-record"
+    command_supervisor_record(start["command_supervisor"])
+    handoff.FAILURE_STAGE = stage_prefix + "-dependencies"
+    original_tools = dict(ci.COMMAND_TOOL_PATHS)
+    ci.COMMAND_TOOL_PATHS.clear()
+    ci.COMMAND_TOOL_PATHS["git"] = consumer_file_path(start, "tool:git")
+    try:
+        dependency_record(ci, start["dependencies"], source)
+        ci.require_dependency_custody(runtime / "compute", start["dependencies"])
+    finally:
+        ci.COMMAND_TOOL_PATHS.clear()
+        ci.COMMAND_TOOL_PATHS.update(original_tools)
+    handoff.FAILURE_STAGE = stage_prefix + "-bison"
+    require(ci.bison_inputs(runtime / "bison") == start["bison_data"])
+    handoff.FAILURE_STAGE = stage_prefix + "-command-supervisor"
+    require(ci.command_supervisor_state(runtime, start["consumer_inputs"])
+            == start["command_supervisor"])
 
 
 def accepted_public_build_start(handoff, runtime):
     ci = handoff.ci
+    native_public_build_custody(
+        handoff, runtime, "public-build-start-native-custody")
     handoff.FAILURE_STAGE = "public-build-start-shape"
     start = ci.document(runtime / "compute/evidence/build-start.json")
     require(set(start) == {
@@ -728,42 +681,15 @@ def accepted_public_build_start(handoff, runtime):
         "source_revision": start["source"]["revision"],
         "source_tree": start["source"]["tree"],
     }
-    source_custody_record(ci, start["source_custody"])
-    consumer_input_record(ci, start["consumer_inputs"])
-    command_supervisor_record(start["command_supervisor"])
-    handoff.FAILURE_STAGE = "public-build-start-consumer-roles"
-    files = start["consumer_inputs"]["files"]
-    required_files = (
-        {f"tool:{name}" for name in ci.HOST_TOOLS}
-        | {"wamr-source-archive", "command-supervisor"})
-    require(required_files <= set(files))
-    handoff.FAILURE_STAGE = "public-build-start-consumer-trees"
-    require_consumer_tree_roles(start["consumer_inputs"], False)
-    handoff.FAILURE_STAGE = "public-build-start-consumer-custody"
-    ci.require_recorded_consumer_inputs(
-        start["consumer_inputs"], content=True,
-        on_role=lambda kind, role: public_consumer_custody_stage(
-            handoff, kind, role))
-    require_public_consumer_paths(handoff, runtime, start["consumer_inputs"])
-
-    handoff.FAILURE_STAGE = "public-build-start-dependencies"
-    original_tools = dict(ci.COMMAND_TOOL_PATHS)
-    ci.COMMAND_TOOL_PATHS.clear()
-    ci.COMMAND_TOOL_PATHS["git"] = files["tool:git"]["path"]
-    try:
-        dependency_record(ci, start["dependencies"], source)
-        ci.require_recorded_build_custody(runtime, start)
-    finally:
-        ci.COMMAND_TOOL_PATHS.clear()
-        ci.COMMAND_TOOL_PATHS.update(original_tools)
+    verify_public_build_side_checks(
+        handoff, runtime, start, source, "public-build-start")
 
     ci.COMMAND_ENVIRONMENT.clear()
     ci.COMMAND_TOOL_PATHS.clear()
     ci.COMMAND_SUPERVISOR_PATH = None
+    handoff.FAILURE_STAGE = "public-build-start-command-bind"
     ci.COMMAND_ENVIRONMENT.update(
         ci.bind_command_tools(start["consumer_inputs"]))
-    handoff.FAILURE_STAGE = "public-build-start-custody"
-    ci.require_recorded_build_custody(runtime, start)
     return start
 
 
@@ -1819,7 +1745,10 @@ def publish_ci(handoff):
         supervised_command_record(
             handoff.ci, recorded, "public-validator-build",
             role_identities, "producer_direct")
-        handoff.ci.require_recorded_build_custody(runtime, start)
+        native_public_build_custody(
+            handoff, runtime, "public-validator-build-native-custody")
+        verify_public_build_side_checks(
+            handoff, runtime, start, source, "public-validator-build")
         require(ci_context(handoff, start) == source)
 
     require_validator_record()
