@@ -536,6 +536,39 @@ class CustodyVerifierTests(unittest.TestCase):
         self.assertEqual(result.stage, "offline")
         self.assertIsNone(self.v._offline)
 
+    def test_offline_policy_allowance_must_match_the_admitted_plan(self):
+        policy = {"vm_tags": {"policy-pack": "nonprod"}, "user_assigned_identity": None}
+
+        def offline(expected):
+            candidate = verifier.Verifier(
+                self.inputs, expected, self.fixture.archive, self.registry,
+                custodian_key=signature_key(self.fixture.signer),
+                approver_key=signature_key(self.approver),
+                witness_key=signature_key(self.fixture.witness),
+                clock=lambda: self.reservation_clock,
+            )
+            with mock.patch.object(admission, "admit", return_value=self.offline):
+                return candidate.verify_offline()
+
+        pinned = replace(self.fixture.expected, azure_policy=policy)
+        self.assertIsInstance(offline(pinned), verifier.Refusal)
+        self.state["azure_policy"] = policy
+        topology.save(self.state_dir, self.state)
+        envelope = topology.envelope_sha({
+            **self.state, "phase": "prepared", "prepared": {
+                "image_sha256": "2" * 64,
+                "seeds": {"data0": {"sha256": "4" * 64},
+                          "data7": {"sha256": "5" * 64}},
+            },
+        })
+        self.assertNotEqual(envelope, self.fixture.expected.final_envelope_sha256)
+        self.assertIsInstance(offline(replace(
+            self.fixture.expected, final_envelope_sha256=envelope,
+        )), verifier.Refusal)
+        self.assertIsInstance(offline(replace(
+            pinned, final_envelope_sha256=envelope,
+        )), admission.OfflineAdmission)
+
     def test_unreviewed_or_tampered_offline_shape_refuses(self):
         for alteration in (
             replace(self.offline, source_sha256="9" * 64),

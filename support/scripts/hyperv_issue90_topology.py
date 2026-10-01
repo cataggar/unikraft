@@ -56,6 +56,11 @@ MAX_RUNTIME = 3600
 CLEANUP_HEADROOM = 2400
 MAX_SERIAL = 4 * 1024 * 1024
 NAME = re.compile(r"uk90-[0-9a-f]{20}")
+POLICY_IDENTITY = re.compile(
+    r"/subscriptions/(?P<subscription>[0-9a-f-]{36})/resourceGroups/"
+    r"(?P<group>[-A-Za-z0-9_.()]{1,90})/providers/Microsoft\.ManagedIdentity/"
+    r"userAssignedIdentities/[A-Za-z0-9][-A-Za-z0-9_]{2,127}"
+)
 HEX32 = re.compile(r"[0-9a-f]{32}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
 INFO = re.compile(
@@ -156,8 +161,87 @@ def tags(state, role):
     }
 
 
+def validate_azure_policy(policy, subscription, group_name):
+    """Validate a private operator pin of a subscription policy's VM footprint."""
+    if policy is None:
+        return None
+    if not isinstance(policy, dict) or set(policy) != {"vm_tags", "user_assigned_identity"}:
+        raise ValueError("Azure policy allowance must pin VM tags and a user identity")
+    vm_tags, identity = policy["vm_tags"], policy["user_assigned_identity"]
+    reserved = {key.lower() for key in (
+        "managed-by", "purpose", "unikraft-run", "issue90-run", "issue90-operation",
+        "image-sha256", "seed0-sha256", "seed7-sha256", "issue90-role",
+    )}
+    if (not isinstance(vm_tags, dict) or not 1 <= len(vm_tags) <= 4
+            or any(not isinstance(key, str) or not 0 < len(key) <= 512
+                   or key.lower() in reserved or not isinstance(value, str)
+                   or len(value) > 256 for key, value in vm_tags.items())
+            or len({key.lower() for key in vm_tags}) != len(vm_tags)):
+        raise ValueError("Azure policy VM tags are invalid or shadow owner tags")
+    if identity is not None:
+        match = POLICY_IDENTITY.fullmatch(identity) if isinstance(identity, str) else None
+        if (match is None or match["subscription"] != subscription
+                or match["group"].lower() == group_name.lower()):
+            raise ValueError(
+                "Azure policy user identity must be a fixed identity in another "
+                "resource group of the same subscription"
+            )
+    return policy
+
+
+def owner_tags(state, actual, role):
+    # Only the privately pinned policy tags may accompany the exact VM owner tags.
+    expected = tags(state, role)
+    if not isinstance(actual, dict) or any(
+        key not in actual or actual[key] != value for key, value in expected.items()
+    ):
+        return False
+    policy = state.get("azure_policy") if role == "vm" else None
+    allowed = policy["vm_tags"] if policy is not None else {}
+    return all(key in allowed and allowed[key] == value
+               for key, value in actual.items() if key not in expected)
+
+
+def vm_identity_allowed(policy, identity):
+    # NSGs cannot block IMDS; only a pinned policy footprint may add identities.
+    if identity is None:
+        return True
+    if policy is None or not isinstance(identity, dict):
+        return False
+    try:
+        require_uuid(identity.get("principalId"))
+        require_uuid(identity.get("tenantId"))
+    except ValueError:
+        return False
+    system = {"type", "principalId", "tenantId"}
+    if identity.get("type") == "SystemAssigned":
+        # Generic REST reads add a null user-identity map; CLI reads omit it.
+        return (set(identity) in (system, system | {"userAssignedIdentities"})
+                and identity.get("userAssignedIdentities") is None)
+    pinned = policy["user_assigned_identity"]
+    assigned = identity.get("userAssignedIdentities")
+    if (pinned is None or identity.get("type") != "SystemAssigned, UserAssigned"
+            or set(identity) != system | {"userAssignedIdentities"}
+            or not isinstance(assigned, dict) or len(assigned) != 1):
+        return False
+    key, value = next(iter(assigned.items()))
+    if key.lower() != pinned.lower() or not isinstance(value, dict):
+        return False
+    if value == {}:
+        return True
+    if set(value) != {"clientId", "principalId"}:
+        return False
+    try:
+        for item in value.values():
+            if item is not None:
+                require_uuid(item)
+    except ValueError:
+        return False
+    return True
+
+
 def owned(state, resource, role):
-    if not isinstance(resource, dict) or resource.get("tags") != tags(state, role):
+    if not isinstance(resource, dict) or not owner_tags(state, resource.get("tags"), role):
         raise RuntimeError(f"Refusing an unowned or retagged {role}")
     expected = group_id(state) if role == "group" else resource_id(state, role)
     if str(resource.get("id", "")).lower() != expected.lower():
@@ -226,6 +310,8 @@ def load(directory):
                               for role in LUNS)]
     if len(set(ids)) != 3:
         raise ValueError("Issue 90 run and disk IDs must be distinct")
+    validate_azure_policy(state.get("azure_policy"), state["subscription"],
+                          state["prefix"] + "-rg")
     if state["phase"] not in ("planned",) and state.get("prepared") is None:
         raise ValueError("Prepared image provenance is unavailable")
     if state.get("prepared") is not None:
@@ -271,20 +357,23 @@ def load(directory):
     return state
 
 
-def plan(directory, subscription):
+def plan(directory, subscription, azure_policy=None):
     subscription = azure.validate_subscription_id(subscription)
     directory = Path(directory).absolute()
     if directory.parent.resolve(strict=True) != directory.parent:
         raise ValueError("State parent must be symlink-free")
+    prefix = "uk90-" + uuid.uuid4().hex[:20]
+    validate_azure_policy(azure_policy, subscription, prefix + "-rg")
     directory.mkdir(mode=0o700, exist_ok=False)
     state = {
         "schema": SCHEMA, "version": 1, "phase": "planned",
         "subscription": subscription, "location": "northeurope",
         "run_id": uuid.uuid4().hex, "operation_id": str(uuid.uuid4()),
         "disk_ids": {role: uuid.uuid4().hex for role in LUNS},
-        "prefix": "uk90-" + uuid.uuid4().hex[:20],
+        "prefix": prefix,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "boot_count": 0,
+        "azure_policy": azure_policy,
     }
     save(directory, state)
     return state
@@ -533,6 +622,7 @@ def envelope(state):
         },
         "network": {"nics": 1, "vnets": 1, "nsgs": 1,
                     "public_ingress": False, "default_outbound": False},
+        "azure_policy": state.get("azure_policy"),
     }
 
 
@@ -987,7 +1077,8 @@ class TopologyRun:
         data = storage.get("dataDisks")
         nics = (vm.get("networkProfile") or {}).get("networkInterfaces")
         if (require_uuid(vm.get("vmId")) != proof["uuid"]
-                or vm.get("identity") is not None
+                or not vm_identity_allowed(self.state.get("azure_policy"),
+                                           vm.get("identity"))
                 or (vm.get("hardwareProfile") or {}).get("vmSize") != "Standard_D2s_v5"
                 or storage.get("diskControllerType") != "SCSI"
                 or not self.valid_os_attachment(storage.get("osDisk"), proof)
@@ -1068,7 +1159,8 @@ class TopologyRun:
         security = properties.get("securityProfile")
         if (
             require_uuid(properties.get("vmId")) != proof["uuid"]
-            or resource.get("identity") is not None
+            or not vm_identity_allowed(self.state.get("azure_policy"),
+                                       resource.get("identity"))
             or properties.get("provisioningState") != "Succeeded"
             or not isinstance(hardware, dict)
             or hardware.get("vmSize") != "Standard_D2s_v5"
@@ -1385,6 +1477,10 @@ def main():
     planner = commands.add_parser("plan", help="generate fresh build IDs; no cloud calls")
     planner.add_argument("--state-dir", required=True, type=Path)
     planner.add_argument("--subscription", required=True)
+    planner.add_argument(
+        "--azure-policy", type=Path,
+        help="private JSON pin of a subscription policy's exact VM tags/identity",
+    )
     prepared = commands.add_parser(
         "prepare", help="validate local boots and package two fresh read-only seed VHDs"
     )
@@ -1406,7 +1502,12 @@ def main():
     args = parser.parse_args()
     try:
         if args.command == "plan":
-            state = plan(args.state_dir, args.subscription)
+            policy = None
+            if args.azure_policy is not None:
+                policy = azure.parse_strict_json(azure.read_regular_file(
+                    args.azure_policy, 16 * 1024, "Azure policy allowance",
+                ), "Azure policy allowance")
+            state = plan(args.state_dir, args.subscription, policy)
             print(json.dumps({
                 "run_id": state["run_id"], "disk_ids": state["disk_ids"],
                 "sector_count": SECTORS, "luns": LUNS,

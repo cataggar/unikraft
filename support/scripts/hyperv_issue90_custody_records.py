@@ -16,6 +16,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 azure = importlib.import_module("hyperv-azure")
+topology = importlib.import_module("hyperv_issue90_topology")
 
 SCHEMA = "uk-hyperv-issue90-custody-v1"
 DOMAINS = {
@@ -119,7 +120,8 @@ def _tree(value, depth=0):
         if len(value) > 32:
             raise ValueError("Custody JSON object exceeds limit")
         for key, item in value.items():
-            if not isinstance(key, str) or len(key) > 80:
+            # Policy user-identity keys are full ARM resource IDs.
+            if not isinstance(key, str) or len(key) > 512:
                 raise ValueError("Custody JSON key exceeds limit")
             _tree(item, depth + 1)
     elif isinstance(value, list):
@@ -178,6 +180,7 @@ class Expected:
     template_sha256: str
     final_envelope_sha256: str
     resource_ids: dict
+    azure_policy: object = None
 
     def validate(self):
         _nonce(self.run_id, "Run ID")
@@ -198,6 +201,11 @@ class Expected:
                 or len(value) > 512 for value in self.resource_ids.values())
                 or len({value.lower() for value in self.resource_ids.values()}) != 10):
             raise ValueError("Expected resource IDs must be distinct absolute ARM paths")
+        if self.azure_policy is not None:
+            group = self.resource_ids["group"].split("/")
+            if len(group) != 5 or group[3] != "resourceGroups":
+                raise ValueError("Expected group ID is not a resource-group path")
+            topology.validate_azure_policy(self.azure_policy, group[2], group[4])
 
 
 @dataclass(frozen=True)
@@ -509,8 +517,8 @@ def _vm_attachment(value, expected, vm_uuid, os_role):
     if not isinstance(value, dict) or value.get("id") != expected.resource_ids["vm"]:
         raise ValueError("VM observation has wrong identity")
     _run_tags(value, expected, "VM observation")
-    if value.get("identity") is not None:
-        raise ValueError("VM observation has a managed identity")
+    if not topology.vm_identity_allowed(expected.azure_policy, value.get("identity")):
+        raise ValueError("VM observation has an unpinned managed identity")
     props = _props(value)
     storage = props.get("storageProfile")
     network = props.get("networkProfile")
@@ -566,7 +574,7 @@ def _deallocation_view(value, expected, vm_uuid):
         return False
     return (value.get("id") == expected.resource_ids["vm"]
             and value.get("vmId") == vm_uuid
-            and value.get("identity") is None
+            and topology.vm_identity_allowed(expected.azure_policy, value.get("identity"))
             and sorted(str(item.get("code")) for item in statuses)
             == ["PowerState/deallocated", "ProvisioningState/succeeded"])
 

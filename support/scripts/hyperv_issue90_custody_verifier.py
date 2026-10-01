@@ -287,6 +287,7 @@ class Verifier:
                     )):
                 raise ValueError("Offline reviewed source, image, seeds or boots differ")
             if (self.expected.template_sha256 == topology.TEMPLATE_SHA256
+                    or self.expected.azure_policy != state.get("azure_policy")
                     or self.expected.resource_ids["group"] != topology.group_id(state)
                     or any(self.expected.resource_ids[role]
                            != topology.resource_id(state, role)
