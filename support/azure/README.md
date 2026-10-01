@@ -1132,6 +1132,35 @@ This format assumes a newly reviewed dummy-OS deployment template and
 original-response capture outside this module. The current pinned template
 attaches the final OS disk and cannot be relabeled as a dummy deployment.
 
+### Offline #90 custodian helper
+
+`support/scripts/hyperv_issue90_custodian.py` is an offline helper for the
+custody format above. It can generate self-held test Ed25519 keys, record an
+injectable `az`-like runner's original stdout bytes into a private
+content-addressed archive plus append-only journal, assemble PREPARED and
+HANDED_OFF envelopes from those observations, and call `inspect_handoff(...)`
+against an independently supplied `Expected`. Its live entry point is
+intentionally closed and raises before any Azure call; tests drive the phase
+sequence with fakes only.
+
+`hyperv_issue90_custodian.py keys <private-dir>` creates a new 0700 directory
+and refuses to reuse an existing one. It writes one 0600 raw private key and one
+0600 raw-public-key hex file for each role: `custodian`, `approver` and
+`witness`. These keys are **TEST-ONLY**. If one operator generates or holds all
+three keys, they provide no independent custodian, approval or witness
+separation of duties; real custody must pin independently controlled public
+keys out of band. Custodian plans require explicit nonzero reviewed-source and
+build-provenance hashes. Grant-access output is never archived with its SAS
+value: the journal records only sanitized argv and a redacted observation
+marker. Upload evidence is written only after an injected upload callable
+returns the actual uploaded SHA-256 and byte count matching the reviewed input,
+inventory summaries are derived from a real `resource list` observation with no
+extra or missing resources, and HANDOFF `running_seconds` is derived from
+journaled deployment/deallocation timestamps unless an explicit larger value is
+supplied. A private `azure_policy` pin in the supplied `Expected` context is
+honored exactly as by the topology controller; without it, any policy-added VM
+identity is refused.
+
 ### Separate offline dummy-OS ARM candidate (not a deployment approval)
 
 `support/azure/hyperv-issue90-dummy-topology.json` is a **candidate only**;
