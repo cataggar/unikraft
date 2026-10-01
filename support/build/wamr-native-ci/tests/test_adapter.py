@@ -31,18 +31,28 @@ LOG_VALIDATE = os.environ.get("WAMR_CI_LOG_VALIDATE")
 spec = importlib.util.spec_from_file_location("wamr_ci", HERE / "run.py")
 ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ci)
-if SUPERVISOR is not None:
-    ci.COMMAND_SUPERVISOR_PATH = str(
-        Path(SUPERVISOR).resolve(strict=True))
+SUPERVISOR_PATH = (
+    str(Path(SUPERVISOR).resolve(strict=True))
+    if SUPERVISOR is not None else None)
 bundle_spec = importlib.util.spec_from_file_location(
     "wamr_public_bundle", HERE / "public_bundle.py")
 public_bundle = importlib.util.module_from_spec(bundle_spec)
 bundle_spec.loader.exec_module(public_bundle)
-ci.COMMAND_TOOL_PATHS.update({
+ENV_COMMAND_TOOL_PATHS = {
     name: os.environ["WAMR_CI_TOOL_" + name.upper().replace("-", "_")]
     for name in ci.HOST_TOOLS
     if "WAMR_CI_TOOL_" + name.upper().replace("-", "_") in os.environ
-})
+}
+
+
+def reset_command_bindings():
+    ci.COMMAND_SUPERVISOR_PATH = SUPERVISOR_PATH
+    ci.COMMAND_TOOL_PATHS.clear()
+    ci.COMMAND_TOOL_PATHS.update(ENV_COMMAND_TOOL_PATHS)
+    ci.COMMAND_ENVIRONMENT.clear()
+
+
+reset_command_bindings()
 
 
 class NativeRecordBridge(unittest.TestCase):
@@ -315,6 +325,28 @@ class NativeRecordBridge(unittest.TestCase):
                 bridge.local_runtime(runtime)
         self.assertEqual(json.loads(arguments.read_text()), [
             "records", "--runtime", str(runtime), "--output", "handoff-v1"])
+
+    def test_local_consumer_custody_uses_native_command_without_fallback(self):
+        bridge = public_bundle.accepted_records
+        root, controller = self.controller_fixture(
+            "import json, os, sys\n"
+            "open(os.environ['WAMR_CI_TEST_ARGS'], 'w').write("
+            "json.dumps(sys.argv[1:]))\n"
+            "sys.exit(1)\n")
+        runtime = root / "runtime"
+        runtime.mkdir(mode=0o700)
+        arguments = root / "arguments.json"
+        with mock.patch.dict(os.environ, {
+                bridge.CONTROLLER_ENV: str(controller),
+                "WAMR_CI_TEST_ARGS": str(arguments)}):
+            with self.assertRaisesRegex(
+                    ValueError,
+                    "native controller local consumer custody refused"):
+                bridge.local_consumer_custody(runtime, "1" * 64, "2" * 64)
+        self.assertEqual(json.loads(arguments.read_text()), [
+            "local-consumer-custody", "--runtime", str(runtime),
+            "--expected-build-start-sha256", "1" * 64,
+            "--expected-boot-inputs-sha256", "2" * 64])
 
     def test_handoff_inspect_uses_native_command_without_fallback(self):
         bridge = public_bundle.accepted_records
@@ -1553,6 +1585,7 @@ class PhysicalPackage(unittest.TestCase):
     """Run the actual native adapter + pinned miz on a nonbootable synthetic PE."""
 
     def setUp(self):
+        reset_command_bindings()
         self.root = Path(tempfile.mkdtemp(prefix="wamr-native-ci-"))
         self.root.chmod(0o700)
         self.addCleanup(shutil.rmtree, self.root)
@@ -1646,6 +1679,7 @@ class PhysicalPackage(unittest.TestCase):
 
 class Evidence(unittest.TestCase):
     def setUp(self):
+        reset_command_bindings()
         self.root = Path(tempfile.mkdtemp(prefix="wamr-native-ci-"))
         self.root.chmod(0o700)
         self.addCleanup(shutil.rmtree, self.root)
@@ -2261,8 +2295,9 @@ class Evidence(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "bundle refused"):
             public_bundle.ci_runtime(runtime_owner)
 
-    def test_public_start_revalidates_recorded_custody_before_binding(self):
+    def test_public_start_routes_custody_to_native_before_binding(self):
         runtime = self.root / "public-runtime"
+        (runtime / "compute/evidence").mkdir(parents=True, mode=0o700)
         consumer = {
             "schema": "uk.wamr.consumer-input-custody",
             "version": 2,
@@ -2274,12 +2309,189 @@ class Evidence(unittest.TestCase):
                 "wamr-source-archive": {"path": "/trusted/wamr.tar"},
                 "command-supervisor": {"path": "/trusted/supervisor"},
             },
-            "trees": {
-                name: {} for name in (
-                    "bison", "python-stdlib", "zig", "llvm")
+            "trees": {},
+        }
+        start = {
+            "source": {"revision": "1" * 40, "tree": "2" * 40},
+            "source_custody": {},
+            "tools": {name: "3" * 64 for name in ci.HOST_TOOLS},
+            "bison_data": {"files": 1},
+            "dependencies": {"accepted": True},
+            "consumer_inputs": consumer,
+            "command_supervisor": {"accepted": True},
+        }
+        boot_inputs = {"boot": "inputs"}
+        self.put(
+            runtime / "compute/evidence/build-start.json",
+            ci.canonical_json(start))
+        self.put(
+            runtime / "compute/evidence/boot-inputs.json",
+            ci.canonical_json(boot_inputs))
+        build_start_sha256 = hashlib.sha256(
+            ci.canonical_json(start)).hexdigest()
+        boot_inputs_sha256 = hashlib.sha256(
+            ci.canonical_json(boot_inputs)).hexdigest()
+        source = {"source_revision": "1" * 40, "source_tree": "2" * 40}
+        owner = types.SimpleNamespace(ci=ci, FAILURE_STAGE="handoff")
+        events = []
+
+        def native(actual_runtime, expected_build_start, expected_boot_inputs):
+            self.assertEqual(actual_runtime, runtime)
+            self.assertEqual(expected_build_start, build_start_sha256)
+            self.assertEqual(expected_boot_inputs, boot_inputs_sha256)
+            self.assertIsNone(ci.COMMAND_SUPERVISOR_PATH)
+            self.assertEqual(ci.COMMAND_TOOL_PATHS, {})
+            events.append("native")
+
+        def dependency(actual_ci, value, actual_source):
+            self.assertIs(actual_ci, ci)
+            self.assertEqual(value, start["dependencies"])
+            self.assertEqual(actual_source, source)
+            self.assertEqual(ci.COMMAND_TOOL_PATHS, {"git": "/trusted/git"})
+            events.append("dependency-shape")
+
+        def dependency_custody(root, value):
+            self.assertEqual(root, runtime / "compute")
+            self.assertEqual(value, start["dependencies"])
+            events.append("dependency-custody")
+
+        def bind(value):
+            self.assertEqual(value, consumer)
+            self.assertEqual(events[:5], [
+                "native", "command-supervisor-record", "dependency-shape",
+                "dependency-custody", "bison"])
+            events.append("bind")
+            return {"WAMR_CI_GIT": "/trusted/git"}
+
+        original_supervisor = ci.COMMAND_SUPERVISOR_PATH
+        original_tools = dict(ci.COMMAND_TOOL_PATHS)
+        original_environment = dict(ci.COMMAND_ENVIRONMENT)
+        try:
+            ci.COMMAND_SUPERVISOR_PATH = None
+            ci.COMMAND_TOOL_PATHS.clear()
+            ci.COMMAND_ENVIRONMENT.clear()
+            with mock.patch.object(
+                        public_bundle.accepted_records,
+                        "local_consumer_custody", side_effect=native), \
+                    mock.patch.object(
+                        public_bundle, "source_custody_record",
+                        side_effect=AssertionError(
+                            "python source custody fallback")), \
+                    mock.patch.object(
+                        public_bundle, "consumer_input_record",
+                        side_effect=AssertionError(
+                            "python consumer custody fallback")), \
+                    mock.patch.object(
+                        ci, "require_recorded_consumer_inputs",
+                        side_effect=AssertionError(
+                            "python consumer recapture fallback")), \
+                    mock.patch.object(
+                        ci, "require_recorded_build_custody",
+                        side_effect=AssertionError(
+                            "python build custody fallback")), \
+                    mock.patch.object(
+                        public_bundle, "command_supervisor_record",
+                        side_effect=lambda value: events.append(
+                            "command-supervisor-record")), \
+                    mock.patch.object(
+                        public_bundle, "dependency_record",
+                        side_effect=dependency), \
+                    mock.patch.object(
+                        ci, "require_dependency_custody",
+                        side_effect=dependency_custody), \
+                    mock.patch.object(
+                        ci, "bison_inputs",
+                        side_effect=lambda root: events.append("bison")
+                        or start["bison_data"]), \
+                    mock.patch.object(
+                        ci, "command_supervisor_state",
+                        return_value=start["command_supervisor"]) as supervisor, \
+                    mock.patch.object(
+                        ci, "bind_command_tools", side_effect=bind):
+                proof = public_bundle.accepted_public_build_start(
+                    owner, runtime)
+                self.assertEqual(proof.start, start)
+                self.assertEqual(proof.build_start_sha256, build_start_sha256)
+                self.assertEqual(proof.boot_inputs_sha256, boot_inputs_sha256)
+            supervisor.assert_called_once_with(runtime, consumer)
+            self.assertEqual(events, [
+                "native", "command-supervisor-record", "dependency-shape",
+                "dependency-custody", "bison", "bind"])
+            self.assertEqual(
+                ci.COMMAND_ENVIRONMENT, {"WAMR_CI_GIT": "/trusted/git"})
+            self.assertEqual(owner.FAILURE_STAGE, "public-build-start-command-bind")
+        finally:
+            ci.COMMAND_SUPERVISOR_PATH = original_supervisor
+            ci.COMMAND_TOOL_PATHS.clear()
+            ci.COMMAND_TOOL_PATHS.update(original_tools)
+            ci.COMMAND_ENVIRONMENT.clear()
+            ci.COMMAND_ENVIRONMENT.update(original_environment)
+
+    def test_public_start_native_refusal_never_falls_back_or_binds(self):
+        runtime = self.root / "public-runtime-refusal"
+        (runtime / "compute/evidence").mkdir(parents=True, mode=0o700)
+        self.put(runtime / "compute/evidence/build-start.json", b"{}\n")
+        self.put(runtime / "compute/evidence/boot-inputs.json", b"{}\n")
+        owner = types.SimpleNamespace(ci=ci, FAILURE_STAGE="handoff")
+        with mock.patch.object(
+                public_bundle.accepted_records, "local_consumer_custody",
+                side_effect=ValueError(
+                    "native controller local consumer custody refused")), \
+                mock.patch.object(ci, "bind_command_tools") as bind, \
+                mock.patch.object(
+                    ci, "require_recorded_build_custody",
+                    side_effect=AssertionError(
+                        "python custody fallback")), \
+                self.assertRaisesRegex(
+                    ValueError, "native controller local consumer custody refused"):
+            public_bundle.accepted_public_build_start(owner, runtime)
+        bind.assert_not_called()
+        self.assertEqual(owner.FAILURE_STAGE, "public-build-start-native-custody")
+
+    def test_public_start_digest_mismatch_refuses_before_binding(self):
+        runtime = self.root / "public-runtime-digest-mismatch"
+        (runtime / "compute/evidence").mkdir(parents=True, mode=0o700)
+        start = {"source": {"revision": "1" * 40, "tree": "2" * 40}}
+        self.put(
+            runtime / "compute/evidence/build-start.json",
+            ci.canonical_json(start))
+        self.put(runtime / "compute/evidence/boot-inputs.json", b"{}\n")
+        owner = types.SimpleNamespace(ci=ci, FAILURE_STAGE="handoff")
+
+        def native(actual_runtime, expected_build_start, unused_boot_inputs):
+            self.assertEqual(actual_runtime, runtime)
+            self.put(
+                runtime / "compute/evidence/build-start.json",
+                b'{"changed":true}\n')
+            actual = hashlib.sha256(
+                (runtime / "compute/evidence/build-start.json"
+                 ).read_bytes()).hexdigest()
+            self.assertNotEqual(expected_build_start, actual)
+            raise ValueError("native controller local consumer custody refused")
+
+        with mock.patch.object(
+                public_bundle.accepted_records, "local_consumer_custody",
+                side_effect=native), \
+                mock.patch.object(ci, "bind_command_tools") as bind, \
+                self.assertRaisesRegex(
+                    ValueError, "native controller local consumer custody refused"):
+            public_bundle.accepted_public_build_start(owner, runtime)
+        bind.assert_not_called()
+        self.assertEqual(owner.FAILURE_STAGE, "public-build-start-native-custody")
+
+    def test_public_start_swapped_after_first_custody_refuses_second_custody(self):
+        runtime = self.root / "public-runtime-second-custody"
+        (runtime / "compute/evidence").mkdir(parents=True, mode=0o700)
+        consumer = {
+            "files": {
+                **{
+                    "tool:" + name: {"path": "/trusted/" + name}
+                    for name in ci.HOST_TOOLS
+                },
+                "command-supervisor": {"path": "/trusted/supervisor"},
+                "wamr-source-archive": {"path": "/trusted/wamr.tar"},
             },
-            "directories": {},
-            "aggregate_sha256": "f" * 64,
+            "trees": {},
         }
         start = {
             "source": {"revision": "1" * 40, "tree": "2" * 40},
@@ -2290,173 +2502,75 @@ class Evidence(unittest.TestCase):
             "consumer_inputs": consumer,
             "command_supervisor": {},
         }
-        owner = type("Handoff", (), {"ci": ci})
-        events = []
-
-        def recorded(expected, content=False, on_role=None):
-            self.assertIs(expected, consumer)
-            self.assertTrue(content)
-            self.assertIsNotNone(on_role)
-            self.assertIsNone(ci.COMMAND_SUPERVISOR_PATH)
-            events.append("consumer")
-
-        def custody(actual_runtime, expected):
-            self.assertEqual(actual_runtime, runtime)
-            self.assertIs(expected, start)
-            if ci.COMMAND_SUPERVISOR_PATH is None:
-                self.assertEqual(
-                    ci.COMMAND_TOOL_PATHS,
-                    {"git": "/trusted/git"})
-                events.append("custody-before-bind")
-            else:
-                self.assertEqual(
-                    ci.COMMAND_SUPERVISOR_PATH,
-                    "/trusted/supervisor")
-                self.assertEqual(
-                    set(ci.COMMAND_TOOL_PATHS), set(ci.HOST_TOOLS))
-                events.append("custody-after-bind")
-            return expected
-
-        original_supervisor = ci.COMMAND_SUPERVISOR_PATH
-        original_tools = dict(ci.COMMAND_TOOL_PATHS)
-        original_environment = dict(ci.COMMAND_ENVIRONMENT)
-        try:
-            ci.COMMAND_SUPERVISOR_PATH = None
-            ci.COMMAND_TOOL_PATHS.clear()
-            ci.COMMAND_ENVIRONMENT.clear()
-            with mock.patch.object(
-                    ci, "document", return_value=start), \
-                    mock.patch.object(
-                        public_bundle, "source_custody_record"), \
-                    mock.patch.object(
-                        public_bundle, "consumer_input_record"), \
-                    mock.patch.object(
-                        public_bundle, "command_supervisor_record"), \
-                    mock.patch.object(
-                        public_bundle, "dependency_record",
-                        side_effect=lambda *unused: events.append(
-                            "dependency")), \
-                    mock.patch.object(
-                        public_bundle, "require_consumer_tree_roles"), \
-                    mock.patch.object(
-                        public_bundle, "require_public_consumer_paths"), \
-                    mock.patch.object(
-                        ci, "require_recorded_consumer_inputs",
-                        side_effect=recorded), \
-                    mock.patch.object(
-                        ci, "require_recorded_build_custody",
-                        side_effect=custody):
-                self.assertIs(
-                    public_bundle.accepted_public_build_start(
-                        owner, runtime),
-                    start)
-            self.assertEqual(events, [
-                "consumer", "dependency", "custody-before-bind",
-                "custody-after-bind",
-            ])
-        finally:
-            ci.COMMAND_SUPERVISOR_PATH = original_supervisor
-            ci.COMMAND_TOOL_PATHS.clear()
-            ci.COMMAND_TOOL_PATHS.update(original_tools)
-            ci.COMMAND_ENVIRONMENT.clear()
-            ci.COMMAND_ENVIRONMENT.update(original_environment)
-
-    def test_public_start_missing_or_tampered_consumer_inputs_never_bind(self):
-        runtime = self.root / "public-runtime-refusal"
-        base_files = {
-            **{
-                "tool:" + name: {"path": "/trusted/" + name}
-                for name in ci.HOST_TOOLS
-            },
-            "wamr-source-archive": {"path": "/trusted/wamr.tar"},
-            "command-supervisor": {"path": "/trusted/supervisor"},
-        }
-        consumer = {
-            "files": base_files,
-            "trees": {
-                name: {} for name in (
-                    "bison", "python-stdlib", "zig", "llvm")
-            },
-        }
-        start = {
-            "source": {"revision": "1" * 40, "tree": "2" * 40},
-            "source_custody": {}, "tools": {}, "bison_data": {},
-            "dependencies": {}, "consumer_inputs": consumer,
-            "command_supervisor": {},
-        }
-        owner = type("Handoff", (), {"ci": ci})
-        for case in ("missing", "tampered"):
-            candidate = copy.deepcopy(start)
-            if case == "missing":
-                del candidate["consumer_inputs"]["files"][
-                    "command-supervisor"]
-            with self.subTest(case=case), \
-                    mock.patch.object(
-                        ci, "document", return_value=candidate), \
-                    mock.patch.object(
-                        public_bundle, "source_custody_record"), \
-                    mock.patch.object(
-                        public_bundle, "consumer_input_record"), \
-                    mock.patch.object(
-                        public_bundle, "command_supervisor_record"), \
-                    mock.patch.object(
-                        public_bundle, "require_consumer_tree_roles"), \
-                    mock.patch.object(
-                        public_bundle, "require_public_consumer_paths"), \
-                    mock.patch.object(
-                        ci, "require_recorded_consumer_inputs",
-                        side_effect=(
-                            ci.Refusal("consumer input custody changed")
-                            if case == "tampered" else None)), \
-                    mock.patch.object(
-                        ci, "bind_command_tools") as bind, \
-                    self.assertRaises((ValueError, ci.Refusal)):
-                public_bundle.accepted_public_build_start(owner, runtime)
-            bind.assert_not_called()
-            self.assertEqual(
-                owner.FAILURE_STAGE,
-                "public-build-start-consumer-roles"
-                if case == "missing" else "public-build-start-consumer-custody")
-
-    def test_public_custody_reports_fixed_role_without_recorded_paths(self):
-        inputs = self.root / "public-custody-roles"
-        tree = inputs / "zig"
-        tree.mkdir(parents=True, mode=0o700)
-        paths = {
-            "native:wamr-aot-build": inputs / "native",
-            "runtime:/private/untrusted-path": inputs / "loader",
-            "tool:git": inputs / "git",
-        }
-        for path in (*paths.values(), tree / "data"):
-            self.put(path, b"baseline")
+        self.put(
+            runtime / "compute/evidence/build-start.json",
+            ci.canonical_json(start))
+        self.put(runtime / "compute/evidence/boot-inputs.json", b"{}\n")
         owner = types.SimpleNamespace(ci=ci, FAILURE_STAGE="handoff")
-        for role, path, label in (
-                ("native:wamr-aot-build", paths["native:wamr-aot-build"],
-                 "native-build"),
-                ("runtime:/private/untrusted-path",
-                 paths["runtime:/private/untrusted-path"], "runtime"),
-                ("tool:git", paths["tool:git"], "tool-git"),
-                ("zig", tree / "data", "zig")):
-            with self.subTest(role=label):
-                expected = ci.record_input_paths(paths, {"zig": tree})
-                ci.require_recorded_consumer_inputs(
-                    expected, content=True,
-                    on_role=lambda kind, name:
-                    public_bundle.public_consumer_custody_stage(
-                        owner, kind, name))
-                self.assertEqual(
-                    owner.FAILURE_STAGE,
-                    "public-build-start-consumer-custody-aggregate")
-                path.write_bytes(b"changed")
-                with self.assertRaises(ci.Refusal):
-                    ci.require_recorded_consumer_inputs(
-                        expected, content=True,
-                        on_role=lambda kind, name:
-                        public_bundle.public_consumer_custody_stage(
-                            owner, kind, name))
-                self.assertEqual(
-                    owner.FAILURE_STAGE,
-                    "public-build-start-consumer-custody-" + label)
+
+        def native(actual_runtime, expected_build_start, unused_boot_inputs):
+            self.assertEqual(actual_runtime, runtime)
+            actual = hashlib.sha256(
+                (runtime / "compute/evidence/build-start.json"
+                 ).read_bytes()).hexdigest()
+            if expected_build_start != actual:
+                raise ValueError(
+                    "native controller local consumer custody refused")
+
+        with mock.patch.object(
+                public_bundle.accepted_records, "local_consumer_custody",
+                side_effect=native), \
+                mock.patch.object(
+                    public_bundle, "command_supervisor_record"), \
+                mock.patch.object(public_bundle, "dependency_record"), \
+                mock.patch.object(ci, "require_dependency_custody"), \
+                mock.patch.object(ci, "bison_inputs", return_value={}), \
+                mock.patch.object(
+                    ci, "command_supervisor_state", return_value={}), \
+                mock.patch.object(
+                    ci, "bind_command_tools", return_value={}):
+            proof = public_bundle.accepted_public_build_start(owner, runtime)
+            self.put(
+                runtime / "compute/evidence/build-start.json",
+                b'{"changed":true}\n')
+            with self.assertRaisesRegex(
+                    ValueError,
+                    "native controller local consumer custody refused"):
+                public_bundle.native_public_build_custody(
+                    owner, runtime, proof, "public-validator-build-native-custody")
+        self.assertEqual(owner.FAILURE_STAGE, "public-validator-build-native-custody")
+
+    def test_public_context_uses_native_verified_start_without_python_source(self):
+        start = {"source": {"revision": "1" * 40, "tree": "2" * 40}}
+        owner = types.SimpleNamespace(ci=ci, FAILURE_STAGE="handoff")
+        env = {
+            "GITHUB_ACTIONS": "true",
+            "GITHUB_REPOSITORY": "cataggar/unikraft",
+            "GITHUB_JOB": "wamr-native-compute",
+            "GITHUB_EVENT_NAME": "pull_request",
+            "GITHUB_REPOSITORY_VISIBILITY": "public",
+            "GITHUB_WORKSPACE": str(ci.REPO),
+            "GITHUB_WORKFLOW_REF": (
+                "cataggar/unikraft/.github/workflows/"
+                "wamr-native-compute.yaml@refs/pull/1/merge"),
+            "GITHUB_SHA": "1" * 40,
+            "GITHUB_RUN_ID": "123",
+            "GITHUB_RUN_ATTEMPT": "1",
+        }
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(
+                    ci, "source",
+                    side_effect=AssertionError(
+                        "python source custody fallback")):
+            self.assertEqual(public_bundle.ci_context(owner, start), {
+                "repository": "cataggar/unikraft",
+                "run_id": "123",
+                "run_attempt": "1",
+                "source_revision": "1" * 40,
+                "source_tree": "2" * 40,
+                "wamr_revision": ci.REVISION,
+            })
+        self.assertEqual(owner.FAILURE_STAGE, "public-context-binding")
 
     def test_precreated_parity_slots_preserve_recorded_runtime_ancestor(self):
         parent = self.root / "paired-parent"
@@ -2475,125 +2589,6 @@ class Evidence(unittest.TestCase):
         (parent / "late-slot").mkdir(mode=0o700)
         with self.assertRaisesRegex(ci.Refusal, "directory custody changed"):
             ci.require_recorded_consumer_inputs(expected, content=True)
-
-    def test_public_context_binds_installed_log_validator_or_refuses(self):
-        runtime = self.root / "public-validator-runtime"
-        (runtime / "compute/evidence").mkdir(parents=True, mode=0o700)
-        for directory in ("bison", "llvm"):
-            (runtime / directory).mkdir(mode=0o700)
-        files = {
-            "tool:" + name: {"path": "/trusted/" + name}
-            for name in ci.HOST_TOOLS
-        }
-        for role, relative in (
-                ("command-supervisor",
-                 "compute/supervisor/bin/wamr-ci-supervisor"),
-                (ci.WAMR_AOT_BUILD_ROLE, ci.WAMR_AOT_BUILD_RELATIVE),
-                (ci.WAMR_LOG_VALIDATOR_ROLE, ci.WAMR_LOG_VALIDATOR_RELATIVE),
-                ("wamr-source-archive", "custody/wamr-source.tar")):
-            path = runtime / relative
-            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            self.put(path, b"fixture executable or archive")
-            files[role] = {"path": str(path)}
-        consumer = {
-            "files": files,
-            "trees": {
-                "bison": {"path": str(runtime / "bison")},
-                "llvm": {"path": str(runtime / "llvm")},
-                "zig": {"path": "/trusted"},
-                "python-stdlib": {
-                    "path": str(Path(ci.sysconfig.get_paths()["stdlib"])
-                                .resolve(strict=True)),
-                },
-            },
-        }
-        start = {
-            "source": {"revision": "1" * 40, "tree": "2" * 40},
-            "source_custody": {}, "tools": {}, "bison_data": {},
-            "dependencies": {}, "consumer_inputs": consumer,
-            "command_supervisor": {},
-        }
-        owner = types.SimpleNamespace(
-            ci=ci, result_records=mock.Mock(), FAILURE_STAGE="handoff")
-        original_supervisor = ci.COMMAND_SUPERVISOR_PATH
-        original_tools = dict(ci.COMMAND_TOOL_PATHS)
-        original_environment = dict(ci.COMMAND_ENVIRONMENT)
-        try:
-            for case in (
-                    "present", "missing", "wrong-path", "extra-role",
-                    "wrong-tree"):
-                candidate = copy.deepcopy(start)
-                if case == "missing":
-                    del candidate["consumer_inputs"]["files"][
-                        ci.WAMR_LOG_VALIDATOR_ROLE]
-                elif case == "wrong-path":
-                    candidate["consumer_inputs"]["files"][
-                        ci.WAMR_LOG_VALIDATOR_ROLE]["path"] = "/trusted/other"
-                elif case == "extra-role":
-                    candidate["consumer_inputs"]["files"][
-                        "native:unapproved"] = {"path": "/trusted/other"}
-                elif case == "wrong-tree":
-                    candidate["consumer_inputs"]["trees"]["zig"][
-                        "path"] = "/trusted/other"
-                ci.COMMAND_SUPERVISOR_PATH = None
-                ci.COMMAND_TOOL_PATHS.clear()
-                ci.COMMAND_ENVIRONMENT.clear()
-                with self.subTest(case=case), \
-                        mock.patch.object(
-                            public_bundle, "ci_runtime",
-                            return_value=runtime), \
-                        mock.patch.object(
-                            ci, "document", return_value=candidate), \
-                        mock.patch.object(
-                            public_bundle, "source_custody_record"), \
-                        mock.patch.object(
-                            public_bundle, "consumer_input_record"), \
-                        mock.patch.object(
-                            public_bundle, "command_supervisor_record"), \
-                        mock.patch.object(
-                            ci, "require_recorded_consumer_inputs"), \
-                        mock.patch.object(
-                            ci, "executable_runtime_paths",
-                            return_value=set()), \
-                        mock.patch.object(
-                            public_bundle, "dependency_record"), \
-                        mock.patch.object(
-                            ci, "require_recorded_build_custody"), \
-                        mock.patch.object(
-                            ci, "bind_command_tools", return_value={}) as bind, \
-                        mock.patch.object(
-                            public_bundle, "ci_context",
-                            side_effect=RuntimeError("past public context")
-                        ) as context:
-                    if case == "present":
-                        with self.assertRaisesRegex(
-                                RuntimeError, "past public context"):
-                            public_bundle.publish_ci(owner)
-                        owner.result_records.assert_called_with(
-                            runtime / "compute")
-                        context.assert_called_once_with(owner, candidate)
-                        bind.assert_called_once_with(consumer)
-                        self.assertEqual(owner.FAILURE_STAGE, "public-context-entry")
-                    else:
-                        failure = (
-                            ci.Refusal if case == "missing" else ValueError)
-                        with self.assertRaises(failure):
-                            public_bundle.publish_ci(owner)
-                        bind.assert_not_called()
-                        context.assert_not_called()
-                        self.assertEqual(
-                            owner.FAILURE_STAGE,
-                            "public-build-start-path-binaries"
-                            if case in ("missing", "wrong-path") else
-                            "public-build-start-path-runtime"
-                            if case == "extra-role" else
-                            "public-build-start-path-trees")
-        finally:
-            ci.COMMAND_SUPERVISOR_PATH = original_supervisor
-            ci.COMMAND_TOOL_PATHS.clear()
-            ci.COMMAND_TOOL_PATHS.update(original_tools)
-            ci.COMMAND_ENVIRONMENT.clear()
-            ci.COMMAND_ENVIRONMENT.update(original_environment)
 
     def test_fresh_publication_binds_before_validator_and_rechecks_record(self):
         repository = self.root / "fresh-publication"
@@ -2618,6 +2613,8 @@ class Evidence(unittest.TestCase):
             },
         }
         start = {"consumer_inputs": consumer}
+        build_start = public_bundle.VerifiedPublicBuildStart(
+            start, "a" * 64, "b" * 64)
         source = {
             "repository": "cataggar/unikraft",
             "run_id": "123", "run_attempt": "1",
@@ -2635,7 +2632,7 @@ class Evidence(unittest.TestCase):
             self.assertIsNone(ci.COMMAND_SUPERVISOR_PATH)
             ci.bind_command_tools(consumer)
             events.append("bound")
-            return start
+            return build_start
 
         def execute(*unused, **kwargs):
             self.assertEqual(
@@ -2679,7 +2676,19 @@ class Evidence(unittest.TestCase):
                     mock.patch.object(
                         ci, "document", return_value=validator_record), \
                     mock.patch.object(
-                        ci, "require_recorded_build_custody"), \
+                        ci, "require_recorded_build_custody",
+                        side_effect=AssertionError(
+                            "python custody fallback")), \
+                    mock.patch.object(
+                        public_bundle, "native_public_build_custody",
+                        side_effect=lambda unused_handoff, actual_runtime,
+                            actual_start, unused_stage: (
+                                self.assertIs(actual_start, build_start),
+                                events.append("native-custody"))[-1]), \
+                    mock.patch.object(
+                        public_bundle, "verify_public_build_side_checks",
+                        side_effect=lambda *unused: events.append(
+                            "side-checks")), \
                     mock.patch.object(
                         public_bundle, "supervised_command_record",
                         side_effect=validate), \
@@ -2691,6 +2700,8 @@ class Evidence(unittest.TestCase):
             self.assertEqual(events[:3], [
                 "bound", "validator", "validated"])
             self.assertEqual(events.count("validated"), 3)
+            self.assertEqual(events.count("native-custody"), 3)
+            self.assertEqual(events.count("side-checks"), 3)
             handoff.export.assert_called_once()
         finally:
             ci.COMMAND_SUPERVISOR_PATH = original_supervisor
@@ -2722,6 +2733,8 @@ class Evidence(unittest.TestCase):
             },
         }
         start = {"consumer_inputs": consumer}
+        build_start = public_bundle.VerifiedPublicBuildStart(
+            start, "a" * 64, "b" * 64)
         bootstrap = {
             "scope": "command_diagnostic_not_acceptance",
             "stage": "public-validator-build",
@@ -2744,7 +2757,7 @@ class Evidence(unittest.TestCase):
                         return_value=runtime), \
                     mock.patch.object(
                         public_bundle, "accepted_public_build_start",
-                        return_value=start), \
+                        return_value=build_start), \
                     mock.patch.object(
                         public_bundle, "ci_context",
                         return_value={
@@ -4353,6 +4366,8 @@ source/generated/
         (self.root / ".d").mkdir(mode=0o700)
         handoff = types.SimpleNamespace(
             ci=ci, result_records=mock.Mock(), private=mock.Mock())
+        build_start = public_bundle.VerifiedPublicBuildStart(
+            {"consumer_inputs": {}}, "a" * 64, "b" * 64)
         with mock.patch.object(ci, "REPO", self.root), \
                 mock.patch.object(ci, "tool", return_value="/tools/zig"), \
                 mock.patch.object(ci, "consumer_file_records"), \
@@ -4361,7 +4376,7 @@ source/generated/
                 mock.patch.object(public_bundle, "ci_runtime", return_value=runtime), \
                 mock.patch.object(
                     public_bundle, "accepted_public_build_start",
-                    return_value={"consumer_inputs": {}}), \
+                    return_value=build_start), \
                 mock.patch.object(public_bundle, "ci_context"), \
                 mock.patch.object(
                     ci, "execute", side_effect=RuntimeError("build captured")) as execute:

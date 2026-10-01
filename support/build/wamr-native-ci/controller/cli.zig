@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 const std = @import("std");
-const files = @import("hyperv_core").private_files;
+const core = @import("hyperv_core");
+const files = core.private_files;
+const contracts = core.contracts;
 
 pub const Action = enum { build, boot, diagnostics, describe, @"supervisor-source-closure", records, @"local-consumer-custody", @"handoff-inspect", @"handoff-inspect-legacy", @"public-validator-build", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation" };
 pub const Command = struct {
@@ -11,6 +13,8 @@ pub const Command = struct {
     output: ?[]const u8 = null,
     supervisor: ?[]const u8 = null,
     git: ?[]const u8 = null,
+    expected_build_start_sha256: ?contracts.Sha256 = null,
+    expected_boot_inputs_sha256: ?contracts.Sha256 = null,
 };
 
 pub fn parse(args: []const []const u8) !Command {
@@ -43,10 +47,29 @@ pub fn parse(args: []const []const u8) !Command {
         return result;
     }
     if (action == .@"local-consumer-custody") {
-        if (args.len != 4 or !std.mem.eql(u8, args[2], "--runtime"))
+        if (args.len != 8) return error.InvalidUsage;
+        var result = Command{ .action = action };
+        var i: usize = 2;
+        while (i < args.len) : (i += 2) {
+            const flag = args[i];
+            const value = args[i + 1];
+            if (std.mem.eql(u8, flag, "--runtime") and result.runtime == null) {
+                files.absoluteFilePath(value) catch return error.InvalidUsage;
+                result.runtime = value;
+            } else if (std.mem.eql(u8, flag, "--expected-build-start-sha256") and
+                result.expected_build_start_sha256 == null)
+            {
+                result.expected_build_start_sha256 = contracts.parseSha256(value) catch return error.InvalidUsage;
+            } else if (std.mem.eql(u8, flag, "--expected-boot-inputs-sha256") and
+                result.expected_boot_inputs_sha256 == null)
+            {
+                result.expected_boot_inputs_sha256 = contracts.parseSha256(value) catch return error.InvalidUsage;
+            } else return error.InvalidUsage;
+        }
+        if (result.runtime == null or result.expected_build_start_sha256 == null or
+            result.expected_boot_inputs_sha256 == null)
             return error.InvalidUsage;
-        files.absoluteFilePath(args[3]) catch return error.InvalidUsage;
-        return .{ .action = action, .runtime = args[3] };
+        return result;
     }
     if (action == .records) {
         if (args.len != 6 and args.len != 8) return error.InvalidUsage;

@@ -110,11 +110,12 @@ under the fixed plan. Its owner-only output is outside the imported stage and
 checkout. Trusted v2 imports invoke this operation before writing
 transport/candidate records; the default Python revalidation path reuses that
 native identity instead of repeating the identity command through Python.
-Python still owns publication policy, source/consumer recapture, local
-public-validator supervision, off-runner trusted-v2 revalidation, and
-legacy/producer-direct identity and revalidation checks.
-Remaining checkout/consumer custody and production/historical supervised
-handoff stages need native owners before `run.py` can be removed.
+Python still owns publication policy, local public-validator supervision,
+off-runner trusted-v2 revalidation, and legacy/producer-direct identity and
+revalidation checks. Historical/imported source and consumer compatibility
+paths remain Python-owned where the native local producer proof does not
+apply. Remaining production/historical supervised handoff stages need native
+owners before `run.py` can be removed.
 `import-validator-build --stage-root ABS --output ABS` is a support-only
 trusted-v2 companion for a pristine imported stage. It accepts no caller
 selected executable: it requires the current clean physical checkout to
@@ -146,15 +147,21 @@ historical revisions, unavailable recorded-tool imports, v1 imports, and
 producer-direct/local revalidation remain Python-owned because they either need
 the caller-supplied validator or do not satisfy the pristine same-revision
 trusted-stage preconditions.
-`local-consumer-custody --runtime ABS` is a support-only read-only probe
-for a completed Python-produced v2 runtime *before* the managed QEMU loader
-is removed. It compares the clean current checkout's full physical source
-custody and both recorded build/boot consumer sets against fresh native
-captures, including exact executable loader roles, input tree contents and
-physical ancestry. It emits no public or acceptance record and does not
-replace Python's dependency, supervisor, packaging, or production policy
-checks. An extracted historical archive cannot satisfy this local proof
-after the original consumer files or loader are removed.
+`local-consumer-custody --runtime ABS --expected-build-start-sha256 HEX
+--expected-boot-inputs-sha256 HEX` is the production owner for a completed
+Python-produced v2 runtime's local checkout/source and build/boot consumer-input
+custody *before* the managed QEMU loader is removed. The public source-bundle
+path hashes the exact `build-start.json` and `boot-inputs.json` bytes it read,
+passes those digests into the native owner, and reuses the same proof on later
+validator-build/export postchecks; Python no longer reinterprets the same
+source/consumer records or falls back after native refusal. The command compares
+the clean current checkout's full physical source custody and both recorded
+build/boot consumer sets against fresh native captures, including exact
+executable loader roles, the recorded `tool:python3` stdlib tree, input tree
+contents and physical ancestry. It emits no public or acceptance record and does
+not replace Python's dependency, supervisor, packaging, validator-build command,
+or production policy checks. An extracted historical archive cannot satisfy this
+local proof after the original consumer files or loader are removed.
 
 ## Native controller preparation (unpublished build path)
 

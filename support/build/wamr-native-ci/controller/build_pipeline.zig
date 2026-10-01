@@ -453,32 +453,13 @@ pub fn requireConsumer(context: *Context) !void {
 }
 
 fn pythonStdlib(context: *Context) ![]const u8 {
-    const python = context.tools[1];
-    try process.initialize();
-    var executable = try process.Executable.open(context.io, python);
-    defer executable.close(context.io);
-    const cwd = try files.openDirectory(context.io, context.repository, .artifact);
-    defer cwd.close(context.io);
-    var env = std.process.Environ.Map.init(context.allocator);
-    defer env.deinit();
-    try env.put("PYTHONDONTWRITEBYTECODE", "1");
-    const deadline = try process.Deadline.afterMilliseconds(30_000);
-    var result = try process.runCommand(context.allocator, context.io, .{
-        .executable = executable,
-        .argv = &.{ python, "-c", "import sysconfig; print(sysconfig.get_path('stdlib'))" },
-        .environment = &env,
-        .cwd = cwd,
-        .primary_deadline = deadline,
-        .cleanup_deadline = .{ .expires_ns = try std.math.add(u64, deadline.expires_ns, 10 * std.time.ns_per_s) },
-        .cancel = context.signal.flag(),
-        .snapshot_executable = false,
-        .limits = .{ .stdout_bytes = 4096, .stderr_bytes = 4096 },
-    });
-    defer result.deinit(context.allocator);
-    if (!result.succeeded() or result.stderr.len != 0 or
-        result.stdout.len < 2 or result.stdout[result.stdout.len - 1] != '\n')
-        return error.InvalidPythonStdlib;
-    return context.allocator.dupe(u8, result.stdout[0 .. result.stdout.len - 1]);
+    return inputs.pythonStdlib(
+        context.allocator,
+        context.io,
+        context.repository,
+        context.tools[1],
+        context.signal.flag(),
+    );
 }
 
 pub fn buildAdapter(state: BootstrapInputsBound) !AdapterBuilt {
@@ -826,10 +807,14 @@ pub fn loadAccepted(context: *Context) !void {
     if (!std.mem.eql(u8, own, try std.process.executablePathAlloc(io, a)))
         return error.UnboundController;
     context.roots = .{
-        .runtime = context.runtime, .source_root = context.repository, .work = context.compute,
-        .zig = context.tools[9], .producer = try subpath(context, "tools/bin/uk-wamr-aot-build"),
+        .runtime = context.runtime,
+        .source_root = context.repository,
+        .work = context.compute,
+        .zig = context.tools[9],
+        .producer = try subpath(context, "tools/bin/uk-wamr-aot-build"),
         .fixture_runner = try subpath(context, "tools/bin/wamr-native-ci-fixtures"),
-        .supervisor = own, .package_tool = try subpath(context, "tools/bin/wamr-ci-package"),
+        .supervisor = own,
+        .package_tool = try subpath(context, "tools/bin/wamr-ci-package"),
         .validator = try subpath(context, "tools/bin/uk-wamr-log-validate"),
         .supervisor_fixture = try subpath(context, "tools/bin/wamr-ci-supervisor-fixture"),
         .tools = context.tools,
@@ -838,7 +823,8 @@ pub fn loadAccepted(context: *Context) !void {
     context.source = try custody.source(a, io, context.repository, context.git);
     context.dependency = try dependencies.capture(a, io, context.repository, context.git, context.compute);
     context.consumer = try inputs.captureProduction(a, io, .{
-        .runtime = context.runtime, .tools = context.tools,
+        .runtime = context.runtime,
+        .tools = context.tools,
         .python_stdlib = try pythonStdlib(context),
     });
     const reproduced = try typedValue(a, try buildStart(context));

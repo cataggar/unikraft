@@ -279,14 +279,6 @@ jobs:
               raise SystemExit("Python handoff refused completed Python records")
           PY
 
-      - name: Recapture the local checkout and consumers before loader cleanup
-        timeout-minutes: 20
-        run: |
-          set -euo pipefail
-          controller="${WAMR_CI_CONTROLLER:?}"
-          root=/d/wamr-ci/wamr-native-runtime
-          "${controller}" local-consumer-custody --runtime "${root}"
-
       - name: Retain the expressly authorized public-source tiny image bundle
         id: public_bundle
         timeout-minutes: 15

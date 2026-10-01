@@ -124,6 +124,40 @@ pub const ProductionPaths = struct {
     python_stdlib: []const u8,
 };
 
+pub fn pythonStdlib(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repository: []const u8,
+    python: []const u8,
+    cancel: ?*const std.atomic.Value(bool),
+) ![]const u8 {
+    try process.initialize();
+    var executable = try process.Executable.open(io, python);
+    defer executable.close(io);
+    const cwd = try files.openDirectory(io, repository, .artifact);
+    defer cwd.close(io);
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("PYTHONDONTWRITEBYTECODE", "1");
+    const deadline = try process.Deadline.afterMilliseconds(30_000);
+    var result = try process.runCommand(allocator, io, .{
+        .executable = executable,
+        .argv = &.{ python, "-c", "import sysconfig; print(sysconfig.get_path('stdlib'))" },
+        .environment = &env,
+        .cwd = cwd,
+        .primary_deadline = deadline,
+        .cleanup_deadline = .{ .expires_ns = try std.math.add(u64, deadline.expires_ns, 10 * std.time.ns_per_s) },
+        .cancel = cancel,
+        .snapshot_executable = false,
+        .limits = .{ .stdout_bytes = 4096, .stderr_bytes = 4096 },
+    });
+    defer result.deinit(allocator);
+    if (!result.succeeded() or result.stderr.len != 0 or
+        result.stdout.len < 2 or result.stdout[result.stdout.len - 1] != '\n')
+        return error.InvalidPythonStdlib;
+    return allocator.dupe(u8, result.stdout[0 .. result.stdout.len - 1]);
+}
+
 pub const Production = struct {
     custody: Custody,
     file_bindings: []Binding,
@@ -798,20 +832,30 @@ fn compareCaptured(expected: Custody, current: Custody) !void {
 
 test "captured production inputs compare every pinned field without recapture" {
     var files_before = [_]FileRecord{.{
-        .role = "tool:zig", .path = "/runtime/zig",
-        .metadata = [_]i128{0} ** 9, .sha256 = [_]u8{'a'} ** 64,
+        .role = "tool:zig",
+        .path = "/runtime/zig",
+        .metadata = [_]i128{0} ** 9,
+        .sha256 = [_]u8{'a'} ** 64,
     }};
     var trees_before = [_]TreeRecord{.{
-        .role = "zig", .path = "/runtime", .files = 1, .directories = 1,
-        .symlinks = 0, .bytes = 1, .content_sha256 = [_]u8{'b'} ** 64,
+        .role = "zig",
+        .path = "/runtime",
+        .files = 1,
+        .directories = 1,
+        .symlinks = 0,
+        .bytes = 1,
+        .content_sha256 = [_]u8{'b'} ** 64,
         .physical_sha256 = [_]u8{'c'} ** 64,
     }};
     var directories_before = [_]DirectoryRecord{.{
-        .path = "/runtime", .metadata = [_]i128{0} ** 9,
+        .path = "/runtime",
+        .metadata = [_]i128{0} ** 9,
     }};
     const expected: Custody = .{
-        .files = &files_before, .trees = &trees_before,
-        .directories = &directories_before, .aggregate_sha256 = [_]u8{'d'} ** 64,
+        .files = &files_before,
+        .trees = &trees_before,
+        .directories = &directories_before,
+        .aggregate_sha256 = [_]u8{'d'} ** 64,
     };
     var files_after = files_before;
     var trees_after = trees_before;
