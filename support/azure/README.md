@@ -1187,9 +1187,13 @@ not already hold this run's records or claims. A replay-registry claim then
 consumes the approval once.
 
 Every `az` call is pinned with `--subscription`; the journal records argv
-without it. After `not_after_utc`, the runner refuses further calls.
+without that flag, but ARM IDs in arguments still contain the subscription, so
+the journal stays private. After `not_after_utc`, the runner refuses further
+calls except write-access revocation.
 `az group exists` must report `false` before `group create`, so an existing
-group is never adopted. A failed upload still revokes write access. The VHD
+group is never adopted. Each grant runs inside a block that always attempts
+`disk revoke-access`, even after a failed or lost grant response or a failed
+upload. The VHD
 upload checks the local file's digest and size before sending any bytes. If
 the journaled dummy VM runtime exceeds the approved budget, the run refuses
 the OS swap. The tool then signs and verifies the records; the handoff
@@ -1203,8 +1207,12 @@ cleanup first probes `group exists`. It deletes the group only if:
 - every listed resource is inside the group and tagged with this run and
   operation.
 
-It deallocates an undeallocated VM best-effort, then requires
-`group exists` to report `false`. The run passes only if verification
+It deallocates an undeallocated VM best-effort and retries `disk
+revoke-access` on every listed owned disk without a journaled revoke (an
+active SAS blocks deletion). It then requires `group exists` to report
+`false`. A `KeyboardInterrupt`, or a SIGTERM/SIGHUP received by the CLI, is
+reported as a failure after cleanup instead of skipping it; SIGKILL or host
+loss still requires checking the subscription by hand. The run passes only if verification
 passed **and** the group was deleted. Output is PASS/FAIL with a sanitized
 reason and the cleanup status. If self-held **TEST-ONLY** keys are used,
 they are not independent custody.

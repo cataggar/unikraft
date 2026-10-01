@@ -9,10 +9,12 @@ import importlib
 import io
 import json
 import os
+import signal
 from pathlib import Path
 import stat
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -34,6 +36,7 @@ class FakeAzure:
         self.fixture = fixture
         self.created = set()
         self.revoked = set()
+        self.active_sas = set()
         self.deployed = False
         self.deallocated = False
         self.swapped = False
@@ -82,6 +85,8 @@ class FakeAzure:
         if args[:2] == ["group", "show"]:
             return self.response(self.group())
         if args[:2] == ["group", "delete"]:
+            if self.active_sas:
+                raise RuntimeError("Call EndGetAccess before deleting the disk")
             self.group_present = False
             return self.response(None)
         if args[:2] == ["disk", "create"]:
@@ -89,9 +94,11 @@ class FakeAzure:
             self.created.add(role)
             return self.response(self.disk(role, original=True))
         if args[:2] == ["disk", "grant-access"]:
+            self.active_sas.add(self.disk_role(args))
             return self.response({"accessSAS": SAS})
         if args[:2] == ["disk", "revoke-access"]:
             self.revoked.add(self.disk_role(args))
+            self.active_sas.discard(self.disk_role(args))
             return self.response(None)
         if args[:2] == ["disk", "show"]:
             return self.response(self.disk(self.disk_role(args)))
@@ -1034,6 +1041,76 @@ class LiveGateTests(unittest.TestCase):
         self.assertIn("data0", self.fake.revoked)
         self.assertNotIn("cleanup.deallocate", journal.by_step)
         self.assert_deleted(result)
+
+    def test_window_closing_during_upload_still_revokes(self):
+        self.prepare()
+
+        def upload(role, path, sas, digest, size):
+            if role == "os":
+                self.clock += timedelta(hours=5)
+            return {"sha256": digest, "size": size}
+
+        result = self.run_live(upload=upload)
+        self.assertFalse(result.passed)
+        self.assertIn("window has closed", result.reason)
+        self.assertIn("disk.os.revoke", self.journal().by_step)
+        self.assertEqual(self.fake.active_sas, set())
+        self.assert_deleted(result)
+
+    def test_lost_grant_response_is_revoked_before_delete(self):
+        self.prepare()
+
+        def lose_grant(args):
+            if args[:2] == ["disk", "grant-access"]:
+                self.fake.after = None
+                raise RuntimeError("grant-access timed out")
+
+        self.fake.after = lose_grant
+        result = self.run_live()
+        self.assertFalse(result.passed)
+        journal = self.journal()
+        self.assertNotIn("disk.dummy.grant", journal.by_step)
+        self.assertIn("disk.dummy.revoke", journal.by_step)
+        self.assertEqual(self.fake.active_sas, set())
+        self.assert_deleted(result)
+
+    def test_cleanup_revokes_disks_lacking_a_journaled_revoke(self):
+        self.prepare()
+        self.fake.fail_once[("disk", "revoke-access")] = RuntimeError("revoke failed")
+
+        def upload(role, path, sas, digest, size):
+            raise RuntimeError("upload failed")
+
+        result = self.run_live(upload=upload)
+        self.assertFalse(result.passed)
+        journal = self.journal()
+        self.assertNotIn("disk.dummy.revoke", journal.by_step)
+        self.assertIn("cleanup.revoke.dummy", journal.by_step)
+        self.assertNotIn("cleanup.revoke.os", journal.by_step)
+        self.assertEqual(self.fake.active_sas, set())
+        self.assert_deleted(result)
+
+    def test_interrupt_is_reported_after_owned_cleanup(self):
+        self.prepare()
+
+        def upload(role, path, sas, digest, size):
+            if role == "data0":
+                raise KeyboardInterrupt
+            return {"sha256": digest, "size": size}
+
+        result = self.run_live(upload=upload)
+        self.assertFalse(result.passed)
+        self.assertIn("Interrupted (KeyboardInterrupt)", result.reason)
+        self.assertIn("disk.data0.revoke", self.journal().by_step)
+        self.assert_deleted(result)
+
+    def test_termination_signals_raise_keyboard_interrupt(self):
+        previous = signal.getsignal(signal.SIGTERM)
+        with self.assertRaises(KeyboardInterrupt):
+            with custodian._interrupt_on_termination():
+                os.kill(os.getpid(), signal.SIGTERM)
+                time.sleep(1)
+        self.assertIs(signal.getsignal(signal.SIGTERM), previous)
 
     def test_runtime_over_budget_refuses_swap_and_cleans_up(self):
         self.prepare(self.body(max_vm_running_seconds=30))

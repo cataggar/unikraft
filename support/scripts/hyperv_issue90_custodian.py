@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import stat
 import subprocess
 import sys
@@ -240,18 +241,22 @@ class Journal:
 
 
 class CustodianRecorder:
-    def __init__(self, directory, runner=None, clock=None):
+    def __init__(self, directory, runner=None, clock=None, revoke_runner=None):
         self.directory = _ensure_private_dir(directory)
         self.archive = ArchiveStore(self.directory / "archive")
         self.journal_path = self.directory / "journal.jsonl"
         self.runner = runner or default_az_runner
+        self.revoke_runner = revoke_runner or self.runner
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.sequence = len(_read_journal(self.journal_path))
 
     def az(self, step, argv, *, timeout=120):
         _check_step(step)
+        # Write-access revocation must still reach Azure after the window.
+        runner = (self.revoke_runner if list(argv[:2]) == ["disk", "revoke-access"]
+                  else self.runner)
         started = _precise_timestamp(self.clock())
-        result = self.runner(list(argv), timeout=timeout)
+        result = runner(list(argv), timeout=timeout)
         completed = _precise_timestamp(self.clock())
         raw, value = _stdout_and_value(result, step)
         redacted = argv[:2] == ["disk", "grant-access"]
@@ -773,6 +778,18 @@ def cleanup_disposable(recorder, plan):
         raise CleanupRefused(
             "Cleanup group contains foreign or untagged resources; deletion refused"
         )
+    listed_ids = {item["id"].lower() for item in listed}
+    for role in DISKS:
+        if (f"disk.{role}.revoke" in journal.by_step
+                or plan.expected.resource_ids[role].lower() not in listed_ids):
+            continue
+        try:
+            recorder.az(f"cleanup.revoke.{role}", [
+                "disk", "revoke-access", "--resource-group", group,
+                "--name", plan.resource_name(role),
+            ], timeout=180)
+        except Exception:
+            pass  # An active SAS makes the group delete below fail closed.
     recorder.az("cleanup.delete", [
         "group", "delete", "--name", group, "--yes",
     ], timeout=1800)
@@ -876,6 +893,9 @@ def _run_live_session(body, *, expected, plan, subscription, directory,
             subscription, deadline=not_after, clock=clock, runner=runner,
         ),
         clock=clock,
+        revoke_runner=SubscriptionRunner(
+            subscription, clock=clock, runner=cleanup_runner or runner,
+        ),
     )
     private = list(_live_private_values(subscription, expected, plan))
 
@@ -911,8 +931,11 @@ def _run_live_session(body, *, expected, plan, subscription, directory,
             digest = verification.digest
         else:
             reason = verification.reason
-    except Exception as error:
-        reason = sanitize_reason(error, private)
+    except BaseException as error:
+        # Interrupts are reported, not re-raised, so the cleanup status is kept.
+        reason = (sanitize_reason(error, private) or type(error).__name__)
+        if not isinstance(error, Exception):
+            reason = f"Interrupted ({type(error).__name__}): {reason}"
     finally:
         cleanup, cleanup_reason = _live_cleanup(
             directory, plan,
@@ -1055,16 +1078,16 @@ def record_preprovision(recorder, plan, *, upload=None):
         disk_uuids[role] = custody._identity(created, role)
         if disk_uuids[role] is None:
             raise ValueError(f"{role} create response lacks an immutable disk UUID")
-        grant = recorder.az(f"disk.{role}.grant", [
-            "disk", "grant-access", "--resource-group", group,
-            "--name", plan.resource_name(role), "--access-level", "Write",
-            "--duration-in-seconds", "1800",
-        ]).value
         revoke = [
             "disk", "revoke-access", "--resource-group", group,
             "--name", plan.resource_name(role),
         ]
         try:
+            grant = recorder.az(f"disk.{role}.grant", [
+                "disk", "grant-access", "--resource-group", group,
+                "--name", plan.resource_name(role), "--access-level", "Write",
+                "--duration-in-seconds", "1800",
+            ]).value
             sas = _grant_sas(grant)
             uploaded_sha, uploaded_size = _upload_result(
                 upload(role, plan.image_path(role), sas,
@@ -1073,7 +1096,10 @@ def record_preprovision(recorder, plan, *, upload=None):
             if uploaded_sha != plan.image_sha256(role) or uploaded_size != size:
                 raise ValueError(f"{role} uploaded bytes differ from reviewed input")
         except BaseException:
-            recorder.az(f"disk.{role}.revoke", revoke, timeout=180)
+            try:
+                recorder.az(f"disk.{role}.revoke", revoke, timeout=180)
+            except Exception:
+                pass  # Cleanup revokes every owned disk again before deletion.
             raise
         recorder.synthetic(f"disk.{role}.upload", {
             "id": plan.expected.resource_ids[role],
@@ -1411,15 +1437,16 @@ def _main_live(args):
         plan = plan_from_mapping(azure.load_strict_json(
             args.plan_json, custody.MAX_RECORD, "Custodian plan",
         )[0], expected)
-        result = run_live(
-            args.approval,
-            approver_public_key=args.approver_public_key,
-            custodian_private_key=args.custodian_private_key,
-            custodian_public_key=args.custodian_public_key,
-            expected=expected, plan=plan, subscription=subscription,
-            directory=args.directory, records_dir=args.records_dir,
-            registry_dir=args.registry_dir,
-        )
+        with _interrupt_on_termination():
+            result = run_live(
+                args.approval,
+                approver_public_key=args.approver_public_key,
+                custodian_private_key=args.custodian_private_key,
+                custodian_public_key=args.custodian_public_key,
+                expected=expected, plan=plan, subscription=subscription,
+                directory=args.directory, records_dir=args.records_dir,
+                registry_dir=args.registry_dir,
+            )
     except Exception as error:
         print("FAIL " + sanitize_reason(error, private) + " cleanup=not-started")
         return 1
@@ -1432,6 +1459,28 @@ def _main_live(args):
         message += " (" + sanitize_reason(result.cleanup_reason, private) + ")"
     print(message)
     return 1
+
+
+class _interrupt_on_termination:
+    """Turn SIGTERM/SIGHUP into KeyboardInterrupt so owned cleanup runs."""
+
+    SIGNALS = tuple(getattr(signal, name) for name in ("SIGTERM", "SIGHUP")
+                    if hasattr(signal, name))
+
+    def __enter__(self):
+        self.previous = {
+            number: signal.signal(number, self._raise) for number in self.SIGNALS
+        }
+        return self
+
+    def __exit__(self, *_exc):
+        for number, handler in self.previous.items():
+            signal.signal(number, handler)
+        return False
+
+    @staticmethod
+    def _raise(number, _frame):
+        raise KeyboardInterrupt(f"signal {number}")
 
 
 def _load_private_json(path, label):
