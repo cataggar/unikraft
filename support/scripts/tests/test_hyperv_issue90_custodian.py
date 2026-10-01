@@ -40,6 +40,8 @@ class FakeAzure:
         self.deployed = False
         self.deallocated = False
         self.swapped = False
+        self.vm_states = []
+        self.swap_states = []
         self.inventory_tamper = None
         self.cleanup_tamper = None
         self.preexisting = False
@@ -114,14 +116,17 @@ class FakeAzure:
             self.deallocated = True
             return self.response(None)
         if action == ("vm", "get-instance-view", "--resource-group"):
-            return self.response(self.fixture.instance_view())
+            return self.response(self.vm_state(self.fixture.instance_view()))
         if args[:2] == ["vm", "update"]:
             self.swapped = True
+            self.vm_states.extend(self.swap_states)
             return self.response(self.fixture.vm("os", deallocated=False))
         if args[:2] == ["vm", "show"]:
             details = "-d" in args
             os_role = "os" if self.swapped else "dummy"
-            return self.response(self.fixture.vm(os_role, deallocated=details))
+            return self.response(self.vm_state(
+                self.fixture.vm(os_role, deallocated=details),
+            ))
         if action == ("network", "nic", "show"):
             return self.response(self.fixture.resource("nic"))
         if action == ("network", "vnet", "show"):
@@ -129,6 +134,12 @@ class FakeAzure:
         if action == ("network", "nsg", "show"):
             return self.response(self.fixture.resource("nsg"))
         raise AssertionError(f"unexpected fake az call: {args}")
+
+    def vm_state(self, value):
+        # Models Azure briefly reporting a transient state after a write.
+        if self.vm_states:
+            value["provisioningState"] = self.vm_states.pop(0)
+        return value
 
     @staticmethod
     def response(value, raw=None):
@@ -252,12 +263,17 @@ class CustodianToolTests(unittest.TestCase):
         values.update(changes)
         return custodian.CustodianPlan(**values)
 
-    def build(self, *, handoff=True, inventory_tamper=None, upload=None, plan=None):
+    def build(self, *, handoff=True, inventory_tamper=None, upload=None, plan=None,
+              configure=None):
         keys = custodian.generate_test_keys(self.root / "keys")
         fake = FakeAzure(self.fixture)
         fake.inventory_tamper = inventory_tamper
+        if configure is not None:
+            configure(fake)
+        self.sleeps = []
         recorder = custodian.CustodianRecorder(
             self.root / "custodian", runner=fake, clock=self.tick,
+            sleep=self.sleeps.append,
         )
         plan = plan or self.plan()
         uploads = []
@@ -335,6 +351,60 @@ class CustodianToolTests(unittest.TestCase):
         result = verify(unpinned, "unpinned")
         self.assertFalse(result.passed)
         self.assertIn("unpinned managed identity", result.reason)
+
+    def test_transient_vm_state_after_swap_is_polled_until_settled(self):
+        def configure(fake):
+            fake.swap_states = ["Updating", "Updating"]
+
+        keys, _fake, _uploads, assembler = self.build(configure=configure)
+        journal = assembler.journal.by_step
+        self.assertEqual(self.sleeps, [custodian.SETTLE_INTERVAL_SECONDS] * 2)
+        for attempt in (1, 2):
+            pending = journal[f"vm.swap-settlement.unsettled-{attempt}"]
+            self.assertEqual(
+                custodian.custody._state(
+                    json.loads(assembler.archive[pending["ref"]["sha256"]])
+                ), "Updating",
+            )
+            self.assertLess(pending["sequence"], journal["vm.swap-settlement"]["sequence"])
+        self.assertNotIn("vm.swap-settlement.unsettled-3", journal)
+        prepared, handoff = self.write_records(
+            assembler, keys["custodian"]["private_key"],
+        )
+        result = custodian.verify_handoff(
+            prepared, handoff, expected=self.fixture.expected,
+            public_key=keys["custodian"]["public_key"],
+            archive_dir=self.root / "custodian/archive",
+            registry_dir=self.registry("registry"),
+            now=datetime(2026, 9, 29, 4, 2, tzinfo=timezone.utc),
+        )
+        self.assertTrue(result.passed, result.reason)
+
+    def test_unsettled_vm_reads_fail_closed(self):
+        cases = (
+            (["Failed"], "vm.dummy.unsettled-1", 0),
+            (["Updating"] * custodian.SETTLE_ATTEMPTS,
+             f"vm.dummy.unsettled-{custodian.SETTLE_ATTEMPTS}",
+             custodian.SETTLE_ATTEMPTS - 1),
+        )
+        for index, (states, last, sleeps) in enumerate(cases):
+            with self.subTest(states=states[0]):
+                self.root = self.root / f"case-{index}"
+                self.root.mkdir()
+
+                def configure(fake, states=states):
+                    fake.after = lambda args: (
+                        args[:2] == ["vm", "deallocate"]
+                        and fake.vm_states.extend(states)
+                    )
+
+                with self.assertRaisesRegex(ValueError, "vm.dummy"):
+                    self.build(configure=configure)
+                journal = custodian.Journal(self.root / "custodian/journal.jsonl")
+                self.assertIn(last, journal.by_step)
+                self.assertNotIn("vm.dummy", journal.by_step)
+                self.assertNotIn("vm.deallocation", journal.by_step)
+                self.assertEqual(len(self.sleeps), sleeps)
 
     def test_original_stdout_bytes_are_archived_verbatim(self):
         raw = b'{ "z" : 2,\n  "a" : 1 }\n'
@@ -840,6 +910,20 @@ class LiveGateTests(unittest.TestCase):
                           records_dir=self.root / "second-records")
         self.assertEqual(len(self.fake.raw_calls), calls)
         self.assertFalse((self.root / "second").exists())
+
+    def test_dry_run_waits_for_vm_to_settle_after_swap(self):
+        # Regression: the first live dry run read "Updating" right after a
+        # swap that itself returned Succeeded, and the handoff check failed.
+        self.prepare()
+        self.fake.swap_states = ["Updating"]
+        with mock.patch.object(custodian.time, "sleep") as sleep:
+            result = self.run_live()
+        self.assertTrue(result.passed, result.reason)
+        self.assert_deleted(result)
+        sleep.assert_called_once_with(custodian.SETTLE_INTERVAL_SECONDS)
+        journal = self.journal().by_step
+        self.assertIn("vm.swap-settlement.unsettled-1", journal)
+        self.assertNotIn("vm.final.unsettled-1", journal)
 
     def test_live_approval_is_single_use(self):
         self.prepare()

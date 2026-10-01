@@ -20,6 +20,7 @@ import signal
 import stat
 import subprocess
 import sys
+import time
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
@@ -60,6 +61,9 @@ LIVE_APPROVAL_FIELDS = (
 LIVE_APPROVAL_LIMIT = 4096
 LIVE_WINDOW = timedelta(minutes=300)
 HANDOFF_LIFETIME = timedelta(minutes=30)
+SETTLE_ATTEMPTS = 30
+SETTLE_INTERVAL_SECONDS = 10
+SETTLING_STATES = frozenset(("Creating", "Updating", "Migrating"))
 PLAN_FIELDS = (
     "reviewed_head", "config_sha256", "efi_sha256", "raw_sha256", "miz_sha256",
     "image_paths",
@@ -241,17 +245,43 @@ class Journal:
 
 
 class CustodianRecorder:
-    def __init__(self, directory, runner=None, clock=None, revoke_runner=None):
+    def __init__(self, directory, runner=None, clock=None, revoke_runner=None,
+                 sleep=None):
         self.directory = _ensure_private_dir(directory)
         self.archive = ArchiveStore(self.directory / "archive")
         self.journal_path = self.directory / "journal.jsonl"
         self.runner = runner or default_az_runner
         self.revoke_runner = revoke_runner or self.runner
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.sleep = sleep or time.sleep
         self.sequence = len(_read_journal(self.journal_path))
 
     def az(self, step, argv, *, timeout=120):
         _check_step(step)
+        return self._store_call(step, argv, self._call(step, argv, timeout))
+
+    def az_settled(self, step, argv, *, timeout=120):
+        """Poll a read until its provisioningState is Succeeded.
+
+        Azure can report a transient state just after a write returned
+        Succeeded. Each unsettled read is journaled as its own attempt step;
+        only the settled read is recorded under ``step``.
+        """
+        _check_step(step)
+        for attempt in range(1, SETTLE_ATTEMPTS + 1):
+            call = self._call(step, argv, timeout)
+            value = call[1]
+            state = custody._state(value) if isinstance(value, dict) else None
+            if state == "Succeeded":
+                return self._store_call(step, argv, call)
+            self._store_call(f"{step}.unsettled-{attempt}", argv, call)
+            if state not in SETTLING_STATES:
+                raise ValueError(f"{step} reached a non-settling provisioning state")
+            if attempt < SETTLE_ATTEMPTS:
+                self.sleep(SETTLE_INTERVAL_SECONDS)
+        raise ValueError(f"{step} did not settle within the polling budget")
+
+    def _call(self, step, argv, timeout):
         # Write-access revocation must still reach Azure after the window.
         runner = (self.revoke_runner if list(argv[:2]) == ["disk", "revoke-access"]
                   else self.runner)
@@ -259,6 +289,11 @@ class CustodianRecorder:
         result = runner(list(argv), timeout=timeout)
         completed = _precise_timestamp(self.clock())
         raw, value = _stdout_and_value(result, step)
+        return raw, value, started, completed
+
+    def _store_call(self, step, argv, call):
+        _check_step(step)
+        raw, value, started, completed = call
         redacted = argv[:2] == ["disk", "grant-access"]
         stored = azure.canonical_json({
             "redacted": "grant-access stdout omitted",
@@ -1135,11 +1170,11 @@ def record_preprovision(recorder, plan, *, upload=None):
         "vm", "deallocate", "--resource-group", group,
         "--name", plan.resource_name("vm"),
     ], timeout=900)
-    recorder.az("vm.dummy", [
+    recorder.az_settled("vm.dummy", [
         "vm", "show", "-d", "--resource-group", group,
         "--name", plan.resource_name("vm"),
     ])
-    recorder.az("vm.deallocation", [
+    recorder.az_settled("vm.deallocation", [
         "vm", "get-instance-view", "--resource-group", group,
         "--name", plan.resource_name("vm"),
     ])
@@ -1159,11 +1194,11 @@ def record_handoff(recorder, plan, phase):
         "--name", plan.resource_name("vm"), "--os-disk",
         plan.expected.resource_ids["os"],
     ], timeout=900)
-    recorder.az("vm.swap-settlement", [
+    recorder.az_settled("vm.swap-settlement", [
         "vm", "show", "-d", "--resource-group", group,
         "--name", plan.resource_name("vm"),
     ])
-    recorder.az("vm.final", [
+    recorder.az_settled("vm.final", [
         "vm", "show", "-d", "--resource-group", group,
         "--name", plan.resource_name("vm"),
     ])
@@ -1535,7 +1570,7 @@ def _aware(value, label):
 
 def _record_children(recorder, plan, *, prefix):
     group = plan.group_name()
-    recorder.az(f"{prefix}.vm", [
+    recorder.az_settled(f"{prefix}.vm", [
         "vm", "show", "--resource-group", group,
         "--name", plan.resource_name("vm"),
     ])
