@@ -9,6 +9,7 @@ const native_export = handoff.export_state;
 const profile = handoff.profile;
 const retained_copy = handoff.retained_copy;
 const zip = handoff.zip;
+const test_options = @import("test_options");
 
 const golden = @embedFile("goldens/contracts-profile-layout.json");
 const zip_multi_golden = @embedFile("goldens/zip-stored-multi.zip");
@@ -1137,21 +1138,22 @@ const CopyFixture = struct {
     fn init(label: []const u8) !CopyFixture {
         const a = std.testing.allocator;
         const io = std.testing.io;
-        var cwd = std.Io.Dir.cwd();
-        try cwd.createDirPath(io, ".zig-cache/handoff-export-tests");
-        var parent = try cwd.openDir(io, ".zig-cache/handoff-export-tests", .{ .iterate = true });
+        var fixture_root = try std.Io.Dir.openDirAbsolute(io, test_options.fixture_root, .{ .iterate = true });
+        defer fixture_root.close(io);
+        try fixture_root.createDirPath(io, "handoff-export-tests");
+        var parent = try fixture_root.openDir(io, "handoff-export-tests", .{ .iterate = true });
         defer parent.close(io);
         copy_fixture_counter += 1;
         const leaf = try std.fmt.allocPrint(a, "{s}-{d}-{d}", .{ label, std.os.linux.getpid(), copy_fixture_counter });
         defer a.free(leaf);
         try parent.createDir(io, leaf, .fromMode(0o700));
-        const rel_path = try std.fs.path.join(a, &.{ ".zig-cache/handoff-export-tests", leaf });
+        const rel_path = try std.fs.path.join(a, &.{ test_options.fixture_root, "handoff-export-tests", leaf });
         var root = try parent.openDir(io, leaf, .{ .iterate = true });
         defer root.close(io);
         try root.createDir(io, "source", .fromMode(0o700));
         try root.createDir(io, "output", .fromMode(0o700));
         const source_dir = try root.openDir(io, "source", .{ .iterate = true });
-        const root_path = try cwd.realPathFileAlloc(io, rel_path, a);
+        const root_path = try std.Io.Dir.cwd().realPathFileAlloc(io, rel_path, a);
         defer a.free(root_path);
         const source_path = try std.fs.path.join(a, &.{ root_path, "source/input.bin" });
         const second_source_path = try std.fs.path.join(a, &.{ root_path, "source/second.bin" });

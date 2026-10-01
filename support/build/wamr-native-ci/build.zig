@@ -345,8 +345,15 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    const handoff_fixture_root = std.fs.path.resolve(b.allocator, &.{
+        b.graph.cache.cwd, b.cache_root.path orelse ".",
+    }) catch @panic("cannot resolve private handoff test root");
+    const handoff_options = b.addOptions();
+    handoff_options.addOption([]const u8, "fixture_root", handoff_fixture_root);
+    handoff_contracts.root_module.addOptions("test_options", handoff_options);
     const handoff_contracts_run = b.addRunArtifact(handoff_contracts);
     const handoff_python_goldens = b.addSystemCommand(&.{ "python3", "-B" });
+    handoff_python_goldens.setEnvironmentVariable("WAMR_HANDOFF_GOLDEN_ROOT", handoff_fixture_root);
     handoff_python_goldens.addFileArg(b.path("tests/test_handoff_contract_goldens.py"));
     const handoff_step = b.step("test-handoff-contracts", "Run native/Python handoff contract goldens");
     handoff_step.dependOn(&handoff_contracts_run.step);

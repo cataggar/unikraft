@@ -42,7 +42,8 @@ def artifact(path, size=1):
 
 
 def scratch_parent():
-    path = ROOT / ".zig-cache/handoff-python-goldens"
+    root = os.environ.get("WAMR_HANDOFF_GOLDEN_ROOT") or os.environ.get("ZIG_LOCAL_CACHE_DIR")
+    path = (Path(root) if root else ROOT / ".zig-cache") / "handoff-python-goldens"
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(path, 0o700)
     return path
