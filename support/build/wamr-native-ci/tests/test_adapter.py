@@ -280,6 +280,28 @@ class NativeRecordBridge(unittest.TestCase):
                 bridge.public_validator_build(runtime, output), output)
         command.assert_called_once()
 
+    def test_local_handoff_revalidation_refusal_has_no_python_fallback(self):
+        bridge = public_bundle.accepted_records
+        root, unused_controller = self.controller_fixture("")
+        del unused_controller
+        runtime = root / "runtime"
+        runtime.mkdir(mode=0o700)
+        output = root / "revalidation"
+        with mock.patch.object(
+                bridge, "_controller_command",
+                side_effect=ValueError(
+                    "native local handoff revalidation refused")) as command, \
+                mock.patch.object(ci, "execute") as python:
+            with self.assertRaisesRegex(ValueError, "revalidation refused"):
+                bridge.local_handoff_revalidation(runtime, output)
+        command.assert_called_once_with(
+            ("local-handoff-revalidation", "--runtime", str(runtime),
+             "--output", str(output)),
+            "native local handoff revalidation refused",
+            timeout_seconds=900)
+        python.assert_not_called()
+        self.assertFalse(output.exists())
+
     def test_oversized_native_stdout_and_stderr_are_killed_and_reaped(self):
         bridge = public_bundle.accepted_records
         for descriptor in (1, 2):
@@ -827,6 +849,112 @@ class NativeRecordBridge(unittest.TestCase):
         execute.assert_not_called()
         self.assertFalse(output.exists())
 
+    def test_v2_export_requires_recorded_supervisor_before_custody(self):
+        handoff = self.handoff_module()
+        root, unused_controller = self.controller_fixture("")
+        del unused_controller
+        runtime = root / "runtime"
+        runtime.mkdir(mode=0o700)
+        evidence = runtime / "compute/evidence"
+        evidence.mkdir(mode=0o700, parents=True)
+        start = {
+            "command_supervisor": {},
+            "consumer_inputs": {"files": {
+                "tool:" + name: {"path": "/recorded/" + name}
+                for name in handoff.ci.HOST_TOOLS
+            }},
+        }
+        handoff.ci.save(evidence / "result.json", {"schema_version": 2})
+        handoff.ci.save(evidence / "build-start.json", start)
+        phases = []
+        with mock.patch.object(
+                handoff, "_selected_records", return_value=(None, {})), \
+                mock.patch.object(handoff.ci, "producer_inputs") as custody, \
+                mock.patch.object(
+                    handoff.accepted_records, "handoff_inspect") as native, \
+                mock.patch.dict(
+                    handoff.ci.COMMAND_TOOL_PATHS, {}, clear=True), \
+                mock.patch.dict(
+                    handoff.ci.COMMAND_ENVIRONMENT, {}, clear=True), \
+                self.assertRaisesRegex(
+                    handoff.ci.Refusal, "missing command supervisor input"):
+            handoff.export(runtime, root / "handoff", on_phase=phases.append)
+        self.assertEqual(phases, ["records"])
+        custody.assert_not_called()
+        native.assert_not_called()
+        self.assertFalse((root / "handoff").exists())
+
+    def test_native_export_refuses_legacy_supervision_without_fallback(self):
+        handoff = self.handoff_module()
+        root, unused_controller = self.controller_fixture("")
+        del unused_controller
+        runtime = root / "runtime"
+        runtime.mkdir(mode=0o700)
+        self.native_start(handoff, runtime)
+        handoff.ci.save(
+            runtime / "compute/evidence/result.json", {"schema_version": 2})
+        accepted = {"modes": list(handoff.ci.SIX_MODES)}
+        with mock.patch.object(
+                handoff, "_selected_records", return_value=(accepted, {})), \
+                mock.patch.object(handoff.ci, "bind_command_tools") as bind, \
+                mock.patch.object(
+                    handoff.ci, "bind_command_supervisor") as legacy_bind, \
+                mock.patch.object(handoff.ci, "producer_inputs") as custody, \
+                mock.patch.object(
+                    handoff.accepted_records, "handoff_inspect") as native, \
+                self.assertRaisesRegex(
+                    handoff.ci.Refusal, "native command supervision required"):
+            handoff.export(runtime, root / "handoff")
+        bind.assert_not_called()
+        legacy_bind.assert_not_called()
+        custody.assert_not_called()
+        native.assert_not_called()
+        self.assertFalse((root / "handoff").exists())
+
+    def test_native_export_inspection_refusal_never_replays_python(self):
+        handoff = self.handoff_module()
+        root, unused_controller = self.controller_fixture("")
+        del unused_controller
+        runtime = root / "runtime"
+        runtime.mkdir(mode=0o700)
+        self.native_start(handoff, runtime)
+        evidence = runtime / "compute/evidence"
+        start = handoff.ci.document(evidence / "build-start.json")
+        start["command_supervisor"] = {}
+        start["consumer_inputs"]["files"].update({
+            "tool:" + name: {"path": "/recorded/" + name}
+            for name in handoff.ci.HOST_TOOLS
+        })
+        source = {"revision": "1" * 40, "tree": "2" * 40}
+        (evidence / "build-start.json").unlink()
+        handoff.ci.save(evidence / "build-start.json", start)
+        handoff.ci.save(evidence / "build.json", {"source": source})
+        handoff.ci.save(evidence / "result.json", {"schema_version": 2})
+        accepted = {"modes": list(handoff.ci.SIX_MODES), "source": source}
+        with mock.patch.object(
+                handoff, "_selected_records", return_value=(accepted, {})), \
+                mock.patch.object(handoff.ci, "producer_inputs") as custody, \
+                mock.patch.object(handoff.ci, "check_build") as build, \
+                mock.patch.object(handoff.ci, "check_boot") as boot, \
+                mock.patch.object(handoff.ci, "COMMAND_SUPERVISOR_PATH", None), \
+                mock.patch.dict(
+                    handoff.ci.COMMAND_TOOL_PATHS, {}, clear=True), \
+                mock.patch.dict(
+                    handoff.ci.COMMAND_ENVIRONMENT, {}, clear=True), \
+                mock.patch.object(
+                    handoff.accepted_records, "handoff_inspect",
+                    side_effect=ValueError("native inspection refused")) as native:
+            with self.assertRaisesRegex(ValueError, "native inspection refused"):
+                handoff.export(runtime, root / "handoff")
+            self.assertEqual(
+                handoff.ci.COMMAND_SUPERVISOR_PATH,
+                str(runtime / "controller/bin/uk-wamr-native-ci"))
+        native.assert_called_once_with(runtime, root / "handoff")
+        custody.assert_not_called()
+        build.assert_not_called()
+        boot.assert_not_called()
+        self.assertFalse((root / "handoff").exists())
+
     def test_legacy_export_requires_recorded_command_supervisor(self):
         handoff = self.handoff_module()
         root, unused_controller = self.controller_fixture("")
@@ -1015,6 +1143,28 @@ class NativeRecordBridge(unittest.TestCase):
         records.assert_called_once_with(
             handoff, stage, source, "producer_direct",
             native_accepted=accepted)
+        with mock.patch.object(ci, "document", return_value=bundle), \
+                mock.patch.object(public_bundle, "members", return_value={}), \
+                mock.patch.object(public_bundle, "inspect_tree"), \
+                mock.patch.object(
+                    public_bundle.accepted_records, "local_runtime",
+                    return_value=accepted), \
+                mock.patch.object(public_bundle, "publication_records"), \
+                mock.patch.object(
+                    public_bundle.accepted_records, "local_handoff_revalidation",
+                    side_effect=ValueError(
+                        "native local handoff revalidation refused")) as native, \
+                mock.patch.object(public_bundle, "native") as python:
+            with self.assertRaisesRegex(ValueError, "revalidation refused"):
+                public_bundle.pack(
+                    handoff, stage, archive, source,
+                    stage.parents[2] / public_bundle.NATIVE_PUBLIC_VALIDATOR_RELATIVE,
+                    stage.parents[2] / public_bundle.NATIVE_CONTROLLER_RELATIVE,
+                    producer="native")
+        native.assert_called_once_with(
+            stage.parents[2], stage.with_name("handoff-revalidation"))
+        python.assert_not_called()
+        self.assertFalse(archive.exists())
 
     def test_imported_v1_command_records_fail_closed(self):
         source = {"source_revision": "1" * 40, "source_tree": "2" * 40}
@@ -1415,6 +1565,79 @@ class NativeRecordBridge(unittest.TestCase):
         self.assertFalse((refused / "transport.json").exists())
         self.assertFalse((refused / "candidate-bundle.json").exists())
         self.assertFalse((refused / "bundle.json").exists())
+
+        native_start = public_bundle.encoded({
+            "consumer_inputs": {"files": {
+                "command-supervisor": {"path": str(
+                    producer_runtime / public_bundle.NATIVE_CONTROLLER_RELATIVE)},
+            }},
+        })
+        start_name = "evidence/build-start.json"
+        native_evidence = copy.deepcopy(evidence)
+        start_item = next(
+            item for item in native_evidence if item["path"] == start_name)
+        start_item.update(
+            size=len(native_start),
+            sha256=hashlib.sha256(native_start).hexdigest())
+        native_bundle = bundle | {"evidence": native_evidence}
+        native_manifest = copy.deepcopy(manifest)
+        native_manifest["members"][start_name] = {
+            key: start_item[key] for key in ("size", "sha256")
+        }
+        native_archive = root / "native-produced.zip"
+        with zipfile.ZipFile(
+                native_archive, "w", compression=zipfile.ZIP_STORED,
+                allowZip64=False) as zipped:
+            for name in sorted(selected):
+                info = zipfile.ZipInfo(name)
+                info.create_system = 3
+                info.external_attr = (stat.S_IFREG | 0o600) << 16
+                zipped.writestr(info, (
+                    native_start if name == start_name
+                    else contents.get(name, b"x")))
+            for name, value in (
+                    ("bundle.json", native_bundle),
+                    ("public-source.json", native_manifest)):
+                info = zipfile.ZipInfo(name)
+                info.create_system = 3
+                info.external_attr = (stat.S_IFREG | 0o600) << 16
+                zipped.writestr(info, public_bundle.encoded(value))
+        native_archive.chmod(0o600)
+        native_accepted = accepted | {"records": [
+            {"name": Path(item["path"]).name, "sha256": item["sha256"]}
+            for item in native_evidence
+        ]}
+        for refusal in (False, True):
+            output = root / ("native-producer-refused" if refusal else "native-producer")
+            with self.subTest(native_refusal=refusal), \
+                    mock.patch.object(
+                        public_bundle.accepted_records, "imported_stage",
+                        return_value=native_accepted), \
+                    mock.patch.object(
+                        public_bundle.accepted_records, "supervisor_import_identity"), \
+                    mock.patch.object(
+                        public_bundle.accepted_records, "import_native_revalidation",
+                        side_effect=(
+                            ValueError("native revalidation refused") if refusal else
+                            lambda unused_stage, path: Path(path))) as native, \
+                    mock.patch.object(public_bundle, "publication_records"), \
+                    mock.patch.object(public_bundle, "native") as python:
+                args = (
+                    handoff, native_archive, output, source, ci.digest(native_archive),
+                    producer_runtime / public_bundle.NATIVE_PUBLIC_VALIDATOR_RELATIVE,
+                    producer_runtime / public_bundle.NATIVE_CONTROLLER_RELATIVE,
+                )
+                if refusal:
+                    with self.assertRaisesRegex(ValueError, "native revalidation refused"):
+                        public_bundle.import_bundle(
+                            *args, artifact_id="123", container_digest="0" * 64)
+                else:
+                    public_bundle.import_bundle(
+                        *args, artifact_id="123", container_digest="0" * 64)
+            native.assert_called_once_with(
+                output, output.with_name(output.name + "-native-identity") / "revalidation")
+            python.assert_not_called()
+            self.assertEqual((output / "bundle.json").exists(), not refusal)
 
     def test_real_archive_requires_native_acceptance_before_publication(self):
         bridge = public_bundle.accepted_records
@@ -2634,7 +2857,8 @@ class Evidence(unittest.TestCase):
                     "tool:" + name: {"path": "/trusted/" + name}
                     for name in ci.HOST_TOOLS
                 },
-                "command-supervisor": {"path": "/trusted/supervisor"},
+                "command-supervisor": {"path": str(
+                    runtime / "compute/supervisor/bin/wamr-ci-supervisor")},
                 "wamr-source-archive": {"path": "/trusted/wamr.tar"},
             },
             "trees": {},
@@ -2877,6 +3101,8 @@ class Evidence(unittest.TestCase):
         handoff = mock.Mock()
         handoff.ci = ci
         handoff.export.return_value = {"version": 2}
+        proof = public_bundle.VerifiedPublicBuildStart(
+            start, "a" * 64, "b" * 64)
         with mock.patch.object(ci, "REPO", repository), \
                 mock.patch.object(
                     ci, "COMMAND_SUPERVISOR_PATH",
@@ -2884,7 +3110,9 @@ class Evidence(unittest.TestCase):
                 mock.patch.object(public_bundle, "ci_runtime", return_value=runtime), \
                 mock.patch.object(
                     public_bundle, "accepted_public_build_start",
-                    return_value=start), \
+                    return_value=proof), \
+                mock.patch.object(
+                    public_bundle.accepted_records, "local_consumer_custody") as custody, \
                 mock.patch.object(public_bundle, "ci_context", return_value=source), \
                 mock.patch.object(ci, "read", return_value=b"primary=0 cleanup=0\n"), \
                 mock.patch.object(ci, "execute") as python_execute, \
@@ -2900,7 +3128,43 @@ class Evidence(unittest.TestCase):
             public_bundle.publish_ci(handoff)
         native_build.assert_called_once_with(
             runtime, publication / "validator-build")
+        self.assertEqual(custody.call_count, 3)
+        for call in custody.call_args_list:
+            self.assertEqual(call.args, (runtime, "a" * 64, "b" * 64))
         python_execute.assert_not_called()
+
+    def test_native_public_start_preserves_pinned_proof_without_python_custody(self):
+        runtime = self.root / "native-public-start"
+        (runtime / "compute/evidence").mkdir(parents=True, mode=0o700)
+        start = {
+            "source": {"revision": "1" * 40, "tree": "2" * 40},
+            "source_custody": {}, "tools": {}, "bison_data": {},
+            "dependencies": {}, "command_supervisor": {},
+            "consumer_inputs": {"files": {
+                "command-supervisor": {"path": str(
+                    runtime / public_bundle.NATIVE_CONTROLLER_RELATIVE)},
+            }},
+        }
+        self.put(
+            runtime / "compute/evidence/build-start.json", ci.canonical_json(start))
+        self.put(runtime / "compute/evidence/boot-inputs.json", b"{}\n")
+        handoff = types.SimpleNamespace(ci=ci, FAILURE_STAGE="")
+        with mock.patch.object(
+                public_bundle.accepted_records, "local_consumer_custody") as custody, \
+                mock.patch.object(
+                    public_bundle.accepted_records, "local_runtime",
+                    return_value={"source": start["source"]}) as native, \
+                mock.patch.object(ci, "bind_command_tools", return_value={}), \
+                mock.patch.object(ci, "command_supervisor_state") as python_supervisor, \
+                mock.patch.object(ci, "require_dependency_custody") as python_dependency:
+            proof = public_bundle.accepted_public_build_start(handoff, runtime)
+        self.assertEqual(proof.start, start)
+        custody.assert_called_once_with(
+            runtime, hashlib.sha256(ci.canonical_json(start)).hexdigest(),
+            hashlib.sha256(b"{}\n").hexdigest())
+        native.assert_called_once_with(runtime)
+        python_supervisor.assert_not_called()
+        python_dependency.assert_not_called()
 
     def test_publication_refuses_bootstrap_validator_record_before_export(self):
         repository = self.root / "bootstrap-publication"
@@ -4560,7 +4824,10 @@ source/generated/
         handoff = types.SimpleNamespace(
             ci=ci, result_records=mock.Mock(), private=mock.Mock())
         build_start = public_bundle.VerifiedPublicBuildStart(
-            {"consumer_inputs": {}}, "a" * 64, "b" * 64)
+            {"consumer_inputs": {"files": {
+                "command-supervisor": {"path": str(
+                    runtime / "compute/supervisor/bin/wamr-ci-supervisor")},
+            }}}, "a" * 64, "b" * 64)
         with mock.patch.object(ci, "REPO", self.root), \
                 mock.patch.object(ci, "tool", return_value="/tools/zig"), \
                 mock.patch.object(ci, "consumer_file_records"), \

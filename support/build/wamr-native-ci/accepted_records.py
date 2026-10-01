@@ -368,7 +368,7 @@ def handoff_inspect(runtime, output, *, legacy=False):
 
 def local_consumer_custody(
         runtime, expected_build_start_sha256, expected_boot_inputs_sha256):
-    """Recapture local Python-produced source and consumer custody natively."""
+    """Recapture the pinned local v2 source and consumer custody natively."""
     runtime = _absolute(runtime)
     refusal = "native controller local consumer custody refused"
     if (not _digest(expected_build_start_sha256, 64)
@@ -443,3 +443,12 @@ def public_validator_build(runtime, output):
         runtime, output, "public-validator-build", "public-validator-build",
         8 * 1024 * 1024 + 1, "native public validator build refused",
         timeout_seconds=VALIDATOR_BUILD_TIMEOUT_SECONDS)
+
+
+def local_handoff_revalidation(runtime, output):
+    """Supervise the fixed native-produced handoff without a Python fallback."""
+    return _runtime_output(
+        runtime, output, "local-handoff-revalidation",
+        "import-native-revalidation", 4097,
+        "native local handoff revalidation refused",
+        timeout_seconds=900)

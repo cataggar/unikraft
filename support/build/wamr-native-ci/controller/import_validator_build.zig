@@ -250,6 +250,16 @@ fn postRun(
     stage: plan.Stage,
     expected_bytes: usize,
 ) !void {
+    _ = try validatedPostRun(allocator, io, output, stage, expected_bytes);
+}
+
+fn validatedPostRun(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    output: []const u8,
+    stage: plan.Stage,
+    expected_bytes: usize,
+) !@import("command_validation.zig").ValidatedCommand {
     const record_path = try std.fmt.allocPrint(allocator, "{s}/evidence/command-{s}.json", .{ output, @tagName(stage) });
     const identity = try physical.readFile(io, record_path, records.max_record_bytes, true);
     var retained = try files.RetainedFile.open(io, record_path, .private);
@@ -273,6 +283,38 @@ fn postRun(
         !std.mem.eql(u8, &checked.output_sha256, &log.sha256))
         return error.CommandOutputChanged;
     try retained.verify(io);
+    return checked;
+}
+
+pub fn revalidateHandoffCommand(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    roots: plan.Roots,
+    private: std.Io.Dir,
+    evidence: std.Io.Dir,
+    signal: ?*core.process.SignalCancellation,
+) !@import("command_validation.zig").ValidatedCommand {
+    var validator = try files.RetainedFile.open(io, roots.direct_validator, .tool);
+    defer validator.close(io);
+    var bundle = try files.RetainedFile.open(io, roots.bundle, .private);
+    defer bundle.close(io);
+    const outcome = try adapter.execute(allocator, io, .{
+        .roots = roots,
+        .stage = .@"import-native-revalidation",
+        .private_dir = private,
+        .evidence_dir = evidence,
+        .cancel = if (signal) |active| active.flag() else null,
+        .capture_stdout = true,
+    });
+    defer allocator.free(outcome.stdout);
+    if (outcome.poisoned) return error.CleanupPoisoned;
+    if (!outcome.accepted or outcome.stderr_bytes != 0 or
+        !std.mem.eql(u8, outcome.stdout, handoff_success))
+        return error.StageRefused;
+    const checked = try validatedPostRun(allocator, io, roots.work, .@"import-native-revalidation", outcome.bytes);
+    try validator.verify(io);
+    try bundle.verify(io);
+    return checked;
 }
 
 pub fn run(
@@ -415,20 +457,8 @@ pub fn run(
         try pinned_candidate.?.verify(io);
         roots.direct_validator = validator_path;
         roots.bundle = candidate_path;
-        const checked = try adapter.execute(allocator, io, .{
-            .roots = roots,
-            .stage = .@"import-native-revalidation",
-            .private_dir = private,
-            .evidence_dir = evidence,
-            .cancel = if (signal) |active| active.flag() else null,
-            .capture_stdout = true,
-        });
-        defer allocator.free(checked.stdout);
-        if (checked.poisoned) return error.CleanupPoisoned;
-        if (!checked.accepted or checked.stderr_bytes != 0 or
-            !std.mem.eql(u8, checked.stdout, handoff_success))
-            return error.StageRefused;
-        revalidated_bytes = checked.bytes;
+        const checked = try revalidateHandoffCommand(allocator, io, roots, private, evidence, signal);
+        revalidated_bytes = @intCast(checked.output_bytes);
         try postRun(allocator, io, output, .@"import-native-revalidation", revalidated_bytes);
         try pinned_candidate.?.verify(io);
     }

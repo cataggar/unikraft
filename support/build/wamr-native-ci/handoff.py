@@ -1056,8 +1056,20 @@ def export(runtime, output, *, on_phase=None):
     modes = ci.MODES if version == 1 else (
         ci.SIX_MODES if accepted is None else tuple(accepted["modes"]))
     names = NAMES if version == 1 else V2_NAMES
-    native_produced = accepted is not None
     expected = ci.document(root / "evidence/build-start.json")
+    legacy_supervision = "command_supervisor" not in expected
+    ci.require(accepted is None or not legacy_supervision,
+               "native command supervision required")
+    if not legacy_supervision:
+        ci.COMMAND_ENVIRONMENT.update(ci.bind_command_tools(
+            expected["consumer_inputs"]))
+    else:
+        ci.COMMAND_ENVIRONMENT.clear()
+        ci.COMMAND_TOOL_PATHS.clear()
+        supervisor_path = ci.bind_command_supervisor(
+            expected["consumer_inputs"])
+        ci.COMMAND_ENVIRONMENT["WAMR_CI_SUPERVISOR"] = supervisor_path
+    native_produced = accepted is not None and not legacy_supervision
     if native_produced:
         build = ci.document(root / "evidence/build.json")
         ci.require(build["source"] == accepted["source"], "native source changed")
@@ -1068,17 +1080,6 @@ def export(runtime, output, *, on_phase=None):
         for name in ("artifacts", "boots"):
             (output / name).mkdir(mode=0o700)
     else:
-        legacy_supervision = "command_supervisor" not in expected
-        if (not legacy_supervision
-                and "command-supervisor" in expected["consumer_inputs"]["files"]):
-            ci.COMMAND_ENVIRONMENT.update(ci.bind_command_tools(
-                expected["consumer_inputs"]))
-        elif legacy_supervision:
-            ci.COMMAND_ENVIRONMENT.clear()
-            ci.COMMAND_TOOL_PATHS.clear()
-            supervisor_path = ci.bind_command_supervisor(
-                expected["consumer_inputs"])
-            ci.COMMAND_ENVIRONMENT["WAMR_CI_SUPERVISOR"] = supervisor_path
         phase("custody")
         before = ci.producer_inputs(runtime, expected["consumer_inputs"])
         ci.require(before == expected,
@@ -1102,9 +1103,6 @@ def export(runtime, output, *, on_phase=None):
             ci.require(checked == ci.document(root / "evidence" / (mode + "-compute.json")),
                        "physical local result changed")
         ci.require_build_custody(runtime, before)
-        if legacy_supervision and ci.COMMAND_SUPERVISOR_PATH is not None:
-            ci.COMMAND_ENVIRONMENT[
-                "WAMR_CI_SUPERVISOR"] = ci.COMMAND_SUPERVISOR_PATH
         phase("inspect")
         inspected_output, unused_inspected_command = (
             accepted_records.handoff_inspect(

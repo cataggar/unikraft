@@ -38,6 +38,27 @@ pub fn supervisorSourceContentClosure(allocator: std.mem.Allocator, io: std.Io, 
     return physical.hex(&hash);
 }
 
+pub fn nativeSourceContentClosure(allocator: std.mem.Allocator) ![64]u8 {
+    var hash = core.Sha256.init(.{});
+    hash.update("uk.wamr.command-supervisor-source-v1-content\x00");
+    for (source.closure) |entry| {
+        const digest = std.fmt.bytesToHex(records.fileIdentity(entry.content), .lower);
+        try physical.bind(allocator, &hash, .{ entry.name, entry.content.len, digest });
+    }
+    return physical.hex(&hash);
+}
+
+pub fn identityBytes(allocator: std.mem.Allocator, source_sha256: []const u8) ![]const u8 {
+    const raw = try std.json.Stringify.valueAlloc(allocator, .{
+        .protocol = "uk.wamr.command-supervisor/1 process-command/1",
+        .schema = "uk.wamr.command-supervisor-identity",
+        .source_content_closure_sha256 = source_sha256,
+        .version = 1,
+    }, .{});
+    defer allocator.free(raw);
+    return records.canonicalAlloc(allocator, raw);
+}
+
 fn get(value: std.json.Value, key: []const u8) !std.json.Value {
     if (value != .object) return error.InvalidImportIdentity;
     return value.object.get(key) orelse error.InvalidImportIdentity;
@@ -305,13 +326,7 @@ pub fn run(
     defer allocator.free(outcome.stdout);
     if (outcome.poisoned) return error.CleanupPoisoned;
     if (!outcome.accepted or outcome.stderr_bytes != 0) return error.StageRefused;
-    const identity = try std.json.Stringify.valueAlloc(allocator, .{
-        .protocol = "uk.wamr.command-supervisor/1 process-command/1",
-        .schema = "uk.wamr.command-supervisor-identity",
-        .source_content_closure_sha256 = source_sha256,
-        .version = 1,
-    }, .{});
-    const expected = try records.canonicalAlloc(allocator, identity);
+    const expected = try identityBytes(allocator, source_sha256);
     if (!std.mem.eql(u8, expected, outcome.stdout)) return error.ImportIdentityChanged;
 
     const record_path = try std.fs.path.join(allocator, &.{ output, "evidence/command-supervisor-import-identity.json" });

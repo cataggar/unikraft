@@ -675,6 +675,11 @@ def consumer_file_path(start, role):
 
 def verify_public_build_side_checks(handoff, runtime, start, source, stage_prefix):
     ci = handoff.ci
+    if recorded_producer(runtime, start["consumer_inputs"]) == "native":
+        handoff.FAILURE_STAGE = stage_prefix + "-native-records"
+        accepted = accepted_records.local_runtime(runtime)
+        require(accepted["source"] == start["source"])
+        return
     handoff.FAILURE_STAGE = stage_prefix + "-command-supervisor-record"
     command_supervisor_record(start["command_supervisor"])
     handoff.FAILURE_STAGE = stage_prefix + "-dependencies"
@@ -690,12 +695,8 @@ def verify_public_build_side_checks(handoff, runtime, start, source, stage_prefi
     handoff.FAILURE_STAGE = stage_prefix + "-bison"
     require(ci.bison_inputs(runtime / "bison") == start["bison_data"])
     handoff.FAILURE_STAGE = stage_prefix + "-command-supervisor"
-    if recorded_producer(runtime, start["consumer_inputs"]) == "python":
-        require(ci.command_supervisor_state(runtime, start["consumer_inputs"])
-                == start["command_supervisor"])
-    else:
-        accepted = accepted_records.local_runtime(runtime)
-        require(accepted["source"] == start["source"])
+    require(ci.command_supervisor_state(runtime, start["consumer_inputs"])
+            == start["command_supervisor"])
 
 
 def recorded_producer(runtime, consumer_inputs):
@@ -1112,27 +1113,6 @@ def native(
         handoff.ci.COMMAND_TOOL_PATHS.update(original_tools)
         handoff.ci.COMMAND_ENVIRONMENT.clear()
         handoff.ci.COMMAND_ENVIRONMENT.update(original_environment)
-
-
-def native_direct(handoff, validator, bundle):
-    validator = Path(validator)
-    bundle = Path(bundle)
-    inputs = handoff.ci.record_input_paths(
-        {"validator": validator, "bundle": bundle}, {}, content=True)
-    completed = subprocess.run(
-        [str(validator), "handoff", str(bundle)],
-        env={"LC_ALL": "C"}, stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600,
-        check=False,
-    )
-    require(
-        completed.returncode == 0
-        and completed.stdout
-        == b"Compute handoff revalidated; authority=not_admitted.\n"
-        and completed.stderr == b"")
-    handoff.ci.record_input_paths(
-        {"validator": validator, "bundle": bundle}, {}, content=True,
-        expected=inputs)
 
 
 def require_consumer_tree_roles(value, legacy):
@@ -1568,7 +1548,12 @@ def pack(handoff, stage, archive, source, validator, supervisor, *, producer="py
     })
     handoff.FAILURE_STAGE = "public-pack-native"
     if producer == "native":
-        native_direct(handoff, validator, stage / "bundle.json")
+        runtime = stage.parents[2]
+        require(stage == runtime / "compute/public-source/handoff"
+                and Path(validator) == runtime / NATIVE_PUBLIC_VALIDATOR_RELATIVE
+                and Path(supervisor) == runtime / NATIVE_CONTROLLER_RELATIVE)
+        accepted_records.local_handoff_revalidation(
+            runtime, stage.with_name("handoff-revalidation"))
     else:
         native(
             handoff, validator, supervisor, stage / "bundle.json", source)
@@ -1781,7 +1766,7 @@ def import_bundle(
         native_identity = identity_parent / "accepted"
         accepted_records.supervisor_import_identity(
             output, supervisor, handoff.ci.tool("git"), native_identity)
-        if native_import_revalidation:
+        if native_import_revalidation or producer == "native":
             handoff.FAILURE_STAGE = "public-import-native-revalidation"
             native_revalidation = accepted_records.import_native_revalidation(
                 output, identity_parent / "revalidation")
@@ -1807,18 +1792,16 @@ def import_bundle(
         "candidate-bundle.json",
         native_accepted=accepted if bundle["version"] == 2 else None)
     handoff.FAILURE_STAGE = "public-import-revalidation"
-    if bundle["version"] == 2 and native_import_revalidation:
+    if bundle["version"] == 2 and (
+            native_import_revalidation or producer == "native"):
         require(native_revalidation is not None)
         handoff.private(native_revalidation)
     else:
         require(native_revalidation is None)
-        if producer == "native":
-            native_direct(handoff, validator, output / "candidate-bundle.json")
-        else:
-            native(
-                handoff, validator, supervisor,
-                output / "candidate-bundle.json", expected,
-                native_identity=native_identity)
+        native(
+            handoff, validator, supervisor,
+            output / "candidate-bundle.json", expected,
+            native_identity=native_identity)
     # Only a fully revalidated import publishes the operator-facing bundle.
     handoff.ci.save(output / "bundle.json", bundle)
     return bundle

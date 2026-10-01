@@ -4,7 +4,7 @@ const core = @import("hyperv_core");
 const files = core.private_files;
 const contracts = core.contracts;
 
-pub const Action = enum { build, boot, diagnostics, describe, @"supervisor-source-closure", records, @"local-consumer-custody", @"handoff-inspect", @"handoff-inspect-legacy", @"public-validator-build", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation" };
+pub const Action = enum { build, boot, diagnostics, describe, @"--identity", @"supervisor-source-closure", records, @"local-consumer-custody", @"handoff-inspect", @"handoff-inspect-legacy", @"public-validator-build", @"local-handoff-revalidation", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation" };
 pub const Command = struct {
     action: Action,
     runtime: ?[]const u8 = null,
@@ -20,6 +20,10 @@ pub const Command = struct {
 pub fn parse(args: []const []const u8) !Command {
     if (args.len < 2) return error.InvalidUsage;
     const action = std.meta.stringToEnum(Action, args[1]) orelse return error.InvalidUsage;
+    if (action == .@"--identity") {
+        if (args.len != 2) return error.InvalidUsage;
+        return .{ .action = action };
+    }
     if (action == .describe) {
         if (args.len != 4 or !std.mem.eql(u8, args[2], "--output") or
             !std.mem.eql(u8, args[3], "json-v1"))
@@ -140,7 +144,7 @@ pub fn parse(args: []const []const u8) !Command {
         if (result.stage_root == null or result.output == null) return error.InvalidUsage;
         return result;
     }
-    if (action == .@"handoff-inspect" or action == .@"handoff-inspect-legacy" or action == .@"public-validator-build") {
+    if (action == .@"handoff-inspect" or action == .@"handoff-inspect-legacy" or action == .@"public-validator-build" or action == .@"local-handoff-revalidation") {
         if (args.len != 6) return error.InvalidUsage;
         var result = Command{ .action = action };
         var i: usize = 2;

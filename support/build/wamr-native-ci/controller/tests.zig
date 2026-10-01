@@ -184,6 +184,7 @@ fn handoffInspectFixtures() !void {
     try std.testing.expectError(error.InvalidContext, controller.handoff_inspect.bind(&accepted, "/output"));
     try std.testing.expectError(error.InvalidContext, controller.handoff_inspect.run(a, io, &accepted, "/output", false, null));
     try std.testing.expectError(error.InvalidContext, controller.public_validator_build.run(a, io, &accepted, "/output", null));
+    try std.testing.expectError(error.InvalidContext, controller.public_validator_build.revalidateHandoff(a, io, &accepted, "/output", null));
     accepted.context = .local_runtime;
     accepted.repository = "/source";
     try std.testing.expectError(error.MissingInput, controller.handoff_inspect.bind(&accepted, "/output"));
@@ -1323,6 +1324,53 @@ test "imported revalidation binds only the built validator and private bundle" {
     }
 }
 
+test "native handoff revalidation is supervised and retains bounded refusal evidence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "native-handoff-revalidation-{d}", .{std.os.linux.getpid()});
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("handoff revalidation fixture cleanup failed");
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    for ([_][]const u8{ "accepted", "reported-error", "nonzero", "overflow", "ok" }) |scenario| {
+        try root.createDir(io, scenario, .fromMode(0o700));
+        const work = try root.openDir(io, scenario, .{ .iterate = true });
+        defer work.close(io);
+        try writeFixtureFile(io, work, "bundle.json", scenario);
+        for ([_][]const u8{ "private", "evidence" }) |entry| try work.createDir(io, entry, .fromMode(0o700));
+        const private = try work.openDir(io, "private", .{ .iterate = true });
+        defer private.close(io);
+        const evidence = try work.openDir(io, "evidence", .{ .iterate = true });
+        defer evidence.close(io);
+        const path = try std.fs.path.join(a, &.{ options.fixture_root, name, scenario });
+        const checked = controller.import_validator_build.revalidateHandoffCommand(a, io, .{
+            .source_root = options.repository_root,
+            .work = path,
+            .runtime = options.fixture_root,
+            .zig = "",
+            .producer = "",
+            .supervisor = options.host_controller_cli,
+            .package_tool = "",
+            .validator = "",
+            .direct_validator = options.command_fixture,
+            .bundle = try std.fs.path.join(a, &.{ path, "bundle.json" }),
+            .tools = @splat(""),
+        }, private, evidence, null);
+        if (std.mem.eql(u8, scenario, "accepted")) {
+            try std.testing.expectEqual(controller.command_plan.Stage.@"import-native-revalidation", (try checked).stage);
+        } else try std.testing.expectError(error.StageRefused, checked);
+        const record = try evidence.readFileAlloc(io, "command-import-native-revalidation.json", a, .limited(controller.records.max_record_bytes));
+        try std.testing.expect(record.len != 0);
+        const log = try private.openFile(io, "import-native-revalidation.log", .{});
+        defer log.close(io);
+        try std.testing.expect((try log.stat(io)).size <= 4097);
+    }
+}
+
 test "imported handoff member rebasing preserves only safe expected relative paths" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1419,6 +1467,12 @@ test "local consumer custody recaptures exact files trees and ancestry" {
         try native_paths.object.put(a, item.role, entry);
         try controller.local_consumer_custody.Fixture.fixedRolePath(a, native_paths, item.role, fixture_path, item.relative);
     }
+    try std.testing.expect(try controller.local_consumer_custody.Fixture.producer(a, fixture_path, native_paths));
+    native_paths.object.getPtr("command-supervisor").?.object.getPtr("path").?.* =
+        .{ .string = try std.fs.path.join(a, &.{ fixture_path, "compute/supervisor/bin/wamr-ci-supervisor" }) };
+    try std.testing.expect(!try controller.local_consumer_custody.Fixture.producer(a, fixture_path, native_paths));
+    native_paths.object.getPtr("command-supervisor").?.object.getPtr("path").?.* = .{ .string = "/unrecorded/controller" };
+    try std.testing.expectError(error.UnexpectedInputPath, controller.local_consumer_custody.Fixture.producer(a, fixture_path, native_paths));
     const changed = try root.openFile(io, "input", .{ .mode = .write_only });
     try changed.writePositionalAll(io, "modified", 0);
     try changed.sync(io);
@@ -1488,6 +1542,7 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
     const build = try cli.parse(&.{ "uk-wamr-native-ci", "build", "--wamr-source", "/wamr", "--runtime", "/runtime" });
     try std.testing.expectEqual(cli.Action.build, build.action);
     try std.testing.expectEqualStrings("/wamr", build.wamr_source.?);
+    try std.testing.expectEqual(cli.Action.@"--identity", (try cli.parse(&.{ "uk-wamr-native-ci", "--identity" })).action);
     try std.testing.expectEqual(cli.Action.describe, (try cli.parse(&.{ "uk-wamr-native-ci", "describe", "--output", "json-v1" })).action);
     const source_closure = try cli.parse(&.{ "uk-wamr-native-ci", "supervisor-source-closure", "--git", "/usr/bin/git", "--output", "sha256-v1" });
     try std.testing.expectEqual(cli.Action.@"supervisor-source-closure", source_closure.action);
@@ -1522,6 +1577,8 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
     const validator_build = try cli.parse(&.{ "uk-wamr-native-ci", "public-validator-build", "--output", "/private/validator", "--runtime", "/runtime" });
     try std.testing.expectEqual(cli.Action.@"public-validator-build", validator_build.action);
     try std.testing.expectEqualStrings("/runtime", validator_build.runtime.?);
+    const local_revalidation = try cli.parse(&.{ "uk-wamr-native-ci", "local-handoff-revalidation", "--runtime", "/runtime", "--output", "/private/revalidation" });
+    try std.testing.expectEqual(cli.Action.@"local-handoff-revalidation", local_revalidation.action);
     try std.testing.expectEqualStrings("/private/validator", validator_build.output.?);
     const imported_validator = try cli.parse(&.{ "uk-wamr-native-ci", "import-validator-build", "--output", "/private/validator", "--stage-root", "/stage" });
     try std.testing.expectEqual(cli.Action.@"import-validator-build", imported_validator.action);
@@ -1543,6 +1600,9 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
     try std.testing.expectEqualStrings("/trusted/supervisor", imported_identity.supervisor.?);
     const rejected = [_][]const []const u8{
         &.{"uk-wamr-native-ci"},
+        &.{ "uk-wamr-native-ci", "--identity", "--runtime", "/runtime" },
+        &.{ "uk-wamr-native-ci", "local-handoff-revalidation", "--runtime", "/runtime" },
+        &.{ "uk-wamr-native-ci", "local-handoff-revalidation", "--runtime", "/runtime", "--output", "/private/revalidation", "--validator", "/caller" },
         &.{ "uk-wamr-native-ci", "supervised-command-record", "--record", "/record", "--identities", "/ids", "--stage", "adapter", "--transport", "trusted-inner-zip", "--profile", "tiny-aot-two-boot" },
         &.{ "uk-wamr-native-ci", "handoff-inspect", "--runtime", "/runtime" },
         &.{ "uk-wamr-native-ci", "handoff-inspect", "--runtime", "/runtime", "--output", "/private/../inspection" },
@@ -1640,6 +1700,76 @@ test "import identity source allowlist matches the historical supervisor source 
     try controller.import_supervisor_identity.validateSourceNames(native);
     const closure = try controller.import_supervisor_identity.supervisorSourceContentClosure(a, std.testing.io, options.repository_root, options.git_executable);
     try std.testing.expectEqualStrings(witness_json.object.get("closure").?.string, closure[0..]);
+}
+
+test "native import identity matches Python guarded source map under supervision" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var names: std.ArrayList([]const u8) = .empty;
+    for (controller.source_custody.closure) |entry| try names.append(a, entry.name);
+    const script =
+        \\import hashlib, importlib.util, json, pathlib, sys
+        \\spec=importlib.util.spec_from_file_location("ci",sys.argv[1])
+        \\ci=importlib.util.module_from_spec(spec); spec.loader.exec_module(ci)
+        \\records={}
+        \\for name in json.loads(sys.argv[2]):
+        \\    raw=pathlib.Path(name).read_bytes()
+        \\    records[name]={"bytes":len(raw),"sha256":hashlib.sha256(raw).hexdigest(),"metadata":[]}
+        \\closure=ci.guarded_record_map("uk.wamr.command-supervisor-source-v1", records)
+        \\sys.stdout.buffer.write(ci.canonical_json({
+        \\    "protocol":"uk.wamr.command-supervisor/1 process-command/1",
+        \\    "schema":"uk.wamr.command-supervisor-identity",
+        \\    "source_content_closure_sha256":closure["content_closure_sha256"],
+        \\    "version":1}))
+    ;
+    const oracle = try std.process.run(a, io, .{
+        .argv = &.{
+            options.python_executable,                                                                     "-B",                                                   "-c", script,
+            try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" }), try std.json.Stringify.valueAlloc(a, names.items, .{}),
+        },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, oracle.term);
+    try std.testing.expectEqualStrings("", oracle.stderr);
+
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "native-import-identity-{d}", .{std.os.linux.getpid()});
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("native identity fixture cleanup failed");
+    const work = try parent.openDir(io, name, .{ .iterate = true });
+    defer work.close(io);
+    for ([_][]const u8{ "private", "evidence" }) |entry| try work.createDir(io, entry, .fromMode(0o700));
+    const private = try work.openDir(io, "private", .{ .iterate = true });
+    defer private.close(io);
+    const evidence = try work.openDir(io, "evidence", .{ .iterate = true });
+    defer evidence.close(io);
+    const outcome = try controller.command_adapter.execute(a, io, .{
+        .roots = .{
+            .source_root = options.repository_root,
+            .work = try std.fs.path.join(a, &.{ options.fixture_root, name }),
+            .runtime = options.fixture_root,
+            .zig = "",
+            .producer = "",
+            .supervisor = options.host_controller_cli,
+            .package_tool = "",
+            .validator = "",
+            .tools = @splat(""),
+        },
+        .stage = .@"supervisor-import-identity",
+        .private_dir = private,
+        .evidence_dir = evidence,
+        .capture_stdout = true,
+    });
+    try std.testing.expect(outcome.accepted and !outcome.poisoned);
+    try std.testing.expectEqual(@as(usize, 0), outcome.stderr_bytes);
+    try std.testing.expectEqualStrings(oracle.stdout, outcome.stdout);
+    const command = try evidence.readFileAlloc(io, "command-supervisor-import-identity.json", a, .limited(controller.records.max_record_bytes));
+    _ = try controller.accepted_run.validateCommandBinding(a, command, .@"supervisor-import-identity", .trusted_inner_zip);
 }
 
 fn writeRelativeFixtureFile(io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: []const u8) !void {

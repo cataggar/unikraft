@@ -52,7 +52,7 @@ The public bundle importer now requires this native imported-records check
 before publishing its candidate, while retaining the Python publication policy.
 Only the protected in-job import that passes `--native-import-revalidation`
 runs trusted-v2 native revalidation through the native controller; default,
-off-runner, and historical trusted-v2 imports retain Python supervised-stage
+off-runner, and historical Python-produced trusted-v2 imports retain Python supervised-stage
 revalidation with the caller-supplied validator. Native-produced v2 local
 handoff requires native acceptance before using its result-record hashes and
 source identity, and its local inspection is routed through the recorded
@@ -60,8 +60,10 @@ runtime controller. A Python-produced local run retains the pinned Python
 source-custody path for result-record selection; it is accepted by the native
 controller only for the v2 handoff inspection route; historical v1 local
 handoff inspection is confined to the explicit legacy action. `records
---runtime`, `public-validator-build --runtime` and
-`local-consumer-custody --runtime` remain native-produced local-runtime gates.
+--runtime` and `public-validator-build --runtime` remain native-produced
+local-runtime gates.
+The digest-pinned local-consumer custody probe admits both recorded v2
+producer layouts without a refusal-triggered fallback.
 The separately validated `command-public-validator-build.json` may appear in
 Python-produced evidence after acceptance; it is not part of the 33 pinned
 result records or the exported archive. Other extra evidence is refused.
@@ -115,6 +117,20 @@ validator build and execution. Python still owns publication policy and
 legacy/producer-direct compatibility checks; native-produced local runs use
 the native records, handoff-inspect, public-validator-build and
 local-consumer-custody owners.
+The controller's read-only `--identity` probe emits the unchanged supervisor
+identity protocol using its embedded native source closure and the recorded
+`command-supervisor-source-v1` hash recipe. It takes no runtime or extra
+options and grants no acceptance or execution authority. Local export binds
+every recorded tool before custody; a native-produced run without the
+non-legacy supervisor record refuses rather than taking the Python path.
+`local-handoff-revalidation --runtime ABS --output ABS` reopens the native
+accepted run and public-validator build evidence, then supervises only the
+fixed public validator and local handoff paths with the existing 600-second
+deadline, bounded streams and cleanup proof. Its private diagnostic records
+are outside the archive. Native-produced imports use the existing native
+import revalidation owner even when the historical compatibility flag is
+omitted; neither local nor imported native validation launches an unsupervised
+Python subprocess or falls back after refusal.
 `import-validator-build --stage-root ABS --output ABS` is a support-only
 trusted-v2 companion for a pristine imported stage. It accepts no caller
 selected executable: it requires the current clean physical checkout to
@@ -138,12 +154,14 @@ imported portable bundle; neither the candidate nor the validator is a public
 bundle member. The validator is retained from build through execution and its
 exact success stdout, empty stderr, bounded log, and command binding are
 checked before returning. A caller cannot select a validator or manifest. The
-protected in-job import path invokes this native operation only when the
-explicit handoff option is present, before writing transport or candidate
-records; native refusal fails the import with no Python fallback. Default
+protected in-job import path invokes this native operation when the explicit
+handoff option is present or the recorded producer is native, before writing
+transport or candidate records; native refusal fails the import with no Python
+fallback. Default Python-produced
 trusted-v2 imports (including the documented off-runner operator flow),
 historical revisions, unavailable recorded-tool imports, v1 imports, and
-producer-direct/local revalidation remain Python-owned because they either need
+Python-produced producer-direct/local revalidation remain Python-owned because
+they either need
 the caller-supplied validator or do not satisfy the pristine same-revision
 trusted-stage preconditions. Native-produced production imports bind the
 recorded controller identity and direct validator built by
@@ -394,11 +412,14 @@ inspection and export. Consumer subprocesses use adapter-owned
 cache/configuration paths; ambient loader, shell-startup, Python, Make and Zig
 injection variables are not inherited.
 
-Before the clean source baseline is taken, the adapter restores the exact
+Before the clean source baseline is taken, the historical Python reference
+restores the exact
 out-of-tree dependency tree and builds the internal
 `wamr-ci-supervisor` from `supervisor.build.zig`. The bootstrap inputs and the
 supervisor's exact tracked source closure are checked before and after that
-build. The production supervisor and public validator use the fixed
+build. The native production controller supervises commands directly through
+the shared process library and records its own embedded source closure.
+Both supervisor implementations and the public validator use the fixed
 `-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2` target with `ReleaseSafe`, not the
 runner's native microarchitecture. The validator's supervised command contract
 binds these exact flags; the supervisor's source closure binds the bootstrap
