@@ -7,11 +7,13 @@ from datetime import datetime, timedelta, timezone
 import argparse
 import hashlib
 import importlib
+import math
 import os
 from pathlib import Path
 import re
 import secrets
 import stat
+import subprocess
 import sys
 
 from cryptography.hazmat.primitives import serialization
@@ -29,6 +31,8 @@ DEFAULT_TEMPLATE = (
 )
 JOURNAL_LIMIT = 512 * 1024
 STEP = re.compile(r"[a-z0-9][a-z0-9_.-]{0,79}\Z")
+HEX40 = re.compile(r"[0-9a-f]{40}\Z")
+HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 PRIVATE_TOKEN = re.compile(
     r"(?:https?://|sig=|accessSAS|access[Ss][Aa][Ss])", re.IGNORECASE,
 )
@@ -68,16 +72,21 @@ class VerificationResult:
 @dataclass(frozen=True)
 class CustodianPlan:
     expected: object
+    reviewed_head: str
+    config_sha256: str
+    efi_sha256: str
+    raw_sha256: str
+    miz_sha256: str
     location: str = LOCATION
     template_file: Path = DEFAULT_TEMPLATE
     name_prefix: str | None = None
-    reviewed_head: str = "0" * 40
-    config_sha256: str = "0" * 64
-    efi_sha256: str = "0" * 64
-    raw_sha256: str = "0" * 64
-    miz_sha256: str = "0" * 64
     image_paths: dict | None = None
     upload_sizes: dict | None = None
+
+    def __post_init__(self):
+        _hex(self.reviewed_head, HEX40, "Reviewed source head")
+        for name in ("config_sha256", "efi_sha256", "raw_sha256", "miz_sha256"):
+            _hex(getattr(self, name), HEX64, name)
 
     def group_name(self):
         return _resource_group_name(self.expected.resource_ids["group"])
@@ -185,30 +194,36 @@ class Journal:
 
 
 class CustodianRecorder:
-    def __init__(self, directory, runner=None):
+    def __init__(self, directory, runner=None, clock=None):
         self.directory = _ensure_private_dir(directory)
         self.archive = ArchiveStore(self.directory / "archive")
         self.journal_path = self.directory / "journal.jsonl"
         self.runner = runner or default_az_runner
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.sequence = len(_read_journal(self.journal_path))
 
     def az(self, step, argv, *, timeout=120):
         _check_step(step)
+        started = _precise_timestamp(self.clock())
         result = self.runner(list(argv), timeout=timeout)
+        completed = _precise_timestamp(self.clock())
         raw, value = _stdout_and_value(result, step)
         redacted = argv[:2] == ["disk", "grant-access"]
         stored = azure.canonical_json({
             "redacted": "grant-access stdout omitted",
         }) if redacted else raw
         return self._store(step, stored, value, argv, redacted=redacted,
-                           synthetic=False)
+                           synthetic=False, started_at_utc=started,
+                           completed_at_utc=completed)
 
     def synthetic(self, step, value, argv=()):
         _check_step(step)
         return self._store(step, azure.canonical_json(value), value, argv,
-                           redacted=False, synthetic=True)
+                           redacted=False, synthetic=True,
+                           started_at_utc=None, completed_at_utc=None)
 
-    def _store(self, step, raw, value, argv, *, redacted, synthetic):
+    def _store(self, step, raw, value, argv, *, redacted, synthetic,
+               started_at_utc, completed_at_utc):
         ref = self.archive.put(raw)
         self.sequence += 1
         entry = {
@@ -218,6 +233,8 @@ class CustodianRecorder:
             "ref": ref,
             "redacted": redacted,
             "synthetic": synthetic,
+            "started_at_utc": started_at_utc,
+            "completed_at_utc": completed_at_utc,
         }
         _append_journal(self.journal_path, entry)
         return Observation(step, ref, value)
@@ -263,7 +280,7 @@ class CustodyAssembler:
         )
 
     def assemble_handoff(self, prepared_raw, *, issued_at_utc=None,
-                         expires_at_utc=None, nonce=None, running_seconds=0,
+                         expires_at_utc=None, nonce=None, running_seconds=None,
                          no_prior_acceptance_boot=True,
                          exclusive_no_writer=True):
         prepared_sha = hashlib.sha256(prepared_raw).hexdigest()
@@ -272,6 +289,7 @@ class CustodyAssembler:
             _timestamp(expires_at_utc) if expires_at_utc is not None
             else _timestamp(_parse_timestamp(issued) + timedelta(minutes=30))
         )
+        runtime = self._running_seconds(running_seconds)
         evidence = {
             "prepared_sha256": prepared_sha,
             "challenge": self.expected.handoff_challenge,
@@ -297,7 +315,7 @@ class CustodyAssembler:
             },
             "no_prior_acceptance_boot": no_prior_acceptance_boot,
             "exclusive_no_writer": exclusive_no_writer,
-            "running_seconds": running_seconds,
+            "running_seconds": runtime,
         }
         return self._body(
             "handoff", 2, prepared_sha, evidence,
@@ -315,7 +333,7 @@ class CustodyAssembler:
     def write_signed(self, output_dir, private_key, *, prepared_at=None,
                      handoff_at=None, handoff_expires_at=None,
                      prepared_nonce=None, handoff_nonce=None,
-                     running_seconds=0):
+                     running_seconds=None):
         output_dir = _ensure_private_dir(output_dir)
         prepared = self.sign(
             self.assemble_prepared(
@@ -356,6 +374,27 @@ class CustodyAssembler:
                 self.expected.preprovision_authorization_sha256,
             "evidence": evidence,
         }
+
+    def _running_seconds(self, override):
+        try:
+            started = self.journal.by_step["deployment.create"]["started_at_utc"]
+            completed = self.journal.by_step["vm.deallocate"]["completed_at_utc"]
+        except KeyError:
+            raise ValueError(
+                "Missing custodian timestamps for dummy VM runtime"
+            ) from None
+        if started is None or completed is None:
+            raise ValueError("Missing custodian timestamps for dummy VM runtime")
+        start = custody._precise_utc(started)
+        end = custody._precise_utc(completed)
+        if end < start:
+            raise ValueError("Custodian dummy VM runtime timestamps are reversed")
+        derived = max(1, math.ceil((end - start).total_seconds()))
+        if override is None:
+            return derived
+        if type(override) is not int or override < derived:
+            raise ValueError("Explicit running_seconds is below observed dummy runtime")
+        return override
 
     def _direct_receipts(self):
         receipts = {}
@@ -405,7 +444,25 @@ class CustodyAssembler:
 
 
 def default_az_runner(arguments, *, timeout=120):
-    return azure.azure_cli(arguments, private=True, timeout=timeout)
+    command = [
+        "az", *arguments, "--only-show-errors", "--output", "json",
+    ]
+    environment = os.environ.copy()
+    environment["AZURE_CORE_COLLECT_TELEMETRY"] = "false"
+    environment["AZURE_LOGGING_ENABLE_LOG_FILE"] = "false"
+    environment["AZURE_EXTENSION_USE_DYNAMIC_INSTALL"] = "no"
+    try:
+        result = subprocess.run(
+            command, capture_output=True, env=environment,
+            timeout=timeout, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise azure.AzureCliTimeout(arguments) from None
+    if result.returncode:
+        if isinstance(result.stderr, bytes):
+            result.stderr = result.stderr.decode("utf-8", "replace")
+        raise azure.AzureCliError(arguments, result, True)
+    return RunnerResult(stdout=result.stdout)
 
 
 def require_live_custodian_approval():
@@ -418,6 +475,11 @@ def run_live(*_args, **_kwargs):
 
 def record_preprovision(recorder, plan, *, upload=None):
     plan.expected.validate()
+    if upload is None:
+        raise ValueError("A VHD upload callable is required")
+    for role in DISKS:
+        if plan.image_path(role) is None:
+            raise ValueError(f"{role} image path is required")
     group = plan.group_name()
     recorder.az("group.create", [
         "group", "create", "--name", group, "--location", plan.location,
@@ -447,12 +509,15 @@ def record_preprovision(recorder, plan, *, upload=None):
             "--duration-in-seconds", "1800",
         ]).value
         sas = _grant_sas(grant)
-        if upload is not None:
+        uploaded_sha, uploaded_size = _upload_result(
             upload(role, plan.image_path(role), sas, plan.image_sha256(role), size)
+        )
+        if uploaded_sha != plan.image_sha256(role) or uploaded_size != size:
+            raise ValueError(f"{role} uploaded bytes differ from reviewed input")
         recorder.synthetic(f"disk.{role}.upload", {
             "id": plan.expected.resource_ids[role],
-            "sha256": plan.image_sha256(role),
-            "size": size,
+            "sha256": uploaded_sha,
+            "size": uploaded_size,
             "status": "Succeeded",
         })
         recorder.az(f"disk.{role}.revoke", [
@@ -719,6 +784,10 @@ def _record_children(recorder, plan, *, prefix):
 
 
 def _record_inventory(recorder, plan, step, disk_uuids, vm_uuid):
+    listed = recorder.az(step + ".list", [
+        "resource", "list", "--resource-group", plan.group_name(),
+    ]).value
+    _validate_inventory_list(listed, plan)
     recorder.synthetic(step, {
         "resources": [
             {
@@ -729,6 +798,47 @@ def _record_inventory(recorder, plan, step, disk_uuids, vm_uuid):
             for role in custody.INVENTORY
         ],
     })
+
+
+def _validate_inventory_list(resources, plan):
+    expected = {
+        plan.expected.resource_ids[role].lower(): (role, _resource_type(role))
+        for role in custody.INVENTORY
+    }
+    if not isinstance(resources, list):
+        raise ValueError("Custodian inventory observation must be a list")
+    seen = {}
+    for resource in resources:
+        if not isinstance(resource, dict):
+            raise ValueError("Custodian inventory contains a non-object resource")
+        resource_id = resource.get("id")
+        resource_type = resource.get("type")
+        if not isinstance(resource_id, str) or not isinstance(resource_type, str):
+            raise ValueError("Custodian inventory resource lacks ID or type")
+        folded = resource_id.lower()
+        if folded in seen:
+            raise ValueError("Custodian inventory contains duplicate resources")
+        seen[folded] = resource
+        if folded not in expected:
+            raise ValueError("Custodian inventory contains an unexpected resource")
+        _role, expected_type = expected[folded]
+        if resource_type.lower() != expected_type.lower():
+            raise ValueError("Custodian inventory resource has an unexpected type")
+    if set(seen) != set(expected):
+        raise ValueError("Custodian inventory is missing expected resources")
+
+
+def _resource_type(role):
+    return {
+        "dummy": "Microsoft.Compute/disks",
+        "os": "Microsoft.Compute/disks",
+        "data0": "Microsoft.Compute/disks",
+        "data7": "Microsoft.Compute/disks",
+        "vm": "Microsoft.Compute/virtualMachines",
+        "nic": "Microsoft.Network/networkInterfaces",
+        "vnet": "Microsoft.Network/virtualNetworks",
+        "nsg": "Microsoft.Network/networkSecurityGroups",
+    }[role]
 
 
 def _direct_create_step(role):
@@ -769,21 +879,32 @@ def _grant_sas(value):
     return value["accessSAS"]
 
 
+def _upload_result(value):
+    if isinstance(value, dict):
+        sha = value.get("sha256")
+        size = value.get("size")
+    elif isinstance(value, tuple) and len(value) == 2:
+        sha, size = value
+    else:
+        raise ValueError("Upload callable must return sha256 and size")
+    custody._sha(sha, "Upload digest")
+    if type(size) is not int or size <= 0:
+        raise ValueError("Upload size is invalid")
+    return sha, size
+
+
 def _stdout_and_value(result, label):
     if isinstance(result, RunnerResult):
         raw = result.stdout
+        if not isinstance(raw, bytes):
+            raise ValueError(f"{label} runner stdout must be bytes")
         value = result.value
         if value is _MISSING:
             value = _parse_stdout(raw, label)
         return raw, value
     if isinstance(result, bytes):
         return result, _parse_stdout(result, label)
-    if isinstance(result, str):
-        raw = result.encode("utf-8")
-        return raw, _parse_stdout(raw, label)
-    value = result
-    raw = b"" if result is None else azure.canonical_json(result)
-    return raw, value
+    raise ValueError("Custodian runner must return original stdout bytes")
 
 
 def _parse_stdout(raw, label):
@@ -806,6 +927,12 @@ def _timestamp(value=None):
     raise ValueError("Custody timestamp must be a UTC datetime or string")
 
 
+def _precise_timestamp(value):
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise ValueError("Custodian clock must return a timezone-aware datetime")
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 def _parse_timestamp(value):
     if isinstance(value, datetime):
         return value.astimezone(timezone.utc)
@@ -826,6 +953,12 @@ def _sanitize_argv(argv):
     return result
 
 
+def _hex(value, pattern, label):
+    if not isinstance(value, str) or not pattern.fullmatch(value) or not int(value, 16):
+        raise ValueError(f"{label} must be nonzero lowercase hex")
+    return value
+
+
 def _read_journal(path):
     path = Path(path)
     if not path.exists():
@@ -835,7 +968,8 @@ def _read_journal(path):
     for number, line in enumerate(raw.splitlines(), 1):
         entry = azure.require_exact_fields(
             azure.parse_strict_json(line, "Custodian journal entry"),
-            ("sequence", "step", "argv", "ref", "redacted", "synthetic"),
+            ("sequence", "step", "argv", "ref", "redacted", "synthetic",
+             "started_at_utc", "completed_at_utc"),
             "Custodian journal entry",
         )
         if entry["sequence"] != number:
@@ -846,6 +980,15 @@ def _read_journal(path):
                 or not isinstance(entry["redacted"], bool)
                 or not isinstance(entry["synthetic"], bool)):
             raise ValueError("Custodian journal entry is malformed")
+        if entry["synthetic"]:
+            if (entry["started_at_utc"] is not None
+                    or entry["completed_at_utc"] is not None):
+                raise ValueError("Synthetic journal entries cannot claim runner time")
+        else:
+            started = custody._precise_utc(entry["started_at_utc"])
+            completed = custody._precise_utc(entry["completed_at_utc"])
+            if completed < started:
+                raise ValueError("Custodian journal timestamps are reversed")
         _archive_ref(entry["ref"], allow_empty=True)
         entries.append(entry)
     return entries

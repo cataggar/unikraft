@@ -1136,11 +1136,12 @@ attaches the final OS disk and cannot be relabeled as a dummy deployment.
 
 `support/scripts/hyperv_issue90_custodian.py` is an offline helper for the
 custody format above. It can generate self-held test Ed25519 keys, record an
-injectable `az`-like runner into a private content-addressed archive plus
-append-only journal, assemble PREPARED and HANDED_OFF envelopes from those
-recorded observations, and call `inspect_handoff(...)` against an independently
-supplied `Expected`. Its live entry point is intentionally closed and raises
-before any Azure call; tests drive the phase sequence with fakes only.
+injectable `az`-like runner's original stdout bytes into a private
+content-addressed archive plus append-only journal, assemble PREPARED and
+HANDED_OFF envelopes from those observations, and call `inspect_handoff(...)`
+against an independently supplied `Expected`. Its live entry point is
+intentionally closed and raises before any Azure call; tests drive the phase
+sequence with fakes only.
 
 `hyperv_issue90_custodian.py keys <private-dir>` creates a new 0700 directory
 and refuses to reuse an existing one. It writes one 0600 raw private key and one
@@ -1148,11 +1149,15 @@ and refuses to reuse an existing one. It writes one 0600 raw private key and one
 `witness`. These keys are **TEST-ONLY**. If one operator generates or holds all
 three keys, they provide no independent custodian, approval or witness
 separation of duties; real custody must pin independently controlled public
-keys out of band. Grant-access output is never archived with its SAS value: the
-journal records only sanitized argv and a redacted observation marker, while the
-signed upload and revocation evidence remains the custodian-constructed
-`{id, sha256, size, status}` and `{id, status, active_sas:false}` records
-validated by the custody module.
+keys out of band. Custodian plans require explicit nonzero reviewed-source and
+build-provenance hashes. Grant-access output is never archived with its SAS
+value: the journal records only sanitized argv and a redacted observation
+marker. Upload evidence is written only after an injected upload callable
+returns the actual uploaded SHA-256 and byte count matching the reviewed input,
+inventory summaries are derived from a real `resource list` observation with no
+extra or missing resources, and HANDOFF `running_seconds` is derived from
+journaled deployment/deallocation timestamps unless an explicit larger value is
+supplied.
 
 ### Separate offline dummy-OS ARM candidate (not a deployment approval)
 
