@@ -80,7 +80,7 @@ class CustodyVerifierTests(unittest.TestCase):
             "efi_sha256": self.offline.efi_sha256,
             "raw_sha256": self.offline.raw_sha256,
             "miz_sha256": self.offline.miz_sha256,
-            "offline_sha256": self.sha(azure.canonical_json(asdict(self.offline))),
+            "offline_sha256": verifier.reproducible_offline_sha256(self.offline),
             "seed_sha256": {"data0": "4" * 64, "data7": "5" * 64},
             "resource_ids": {
                 role: topology.resource_id(self.state, role)
@@ -202,7 +202,7 @@ class CustodyVerifierTests(unittest.TestCase):
                 for role, identifier, uid in preboot.disks
             },
             "reviewed_image_sha256": preboot.offline.vhd_sha256,
-            "offline_sha256": self.sha(azure.canonical_json(asdict(preboot.offline))),
+            "offline_sha256": verifier.reproducible_offline_sha256(preboot.offline),
             "seed_sha256": self.fixture.expected.seed_sha256,
             "remaining_seconds": 3590, "one_start": True,
         }
@@ -610,6 +610,84 @@ class CustodyVerifierTests(unittest.TestCase):
             self.sign(self.assurance, self.fixture.witness), self.baseline,
             now=NOW,
         ), verifier.Refusal)
+
+    def fresh_serials(self, offline):
+        return replace(offline, boots=tuple(
+            replace(boot, serial_sha256=f"{index + 1}" * 64,
+                    report_sha256=f"{index + 5}" * 64)
+            for index, boot in enumerate(offline.boots)
+        ))
+
+    def test_reproducible_offline_digest_ignores_only_boot_serials(self):
+        digest = verifier.reproducible_offline_sha256(self.offline)
+        varied = self.fresh_serials(self.offline)
+        self.assertNotEqual(asdict(varied), asdict(self.offline))
+        self.assertEqual(verifier.reproducible_offline_sha256(varied), digest)
+        mapping = azure.parse_strict_json(
+            azure.canonical_json(asdict(varied)), "Admission result",
+        )
+        self.assertEqual(verifier.reproducible_offline_sha256(mapping), digest)
+        for alteration in (
+            replace(self.offline, implementation_sha256="1" * 64),
+            replace(self.offline, seeds=(
+                replace(self.offline.seeds[0], manifest_sha256="9" * 64),
+                self.offline.seeds[1],
+            )),
+            replace(self.offline, boots=(
+                replace(self.offline.boots[0], image_sha256="9" * 64),
+                *self.offline.boots[1:],
+            )),
+        ):
+            with self.subTest(alteration=alteration):
+                self.assertNotEqual(
+                    verifier.reproducible_offline_sha256(alteration), digest,
+                )
+        for invalid in (
+            {**mapping, "extra": 1},
+            {key: value for key, value in mapping.items() if key != "boots"},
+            {**mapping, "boots": [{"source": "raw"}]},
+            "not an admission",
+        ):
+            with self.subTest(invalid=type(invalid).__name__):
+                with self.assertRaises(ValueError):
+                    verifier.reproducible_offline_sha256(invalid)
+
+    def test_preprovision_survives_fresh_admission_boot_serials(self):
+        varied = self.fresh_serials(self.offline)
+        with mock.patch.object(admission, "admit", return_value=varied):
+            self.assertIs(self.v.verify_offline(), varied)
+        candidate = self.observe()
+        self.assertIsInstance(candidate, verifier.CandidateAcceptance)
+        self.assertIs(candidate.permit.preboot.offline, varied)
+        self.assertIsInstance(self.dispose(candidate), verifier.FinalAcceptance)
+
+    def test_other_fresh_admission_changes_still_refuse_preprovision(self):
+        for alteration in (
+            replace(self.fresh_serials(self.offline), implementation_sha256="1" * 64),
+            replace(self.offline, seeds=(
+                replace(self.offline.seeds[0], manifest_sha256="9" * 64),
+                self.offline.seeds[1],
+            )),
+        ):
+            with self.subTest(alteration=alteration):
+                candidate = verifier.Verifier(
+                    self.inputs, self.fixture.expected,
+                    self.fixture.archive, self.registry,
+                    custodian_key=signature_key(self.fixture.signer),
+                    approver_key=signature_key(self.approver),
+                    witness_key=signature_key(self.fixture.witness),
+                    clock=lambda: self.reservation_clock,
+                )
+                self.v = candidate
+                with mock.patch.object(admission, "admit", return_value=alteration):
+                    self.assertIs(candidate.verify_offline(), alteration)
+                refused = self.prepare()
+                self.assertEqual(refused, verifier.Refusal(
+                    "handoff", "signed_or_independent_handoff_incomplete",
+                ))
+                self.assertFalse((self.state_dir.parent / (
+                    "run-" + self.state["run_id"] + ".json"
+                )).exists())
 
     def test_wrong_key_run_digest_challenge_and_assertions_refuse(self):
         for alteration in (

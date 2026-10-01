@@ -1161,9 +1161,12 @@ honored exactly as by the topology controller; without it, any policy-added VM
 identity is refused.
 
 The `live` entry point exists **only for one signed disposable dry run**
-(zero-content VHDs, everything deleted afterwards). **Acceptance remains
-unavailable**: any approval mode other than `disposable-dry-run` is refused,
-and without a valid approval `live` refuses before any Azure call.
+(zero-content VHDs, everything deleted afterwards). It refuses any approval
+mode other than `disposable-dry-run`, and without a valid approval `live`
+refuses before any Azure call. Acceptance is never run here: it exists only
+in the separate owner-attested acceptance lane below, behind a signed
+`acceptance` approval, its pre-provision statement and a passing remote
+verifier.
 `approve-dry-run` writes a new 0600 approval: canonical JSON
 `{"body", "signature"}`, where the signature is Ed25519 over
 `uk-hyperv-issue90-custodian-live-approval-v1\n` plus the canonical body. The
@@ -1223,6 +1226,87 @@ loss still requires checking the subscription by hand. The run passes only if ve
 passed **and** the group was deleted. Output is PASS/FAIL with a sanitized
 reason and the cleanup status. If self-held **TEST-ONLY** keys are used,
 they are not independent custody.
+
+#### Owner-attested #90 acceptance lane
+
+`support/scripts/hyperv_issue90_acceptance.py` runs **one** real acceptance
+attempt with self-held **TEST-ONLY** custodian, approver and witness keys
+(three distinct keys). One operator holds all three, so every result is
+**owner-attested, not independent custody**; the summary always says
+`owner_attested_test_keys: true` and `independent_custody: false`. The opt-in
+verifier below decides the result; this lane only drives Azure and signs
+the statements the verifier requires.
+
+Preparation, all offline:
+
+1. Run the offline admission once and record the reproducible digest
+   (`offline-digest --admission-json ...`).
+2. `sign-preprovision` signs the approver's verifier-v1 `preprovision`
+   statement P from the expected context, the plan and that digest. Set
+   `Expected.preprovision_authorization_sha256` to P's printed digest.
+3. `approve-acceptance` writes a live approval with
+   `mode: "acceptance"`. It has the dry-run fields plus
+   `preprovision_sha256` (P's digest), `max_vm_running_seconds` of at most
+   3600 and a window of at most 300 minutes.
+
+Times are in the **verifier host's clock domain**. When the local clock is
+skewed, pass `--clock-offset-seconds` (local minus verifier UTC, at most
+3600) to `sign-preprovision` and `approve-acceptance`. The verifier
+requires P's `issued_at_utc` to be no later than its own clock and earlier
+than PREPARED. `approve-acceptance` refuses a P issued in the verifier's
+future, and a window that has already ended.
+
+Before any Azure call, `acceptance` applies the dry-run approval checks,
+requires P to be a valid approver-signed statement that matches `Expected`
+and the plan and was issued before now, and requires `Expected` and the
+approval to bind P's digest. It then asks the verifier to re-run the offline
+admission, and refuses unless the reproducible digest equals P's. Only then
+does a registry claim consume the approval once.
+
+The verifier runs on a separate x86_64 KVM host because it re-runs `admit()`.
+`serve-verifier` (offline inputs, expected, registry and the three public
+keys) speaks newline-delimited canonical JSON on stdin/stdout: a `ready`
+line, then exactly one request per stage, in order (offline, handoff,
+dispatch, optional observation, disposal). Bytes are bounded base64. The
+protocol uses private descriptors; stdio and diagnostics go to `/dev/null`,
+so stdout carries only protocol lines, even on startup failure.
+`--verifier-argv-json` names the command, for example an `ssh` argv. Each
+call has a deadline. Pipes are non-blocking, so a stalled peer cannot hold
+a read or write past it. A transport or response error is a refusal.
+
+The `ready` line carries the verifier's UTC time (`now_utc`, microseconds).
+`acceptance` connects before any Azure call and refuses a missing,
+malformed or more-than-3600 s-distant time. It then runs entirely on the
+verifier's clock: `now_utc` carried forward by the local monotonic clock
+from the moment `ready` was received. That clock lags the verifier slightly
+and is never ahead of it. It drives every statement, journal time, approval
+window, deadline and the start-after-reservation wait. The measured offset,
+rounded to seconds, is journaled and reported in the summary.
+
+After the dry-run style provisioning and HANDOFF (lifetime at most 55
+minutes), the lane does the following:
+
+- **Witness statements.** It journals a baseline `get-boot-log`. Text reads
+  go through `CustodianRecorder.az_text`, which refuses storage tokens. It
+  then signs a witness assurance whose single dummy interval equals HANDOFF
+  `running_seconds`, and the approver authorization with a fresh challenge.
+  It sends the verifier only PREPARED/HANDOFF evidence and witness blobs.
+- **One start.** If the verifier reserves the start, the lane waits past
+  the reservation and issues **exactly one** `az vm start`, never retried.
+  A failed or lost response is recorded as a lost start.
+- **Polling.** It polls `get-boot-log` for at most 15 minutes, within the
+  runtime budget and expiries, until a final or failure marker.
+- **Evidence.** It deallocates and proves the deallocation with a settled
+  instance view. The witness observation binds the parsed controller/LUN
+  topology to the original disk UUIDs.
+- **Cleanup always runs**, even after errors and interrupts. CLOSED, the
+  witness ACK and the witness disposal statement follow only when owned-group
+  deletion is proven.
+
+PASS requires the verifier's `FinalAcceptance` **and** a deleted group.
+Records and a sanitized `summary.json` are written privately.
+`require_live_cleanup_proof()` and the topology `run()` live gate stay
+closed.
 
 ### Separate offline dummy-OS ARM candidate (not a deployment approval)
 
@@ -1344,10 +1428,14 @@ with Ed25519 over
 All carry the exact run/operation IDs and whole-second UTC issue time;
 extra/missing fields, unknown intervals, incomplete ledgers, stale records,
 unbound hashes, noncanonical signatures and missing archive bytes refuse.
-Preprovision predates PREPARED and binds the **entire offline admission hash**
-and its reviewed head/source, config, EFI, raw, VHD and Miz digests; both
-seed hashes, dummy VHD, reviewed dummy template, envelope and all ten
-original resource IDs. Assurance is issued at/after HANDED_OFF and binds
+Preprovision predates PREPARED and binds the **reproducible offline
+admission hash** and its reviewed head/source, config, EFI, raw, VHD and Miz
+digests; both seed hashes, dummy VHD, reviewed dummy template, envelope and
+all ten original resource IDs. The reproducible hash,
+`reproducible_offline_sha256(offline)`, is the SHA-256 of the canonical
+admission JSON with only each boot's `serial_sha256` and `report_sha256`
+removed: real boot serials carry timestamps, so a later `admit()` cannot
+reproduce them, while every other admission field must still match. Assurance is issued at/after HANDED_OFF and binds
 the handoff/preprovision digests, independent no-writer and no-prior-boot
 assertions, bounded RBAC and boot-history archive digests, original VM/disk
 UUIDs, fresh pre-dispatch serial baseline and generation, and a **complete**
