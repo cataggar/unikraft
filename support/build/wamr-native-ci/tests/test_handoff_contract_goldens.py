@@ -5,13 +5,25 @@
 Regenerate intentionally with:
   python3 -B support/build/wamr-native-ci/tests/test_handoff_contract_goldens.py --write
 """
-import copy, importlib.util, json, os, sys, tempfile, unittest, zipfile
+import contextlib, copy, hashlib, importlib.util, io, json, os, shutil, stat, sys, tempfile, unittest, zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
 WAMR_CI = ROOT / "support/build/wamr-native-ci"
 FIXTURES = WAMR_CI / "tests/fixtures/differential"
 GOLDEN = WAMR_CI / "handoff/goldens/contracts-profile-layout.json"
+ZIP_MULTI = WAMR_CI / "handoff/goldens/zip-stored-multi.zip"
+ZIP_EMPTY = WAMR_CI / "handoff/goldens/zip-stored-empty.zip"
+PACK_V1 = WAMR_CI / "handoff/goldens/zip-pack-v1.zip"
+PACK_V2 = WAMR_CI / "handoff/goldens/zip-pack-v2.zip"
+PACK_V1_BUNDLE = WAMR_CI / "handoff/goldens/zip-pack-v1-bundle.json"
+PACK_V1_PUBLIC_SOURCE = WAMR_CI / "handoff/goldens/zip-pack-v1-public-source.json"
+PACK_V2_BUNDLE = WAMR_CI / "handoff/goldens/zip-pack-v2-bundle.json"
+PACK_V2_PUBLIC_SOURCE = WAMR_CI / "handoff/goldens/zip-pack-v2-public-source.json"
+PACK_HASHES = WAMR_CI / "handoff/goldens/zip-pack-hashes.json"
+ROOT_BOUND_V1 = WAMR_CI / "handoff/goldens/root-bound-v1.json"
+ROOT_BOUND_V2 = WAMR_CI / "handoff/goldens/root-bound-v2.json"
+ROOT_BOUND_STAGE = "/opt/wamr-handoff-golden-stage"
 SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 REV = "0123456789012345678901234567890123456789"
 UUID = "00000000-0000-4000-8000-000000000001"
@@ -26,6 +38,50 @@ def load(name):
 
 def artifact(path, size=1):
     return {"path": path, "size": size, "sha256": SHA}
+
+
+def scratch_parent():
+    path = ROOT / ".zig-cache/handoff-python-goldens"
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+    return path
+
+
+@contextlib.contextmanager
+def private_tempdir(prefix):
+    raw = tempfile.mkdtemp(prefix=prefix, dir=scratch_parent())
+    try:
+        root = Path(raw).resolve()
+        os.chmod(root, 0o700)
+        yield root
+    finally:
+        shutil.rmtree(raw, ignore_errors=True)
+
+
+def zip_fixture(entries):
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_STORED, allowZip64=False) as zipped:
+        for name, raw in entries:
+            info = zipfile.ZipInfo(name)
+            info.create_system = 3
+            info.external_attr = (stat.S_IFREG | 0o600) << 16
+            zipped.writestr(info, raw)
+    return out.getvalue()
+
+
+def zip_multi_golden():
+    return zip_fixture((
+        ("alpha.txt", b"alpha\n"),
+        ("dir/nested.bin", b"\x00stored bytes\n"),
+        ("omega.dat", b"last member"),
+    ))
+
+
+def zip_empty_golden():
+    return zip_fixture((
+        ("empty.bin", b""),
+        ("nonempty.txt", b"non-empty\n"),
+    ))
 
 
 def source_context(public_bundle, handoff):
@@ -125,9 +181,7 @@ def materialize_bundle(handoff, public_bundle, stage, version):
 
 
 def packed_records(handoff, public_bundle, version):
-    with tempfile.TemporaryDirectory(prefix="handoff-contract-pack-") as raw:
-        root = Path(raw).resolve()
-        os.chmod(root, 0o700)
+    with private_tempdir("handoff-contract-pack-") as root:
         stage = root / "stage"
         stage.mkdir(mode=0o700)
         out = root / "out"
@@ -147,13 +201,32 @@ def packed_records(handoff, public_bundle, version):
             with archive.open("rb") as handle:
                 public_bundle.verify_archive_descriptor(handoff, handle.fileno(), source, archive_sha256)
             with zipfile.ZipFile(archive) as zipped:
-                bundle = public_bundle.decode(zipped.read("bundle.json"))
-                manifest = public_bundle.decode(zipped.read("public-source.json"))
-            return {"bundle": bundle, "manifest": manifest, "source": source}
+                bundle_raw = zipped.read("bundle.json")
+                manifest_raw = zipped.read("public-source.json")
+                bundle = public_bundle.decode(bundle_raw)
+                manifest = public_bundle.decode(manifest_raw)
+            archive_bytes = archive.read_bytes()
+            return {
+                "bundle": bundle,
+                "manifest": manifest,
+                "source": source,
+                "archive": archive_bytes,
+                "archive_sha256": archive_sha256,
+                "bundle_raw": bundle_raw,
+                "manifest_raw": manifest_raw,
+            }
         finally:
             public_bundle.publication_records = original_publication_records
             public_bundle.inspect_tree = original_inspect_tree
             public_bundle.native = original_native
+
+
+def pack_hashes(packed):
+    value = {
+        "zip-pack-v1.zip": hashlib.sha256(packed[1]["archive"]).hexdigest(),
+        "zip-pack-v2.zip": hashlib.sha256(packed[2]["archive"]).hexdigest(),
+    }
+    return json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
 
 
 def max_accepted_member_size(handoff, public_bundle, version, member, upper):
@@ -182,9 +255,7 @@ def artifact_limits(handoff, public_bundle, version):
 
 
 def candidate_records(handoff, public_bundle, version):
-    with tempfile.TemporaryDirectory(prefix="handoff-contract-") as raw:
-        root = Path(raw).resolve()
-        os.chmod(root, 0o700)
+    with private_tempdir("handoff-contract-") as root:
         stage = root / "stage"
         stage.mkdir(mode=0o700)
         bundle = materialize_bundle(handoff, public_bundle, stage, version)
@@ -212,6 +283,33 @@ def candidate_records(handoff, public_bundle, version):
             if version == 2 else None
         )
         return candidate, admission, transport
+
+
+def root_bound_bundle(handoff, public_bundle, version):
+    with private_tempdir("handoff-contract-root-bound-") as root:
+        stage = root / "stage"
+        stage.mkdir(mode=0o700)
+        bundle = materialize_bundle(handoff, public_bundle, stage, version)
+        selected = public_bundle.members(handoff, bundle, stage)
+        assert len(selected) + 2 == (
+            public_bundle.V1_ZIP_MEMBERS if version == 1 else public_bundle.V2_ZIP_MEMBERS)
+        actual = stage.as_posix()
+
+    def normalize(value):
+        if isinstance(value, dict):
+            return {
+                key: (ROOT_BOUND_STAGE + raw[len(actual):]
+                      if key == "path" and isinstance(raw := item, str)
+                      and raw.startswith(actual + "/") else normalize(item))
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [normalize(item) for item in value]
+        return value
+
+    normalized = normalize(bundle)
+    public_bundle.members(handoff, normalized, Path(ROOT_BOUND_STAGE))
+    return public_bundle.encoded(normalized)
 
 
 def contract_golden():
@@ -305,6 +403,19 @@ def contract_golden():
 class HandoffContractGoldens(unittest.TestCase):
     def test_python_oracle_matches_checked_in_golden(self):
         self.assertEqual(GOLDEN.read_text(encoding="utf-8"), contract_golden())
+        self.assertEqual(ZIP_MULTI.read_bytes(), zip_multi_golden())
+        self.assertEqual(ZIP_EMPTY.read_bytes(), zip_empty_golden())
+        handoff, public_bundle = load("handoff"), load("public_bundle")
+        packed = {version: packed_records(handoff, public_bundle, version) for version in (1, 2)}
+        self.assertEqual(PACK_V1.read_bytes(), packed[1]["archive"])
+        self.assertEqual(PACK_V2.read_bytes(), packed[2]["archive"])
+        self.assertEqual(PACK_V1_BUNDLE.read_bytes(), packed[1]["bundle_raw"])
+        self.assertEqual(PACK_V1_PUBLIC_SOURCE.read_bytes(), packed[1]["manifest_raw"])
+        self.assertEqual(PACK_V2_BUNDLE.read_bytes(), packed[2]["bundle_raw"])
+        self.assertEqual(PACK_V2_PUBLIC_SOURCE.read_bytes(), packed[2]["manifest_raw"])
+        self.assertEqual(PACK_HASHES.read_text(encoding="utf-8"), pack_hashes(packed))
+        self.assertEqual(ROOT_BOUND_V1.read_bytes(), root_bound_bundle(handoff, public_bundle, 1))
+        self.assertEqual(ROOT_BOUND_V2.read_bytes(), root_bound_bundle(handoff, public_bundle, 2))
 
     def test_python_members_match_zig_sample_verdicts(self):
         handoff, public_bundle = load("handoff"), load("public_bundle")
@@ -327,9 +438,7 @@ class HandoffContractGoldens(unittest.TestCase):
 
     def test_python_accepts_real_root_bound_handoff_and_v1_candidate(self):
         handoff, public_bundle = load("handoff"), load("public_bundle")
-        with tempfile.TemporaryDirectory(prefix="handoff-contract-root-") as raw:
-            root = Path(raw).resolve()
-            os.chmod(root, 0o700)
+        with private_tempdir("handoff-contract-root-") as root:
             stage = root / "stage"
             stage.mkdir(mode=0o700)
             bundle = materialize_bundle(handoff, public_bundle, stage, 2)
@@ -349,5 +458,18 @@ class HandoffContractGoldens(unittest.TestCase):
 if __name__ == "__main__":
     if sys.argv[1:] == ["--write"]:
         GOLDEN.write_text(contract_golden(), encoding="utf-8")
+        ZIP_MULTI.write_bytes(zip_multi_golden())
+        ZIP_EMPTY.write_bytes(zip_empty_golden())
+        handoff, public_bundle = load("handoff"), load("public_bundle")
+        packed = {version: packed_records(handoff, public_bundle, version) for version in (1, 2)}
+        PACK_V1.write_bytes(packed[1]["archive"])
+        PACK_V2.write_bytes(packed[2]["archive"])
+        PACK_V1_BUNDLE.write_bytes(packed[1]["bundle_raw"])
+        PACK_V1_PUBLIC_SOURCE.write_bytes(packed[1]["manifest_raw"])
+        PACK_V2_BUNDLE.write_bytes(packed[2]["bundle_raw"])
+        PACK_V2_PUBLIC_SOURCE.write_bytes(packed[2]["manifest_raw"])
+        PACK_HASHES.write_text(pack_hashes(packed), encoding="utf-8")
+        ROOT_BOUND_V1.write_bytes(root_bound_bundle(handoff, public_bundle, 1))
+        ROOT_BOUND_V2.write_bytes(root_bound_bundle(handoff, public_bundle, 2))
     else:
         unittest.main()
