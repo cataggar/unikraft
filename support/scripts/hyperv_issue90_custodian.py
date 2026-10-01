@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-3-Clause
-"""Offline #90 custodian recorder and signed handoff assembler; no live gate."""
+"""#90 custodian recorder and signed handoff assembler.
+
+Live Azure use is limited to one signed, disposable dry run; acceptance is
+not available.
+"""
 
 from dataclasses import MISSING, dataclass, fields
 from datetime import datetime, timedelta, timezone
@@ -12,12 +16,17 @@ import os
 from pathlib import Path
 import re
 import secrets
+import signal
 import stat
 import subprocess
 import sys
 
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 
 azure = importlib.import_module("hyperv-azure")
 custody = importlib.import_module("hyperv_issue90_custody_records")
@@ -37,10 +46,33 @@ PRIVATE_TOKEN = re.compile(
     r"(?:https?://|sig=|accessSAS|access[Ss][Aa][Ss])", re.IGNORECASE,
 )
 NO_LIVE_APPROVAL = (
-    "Live #90 custodian Azure access is disabled: this offline tool requires "
-    "a separate reviewed live approval gate that is intentionally not present"
+    "Live #90 custodian Azure access is disabled without a valid signed "
+    "disposable dry-run approval; acceptance mode is not available"
+)
+LIVE_APPROVAL_SCHEMA = "uk-hyperv-issue90-custodian-live-approval-v1"
+LIVE_MODE = "disposable-dry-run"
+LIVE_CLEANUP = "delete-owned-group"
+LIVE_APPROVAL_FIELDS = (
+    "schema", "version", "mode", "subscription_sha256", "location", "run_id",
+    "operation_id", "group_id", "not_before_utc", "not_after_utc",
+    "max_vm_running_seconds", "cleanup", "nonce",
+)
+LIVE_APPROVAL_LIMIT = 4096
+LIVE_WINDOW = timedelta(minutes=300)
+HANDOFF_LIFETIME = timedelta(minutes=30)
+PLAN_FIELDS = (
+    "reviewed_head", "config_sha256", "efi_sha256", "raw_sha256", "miz_sha256",
+    "image_paths",
 )
 _MISSING = object()
+
+
+class LiveApprovalRefused(RuntimeError):
+    pass
+
+
+class CleanupRefused(ValueError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -67,6 +99,21 @@ class VerificationResult:
     passed: bool
     digest: str | None = None
     reason: str | None = None
+
+
+@dataclass(frozen=True)
+class CleanupResult:
+    status: str
+    deallocated: bool = False
+
+
+@dataclass(frozen=True)
+class LiveResult:
+    passed: bool
+    verification_digest: str | None
+    cleanup: str
+    reason: str | None = None
+    cleanup_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -194,18 +241,22 @@ class Journal:
 
 
 class CustodianRecorder:
-    def __init__(self, directory, runner=None, clock=None):
+    def __init__(self, directory, runner=None, clock=None, revoke_runner=None):
         self.directory = _ensure_private_dir(directory)
         self.archive = ArchiveStore(self.directory / "archive")
         self.journal_path = self.directory / "journal.jsonl"
         self.runner = runner or default_az_runner
+        self.revoke_runner = revoke_runner or self.runner
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.sequence = len(_read_journal(self.journal_path))
 
     def az(self, step, argv, *, timeout=120):
         _check_step(step)
+        # Write-access revocation must still reach Azure after the window.
+        runner = (self.revoke_runner if list(argv[:2]) == ["disk", "revoke-access"]
+                  else self.runner)
         started = _precise_timestamp(self.clock())
-        result = self.runner(list(argv), timeout=timeout)
+        result = runner(list(argv), timeout=timeout)
         completed = _precise_timestamp(self.clock())
         raw, value = _stdout_and_value(result, step)
         redacted = argv[:2] == ["disk", "grant-access"]
@@ -376,20 +427,7 @@ class CustodyAssembler:
         }
 
     def _running_seconds(self, override):
-        try:
-            started = self.journal.by_step["deployment.create"]["started_at_utc"]
-            completed = self.journal.by_step["vm.deallocate"]["completed_at_utc"]
-        except KeyError:
-            raise ValueError(
-                "Missing custodian timestamps for dummy VM runtime"
-            ) from None
-        if started is None or completed is None:
-            raise ValueError("Missing custodian timestamps for dummy VM runtime")
-        start = custody._precise_utc(started)
-        end = custody._precise_utc(completed)
-        if end < start:
-            raise ValueError("Custodian dummy VM runtime timestamps are reversed")
-        derived = max(1, math.ceil((end - start).total_seconds()))
+        derived = _observed_running_seconds(self.journal)
         if override is None:
             return derived
         if type(override) is not int or override < derived:
@@ -465,12 +503,541 @@ def default_az_runner(arguments, *, timeout=120):
     return RunnerResult(stdout=result.stdout)
 
 
-def require_live_custodian_approval():
-    raise RuntimeError(NO_LIVE_APPROVAL)
+class SubscriptionRunner:
+    """Pin every az call to one subscription, optionally until a deadline."""
+
+    def __init__(self, subscription, deadline=None, clock=None, runner=None):
+        self.subscription = custody._uuid(subscription, "Subscription")
+        if deadline is not None:
+            deadline = _aware(deadline, "Live runner deadline")
+        self.deadline = deadline
+        self.clock = clock or _utc_now
+        self.runner = runner
+
+    def __call__(self, arguments, *, timeout=120):
+        arguments = list(arguments)
+        if any(not isinstance(item, str) or item == "--subscription"
+               or item.startswith("--subscription=") for item in arguments):
+            raise ValueError("Custodian argv must not select its own subscription")
+        if (self.deadline is not None
+                and _aware(self.clock(), "Custodian clock") > self.deadline):
+            raise RuntimeError(
+                "Approved live window has closed; refusing further Azure calls"
+            )
+        runner = self.runner or default_az_runner
+        return runner(
+            [*arguments, "--subscription", self.subscription], timeout=timeout,
+        )
 
 
-def run_live(*_args, **_kwargs):
-    require_live_custodian_approval()
+def read_subscription(path):
+    raw = _read_private_file(path, 128, "Subscription file")
+    try:
+        text = raw.decode("ascii").strip()
+    except UnicodeDecodeError:
+        raise ValueError("Subscription file must contain one UUID") from None
+    return custody._uuid(text, "Subscription")
+
+
+def approval_body(*, subscription, run_id, operation_id, group_id,
+                  not_before_utc, not_after_utc, max_vm_running_seconds,
+                  location=LOCATION, nonce=None):
+    subscription = custody._uuid(subscription, "Subscription")
+    if not_before_utc is None or not_after_utc is None:
+        raise ValueError("Live approval window bounds are required")
+    body = {
+        "schema": LIVE_APPROVAL_SCHEMA,
+        "version": 1,
+        "mode": LIVE_MODE,
+        "subscription_sha256": _subscription_sha256(subscription),
+        "location": location,
+        "run_id": run_id,
+        "operation_id": operation_id,
+        "group_id": group_id,
+        "not_before_utc": _timestamp(not_before_utc),
+        "not_after_utc": _timestamp(not_after_utc),
+        "max_vm_running_seconds": max_vm_running_seconds,
+        "cleanup": LIVE_CLEANUP,
+        "nonce": nonce or secrets.token_hex(16),
+    }
+    _approval_shape(body)
+    _approval_group_prefix(group_id, subscription)
+    return body
+
+
+def sign_live_approval(body, approver_private_key):
+    _approval_shape(body)
+    signature = _private_key(approver_private_key).sign(_approval_message(body))
+    return azure.canonical_json({"body": body, "signature": signature.hex()})
+
+
+def require_live_custodian_approval(approval_raw=None, *, approver_public_key=None,
+                                    custodian_public_key=None, expected=None,
+                                    plan=None, subscription=None, now=None):
+    if not approval_raw:
+        raise LiveApprovalRefused(NO_LIVE_APPROVAL)
+    if any(value is None for value in (
+        approver_public_key, custodian_public_key, expected, plan,
+        subscription, now,
+    )):
+        raise LiveApprovalRefused(NO_LIVE_APPROVAL)
+    try:
+        return _require_live_approval(
+            approval_raw, approver_public_key, custodian_public_key,
+            expected, plan, subscription, now,
+        )
+    except LiveApprovalRefused:
+        raise
+    except Exception as error:
+        raise LiveApprovalRefused(f"Live approval refused: {error}") from None
+
+
+def _require_live_approval(approval_raw, approver_public_key,
+                           custodian_public_key, expected, plan,
+                           subscription, now):
+    if not isinstance(approval_raw, bytes) or len(approval_raw) > LIVE_APPROVAL_LIMIT:
+        raise ValueError("Live approval exceeds its byte limit")
+    record = azure.require_exact_fields(
+        custody._parse(approval_raw, "Live approval", LIVE_APPROVAL_LIMIT),
+        ("body", "signature"), "Live approval",
+    )
+    signature = record["signature"]
+    if not isinstance(signature, str) or not re.fullmatch(r"[0-9a-f]{128}", signature):
+        raise ValueError("Invalid live approval signature encoding")
+    approver = load_public_key(approver_public_key)
+    if approver == load_public_key(custodian_public_key):
+        raise ValueError("Live approver key must differ from the custodian key")
+    body = record["body"]
+    if not isinstance(body, dict):
+        raise ValueError("Live approval body must be an object")
+    try:
+        Ed25519PublicKey.from_public_bytes(approver).verify(
+            bytes.fromhex(signature), _approval_message(body),
+        )
+    except (InvalidSignature, ValueError):
+        raise ValueError("Invalid live approval signature") from None
+    not_before, not_after = _approval_shape(body)
+    subscription = custody._uuid(subscription, "Subscription")
+    if body["subscription_sha256"] != _subscription_sha256(subscription):
+        raise ValueError("Live approval is bound to a different subscription")
+    if not isinstance(expected, custody.Expected):
+        raise ValueError("Live approval requires an Expected custody context")
+    expected.validate()
+    if not isinstance(plan, CustodianPlan) or plan.expected != expected:
+        raise ValueError("Custodian plan differs from the expected custody context")
+    if plan.location != LOCATION or body["location"] != plan.location:
+        raise ValueError("Live approval location differs from the custodian plan")
+    if (body["run_id"] != expected.run_id
+            or body["operation_id"] != expected.operation_id):
+        raise ValueError("Live approval run or operation differs from expected")
+    group_id = body["group_id"]
+    if group_id != expected.resource_ids["group"]:
+        raise ValueError("Live approval group differs from the expected group")
+    _approval_group_prefix(group_id, subscription)
+    _require_owned_scope(expected, group_id)
+    now = custody._now(now)
+    if not not_before <= now <= not_after:
+        raise ValueError("Current time is outside the approved live window")
+    if (expected.preprovision_authorization_sha256
+            != hashlib.sha256(approval_raw).hexdigest()):
+        raise ValueError(
+            "Expected preprovision authorization digest differs from the live approval"
+        )
+    return body
+
+
+def _approval_message(body):
+    return (LIVE_APPROVAL_SCHEMA + "\n").encode("ascii") + azure.canonical_json(body)
+
+
+def _approval_shape(body):
+    azure.require_exact_fields(body, LIVE_APPROVAL_FIELDS, "Live approval body")
+    if (body["schema"] != LIVE_APPROVAL_SCHEMA
+            or type(body["version"]) is not int or body["version"] != 1):
+        raise ValueError("Live approval schema or version is not supported")
+    if body["mode"] != LIVE_MODE:
+        raise ValueError(
+            "Only the disposable dry-run live mode is available; acceptance "
+            "and every other live mode are not authorized"
+        )
+    if body["cleanup"] != LIVE_CLEANUP:
+        raise ValueError("Live approval must require deleting the owned group")
+    if body["location"] != LOCATION:
+        raise ValueError("Live approval location is not the reviewed region")
+    custody._sha(body["subscription_sha256"], "Live approval subscription digest")
+    custody._nonce(body["run_id"], "Live approval run ID")
+    custody._uuid(body["operation_id"], "Live approval operation ID")
+    group = body["group_id"]
+    parts = group.split("/") if isinstance(group, str) else []
+    if (not isinstance(group, str) or len(group) > 512 or len(parts) != 5
+            or parts[0] or parts[1] != "subscriptions"
+            or parts[3] != "resourceGroups" or not parts[4]):
+        raise ValueError("Live approval group is not a resource-group ARM path")
+    not_before = custody._utc(body["not_before_utc"])
+    not_after = custody._utc(body["not_after_utc"])
+    if not not_before < not_after or not_after - not_before > LIVE_WINDOW:
+        raise ValueError(
+            "Live approval window must be positive and at most 300 minutes"
+        )
+    seconds = body["max_vm_running_seconds"]
+    if type(seconds) is not int or not 1 <= seconds <= 3600:
+        raise ValueError("Live approval VM runtime budget must be 1..3600 seconds")
+    custody._nonce(body["nonce"], "Live approval nonce")
+    return not_before, not_after
+
+
+def _approval_group_prefix(group_id, subscription):
+    if not group_id.startswith(f"/subscriptions/{subscription}/resourceGroups/"):
+        raise ValueError("Live approval group is outside the pinned subscription")
+
+
+def _require_owned_scope(expected, group_id):
+    prefix = (group_id + "/providers/").lower()
+    for role, resource_id in expected.resource_ids.items():
+        if role == "group":
+            continue
+        segments = resource_id.split("/")[1:]
+        if (not resource_id.lower().startswith(prefix)
+                or any(item in ("", ".", "..") for item in segments)):
+            raise ValueError(
+                "Every expected resource ID must be inside the approved group"
+            )
+
+
+def _subscription_sha256(subscription):
+    return hashlib.sha256(subscription.encode("ascii")).hexdigest()
+
+
+def azure_vhd_upload(role, path, sas, digest, size):
+    path = Path(path)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{role} image must be a regular non-symlink file")
+    actual_size = path.stat().st_size
+    if actual_size != size:
+        raise ValueError(f"{role} image size differs from the planned upload")
+    actual = azure.image_sha256(path)
+    if actual != digest:
+        raise ValueError(f"{role} image digest differs from the reviewed input")
+    endpoint, token = azure.upload_endpoint(sas)
+    azure.upload_managed_vhd(
+        path, endpoint, token, timeout=1200, expected_sha256=digest,
+    )
+    return {"sha256": actual, "size": actual_size}
+
+
+def cleanup_disposable(recorder, plan):
+    """Delete only a group this journal proved new that still carries this
+    run's exact owner tags and only owned resources."""
+    journal = Journal(recorder.journal_path)
+    proven_new = (
+        "group.precheck" in journal.by_step
+        and _journal_value(recorder, journal, "group.precheck") is False
+    )
+    if not proven_new:
+        if "group.create" in journal.by_step:
+            raise CleanupRefused(
+                "Group pre-existence check did not prove a new group"
+            )
+        return CleanupResult("not-created")
+    group_id = plan.expected.resource_ids["group"]
+    group = plan.group_name()
+    if "group.create" not in journal.by_step:
+        # The absence precheck passed but create failed or timed out. A group
+        # now present must still carry this run's exact owner tags below.
+        probe = recorder.az("cleanup.probe", [
+            "group", "exists", "--name", group,
+        ]).value
+        if probe is False:
+            return CleanupResult("not-created")
+        if probe is not True:
+            return CleanupResult("unconfirmed")
+    shown = recorder.az("cleanup.group", ["group", "show", "--name", group]).value
+    tags = shown.get("tags") if isinstance(shown, dict) else None
+    if (not isinstance(shown, dict) or not isinstance(shown.get("id"), str)
+            or shown["id"].lower() != group_id.lower()):
+        raise CleanupRefused("Cleanup group identity differs from the expected group")
+    if (not isinstance(tags, dict)
+            or any(tags.get(key) != value
+                   for key, value in plan.tags("group").items())):
+        raise CleanupRefused("Cleanup group lacks this run's exact owner tags")
+    listed = recorder.az("cleanup.inventory", [
+        "resource", "list", "--resource-group", group,
+    ]).value
+    owned, vm_present = _cleanup_inventory(listed, plan)
+    deallocated = False
+    if vm_present and "vm.deallocate" not in journal.by_step:
+        try:
+            recorder.az("cleanup.deallocate", [
+                "vm", "deallocate", "--resource-group", group,
+                "--name", plan.resource_name("vm"),
+            ], timeout=900)
+            deallocated = True
+        except Exception:
+            pass
+    if not owned:
+        raise CleanupRefused(
+            "Cleanup group contains foreign or untagged resources; deletion refused"
+        )
+    listed_ids = {item["id"].lower() for item in listed}
+    for role in DISKS:
+        if (f"disk.{role}.revoke" in journal.by_step
+                or plan.expected.resource_ids[role].lower() not in listed_ids):
+            continue
+        try:
+            recorder.az(f"cleanup.revoke.{role}", [
+                "disk", "revoke-access", "--resource-group", group,
+                "--name", plan.resource_name(role),
+            ], timeout=180)
+        except Exception:
+            pass  # An active SAS makes the group delete below fail closed.
+    recorder.az("cleanup.delete", [
+        "group", "delete", "--name", group, "--yes",
+    ], timeout=1800)
+    exists = recorder.az("cleanup.exists", [
+        "group", "exists", "--name", group,
+    ]).value
+    if exists is not False:
+        raise ValueError("Cleanup did not prove the owned group is gone")
+    return CleanupResult("deleted", deallocated)
+
+
+def _cleanup_inventory(listed, plan):
+    if not isinstance(listed, list):
+        return False, False
+    prefix = (plan.expected.resource_ids["group"] + "/providers/").lower()
+    vm_id = plan.expected.resource_ids["vm"].lower()
+    owned = True
+    vm_present = False
+    for item in listed:
+        resource_id = item.get("id") if isinstance(item, dict) else None
+        tags = item.get("tags") if isinstance(item, dict) else None
+        if (not isinstance(resource_id, str)
+                or not resource_id.lower().startswith(prefix)
+                or not isinstance(tags, dict)
+                or tags.get("issue90-run") != plan.expected.run_id
+                or tags.get("issue90-operation") != plan.expected.operation_id):
+            owned = False
+            continue
+        if resource_id.lower() == vm_id:
+            vm_present = True
+    return owned, vm_present
+
+
+def run_live(approval=None, *, approver_public_key=None,
+             custodian_private_key=None, custodian_public_key=None,
+             expected=None, plan=None, subscription=None, directory=None,
+             records_dir=None, registry_dir=None, runner=None,
+             cleanup_runner=None, upload=None, clock=None):
+    """Run one signed disposable dry run; acceptance is never available."""
+    clock = clock or _utc_now
+    if approval is None:
+        raise LiveApprovalRefused(NO_LIVE_APPROVAL)
+    try:
+        approval_raw = _read_private_file(
+            approval, LIVE_APPROVAL_LIMIT, "Live approval",
+        )
+    except (OSError, ValueError):
+        raise LiveApprovalRefused(
+            NO_LIVE_APPROVAL + " (approval must be a private bounded file)"
+        ) from None
+    body = require_live_custodian_approval(
+        approval_raw,
+        approver_public_key=approver_public_key,
+        custodian_public_key=custodian_public_key,
+        expected=expected, plan=plan, subscription=subscription, now=clock(),
+    )
+    if any(value is None for value in (
+        custodian_private_key, directory, records_dir, registry_dir,
+    )):
+        raise LiveApprovalRefused(NO_LIVE_APPROVAL)
+    custodian_key = _private_key(custodian_private_key)
+    custodian_public = load_public_key(custodian_public_key)
+    if _public_bytes(custodian_key) != custodian_public:
+        raise ValueError("Custodian private and public keys do not match")
+    _check_template(plan, expected)
+    if upload is None:
+        _preflight_uploads(plan)
+        upload = azure_vhd_upload
+    records_dir = _ensure_private_dir(records_dir)
+    if any(os.path.lexists(records_dir / name)
+           for name in ("prepared.json", "handoff.json")):
+        raise ValueError("Records directory already holds custody records")
+    registry_dir = _require_private_dir(registry_dir, "Replay registry")
+    if any(os.path.lexists(registry_dir / name) for name in (
+        f"run-{expected.run_id}.json",
+        f"challenge-{expected.handoff_challenge}.json",
+    )):
+        raise ValueError("Run or handoff challenge was already consumed")
+    directory = _create_private_dir(directory, "Live custodian directory")
+    try:
+        _claim_live_approval(registry_dir, approval_raw, body)
+    except BaseException:
+        directory.rmdir()
+        raise
+    return _run_live_session(
+        body, expected=expected, plan=plan, subscription=subscription,
+        directory=directory, records_dir=records_dir,
+        registry_dir=registry_dir, custodian_key=custodian_key,
+        custodian_public=custodian_public, runner=runner,
+        cleanup_runner=cleanup_runner, upload=upload, clock=clock,
+    )
+
+
+def _run_live_session(body, *, expected, plan, subscription, directory,
+                      records_dir, registry_dir, custodian_key,
+                      custodian_public, runner, cleanup_runner, upload, clock):
+    not_after = custody._utc(body["not_after_utc"])
+    recorder = CustodianRecorder(
+        directory,
+        runner=SubscriptionRunner(
+            subscription, deadline=not_after, clock=clock, runner=runner,
+        ),
+        clock=clock,
+        revoke_runner=SubscriptionRunner(
+            subscription, clock=clock, runner=cleanup_runner or runner,
+        ),
+    )
+    private = list(_live_private_values(subscription, expected, plan))
+
+    def tracked_upload(role, path, sas, digest, size):
+        if isinstance(sas, str):
+            private.extend((sas, *sas.split("?", 1)[1:]))
+        return upload(role, path, sas, digest, size)
+
+    digest = reason = None
+    try:
+        phase = record_preprovision(recorder, plan, upload=tracked_upload)
+        runtime = _observed_running_seconds(Journal(recorder.journal_path))
+        if runtime > body["max_vm_running_seconds"]:
+            raise ValueError(
+                "Observed dummy VM runtime exceeds the approved maximum; "
+                "refusing the OS swap"
+            )
+        record_handoff(recorder, plan, phase)
+        issued = _aware(clock(), "Custodian clock").replace(microsecond=0)
+        expires = min(issued + HANDOFF_LIFETIME, not_after)
+        if expires <= issued:
+            raise ValueError("Approved live window closed before handoff signing")
+        prepared, handoff = CustodyAssembler(directory, expected).write_signed(
+            records_dir, custodian_key, prepared_at=issued, handoff_at=issued,
+            handoff_expires_at=expires,
+        )
+        verification = verify_handoff(
+            prepared, handoff, expected=expected, public_key=custodian_public,
+            archive_dir=directory / "archive", registry_dir=registry_dir,
+            now=clock(), private_values=private,
+        )
+        if verification.passed:
+            digest = verification.digest
+        else:
+            reason = verification.reason
+    except BaseException as error:
+        # Interrupts are reported, not re-raised, so the cleanup status is kept.
+        reason = (sanitize_reason(error, private) or type(error).__name__)
+        if not isinstance(error, Exception):
+            reason = f"Interrupted ({type(error).__name__}): {reason}"
+    finally:
+        cleanup, cleanup_reason = _live_cleanup(
+            directory, plan,
+            SubscriptionRunner(
+                subscription, clock=clock, runner=cleanup_runner or runner,
+            ),
+            clock, private,
+        )
+    passed = digest is not None and cleanup == "deleted"
+    if not passed and reason is None:
+        reason = "Owned dry-run resource group cleanup was not proven"
+    return LiveResult(passed, digest, cleanup, reason, cleanup_reason)
+
+
+def _live_cleanup(directory, plan, runner, clock, private):
+    try:
+        result = cleanup_disposable(
+            CustodianRecorder(directory, runner=runner, clock=clock), plan,
+        )
+    except CleanupRefused as error:
+        return "refused", sanitize_reason(error, private)
+    except Exception as error:
+        return "failed", sanitize_reason(error, private)
+    if result.status == "unconfirmed":
+        return result.status, (
+            "Group creation could be neither confirmed nor ruled out; no "
+            "deletion was attempted, so check the subscription manually"
+        )
+    return result.status, None
+
+
+def _live_private_values(subscription, expected, plan):
+    values = {
+        subscription, expected.run_id, expected.operation_id,
+        expected.handoff_challenge, plan.group_name(), plan.prefix(),
+    }
+    for resource_id in expected.resource_ids.values():
+        values.add(resource_id)
+        values.add(resource_id.rsplit("/", 1)[-1])
+    return tuple(sorted(values))
+
+
+def _claim_live_approval(registry_dir, approval_raw, body):
+    digest = hashlib.sha256(approval_raw).hexdigest()
+    claim = azure.canonical_json({
+        "approval_sha256": digest,
+        "run_id": body["run_id"],
+        "nonce": body["nonce"],
+    })
+    try:
+        _write_private_file(registry_dir / f"live-approval-{digest}.json", claim)
+    except FileExistsError:
+        raise LiveApprovalRefused("Live approval was already consumed") from None
+
+
+def _check_template(plan, expected):
+    raw = azure.read_regular_file(
+        plan.template_file, 1024 * 1024, "Custodian ARM template",
+    )
+    if hashlib.sha256(raw).hexdigest() != expected.template_sha256:
+        raise ValueError("ARM template bytes differ from Expected.template_sha256")
+
+
+def _preflight_uploads(plan):
+    for role in DISKS:
+        path = plan.image_path(role)
+        if path is None:
+            raise ValueError(f"{role} image path is required")
+        path = Path(path)
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"{role} image must be a regular non-symlink file")
+        if path.stat().st_size != plan.upload_size(role):
+            raise ValueError(f"{role} image size differs from the planned upload")
+    azure.check_upload_dependencies()
+
+
+def _observed_running_seconds(journal):
+    try:
+        started = journal.by_step["deployment.create"]["started_at_utc"]
+        completed = journal.by_step["vm.deallocate"]["completed_at_utc"]
+    except KeyError:
+        raise ValueError(
+            "Missing custodian timestamps for dummy VM runtime"
+        ) from None
+    if started is None or completed is None:
+        raise ValueError("Missing custodian timestamps for dummy VM runtime")
+    start = custody._precise_utc(started)
+    end = custody._precise_utc(completed)
+    if end < start:
+        raise ValueError("Custodian dummy VM runtime timestamps are reversed")
+    return max(1, math.ceil((end - start).total_seconds()))
+
+
+def _journal_value(recorder, journal, step):
+    ref = journal.ref(step)
+    raw = _read_private_file(
+        recorder.archive.directory / ref["sha256"], custody.MAX_ARCHIVE,
+        "Custodian archive blob",
+    )
+    if len(raw) != ref["size"] or hashlib.sha256(raw).hexdigest() != ref["sha256"]:
+        raise ValueError("Custodian archive blob differs from its journal reference")
+    return _parse_stdout(raw, step)
 
 
 def record_preprovision(recorder, plan, *, upload=None):
@@ -481,6 +1048,14 @@ def record_preprovision(recorder, plan, *, upload=None):
         if plan.image_path(role) is None:
             raise ValueError(f"{role} image path is required")
     group = plan.group_name()
+    exists = recorder.az("group.precheck", [
+        "group", "exists", "--name", group,
+    ]).value
+    if exists is not False:
+        raise ValueError(
+            "Resource group already exists or its absence is unproven; "
+            "refusing to adopt it"
+        )
     recorder.az("group.create", [
         "group", "create", "--name", group, "--location", plan.location,
         "--tags", *plan.tag_args("group"),
@@ -503,27 +1078,36 @@ def record_preprovision(recorder, plan, *, upload=None):
         disk_uuids[role] = custody._identity(created, role)
         if disk_uuids[role] is None:
             raise ValueError(f"{role} create response lacks an immutable disk UUID")
-        grant = recorder.az(f"disk.{role}.grant", [
-            "disk", "grant-access", "--resource-group", group,
-            "--name", plan.resource_name(role), "--access-level", "Write",
-            "--duration-in-seconds", "1800",
-        ]).value
-        sas = _grant_sas(grant)
-        uploaded_sha, uploaded_size = _upload_result(
-            upload(role, plan.image_path(role), sas, plan.image_sha256(role), size)
-        )
-        if uploaded_sha != plan.image_sha256(role) or uploaded_size != size:
-            raise ValueError(f"{role} uploaded bytes differ from reviewed input")
+        revoke = [
+            "disk", "revoke-access", "--resource-group", group,
+            "--name", plan.resource_name(role),
+        ]
+        try:
+            grant = recorder.az(f"disk.{role}.grant", [
+                "disk", "grant-access", "--resource-group", group,
+                "--name", plan.resource_name(role), "--access-level", "Write",
+                "--duration-in-seconds", "1800",
+            ]).value
+            sas = _grant_sas(grant)
+            uploaded_sha, uploaded_size = _upload_result(
+                upload(role, plan.image_path(role), sas,
+                       plan.image_sha256(role), size)
+            )
+            if uploaded_sha != plan.image_sha256(role) or uploaded_size != size:
+                raise ValueError(f"{role} uploaded bytes differ from reviewed input")
+        except BaseException:
+            try:
+                recorder.az(f"disk.{role}.revoke", revoke, timeout=180)
+            except Exception:
+                pass  # Cleanup revokes every owned disk again before deletion.
+            raise
         recorder.synthetic(f"disk.{role}.upload", {
             "id": plan.expected.resource_ids[role],
             "sha256": uploaded_sha,
             "size": uploaded_size,
             "status": "Succeeded",
         })
-        recorder.az(f"disk.{role}.revoke", [
-            "disk", "revoke-access", "--resource-group", group,
-            "--name", plan.resource_name(role),
-        ], timeout=180)
+        recorder.az(f"disk.{role}.revoke", revoke, timeout=180)
         recorder.synthetic(f"disk.{role}.revocation", {
             "id": plan.expected.resource_ids[role],
             "status": "Succeeded",
@@ -708,6 +1292,34 @@ def expected_from_mapping(value):
     return custody.Expected(**kwargs)
 
 
+def plan_from_mapping(value, expected):
+    if not isinstance(value, dict):
+        raise ValueError("Custodian plan must be a JSON object")
+    if set(value) - {*PLAN_FIELDS, "upload_sizes"} or not set(PLAN_FIELDS) <= set(value):
+        raise ValueError("Custodian plan has unknown or missing fields")
+    paths = azure.require_exact_fields(
+        value["image_paths"], DISKS, "Custodian plan image paths",
+    )
+    if any(not isinstance(item, str) or not item for item in paths.values()):
+        raise ValueError("Custodian plan image paths must be non-empty strings")
+    sizes = value.get("upload_sizes")
+    if sizes is not None and (
+        not isinstance(sizes, dict) or set(sizes) - set(DISKS)
+        or any(type(item) is not int or item <= 0 for item in sizes.values())
+    ):
+        raise ValueError("Custodian plan upload sizes are invalid")
+    return CustodianPlan(
+        expected=expected,
+        reviewed_head=value["reviewed_head"],
+        config_sha256=value["config_sha256"],
+        efi_sha256=value["efi_sha256"],
+        raw_sha256=value["raw_sha256"],
+        miz_sha256=value["miz_sha256"],
+        image_paths={role: Path(item) for role, item in paths.items()},
+        upload_sizes=sizes,
+    )
+
+
 def sanitize_reason(error, private_values=()):
     return azure.safe_failure_message(error, private_values)
 
@@ -725,7 +1337,30 @@ def main(argv=None):
     verify.add_argument("--expected-json", required=True, type=Path)
     verify.add_argument("--custodian-public-key", required=True, type=Path)
     verify.add_argument("--now")
-    sub.add_parser("live", help="disabled live custodian entry point")
+    approve = sub.add_parser(
+        "approve-dry-run",
+        help="sign a disposable dry-run live approval (acceptance unavailable)",
+    )
+    approve.add_argument("--expected-json", required=True, type=Path)
+    approve.add_argument("--subscription-file", required=True, type=Path)
+    approve.add_argument("--approver-private-key", required=True, type=Path)
+    approve.add_argument("--not-before", required=True)
+    approve.add_argument("--not-after", required=True)
+    approve.add_argument("--max-vm-running-seconds", required=True, type=int)
+    approve.add_argument("--output", required=True, type=Path)
+    live = sub.add_parser(
+        "live", help="run one signed disposable dry run (acceptance unavailable)",
+    )
+    live.add_argument("--approval", required=True, type=Path)
+    live.add_argument("--approver-public-key", required=True, type=Path)
+    live.add_argument("--custodian-private-key", required=True, type=Path)
+    live.add_argument("--custodian-public-key", required=True, type=Path)
+    live.add_argument("--expected-json", required=True, type=Path)
+    live.add_argument("--subscription-file", required=True, type=Path)
+    live.add_argument("--plan-json", required=True, type=Path)
+    live.add_argument("--directory", required=True, type=Path)
+    live.add_argument("--records-dir", required=True, type=Path)
+    live.add_argument("--registry-dir", required=True, type=Path)
     args = parser.parse_args(argv)
     if args.command == "keys":
         generate_test_keys(args.directory)
@@ -734,11 +1369,129 @@ def main(argv=None):
             "three roles is not independent custody."
         )
         return 0
+    if args.command == "approve-dry-run":
+        return _main_approve(args)
     if args.command == "live":
-        run_live()
+        return _main_live(args)
     expected = expected_from_mapping(azure.load_strict_json(
         args.expected_json, custody.MAX_RECORD, "Expected custody context",
     )[0])
+    result = verify_handoff(
+        args.prepared, args.handoff,
+        expected=expected,
+        public_key=args.custodian_public_key,
+        archive_dir=args.archive_dir,
+        registry_dir=args.registry_dir,
+        now=_parse_timestamp(args.now) if args.now else None,
+        output=sys.stdout,
+    )
+    return 0 if result.passed else 1
+
+
+def _main_approve(args):
+    private = []
+    try:
+        subscription = read_subscription(args.subscription_file)
+        private.append(subscription)
+        expected = expected_from_mapping(
+            _load_private_json(args.expected_json, "Expected custody context"),
+        )
+        expected.validate()
+        private.extend((expected.run_id, expected.operation_id,
+                        *expected.resource_ids.values()))
+        group_id = expected.resource_ids["group"]
+        body = approval_body(
+            subscription=subscription,
+            run_id=expected.run_id,
+            operation_id=expected.operation_id,
+            group_id=group_id,
+            not_before_utc=args.not_before,
+            not_after_utc=args.not_after,
+            max_vm_running_seconds=args.max_vm_running_seconds,
+        )
+        _require_owned_scope(expected, group_id)
+        raw = sign_live_approval(body, args.approver_private_key)
+        _write_private_file(args.output, raw)
+    except Exception as error:
+        print("FAIL " + sanitize_reason(error, private))
+        return 1
+    print(
+        "Wrote signed disposable dry-run approval; set "
+        "Expected.preprovision_authorization_sha256 to "
+        + hashlib.sha256(raw).hexdigest()
+    )
+    return 0
+
+
+def _main_live(args):
+    private = []
+    try:
+        subscription = read_subscription(args.subscription_file)
+        private.append(subscription)
+        expected = expected_from_mapping(
+            _load_private_json(args.expected_json, "Expected custody context"),
+        )
+        private.extend((expected.run_id, expected.operation_id))
+        if isinstance(expected.resource_ids, dict):
+            private.extend(str(item) for item in expected.resource_ids.values())
+        plan = plan_from_mapping(azure.load_strict_json(
+            args.plan_json, custody.MAX_RECORD, "Custodian plan",
+        )[0], expected)
+        with _interrupt_on_termination():
+            result = run_live(
+                args.approval,
+                approver_public_key=args.approver_public_key,
+                custodian_private_key=args.custodian_private_key,
+                custodian_public_key=args.custodian_public_key,
+                expected=expected, plan=plan, subscription=subscription,
+                directory=args.directory, records_dir=args.records_dir,
+                registry_dir=args.registry_dir,
+            )
+    except Exception as error:
+        print("FAIL " + sanitize_reason(error, private) + " cleanup=not-started")
+        return 1
+    if result.passed:
+        print("PASS cleanup=deleted")
+        return 0
+    message = "FAIL " + sanitize_reason(result.reason, private)
+    message += " cleanup=" + result.cleanup
+    if result.cleanup_reason:
+        message += " (" + sanitize_reason(result.cleanup_reason, private) + ")"
+    print(message)
+    return 1
+
+
+class _interrupt_on_termination:
+    """Turn SIGTERM/SIGHUP into KeyboardInterrupt so owned cleanup runs."""
+
+    SIGNALS = tuple(getattr(signal, name) for name in ("SIGTERM", "SIGHUP")
+                    if hasattr(signal, name))
+
+    def __enter__(self):
+        self.previous = {}
+        for number in self.SIGNALS:
+            if signal.getsignal(number) is signal.SIG_IGN:
+                continue  # Respect nohup and other inherited ignores.
+            self.previous[number] = signal.signal(number, self._raise)
+        return self
+
+    def __exit__(self, *_exc):
+        for number, handler in self.previous.items():
+            signal.signal(number, handler)
+        return False
+
+    def _raise(self, number, _frame):
+        # Fire once: later signals must not abort the owned cleanup, and the
+        # cleanup az children inherit the ignore disposition.
+        for item in self.previous:
+            signal.signal(item, signal.SIG_IGN)
+        raise KeyboardInterrupt(f"signal {number}")
+
+
+def _load_private_json(path, label):
+    return azure.parse_strict_json(
+        _read_private_file(path, custody.MAX_RECORD, label), label,
+    )
     result = verify_handoff(
         args.prepared, args.handoff,
         expected=expected,
@@ -761,6 +1514,23 @@ def _private_key(value):
     if len(raw) != 32:
         raise ValueError("Ed25519 private key must be 32 raw bytes")
     return Ed25519PrivateKey.from_private_bytes(raw)
+
+
+def _public_bytes(private_key):
+    return private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+
+
+def _utc_now():
+    return datetime.now(timezone.utc)
+
+
+def _aware(value, label):
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise ValueError(f"{label} must be a timezone-aware datetime")
+    return value.astimezone(timezone.utc)
 
 
 def _record_children(recorder, plan, *, prefix):
@@ -1039,15 +1809,15 @@ def _ensure_private_dir(path):
             raise
 
 
-def _create_private_dir(path):
+def _create_private_dir(path, label="Custodian key directory"):
     path = Path(path).absolute()
     if path.exists():
-        raise FileExistsError("Custodian key directory already exists")
+        raise FileExistsError(f"{label} already exists")
     os.mkdir(path, 0o700)
     try:
         os.chmod(path, 0o700)
         _fsync_directory(path.parent)
-        return _require_private_dir(path, "Custodian key directory")
+        return _require_private_dir(path, label)
     except BaseException:
         try:
             path.rmdir()
