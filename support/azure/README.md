@@ -1249,6 +1249,13 @@ Preparation, all offline:
    `preprovision_sha256` (P's digest), `max_vm_running_seconds` of at most
    3600 and a window of at most 300 minutes.
 
+Times are in the **verifier host's clock domain**. When the local clock is
+skewed, pass `--clock-offset-seconds` (local minus verifier UTC, at most
+3600) to `sign-preprovision` and `approve-acceptance`. The verifier
+requires P's `issued_at_utc` to be no later than its own clock and earlier
+than PREPARED. `approve-acceptance` refuses a P issued in the verifier's
+future, and a window that has already ended.
+
 Before any Azure call, `acceptance` applies the dry-run approval checks,
 requires P to be a valid approver-signed statement that matches `Expected`
 and the plan and was issued before now, and requires `Expected` and the
@@ -1261,9 +1268,20 @@ The verifier runs on a separate x86_64 KVM host because it re-runs `admit()`.
 keys) speaks newline-delimited canonical JSON on stdin/stdout: a `ready`
 line, then exactly one request per stage, in order (offline, handoff,
 dispatch, optional observation, disposal). Bytes are bounded base64. The
-protocol uses private descriptors; stdio and diagnostics go to `/dev/null`.
+protocol uses private descriptors; stdio and diagnostics go to `/dev/null`,
+so stdout carries only protocol lines, even on startup failure.
 `--verifier-argv-json` names the command, for example an `ssh` argv. Each
-call has a timeout. A transport or response error is a refusal.
+call has a deadline. Pipes are non-blocking, so a stalled peer cannot hold
+a read or write past it. A transport or response error is a refusal.
+
+The `ready` line carries the verifier's UTC time (`now_utc`, microseconds).
+`acceptance` connects before any Azure call and refuses a missing,
+malformed or more-than-3600 s-distant time. It then runs entirely on the
+verifier's clock: `now_utc` carried forward by the local monotonic clock
+from the moment `ready` was received. That clock lags the verifier slightly
+and is never ahead of it. It drives every statement, journal time, approval
+window, deadline and the start-after-reservation wait. The measured offset,
+rounded to seconds, is journaled and reported in the summary.
 
 After the dry-run style provisioning and HANDOFF (lifetime at most 55
 minutes), the lane does the following:

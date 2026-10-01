@@ -11,9 +11,11 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from unittest import mock
 
@@ -60,6 +62,38 @@ def guest_serial(state):
 def partial_serial(state):
     text = guest_serial(state)
     return text[:text.index("HYPERV_TOPOLOGY FINAL ")]
+
+
+def child_argv(*bodies):
+    code = textwrap.dedent(f"""
+        import sys
+        sys.path.insert(0, {str(SCRIPTS)!r})
+        sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})
+        import importlib
+        acceptance = importlib.import_module("hyperv_issue90_acceptance")
+        from test_hyperv_issue90_acceptance import FakeLocal
+    """) + "".join(textwrap.dedent(body) for body in bodies)
+    return [sys.executable, "-c", code]
+
+
+RAW_READY = """
+    import json, time
+    ready = {{"protocol": acceptance.PROTOCOL, "stage": "ready",
+              "passed": True, "reason": None}}
+    ready.update({change})
+    sys.stdout.buffer.write(json.dumps(
+        ready, sort_keys=True, separators=(",", ":")).encode() + b"\\n")
+    sys.stdout.buffer.flush()
+"""
+READY = """
+    import time
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc) - timedelta(seconds={shift})
+    sys.stdout.buffer.write(acceptance.encode_response({{
+        "stage": "ready", "passed": True, "reason": None,
+        "now_utc": now.strftime(acceptance.PRECISE_UTC)}}))
+    sys.stdout.buffer.flush()
+"""
 
 
 class Clock:
@@ -213,7 +247,8 @@ class AcceptanceLaneTests(unittest.TestCase):
 
     def run_acceptance(self, serials=None, *, admit=None, approval=None,
                        preprovision=None, configure=None, registry=None,
-                       verifier_claims=(), max_poll_seconds=600):
+                       verifier_claims=(), max_poll_seconds=600,
+                       lane_skew=None, correct=True):
         self.count += 1
         number = self.count
         self.clock = Clock()
@@ -256,6 +291,13 @@ class AcceptanceLaneTests(unittest.TestCase):
             clock=self.clock, sleep=self.clock.sleep,
         )
         self.verifier = Recording(self.local)
+        lane_clock, offset = self.clock, None
+        if lane_skew is not None:
+            def raw():
+                return self.clock() + timedelta(seconds=lane_skew)
+            lane_clock = raw
+            if correct:
+                lane_clock, offset = self.ready_clock(raw)
         self.directory = self.root / f"live-{number}"
         self.records = self.root / f"records-{number}"
         with mock.patch.object(admission, "admit",
@@ -267,9 +309,25 @@ class AcceptanceLaneTests(unittest.TestCase):
                 subscription=SUBSCRIPTION, state=self.state,
                 directory=self.directory, records_dir=self.records,
                 registry_dir=registry, verifier=self.verifier,
-                runner=self.fake, upload=self.upload, clock=self.clock,
+                runner=self.fake, upload=self.upload, clock=lane_clock,
                 sleep=self.clock.sleep, max_poll_seconds=max_poll_seconds,
+                clock_offset_seconds=offset,
             )
+
+    def ready_clock(self, raw):
+        """Derive the lane clock from the verifier's real `ready` line."""
+        stdout = io.BytesIO()
+        acceptance.serve(self.local, io.BytesIO(), stdout)
+        ready = acceptance.decode_response(
+            stdout.getvalue().splitlines(True)[0], "ready")
+
+        def monotonic():
+            return (self.clock() - START).total_seconds()
+        clock = acceptance.VerifierClock(
+            ready["now_utc"], received_utc=raw(), anchor=monotonic(),
+            monotonic=monotonic,
+        )
+        return clock, clock.offset_seconds
 
     def journal(self):
         return custodian.Journal(self.directory / "journal.jsonl")
@@ -365,6 +423,44 @@ class AcceptanceLaneTests(unittest.TestCase):
         )
         self.assertNotEqual(acceptance_record["challenge"],
                             self.fixture.expected.handoff_challenge)
+
+    def assert_verifier_clock_domain(self, skew):
+        result = self.run_acceptance(lane_skew=skew)
+        self.assertTrue(result.passed, result.reasons)
+        self.assertEqual(result.verifier_result, "PASS")
+        self.assert_cleaned(result)
+        self.assertEqual(len(self.starts()), 1)
+        self.assertLessEqual(abs(result.clock_offset_seconds - skew), 2)
+        summary = self.assert_private_summary()
+        self.assertEqual(summary["clock_offset_seconds"],
+                         result.clock_offset_seconds)
+        note = self.journal().by_step["verifier.clock-offset"]
+        self.assertEqual(self.steps()[0], "verifier.clock-offset")
+        raw = (self.directory / "archive" / note["ref"]["sha256"]).read_bytes()
+        self.assertEqual(json.loads(raw), {
+            "clock_offset_seconds": result.clock_offset_seconds,
+        })
+        verifier_now = self.clock.now
+        for name in ("prepared.json", "assurance.json", "acceptance.json",
+                     "observation.json", "disposal.json"):
+            issued = custody._utc(json.loads(
+                (self.records / name).read_bytes())["body"]["issued_at_utc"])
+            self.assertLessEqual(issued, verifier_now, name)
+
+    def test_lane_clock_ahead_of_verifier_uses_ready_time(self):
+        self.assert_verifier_clock_domain(125)
+
+    def test_lane_clock_behind_verifier_uses_ready_time(self):
+        self.assert_verifier_clock_domain(-125)
+
+    def test_uncorrected_lane_clock_ahead_loses_the_attempt(self):
+        result = self.run_acceptance(lane_skew=125, correct=False)
+        self.assertFalse(result.passed)
+        self.assertTrue(any("statement_issued_in_future" in reason
+                            for reason in result.reasons), result.reasons)
+        self.assertEqual(self.starts(), [])
+        self.assert_cleaned(result)
+        self.assertIsNone(result.clock_offset_seconds)
 
     def test_unavailable_baseline_is_recorded_without_storage_tokens(self):
         result = self.run_acceptance(
@@ -596,6 +692,7 @@ class FakeLocal:
         self.fail = fail
         self.error = error
         self.calls = []
+        self.clock = lambda: datetime.now(timezone.utc)
 
     def _result(self, stage, **extra):
         self.calls.append(stage)
@@ -758,15 +855,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(responses[-1]["stage"], "disposal")
 
     def child(self, body):
-        code = textwrap.dedent(f"""
-            import sys
-            sys.path.insert(0, {str(SCRIPTS)!r})
-            sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})
-            import importlib
-            acceptance = importlib.import_module("hyperv_issue90_acceptance")
-            from test_hyperv_issue90_acceptance import FakeLocal
-        """) + textwrap.dedent(body)
-        return [sys.executable, "-c", code]
+        return child_argv(body)
 
     def test_remote_verifier_round_trip_over_a_subprocess(self):
         remote = acceptance.RemoteVerifier(self.child("""
@@ -817,6 +906,142 @@ class ProtocolTests(unittest.TestCase):
                 return {"stage": "offline", "passed": True, "reason": None}
         self.assertEqual(acceptance._call_verifier(Bad(), "offline")["reason"],
                          "verifier_response_invalid")
+
+    def test_ready_reports_the_verifier_time(self):
+        local = FakeLocal()
+        local.clock = lambda: datetime(2026, 9, 29, 4, 0, 1, 25,
+                                       tzinfo=timezone.utc)
+        code, responses = self.serve(local, [])
+        self.assertEqual(code, 1)
+        self.assertEqual(responses, [{
+            "protocol": acceptance.PROTOCOL, "stage": "ready", "passed": True,
+            "reason": None, "now_utc": "2026-09-29T04:00:01.000025Z",
+        }])
+
+        def broken():
+            raise RuntimeError("private detail")
+        local.clock = broken
+        code, responses = self.serve(local, [acceptance.encode_request("offline")])
+        self.assertEqual(responses, [{
+            "protocol": acceptance.PROTOCOL, "stage": "ready", "passed": False,
+            "reason": "verifier_clock_unavailable",
+        }])
+        self.assertEqual(local.calls, [])
+        ready = {"stage": "ready", "passed": True, "reason": None,
+                 "now_utc": "2026-09-29T04:00:01.000025Z"}
+        self.assertEqual(acceptance.check_response("ready", ready), ready)
+        for change in ({"now_utc": "2026-09-29T04:00:01Z"}, {"now_utc": None},
+                       {"now_utc": "2026-02-30T04:00:01.000000Z"}):
+            with self.assertRaises(ValueError, msg=change):
+                acceptance.check_response("ready", {**ready, **change})
+        missing = dict(ready)
+        del missing["now_utc"]
+        with self.assertRaises(ValueError):
+            acceptance.check_response("ready", missing)
+
+    def test_verifier_clock_lags_the_ready_time(self):
+        ticks = [100.0]
+        clock = acceptance.VerifierClock(
+            "2026-09-29T04:00:00.500000Z",
+            received_utc=datetime(2026, 9, 29, 4, 2, 5, 750000,
+                                  tzinfo=timezone.utc),
+            anchor=100.0, monotonic=lambda: ticks[0],
+        )
+        self.assertEqual(clock.offset_seconds, 125.25)
+        self.assertEqual(clock(), datetime(2026, 9, 29, 4, 0, 0, 500000,
+                                           tzinfo=timezone.utc))
+        ticks[0] = 160.25
+        self.assertEqual(clock(), datetime(2026, 9, 29, 4, 1, 0, 750000,
+                                           tzinfo=timezone.utc))
+        ticks[0] = 99.0
+        self.assertEqual(clock(), datetime(2026, 9, 29, 4, 0, 0, 500000,
+                                           tzinfo=timezone.utc))
+        for value in ("2026-09-29T04:00:00Z", None, 5):
+            with self.assertRaises(ValueError):
+                acceptance.VerifierClock(
+                    value, received_utc=datetime.now(timezone.utc), anchor=0.0)
+        self.assertEqual(acceptance.clock_offset(-125.4), -125)
+        for value in (float("nan"), float("inf"), True, "1", 3600.5):
+            with self.assertRaises(ValueError, msg=value):
+                acceptance.clock_offset(value)
+        shifted = acceptance.offset_clock(
+            125, clock=lambda: datetime(2026, 9, 29, 4, 2, 5, tzinfo=timezone.utc))
+        self.assertEqual(shifted(), datetime(2026, 9, 29, 4, 0, 0,
+                                             tzinfo=timezone.utc))
+
+    def test_remote_verifier_derives_the_verifier_clock_from_ready(self):
+        remote = acceptance.RemoteVerifier(
+            child_argv(READY.format(shift=125), "time.sleep(30)\n"),
+            timeouts={"ready": 60},
+        )
+        self.addCleanup(remote.close)
+        before = datetime.now(timezone.utc)
+        clock = remote.connect()
+        self.assertIsInstance(clock, acceptance.VerifierClock)
+        self.assertGreaterEqual(remote.clock_offset_seconds, 125)
+        self.assertLess(remote.clock_offset_seconds, 125 + 30)
+        lane = clock()
+        self.assertLessEqual(lane, datetime.now(timezone.utc)
+                             - timedelta(seconds=125))
+        self.assertGreater(lane, before - timedelta(seconds=126))
+        self.assertIs(remote.connect(), clock)
+        remote.close(kill=True)
+        with self.assertRaises(acceptance.VerifierTransportError):
+            remote.offline()
+
+    def test_remote_verifier_refuses_missing_invalid_or_distant_ready_time(self):
+        for body in (
+            RAW_READY.format(change="{}"),
+            RAW_READY.format(change='{"now_utc": "2026-09-29T04:00:00Z"}'),
+            RAW_READY.format(change='{"now_utc": 5}'),
+            RAW_READY.format(change='{"now_utc": "garbage"}'),
+            READY.format(shift=7200),
+            READY.format(shift=-7200),
+        ):
+            remote = acceptance.RemoteVerifier(
+                child_argv(body, "time.sleep(30)\n"), timeouts={"ready": 60},
+            )
+            self.addCleanup(remote.close)
+            started = time.monotonic()
+            with self.assertRaises(acceptance.VerifierTransportError):
+                remote.connect()
+            self.assertLess(time.monotonic() - started, 20)
+            self.assertIsNone(remote.process)
+            self.assertIsNone(remote.clock)
+
+    def test_stalled_reader_times_out_within_the_stage_deadline(self):
+        remote = acceptance.RemoteVerifier(child_argv(READY.format(shift=0), """
+            for _ in range(4):
+                sys.stdin.buffer.raw.read(4096)
+                time.sleep(0.05)
+            time.sleep(60)
+        """), timeouts={"ready": 60, "handoff": 1})
+        self.addCleanup(remote.close)
+        remote.connect()
+        started = time.monotonic()
+        result = acceptance._call_verifier(
+            remote, "handoff", b"P", b"H", b"A", b"W",
+            b"x" * (2 * 1024 * 1024), [],
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(result["reason"], "verifier_transport_failed")
+        self.assertLess(elapsed, 4)
+        self.assertIsNone(remote.process)
+
+    def test_partial_response_times_out_within_the_stage_deadline(self):
+        remote = acceptance.RemoteVerifier(child_argv(READY.format(shift=0), """
+            sys.stdin.buffer.readline()
+            sys.stdout.buffer.write(b'{"protocol":"' + b"x" * 300000)
+            sys.stdout.buffer.flush()
+            time.sleep(60)
+        """), timeouts={"ready": 60, "offline": 1})
+        self.addCleanup(remote.close)
+        remote.connect()
+        started = time.monotonic()
+        result = acceptance._call_verifier(remote, "offline")
+        self.assertEqual(result["reason"], "verifier_transport_failed")
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertIsNone(remote.process)
 
 
 class LocalVerifierTests(unittest.TestCase):
@@ -1032,6 +1257,148 @@ class CliTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             acceptance.offline_inputs_from_mapping(
                 {**mapping, "reviewed": {"head_commit": "a" * 40}})
+
+    def plan_file(self):
+        return write_private(self.root / "plan.json", json.dumps({
+            "reviewed_head": "a" * 40, "config_sha256": "b" * 64,
+            "efi_sha256": "d" * 64, "raw_sha256": "e" * 64,
+            "miz_sha256": "f" * 64,
+            "image_paths": {role: str(self.root / f"{role}.vhd")
+                            for role in custodian.DISKS},
+        }).encode())
+
+    def acceptance_cli(self, *bodies):
+        argv = write_private(self.root / "verifier-argv.json", json.dumps(
+            child_argv(*bodies)).encode())
+        subscription = write_private(self.root / "subscription",
+                                     (SUBSCRIPTION + "\n").encode())
+        calls = []
+
+        def run(*args, **kwargs):
+            calls.append(kwargs)
+            return acceptance.AcceptanceResult(
+                False, "offline", "not-started", ("stub",),
+                clock_offset_seconds=acceptance.clock_offset(
+                    kwargs["clock_offset_seconds"]),
+            )
+        with mock.patch.object(acceptance, "run_acceptance", side_effect=run):
+            code, output = self.cli(
+                "acceptance", "--approval", self.root / "approval.json",
+                "--preprovision", self.root / "preprovision.json",
+                "--keys-dir", self.root / "keys",
+                "--expected-json", self.expected_file(self.fixture.expected,
+                                                      "expected.json"),
+                "--plan-json", self.plan_file(),
+                "--subscription-file", subscription,
+                "--state-dir", self.root / "state",
+                "--directory", self.root / "live",
+                "--records-dir", self.root / "records",
+                "--registry-dir", self.root / "registry",
+                "--verifier-argv-json", argv,
+            )
+        self.assert_private_output(output)
+        return code, json.loads(output), calls
+
+    def test_acceptance_runs_in_the_verifier_clock_domain(self):
+        code, summary, calls = self.acceptance_cli(
+            READY.format(shift=125), "time.sleep(30)\n")
+        self.assertEqual(code, 1)
+        self.assertEqual(len(calls), 1)
+        clock = calls[0]["clock"]
+        self.assertIsInstance(clock, acceptance.VerifierClock)
+        self.assertGreaterEqual(calls[0]["clock_offset_seconds"], 125)
+        self.assertLess(calls[0]["clock_offset_seconds"], 155)
+        self.assertLessEqual(clock(), datetime.now(timezone.utc)
+                             - timedelta(seconds=125))
+        self.assertEqual(summary["clock_offset_seconds"],
+                         round(calls[0]["clock_offset_seconds"]))
+        self.assertIs(summary["independent_custody"], False)
+
+    def test_missing_or_invalid_verifier_time_refuses_before_azure(self):
+        for change in ("{}", '{"now_utc": "2026-09-29T04:00:00Z"}',
+                       '{"now_utc": null}'):
+            code, summary, calls = self.acceptance_cli(
+                RAW_READY.format(change=change), "time.sleep(30)\n")
+            self.assertEqual(code, 1)
+            self.assertEqual(calls, [])
+            self.assertEqual((summary["stage"], summary["cleanup"]),
+                             ("gate", "not-started"))
+            self.assertIsNone(summary["clock_offset_seconds"])
+            self.assertFalse(os.path.lexists(self.root / "live"))
+
+    def test_serve_verifier_writes_only_protocol_lines(self):
+        script = SCRIPTS / "hyperv_issue90_acceptance.py"
+        missing = self.root / "missing.json"
+        done = subprocess.run(
+            [sys.executable, str(script), "serve-verifier",
+             "--offline-inputs-json", str(missing),
+             "--expected-json", str(missing),
+             "--registry-dir", str(self.root / "registry"),
+             *(item for role in custodian.KEY_ROLES for item in (
+                 f"--{role}-public-key", str(missing)))],
+            input=acceptance.encode_request("offline"), capture_output=True,
+            timeout=120, check=False,
+        )
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual(done.stdout, azure.canonical_json({
+            "protocol": acceptance.PROTOCOL, "stage": "ready", "passed": False,
+            "reason": "verifier_setup_failed",
+        }))
+        self.assertEqual(done.stderr, b"")
+        done = subprocess.run(
+            [sys.executable, str(script), "serve-verifier"],
+            input=b"", capture_output=True, timeout=120, check=False,
+        )
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(done.stdout, b"")
+
+    def test_clock_offset_stamps_and_checks_in_the_verifier_domain(self):
+        bound_offset = -300
+        statement = self.root / "preprovision.json"
+        code, output = self.cli(
+            "sign-preprovision", "--expected-json",
+            self.expected_file(self.fixture.expected, "expected0.json"),
+            "--plan-json", self.plan_file(),
+            "--approver-private-key", self.keys["approver"]["private_key"],
+            "--offline-sha256", "9" * 64, "--output", statement,
+            "--clock-offset-seconds", bound_offset,
+        )
+        self.assertEqual(code, 0, output)
+        issued = custody._utc(json.loads(statement.read_bytes())["body"][
+            "issued_at_utc"])
+        shifted = datetime.now(timezone.utc) + timedelta(seconds=300)
+        self.assertLessEqual(abs((shifted - issued).total_seconds()), 5)
+        bound = replace(self.fixture.expected,
+                        preprovision_authorization_sha256=sha(
+                            statement.read_bytes()))
+        expected = self.expected_file(bound, "expected.json")
+        subscription = write_private(self.root / "subscription",
+                                     (SUBSCRIPTION + "\n").encode())
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+
+        def approve(offset, minutes=(-1, 120), name="approval.json"):
+            window = [(now + timedelta(minutes=value)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ") for value in minutes]
+            return self.cli(
+                "approve-acceptance", "--expected-json", expected,
+                "--preprovision", statement, "--subscription-file", subscription,
+                "--approver-private-key", self.keys["approver"]["private_key"],
+                "--not-before", window[0], "--not-after", window[1],
+                "--max-vm-running-seconds", 3600,
+                "--output", self.root / name, "--clock-offset-seconds", offset,
+            )
+        code, output = approve(0, name="local.json")
+        self.assertEqual(code, 1)
+        self.assertIn("future", output)
+        self.assertFalse((self.root / "local.json").exists())
+        code, output = approve(bound_offset, minutes=(-10, 3), name="late.json")
+        self.assertEqual(code, 1)
+        self.assertIn("ended", output)
+        code, output = approve("nan", name="nan.json")
+        self.assertEqual(code, 1)
+        code, output = approve(bound_offset)
+        self.assertEqual(code, 0, output)
+        self.assertTrue((self.root / "approval.json").exists())
 
 
 if __name__ == "__main__":

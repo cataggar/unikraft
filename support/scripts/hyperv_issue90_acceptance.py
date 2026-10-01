@@ -15,6 +15,7 @@ from datetime import timedelta
 import hashlib
 import importlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -63,6 +64,8 @@ START_TIMEOUT_SECONDS = 900
 WAIT_LIMIT_SECONDS = 120
 START_WAIT_LIMIT_SECONDS = 60
 MAX_SKEW_SECONDS = 10
+MAX_CLOCK_OFFSET_SECONDS = 3600
+PRECISE_UTC = "%Y-%m-%dT%H:%M:%S.%fZ"
 MAX_BLOBS = 128
 MAX_LINE = 32 * 1024 * 1024
 TIMEOUTS = {
@@ -81,7 +84,7 @@ REQUESTS = {
                  ("disposal", "record"), ("blobs", "blobs")),
 }
 RESPONSES = {
-    "ready": (),
+    "ready": ("now_utc",),
     "offline": ("offline_sha256",),
     "handoff": ("consumed_seconds",),
     "dispatch": ("claim_sha256", "reserved_at_utc", "expires_at_utc",
@@ -122,6 +125,7 @@ class AcceptanceResult:
     cleanup_reason: str | None = None
     verifier_result: str | None = None
     owner_attested_test_keys: bool = True
+    clock_offset_seconds: int | None = None
 
     def summary(self, private_values=()):
         def clean(text):
@@ -136,7 +140,52 @@ class AcceptanceResult:
             "verifier_result": self.verifier_result,
             "owner_attested_test_keys": True,
             "independent_custody": False,
+            "clock_offset_seconds": self.clock_offset_seconds,
         }
+
+
+class VerifierClock:
+    """The verifier host's UTC clock, carried forward by local monotonic time.
+
+    It is anchored when `ready` was received, after the verifier stamped its
+    time, so it lags the verifier by the transport delay and is never ahead.
+    `offset_seconds` is the local UTC clock minus the verifier's.
+    """
+
+    def __init__(self, verifier_now_utc, *, received_utc, anchor,
+                 monotonic=None):
+        self.verifier_utc = custody._precise_utc(verifier_now_utc)
+        received = custodian._aware(received_utc, "Local clock")
+        self.offset_seconds = (received - self.verifier_utc).total_seconds()
+        if (not isinstance(anchor, (int, float)) or isinstance(anchor, bool)
+                or not math.isfinite(anchor)):
+            raise ValueError("Verifier clock anchor is invalid")
+        self.anchor = anchor
+        self.monotonic = monotonic or time.monotonic
+
+    def __call__(self):
+        elapsed = max(self.monotonic() - self.anchor, 0)
+        return self.verifier_utc + timedelta(seconds=elapsed)
+
+
+def clock_offset(seconds):
+    """Validate a local-minus-verifier clock offset and round it to seconds."""
+    if (not isinstance(seconds, (int, float)) or isinstance(seconds, bool)
+            or not math.isfinite(seconds)
+            or abs(seconds) > MAX_CLOCK_OFFSET_SECONDS):
+        raise ValueError(
+            "Clock offset must be finite and at most "
+            f"{MAX_CLOCK_OFFSET_SECONDS} seconds"
+        )
+    return round(seconds)
+
+
+def offset_clock(seconds, *, clock=None):
+    """Return the local clock shifted into the verifier's clock domain."""
+    clock_offset(seconds)
+    clock = clock or custodian._utc_now
+    return lambda: custodian._aware(clock(), "Local clock") - timedelta(
+        seconds=seconds)
 
 
 def _floor(value):
@@ -634,7 +683,9 @@ def check_response(stage, value):
                 else not isinstance(value["reason"], str)
                 or not REASON.fullmatch(value["reason"]))):
         raise ValueError("Verifier response stage, result or reason is invalid")
-    if stage == "offline" and passed:
+    if stage == "ready" and passed:
+        custody._precise_utc(value["now_utc"])
+    elif stage == "offline" and passed:
         custody._sha(value["offline_sha256"], "Offline admission digest")
     elif stage == "handoff" and passed:
         seconds = value["consumed_seconds"]
@@ -689,17 +740,24 @@ def _emit(stdout, value):
     stdout.flush()
 
 
-def serve(local, stdin, stdout):
+def serve(local, stdin, stdout, *, clock=None):
     """Serve one verifier session over newline-delimited canonical JSON.
 
-    The first line reports readiness; then one request per stage, strictly
-    in order. A refused offline/handoff/dispatch stage, a disposal or any
-    protocol error ends the session.
+    The first line reports readiness and the verifier's current UTC time
+    (`now_utc`, microseconds) so the lane can use this clock domain; then one
+    request per stage, strictly in order. A refused offline/handoff/dispatch
+    stage, a disposal or any protocol error ends the session.
     """
     if local is None:
         _emit(stdout, _refused("ready", "verifier_setup_failed"))
         return 1
-    _emit(stdout, {"stage": "ready", "passed": True, "reason": None})
+    try:
+        now = custody._now((clock or local.clock)()).strftime(PRECISE_UTC)
+    except Exception:
+        _emit(stdout, _refused("ready", "verifier_clock_unavailable"))
+        return 1
+    _emit(stdout, {"stage": "ready", "passed": True, "reason": None,
+                   "now_utc": now})
     previous = None
     while True:
         try:
@@ -742,31 +800,60 @@ def serve(local, stdin, stdout):
 class RemoteVerifier:
     """Speak the verifier protocol to a `serve-verifier` command (e.g. ssh)."""
 
-    def __init__(self, argv, *, timeouts=None):
+    def __init__(self, argv, *, timeouts=None, local_clock=None,
+                 monotonic=None):
         if (not isinstance(argv, (list, tuple)) or not argv or len(argv) > 64
                 or any(not isinstance(item, str) or not item or "\0" in item
                        for item in argv)):
             raise ValueError("Verifier command must be a non-empty argv list")
         self.argv = list(argv)
         self.timeouts = {**TIMEOUTS, **(timeouts or {})}
+        self.local_clock = local_clock or custodian._utc_now
+        self.monotonic = monotonic or time.monotonic
         self.process = None
+        self.started = False
         self.buffer = b""
         self.broken = False
+        self.received = None
+        self.clock = None
+        self.clock_offset_seconds = None
+
+    def connect(self):
+        """Start the session and return the verifier-domain clock."""
+        if self.broken:
+            raise VerifierTransportError("Verifier session is no longer usable")
+        self._start()
+        return self.clock
 
     def _start(self):
-        if self.process is not None:
+        if self.started:
+            if self.process is None:
+                raise VerifierTransportError("Verifier session has ended")
             return
+        self.started = True
         try:
             self.process = subprocess.Popen(
                 self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, close_fds=True,
             )
+            os.set_blocking(self.process.stdin.fileno(), False)
+            os.set_blocking(self.process.stdout.fileno(), False)
         except OSError:
             self.broken = True
+            self.close(kill=True)
             raise VerifierTransportError("Verifier command could not start") from None
         ready = self._receive("ready")
         if not ready["passed"]:
             self._fail("Remote verifier setup refused: " + ready["reason"])
+        received_utc, anchor = self.received
+        try:
+            clock = VerifierClock(ready["now_utc"], received_utc=received_utc,
+                                  anchor=anchor, monotonic=self.monotonic)
+            clock_offset(clock.offset_seconds)
+        except ValueError:
+            self._fail("Verifier clock is invalid or too far from the local clock")
+        self.clock = clock
+        self.clock_offset_seconds = clock.offset_seconds
 
     def _fail(self, message):
         self.broken = True
@@ -785,6 +872,8 @@ class RemoteVerifier:
                 continue
             try:
                 written = os.write(descriptor, view[:65536])
+            except BlockingIOError:
+                continue
             except OSError:
                 self._fail("Verifier connection closed")
             view = view[written:]
@@ -802,11 +891,17 @@ class RemoteVerifier:
             readable, _, _ = select.select([descriptor], [], [], remaining)
             if not readable:
                 continue
-            chunk = os.read(descriptor, 1024 * 1024)
+            try:
+                chunk = os.read(descriptor, 1024 * 1024)
+            except BlockingIOError:
+                continue
+            except OSError:
+                self._fail("Verifier connection closed")
             if not chunk:
                 self._fail("Verifier connection closed")
             self.buffer += chunk
         line, self.buffer = self.buffer.split(b"\n", 1)
+        self.received = (self.local_clock(), self.monotonic())
         try:
             return decode_response(line + b"\n", stage)
         except ValueError:
@@ -927,14 +1022,18 @@ def run_acceptance(approval=None, *, preprovision=None, keys=None,
                    verifier=None, runner=None, cleanup_runner=None,
                    upload=None, clock=None, sleep=None,
                    poll_interval=POLL_INTERVAL_SECONDS,
-                   max_poll_seconds=MAX_POLL_SECONDS):
+                   max_poll_seconds=MAX_POLL_SECONDS, clock_offset_seconds=None):
     """Run one owner-attested acceptance: at most one VM start, always cleanup.
 
+    `clock` must be the verifier's clock domain (see `VerifierClock`); it
+    drives every statement, journal time, approval window and deadline.
     Every refusal before the offline verifier passes happens before any
     Azure call. PASS needs the verifier's FinalAcceptance and a deleted group.
     """
     clock = clock or custodian._utc_now
     sleep = sleep or time.sleep
+    offset = (None if clock_offset_seconds is None
+              else clock_offset(clock_offset_seconds))
     if approval is None or preprovision is None or verifier is None:
         raise custodian.LiveApprovalRefused(NO_ACCEPTANCE)
     try:
@@ -986,11 +1085,12 @@ def run_acceptance(approval=None, *, preprovision=None, keys=None,
     offline = _call_verifier(verifier, "offline")
     if not offline["passed"]:
         return AcceptanceResult(False, "offline", "not-started",
-                                ("verifier offline: " + offline["reason"],))
+                                ("verifier offline: " + offline["reason"],),
+                                clock_offset_seconds=offset)
     if offline["offline_sha256"] != statement["offline_sha256"]:
         return AcceptanceResult(False, "offline", "not-started", (
             "verifier offline admission differs from the pre-provision statement",
-        ))
+        ), clock_offset_seconds=offset)
     directory = custodian._create_private_dir(directory, "Live custodian directory")
     try:
         custodian._claim_live_approval(registry_dir, approval_raw, body)
@@ -1003,7 +1103,7 @@ def run_acceptance(approval=None, *, preprovision=None, keys=None,
         directory=directory, records_dir=records_dir, registry_dir=registry_dir,
         verifier=verifier, runner=runner, cleanup_runner=cleanup_runner,
         upload=upload, clock=clock, sleep=sleep, poll_interval=poll_interval,
-        max_poll_seconds=max_poll_seconds,
+        max_poll_seconds=max_poll_seconds, clock_offset_seconds=offset,
     ).run()
 
 
@@ -1015,8 +1115,10 @@ class _AcceptanceRun:
     def __init__(self, body, material, statement, preprovision_raw, *, expected,
                  plan, subscription, state, directory, records_dir,
                  registry_dir, verifier, runner, cleanup_runner, upload,
-                 clock, sleep, poll_interval, max_poll_seconds):
+                 clock, sleep, poll_interval, max_poll_seconds,
+                 clock_offset_seconds):
         self.body = body
+        self.clock_offset = clock_offset_seconds
         self.keys = material
         self.statement = statement
         self.preprovision_raw = preprovision_raw
@@ -1108,6 +1210,9 @@ class _AcceptanceRun:
 
     def run(self):
         try:
+            self.recorder.synthetic("verifier.clock-offset", {
+                "clock_offset_seconds": self.clock_offset,
+            })
             self._provision()
             if self._assure() and self._authorize():
                 self._start_and_observe()
@@ -1144,7 +1249,7 @@ class _AcceptanceRun:
             self.reasons.append("Owned acceptance resource group cleanup was not proven")
         result = AcceptanceResult(
             passed, self.stage, cleanup, tuple(self.reasons),
-            cleanup_reason, verdict,
+            cleanup_reason, verdict, clock_offset_seconds=self.clock_offset,
         )
         try:
             self._write("summary.json", azure.canonical_json(
@@ -1633,6 +1738,8 @@ def main(argv=None):
     sign.add_argument("--approver-private-key", required=True, type=Path)
     sign.add_argument("--offline-sha256", required=True)
     sign.add_argument("--output", required=True, type=Path)
+    sign.add_argument("--clock-offset-seconds", type=float, default=0.0,
+                      help="local minus verifier UTC clock, in seconds")
     approve = sub.add_parser(
         "approve-acceptance", help="sign a live acceptance approval",
     )
@@ -1644,6 +1751,8 @@ def main(argv=None):
     approve.add_argument("--not-after", required=True)
     approve.add_argument("--max-vm-running-seconds", required=True, type=int)
     approve.add_argument("--output", required=True, type=Path)
+    approve.add_argument("--clock-offset-seconds", type=float, default=0.0,
+                         help="local minus verifier UTC clock, in seconds")
     live = sub.add_parser(
         "acceptance", help="run the single owner-attested acceptance attempt",
     )
@@ -1718,9 +1827,10 @@ def _main_sign(args):
         private.extend(_expected_private(expected))
         plan = custodian.plan_from_mapping(custodian._load_private_json(
             args.plan_json, "Custodian plan"), expected)
+        clock = offset_clock(args.clock_offset_seconds)
         body = preprovision_body(
             expected=expected, plan=plan, offline_sha256=args.offline_sha256,
-            issued_at_utc=_stamp(custodian._utc_now()),
+            issued_at_utc=_stamp(clock()),
         )
         raw = sign_statement(body, args.approver_private_key)
         custodian._write_private_file(args.output, raw)
@@ -1744,9 +1854,16 @@ def _main_approve(args):
         statement = custodian._read_private_file(
             args.preprovision, custody.MAX_RECORD, "Pre-provision statement",
         )
+        clock = offset_clock(args.clock_offset_seconds)
         approver = custodian.load_private_key(args.approver_private_key)
-        custody_verifier._signed(statement, "preprovision",
-                                 custodian._public_bytes(approver))
+        signed, _ = custody_verifier._signed(
+            statement, "preprovision", custodian._public_bytes(approver),
+        )
+        now = clock()
+        if custody._utc(signed["issued_at_utc"]) > now:
+            raise ValueError(
+                "Pre-provision statement is issued in the verifier's future"
+            )
         if _sha(statement) != expected.preprovision_authorization_sha256:
             raise ValueError(
                 "Expected.preprovision_authorization_sha256 differs from the "
@@ -1762,6 +1879,8 @@ def _main_approve(args):
             preprovision_sha256=_sha(statement),
         )
         custodian._require_owned_scope(expected, group_id)
+        if custody._utc(body["not_after_utc"]) <= now:
+            raise ValueError("Acceptance approval window has already ended")
         raw = custodian.sign_live_approval(body, approver)
         custodian._write_private_file(args.output, raw)
     except Exception as error:
@@ -1774,6 +1893,7 @@ def _main_approve(args):
 def _main_acceptance(args):
     private = []
     verifier = None
+    offset = None
     try:
         subscription = custodian.read_subscription(args.subscription_file)
         private.append(subscription)
@@ -1789,6 +1909,10 @@ def _main_acceptance(args):
         argv = custodian._load_private_json(args.verifier_argv_json,
                                             "Verifier command")
         verifier = RemoteVerifier(argv)
+        # Every statement, journal time and deadline uses the verifier's
+        # clock domain, established from `ready` before any Azure call.
+        clock = verifier.connect()
+        offset = clock_offset(verifier.clock_offset_seconds)
         with custodian._interrupt_on_termination():
             result = run_acceptance(
                 args.approval, preprovision=args.preprovision,
@@ -1796,12 +1920,14 @@ def _main_acceptance(args):
                 subscription=subscription, state=state,
                 directory=args.directory, records_dir=args.records_dir,
                 registry_dir=args.registry_dir, verifier=verifier,
+                clock=clock, clock_offset_seconds=verifier.clock_offset_seconds,
             )
     except Exception as error:
         print(azure.canonical_json({
             "result": "FAIL", "stage": "gate", "cleanup": "not-started",
             "reasons": [custodian.sanitize_reason(error, private)],
             "owner_attested_test_keys": True, "independent_custody": False,
+            "clock_offset_seconds": offset,
         }).decode("ascii"), end="")
         return 1
     finally:
