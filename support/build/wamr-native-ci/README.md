@@ -722,10 +722,11 @@ establishes the first local tiny-compute observation.
 ## Differential parity preparation
 
 `test-controller` now includes native source-custody production limits, twelve
-physical Bison/consumer/dependency/supervision fault fixtures, and frozen v1/v2
-result-parser goldens. `test-controller-limits`,
-`test-controller-fault-parity`, and `test-differential-records` run those
-suites separately. The matching Python
+physical Bison/consumer/dependency/supervision fault fixtures, frozen v1/v2
+result-parser goldens, and the #187 handoff/public-bundle contract golden.
+`test-controller-limits`, `test-controller-fault-parity`,
+`test-differential-records`, and `test-handoff-contracts` run those suites separately.
+The matching Python
 parser fixtures run with
 `python3 -B -m unittest test_differential_parity.DeterministicContracts`
 from the tests directory. These goldens contain synthetic records, not guest
