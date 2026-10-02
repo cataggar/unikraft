@@ -938,6 +938,12 @@ allocation faults, cancellation, swaps/symlinks/hardlinks and binary secret-scan
 boundaries. Ancestor-directory ABA probes cover all five pin families; bounded
 FIFO/SIGINT helpers verify irreversible poisoning, no bundle and descriptor
 cleanup without hanging the runner.
+Build-time oracle/result fixture paths are absolute for both package-directory
+and repository-root `--build-file` invocations; retained-file validation is not
+relaxed to accept relative paths. Qualification includes the protected aggregate
+`test install` gate with `-Dtest-root`, isolated restored dependencies and
+private fixture/cache roots outside the source under test, not just the
+standalone handoff or controller selectors.
 They invoke actual Python `handoff.export()` to compare all 83 selected v2
 members, canonical manifests after local-root rebasing and accepted result
 identity, and check Python reuse/I/O/producer-binding refusals. This complete
