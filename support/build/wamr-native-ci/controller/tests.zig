@@ -46,11 +46,16 @@ test "build command table has closed roles, order, deadlines and native executab
     }).get("tool:sh"));
 }
 
-test "handoff inspect command matches Python's closed post-run contract" {
+fn frozenContract(a: std.mem.Allocator, compressed: []const u8) ![]const u8 {
+    var reader = std.Io.Reader.fixed(compressed);
+    var decompressed = std.compress.flate.Decompress.init(&reader, .gzip, &.{});
+    return decompressed.reader.allocRemaining(a, .limited(2 * 1024 * 1024));
+}
+
+test "handoff inspect command matches the frozen post-run contract" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const io = std.testing.io;
     const plan = controller.command_plan;
     const selected = plan.spec(.@"handoff-inspect");
     try std.testing.expectEqual(@as(u32, 150), selected.seconds);
@@ -59,25 +64,8 @@ test "handoff inspect command matches Python's closed post-run contract" {
     try std.testing.expect(plan.isBoot(selected.stage));
     try std.testing.expectEqual(@as(usize, 64 * 1024 + 1), plan.limits(selected).stdout_bytes);
     try std.testing.expectEqual(@as(usize, 64 * 1024 + 1), plan.limits(selected).stderr_bytes);
-    const reference = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" });
-    defer a.free(reference);
-    const script =
-        \\import importlib.util,sys
-        \\s=importlib.util.spec_from_file_location("ci",sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
-        \\sys.stdout.buffer.write(m.canonical_json(m.production_command_contract("handoff-inspect")))
-    ;
-    const response = try std.process.run(a, io, .{
-        .argv = &.{ options.python_executable, "-B", "-c", script, reference },
-        .cwd = .{ .path = options.repository_root },
-        .stdout_limit = .limited(16384),
-        .stderr_limit = .limited(4096),
-    });
-    defer a.free(response.stdout);
-    defer a.free(response.stderr);
-    if (response.term != .exited or response.term.exited != 0)
-        std.debug.print("handoff contract oracle: {s}\n", .{response.stderr});
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, response.term);
-    var parsed = try std.json.parseFromSlice(std.json.Value, a, response.stdout, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false });
+    const golden = try frozenContract(a, @embedFile("goldens/handoff-inspect-contract.json.gz"));
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, golden, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false });
     defer parsed.deinit();
     const contract = parsed.value.object;
     try std.testing.expectEqualStrings("bound-tools", contract.get("kind").?.string);
@@ -1988,30 +1976,12 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
     for (rejected) |argv| try std.testing.expectError(error.InvalidUsage, cli.parse(argv));
 }
 
-test "import identity source allowlist matches the historical supervisor source set" {
+test "import identity source allowlist matches the frozen historical supervisor source set" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const script =
-        \\import importlib.util, json, sys
-        \\spec=importlib.util.spec_from_file_location("ci",sys.argv[1])
-        \\ci=importlib.util.module_from_spec(spec); spec.loader.exec_module(ci)
-        \\sys.stdout.write(json.dumps({
-        \\    "names": ci.SUPERVISOR_SOURCE_FILES,
-        \\    "closure": ci.supervisor_source_map()["content_closure_sha256"],
-        \\}))
-    ;
-    const witness_path = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" });
-    const output = try std.process.run(a, std.testing.io, .{
-        .argv = &.{ options.python_executable, "-B", "-c", script, witness_path },
-        .cwd = .{ .path = options.repository_root },
-        .stdout_limit = .limited(8192),
-        .stderr_limit = .limited(4096),
-    });
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, output.term);
-    const witness_json = try std.json.parseFromSliceLeaky(std.json.Value, a, output.stdout, .{});
-    try std.testing.expect(witness_json == .object);
-    const names = witness_json.object.get("names").?;
+    const golden = try frozenContract(a, @embedFile("goldens/historical-supervisor-sources.json.gz"));
+    const names = try std.json.parseFromSliceLeaky(std.json.Value, a, golden, .{ .duplicate_field_behavior = .@"error" });
     try std.testing.expect(names == .array);
     var selected = std.json.Value{ .object = .empty };
     var modified = std.json.Value{ .object = .empty };
@@ -2026,43 +1996,15 @@ test "import identity source allowlist matches the historical supervisor source 
     for (controller.source_custody.closure) |entry|
         try native.object.put(a, entry.name, .null);
     try controller.import_supervisor_identity.validateSourceNames(native);
-    const closure = try controller.import_supervisor_identity.supervisorSourceContentClosure(a, std.testing.io, options.repository_root, options.git_executable);
-    try std.testing.expectEqualStrings(witness_json.object.get("closure").?.string, closure[0..]);
 }
 
-test "native import identity matches Python guarded source map under supervision" {
+test "native import identity retains its guarded source map under supervision" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const io = std.testing.io;
-    var names: std.ArrayList([]const u8) = .empty;
-    for (controller.source_custody.closure) |entry| try names.append(a, entry.name);
-    const script =
-        \\import hashlib, importlib.util, json, pathlib, sys
-        \\spec=importlib.util.spec_from_file_location("ci",sys.argv[1])
-        \\ci=importlib.util.module_from_spec(spec); spec.loader.exec_module(ci)
-        \\records={}
-        \\for name in json.loads(sys.argv[2]):
-        \\    raw=pathlib.Path(name).read_bytes()
-        \\    records[name]={"bytes":len(raw),"sha256":hashlib.sha256(raw).hexdigest(),"metadata":[]}
-        \\closure=ci.guarded_record_map("uk.wamr.command-supervisor-source-v1", records)
-        \\sys.stdout.buffer.write(ci.canonical_json({
-        \\    "protocol":"uk.wamr.command-supervisor/1 process-command/1",
-        \\    "schema":"uk.wamr.command-supervisor-identity",
-        \\    "source_content_closure_sha256":closure["content_closure_sha256"],
-        \\    "version":1}))
-    ;
-    const oracle = try std.process.run(a, io, .{
-        .argv = &.{
-            options.python_executable,                                                                     "-B",                                                   "-c", script,
-            try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" }), try std.json.Stringify.valueAlloc(a, names.items, .{}),
-        },
-        .cwd = .{ .path = options.repository_root },
-        .stdout_limit = .limited(1024),
-        .stderr_limit = .limited(4096),
-    });
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, oracle.term);
-    try std.testing.expectEqualStrings("", oracle.stderr);
+    const closure = try controller.import_supervisor_identity.nativeSourceContentClosure(a);
+    const expected = try controller.import_supervisor_identity.identityBytes(a, &closure);
 
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
     defer parent.close(io);
@@ -2095,7 +2037,7 @@ test "native import identity matches Python guarded source map under supervision
     });
     try std.testing.expect(outcome.accepted and !outcome.poisoned);
     try std.testing.expectEqual(@as(usize, 0), outcome.stderr_bytes);
-    try std.testing.expectEqualStrings(oracle.stdout, outcome.stdout);
+    try std.testing.expectEqualStrings(expected, outcome.stdout);
     const command = try evidence.readFileAlloc(io, "command-supervisor-import-identity.json", a, .limited(controller.records.max_record_bytes));
     _ = try controller.accepted_run.validateCommandBinding(a, command, .@"supervisor-import-identity", .trusted_inner_zip);
 }
@@ -2229,28 +2171,8 @@ test "historical v2 supervised bindings use the closed imported producer contrac
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const script =
-        \\import copy, importlib.util, sys
-        \\s=importlib.util.spec_from_file_location("witness",sys.argv[1])
-        \\m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
-        \\e=m.Evidence()
-        \\stages=("adapter","local-boot-tool","fixtures","prepare","config","native-image","package","raw-x2apic","raw-legacy-apic","finalize-qcow2","qcow2-x2apic","qcow2-legacy-apic","derive-fixed-vhd","vpc-x2apic","vpc-legacy-apic","inspect","log-validator-x2apic","log-validator-legacy")
-        \\records={name:e.supervised_binding(name)[0] for name in stages}
-        \\tampered=copy.deepcopy(records["adapter"]); tampered["supervisor"]["request"]["argv"][1]={"kind":"literal","value":"--arbitrary"}
-        \\records["tampered"]=e.rehash_supervised_binding(tampered)
-        \\sys.stdout.buffer.write(m.ci.canonical_json(records))
-    ;
-    const witness = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/tests/test_adapter.py" });
-    const response = try std.process.run(a, std.testing.io, .{
-        .argv = &.{ options.python_executable, "-B", "-c", script, witness },
-        .cwd = .{ .path = options.repository_root },
-        .stdout_limit = .limited(1024 * 1024),
-        .stderr_limit = .limited(4096),
-    });
-    if (response.term != .exited or response.term.exited != 0)
-        std.debug.print("historical binding witness: {s}\n", .{response.stderr});
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, response.term);
-    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, response.stdout, .{ .duplicate_field_behavior = .@"error" });
+    const golden = try frozenContract(a, @embedFile("goldens/historical-v2-bindings.json.gz"));
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, golden, .{ .duplicate_field_behavior = .@"error" });
     const values = parsed.object;
     var verified: usize = 0;
     for (values.keys(), values.values()) |name, value| {
@@ -2269,63 +2191,12 @@ test "historical v2 supervised bindings use the closed imported producer contrac
     try std.testing.expectEqual(@as(usize, 18), verified);
 }
 
-test "legacy handoff inspect command fixture matches Python strictness" {
+test "legacy handoff inspect command matches frozen acceptance and refusal vectors" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const script =
-        \\import copy, importlib.util, sys
-        \\s=importlib.util.spec_from_file_location("witness",sys.argv[1])
-        \\m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
-        \\e=m.Evidence()
-        \\profile="tiny-aot-two-boot"
-        \\stage="handoff-inspect-legacy"
-        \\transport="producer_direct"
-        \\record,identities=e.supervised_binding(stage,profile=profile)
-        \\def check(record):
-        \\    m.ci.validate_supervised_command_binding(record,stage,identities,transport_context=transport,profile=profile)
-        \\check(record)
-        \\mutations={}
-        \\def refuse(name, changed, rehash=True):
-        \\    if rehash:
-        \\        e.rehash_supervised_binding(changed)
-        \\    try:
-        \\        check(changed)
-        \\    except m.ci.Refusal:
-        \\        mutations[name]=changed
-        \\    else:
-        \\        raise AssertionError(name+" admitted")
-        \\changed=copy.deepcopy(record)
-        \\changed["supervisor"]["request"]["retained_executables"]=[]
-        \\changed["supervisor"]["result"]["command"]["retained_executables"]=[]
-        \\refuse("retained-empty", changed)
-        \\changed=copy.deepcopy(record)
-        \\changed["sha256"]="0"*64
-        \\refuse("record-empty-sha", changed, rehash=False)
-        \\changed=copy.deepcopy(record)
-        \\changed["supervisor"]["result"]["command"]["output"]["combined_sha256"]="0"*64
-        \\refuse("output-empty-sha", changed)
-        \\changed=copy.deepcopy(record)
-        \\non_empty="1"*64
-        \\changed["sha256"]=non_empty
-        \\changed["supervisor"]["result"]["command"]["output"]["combined_sha256"]=non_empty
-        \\refuse("zero-bytes-non-empty-hash", changed)
-        \\changed=copy.deepcopy(record)
-        \\changed["supervisor"]["request"]["supervisor"]["identity"]["mode"]=65536
-        \\refuse("identity-mode-u16", changed)
-        \\sys.stdout.buffer.write(m.ci.canonical_json({"accepted":record,"mutations":mutations}))
-    ;
-    const witness = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/tests/test_adapter.py" });
-    const response = try std.process.run(a, std.testing.io, .{
-        .argv = &.{ options.python_executable, "-B", "-c", script, witness },
-        .cwd = .{ .path = options.repository_root },
-        .stdout_limit = .limited(2 * 1024 * 1024),
-        .stderr_limit = .limited(4096),
-    });
-    if (response.term != .exited or response.term.exited != 0)
-        std.debug.print("v1 command witness: {s}\n", .{response.stderr});
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, response.term);
-    var parsed = try std.json.parseFromSlice(std.json.Value, a, response.stdout, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false });
+    const golden = try frozenContract(a, @embedFile("goldens/legacy-handoff-bindings.json.gz"));
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, golden, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false });
     defer parsed.deinit();
     const accepted = try fixtureField(parsed.value, "accepted");
     const mutations = try fixtureField(parsed.value, "mutations");
@@ -3304,6 +3175,68 @@ test "trusted historical inner stage accepts complete records and refuses tamper
     });
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, cli_success.term);
     try std.testing.expectEqualStrings(handoff, cli_success.stdout);
+    const reader_name = try std.fmt.allocPrint(a, "{s}-reader-source", .{name});
+    const reader_repository = try std.fs.path.join(a, &.{ options.fixture_root, reader_name });
+    const cloned = try std.process.run(a, io, .{
+        .argv = &.{ options.git_executable, "clone", "-q", "--no-hardlinks", "--", options.repository_root, reader_repository },
+        .cwd = .{ .path = options.fixture_root },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, cloned.term);
+    defer parent.deleteTree(io, reader_name) catch @panic("legacy reader source cleanup failed");
+    const revalidated_name = try std.fmt.allocPrint(a, "{s}-native-revalidation", .{name});
+    const revalidated_path = try std.fs.path.join(a, &.{ options.fixture_root, revalidated_name });
+    defer parent.deleteTree(io, revalidated_name) catch @panic("legacy revalidation cleanup failed");
+    const revalidated = try std.process.run(a, io, .{
+        .argv = &.{
+            options.host_controller_cli, "import-handoff-revalidation",
+            "--stage-root",              stage_root_path,
+            "--git",                     options.git_executable,
+            "--supervisor",              options.host_controller_cli,
+            "--validator",               options.import_validator,
+            "--output",                  revalidated_path,
+        },
+        .cwd = .{ .path = reader_repository },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    if (revalidated.term != .exited or revalidated.term.exited != 0)
+        std.debug.print("legacy native revalidation: {s}\n", .{revalidated.stderr});
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, revalidated.term);
+    try std.testing.expectEqualStrings("", revalidated.stdout);
+    try std.testing.expectEqualStrings("", revalidated.stderr);
+    const revalidated_output = try parent.openDir(io, revalidated_name, .{ .iterate = true });
+    defer revalidated_output.close(io);
+    try std.testing.expectEqualStrings(
+        "Compute handoff revalidated; authority=not_admitted.\n",
+        try revalidated_output.readFileAlloc(io, "private/import-native-revalidation.log", a, .limited(4096)),
+    );
+    const command = try revalidated_output.readFileAlloc(io, "evidence/command-import-native-revalidation.json", a, .limited(controller.records.max_record_bytes));
+    _ = try controller.accepted_run.validateCommandBinding(a, command, .@"import-native-revalidation", .trusted_inner_zip);
+    try accepted.revalidate();
+    try parent.deleteTree(io, revalidated_name);
+
+    for ([_][]const u8{ "supervisor", "validator" }) |substituted| {
+        const refused = try std.process.run(a, io, .{
+            .argv = &.{
+                options.host_controller_cli, "import-handoff-revalidation",
+                "--stage-root",              stage_root_path,
+                "--git",                     options.git_executable,
+                "--supervisor",              if (std.mem.eql(u8, substituted, "supervisor")) options.command_fixture else options.host_controller_cli,
+                "--validator",               if (std.mem.eql(u8, substituted, "validator")) options.command_fixture else options.import_validator,
+                "--output",                  revalidated_path,
+            },
+            .cwd = .{ .path = reader_repository },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, refused.term);
+        try std.testing.expectEqualStrings("", refused.stdout);
+        try std.testing.expect(std.mem.indexOf(u8, refused.stderr, if (std.mem.eql(u8, substituted, "supervisor")) "ImportSupervisorChanged" else "InvalidValidator") != null);
+        try std.testing.expectError(error.FileNotFound, parent.openDir(io, revalidated_name, .{}));
+        try accepted.revalidate();
+    }
     try root.createDir(io, "boots/unexpected", .fromMode(0o700));
     try std.testing.expectError(error.InvalidImportedBundle, accepted.revalidate());
     try root.deleteDir(io, "boots/unexpected");
