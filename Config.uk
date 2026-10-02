@@ -28,10 +28,10 @@ config NO_APP
 
 config UK_BASE
 	string
-	default "$(UK_BASE)"
+	default "$(UK_CONFIG_BASE)"
 config UK_APP
 	string
-	default "$(UK_APP)"
+	default "$(UK_CONFIG_APP)"
 config UK_DEFNAME
 	string
 	default "$(UK_NAME)"

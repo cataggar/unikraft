@@ -124,6 +124,40 @@ pub const ProductionPaths = struct {
     python_stdlib: []const u8,
 };
 
+pub fn pythonStdlib(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repository: []const u8,
+    python: []const u8,
+    cancel: ?*const std.atomic.Value(bool),
+) ![]const u8 {
+    try process.initialize();
+    var executable = try process.Executable.open(io, python);
+    defer executable.close(io);
+    const cwd = try files.openDirectory(io, repository, .artifact);
+    defer cwd.close(io);
+    var env = std.process.Environ.Map.init(allocator);
+    defer env.deinit();
+    try env.put("PYTHONDONTWRITEBYTECODE", "1");
+    const deadline = try process.Deadline.afterMilliseconds(30_000);
+    var result = try process.runCommand(allocator, io, .{
+        .executable = executable,
+        .argv = &.{ python, "-c", "import sysconfig; print(sysconfig.get_path('stdlib'))" },
+        .environment = &env,
+        .cwd = cwd,
+        .primary_deadline = deadline,
+        .cleanup_deadline = .{ .expires_ns = try std.math.add(u64, deadline.expires_ns, 10 * std.time.ns_per_s) },
+        .cancel = cancel,
+        .snapshot_executable = false,
+        .limits = .{ .stdout_bytes = 4096, .stderr_bytes = 4096 },
+    });
+    defer result.deinit(allocator);
+    if (!result.succeeded() or result.stderr.len != 0 or
+        result.stdout.len < 2 or result.stdout[result.stdout.len - 1] != '\n')
+        return error.InvalidPythonStdlib;
+    return allocator.dupe(u8, result.stdout[0 .. result.stdout.len - 1]);
+}
+
 pub const Production = struct {
     custody: Custody,
     file_bindings: []Binding,
@@ -251,7 +285,7 @@ pub fn captureProduction(allocator: std.mem.Allocator, io: std.Io, paths: Produc
 pub fn requireProduction(allocator: std.mem.Allocator, io: std.Io, paths: ProductionPaths, expected: Custody) !void {
     var current = try captureProduction(allocator, io, paths);
     defer current.deinit(allocator);
-    try requireSame(allocator, io, expected, current.file_bindings, current.tree_bindings);
+    try compareCaptured(expected, current.custody);
 }
 pub const Bison = struct { files: usize, bytes: usize, sha256: [64]u8 };
 pub const Binding = struct { role: []const u8, path: []const u8 };
@@ -768,6 +802,13 @@ pub fn requireSame(allocator: std.mem.Allocator, io: std.Io, expected: Custody, 
         return error.InvalidInputCustody;
     var current = try capture(allocator, io, file_paths, tree_paths);
     defer current.deinit(allocator);
+    try compareCaptured(expected, current);
+}
+
+fn compareCaptured(expected: Custody, current: Custody) !void {
+    if (!std.mem.eql(u8, expected.schema, "uk.wamr.consumer-input-custody") or expected.version != 2 or
+        expected.files.len != current.files.len or expected.trees.len != current.trees.len)
+        return error.InvalidInputCustody;
     if (!std.meta.eql(expected.aggregate_sha256, current.aggregate_sha256) or
         expected.directories.len != current.directories.len) return error.InputChanged;
     for (expected.files, current.files) |a, b| {
@@ -787,4 +828,56 @@ pub fn requireSame(allocator: std.mem.Allocator, io: std.Io, expected: Custody, 
         if (!std.mem.eql(u8, a.path, b.path) or !std.meta.eql(a.metadata, b.metadata))
             return error.InputChanged;
     }
+}
+
+test "captured production inputs compare every pinned field without recapture" {
+    var files_before = [_]FileRecord{.{
+        .role = "tool:zig",
+        .path = "/runtime/zig",
+        .metadata = [_]i128{0} ** 9,
+        .sha256 = [_]u8{'a'} ** 64,
+    }};
+    var trees_before = [_]TreeRecord{.{
+        .role = "zig",
+        .path = "/runtime",
+        .files = 1,
+        .directories = 1,
+        .symlinks = 0,
+        .bytes = 1,
+        .content_sha256 = [_]u8{'b'} ** 64,
+        .physical_sha256 = [_]u8{'c'} ** 64,
+    }};
+    var directories_before = [_]DirectoryRecord{.{
+        .path = "/runtime",
+        .metadata = [_]i128{0} ** 9,
+    }};
+    const expected: Custody = .{
+        .files = &files_before,
+        .trees = &trees_before,
+        .directories = &directories_before,
+        .aggregate_sha256 = [_]u8{'d'} ** 64,
+    };
+    var files_after = files_before;
+    var trees_after = trees_before;
+    var directories_after = directories_before;
+    var current = expected;
+    current.files = &files_after;
+    current.trees = &trees_after;
+    current.directories = &directories_after;
+    try compareCaptured(expected, current);
+
+    current.aggregate_sha256[0] = 'e';
+    try std.testing.expectError(error.InputChanged, compareCaptured(expected, current));
+    current.aggregate_sha256[0] = 'd';
+    files_after[0].sha256[0] = 'e';
+    try std.testing.expectError(error.InputChanged, compareCaptured(expected, current));
+    files_after[0].sha256[0] = 'a';
+    trees_after[0].physical_sha256[0] = 'e';
+    try std.testing.expectError(error.InputChanged, compareCaptured(expected, current));
+    trees_after[0].physical_sha256[0] = 'c';
+    directories_after[0].metadata[0] = 1;
+    try std.testing.expectError(error.InputChanged, compareCaptured(expected, current));
+    directories_after[0].metadata[0] = 0;
+    current.version = 1;
+    try std.testing.expectError(error.InvalidInputCustody, compareCaptured(expected, current));
 }

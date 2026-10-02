@@ -2679,9 +2679,14 @@ class HypervWorkflowTest(unittest.TestCase):
             'test "$(stat -c \'%a\' -- "${compute_fixture_root}")" = 700',
             '-Dtest-root="${compute_fixture_root}"',
             "-Doptimize=ReleaseSafe test install",
+            '"${root}/compute-tools/bin/uk-wamr-native-ci"',
+            "supervisor-source-closure --git /usr/bin/git --output sha256-v1",
         ):
             self.assertIn(required, step)
-        for forbidden in ("|| true", "continue-on-error:", "-Dtest-filter="):
+        for forbidden in (
+            "|| true", "continue-on-error:", "-Dtest-filter=",
+            "import run", "supervisor_source_map()",
+        ):
             self.assertNotIn(forbidden, step)
 
         build = (
@@ -2699,6 +2704,20 @@ class HypervWorkflowTest(unittest.TestCase):
         native = (
             SUPPORT.parent / ".github/workflows/wamr-native-compute.yaml"
         ).read_text()
+        self.assertLess(
+            native.index("      - name: Install the existing pinned Zig compiler\n"),
+            native.index("      - name: Exercise the production source-custody limits explicitly\n"),
+        )
+        source_limits = native.split(
+            "      - name: Exercise the production source-custody limits explicitly\n",
+            1,
+        )[1].split("\n      - name:", 1)[0]
+        for required in (
+            "git worktree add --detach",
+            "test-controller-limits",
+            "source_custody_production_limits.py",
+        ):
+            self.assertIn(required, source_limits)
         for required in (
             "for name in llvm-readelf llvm-strip; do",
             'target="$(readlink -f "${alias}")"',
@@ -2767,6 +2786,44 @@ class HypervWorkflowTest(unittest.TestCase):
         ):
             self.assertIn(f"refuse {refusal}", driver)
 
+    def test_wamr_paired_slots_are_reserved_before_build_custody(self):
+        workflow = (
+            SUPPORT.parent / ".github/workflows/wamr-native-compute.yaml"
+        ).read_text()
+        install_step = workflow.split(
+            "      - name: Install the production portable native controller\n",
+            1,
+        )[1].split("\n      - name: Record the runner CPU", 1)[0]
+        self.assertIn("support/build/wamr-native-ci/build.zig", install_step)
+        self.assertIn(
+            "rm -rf support/build/wamr-native-ci/.zig-cache "
+            "support/build/wamr-native-ci/zig-pkg",
+            install_step,
+        )
+        build_step = workflow.split(
+            "      - name: Build the tiny AOT image with the installed native producer and safety graph\n",
+            1,
+        )[1].split("\n      - name: Run six native boots", 1)[0]
+        slots = (
+            "for output in /d/wamr-ci/wamr-differential-sources "
+            "/d/wamr-ci/wamr-differential; do"
+        )
+        self.assertLess(
+            build_step.index(slots),
+            build_step.index('"${controller}" build --runtime "${root}"'))
+        self.assertIn('controller="${WAMR_CI_CONTROLLER:?}"', build_step)
+        driver = (
+            SUPPORT.parent / ".github/scripts/wamr-native-ci.sh"
+        ).read_text()
+        for required in (
+            "shopt -s nullglob dotglob",
+            'entries=("${output}"/*)',
+            'entries=("${source_root}"/*)',
+            'refuse prior-parity-output',
+        ):
+            self.assertIn(required, driver)
+        self.assertNotIn('rmdir -- "${source_root}"', driver)
+
     def test_wamr_cpu_report_preserves_source_without_bytecode_environment(self):
         workflow = (
             SUPPORT.parent / ".github/workflows/wamr-native-compute.yaml"
@@ -2803,6 +2860,18 @@ class HypervWorkflowTest(unittest.TestCase):
             )
             zig.chmod(0o700)
             (tools / "python3").symlink_to(sys.executable)
+            controller = tools / "uk-wamr-native-ci"
+            controller.write_text(
+                '#!/bin/sh\n'
+                'test "$1" = describe && test "$2" = --output && '
+                'test "$3" = json-v1 || exit 1\n'
+                'printf "%s\\n" '
+                '\'{"recorded_executable_target":["-Dtarget=x86_64-linux-gnu",'
+                '"-Dcpu=x86_64_v2"],"schema":"uk.wamr.native-ci-describe",'
+                '"schema_version":1,"source_closure_sha256":"'
+                '0000000000000000000000000000000000000000000000000000000000000000"}\'\n'
+            )
+            controller.chmod(0o700)
             runner = root / "runner"
             runner.mkdir()
             environment = dict(os.environ)
@@ -2810,6 +2879,7 @@ class HypervWorkflowTest(unittest.TestCase):
             environment.pop("PYTHONPYCACHEPREFIX", None)
             environment["PATH"] = str(tools) + os.pathsep + environment["PATH"]
             environment["RUNNER_TEMP"] = str(runner)
+            environment["WAMR_CI_CONTROLLER"] = str(controller)
             result = subprocess.run(
                 ["bash", "-c", script], cwd=repository, env=environment,
                 text=True, capture_output=True, timeout=30,

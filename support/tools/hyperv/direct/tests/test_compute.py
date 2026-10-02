@@ -1037,10 +1037,35 @@ class Compute(unittest.TestCase):
                 self.assertTrue(content)
                 return producer
 
+            def native_handoff_inspect(actual_runtime, output, *, legacy=False):
+                self.assertEqual(actual_runtime, runtime)
+                self.assertTrue(legacy)
+                output.mkdir(mode=0o700)
+                (output / "private").mkdir(mode=0o700)
+                (output / "evidence").mkdir(mode=0o700)
+                inspected = root / "evidence/package.json"
+                command = output / "evidence/command-handoff-inspect-legacy.json"
+                (output / "private/handoff-inspect-legacy.log").write_bytes(
+                    inspected.read_bytes())
+                (output / "private/handoff-inspect-legacy.log").chmod(0o600)
+                write(command, {
+                    "scope": "command_diagnostic_not_acceptance",
+                    "stage": "handoff-inspect-legacy",
+                    "exit_code": 0,
+                    "bytes": inspected.stat().st_size,
+                    "sha256": ci.digest(inspected),
+                    "over_limit": False,
+                    "known_error_markers": [],
+                })
+                return output / "private/handoff-inspect-legacy.log", command
+
             with mock.patch.object(ci, "check_build", return_value=build), \
                     mock.patch.object(
                         ci, "producer_inputs", autospec=True,
-                        side_effect=mocked_producer_inputs):
+                        side_effect=mocked_producer_inputs), \
+                    mock.patch.object(
+                        handoff.accepted_records, "handoff_inspect",
+                        side_effect=native_handoff_inspect):
                 with mock.patch.object(ci, "require_build_custody"):
                     handoff.export(runtime, handoff_parent / "handoff")
         self.assertEqual((root / "evidence/result.json").read_bytes(), original)
@@ -1130,10 +1155,37 @@ class Compute(unittest.TestCase):
         # An alternate worktree cannot satisfy that and today's exact root.
         if REPO.name == "unikraft":
             delivered.publication_records(handoff, stage, source)
+        refused = self.root / "refused-import"
+        with self.assertRaisesRegex(ValueError, "native controller records refused"):
+            public_bundle.import_bundle(
+                handoff, archive, refused, source, archive_sha256,
+                VALIDATOR, SUPERVISOR)
+        self.assertFalse((refused / "candidate-bundle.json").exists())
+        self.assertFalse((refused / "bundle.json").exists())
+        # This v1 policy fixture has mocked producer custody, not a complete
+        # native-accepted run; only the downstream archive checks use a stub.
+        native_view = {
+            "source": {
+                "revision": source["source_revision"],
+                "tree": source["source_tree"],
+            },
+            "compatibility": "tiny-v1",
+            "result": {
+                "sha256": portable["artifacts"][
+                    handoff.NAMES.index("local_result")]["sha256"],
+            },
+            "records": [
+                {"name": Path(item["path"]).name, "sha256": item["sha256"]}
+                for item in portable["evidence"]
+            ],
+        }
         output = self.root / "imported"
-        imported = public_bundle.import_bundle(
-            handoff, archive, output, source, archive_sha256,
-            VALIDATOR, SUPERVISOR)
+        with mock.patch.object(
+                public_bundle.accepted_records, "imported_stage",
+                return_value=native_view):
+            imported = public_bundle.import_bundle(
+                handoff, archive, output, source, archive_sha256,
+                VALIDATOR, SUPERVISOR)
         self.assertEqual(imported["authority"], "not_admitted")
         self.assertEqual((output / "artifacts/vhd").read_bytes(), (stage / "artifacts/vhd").read_bytes())
         self.assertEqual(handoff.candidate_plan(output / "bundle.json", self.root / "public-plan.json")["authority"],

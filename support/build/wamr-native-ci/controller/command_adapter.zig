@@ -5,6 +5,7 @@ const core = @import("hyperv_core");
 const files = core.private_files;
 const process = core.process;
 const Sha256 = core.Sha256;
+const linux = std.os.linux;
 const plan = @import("command_plan.zig");
 const records = @import("records.zig");
 
@@ -27,6 +28,7 @@ pub const Request = struct {
     private_dir: std.Io.Dir,
     evidence_dir: std.Io.Dir,
     cancel: ?*const std.atomic.Value(bool) = null,
+    supervisor_role: []const u8 = "command-supervisor",
     test_seconds: ?u32 = null,
     test_output_limit: ?usize = null,
     test_replacement: ?[]const u8 = null,
@@ -203,6 +205,29 @@ fn create(io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: []const u8) !voi
     try (std.Io.File{ .handle = dir.handle, .flags = .{ .nonblocking = false } }).sync(io);
 }
 
+pub fn openPinnedTool(io: std.Io, path: []const u8, role: []const u8) !files.RetainedFile {
+    const large_roles = [_][]const u8{
+        "tool:zig",          "tool:llvm-nm",      "tool:llvm-objcopy",
+        "tool:llvm-objdump", "tool:llvm-readelf", "tool:llvm-strip",
+    };
+    var large = false;
+    for (large_roles) |name| if (std.mem.eql(u8, name, role)) {
+        large = true;
+        break;
+    };
+    if (!large)
+        return files.RetainedFile.open(io, path, .tool);
+    var retained = try files.RetainedFile.open(io, path, .artifact);
+    errdefer retained.close(io);
+    const value = retained.file_snapshot;
+    if (value.mode & linux.S.IFMT != linux.S.IFREG or
+        (value.uid != 0 and value.uid != linux.geteuid()) or value.mode & 0o111 == 0 or
+        value.mode & 0o6022 != 0 or value.nlink != 1 or
+        value.size == 0 or value.size > 256 * 1024 * 1024)
+        return error.UnsafeFile;
+    return retained;
+}
+
 /// The public command record is constructed from the direct shared supervisor
 /// result, not from child-controlled text or a subprocess protocol response.
 pub fn execute(allocator: Allocator, io: std.Io, request: Request) !Outcome {
@@ -219,11 +244,12 @@ pub fn execute(allocator: Allocator, io: std.Io, request: Request) !Outcome {
     }
     const env_bindings = try plan.environment(a, request.stage);
     const executable_path = try request.roots.get(selected.executable);
-    var pinned = try files.RetainedFile.open(io, executable_path, .tool);
+    var pinned = try openPinnedTool(io, executable_path, selected.executable);
     defer pinned.close(io);
     var executable = try process.Executable.fromFile(io, pinned.file);
     defer executable.close(io);
-    var supervisor = try files.RetainedFile.open(io, request.roots.supervisor, .tool);
+    const supervisor_path = try request.roots.get(request.supervisor_role);
+    var supervisor = try files.RetainedFile.open(io, supervisor_path, .tool);
     defer supervisor.close(io);
     var controller_executable = try process.Executable.fromFile(io, supervisor.file);
     defer controller_executable.close(io);
@@ -256,7 +282,7 @@ pub fn execute(allocator: Allocator, io: std.Io, request: Request) !Outcome {
             std.mem.eql(u8, entry.name, "WAMR_CI_PYTHON") or
             std.mem.startsWith(u8, entry.name, "WAMR_CI_TOOL_") or
             std.mem.eql(u8, entry.name, "WAMR_CI_LOG_VALIDATE"))) continue;
-        var file = try files.RetainedFile.open(io, resolved, .tool);
+        var file = try openPinnedTool(io, resolved, entry.value.path.role);
         errdefer file.close(io);
         if (file.file_snapshot.mode & 0o111 == 0) {
             file.close(io);
@@ -403,7 +429,7 @@ pub fn execute(allocator: Allocator, io: std.Io, request: Request) !Outcome {
         .argv = try array(a, argv_public.items),
         .environment = try array(a, env_public.items),
         .cwd = try binding(a, .{ .path = .{ .role = "source" } }),
-        .supervisor = try identified(a, "command-supervisor", controller_executable.identity),
+        .supervisor = try identified(a, request.supervisor_role, controller_executable.identity),
         .native_executable = try identified(a, selected.executable, executable.identity),
         .command_executable = try identified(a, selected.executable, executable.identity),
         .interpreter = @as(?Value, null),

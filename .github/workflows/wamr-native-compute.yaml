@@ -13,7 +13,10 @@ permissions:
 jobs:
   wamr-native-compute:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 300
+    env:
+      WAMR_NATIVE_CONTROLLER_ROOT: /d/wamr-ci/wamr-native-runtime
+      WAMR_CI_CONTROLLER: /d/wamr-ci/wamr-native-runtime/controller/bin/uk-wamr-native-ci
     outputs:
       inner-zip-sha256: ${{ steps.public_binding.outputs.inner_zip_sha256 }}
       inner-zip-bytes: ${{ steps.public_binding.outputs.inner_zip_bytes }}
@@ -62,13 +65,6 @@ jobs:
           fi
           mkdir -p .d
 
-      - name: Exercise the production source-custody limits explicitly
-        timeout-minutes: 15
-        run: |
-          set -euo pipefail
-          export PYTHONDONTWRITEBYTECODE=1
-          python3 support/build/wamr-native-ci/tests/source_custody_production_limits.py
-
       - name: Set up the existing verified native downloader
         uses: cataggar/ghr/actions/setup@114926d37d3825e63bede2ccc7ce56b67eda7495
         with:
@@ -90,7 +86,26 @@ jobs:
           ghr-version: v0.8.0
           tools: cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
-      - name: Exercise native controller and package-boot fixtures in an isolated x86 worktree
+      - name: Exercise the production source-custody limits explicitly
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          source_root="${RUNNER_TEMP}/wamr-source-custody-limits"
+          test ! -e "${source_root}"
+          git worktree add --detach "${source_root}" HEAD
+          cleanup() { git worktree remove --force -- "${source_root}"; }
+          trap cleanup EXIT
+          mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-source-custody-limits-cache"
+          ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-source-custody-limits-cache" \
+            zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
+            -Doptimize=ReleaseSafe -j2 test-controller-limits
+          (
+            cd "${source_root}"
+            export PYTHONDONTWRITEBYTECODE=1
+            python3 -B support/build/wamr-native-ci/tests/source_custody_production_limits.py
+          )
+
+      - name: Exercise native controller, custody limits, and package-boot fixtures in an isolated x86 worktree
         timeout-minutes: 15
         run: |
           set -euo pipefail
@@ -101,13 +116,44 @@ jobs:
           trap cleanup EXIT
           mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-controller-fixture-cache"
           mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-controller-pipeline-root"
-          ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
+          if ! ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
             zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
-            -Doptimize=ReleaseSafe -j2 test-controller
+            -Doptimize=ReleaseSafe -j2 test-controller; then
+            if ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
+              zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
+              -Doptimize=ReleaseSafe -j1 test-controller-direct; then
+              echo "Direct controller diagnostic passed after the gate failed" >&2
+            else
+              echo "Direct controller diagnostic also failed" >&2
+            fi
+            exit 1
+          fi
           ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
             zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
             -Doptimize=ReleaseSafe -Dtest-root="${RUNNER_TEMP}/wamr-controller-pipeline-root" \
             -j2 test-pipeline
+          (
+            cd "${source_root}"
+            PYTHONDONTWRITEBYTECODE=1 \
+              PYTHONPATH="${source_root}/support/build/wamr-native-ci/tests:${source_root}/support/build/wamr-native-ci" \
+              python3 -B -m unittest -q test_differential_parity.DeterministicContracts
+          )
+
+      - name: Install the production portable native controller
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          umask 077
+          controller_root="${WAMR_NATIVE_CONTROLLER_ROOT:?}"
+          test -d "${controller_root}"
+          test ! -e "${controller_root}/controller"
+          mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-native-controller-cache"
+          ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-native-controller-cache" \
+            zig build --build-file support/build/wamr-native-ci/build.zig \
+              -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=ReleaseSafe \
+              -Dcontroller-runtime="${controller_root}" -j2 install-controller
+          rm -rf support/build/wamr-native-ci/.zig-cache support/build/wamr-native-ci/zig-pkg
+          test -x "${WAMR_CI_CONTROLLER:?}"
 
       - name: Record the runner CPU and portable executable target
         run: |
@@ -129,17 +175,24 @@ jobs:
           fi
           echo "Runner CPU model: ${model:-unknown}"
           echo "Zig native CPU: ${zig_cpu}"
-          python3 -B - <<'PY'
-          import importlib.util
-          from pathlib import Path
+          controller="${WAMR_CI_CONTROLLER:?}"
+          test -x "${controller}"
+          describe="$("${controller}" describe --output json-v1)"
+          recorded_target="$(python3 -B -c '
+          import json
+          import sys
 
-          path = Path("support/build/wamr-native-ci/run.py").resolve()
-          spec = importlib.util.spec_from_file_location("wamr_native_ci", path)
-          module = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(module)
-          print("Recorded supervisor/validator target:",
-                " ".join(module.RECORDED_EXECUTABLE_TARGET))
-          PY
+          payload = json.load(sys.stdin)
+          target = payload.get("recorded_executable_target")
+          if (payload.get("schema") != "uk.wamr.native-ci-describe" or
+              payload.get("schema_version") != 1 or
+              not isinstance(target, list) or
+              not target or
+              not all(isinstance(item, str) for item in target)):
+              raise SystemExit("native controller describe returned an invalid target")
+          print(" ".join(target))
+          ' <<< "${describe}")"
+          echo "Recorded supervisor/validator target: ${recorded_target}"
 
       - name: Acquire the existing native LLVM distribution
         uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495
@@ -167,6 +220,11 @@ jobs:
           mkdir -p -m 700 "${zig_dir}"
           cp -a -- "${zig_source}/." "${zig_dir}/"
           chmod -R u=rwX,go= "${zig_dir}"
+          for output in /d/wamr-ci/wamr-differential-sources /d/wamr-ci/wamr-differential; do
+            test ! -e "${output}"
+            test ! -L "${output}"
+            mkdir -m 700 -- "${output}"
+          done
           mkdir -m 700 "${root}/firmware"
           cp --no-preserve=mode,ownership \
             "$(readlink -f /usr/share/OVMF/OVMF_CODE_4M.fd)" "${root}/firmware/code.fd"
@@ -186,11 +244,13 @@ jobs:
           export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
           echo "${zig_dir}" >> "${GITHUB_PATH}"
           echo "${root}/llvm/bin" >> "${GITHUB_PATH}"
-          python3 support/build/wamr-native-ci/run.py build --runtime "${root}" \
+          controller="${WAMR_CI_CONTROLLER:?}"
+          test -x "${controller}"
+          "${controller}" build --runtime "${root}" \
             --wamr-source "${GITHUB_WORKSPACE}/.d/wamr-source"
 
-      - name: Run raw QCOW2 and derived fixed VHD under both APIC configurations
-        timeout-minutes: 15
+      - name: Run six native boots and paired Python/native success in the managed KVM process
+        timeout-minutes: 150
         env:
           QUALIFICATION_REPOSITORY_ID: ${{ github.repository_id }}
           QUALIFICATION_SOURCE_JOB: wamr-native-compute
@@ -201,10 +261,31 @@ jobs:
           export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
           bash .github/scripts/hyperv-qemu-candidate-runtime.sh "${root}" compute
 
+      - name: Reopen the native-produced local handoff on its recorded controller path
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          root=/d/wamr-ci/wamr-native-runtime
+          python3 -B - "${root}" <<'PY'
+          import importlib.util
+          from pathlib import Path
+          import sys
+
+          runtime = Path(sys.argv[1])
+          module = Path("support/build/wamr-native-ci/handoff.py").resolve()
+          spec = importlib.util.spec_from_file_location("wamr_handoff", module)
+          handoff = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(handoff)
+          records = handoff.result_records(runtime / "compute")
+          if len(records) != 33:
+              raise SystemExit("local handoff refused completed native records")
+          PY
+
       - name: Retain the expressly authorized public-source tiny image bundle
         id: public_bundle
-        timeout-minutes: 15
+        timeout-minutes: 75
         env:
+          WAMR_CI_CONTROLLER: /d/wamr-ci/wamr-native-runtime/controller/bin/uk-wamr-native-ci
           GITHUB_REPOSITORY_VISIBILITY: ${{ github.event.repository.private == false && 'public' || 'private' }}
           WAMR_CI_RUNTIME: /d/wamr-ci/wamr-native-runtime
         run: |
@@ -217,6 +298,8 @@ jobs:
           export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
           result="$(python3 support/build/wamr-native-ci/handoff.py public-source-bundle)"
           printf '%s\n' "${result}"
+          test -s "${root}/compute/public-source/handoff/private/handoff-inspect.log"
+          test -s "${root}/compute/public-source/handoff/evidence/command-handoff-inspect.json"
           archive_sha256="$(
             printf '%s\n' "${result}" |
               sed -n 's/^Public source archive SHA-256: //p'
@@ -367,6 +450,7 @@ jobs:
 
       - name: Bind and publish the redownloaded inner public-source ZIP
         id: public_binding
+        timeout-minutes: 45
         env:
           INNER_ZIP_SHA256: ${{ steps.public_bundle.outputs.inner_zip_sha256 }}
           CONTAINER_DIGEST: ${{ steps.public_upload.outputs.artifact-digest }}
@@ -374,6 +458,7 @@ jobs:
           ARTIFACT_URL: ${{ steps.public_upload.outputs.artifact-url }}
           REDOWNLOAD_DIR: ${{ steps.public_redownload.outputs.destination }}
           SOURCE_TREE: ${{ steps.public_bundle.outputs.source_tree }}
+          WAMR_CI_CONTROLLER: /d/wamr-ci/wamr-native-runtime/controller/bin/uk-wamr-native-ci
         run: |
           set -euo pipefail
           export PYTHONDONTWRITEBYTECODE=1
@@ -430,8 +515,8 @@ jobs:
           root=/d/wamr-ci/wamr-native-runtime
           import_root="${root}/compute/public-source/exact-redownload"
           mkdir -m 700 "${import_root}"
-          validator="${root}/compute/public-source/tools/bin/uk-wamr-direct-validate"
-          supervisor="${root}/compute/supervisor/bin/wamr-ci-supervisor"
+          validator="${root}/compute/public-source/validator-build/public-source/tools/bin/uk-wamr-direct-validate"
+          supervisor="${root}/controller/bin/uk-wamr-native-ci"
           python3 support/build/wamr-native-ci/handoff.py \
             import-public-source-bundle \
             --archive "${archive}" \
@@ -444,7 +529,11 @@ jobs:
             --validator "${validator}" \
             --supervisor "${supervisor}" \
             --artifact-id "${ARTIFACT_ID}" \
-            --container-digest "${CONTAINER_DIGEST}"
+            --container-digest "${CONTAINER_DIGEST}" \
+            --native-import-revalidation
+          native_revalidation="${import_root}/success-native-identity/revalidation"
+          test -s "${native_revalidation}/private/import-native-revalidation.log"
+          test -s "${native_revalidation}/evidence/command-import-native-revalidation.json"
           python3 support/build/wamr-native-ci/handoff.py candidate \
             --bundle "${import_root}/success/bundle.json" \
             --output "${import_root}/candidate-scope.json"
@@ -564,10 +653,154 @@ jobs:
           PY
           } >> "${GITHUB_STEP_SUMMARY}"
 
+      - name: Revalidate the trusted inner stage through the native records bridge
+        timeout-minutes: 20
+        env:
+          SOURCE_TREE: ${{ steps.public_bundle.outputs.source_tree }}
+        run: |
+          set -euo pipefail
+          umask 077
+          imported=/d/wamr-ci/wamr-native-runtime/compute/public-source/exact-redownload/success
+          stage="${RUNNER_TEMP}/wamr-inner-stage"
+          output="${RUNNER_TEMP}/wamr-imported-handoff-v1.json"
+          controller="${WAMR_CI_CONTROLLER:?}"
+          test -x "${controller}"
+          test ! -e "${stage}"
+          test ! -e "${output}"
+          python3 -B - "${imported}" "${stage}" <<'PY'
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import shutil
+          import sys
+
+          source, stage = map(Path, sys.argv[1:])
+          manifest = json.loads((source / "public-source.json").read_bytes())
+          stage.mkdir(mode=0o700)
+          names = sorted(manifest["members"])
+          if len(names) != 83:
+              raise SystemExit("unexpected trusted inner stage member count")
+          for name in [*names, "public-source.json", "portable-bundle.json"]:
+              relative = PurePosixPath(name)
+              if (str(relative) != name or not 1 <= len(relative.parts) <= 3
+                      or relative.parts[0] not in (
+                          "artifacts", "boots", "evidence",
+                          "public-source.json", "portable-bundle.json")
+                      or any(part in ("", ".", "..") for part in relative.parts)):
+                  raise SystemExit("unsafe trusted inner stage member")
+              original = source.joinpath(*relative.parts)
+              if original.is_symlink() or not original.is_file():
+                  raise SystemExit("missing trusted inner stage member")
+              copy = stage.joinpath(*relative.parts)
+              copy.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+              with original.open("rb") as src, copy.open("xb") as dst:
+                  os.fchmod(dst.fileno(), 0o600)
+                  shutil.copyfileobj(src, dst, 65536)
+          PY
+          "${controller}" records --stage-root "${stage}" \
+            --transport trusted-inner-zip --output handoff-v1 > "${output}"
+          python3 -B - "${output}" "${GITHUB_SHA}" "${SOURCE_TREE}" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          value = json.loads(Path(sys.argv[1]).read_bytes())
+          if (value["schema"] != "uk.wamr.native-ci-controller-records"
+                  or value["schema_version"] != 1
+                  or value["context"] != "trusted-inner-zip"
+                  or value["compatibility"] != "tiny-v2"
+                  or value["profile"] != "qcow2-derived-vhd"
+                  or value["source"] != {
+                      "revision": sys.argv[2], "tree": sys.argv[3]}
+                  or value["modes"] != [
+                      "raw-x2apic", "raw-legacy-apic",
+                      "qcow2-x2apic", "qcow2-legacy-apic",
+                      "vpc-x2apic", "vpc-legacy-apic"]
+                  or len(value["records"]) != 33
+                  or len(value["artifacts"]) != 50
+                  or value["runtime_inputs"]):
+              raise SystemExit("native record bridge refused trusted v2 import")
+          PY
+          identity_parent="${RUNNER_TEMP}/wamr-private-native-identity"
+          test ! -e "${identity_parent}"
+          mkdir -m 700 "${identity_parent}"
+          identity="${identity_parent}/success"
+          supervisor=/d/wamr-ci/wamr-native-runtime/controller/bin/uk-wamr-native-ci
+          test ! -e "${identity}"
+          "${controller}" supervisor-import-identity \
+            --stage-root "${stage}" \
+            --supervisor "${supervisor}" \
+            --git /usr/bin/git \
+            --output "${identity}"
+          test -s "${identity}/private/supervisor-import-identity.log"
+          test -s "${identity}/evidence/command-supervisor-import-identity.json"
+          python3 -B - "${identity}" <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import sys
+
+          root = Path(sys.argv[1])
+          log = (root / "private/supervisor-import-identity.log").read_bytes()
+          record = json.loads(
+              (root / "evidence/command-supervisor-import-identity.json").read_bytes())
+          if (record["scope"] != "command_diagnostic_not_acceptance"
+                  or record["stage"] != "supervisor-import-identity"
+                  or record["exit_code"] != 0
+                  or record["bytes"] != len(log)
+                  or record["sha256"] != hashlib.sha256(log).hexdigest()
+                  or record["supervisor"]["request"]["argv"] != [
+                      {"kind": "path", "role": "command-supervisor", "relative": ""},
+                      {"kind": "literal", "value": "--identity"}]):
+              raise SystemExit("native imported supervisor identity record refused")
+          PY
+          tampered="${identity_parent}/tampered-supervisor"
+          test ! -e "${tampered}"
+          cp -- "${supervisor}" "${tampered}"
+          printf 'tamper' >> "${tampered}"
+          if "${controller}" supervisor-import-identity \
+            --stage-root "${stage}" \
+            --supervisor "${tampered}" \
+            --git /usr/bin/git \
+            --output "${identity_parent}/refused-supervisor"; then
+            echo "Native import identity accepted changed supervisor" >&2
+            exit 1
+          fi
+          test ! -e "${identity_parent}/refused-supervisor"
+          printf '\n' >> "${stage}/evidence/build.json"
+          if "${controller}" records --stage-root "${stage}" \
+            --transport trusted-inner-zip --output handoff-v1 \
+            > "${RUNNER_TEMP}/wamr-tampered-handoff-v1.json"; then
+            echo "Native records bridge accepted changed inner evidence" >&2
+            exit 1
+          fi
+          test ! -s "${RUNNER_TEMP}/wamr-tampered-handoff-v1.json"
+          if "${controller}" import-native-revalidation \
+            --stage-root "${stage}" --output "${identity_parent}/refused-revalidation"; then
+            echo "Native revalidation accepted changed inner evidence" >&2
+            exit 1
+          fi
+          test ! -e "${identity_parent}/refused-revalidation"
+          if "${controller}" supervisor-import-identity \
+            --stage-root "${stage}" \
+            --supervisor "${supervisor}" \
+            --git /usr/bin/git \
+            --output "${identity_parent}/refused-stage"; then
+            echo "Native import identity accepted changed inner evidence" >&2
+            exit 1
+          fi
+          test ! -e "${identity_parent}/refused-stage"
+          if "${controller}" import-validator-build \
+            --stage-root "${stage}" --output "${identity_parent}/refused-validator"; then
+            echo "Native import validator build accepted changed inner evidence" >&2
+            exit 1
+          fi
+          test ! -e "${identity_parent}/refused-validator"
+
       - name: Retain redacted diagnostics separately from the public-source image bundle
         if: always()
         run: |
-          python3 support/build/wamr-native-ci/run.py diagnostics \
+          "${WAMR_CI_CONTROLLER:?}" diagnostics \
             --runtime /d/wamr-ci/wamr-native-runtime
 
       - name: Publish bounded local-only records
@@ -579,3 +812,145 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 7
+
+      - name: Retain bounded paired native replay for handoff diagnosis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wamr-native-replay-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /d/wamr-ci/wamr-differential/native-records.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  wamr-differential-parity:
+    needs: wamr-native-compute
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        case: [build-start-tamper, missing-build, occupied-boot-slot, prior-build-output]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: cataggar/wamr
+          ref: a53205d77be3b880eb8f8b96679512ba58e2331a
+          path: .d/wamr-source
+          persist-credentials: false
+
+      - name: Check the x86 KVM runner and build prerequisites
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          test -c /dev/kvm
+          sudo install -d -o root -g root -m 755 /d
+          sudo install -d -o "$(id -u)" -g "$(id -g)" -m 700 /d/wamr-ci
+          export PATH="/usr/bin:/bin:${PATH}"
+          if ! (
+            for name in bash make bison yacc flex lex m4 python3 getfacl; do
+              test -x "/usr/bin/${name}" || exit 1
+            done
+            test -r /usr/share/OVMF/OVMF_CODE_4M.fd
+            test -r /usr/share/OVMF/OVMF_VARS_4M.fd
+          ); then
+            sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources \
+              -o Dir::Etc::sourceparts=- update -qq
+            sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources \
+              -o Dir::Etc::sourceparts=- install -y --no-install-recommends \
+              make bison flex m4 python3 acl ovmf
+          fi
+          mkdir -p .d
+
+      - name: Set up the pinned native downloader
+        uses: cataggar/ghr/actions/setup@114926d37d3825e63bede2ccc7ce56b67eda7495
+        with:
+          ghr-version: v0.8.0
+          cache: 'false'
+
+      - name: Acquire the pinned QEMU runtime and private Bison data
+        run: |
+          set -euo pipefail
+          bash .github/scripts/hyperv-native-qemu-acquire.sh /d/wamr-ci/wamr-native-runtime
+          export PATH="/usr/bin:/bin:${PATH}"
+          bash .github/scripts/hyperv-native-bison-acquire.sh /d/wamr-ci/wamr-native-runtime
+
+      - name: Install the pinned Zig compiler
+        uses: cataggar/ghr/actions/install@114926d37d3825e63bede2ccc7ce56b67eda7495
+        with:
+          ghr-version: v0.8.0
+          tools: cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Acquire the pinned LLVM distribution
+        uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495
+        with:
+          ghr-version: v0.8.0
+          tools: cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
+          dest: /d/wamr-ci/wamr-native-runtime/llvm
+          extract: 'true'
+          strip-components: '1'
+          cache: 'false'
+
+      - name: Install the portable controller and complete private runtime inputs
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          umask 077
+          root=/d/wamr-ci/wamr-native-runtime
+          zig_source="$(dirname "$(readlink -f "$(command -v zig)")")"
+          zig_dir=/d/wamr-ci/wamr-native-tools/zig-0.16.0
+          test ! -e "${zig_dir}"
+          mkdir -p -m 700 "${zig_dir}"
+          cp -a -- "${zig_source}/." "${zig_dir}/"
+          chmod -R u=rwX,go= "${zig_dir}"
+          mkdir -m 700 "${root}/firmware"
+          cp --no-preserve=mode,ownership \
+            "$(readlink -f /usr/share/OVMF/OVMF_CODE_4M.fd)" "${root}/firmware/code.fd"
+          cp --no-preserve=mode,ownership \
+            "$(readlink -f /usr/share/OVMF/OVMF_VARS_4M.fd)" "${root}/firmware/vars.fd"
+          for name in llvm-readelf llvm-strip; do
+            alias="${root}/llvm/bin/${name}"
+            target="$(readlink -f "${alias}")"
+            test -f "${target}"
+            temporary="${alias}.materialized"
+            test ! -e "${temporary}"
+            cp --no-preserve=mode,ownership -- "${target}" "${temporary}"
+            chmod 500 "${temporary}"
+            rm -- "${alias}"
+            mv -- "${temporary}" "${alias}"
+          done
+          export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
+          controller_root=/d/wamr-ci/wamr-differential-controller
+          test ! -e "${controller_root}"
+          mkdir -m 0700 -- "${controller_root}"
+          mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-differential-controller-cache"
+          ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-differential-controller-cache" \
+            zig build --build-file support/build/wamr-native-ci/build.zig \
+              -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=ReleaseSafe \
+              -Dcontroller-runtime="${controller_root}" -j2 install-controller
+          test -x "${controller_root}/controller/bin/uk-wamr-native-ci"
+
+      - name: Compare paired real fault outcomes with managed KVM
+        timeout-minutes: 150
+        env:
+          QUALIFICATION_REPOSITORY_ID: ${{ github.repository_id }}
+          QUALIFICATION_SOURCE_JOB: wamr-differential-parity
+          DIFFERENTIAL_CASE: ${{ matrix.case }}
+        run: |
+          set -euo pipefail
+          root=/d/wamr-ci/wamr-native-runtime
+          zig_dir="$(dirname "$(readlink -f "$(command -v zig)")")"
+          export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
+          bash .github/scripts/hyperv-qemu-candidate-runtime.sh \
+            "${root}" differential "${DIFFERENTIAL_CASE}"
+
+      - name: Remove only the managed QEMU dynamic runtime
+        if: always()
+        run: |
+          bash .github/scripts/hyperv-native-libfdt-cleanup.sh /d/wamr-ci/wamr-native-runtime

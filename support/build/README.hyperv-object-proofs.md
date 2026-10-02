@@ -133,7 +133,8 @@ the shared `support/tools/hyperv/process.zig` / `diagnostics.zig` modules and
 their transitive `contracts.zig` / `sensitive.zig` dependencies.
 There are no new package dependencies or package restores. Required CI runs the
 focused selector in Debug and ReleaseSafe. Both guarded producer maps bind the
-complete build closure and the shared core dependencies.
+complete guarded build closure outside the separate `wamr-native-ci` controller
+subtree and the shared core dependencies.
 
 This selector supplies object/link/ABI evidence only. It does not run
 remaining controller/persistence/preparation Python aggregates, linked-image

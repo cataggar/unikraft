@@ -63,6 +63,7 @@ pub fn plan(
 pub const Options = struct {
     optimize: std.builtin.OptimizeMode,
     path_bindings: []const PathBinding = &.{},
+    strip: bool = false,
 };
 
 pub const Output = struct {
@@ -137,6 +138,7 @@ pub fn execute(
             .pic = planned.object.pic,
             .omit_frame_pointer = planned.object.omit_frame_pointer,
             .error_tracing = false,
+            .strip = if (options.strip) true else null,
         });
         try addIncludes(target_module, graph.global_includes, options.path_bindings);
         try addIncludes(target_module, planned.object.includes, options.path_bindings);
@@ -164,6 +166,7 @@ pub fn execute(
             .pic = planned.object.pic,
             .omit_frame_pointer = planned.object.omit_frame_pointer,
             .error_tracing = false,
+            .strip = if (options.strip) true else null,
         });
         const object = b.addObject(.{
             .name = b.fmt("{s}-{s}", .{ planned.component_name, planned.object.name }),
@@ -200,7 +203,7 @@ pub fn addFixtureValidation(b: *std.Build) Error!*std.Build.Step {
     );
     const logical_header = "/fixture/generated/include/uk/bits/config.h";
     const logical_include = "/fixture/generated/include";
-    const graph = testGraph(&.{.{
+    const fixture_objects = [_]component.TargetZigObject{.{
         .name = "fixture",
         .root_source_file = fixture_source,
         .output = "/fixture/fixture.o",
@@ -209,13 +212,22 @@ pub fn addFixtureValidation(b: *std.Build) Error!*std.Build.Step {
             .{ .path = fixture_include, .languages = &.{.zig} },
         },
         .dependencies = &.{logical_header},
-    }});
+    }};
+    const graph = testGraph(&fixture_objects);
     const compiled = try execute(b, graph, .{
         .optimize = .ReleaseSafe,
         .path_bindings = &.{.{
             .logical_path = logical_header,
             .lazy_path = config_header,
         }},
+    });
+    const stripped = try execute(b, testGraph(&fixture_objects), .{
+        .optimize = .ReleaseSafe,
+        .path_bindings = &.{.{
+            .logical_path = logical_header,
+            .lazy_path = config_header,
+        }},
+        .strip = true,
     });
     const link = b.addSystemCommand(&.{
         "zig",
@@ -238,6 +250,17 @@ pub fn addFixtureValidation(b: *std.Build) Error!*std.Build.Step {
         "llvm-nm",
     });
     verify.addFileArg(linked);
+    const verify_stripped = b.addSystemCommand(&.{
+        "python3",
+        "support/build/tests/target-zig-object/verify.py",
+        "--readelf",
+        "llvm-readelf",
+        "--nm",
+        "llvm-nm",
+        "--expect-stripped",
+    });
+    verify_stripped.addFileArg(stripped.outputs[0].lazy_path);
+    verify.step.dependOn(&verify_stripped.step);
     return &verify.step;
 }
 

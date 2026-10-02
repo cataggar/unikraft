@@ -66,17 +66,22 @@ GUARDED_CONTRACT_SCHEMA = (
     "unikraft.hyperv.guarded-v2-pristine-unavailable"
 )
 GUARDED_PRODUCER_SCHEMA = "unikraft.hyperv.guarded-producer-pin"
-GUARDED_PRODUCER_SCHEMA_VERSION = 4
-# Keep these independently enforced pins aligned with the reviewed controller
-# source set; this does not expand the guarded platform-only contract.
+GUARDED_PRODUCER_SCHEMA_VERSION = 5
+GUARDED_PRODUCER_DIRECTORY_EXCLUSIONS = {
+    "support/build": ("wamr-native-ci",),
+}
+# Keep these independently enforced pins aligned with the reviewed guarded
+# producer source set. Schema 5 records support/build without the separate
+# WAMR native CI controller subtree; that subtree must still be a plain
+# non-symlink directory, and no other guarded closure has exclusions.
 GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "a310b3b5db60902e6d2b8fe54f3695c0b4981b9bb821025a4dbec59267e34205"
+            "109e7345aff40fed3feaa9bf51bd09fc8f20c34493409447a10feb2b0b5d501b"
         ),
-        "size": 2963691,
-        "files": 254,
+        "size": 1780570,
+        "files": 217,
     },
     "support/kconfig": {
         "name": "support/kconfig",
@@ -212,16 +217,16 @@ GUARDED_PRODUCER_FILES = {
         "54e350a7d5e2bcc0cc7932bf7713741b18ada4760f2da4a575ebdc2cae646013"
     ),
     "Config.uk": (
-        "31ad9392835d740c86f36c8801dc1d0973ee33c2a40ef6f758ecb8f65cc58d5f"
+        "a7dd02562548fd3d56dbd31a297f9677e2f4a098ff03247ebe9dd1456b5e02c2"
     ),
     "Makefile": (
-        "6dd447ae720971d034a15960511cceaa05e109f7b239529d9568185c62f6e6e0"
+        "7e89ae8423aa78bce6b8316a6e6fe0eda58de8604f9fb525a30ce016b32abeeb"
     ),
     "Makefile.uk": (
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
     ),
     "build.zig": (
-        "064cf3445f3bb531ba10479fd08e1886ae1555b79969b37a3691a5076c60571c"
+        "e8c8045183e07e5f016f27373ad54b61d1c59dbac51b6fc125af48d6ac675a5c"
     ),
     "build.zig.zon": (
         "511efb394c90490f52120af26e87c5e0a3ea27a444ab1c197ce04f1b3b709e4e"
@@ -296,10 +301,10 @@ GUARDED_PRODUCER_FILES = {
         "d6ae0548d15f54eecbfe333490b648165047e1a63e72a61aafea62aec2b8aeab"
     ),
     "support/build/native-config-metadata.py": (
-        "a8a98d3eaab01e454fc863d07214aea947baafdf512debf55259807ed96998b7"
+        "b6ff513dcfd0cddd55ccd75e3b3c78ddaa286190bfa283621cfe08d9b3fe0ef6"
     ),
     "support/build/native-config-metadata.zig": (
-        "aa4d88591d27633eff90c424451782aad753e160d005ecaefc00e99c1f4281e2"
+        "12ec5aa6fd3b8d93efa20d861f268010c4b8a7d9bbdf994ad83318d23eacb117"
     ),
     "support/build/native-config-tool.zig": (
         "30291f034f98c970bbf7879189e9bc4c8bc5aa5a6a19fe1ed247d508641d46a9"
@@ -323,7 +328,7 @@ GUARDED_PRODUCER_FILES = {
         "2c9d31594401b9d7a095e4620d13dd375a7163b9df168284113dce41eb084caa"
     ),
     "support/build/native-target-object.zig": (
-        "c738d4dcd2acf2085c29716725461822752c8c96bab20ab8ec6e9338f51daa20"
+        "cdbf48bdabc4a82c7922efe3d44e412dd88d751160a19d048f39636023e77d98"
     ),
     "support/build/postprocess-elf.zig": (
         "e227ca4b63adfd76ad5e768b424cf750f7e12d6eac8743b7fe9420e339083180"

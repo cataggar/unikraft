@@ -13,6 +13,7 @@ pub const Entry = inputs.Entry;
 // The embedded bytes make this executable's own compile-time source inputs
 // independently checkable. Git revision/clean-tree admission is owned by PR 02.
 pub const closure = inputs.entries;
+pub const previous_closure = inputs.previous_entries;
 
 pub fn contentClosure() [Sha256.digest_length]u8 {
     var hash = Sha256.init(.{});
@@ -69,6 +70,24 @@ pub const Source = struct {
         physical_sha256: [64]u8,
         role_excluded_outputs: [limits.roles.len][]const u8 = limits.roles,
     },
+
+    pub fn same(a: Source, b: Source) bool {
+        const first = a.custody;
+        const second = b.custody;
+        if (!std.mem.eql(u8, a.revision, b.revision) or
+            !std.mem.eql(u8, a.tree, b.tree) or
+            !std.mem.eql(u8, first.schema, second.schema) or
+            first.version != second.version or
+            !std.mem.eql(u8, first.object_format, second.object_format) or
+            first.files != second.files or first.directories != second.directories or
+            first.bytes != second.bytes or
+            !std.meta.eql(first.content_sha256, second.content_sha256) or
+            !std.meta.eql(first.physical_sha256, second.physical_sha256))
+            return false;
+        for (first.role_excluded_outputs, second.role_excluded_outputs) |left, right|
+            if (!std.mem.eql(u8, left, right)) return false;
+        return true;
+    }
 };
 
 const git_prefix = [_][]const u8{
@@ -76,6 +95,8 @@ const git_prefix = [_][]const u8{
     "-c",             "core.fsmonitorHookVersion=", "-c",                       "credential.helper=", "-c",
     "core.pager=cat",
 };
+
+pub const git_probe_deadline_ms = 120_000;
 
 pub fn gitOutput(
     allocator: std.mem.Allocator,
@@ -127,7 +148,7 @@ pub fn gitOutput(
     defer {
         if (bounded_fd) |fd| _ = linux.close(fd);
     }
-    const primary = try process.Deadline.afterMilliseconds(60_000);
+    const primary = try process.Deadline.afterMilliseconds(git_probe_deadline_ms);
     const cleanup: process.Deadline = .{ .expires_ns = try std.math.add(u64, primary.expires_ns, 10 * std.time.ns_per_s) };
     var result = try process.runCommand(allocator, io, .{
         .executable = executable,
@@ -141,7 +162,7 @@ pub fn gitOutput(
         .limits = .{ .stdout_bytes = if (output != null) 1024 else @max(1, @min(limit, 8 * limits.mib)), .stderr_bytes = 4096 },
     });
     defer result.deinit(allocator);
-    if (!result.succeeded() or result.stderr.len != 0 or result.stdout.len > limit) return error.GitRefused;
+    try requireGitOutcome(result, limit);
     if (bounded_fd) |fd| {
         const length = linux.lseek(fd, 0, 1);
         if (linux.errno(length) != .SUCCESS or length == 0 or length > limit)
@@ -162,6 +183,48 @@ pub fn gitOutput(
     if (!files.sameSnapshot(before, try files.snapshot(.{ .handle = after.handle, .flags = .{ .nonblocking = false } })))
         return error.SourceChanged;
     return allocator.dupe(u8, result.stdout);
+}
+
+pub fn requireGitOutcome(result: process.CommandResult, limit: usize) !void {
+    if (result.primary_deadline_reached) return error.GitTimedOut;
+    if (!result.succeeded()) {
+        switch (result.primary) {
+            .exited => |code| if (code != 0) return error.GitExited,
+            .signal => return error.GitSignaled,
+            .timeout => return error.GitTimedOut,
+            .cancelled => return error.GitCancelled,
+            .output_overflow => return error.GitOutputOverflow,
+            .exec_failed => return error.GitExecFailed,
+            .snapshot_unsupported => return error.GitSnapshotUnsupported,
+            .event_limit => return error.GitEventLimit,
+            .local_io => {
+                if (result.stdout_status == .io_failed) return error.GitStdoutIo;
+                if (result.stderr_status == .io_failed) return error.GitStderrIo;
+                if (result.primary_events == 0) return error.GitStartupIo;
+                return error.GitMonitorIo;
+            },
+            .executable_changed => return error.GitExecutableChanged,
+            .unknown => return error.GitUnknownTermination,
+        }
+        if (!result.cleanup_complete or result.cleanup != .complete) return switch (result.cleanup) {
+            .deadline => error.GitCleanupTimedOut,
+            .event_limit => error.GitCleanupEventLimit,
+            .descendant_untracked => error.GitCleanupDescendantUntracked,
+            .identity_changed => error.GitCleanupIdentityChanged,
+            .signal_failed => error.GitCleanupSignalFailed,
+            .reap_failed => error.GitCleanupReapFailed,
+            .proc_unavailable => error.GitCleanupProcUnavailable,
+            .local_io => error.GitCleanupLocalIo,
+            .complete, .not_required => error.GitCleanupIncomplete,
+        };
+        if (result.descendants.limit_exceeded) return error.GitDescendantLimit;
+        if (result.stdout_status != .complete or result.stderr_status != .complete)
+            return error.GitStreamIncomplete;
+        if (!result.executable_stable) return error.GitExecutableChanged;
+        return error.GitRefused;
+    }
+    if (result.stderr.len != 0) return error.GitDiagnostic;
+    if (result.stdout.len > limit) return error.GitOutputOverflow;
 }
 
 fn gitLine(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: []const u8, args: []const []const u8) ![]u8 {
@@ -192,6 +255,7 @@ fn inspectOutput(
     relative: []const u8,
     state: *Ignored,
     hash: *Sha256,
+    allow_missing_roots: bool,
 ) !void {
     try limits.relative(relative, limits.ignored_path, limits.ignored_depth);
     _ = try limits.outputRole(relative);
@@ -200,7 +264,13 @@ fn inspectOutput(
     const parent_path = std.fs.path.dirname(path).?;
     const parent = try files.openDirectory(io, parent_path, .artifact);
     defer parent.close(io);
-    const named = try parent.openFile(io, std.fs.path.basename(path), .{ .path_only = true, .follow_symlinks = false });
+    const named = parent.openFile(io, std.fs.path.basename(path), .{ .path_only = true, .follow_symlinks = false }) catch |err| {
+        if (allow_missing_roots and err == error.FileNotFound and std.mem.eql(u8, relative, role)) {
+            try physical.bind(allocator, hash, .{ "absent", relative });
+            return;
+        }
+        return err;
+    };
     defer named.close(io);
     const before = try files.snapshot(named);
     if (before.uid != std.os.linux.geteuid()) return error.UnsafeIgnoredEntry;
@@ -235,7 +305,7 @@ fn inspectOutput(
         for (names.items) |name| {
             const child = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ relative, name });
             defer allocator.free(child);
-            try inspectOutput(allocator, io, repo, git, role, child, state, hash);
+            try inspectOutput(allocator, io, repo, git, role, child, state, hash, allow_missing_roots);
         }
     } else if (kind == std.os.linux.S.IFREG) {
         if (before.nlink != 1 or before.size > limits.ignored_file)
@@ -285,7 +355,7 @@ fn inspectOutput(
         return error.IgnoredChanged;
 }
 
-fn ignoredState(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: []const u8) !Ignored {
+fn ignoredState(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: []const u8, allow_missing_roots: bool) !Ignored {
     const inventory = try gitOutput(allocator, io, repo, git, &.{
         "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z",
     }, limits.ignored_git_output, null);
@@ -310,7 +380,7 @@ fn ignoredState(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git:
     hash.update("uk.wamr.ignored-source-policy-v1\x00");
     var state: Ignored = .{ .entries = 0, .bytes = 0, .physical_sha256 = undefined, .inventory_sha256 = std.fmt.bytesToHex(inventory_hash, .lower) };
     for (limits.roles) |role| {
-        try inspectOutput(allocator, io, repo, git, role, role, &state, &hash);
+        try inspectOutput(allocator, io, repo, git, role, role, &state, &hash, allow_missing_roots);
     }
     state.physical_sha256 = physical.hex(&hash);
     return state;
@@ -434,8 +504,16 @@ fn trackedFile(
 }
 
 pub fn source(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: []const u8) !Source {
+    return captureSource(allocator, io, repo, git, false);
+}
+
+pub fn portableSource(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: []const u8) !Source {
+    return captureSource(allocator, io, repo, git, true);
+}
+
+fn captureSource(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: []const u8, allow_missing_roots: bool) !Source {
     _ = try directoryBefore(io, repo);
-    const ignored_before = try ignoredState(allocator, io, repo, git);
+    const ignored_before = try ignoredState(allocator, io, repo, git, allow_missing_roots);
     try clean(allocator, io, repo, git);
     const revision = try gitLine(allocator, io, repo, git, &.{ "rev-parse", "HEAD" });
     const tree = try gitLine(allocator, io, repo, git, &.{ "rev-parse", "HEAD^{tree}" });
@@ -493,7 +571,7 @@ pub fn source(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: [
     defer allocator.free(final_tree);
     if (!std.mem.eql(u8, revision, final_revision) or !std.mem.eql(u8, tree, final_tree))
         return error.SourceChanged;
-    const ignored_after = try ignoredState(allocator, io, repo, git);
+    const ignored_after = try ignoredState(allocator, io, repo, git, allow_missing_roots);
     if (!std.meta.eql(ignored_before, ignored_after)) return error.IgnoredChanged;
     return .{
         .revision = revision,
@@ -593,6 +671,7 @@ pub fn trackedManifest(
         return error.InvalidGitOutput;
     const listing = try gitOutput(allocator, io, repo, git, &.{ "ls-tree", "-z", "HEAD", "--", relative }, 2048, null);
     defer allocator.free(listing);
+    if (listing.len == 0) return error.UntrackedManifest;
     const matches = try trackedMap(allocator, listing, if (std.mem.eql(u8, format, "sha1")) 40 else 64);
     defer allocator.free(matches);
     if (matches.len != 1 or !std.mem.eql(u8, matches[0].path, relative) or std.mem.eql(u8, matches[0].mode, "120000"))

@@ -39,6 +39,7 @@ pub const Context = struct {
     fixture_report: ?physical.File = null,
     test_before_publication: ?*const fn (*Context) void = null,
     failed_stage: []const u8 = "startup",
+    failed_operation: []const u8 = "",
 };
 
 pub const Invocation = struct { context: *Context };
@@ -49,8 +50,8 @@ pub const WamrArchiveSealed = struct { context: *Context, runtime: files.Directo
 pub const DependenciesRestored = struct { context: *Context, runtime: files.Directory, work: files.Directory };
 pub const BootstrapInputsBound = struct { context: *Context, runtime: files.Directory, work: files.Directory };
 pub const AdapterBuilt = struct { context: *Context, runtime: files.Directory, work: files.Directory };
-pub const InputsBaselined = struct { context: *Context, runtime: files.Directory, work: files.Directory };
 pub const LocalBootBuilt = struct { context: *Context, runtime: files.Directory, work: files.Directory };
+pub const InputsBaselined = struct { context: *Context, runtime: files.Directory, work: files.Directory };
 pub const NativeFixturesPassed = struct { context: *Context, runtime: files.Directory, work: files.Directory };
 pub const ProducerPrepared = struct { context: *Context, runtime: files.Directory, work: files.Directory };
 pub const ConfigSolved = struct { context: *Context, runtime: files.Directory, work: files.Directory };
@@ -96,6 +97,14 @@ fn read(context: *Context, path: []const u8, max: usize, private: bool) ![]const
     defer data.deinit();
     try retained.verify(context.io);
     return context.allocator.dupe(u8, data.bytes());
+}
+
+pub fn readAcceptedRecord(context: *Context, name: []const u8) ![]const u8 {
+    const relative = try std.fs.path.join(context.allocator, &.{ "evidence", name });
+    defer context.allocator.free(relative);
+    const path = try subpath(context, relative);
+    defer context.allocator.free(path);
+    return read(context, path, records.max_record_bytes, true);
 }
 
 fn evidence(context: *Context, name: []const u8, value: anytype) !void {
@@ -299,24 +308,28 @@ fn requireBootstrapInputs(context: *Context) !void {
 fn restoreDependencies(context: *Context) !void {
     const a = context.allocator;
     const io = context.io;
+    context.failed_operation = "create-restore";
     const restore_root = try subpath(context, "dependencies");
     const work = try files.openDirectory(io, context.compute, .private);
     defer work.close(io);
     try work.createDir(io, "dependencies", .fromMode(0o700));
     const dir = try files.openDirectory(io, restore_root, .private);
     defer dir.close(io);
+    context.failed_operation = "tracked-manifests";
     const manifests = try dependencies.sourceManifests(a, io, context.repository, context.git);
     defer for (manifests) |manifest| manifest.deinit(a);
     for (manifests, [_][]const u8{ "build.zig", "build.zig.zon" }) |manifest, name|
         try create(io, dir, name, manifest.content);
     try dependencies.pinnedManifest(a, manifests[1].content);
     try dir.createDir(io, "zig-pkg", .fromMode(0o700));
+    context.failed_operation = "fetch-pinned-package";
     _ = try runBootstrap(context, "dependency-restore", &.{
         context.roots.zig,                    "build",       "--build-file",                try join(context, &.{ restore_root, "build.zig" }),
         "--fetch=all",                        "--cache-dir", try subpath(context, "cache"), "--global-cache-dir",
         try subpath(context, "global-cache"), "-j2",
     }, restore_root, 900, 8 * limits.mib);
     const packages = try join(context, &.{ restore_root, "zig-pkg" });
+    context.failed_operation = "inventory-packages";
     var listing = try dependencies.packageSet(a, io, packages);
     defer listing.deinit(a);
     const hash_work = try subpath(context, "dependency-hash-work");
@@ -327,6 +340,7 @@ fn restoreDependencies(context: *Context) !void {
     try create(io, hash_dir, "build.zig.zon", manifests[1].content);
     try hash_dir.createDir(io, "zig-pkg", .fromMode(0o700));
     try work.createDir(io, "dependency-hash-cache", .fromMode(0o700));
+    context.failed_operation = "verify-package-hashes";
     for (listing.packages, 0..) |package, index| {
         const name = try std.fmt.allocPrint(a, "dependency-hash-{d:0>3}", .{index});
         const raw = try runBootstrap(context, name, &.{
@@ -336,14 +350,17 @@ fn restoreDependencies(context: *Context) !void {
         if (!std.mem.eql(u8, raw, try std.fmt.allocPrint(a, "{s}\n", .{package.name})))
             return error.PackageHashMismatch;
     }
+    context.failed_operation = "record-dependencies";
     context.dependency = try dependencies.capture(a, io, context.repository, context.git, context.compute);
 }
 
 pub fn restore(state: WamrArchiveSealed) !DependenciesRestored {
     const context = state.context;
     context.failed_stage = "dependency-restore";
+    context.failed_operation = "bind-bootstrap-inputs";
     try freezeBootstrapInputs(context);
     try restoreDependencies(context);
+    context.failed_operation = "verify-bootstrap-inputs";
     try requireBootstrapInputs(context);
     return next(state, DependenciesRestored);
 }
@@ -360,12 +377,12 @@ pub fn bootstrap(state: DependenciesRestored) !BootstrapInputsBound {
 
 pub fn requireSource(context: *Context) !void {
     try cancelled(context);
-    const actual = try custody.source(context.allocator, context.io, context.repository, context.git);
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    const actual = try custody.source(scratch.allocator(), context.io, context.repository, context.git);
     try cancelled(context);
     const before = context.source.?;
-    if (!std.mem.eql(u8, actual.revision, before.revision) or
-        !std.mem.eql(u8, actual.tree, before.tree) or
-        !std.meta.eql(actual.custody, before.custody)) return error.SourceChanged;
+    if (!before.same(actual)) return error.SourceChanged;
 }
 
 fn runStage(state: anytype, selected: plan.Stage, check_consumer: bool) !void {
@@ -436,32 +453,13 @@ pub fn requireConsumer(context: *Context) !void {
 }
 
 fn pythonStdlib(context: *Context) ![]const u8 {
-    const python = context.tools[1];
-    try process.initialize();
-    var executable = try process.Executable.open(context.io, python);
-    defer executable.close(context.io);
-    const cwd = try files.openDirectory(context.io, context.repository, .artifact);
-    defer cwd.close(context.io);
-    var env = std.process.Environ.Map.init(context.allocator);
-    defer env.deinit();
-    try env.put("PYTHONDONTWRITEBYTECODE", "1");
-    const deadline = try process.Deadline.afterMilliseconds(30_000);
-    var result = try process.runCommand(context.allocator, context.io, .{
-        .executable = executable,
-        .argv = &.{ python, "-c", "import sysconfig; print(sysconfig.get_path('stdlib'))" },
-        .environment = &env,
-        .cwd = cwd,
-        .primary_deadline = deadline,
-        .cleanup_deadline = .{ .expires_ns = try std.math.add(u64, deadline.expires_ns, 10 * std.time.ns_per_s) },
-        .cancel = context.signal.flag(),
-        .snapshot_executable = false,
-        .limits = .{ .stdout_bytes = 4096, .stderr_bytes = 4096 },
-    });
-    defer result.deinit(context.allocator);
-    if (!result.succeeded() or result.stderr.len != 0 or
-        result.stdout.len < 2 or result.stdout[result.stdout.len - 1] != '\n')
-        return error.InvalidPythonStdlib;
-    return context.allocator.dupe(u8, result.stdout[0 .. result.stdout.len - 1]);
+    return inputs.pythonStdlib(
+        context.allocator,
+        context.io,
+        context.repository,
+        context.tools[1],
+        context.signal.flag(),
+    );
 }
 
 pub fn buildAdapter(state: BootstrapInputsBound) !AdapterBuilt {
@@ -469,7 +467,7 @@ pub fn buildAdapter(state: BootstrapInputsBound) !AdapterBuilt {
     return next(state, AdapterBuilt);
 }
 
-pub fn baseline(state: AdapterBuilt) !InputsBaselined {
+pub fn baseline(state: LocalBootBuilt) !InputsBaselined {
     const context = state.context;
     context.failed_stage = "build-start";
     try requireBuildEvidence(context);
@@ -519,9 +517,12 @@ fn rawValue(allocator: std.mem.Allocator, raw: []const u8) !std.json.Value {
 }
 
 fn supervisorState(context: *Context) !std.json.Value {
-    const a = context.allocator;
-    const source_map = try supervisorSourceMap(context);
-    const runtime_map = try supervisorRuntimeMap(context);
+    return captureSupervisorState(context.allocator, context.io, context.repository, context.roots.supervisor);
+}
+
+pub fn captureSupervisorState(a: std.mem.Allocator, io: std.Io, repository: []const u8, supervisor: []const u8) !std.json.Value {
+    const source_map = try supervisorSourceMap(a, io, repository);
+    const runtime_map = try supervisorRuntimeMap(a, io, supervisor);
     return typedValue(a, .{
         .schema = "uk.wamr.command-supervisor",
         .version = 1,
@@ -540,8 +541,7 @@ const Map = struct {
 };
 const MapEntry = struct { name: []const u8, file: physical.File };
 
-fn guardedMap(context: *Context, domain: []const u8, sorted: []const MapEntry) !Map {
-    const a = context.allocator;
+fn guardedMap(a: std.mem.Allocator, domain: []const u8, sorted: []const MapEntry) !Map {
     var content = Sha256.init(.{});
     content.update(try std.fmt.allocPrint(a, "{s}-content\x00", .{domain}));
     var physical_hash = Sha256.init(.{});
@@ -567,35 +567,33 @@ fn guardedMap(context: *Context, domain: []const u8, sorted: []const MapEntry) !
     };
 }
 
-fn supervisorSourceMap(context: *Context) !Map {
-    const a = context.allocator;
+fn supervisorSourceMap(a: std.mem.Allocator, io: std.Io, repository: []const u8) !Map {
     var entries: std.ArrayList(MapEntry) = .empty;
     for (custody.closure) |entry| {
-        const file = try physical.readFile(context.io, try join(context, &.{ context.repository, entry.name }), limits.tracked_file, false);
+        const file = try physical.readFile(io, try std.fs.path.join(a, &.{ repository, entry.name }), limits.tracked_file, false);
         try entries.append(a, .{ .name = entry.name, .file = file });
     }
-    return guardedMap(context, "uk.wamr.command-supervisor-source-v1", entries.items);
+    return guardedMap(a, "uk.wamr.command-supervisor-source-v1", entries.items);
 }
 
-fn supervisorRuntimeMap(context: *Context) !Map {
-    const a = context.allocator;
+fn supervisorRuntimeMap(a: std.mem.Allocator, io: std.Io, supervisor: []const u8) !Map {
     var entries: std.ArrayList(MapEntry) = .empty;
-    const binary = try physical.readFile(context.io, context.roots.supervisor, limits.tracked_file, false);
+    const binary = try physical.readFile(io, supervisor, limits.tracked_file, false);
     try entries.append(a, .{ .name = "executable", .file = binary });
-    const runtime_paths = try inputs.executableRuntimePaths(a, context.io, context.roots.supervisor);
+    const runtime_paths = try inputs.executableRuntimePaths(a, io, supervisor);
     for (runtime_paths) |path| {
         const role = try std.fmt.allocPrint(a, "runtime:{s}", .{path});
-        try entries.append(a, .{ .name = role, .file = try physical.readFile(context.io, path, limits.tracked_file, false) });
+        try entries.append(a, .{ .name = role, .file = try physical.readFile(io, path, limits.tracked_file, false) });
     }
-    return guardedMap(context, "uk.wamr.command-supervisor-runtime-v1", entries.items);
+    return guardedMap(a, "uk.wamr.command-supervisor-runtime-v1", entries.items);
 }
 
-pub fn buildLocalBoot(state: InputsBaselined) !LocalBootBuilt {
-    try runStage(state, .@"local-boot-tool", true);
+pub fn buildLocalBoot(state: AdapterBuilt) !LocalBootBuilt {
+    try runStage(state, .@"local-boot-tool", false);
     return next(state, LocalBootBuilt);
 }
 
-pub fn testFixtures(state: LocalBootBuilt) !NativeFixturesPassed {
+pub fn testFixtures(state: InputsBaselined) !NativeFixturesPassed {
     try runStage(state, .fixtures, true);
     const context = state.context;
     const path = try subpath(context, "fixtures/native-scenarios.json");
@@ -787,7 +785,7 @@ pub fn loadAccepted(context: *Context) !void {
     const a = context.allocator;
     const io = context.io;
     try cancelled(context);
-    const expected = try read(context, try subpath(context, "evidence/build-start.json"), limits.tracked_file, true);
+    const expected = try readAcceptedRecord(context, "build-start.json");
     const document = try core.contracts.Document.parse(a, expected, .{ .bytes = records.max_record_bytes, .items = 4096, .tokens = 65536, .depth = 32 });
     defer document.deinit();
     try document.requireCanonical(a, expected);
@@ -809,10 +807,14 @@ pub fn loadAccepted(context: *Context) !void {
     if (!std.mem.eql(u8, own, try std.process.executablePathAlloc(io, a)))
         return error.UnboundController;
     context.roots = .{
-        .runtime = context.runtime, .source_root = context.repository, .work = context.compute,
-        .zig = context.tools[9], .producer = try subpath(context, "tools/bin/uk-wamr-aot-build"),
+        .runtime = context.runtime,
+        .source_root = context.repository,
+        .work = context.compute,
+        .zig = context.tools[9],
+        .producer = try subpath(context, "tools/bin/uk-wamr-aot-build"),
         .fixture_runner = try subpath(context, "tools/bin/wamr-native-ci-fixtures"),
-        .supervisor = own, .package_tool = try subpath(context, "tools/bin/wamr-ci-package"),
+        .supervisor = own,
+        .package_tool = try subpath(context, "tools/bin/wamr-ci-package"),
         .validator = try subpath(context, "tools/bin/uk-wamr-log-validate"),
         .supervisor_fixture = try subpath(context, "tools/bin/wamr-ci-supervisor-fixture"),
         .tools = context.tools,
@@ -821,7 +823,8 @@ pub fn loadAccepted(context: *Context) !void {
     context.source = try custody.source(a, io, context.repository, context.git);
     context.dependency = try dependencies.capture(a, io, context.repository, context.git, context.compute);
     context.consumer = try inputs.captureProduction(a, io, .{
-        .runtime = context.runtime, .tools = context.tools,
+        .runtime = context.runtime,
+        .tools = context.tools,
         .python_stdlib = try pythonStdlib(context),
     });
     const reproduced = try typedValue(a, try buildStart(context));
@@ -847,7 +850,7 @@ pub fn loadAccepted(context: *Context) !void {
 }
 
 pub fn revalidateAccepted(context: *Context) !void {
-    const actual = try read(context, try subpath(context, "evidence/build.json"), limits.tracked_file, true);
+    const actual = try readAcceptedRecord(context, "build.json");
     const value = try buildValue(context);
     const encoded = try std.json.Stringify.valueAlloc(context.allocator, value, .{});
     if (!std.mem.eql(u8, actual, try records.canonicalAlloc(context.allocator, encoded)))
@@ -874,7 +877,7 @@ pub fn run(context: *Context) !BuildAccepted {
     var reserved = try reserve(bound);
     defer reserved.work.close(context.io);
     return acceptBuild(try nativeImage(try solveConfig(try prepare(try testFixtures(
-        try buildLocalBoot(try baseline(try buildAdapter(try bootstrap(
+        try baseline(try buildLocalBoot(try buildAdapter(try bootstrap(
             try restore(try sealSource(try captureSource(reserved))),
         )))),
     )))));

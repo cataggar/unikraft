@@ -31,7 +31,8 @@ fn run(allocator: std.mem.Allocator, io: std.Io, root: []const u8) !void {
     for (std.enums.values(controller.command_plan.Stage)) |stage| {
         const selected = controller.command_plan.spec(stage);
         if (selected.stage != stage or selected.seconds == 0 or
-            selected.argv.len < 3 or selected.argv[0] != .path or
+            selected.argv.len < @as(usize, if (stage == .@"supervisor-import-identity") 2 else 3) or
+            selected.argv[0] != .path or
             !std.mem.eql(u8, selected.argv[0].path.role, selected.executable))
             return error.InvalidStage;
         const environment = try controller.command_plan.environment(allocator, stage);

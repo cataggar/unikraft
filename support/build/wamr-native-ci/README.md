@@ -1,6 +1,6 @@
 # Credential-free tiny native WAMR PR gate
 
-## Native package and boot chain (unpublished caller)
+## Native package and boot chain (production caller)
 
 The installed controller now implements `boot --runtime ABS` as a closed,
 local-only `tiny_exact_v2` chain. It first refuses hosts without readable and
@@ -28,9 +28,179 @@ and prevents every subsequent transition. Public success contains exactly
 the v2 six-mode record set, `final-inspection.json`, then `result.json` last
 without self-hashing. Historical four-mode v1 is read-only; there is no
 caller-selected downgrade. `diagnostics --runtime ABS` emits allowlisted
-redacted observations only, never acceptance. `run.py` remains the
-authoritative production caller and differential reference until the later
-parity/bridge/cutover PRs; workflows, wrappers and authority are unchanged.
+redacted observations only, never acceptance. The protected production
+workflow now invokes the installed portable controller for build, boot and
+diagnostics; `run.py` remains only as the Python differential reference and
+historical compatibility reader until its later removal slices.
+
+## Native record-consumer bridge (Python still performs the handoff)
+
+`uk-wamr-native-ci records --runtime ABS --output handoff-v1` reopens a
+completed local v2 run, including source and input custody, the six boot
+transcripts and image chain, before emitting a bounded, canonical private JSON
+description of pinned records, artifacts and runtime inputs. Local replay
+requires the original runtime-installed controller and its recorded source
+worktree; a separately installed controller cannot replay a Python-produced
+run. The separate
+`records --stage-root ABS --transport trusted-inner-zip --output handoff-v1`
+form checks an extracted public-source inner tree. The initial imported-stage
+fixture covers older allowlisted v1 evidence; the current v2 import is also
+exercised against a retained protected archive. Neither form executes build or
+boot, changes authority, or makes a partially checked manifest an accepted run.
+
+The public bundle importer now requires this native imported-records check
+before publishing its candidate, while retaining the Python publication policy.
+Only the protected in-job import that passes `--native-import-revalidation`
+runs trusted-v2 native revalidation through the native controller; default,
+off-runner, and historical Python-produced trusted-v2 imports retain Python supervised-stage
+revalidation with the caller-supplied validator. Native-produced v2 local
+handoff requires native acceptance before using its result-record hashes and
+source identity, and its local inspection is routed through the recorded
+runtime controller. A Python-produced local run retains the pinned Python
+source-custody path for result-record selection; it is accepted by the native
+controller only for the v2 handoff inspection route; historical v1 local
+handoff inspection is confined to the explicit legacy action. `records
+--runtime` and `public-validator-build --runtime` remain native-produced
+local-runtime gates.
+The digest-pinned local-consumer custody probe admits both recorded v2
+producer layouts without a refusal-triggered fallback.
+The separately validated `command-public-validator-build.json` may appear in
+Python-produced evidence after acceptance; it is not part of the 33 pinned
+result records or the exported archive. Other extra evidence is refused.
+Historical v1 retains its pinned-source compatibility path; native-produced v2
+never falls back to Python after a native refusal. The caller must
+independently authenticate the executable provided by `WAMR_CI_CONTROLLER`;
+owner and mode checks alone do not prove its provenance. Protected paired boots
+have exercised the completed native local-record replay and Python record
+selection, with public-source publication and trusted import passing separately.
+For a trusted v2 import, the native accepted-run records gate validates the
+imported command bindings before Python applies archive and publication policy;
+Python no longer reinterprets those imported command records. Trusted v1
+imports with supervisor command records are fail-closed by the native
+imported-stage gate and publication policy; pre-supervisor v1 imports keep
+their historical no-supervisor behavior. Producer-direct publication retains
+its existing Python command checks.
+`handoff-inspect --runtime ABS --output ABS` is the native owner of the
+non-legacy local handoff inspection, and `handoff-inspect-legacy --runtime
+ABS --output ABS` owns the historical v1 output names
+`private/handoff-inspect-legacy.log` and
+`evidence/command-handoff-inspect-legacy.json`. They accept native-produced
+v2 runtimes and Python-produced v2 runtimes through `handoff-inspect` only, or
+synthetic/historical v1 runtimes through `handoff-inspect-legacy` only, when
+the recorded supervisor, source and consumer custody can be recaptured. They
+use the pinned package/EFI inputs and retain bounded private logs and command
+records in a create-only owner-only output beneath an existing private parent
+outside the runtime's pinned input ancestors. For Python-produced v2 runs the
+command record names the actually running native controller as
+`native:handoff-inspect-controller`; historical legacy inspection requires the
+recorded `command-supervisor` role instead of an ambient compatibility
+supervisor. The stages neither export an image nor fall back to Python after
+refusal. `public-validator-build --runtime
+ABS --output ABS` accepts native-produced local runtimes only, using the
+recorded Zig tool and controller to build the fixed x86_64 validator in an
+independent private output, retaining its bounded command evidence without
+modifying the accepted runtime or publishing an archive. The production public
+bundle path selects the native or Python owner solely from the recorded
+`build-start.json` supervisor path; native-produced runs never fall back to
+Python after a native refusal.
+`supervisor-import-identity --stage-root ABS --supervisor ABS --git ABS
+--output ABS` is a separate support-only operation for a clean, trusted
+imported v2 inner stage. It checks the recorded supervisor source files
+against the imported Git revision and the supplied executable and loader
+closure against the imported consumer records, then supervises `--identity`
+under the fixed plan. Its owner-only output is outside the imported stage and
+checkout. Trusted v2 imports invoke this operation before writing
+transport/candidate records; the default Python revalidation path reuses that
+native identity instead of repeating the identity command through Python; the
+protected native revalidation path also avoids a Python handoff between
+validator build and execution. Python still owns publication policy and
+legacy/producer-direct compatibility checks; native-produced local runs use
+the native records, handoff-inspect, public-validator-build and
+local-consumer-custody owners.
+The controller's read-only `--identity` probe emits the unchanged supervisor
+identity protocol using its embedded native source closure and the recorded
+`command-supervisor-source-v1` hash recipe. It takes no runtime or extra
+options and grants no acceptance or execution authority. Local export binds
+every recorded tool before custody; a native-produced run without the
+non-legacy supervisor record refuses rather than taking the Python path.
+`local-handoff-revalidation --runtime ABS --output ABS` reopens the native
+accepted run and public-validator build evidence, then supervises only the
+fixed public validator and local handoff paths with the existing 600-second
+deadline, bounded streams and cleanup proof. Its private diagnostic records
+are outside the archive. Native-produced imports stay native-owned, but
+portable downloaded imports and explicit same-runner imports have distinct
+tool-authentication contexts. Neither launches an unsupervised Python
+subprocess or falls back after refusal.
+`import-validator-build --stage-root ABS --output ABS` is a support-only
+trusted-v2 companion for a pristine imported stage. It accepts no caller
+selected executable: it requires the current clean physical checkout to
+match the imported revision, tree, and source-content commitment, and the
+recorded Git and Zig executables, loader files, and Zig installation tree to
+retain their imported consumer content. It supervises the fixed x86_64 direct-validator build in
+a separate owner-only output and checks its ELF and bounded private command
+evidence. A historical revision or unavailable recorded tool refuses this
+operation. The standalone build command remains support-only. The protected
+workflow's same-job trusted-v2 import passes the explicit
+`import-public-source-bundle --native-import-revalidation` option to use the
+combined `import-native-revalidation` operation so the validator is built and
+retained through execution without a Python handoff between them.
+`import-native-revalidation --stage-root ABS --output ABS` builds that fixed
+direct validator and supervises its `handoff` verification in the same native
+invocation for trusted v2 imports whose pristine stage matches the current
+checkout and recorded tool custody. It constructs a private canonical
+candidate outside the pristine imported stage by rebasing only the exact
+artifact, boot, and evidence member paths already validated against the
+imported portable bundle; neither the candidate nor the validator is a public
+bundle member. The validator is retained from build through execution and its
+exact success stdout, empty stderr, bounded log, and command binding are
+checked before returning. A caller cannot select a validator or manifest. The
+protected in-job import path invokes this strict native operation only when the
+explicit handoff option is present, before writing
+transport or candidate records; native refusal fails the import with no Python
+fallback. Default Python-produced
+trusted-v2 imports (including the documented off-runner operator flow),
+historical revisions, unavailable recorded-tool imports, v1 imports, and
+Python-produced producer-direct/local revalidation remain Python-owned because
+they either need
+the caller-supplied validator or do not satisfy the pristine same-revision
+trusted-stage preconditions. Native-produced production imports bind the
+recorded controller identity and direct validator built by
+`public-validator-build --runtime` in that explicit same-runner lane.
+
+Default native-produced downloads instead invoke
+`import-handoff-revalidation --stage-root ABS --git ABS --supervisor ABS
+--validator ABS --output ABS`. This closed trusted-inner-ZIP owner authenticates
+the explicitly supplied local native supervisor by producer content/runtime
+commitments and the exact Git source tree. The local controller must have the
+same authenticated native executable content; the validator must match the
+native owner's build-derived direct-validator digest, not a caller-provided
+claim or an identity string emitted by an untrusted executable. The build
+graph obtains that digest from the existing direct-validator artifact and
+includes its tracked source inputs in the native source closure.
+Source and destination tool paths, inodes and timestamps need not agree.
+Producer filesystem identities remain observations of the producer context:
+portable import neither opens the producer's Git/Zig paths nor compares local
+filesystem metadata to their recorded metadata. Native ownership retains
+local executable and loader pins and local clean source snapshots before and
+after supervised validation. A fresh portable checkout need not contain the
+producer's generated output roots; present ignored outputs still use the
+existing closed role allowlist and bounds. Source/tool substitution or mutation refuses;
+the same-runner option cannot weaken these checks or select Python fallback.
+`local-consumer-custody --runtime ABS --expected-build-start-sha256 HEX
+--expected-boot-inputs-sha256 HEX` is the production owner for a completed
+v2 runtime's local checkout/source and build/boot consumer-input
+custody *before* the managed QEMU loader is removed. The public source-bundle
+path hashes the exact `build-start.json` and `boot-inputs.json` bytes it read,
+passes those digests into the native owner, and reuses the same proof on later
+validator-build/export postchecks; Python no longer reinterprets the same
+source/consumer records or falls back after native refusal. The command compares
+the clean current checkout's full physical source custody and both recorded
+build/boot consumer sets against fresh native captures, including exact
+executable loader roles, the recorded `tool:python3` stdlib tree, input tree
+contents and physical ancestry. It emits no public or acceptance record and does
+not replace Python's dependency, supervisor, packaging, validator-build command,
+or production policy checks. An extracted historical archive cannot satisfy this
+local proof after the original consumer files or loader are removed.
 
 ## Native controller preparation (unpublished build path)
 
@@ -48,6 +218,15 @@ the explicit GNU/v2 and `ReleaseSafe` flags and refuses musl, v3, or an
 unspecified target before creating a slot. `describe --output json-v1`
 reports that fixed target and the embedded source-content closure without
 accessing a runtime or granting boot authority.
+
+The protected native-compute workflow installs this same portable controller
+from the checked-out source after pinned Zig setup at
+`/d/wamr-ci/wamr-native-runtime/controller/bin/uk-wamr-native-ci`. That
+path is the production build/boot/diagnostics controller; the workflow obtains
+the recorded executable target from native
+`describe --output json-v1` instead of importing `run.py`. The separate
+`/d/wamr-ci/wamr-differential-controller` install name remains limited to the
+paired differential fault jobs.
 
 The native custody library now exposes clean Git tracked-object/physical
 source and ignored-output checks, fixed-revision create-only WAMR archive
@@ -69,6 +248,11 @@ tiny artifacts and image before publishing `build.json`, and retains bounded
 private command logs and create-only public command records. The local-boot
 installer has its own precreated `compute/local-boot-tools` slot so it cannot
 mutate the already frozen `compute/tools/bin` consumer-input directory.
+Both installer command records precede `build-start.json`, which baselines
+the post-installation consumer inputs in the same order as the Python controller.
+Native boot reopens `build-start.json` and `build.json` with the 4-MiB
+evidence-record limit, not the 256-MiB tracked-source-file bound; physical
+custody of larger executables remains independently bounded.
 `test-controller` exercises native custody, build-command failures, production
 boundaries, tamper/refusal, and `run.py` differential record fixtures. The
 installed fixture stage itself supervises bounded native success, nonzero,
@@ -84,18 +268,23 @@ test runs in a separate clean worktree in the protected gate, never during
 the supervised production adapter build. Custody link and depth fixtures use
 the selected cache even when production sets `ZIG_LOCAL_CACHE_DIR` outside
 the checkout.
-The protected x86 job exercises `test-controller` first in a separate clean
-worktree, keeping its test dependencies and cache outside the production
-source checkout; this reports fixture failures without exposing private
-supervised-command output.
-`python3 -m unittest support/build/wamr-native-ci/tests/source_custody_production_limits.py`
-remains the independent full-size source-boundary oracle until cutover.
+The protected x86 job exercises `test-controller-limits` and then
+`test-controller` in separate clean worktrees, keeping test dependencies and
+cache outside the production source checkout; this reports fixture failures
+without exposing private supervised-command output. On failure it runs the
+host test binary directly for diagnostic errors while keeping the original
+gate failed. The Python
+`tests/source_custody_production_limits.py` remains paired with the native
+limit fixture while production `build` uses the installed native controller.
 
 `build --runtime ABS --wamr-source ABS`, `boot --runtime ABS`, and
 `diagnostics --runtime ABS` are available only through the installed
-native controller. Production workflow callers continue using the Python controller;
-there is no fallback, boot cutover, or change in acceptance authority before
-the later parity and cutover PRs. The closed
+native controller. Native stage failures report only a static Zig error name
+alongside the failed stage; dependency restoration also reports a static
+operation label. Command output and private paths remain in bounded private
+logs. Production workflow callers use the same installed controller path for
+build, boot and diagnostics; there is no fallback to `run.py` after a native
+refusal and no change in cloud authority. The closed
 `tiny_exact_v2` production type has six ordered raw/QCOW2/VPC modes;
 the four-mode v1 type is read-only compatibility. No caller-selectable profile,
 CoreMark mode, Azure entry, or alternate validator is installed.
@@ -180,8 +369,11 @@ The source must be clean and committed before building. The source record
 independently hashes every tracked blob/symlink target against its Git object
 ID and binds every tracked parent directory's device/inode/type, ownership,
 links, size, mtime and ctime. Its bounded summary records file, directory and
-byte counts plus content and physical SHA256 values. The only role-excluded
-output roots are exactly `.d`, the fail-closed precreated `.zig-cache`,
+byte counts plus content and physical SHA256 values. Native rechecks compare
+these source fields by value, including independently allocated Git
+object-format strings, while still rejecting changed hashes, counts, revisions
+and excluded-output roles. The only role-excluded output roots are exactly
+`.d`, the fail-closed precreated `.zig-cache`,
 `support/apps/wamr-aot/build`, and the precreated
 `support/apps/wamr-aot/.config`. `.d` alone may already contain the workflow's
 pinned WAMR checkout and acquired runtime; those consumed inputs are separately
@@ -209,10 +401,13 @@ include the exact indirect shell/coreutils executables used by the native build
 graph (`dash`, `cp`, `env`, `mkdir`, `readlink` and `uname`) rather than
 unrelated `/usr/bin` members. Selected executable invocations use retained
 descriptor paths for Zig, Python, compiler/binutils and the recorded helper
-tools. Data trees, package paths and other pathname inputs remain path-based
-and are protected by their physical/content snapshots immediately before and
-after consumption; custody does not claim arbitrary pathname data is read
-through retained descriptors. The post-processing graph uses the objcopy
+tools. Only the pinned Zig and five LLVM executable roles admit up to the
+existing 256 MiB process-executable limit under no-follow, owner, mode and
+single-link checks; other retained tools keep their generic 64 MiB limit.
+Data trees, package paths and other pathname inputs remain path-based and are
+protected by their physical/content snapshots immediately before and after
+consumption; custody does not claim arbitrary pathname data is read through
+retained descriptors. The post-processing graph uses the objcopy
 interface for descriptor-safe stripping. The hosted workflow first materializes the pinned Zig distribution
 create-only beneath the owned ignored `.d` tool root, avoiding mutable
 runner-managed ancestor directories. Native Make's unused Wget version probe is disabled by a fixed
@@ -237,11 +432,14 @@ inspection and export. Consumer subprocesses use adapter-owned
 cache/configuration paths; ambient loader, shell-startup, Python, Make and Zig
 injection variables are not inherited.
 
-Before the clean source baseline is taken, the adapter restores the exact
+Before the clean source baseline is taken, the historical Python reference
+restores the exact
 out-of-tree dependency tree and builds the internal
 `wamr-ci-supervisor` from `supervisor.build.zig`. The bootstrap inputs and the
 supervisor's exact tracked source closure are checked before and after that
-build. The production supervisor and public validator use the fixed
+build. The native production controller supervises commands directly through
+the shared process library and records its own embedded source closure.
+Both supervisor implementations and the public validator use the fixed
 `-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2` target with `ReleaseSafe`, not the
 runner's native microarchitecture. The validator's supervised command contract
 binds these exact flags; the supervisor's source closure binds the bootstrap
@@ -316,9 +514,9 @@ Private state directories are `0700`, identity/config/diagnostic files
 are `0600`, and any failed or partial build is a refusal, never a boot,
 cloud, or workload-acceptance result. The installed native producer's
 golden/fault/integration tests are `zig build --build-file
-support/apps/wamr-aot/build.zig test-unit test-integration`; serial
-validation and controller/boot/handoff Python belong to subsequent
-#188/#186/#187/#189 cutovers, not to this producer.
+support/apps/wamr-aot/build.zig test-unit test-integration`; Azure
+admission, broader workload validation and final `run.py` removal remain
+separate follow-up slices, not producer-side fallbacks.
 Recorded indirect executable variables are replaced inside the supervisor by
 paths to its retained descriptors. The reviewed self-reexecuting package and
 local-boot tools ignore inherited retained-self values unless the original
@@ -419,7 +617,12 @@ URL/revision/package hash, and only then performs the bounded fetch. Before
 reading package content it enumerates and snapshots the complete bounded
 directory set, including `zig-pkg`, then requires the exact set and metadata
 after traversal. The restored tree rejects links, nonregular entries, unsafe
-names, extra/missing/duplicate roots and incomplete transitive manifests. Zig 0.16
+names, extra/missing/duplicate roots and incomplete transitive manifests.
+An upstream package's `.dependencies = .{}` has no transitive edges; the
+source-pinned root manifest must still name exactly one Miz dependency.
+Under its owner-only `0700` root, descriptor-relative native custody admits
+and records upstream package file/directory modes (including `0777`) without
+relaxing the general host-artifact policy. Zig 0.16
 `fetch PATH` independently recomputes every package hash, including Miz rather
 than trusting its directory name. `build-start.json` embeds
 `uk.wamr.zig-dependency-custody` version 1: request and source/copy manifest
@@ -447,11 +650,23 @@ Cleanup has its own absolute deadline and bounded scan/signal/reap budgets;
 exhaustion or uncertain ownership poisons the one-shot supervisor result and
 cannot become success. This is cleanup for cooperative or accidentally
 detached owned descendants, not a hostile same-UID or PID-namespace ownership
-claim. Git bootstrap/custody probes run with
+claim. Git bootstrap/custody probes have a 120-second primary deadline and report
+distinct static startup/monitor I/O, cleanup, stream, output-overflow, and stderr refusal
+categories; raw Git output stays private. Repeated source-custody rechecks
+release their per-call scratch rather than retaining whole-tree file bytes
+in the controller's lifetime arena. Boot-stage rechecks also release the
+temporary evidence, dependency, and tool-custody snapshots after each stage;
+their accepted identities and pinned evidence remain in the lifetime arena.
+Each recheck compares one fresh snapshot of each pinned source, dependency,
+consumer input, and build record rather than capturing the same inputs again
+while reconstructing the accepted build. Production consumer-input comparison
+uses the freshly captured identities without repeating the full tree walk.
+They run with
 system/global configuration, hooks, repository fsmonitor helpers, credential
 helpers, replacement objects, terminal prompts and pagers disabled where
 applicable.
-Build commands use `-j2`; the workflow has a 60-minute ceiling. Each build
+Build commands use `-j2`; the production and fault-matrix jobs each have a
+180-minute ceiling and their paired KVM steps a 150-minute ceiling. Each build
 command has an absolute deadline, 4-MiB limits per native stream and an
 8-MiB combined private-log limit (one extra byte detects overflow), followed
 by an independent ten-second supervisor cleanup deadline. The native packaging
@@ -497,17 +712,14 @@ cp support/tools/hyperv/local_boot/build.zig \
 zig build --build-file .d/wamr-ci-check/restore/build.zig --fetch=all \
   --cache-dir .d/wamr-ci-check/cache \
   --global-cache-dir .d/wamr-ci-check/global-cache -j2
+zig build --build-file support/build/wamr-native-ci/build.zig \
+  --system "$PWD/.d/wamr-ci-check/restore/zig-pkg" \
+  --cache-dir .d/wamr-ci-check/cache --prefix "$PWD/.d/wamr-ci-check/out" \
+  -Dtest-root="$PWD/.d/wamr-ci-check/fixtures" \
+  -Doptimize=ReleaseSafe -j2 test install
 SUPERVISOR_SOURCE_SHA256="$(
-  PYTHONDONTWRITEBYTECODE=1 python3 - <<'PY'
-import importlib.util
-from pathlib import Path
-
-path = Path("support/build/wamr-native-ci/run.py").resolve()
-spec = importlib.util.spec_from_file_location("wamr_native_ci", path)
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-print(module.supervisor_source_map()["content_closure_sha256"])
-PY
+  "$PWD/.d/wamr-ci-check/out/bin/uk-wamr-native-ci" \
+    supervisor-source-closure --git "$(command -v git)" --output sha256-v1
 )"
 zig build --build-file support/build/wamr-native-ci/supervisor.build.zig \
   --system "$PWD/.d/wamr-ci-check/restore/zig-pkg" \
@@ -516,11 +728,6 @@ zig build --build-file support/build/wamr-native-ci/supervisor.build.zig \
   --prefix "$PWD/.d/wamr-ci-check/supervisor" \
   -Dsource-closure-sha256="$SUPERVISOR_SOURCE_SHA256" \
   -Doptimize=ReleaseSafe -j2 install
-zig build --build-file support/build/wamr-native-ci/build.zig \
-  --system "$PWD/.d/wamr-ci-check/restore/zig-pkg" \
-  --cache-dir .d/wamr-ci-check/cache --prefix "$PWD/.d/wamr-ci-check/out" \
-  -Dtest-root="$PWD/.d/wamr-ci-check/fixtures" \
-  -Doptimize=ReleaseSafe -j2 test install
 WAMR_CI_PACKAGE="$PWD/.d/wamr-ci-check/out/bin/wamr-ci-package" \
 WAMR_CI_LOG_VALIDATE="$PWD/.d/wamr-ci-check/out/bin/uk-wamr-log-validate" \
 WAMR_CI_SUPERVISOR="$PWD/.d/wamr-ci-check/supervisor/bin/wamr-ci-supervisor" \
@@ -551,9 +758,9 @@ The other fixture independently mutates the last serial and the derived VHD
 after final inspection, requiring both to refuse before `result.json`.
 Both fixtures' local-boot request/report/serial inputs are expressly synthetic:
 they do not launch QEMU, prove KVM, or run the full build/source custody.
-An actual native six-guest success gate requires a separate fresh x86/KVM CI worktree
-and runtime with the pinned tools, archive, QEMU and firmware; the existing
-production Python job remains authoritative until its scheduled cutover.
+An actual native six-guest success gate requires the protected production
+x86/KVM CI worktree and runtime with the pinned tools, archive, QEMU and
+firmware; these synthetic fixtures remain non-authoritative.
 The Python fixtures use the actual native packaging helper and pinned miz
 with a synthetic **nonbootable** PE, plus synthetic compute/log records.
 They check full raw/QCOW2/VHD/footer hashes, physical reload,
@@ -568,6 +775,160 @@ fixture, executable-override or skip switch.
 ARM development can run these fixtures, but cannot qualify the guest.
 Only a successful real x86 PR run of the corrected, committed native base
 establishes the first local tiny-compute observation.
+
+## Differential parity preparation
+
+`test-controller` now includes native source-custody production limits, twelve
+physical Bison/consumer/dependency/supervision fault fixtures, frozen v1/v2
+result-parser goldens, and the #187 handoff/public-bundle contract golden.
+`test-controller-limits`, `test-controller-fault-parity`,
+`test-differential-records`, and `test-handoff-contracts` run those suites separately.
+The matching Python
+parser fixtures run with
+`python3 -B -m unittest test_differential_parity.DeterministicContracts`
+from the tests directory. These goldens contain synthetic records, not guest
+boot evidence.
+
+On a host without accessible x86 KVM,
+`python3 -B support/build/wamr-native-ci/tests/test_differential_parity.py local`
+compares actual Python and native controller CLI refusals in separate private
+roots. Its three documented legacy-CLI exceptions require exact refusal
+versus closed-grammar usage outcomes; they do not make a failed controller
+run successful. The `full` action requires separate clean worktrees, real
+pinned tools and WAMR source, an empty private `.d` output role in each
+worktree, an owner-only runtime template and portable controller, and
+accessible x86 KVM. The protected x86 job installs that
+controller from its isolated fixture worktree into a separate private root,
+then runs one paired six-mode success case after the native production boot
+within the same managed, non-root KVM process. An unexplained difference fails
+the job before the public bundle is published. Unequal build records fail before
+the paired boots; only equal builds proceed to six-mode boot comparison.
+Passing this one case does not
+change production acceptance authority or invoke Azure. Once the production job
+passes, four separate bounded, credential-free x86/KVM matrix jobs run paired
+`build-start-tamper`, `missing-build`, `occupied-boot-slot`, and
+`prior-build-output` cases from fresh worktrees. Each retains strict fault
+and evidence parity; there is no TCG or successful-skip fallback.
+For the three post-build faults, both builds must first pass the full paired
+physical comparison. After injecting the same named fault into each side,
+the oracle requires the case-specific Python refusal and native boot-platform
+error, rechecks the original source and consumer custody, and compares each
+side's complete evidence, artifacts and retained outputs with its own
+previously verified build. Only the exact injected record rewrite, missing
+build record or occupied boot-slot file may differ. The rewritten
+`build-start.json` necessarily has a newer timestamp; only that named fault
+excludes its timestamp from evidence-order checking, while the order of
+every other record remains strict. No fault may publish an acceptance result.
+The different Python/native supervised build commands, controller closures,
+local-boot installation paths, and native-only boot-input validator role are
+checked against their own exact physical contracts; each QCOW2 acceptance
+binds its own boot-input record rather than treating different hashes as equal.
+Shared production executables are built without path-dependent debug sections
+outside Debug mode so separately cached ReleaseSafe builds retain identical
+bytes for strict paired tool and boot-input custody. The pinned upstream WAMR
+compiler is also built with its supported `-Dstrip=true` option: otherwise its
+debug sections change the compiler and generated runtime-identity bytes across
+the two source roots, even when the compiled workload is identical.
+The native static runtime archive is passed through the pinned LLVM objcopy
+`--strip-debug` in a supervised, recorded producer command before publication;
+its separately built ELF members otherwise retain checkout-dependent DWARF
+strings and line tables. The single checked Zig object member is then extracted
+and repacked by pinned `zig ar` under a stable basename: the original archive's
+long-name table embeds the absolute, checkout-dependent Zig cache path. Symbols
+and relocations required for linking remain.
+The CI production build command and the paired differential build comparison
+set `WAMR_CI_PORTABLE_CONFIG=1` for the native and Python controllers. The
+native image builder forwards it to the root Zig facade,
+which gives both Kconfig solvers the same inert defaults for `CONFIG_UK_BASE`
+and `CONFIG_UK_APP`; Make still uses the actual checkout and application paths
+for source discovery and compilation. Make also derives paired `HOSTUTC` from
+the verified source commit's UTC timestamp, rather than embedding each
+separately built image's wall-clock time in its loadable `.uk_libinfo`
+section. Ordinary builds retain their path and build-time metadata defaults.
+Portable C, C++, and assembly builds map the source checkout root to
+`/wamr-ci/source` in DWARF without stripping the debug ELF; this keeps its
+nonload debug sections comparable across worktrees.
+For paired portable CI only, Zig-owned target objects omit their debug
+sections: their generated wrapper modules otherwise record each worktree's
+private `native-environment/zig_local_cache/o/` path. The final debug ELF
+still retains the C and assembly DWARF; ordinary builds retain Zig target
+debugging as well.
+The paired comparison still requires identical raw `.config` bytes and
+matching image hashes; it does not normalize either artifact.
+Protected paired runs print only closed stage-start and stage-completion
+labels to identify which of the four real controller invocations has exhausted
+the bounded step deadline. Failed paired builds and boots report only per-side
+exit classes, evidence and artifact names, and path-free refusal or static
+native error markers. Artifact differences identify only the fixed role and
+changed size, hash or mode field; a config hash mismatch is additionally marked
+when rechecked config bytes differ only by the source-root path, without
+normalizing acceptance. A changed build image record also identifies only
+fixed config, input, tool or image-file roles, without exposing their values
+or relaxing the byte comparison. A differing runtime identity is diagnosed
+using only fixed artifact roles and whether its commands or other metadata
+differ; the diagnostic first rechecks the original identity-file hash against
+the build record. Differing EFI and debug images are likewise rehashed against
+their build records before reporting only PE header/section or ELF
+header/alloc/nonalloc section indices with allowlisted section names; byte
+comparison remains strict. A changed `.debug_str` additionally reports only
+fixed classes for differing strings (source-root, other-absolute, relative-path
+or other), including fixed app build/source roles and whether replacing the checkout
+roots solely for diagnosis would equalize the bytes or string sets. Raw DWARF
+strings and private command logs remain local.
+Image command arguments embedded in the build identity retain their actual
+paths; paired comparison treats only the four reviewed app, config, Make
+environment, and private tool path assignments as equivalent across roots,
+after checking their physical roles. All other arguments remain strict. Once
+both native-image stages and their pinned tool identities have been verified,
+the selected `/proc/<pid>/fd/<fd>` descriptor used by the Python supervisor
+and the corresponding pinned tool path used by the native supervisor compare
+by their fixed tool role. Repeated occurrences of each role must still use
+the same path within each command; without the verified stage, descriptor
+paths remain strict. Other executable paths retain exact path or source-root
+comparison. A remaining build-record
+difference reports only fixed top-level and image
+argument-position labels. Retained-output differences report only fixed
+private, fixture, package, public-source or boot-slot roles and changed
+membership, mode, type or size, never raw filenames or log contents.
+Known package job/image and boot request/report/validator slots receive more
+specific fixed-role size or membership labels; unknown files remain strict.
+Differing selected image-command tool paths additionally report only their
+fixed roles and path classes (retained descriptor, bound producer tool,
+checkout/private root, other absolute path, or other), never path values.
+At completed builds, the Python-only Zig and supervisor version logs must
+match their pinned versions, its supervisor build log must be bounded and
+free of known error markers, and its source-metadata diagnostic must be a
+canonical, valid nonempty baseline. The native-only fixture report must
+match the exact canonical seven-scenario contract already verified by the
+native fixture stage. Only these reviewed, physically checked side-specific
+files are removed from cross-controller retained membership comparison;
+unreviewed retained outputs and shared slots remain strict.
+When completed boots differ, comparison rehashes each QCOW2 acceptance's
+own build, finalization, boot-input, boot request, report, serial, and compute
+records before reporting only fixed mode/field labels. Changed finalization
+and per-mode compute records likewise identify only reviewed nested field
+roles. Finalization and derivation provenance are rechecked against each
+side's canonical intent bytes (including the domain-separated config hash),
+the pinned package tool, and the corresponding source-image commitment;
+unreviewed intent fields remain strict after normalizing verified source
+roots. Each differing raw serial is independently rehashed against its
+report. At completed paired boots, cross-controller serial comparison removes
+only UART framing accepted by the shared native validator and the
+kernel-log timestamps; every other byte must agree. Each side's original
+serial, request, report, compute, acceptance, derivation gate, and final
+inspection hashes still bind its own unchanged bytes. Differing receipt
+hashes are reviewed only after their per-side commitments, physical boot
+inputs and all six compute results are proved; unreviewed content remains
+strict. If that proof is unavailable, fixed-class timestamp, framing, phase
+and retained-role diagnostics do not grant parity. Boot command records are checked
+against their own supervised stage contracts and physically pinned tool
+identities before their per-side command outcome is compared. Side-specific
+validator records/logs are rehashed and checked against their pinned
+supervised contract, raw serial and compute output before removing only
+their verified retained slots from membership comparison. Rooted package-job
+sizes are reviewed only after checking each job's source pin, producer,
+intent and ownership roles. No private
+serial data, command logs, hashes, or paths are printed.
 
 ## Private final-image handoff
 
@@ -644,7 +1005,11 @@ The protected job builds and boots from the fixed private
 `/d/wamr-ci/wamr-native-runtime` root, with the sealed Zig distribution
 beside it under `/d/wamr-ci/wamr-native-tools`; the root-owned `/d` boundary
 and precreated private `wamr-ci` directory avoid mutable hosted-runner home
-ancestors while retaining exact component custody. Its authenticated QEMU
+ancestors while retaining exact component custody. Both paired-comparison
+output slots are created before the build-start baseline and checked empty
+before use. The source slot stays in place after worktree cleanup: creating
+or removing it later would change the recorded `/d/wamr-ci` ancestor metadata
+even if no retained input bytes changed. Its authenticated QEMU
 `libfdt` runtime is established before the build-input baseline and removed
 by exact recorded identity only after final handoff revalidation, so neither
 boot setup nor pre-export cleanup can mutate a recorded system-library
@@ -657,6 +1022,11 @@ It uses only the validated recorded Git executable for the source/dependency
 recheck, recomputes the exact source, dependency, Bison, consumer and guarded
 supervisor custody, and only then binds the full recorded tool set and the
 fixed-runtime supervisor. It repeats the full custody check after binding.
+Pre-export refusal names only a fixed result, build-start schema/consumer
+role/tree/custody (with a fixed allowlisted file or tree role when physical
+custody changes), physical path role/binary/runtime/tree, dependency/custody,
+or CI environment/source/binding stage; it does not print recorded paths,
+content, hashes, or private runner state.
 If the native log validator is installed, the preflight requires its recorded
 role, exact runtime path and executable dependency closure; a missing or
 misbound role refuses publication before tools are bound.
@@ -708,7 +1078,10 @@ The exact pre-supervisor merged sources
 `3c6d5d98dc5736d86e97884184b26be39c3f11d5`, with their literal recorded
 trees, remain compatible with the same fixed 20-evidence/55-file archive
 shape without a command-supervisor record. Any other current source must carry
-the native supervisor result fields and guarded producer maps.
+the native supervisor result fields. WAMR native CI source-only changes no
+longer require guarded Hyper-V producer map repins: that pin excludes this
+subtree, while the WAMR controller's own source custody and supervisor
+source-closure pins remain separate.
 Symlinks/hardlinks, duplicate/extra/absolute/traversal members, compression,
 oversize inputs and known credential/account/approval patterns are refused.
 
@@ -777,11 +1150,12 @@ original requests), and uses the production native checker before publishing
 a usable `bundle.json`. Its plan remains `authority=not_admitted`; new final
 artifact-bound human approval is required.
 
-The expensive production-boundary module
-`tests/source_custody_production_limits.py` is intentionally excluded from
-default discovery and runs explicitly in protected CI. Its single PID-scoped
-`/d` fixture combines 131,072-entry and 8-GiB sparse-file exact/excess checks,
-constructs real exact/first-excess 8-MiB Git ignored inventories, and covers
-the 1,024-byte path, 64-component and 128-root diagnostic boundaries. It uses
-sparse allocation, emits no large payloads, and removes only its exact fixture
-directory.
+The native `test-controller-limits` production-boundary fixture is the
+protected CI source-custody limit check. It covers the historical Python
+script's frozen ignored-output constants, exact/excess 131,072-entry and
+8-GiB sparse-file limits, exact/excess 8-MiB Git ignored inventories,
+1,024-byte path, 64-component depth and 128-root diagnostic boundaries, and
+adds tracked-source entry, byte, file-size and unsafe-type boundaries. The
+Python `tests/source_custody_production_limits.py` remains intentionally
+excluded from default discovery and runs explicitly in protected CI as long
+as production `run.py build` still owns the build path.

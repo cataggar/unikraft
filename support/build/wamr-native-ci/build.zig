@@ -7,6 +7,24 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const portable_query = controller_target.portableQuery();
     const portable_target = b.resolveTargetQuery(portable_query);
+    const identity_writer = b.addExecutable(.{
+        .name = "wamr-validator-identity",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("build.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const portable_direct = b.dependency("direct_validator", .{
+        .target = portable_target,
+        .optimize = .ReleaseSafe,
+    }).artifact("uk-wamr-direct-validate");
+    const portable_identity = validatorIdentity(b, identity_writer, portable_direct, portable_target);
+    const host_direct = b.dependency("direct_validator", .{
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    }).artifact("uk-wamr-direct-validate");
+    const host_identity = validatorIdentity(b, identity_writer, host_direct, b.graph.host);
     const core = b.createModule(.{
         .root_source_file = b.path("../../tools/hyperv/core.zig"),
         .target = target,
@@ -33,6 +51,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("../../apps/wamr-aot/validator/main.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = optimize != .Debug,
         .imports = &.{
             .{ .name = "wamr_log_validator", .module = log_validator },
             .{ .name = "hyperv_core", .module = core },
@@ -60,6 +79,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("package.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = optimize != .Debug,
         .imports = &.{.{ .name = "public_image", .module = image }},
     });
     const cli = b.addExecutable(.{ .name = "wamr-ci-package", .root_module = root });
@@ -70,6 +90,21 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     portable_core.addAssemblyFile(b.path("../../tools/hyperv/sha256_clear_upper.S"));
+    const portable_serial = b.createModule(.{
+        .root_source_file = b.path("../../tools/hyperv/local_boot/serial.zig"),
+        .target = portable_target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "hyperv_core", .module = portable_core }},
+    });
+    const portable_validator = b.createModule(.{
+        .root_source_file = b.path("../../apps/wamr-aot/validator/root.zig"),
+        .target = portable_target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = portable_core },
+            .{ .name = "local_boot_serial", .module = portable_serial },
+        },
+    });
     const source_closure_module = b.createModule(.{
         .root_source_file = b.path("../../controller_source_closure.zig"),
         .target = portable_target,
@@ -81,7 +116,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "hyperv_core", .module = portable_core },
+            .{ .name = "wamr_log_validator", .module = portable_validator },
             .{ .name = "controller_source_closure", .module = source_closure_module },
+            .{ .name = "import_validator_identity", .module = portable_identity },
         },
     });
     const controller_cli = b.addExecutable(.{
@@ -133,13 +170,30 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     });
+    const host_serial = b.createModule(.{
+        .root_source_file = b.path("../../tools/hyperv/local_boot/serial.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "hyperv_core", .module = host_core }},
+    });
+    const host_validator = b.createModule(.{
+        .root_source_file = b.path("../../apps/wamr-aot/validator/root.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = host_core },
+            .{ .name = "local_boot_serial", .module = host_serial },
+        },
+    });
     const host_controller = b.createModule(.{
         .root_source_file = b.path("controller/root.zig"),
         .target = b.graph.host,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "hyperv_core", .module = host_core },
+            .{ .name = "wamr_log_validator", .module = host_validator },
             .{ .name = "controller_source_closure", .module = host_closure },
+            .{ .name = "import_validator_identity", .module = host_identity },
         },
     });
     const host_cli = b.addExecutable(.{
@@ -190,6 +244,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     controller_tests.root_module.addOptions("test_options", controller_options);
+    controller_options.addOptionPath("host_controller_cli", host_cli.getEmittedBin());
+    controller_options.addOptionPath("import_validator", host_direct.getEmittedBin());
     const fixture_host = b.addExecutable(.{
         .name = "wamr-native-ci-fixtures-host-test",
         .root_module = b.createModule(.{
@@ -213,6 +269,10 @@ pub fn build(b: *std.Build) void {
     });
     controller_options.addOptionPath("command_fixture", command_fixture.getEmittedBin());
     const controller_run = b.addRunArtifact(controller_tests);
+    const controller_direct = b.addSystemCommand(&.{"/usr/bin/env"});
+    controller_direct.addFileArg(controller_tests.getEmittedBin());
+    b.step("test-controller-direct", "Run host controller tests with direct failure output")
+        .dependOn(&controller_direct.step);
     const install_target_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("controller/install_target_tests.zig"),
@@ -223,8 +283,73 @@ pub fn build(b: *std.Build) void {
     install_target_tests.root_module.addOptions("test_options", controller_options);
     const install_target_run = b.addRunArtifact(install_target_tests);
     install_target_run.step.dependOn(&controller_run.step);
-    b.step("test-controller", "Run controller foundation unit, golden, and fault fixtures")
-        .dependOn(&install_target_run.step);
+    const controller_step = b.step("test-controller", "Run controller foundation unit, golden, and fault fixtures");
+    controller_step.dependOn(&install_target_run.step);
+    const source_limits_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("controller/source_custody_limits_tests.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "hyperv_core", .module = host_core },
+                .{ .name = "controller_source_closure", .module = host_closure },
+            },
+        }),
+    });
+    source_limits_tests.root_module.addOptions("test_options", controller_options);
+    const source_limits_run = b.addRunArtifact(source_limits_tests);
+    b.step("test-controller-limits", "Run native source-custody production boundary fixtures")
+        .dependOn(&source_limits_run.step);
+    controller_step.dependOn(&source_limits_run.step);
+    const fault_parity_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("controller/fault_parity_tests.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wamr_controller", .module = host_controller },
+                .{ .name = "hyperv_core", .module = host_core },
+            },
+        }),
+    });
+    fault_parity_tests.root_module.addOptions("test_options", controller_options);
+    controller_run.step.dependOn(&fault_parity_tests.step);
+    const fault_parity_run = b.addRunArtifact(fault_parity_tests);
+    fault_parity_run.step.dependOn(&controller_run.step);
+    b.step("test-controller-fault-parity", "Run native physical custody parity faults")
+        .dependOn(&fault_parity_run.step);
+    controller_step.dependOn(&fault_parity_run.step);
+    const record_goldens = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/differential_records.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wamr_controller", .module = host_controller },
+                .{ .name = "hyperv_core", .module = host_core },
+            },
+        }),
+    });
+    const record_goldens_run = b.addRunArtifact(record_goldens);
+    b.step("test-differential-records", "Run frozen v1/v2 native record goldens")
+        .dependOn(&record_goldens_run.step);
+    controller_step.dependOn(&record_goldens_run.step);
+    const handoff_contracts = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("handoff/tests.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "hyperv_core", .module = host_core }},
+        }),
+    });
+    const handoff_contracts_run = b.addRunArtifact(handoff_contracts);
+    const handoff_python_goldens = b.addSystemCommand(&.{ "python3", "-B" });
+    handoff_python_goldens.addFileArg(b.path("tests/test_handoff_contract_goldens.py"));
+    const handoff_step = b.step("test-handoff-contracts", "Run native/Python handoff contract goldens");
+    handoff_step.dependOn(&handoff_contracts_run.step);
+    handoff_step.dependOn(&handoff_python_goldens.step);
+    controller_step.dependOn(&handoff_contracts_run.step);
+    controller_step.dependOn(&handoff_python_goldens.step);
     const tests = b.addTest(.{ .root_module = root });
     const unit_tests = b.addRunArtifact(tests);
     const unit_step = b.step("test-unit", "Test the compute packaging adapter command boundary");
@@ -247,13 +372,33 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const proof_serial = b.createModule(.{
+        .root_source_file = b.path("controller/public_image_serial.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "local_boot", .module = image.import_table.get("local_boot").? }},
+    });
+    const proof_validator = b.createModule(.{
+        .root_source_file = b.path("../../apps/wamr-aot/validator/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = image.import_table.get("hyperv_core").? },
+            .{ .name = "local_boot_serial", .module = proof_serial },
+        },
+    });
     const proof_controller = b.createModule(.{
         .root_source_file = b.path("controller/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "hyperv_core", .module = image.import_table.get("hyperv_core").? },
+            .{ .name = "wamr_log_validator", .module = proof_validator },
             .{ .name = "controller_source_closure", .module = proof_closure },
+            .{ .name = "import_validator_identity", .module = validatorIdentity(b, identity_writer, b.dependency("direct_validator", .{
+                .target = target,
+                .optimize = .ReleaseSafe,
+            }).artifact("uk-wamr-direct-validate"), target) },
         },
     });
     const pipeline_tests = b.addTest(.{ .root_module = b.createModule(.{
@@ -273,4 +418,48 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&unit_tests.step);
     test_step.dependOn(&pipeline_run.step);
     test_step.dependOn(&controller_run.step);
+    test_step.dependOn(&source_limits_run.step);
+    test_step.dependOn(&fault_parity_run.step);
+    test_step.dependOn(&record_goldens_run.step);
+    test_step.dependOn(&handoff_contracts_run.step);
+    test_step.dependOn(&handoff_python_goldens.step);
+}
+
+fn validatorIdentity(
+    b: *std.Build,
+    writer: *std.Build.Step.Compile,
+    validator: *std.Build.Step.Compile,
+    target: std.Build.ResolvedTarget,
+) *std.Build.Module {
+    const run = b.addRunArtifact(writer);
+    run.addFileArg(validator.getEmittedBin());
+    const generated = b.addWriteFiles().addCopyFile(run.captureStdOut(.{}), "validator-identity.zig");
+    return b.createModule(.{
+        .root_source_file = generated,
+        .target = target,
+        .optimize = .ReleaseSafe,
+    });
+}
+
+pub fn main(init: std.process.Init) !void {
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len != 2) return error.InvalidUsage;
+    const file = try std.Io.Dir.cwd().openFile(init.io, args[1], .{ .follow_symlinks = false });
+    defer file.close(init.io);
+    const before = try file.stat(init.io);
+    if (before.size > 64 * 1024 * 1024) return error.ArtifactLimit;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < before.size) {
+        const count = try file.readPositionalAll(init.io, buffer[0..@intCast(@min(buffer.len, before.size - offset))], offset);
+        if (count == 0) return error.ArtifactChanged;
+        hash.update(buffer[0..count]);
+        offset += count;
+    }
+    const after = try file.stat(init.io);
+    if (before.size != after.size or !std.meta.eql(before.mtime, after.mtime))
+        return error.ArtifactChanged;
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &.{});
+    try stdout.interface.print("pub const sha256 = \"{s}\";\n", .{std.fmt.bytesToHex(hash.finalResult(), .lower)});
 }

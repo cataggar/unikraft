@@ -249,6 +249,9 @@ fingerprints the native build selection, Hyper-V message ingress and ABI,
 VMBus storage-offer matcher and sticky lifetime state, StorVSC coherent
 inventory/core, and the acceptance application's unavailable decision and
 record framing, including their Kconfig, Make, and exported-symbol wiring.
+It intentionally excludes the separate `support/build/wamr-native-ci`
+controller subtree, which has its own source custody and is not referenced by
+the guarded Hyper-V producer entry points.
 Any update to that critical proof closure requires an explicit reviewed pin
 change before another guarded image can be generated.
 
@@ -361,11 +364,12 @@ capability requires an explicit reviewed source change. Any tracked source,
 configuration, helper, requirement, SDK file, or prepared-input change fails
 before the first cloud command.
 
-The guarded producer-pin-v4 contract additionally binds the complete
-`support/build` directory, including production validation gates even when
-they live below `tests/`, plus every external native-image helper invoked by
-the root Make/facade/postprocessing path. Unknown additions, removals, or byte
-changes fail closed. The input-manifest-v9 and private-build-receipt-v6
+The guarded producer-pin-v5 contract additionally binds the `support/build`
+directory except for exactly its top-level `wamr-native-ci` subtree, including
+production validation gates even when they live below `tests/`, plus every
+external native-image helper invoked by the root Make/facade/postprocessing
+path. Unknown additions, removals, or byte changes outside that excluded
+subtree fail closed. The input-manifest-v9 and private-build-receipt-v6
 contracts bind the copied Git runtime used for every source query and
 native-build invocation, the exact reviewed producer files, protocol 1,
 identity policy 2, `no-devices`, guest return 2, and the private solved
@@ -577,7 +581,7 @@ does not build, reseed, convert, or discover a resource budget. It requires:
 - a completed schema-4 `unikraft.hyperv.private-preflight-receipt` loaded from
   the private preflight's complete state directory, binding the same guest
   VHD, source tree, solved configuration, private build receipt, twelve-tool
-  closure, schema-4 guarded producer pin, all six retained boot logs, immutable
+  closure, schema-5 guarded producer pin, all six retained boot logs, immutable
   host/deployment identities, the exact nested-capability admission record,
   accounting and completed cleanup.
 

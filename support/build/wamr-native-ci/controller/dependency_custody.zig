@@ -69,7 +69,10 @@ fn dependencyNode(allocator: std.mem.Allocator, bytes: []const u8) !struct {
         if (found != null) return error.InvalidManifest;
         found = root.struct_literal.vals.at(@intCast(i)).get(zoir);
     }
-    if (found) |node| if (node != .struct_literal) return error.InvalidManifest;
+    if (found) |node| switch (node) {
+        .struct_literal, .empty_literal => {},
+        else => return error.InvalidManifest,
+    };
     return .{ .source_bytes = zero, .ast = ast, .zoir = zoir, .node = found };
 }
 
@@ -79,7 +82,7 @@ pub fn pinnedManifest(allocator: std.mem.Allocator, bytes: []const u8) !void {
     defer parsed.ast.deinit(allocator);
     defer parsed.zoir.deinit(allocator);
     const dependencies = parsed.node orelse return error.UnpinnedDependency;
-    if (dependencies.struct_literal.names.len != 1 or
+    if (dependencies != .struct_literal or dependencies.struct_literal.names.len != 1 or
         !std.mem.eql(u8, dependencies.struct_literal.names[0].get(parsed.zoir), "miz_source"))
         return error.UnpinnedDependency;
     const index = dependencies.struct_literal.vals.at(0);
@@ -99,6 +102,7 @@ pub fn packageDependencies(allocator: std.mem.Allocator, bytes: []const u8) ![][
     defer parsed.ast.deinit(allocator);
     defer parsed.zoir.deinit(allocator);
     const dependencies = parsed.node orelse return allocator.alloc([]const u8, 0);
+    if (dependencies == .empty_literal) return allocator.alloc([]const u8, 0);
     const result = try allocator.alloc([]const u8, dependencies.struct_literal.names.len);
     errdefer allocator.free(result);
     for (dependencies.struct_literal.names, 0..) |_, i| {
@@ -133,16 +137,47 @@ const Stats = struct {
     physical_hash: Sha256,
 };
 
-fn scan(allocator: std.mem.Allocator, io: std.Io, root: []const u8, prefix: []const u8, state: *Stats) !void {
-    const path = if (prefix.len == 0) root else try std.fs.path.join(allocator, &.{ root, prefix });
-    defer if (prefix.len != 0) allocator.free(path);
-    const before = try physical.directory(io, path, false);
+fn packageDirectory(io: std.Io, parent: std.Io.Dir, name: []const u8) !std.Io.Dir {
+    const dir = try parent.openDir(io, name, .{ .iterate = true, .follow_symlinks = false });
+    errdefer dir.close(io);
+    const info = try files.snapshot(.{ .handle = dir.handle, .flags = .{ .nonblocking = false } });
+    if (info.mode & linux.S.IFMT != linux.S.IFDIR or info.uid != linux.geteuid())
+        return error.UnsafePackageDirectory;
+    return dir;
+}
+
+fn packageFile(io: std.Io, dir: std.Io.Dir, name: []const u8, before: files.Snapshot) !physical.File {
+    const file = try dir.openFile(io, name, .{ .follow_symlinks = false });
+    defer file.close(io);
+    if (before.mode & linux.S.IFMT != linux.S.IFREG or before.uid != linux.geteuid() or
+        before.nlink != 1 or before.size > limits.dependency_file or
+        !files.sameSnapshot(before, try files.snapshot(file)))
+        return error.UnsafePackageFile;
+    var hash = Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < before.size) {
+        const count = try file.readPositionalAll(io, buffer[0..@intCast(@min(buffer.len, before.size - offset))], offset);
+        if (count == 0) return error.PackageChanged;
+        hash.update(buffer[0..count]);
+        offset += count;
+    }
+    if (try file.readPositionalAll(io, buffer[0..1], offset) != 0 or
+        !files.sameSnapshot(before, try files.snapshot(file)))
+        return error.PackageChanged;
+    return .{
+        .bytes = before.size,
+        .sha256 = std.fmt.bytesToHex(hash.finalResult(), .lower),
+        .metadata = physical.metadata(before),
+    };
+}
+
+fn scan(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, prefix: []const u8, state: *Stats) !void {
+    const before = try files.snapshot(.{ .handle = dir.handle, .flags = .{ .nonblocking = false } });
     if (before.uid != linux.geteuid()) return error.UnsafePackageDirectory;
     try limits.addBounded(&state.directories, 1, limits.dependency_entries - state.files);
     try physical.bind(allocator, &state.content, .{ "directory", prefix, before.mode & 0o7777 });
     try physical.bind(allocator, &state.physical_hash, .{ "directory", prefix, physical.metadata(before) });
-    const dir = try files.openDirectory(io, path, .artifact);
-    defer dir.close(io);
     var entries: std.ArrayList([]const u8) = .empty;
     defer {
         for (entries.items) |name| allocator.free(name);
@@ -168,15 +203,17 @@ fn scan(allocator: std.mem.Allocator, io: std.Io, root: []const u8, prefix: []co
         defer member.close(io);
         const info = try files.snapshot(member);
         if (info.mode & linux.S.IFMT == linux.S.IFDIR) {
-            try scan(allocator, io, root, relative, state);
+            const child = try packageDirectory(io, dir, name);
+            defer child.close(io);
+            if (!files.sameSnapshot(info, try files.snapshot(.{ .handle = child.handle, .flags = .{ .nonblocking = false } })))
+                return error.PackageChanged;
+            try scan(allocator, io, child, relative, state);
         } else if (info.mode & linux.S.IFMT == linux.S.IFREG) {
             if (info.uid != linux.geteuid() or info.nlink != 1 or info.size > limits.dependency_file)
                 return error.UnsafePackageFile;
             try limits.addBounded(&state.files, 1, limits.dependency_entries - state.directories);
             try limits.addBounded(&state.bytes, @intCast(info.size), limits.dependency_bytes);
-            const absolute = try std.fs.path.join(allocator, &.{ root, relative });
-            defer allocator.free(absolute);
-            const member_record = try physical.readFile(io, absolute, limits.dependency_file, false);
+            const member_record = try packageFile(io, dir, name, info);
             if (!std.meta.eql(member_record.metadata, physical.metadata(info)))
                 return error.PackageChanged;
             try physical.bind(allocator, &state.content, .{ "file", relative, info.size, info.mode & 0o7777, member_record.sha256 });
@@ -186,29 +223,33 @@ fn scan(allocator: std.mem.Allocator, io: std.Io, root: []const u8, prefix: []co
         defer reopened.close(io);
         if (!files.sameSnapshot(info, try files.snapshot(reopened))) return error.PackageChanged;
     }
-    if (!files.sameSnapshot(before, try physical.directory(io, path, false))) return error.PackageChanged;
+    if (!files.sameSnapshot(before, try files.snapshot(.{ .handle = dir.handle, .flags = .{ .nonblocking = false } })))
+        return error.PackageChanged;
 }
 
-pub fn inventory(allocator: std.mem.Allocator, io: std.Io, path: []const u8, name: []const u8) !Package {
+fn inventory(allocator: std.mem.Allocator, io: std.Io, packages: std.Io.Dir, name: []const u8) !Package {
     try limits.packageName(name);
+    const dir = try packageDirectory(io, packages, name);
+    defer dir.close(io);
     var state: Stats = .{ .content = Sha256.init(.{}), .physical_hash = Sha256.init(.{}) };
     state.content.update("hyperv-native-tree-v1\x00");
     state.physical_hash.update("hyperv-native-physical-v1\x00");
-    try scan(allocator, io, path, "", &state);
+    try scan(allocator, io, dir, "", &state);
     if (state.files == 0) return error.EmptyPackage;
     var manifest_sha256: ?[64]u8 = null;
     var manifest_bytes: usize = 0;
     var dependencies = try allocator.alloc([]const u8, 0);
-    const manifest = try std.fs.path.join(allocator, &.{ path, "build.zig.zon" });
-    defer allocator.free(manifest);
-    if (files.RetainedFile.open(io, manifest, .artifact)) |retained| {
-        var file = retained;
+    if (dir.openFile(io, "build.zig.zon", .{ .follow_symlinks = false })) |file| {
         defer file.close(io);
-        if (file.file_snapshot.size > 4 * limits.mib) return error.InvalidManifest;
-        const raw = try allocator.alloc(u8, @intCast(file.file_snapshot.size));
+        const before = try files.snapshot(file);
+        if (before.size > 4 * limits.mib or before.mode & linux.S.IFMT != linux.S.IFREG or
+            before.uid != linux.geteuid() or before.nlink != 1)
+            return error.InvalidManifest;
+        const raw = try allocator.alloc(u8, @intCast(before.size));
         defer allocator.free(raw);
-        if (try file.file.readPositionalAll(io, raw, 0) != raw.len) return error.PackageChanged;
-        try file.verify(io);
+        if (try file.readPositionalAll(io, raw, 0) != raw.len or
+            !files.sameSnapshot(before, try files.snapshot(file)))
+            return error.PackageChanged;
         var hash: [32]u8 = undefined;
         Sha256.hash(raw, &hash, .{});
         manifest_sha256 = std.fmt.bytesToHex(hash, .lower);
@@ -268,9 +309,7 @@ pub fn packageSet(allocator: std.mem.Allocator, io: std.Io, packages: []const u8
     var directories: usize = 0;
     var bytes: usize = 0;
     for (roots.items, 0..) |name, i| {
-        const path = try std.fs.path.join(allocator, &.{ packages, name });
-        defer allocator.free(path);
-        collected[i] = try inventory(allocator, io, path, name);
+        collected[i] = try inventory(allocator, io, dir, name);
         populated += 1;
         try limits.addBounded(&files_count, collected[i].files, limits.dependency_entries);
         try limits.addBounded(&directories, collected[i].directories, limits.dependency_entries - files_count);
@@ -653,6 +692,8 @@ pub fn verifyZigPackageHashes(
     const baseline = try physical.directory(io, work_path, true);
     const packages_path = try std.fs.path.join(allocator, &.{ compute, "dependencies", "zig-pkg" });
     defer allocator.free(packages_path);
+    const packages = try files.openDirectory(io, packages_path, .private);
+    defer packages.close(io);
     var executable = try process.Executable.open(io, zig);
     defer executable.close(io);
     try process.initialize();
@@ -666,7 +707,9 @@ pub fn verifyZigPackageHashes(
         try requireDocument(allocator, io, repository, git, compute, expected);
         const package_path = try std.fs.path.join(allocator, &.{ packages_path, package.name });
         defer allocator.free(package_path);
-        const package_before = try physical.directory(io, package_path, false);
+        const package_dir = try packageDirectory(io, packages, package.name);
+        defer package_dir.close(io);
+        const package_before = try files.snapshot(.{ .handle = package_dir.handle, .flags = .{ .nonblocking = false } });
         const deadline = try process.Deadline.afterMilliseconds(300_000);
         var result = try process.runCommand(allocator, io, .{
             .executable = executable,
@@ -684,7 +727,9 @@ pub fn verifyZigPackageHashes(
             !std.mem.eql(u8, result.stdout[0..package.name.len], package.name) or
             result.stdout[package.name.len] != '\n')
             return error.PackageHashMismatch;
-        if (!files.sameSnapshot(package_before, try physical.directory(io, package_path, false)))
+        const reopened = try packageDirectory(io, packages, package.name);
+        defer reopened.close(io);
+        if (!files.sameSnapshot(package_before, try files.snapshot(.{ .handle = reopened.handle, .flags = .{ .nonblocking = false } })))
             return error.PackageChanged;
         const first = try std.fs.path.join(allocator, &.{ work_path, "build.zig" });
         defer allocator.free(first);

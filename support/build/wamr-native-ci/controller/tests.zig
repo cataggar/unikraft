@@ -46,6 +46,549 @@ test "build command table has closed roles, order, deadlines and native executab
     }).get("tool:sh"));
 }
 
+test "handoff inspect command matches Python's closed post-run contract" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const plan = controller.command_plan;
+    const selected = plan.spec(.@"handoff-inspect");
+    try std.testing.expectEqual(@as(u32, 150), selected.seconds);
+    try std.testing.expectEqual(@as(usize, 64 * 1024), selected.output_limit);
+    try std.testing.expectEqualStrings("input:package_tool", selected.executable);
+    try std.testing.expect(plan.isBoot(selected.stage));
+    try std.testing.expectEqual(@as(usize, 64 * 1024 + 1), plan.limits(selected).stdout_bytes);
+    try std.testing.expectEqual(@as(usize, 64 * 1024 + 1), plan.limits(selected).stderr_bytes);
+    const reference = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" });
+    defer a.free(reference);
+    const script =
+        \\import importlib.util,sys
+        \\s=importlib.util.spec_from_file_location("ci",sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+        \\sys.stdout.buffer.write(m.canonical_json(m.production_command_contract("handoff-inspect")))
+    ;
+    const response = try std.process.run(a, io, .{
+        .argv = &.{ options.python_executable, "-B", "-c", script, reference },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(16384),
+        .stderr_limit = .limited(4096),
+    });
+    defer a.free(response.stdout);
+    defer a.free(response.stderr);
+    if (response.term != .exited or response.term.exited != 0)
+        std.debug.print("handoff contract oracle: {s}\n", .{response.stderr});
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, response.term);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, response.stdout, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false });
+    defer parsed.deinit();
+    const contract = parsed.value.object;
+    try std.testing.expectEqualStrings("bound-tools", contract.get("kind").?.string);
+    try std.testing.expectEqual(selected.seconds, try core.contracts.integer(u32, contract.get("seconds").?));
+    try std.testing.expectEqual(selected.output_limit, try core.contracts.integer(usize, contract.get("output_limit").?));
+    const argv = contract.get("argv").?.array.items;
+    try std.testing.expectEqual(selected.argv.len, argv.len);
+    for (selected.argv, argv) |entry, expected| {
+        const local = switch (entry) {
+            .literal => |literal| try std.json.Stringify.valueAlloc(a, .{ .kind = "literal", .value = literal }, .{}),
+            .path => |path| try std.json.Stringify.valueAlloc(a, .{ .kind = "path", .role = path.role, .relative = path.relative }, .{}),
+        };
+        defer a.free(local);
+        const remote = try std.json.Stringify.valueAlloc(a, expected, .{});
+        defer a.free(remote);
+        try std.testing.expectEqualStrings(try controller.records.canonicalAlloc(a, remote), try controller.records.canonicalAlloc(a, local));
+    }
+    try std.testing.expectEqualStrings("source", selected.argv[2].path.role);
+    try std.testing.expectEqualStrings("compute", selected.argv[3].path.role);
+    const environment = try plan.environment(a, selected.stage);
+    defer plan.freeEnvironment(a, environment);
+    const expected_env = contract.get("environment").?.array.items;
+    try std.testing.expectEqual(environment.len, expected_env.len);
+    for (environment, expected_env) |entry, expected| {
+        try std.testing.expectEqualStrings(entry.name, expected.object.get("name").?.string);
+        const binding = entry.value;
+        const local = switch (binding) {
+            .literal => |literal| try std.json.Stringify.valueAlloc(a, .{ .kind = "literal", .value = literal }, .{}),
+            .path => |path| try std.json.Stringify.valueAlloc(a, .{ .kind = "path", .role = path.role, .relative = path.relative }, .{}),
+        };
+        defer a.free(local);
+        const remote = try std.json.Stringify.valueAlloc(a, expected.object.get("value").?, .{});
+        defer a.free(remote);
+        try std.testing.expectEqualStrings(try controller.records.canonicalAlloc(a, remote), try controller.records.canonicalAlloc(a, local));
+    }
+    const limits = try std.json.Stringify.valueAlloc(a, plan.limits(selected), .{});
+    defer a.free(limits);
+    const expected_limits = try std.json.Stringify.valueAlloc(a, contract.get("limits").?, .{});
+    defer a.free(expected_limits);
+    try std.testing.expectEqualStrings(try controller.records.canonicalAlloc(a, expected_limits), try controller.records.canonicalAlloc(a, limits));
+}
+
+fn commandDigest(a: std.mem.Allocator, value: std.json.Value) ![]const u8 {
+    const raw = try std.json.Stringify.valueAlloc(a, value, .{});
+    const canonical = try controller.records.canonicalAlloc(a, raw);
+    const digest = std.fmt.bytesToHex(controller.records.fileIdentity(canonical), .lower);
+    return try a.dupe(u8, &digest);
+}
+
+fn withoutFields(a: std.mem.Allocator, value: std.json.Value, skipped: []const []const u8) !std.json.Value {
+    var result = std.json.Value{ .object = .empty };
+    var iterator = value.object.iterator();
+    while (iterator.next()) |entry| {
+        var skip = false;
+        for (skipped) |name| if (std.mem.eql(u8, entry.key_ptr.*, name)) {
+            skip = true;
+            break;
+        };
+        if (!skip) try result.object.put(a, entry.key_ptr.*, entry.value_ptr.*);
+    }
+    return result;
+}
+
+fn rehashCommandRecord(a: std.mem.Allocator, record: *std.json.Value) ![]const u8 {
+    const supervisor = record.object.getPtr("supervisor") orelse return error.InvalidCommand;
+    const request = supervisor.object.getPtr("request") orelse return error.InvalidCommand;
+    request.object.getPtr("argv_sha256").?.* = .{ .string = try commandDigest(a, request.object.get("argv").?) };
+    request.object.getPtr("environment_sha256").?.* = .{ .string = try commandDigest(a, request.object.get("environment").?) };
+    request.object.getPtr("cwd_sha256").?.* = .{ .string = try commandDigest(a, request.object.get("cwd").?) };
+    request.object.getPtr("canonical_sha256").?.* = .{ .string = try commandDigest(a, try withoutFields(a, request.*, &.{
+        "canonical_sha256",
+        "argv_sha256",
+        "environment_sha256",
+        "cwd_sha256",
+    })) };
+    const result = supervisor.object.getPtr("result") orelse return error.InvalidCommand;
+    result.object.getPtr("request_canonical_sha256").?.* = request.object.get("canonical_sha256").?;
+    result.object.getPtr("canonical_sha256").?.* = .{ .string = try commandDigest(a, try withoutFields(a, result.*, &.{"canonical_sha256"})) };
+    return controller.records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, record.*, .{}));
+}
+
+fn handoffInspectFixtures() !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const plan = controller.command_plan;
+    var accepted = controller.accepted_run.AcceptedRun{
+        .arena = std.heap.ArenaAllocator.init(a),
+        .io = io,
+        .context = .trusted_inner_zip,
+        .compatibility = .tiny_v2_qcow2_derived_vhd,
+        .production_profile = .tiny_exact_v2,
+        .source = undefined,
+        .result = undefined,
+        .records = &.{},
+        .artifacts = &.{},
+        .runtime_inputs = &.{},
+        .root = "/runtime",
+        .repository = null,
+        .environ = null,
+    };
+    defer accepted.deinit();
+    try std.testing.expectError(error.InvalidContext, controller.handoff_inspect.bind(&accepted, "/output"));
+    try std.testing.expectError(error.InvalidContext, controller.handoff_inspect.run(a, io, &accepted, "/output", false, null));
+    try std.testing.expectError(error.InvalidContext, controller.public_validator_build.run(a, io, &accepted, "/output", null));
+    try std.testing.expectError(error.InvalidContext, controller.public_validator_build.revalidateHandoff(a, io, &accepted, "/output", null));
+    accepted.context = .local_runtime;
+    accepted.repository = "/source";
+    try std.testing.expectError(error.MissingInput, controller.handoff_inspect.bind(&accepted, "/output"));
+
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "handoff-inspect-{d}", .{std.os.linux.getpid()});
+    defer a.free(name);
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("handoff inspect fixture cleanup failed");
+    const fixture_dir = try parent.openDir(io, name, .{ .iterate = true });
+    defer fixture_dir.close(io);
+    try fixture_dir.createDirPath(io, "source/support/apps/wamr-aot/build");
+    try fixture_dir.createDir(io, "compute", .fromMode(0o700));
+    const compute_dir = try fixture_dir.openDir(io, "compute", .{ .iterate = true });
+    defer compute_dir.close(io);
+    try compute_dir.createDir(io, "package", .fromMode(0o700));
+    try compute_dir.createDir(io, "tools", .fromMode(0o700));
+    const tools_dir = try compute_dir.openDir(io, "tools", .{ .iterate = true });
+    defer tools_dir.close(io);
+    try tools_dir.createDir(io, "bin", .fromMode(0o700));
+    const tools_bin = try tools_dir.openDir(io, "bin", .{ .iterate = true });
+    defer tools_bin.close(io);
+    try compute_dir.createDir(io, "supervisor", .fromMode(0o700));
+    const supervisor_dir = try compute_dir.openDir(io, "supervisor", .{ .iterate = true });
+    defer supervisor_dir.close(io);
+    try supervisor_dir.createDir(io, "bin", .fromMode(0o700));
+    const supervisor_bin = try supervisor_dir.openDir(io, "bin", .{ .iterate = true });
+    defer supervisor_bin.close(io);
+    try fixture_dir.createDir(io, "controller", .fromMode(0o700));
+    const controller_dir = try fixture_dir.openDir(io, "controller", .{ .iterate = true });
+    defer controller_dir.close(io);
+    try controller_dir.createDir(io, "bin", .fromMode(0o700));
+    const controller_bin = try controller_dir.openDir(io, "bin", .{ .iterate = true });
+    defer controller_bin.close(io);
+    try fixture_dir.createDir(io, "output", .fromMode(0o700));
+    const output_dir = try fixture_dir.openDir(io, "output", .{ .iterate = true });
+    defer output_dir.close(io);
+    try output_dir.createDir(io, "private", .fromMode(0o700));
+    try output_dir.createDir(io, "evidence", .fromMode(0o700));
+    const private = try output_dir.openDir(io, "private", .{ .iterate = true });
+    defer private.close(io);
+    const evidence = try output_dir.openDir(io, "evidence", .{ .iterate = true });
+    defer evidence.close(io);
+    const efi_dir = try fixture_dir.openDir(io, "source/support/apps/wamr-aot/build", .{});
+    defer efi_dir.close(io);
+    try writeFixtureFile(io, efi_dir, "wamr_hyperv-x86_64-efi", "efi");
+    const root = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    defer a.free(root);
+    const source = try std.fs.path.join(a, &.{ root, "source" });
+    defer a.free(source);
+    const compute = try std.fs.path.join(a, &.{ root, "compute" });
+    defer a.free(compute);
+    const output = try std.fs.path.join(a, &.{ root, "output" });
+    defer a.free(output);
+    const efi = try std.fs.path.join(a, &.{ source, "support/apps/wamr-aot/build/wamr_hyperv-x86_64-efi" });
+    defer a.free(efi);
+    const executable = try std.fs.path.resolve(a, &.{ options.repository_root, options.command_fixture });
+    defer a.free(executable);
+    const bound_tool = try std.Io.Dir.realPathFileAbsoluteAlloc(io, "/usr/bin/true", a);
+    defer a.free(bound_tool);
+    try copyFixtureExecutable(io, a, executable, tools_bin, "wamr-ci-package");
+    try copyFixtureExecutable(io, a, bound_tool, supervisor_bin, "wamr-ci-supervisor");
+    try copyFixtureExecutable(io, a, bound_tool, controller_bin, "uk-wamr-native-ci");
+    const original_tool = try std.fs.path.join(a, &.{ compute, "tools/bin/wamr-ci-package" });
+    const original_supervisor = try std.fs.path.join(a, &.{ compute, "supervisor/bin/wamr-ci-supervisor" });
+    const records_controller = try std.fs.path.join(a, &.{ root, "controller/bin/uk-wamr-native-ci" });
+    const handoff_controller = try std.Io.Dir.realPathFileAbsoluteAlloc(io, "/proc/self/exe", a);
+    const roots = plan.Roots{
+        .source_root = source,
+        .work = output,
+        .compute = compute,
+        .runtime = root,
+        .zig = bound_tool,
+        .producer = bound_tool,
+        .fixture_runner = bound_tool,
+        .supervisor = records_controller,
+        .package_tool = original_tool,
+        .validator = bound_tool,
+        .supervisor_fixture = bound_tool,
+        .efi = efi,
+        .tools = [_][]const u8{bound_tool} ** controller.input_custody.host_tools.len,
+    };
+    const sample = controller.accepted_run.PinnedInput{
+        .role = "",
+        .path = "",
+        .snapshot = .{ .bytes = 1, .sha256 = [_]u8{'0'} ** 64, .metadata = [_]i128{0} ** 9 },
+    };
+    var pinned: [controller.input_custody.host_tools.len + 6]controller.accepted_run.PinnedInput = undefined;
+    for (controller.input_custody.host_tools, 0..) |tool, i| {
+        pinned[i] = sample;
+        pinned[i].role = try std.fmt.allocPrint(accepted.arena.allocator(), "tool:{s}", .{tool});
+        pinned[i].path = bound_tool;
+    }
+    const additional = [_]struct { role: []const u8, path: []const u8 }{
+        .{ .role = "package_tool", .path = original_tool },
+        .{ .role = "efi", .path = efi },
+        .{ .role = "command-supervisor", .path = records_controller },
+        .{ .role = controller.accepted_run.handoff_controller_role, .path = handoff_controller },
+        .{ .role = "native:wamr-aot-build", .path = bound_tool },
+        .{ .role = "native:wamr-log-validate", .path = bound_tool },
+    };
+    for (additional, 0..) |entry, i| {
+        pinned[controller.input_custody.host_tools.len + i] = sample;
+        pinned[controller.input_custody.host_tools.len + i].role = entry.role;
+        pinned[controller.input_custody.host_tools.len + i].path = entry.path;
+    }
+    accepted.root = root;
+    accepted.repository = source;
+    accepted.runtime_inputs = &pinned;
+    try expectInvalidHandoffRun(a, io, &accepted, try std.fs.path.join(a, &.{ root, "native-v2-legacy-refused" }), true);
+    const bound = try controller.handoff_inspect.bind(&accepted, output);
+    try std.testing.expectEqualStrings("command-supervisor", controller.handoff_inspect.supervisorRole(&accepted));
+    try std.testing.expectEqualStrings(records_controller, bound.supervisor);
+    try std.testing.expectEqualStrings(original_tool, bound.package_tool);
+    try std.testing.expectEqualStrings(efi, bound.efi);
+    try std.testing.expectEqualStrings(compute, bound.compute);
+    try std.testing.expectEqualStrings(output, bound.work);
+    try std.testing.expectError(error.UnboundCommandRole, bound.get("native:wamr-native-ci-fixtures"));
+    try std.testing.expectError(error.UnboundCommandRole, bound.get("native:wamr-ci-supervisor-fixture"));
+    pinned[controller.input_custody.host_tools.len + 2].path = original_supervisor;
+    try std.testing.expectError(error.InputChanged, controller.handoff_inspect.bind(&accepted, output));
+    accepted.local_producer = .python;
+    const python_bound = try controller.handoff_inspect.bind(&accepted, output);
+    try expectInvalidHandoffRun(a, io, &accepted, try std.fs.path.join(a, &.{ root, "python-v2-legacy-refused" }), true);
+    try std.testing.expectEqualStrings(controller.accepted_run.handoff_controller_role, controller.handoff_inspect.supervisorRole(&accepted));
+    try std.testing.expectEqualStrings(original_supervisor, python_bound.supervisor);
+    try std.testing.expectEqualStrings(handoff_controller, python_bound.handoff_controller);
+    accepted.local_producer = .native;
+    pinned[controller.input_custody.host_tools.len + 2].path = records_controller;
+    pinned[controller.input_custody.host_tools.len + 1].path = "/substituted/efi";
+    try std.testing.expectError(error.InputChanged, controller.handoff_inspect.bind(&accepted, output));
+    pinned[controller.input_custody.host_tools.len + 1].path = efi;
+    pinned[controller.input_custody.host_tools.len].path = "/substituted/package-tool";
+    try std.testing.expectError(error.InputChanged, controller.handoff_inspect.bind(&accepted, output));
+    pinned[controller.input_custody.host_tools.len].path = original_tool;
+    try std.testing.expectEqualStrings(efi, try plan.path(a, plan.spec(.@"handoff-inspect").argv[2], roots));
+    try std.testing.expectEqualStrings(try std.fs.path.join(a, &.{ compute, "package" }), try plan.path(a, plan.spec(.@"handoff-inspect").argv[3], roots));
+    var incomplete = roots;
+    incomplete.compute = "";
+    try std.testing.expectError(error.UnboundCommandRole, plan.path(a, plan.spec(.@"handoff-inspect").argv[3], incomplete));
+    const result = try controller.command_adapter.execute(a, io, .{
+        .roots = roots,
+        .stage = .@"handoff-inspect",
+        .private_dir = private,
+        .evidence_dir = evidence,
+        .capture_stdout = true,
+    });
+    defer a.free(result.stdout);
+    try std.testing.expect(result.accepted);
+    try std.testing.expect(!result.poisoned);
+    try std.testing.expectEqual(@as(usize, 0), result.stderr_bytes);
+    const original = "{\"image\":{\"efi\":{\"size\":3}},\"producer_sha256\":\"fixture\"}\n";
+    try std.testing.expectEqualStrings(original, result.stdout);
+    try controller.handoff_inspect.matchPackage(a, result.stdout, original);
+    try std.testing.expectError(error.PackageChanged, controller.handoff_inspect.matchPackage(a, result.stdout, "{\"image\":{\"efi\":{\"size\":4}},\"producer_sha256\":\"fixture\"}\n"));
+    try std.testing.expectError(error.PackageChanged, controller.handoff_inspect.matchPackage(a, result.stdout, "{\"image\":{\"efi\":{\"size\":3}},\"producer_sha256\":\"changed\"}\n"));
+    const record_path = try std.fs.path.join(a, &.{ output, "evidence/command-handoff-inspect.json" });
+    defer a.free(record_path);
+    const recorded = try controller.custody_files.readFile(io, record_path, 1024 * 1024, true);
+    const raw = try a.alloc(u8, @intCast(recorded.bytes));
+    defer a.free(raw);
+    const file = try evidence.openFile(io, "command-handoff-inspect.json", .{ .follow_symlinks = false });
+    defer file.close(io);
+    try std.testing.expectEqual(raw.len, try file.readPositionalAll(io, raw, 0));
+    const checked = try controller.accepted_run.validateCommandBinding(a, raw, .@"handoff-inspect", .local_runtime);
+    try std.testing.expectEqual(plan.Stage.@"handoff-inspect", checked.stage);
+    try compute_dir.createDir(io, "evidence", .fromMode(0o700));
+    const source_evidence = try compute_dir.openDir(io, "evidence", .{ .iterate = true });
+    defer source_evidence.close(io);
+    const tool_record = try controller.custody_files.readFile(io, bound_tool, 64 * 1024 * 1024, false);
+    const package_record = try controller.custody_files.readFile(io, original_tool, 64 * 1024 * 1024, false);
+    const supervisor_record = try controller.custody_files.readFile(io, records_controller, 64 * 1024 * 1024, false);
+    const python_supervisor_record = try controller.custody_files.readFile(io, original_supervisor, 64 * 1024 * 1024, false);
+    const handoff_controller_record = try controller.custody_files.readFile(io, handoff_controller, 64 * 1024 * 1024, false);
+    const tool_json = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .metadata = tool_record.metadata, .sha256 = tool_record.sha256 }, .{}), .{ .parse_numbers = false });
+    const package_json = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .metadata = package_record.metadata, .sha256 = package_record.sha256 }, .{}), .{ .parse_numbers = false });
+    const supervisor_json = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .metadata = supervisor_record.metadata, .sha256 = supervisor_record.sha256 }, .{}), .{ .parse_numbers = false });
+    const python_supervisor_json = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .metadata = python_supervisor_record.metadata, .sha256 = python_supervisor_record.sha256 }, .{}), .{ .parse_numbers = false });
+    var start_files = std.json.Value{ .object = .empty };
+    for (controller.input_custody.host_tools) |tool|
+        try start_files.object.put(a, try std.fmt.allocPrint(a, "tool:{s}", .{tool}), tool_json);
+    try start_files.object.put(a, "command-supervisor", supervisor_json);
+    const build_start = try controller.records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, .{ .consumer_inputs = .{ .files = start_files } }, .{}));
+    try writeFixtureFile(io, source_evidence, "build-start.json", build_start);
+    const boot_inputs = try controller.records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, .{ .files = .{ .package_tool = package_json } }, .{}));
+    try writeFixtureFile(io, source_evidence, "boot-inputs.json", boot_inputs);
+    const verified = try controller.accepted_run.validateLocalHandoffCommand(&accepted, raw);
+    try std.testing.expectEqual(plan.Stage.@"handoff-inspect", verified.stage);
+    try fixture_dir.createDir(io, "python-output", .fromMode(0o700));
+    const python_output = try std.fs.path.join(a, &.{ root, "python-output" });
+    const python_output_dir = try fixture_dir.openDir(io, "python-output", .{ .iterate = true });
+    defer python_output_dir.close(io);
+    try python_output_dir.createDir(io, "private", .fromMode(0o700));
+    try python_output_dir.createDir(io, "evidence", .fromMode(0o700));
+    const python_private = try python_output_dir.openDir(io, "private", .{ .iterate = true });
+    defer python_private.close(io);
+    const python_evidence = try python_output_dir.openDir(io, "evidence", .{ .iterate = true });
+    defer python_evidence.close(io);
+    accepted.local_producer = .python;
+    pinned[controller.input_custody.host_tools.len + 2].path = original_supervisor;
+    const python_roots = try controller.handoff_inspect.bind(&accepted, python_output);
+    const python_result = try controller.command_adapter.execute(a, io, .{
+        .roots = python_roots,
+        .stage = .@"handoff-inspect",
+        .private_dir = python_private,
+        .evidence_dir = python_evidence,
+        .supervisor_role = controller.accepted_run.handoff_controller_role,
+        .capture_stdout = true,
+    });
+    defer a.free(python_result.stdout);
+    try std.testing.expect(python_result.accepted);
+    const python_record_path = try std.fs.path.join(a, &.{ python_output, "evidence/command-handoff-inspect.json" });
+    const python_record = try controller.custody_files.readFile(io, python_record_path, 1024 * 1024, true);
+    const python_raw = try a.alloc(u8, @intCast(python_record.bytes));
+    defer a.free(python_raw);
+    const python_file = try python_evidence.openFile(io, "command-handoff-inspect.json", .{ .follow_symlinks = false });
+    defer python_file.close(io);
+    try std.testing.expectEqual(python_raw.len, try python_file.readPositionalAll(io, python_raw, 0));
+    var python_doc = try std.json.parseFromSlice(std.json.Value, a, python_raw, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false });
+    defer python_doc.deinit();
+    const python_request = python_doc.value.object.get("supervisor").?.object.get("request").?;
+    const python_supervisor_binding = python_request.object.get("supervisor").?;
+    try std.testing.expectEqualStrings(
+        controller.accepted_run.handoff_controller_role,
+        python_supervisor_binding.object.get("path").?.object.get("role").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        &handoff_controller_record.sha256,
+        python_supervisor_binding.object.get("identity").?.object.get("content_sha256").?.string,
+    );
+    _ = try source_evidence.deleteFile(io, "build-start.json");
+    var python_start_files = std.json.Value{ .object = .empty };
+    for (controller.input_custody.host_tools) |tool|
+        try python_start_files.object.put(a, try std.fmt.allocPrint(a, "tool:{s}", .{tool}), tool_json);
+    try python_start_files.object.put(a, "command-supervisor", python_supervisor_json);
+    const python_build_start = try controller.records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, .{ .consumer_inputs = .{ .files = python_start_files } }, .{}));
+    try writeFixtureFile(io, source_evidence, "build-start.json", python_build_start);
+    pinned[controller.input_custody.host_tools.len + 3].snapshot = .{
+        .bytes = handoff_controller_record.bytes,
+        .sha256 = handoff_controller_record.sha256,
+        .metadata = handoff_controller_record.metadata,
+    };
+    const verified_python = try controller.accepted_run.validateLocalHandoffCommand(&accepted, python_raw);
+    try std.testing.expectEqual(plan.Stage.@"handoff-inspect", verified_python.stage);
+
+    try fixture_dir.createDir(io, "python-mislabel-output", .fromMode(0o700));
+    const python_mislabel_output = try std.fs.path.join(a, &.{ root, "python-mislabel-output" });
+    const python_mislabel_dir = try fixture_dir.openDir(io, "python-mislabel-output", .{ .iterate = true });
+    defer python_mislabel_dir.close(io);
+    try python_mislabel_dir.createDir(io, "private", .fromMode(0o700));
+    try python_mislabel_dir.createDir(io, "evidence", .fromMode(0o700));
+    const python_mislabel_private = try python_mislabel_dir.openDir(io, "private", .{ .iterate = true });
+    defer python_mislabel_private.close(io);
+    const python_mislabel_evidence = try python_mislabel_dir.openDir(io, "evidence", .{ .iterate = true });
+    defer python_mislabel_evidence.close(io);
+    var python_mislabel_roots = python_roots;
+    python_mislabel_roots.work = python_mislabel_output;
+    const python_mislabel_result = try controller.command_adapter.execute(a, io, .{
+        .roots = python_mislabel_roots,
+        .stage = .@"handoff-inspect",
+        .private_dir = python_mislabel_private,
+        .evidence_dir = python_mislabel_evidence,
+        .supervisor_role = "command-supervisor",
+        .capture_stdout = true,
+    });
+    defer a.free(python_mislabel_result.stdout);
+    try std.testing.expect(python_mislabel_result.accepted);
+    const python_mislabel_record_path = try std.fs.path.join(a, &.{ python_mislabel_output, "evidence/command-handoff-inspect.json" });
+    const python_mislabel_record = try controller.custody_files.readFile(io, python_mislabel_record_path, 1024 * 1024, true);
+    const python_mislabel_raw = try a.alloc(u8, @intCast(python_mislabel_record.bytes));
+    const python_mislabel_file = try python_mislabel_evidence.openFile(io, "command-handoff-inspect.json", .{ .follow_symlinks = false });
+    defer python_mislabel_file.close(io);
+    try std.testing.expectEqual(python_mislabel_raw.len, try python_mislabel_file.readPositionalAll(io, python_mislabel_raw, 0));
+    try std.testing.expectError(error.InvalidCommandIdentity, controller.accepted_run.validateLocalHandoffCommand(&accepted, python_mislabel_raw));
+
+    const identity_cases = [_]struct {
+        field: []const u8,
+        value: std.json.Value,
+        err: anyerror,
+    }{
+        .{ .field = "content_sha256", .value = .{ .string = "0000000000000000000000000000000000000000000000000000000000000000" }, .err = error.EvidenceChanged },
+        .{ .field = "inode", .value = .{ .integer = 99 }, .err = error.InvalidCommandIdentity },
+        .{ .field = "ctime_seconds", .value = .{ .integer = 99 }, .err = error.InvalidCommandIdentity },
+    };
+    for (identity_cases) |case| {
+        var tampered = try std.json.parseFromSlice(std.json.Value, a, python_raw, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false });
+        defer tampered.deinit();
+        const identity = tampered.value.object.getPtr("supervisor").?.object.getPtr("request").?.object.getPtr("supervisor").?.object.getPtr("identity").?;
+        identity.object.getPtr(case.field).?.* = case.value;
+        const tampered_raw = try rehashCommandRecord(a, &tampered.value);
+        try std.testing.expectError(case.err, controller.accepted_run.validateLocalHandoffCommand(&accepted, tampered_raw));
+    }
+
+    accepted.local_producer = .native;
+    pinned[controller.input_custody.host_tools.len + 2].path = records_controller;
+    _ = try source_evidence.deleteFile(io, "build-start.json");
+    try writeFixtureFile(io, source_evidence, "build-start.json", build_start);
+
+    try fixture_dir.createDir(io, "native-wrong-role-output", .fromMode(0o700));
+    const native_wrong_output = try std.fs.path.join(a, &.{ root, "native-wrong-role-output" });
+    const native_wrong_dir = try fixture_dir.openDir(io, "native-wrong-role-output", .{ .iterate = true });
+    defer native_wrong_dir.close(io);
+    try native_wrong_dir.createDir(io, "private", .fromMode(0o700));
+    try native_wrong_dir.createDir(io, "evidence", .fromMode(0o700));
+    const native_wrong_private = try native_wrong_dir.openDir(io, "private", .{ .iterate = true });
+    defer native_wrong_private.close(io);
+    const native_wrong_evidence = try native_wrong_dir.openDir(io, "evidence", .{ .iterate = true });
+    defer native_wrong_evidence.close(io);
+    var native_wrong_roots = roots;
+    native_wrong_roots.handoff_controller = handoff_controller;
+    const native_wrong_result = try controller.command_adapter.execute(a, io, .{
+        .roots = native_wrong_roots,
+        .stage = .@"handoff-inspect",
+        .private_dir = native_wrong_private,
+        .evidence_dir = native_wrong_evidence,
+        .supervisor_role = controller.accepted_run.handoff_controller_role,
+        .capture_stdout = true,
+    });
+    defer a.free(native_wrong_result.stdout);
+    try std.testing.expect(native_wrong_result.accepted);
+    const native_wrong_record_path = try std.fs.path.join(a, &.{ native_wrong_output, "evidence/command-handoff-inspect.json" });
+    const native_wrong_record = try controller.custody_files.readFile(io, native_wrong_record_path, 1024 * 1024, true);
+    const native_wrong_raw = try a.alloc(u8, @intCast(native_wrong_record.bytes));
+    const native_wrong_file = try native_wrong_evidence.openFile(io, "command-handoff-inspect.json", .{ .follow_symlinks = false });
+    defer native_wrong_file.close(io);
+    try std.testing.expectEqual(native_wrong_raw.len, try native_wrong_file.readPositionalAll(io, native_wrong_raw, 0));
+    try std.testing.expectError(error.InvalidCommandIdentity, controller.accepted_run.validateLocalHandoffCommand(&accepted, native_wrong_raw));
+
+    const validator_plan = plan.spec(.@"public-validator-build");
+    try std.testing.expectEqualStrings("tool:zig", validator_plan.executable);
+    try std.testing.expectEqual(@as(u32, 1800), validator_plan.seconds);
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), validator_plan.output_limit);
+    try std.testing.expectEqualStrings(
+        try std.fs.path.join(a, &.{ output, "public-source/tools" }),
+        try plan.path(a, validator_plan.argv[9], roots),
+    );
+    const env = try plan.environment(a, .@"public-validator-build");
+    defer plan.freeEnvironment(a, env);
+    var launch = false;
+    var temporary = false;
+    for (env) |entry| {
+        if (std.mem.eql(u8, entry.name, "WAMR_CI_LAUNCH_EXECUTABLE")) {
+            try std.testing.expectEqualStrings("tool:zig", entry.value.path.role);
+            launch = true;
+        } else if (std.mem.eql(u8, entry.name, "TMPDIR")) {
+            try std.testing.expectEqualStrings("private", entry.value.path.relative);
+            temporary = true;
+        }
+        try std.testing.expect(!std.mem.eql(u8, entry.name, "KCONFIG_CONFIG"));
+    }
+    try std.testing.expect(launch and temporary);
+    const built = try controller.command_adapter.execute(a, io, .{
+        .roots = roots,
+        .stage = .@"public-validator-build",
+        .private_dir = private,
+        .evidence_dir = evidence,
+    });
+    try std.testing.expect(built.accepted);
+    const builder_path = try std.fs.path.join(a, &.{ output, "evidence/command-public-validator-build.json" });
+    defer a.free(builder_path);
+    const builder_record = try controller.custody_files.readFile(io, builder_path, 1024 * 1024, true);
+    const builder_raw = try a.alloc(u8, @intCast(builder_record.bytes));
+    defer a.free(builder_raw);
+    const builder_file = try evidence.openFile(io, "command-public-validator-build.json", .{ .follow_symlinks = false });
+    defer builder_file.close(io);
+    try std.testing.expectEqual(builder_raw.len, try builder_file.readPositionalAll(io, builder_raw, 0));
+    const validated_builder = try controller.accepted_run.validateLocalPostRunCommand(&accepted, builder_raw, .@"public-validator-build");
+    try std.testing.expectEqual(plan.Stage.@"public-validator-build", validated_builder.stage);
+    try std.testing.expectEqual(@as(u64, 0), validated_builder.output_bytes);
+    const checked_builder = try controller.public_validator_build.validateCommandEvidence(a, io, &accepted, output, built.bytes);
+    try std.testing.expectEqual(plan.Stage.@"public-validator-build", checked_builder.stage);
+    try std.testing.expectError(error.CommandOutputChanged, controller.public_validator_build.validateCommandEvidence(
+        a,
+        io,
+        &accepted,
+        output,
+        built.bytes + 1,
+    ));
+    try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateLocalPostRunCommand(&accepted, builder_raw, .package));
+    var changed_boot = try std.json.parseFromSlice(std.json.Value, a, boot_inputs, .{
+        .duplicate_field_behavior = .@"error",
+        .parse_numbers = false,
+    });
+    defer changed_boot.deinit();
+    changed_boot.value.object.getPtr("files").?.object.getPtr("package_tool").?.object.getPtr("sha256").?.* =
+        .{ .string = "0000000000000000000000000000000000000000000000000000000000000000" };
+    const changed_json = try std.json.Stringify.valueAlloc(a, changed_boot.value, .{});
+    const changed_raw = try controller.records.canonicalAlloc(a, changed_json);
+    const boot_file = try source_evidence.openFile(io, "boot-inputs.json", .{ .mode = .read_write, .follow_symlinks = false });
+    try boot_file.setLength(io, 0);
+    try boot_file.writePositionalAll(io, changed_raw, 0);
+    boot_file.close(io);
+    try std.testing.expectError(error.EvidenceChanged, controller.accepted_run.validateLocalHandoffCommand(&accepted, raw));
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false });
+    defer parsed.deinit();
+    const command = parsed.value.object.getPtr("supervisor").?.object.getPtr("request").?;
+    try std.testing.expectEqualStrings("source", command.object.get("argv").?.array.items[2].object.get("role").?.string);
+    try std.testing.expectEqualStrings("compute", command.object.get("argv").?.array.items[3].object.get("role").?.string);
+    const argv = command.object.getPtr("argv").?;
+    argv.array.items[3].object.getPtr("role").?.* = .{ .string = "work" };
+    try std.testing.expectError(error.InvalidCommand, controller.command_validation.validate(a, parsed.value, .@"handoff-inspect", .local_runtime));
+}
+
 test "six boot modes bind exact image, APIC flags, validator and command budgets" {
     const a = std.testing.allocator;
     const plan = controller.command_plan;
@@ -112,7 +655,8 @@ test "exact bounded validator JSON and Python tiny differential faults" {
     const a = std.testing.allocator;
     const io = std.testing.io;
     const raw_hash = std.fmt.bytesToHex(controller.records.fileIdentity("abc"), .lower);
-    const valid = try std.fmt.allocPrint(a,
+    const valid = try std.fmt.allocPrint(
+        a,
         "{{\"compute\":{{\"answer\":42}},\"mode\":\"tiny\",\"raw_serial_bytes\":3,\"raw_serial_sha256\":\"{s}\",\"schema\":\"uk.wamr.log-validation\",\"schema_version\":1}}\n",
         .{&raw_hash},
     );
@@ -158,7 +702,8 @@ test "exact bounded validator JSON and Python tiny differential faults" {
         const result = try std.process.run(a, io, .{
             .argv = &.{ options.python_executable, "-B", "-c", oracle, reference, hex },
             .cwd = .{ .path = options.repository_root },
-            .stdout_limit = .limited(64), .stderr_limit = .limited(4096),
+            .stdout_limit = .limited(64),
+            .stderr_limit = .limited(4096),
         });
         defer a.free(result.stdout);
         defer a.free(result.stderr);
@@ -199,8 +744,7 @@ test "native diagnostics retain only bounded allowlisted observations and never 
     defer a.free(report);
     try writeFixtureFile(io, boot, "report.json", report);
     try writeFixtureFile(io, evidence, "command-fixtures.json", "{\"exit_code\":1}\n");
-    try writeFixtureFile(io, private, "fixtures.log",
-        "test_safe_name (test_adapter.Evidence.test_safe_name) ... ERROR\nPRIVATE_SYNTHETIC_SERIAL_AND_PATH\n");
+    try writeFixtureFile(io, private, "fixtures.log", "test_safe_name (test_adapter.Evidence.test_safe_name) ... ERROR\nPRIVATE_SYNTHETIC_SERIAL_AND_PATH\n");
     var signal = try controller.build_pipeline.installCancellation();
     defer signal.deinit();
     var scratch = std.heap.ArenaAllocator.init(a);
@@ -208,13 +752,21 @@ test "native diagnostics retain only bounded allowlisted observations and never 
     const compute_path = try std.fs.path.join(a, &.{ runtime, "compute" });
     defer a.free(compute_path);
     var base: controller.build_pipeline.Context = .{
-        .allocator = scratch.allocator(), .io = io, .environ = undefined, .runtime = runtime,
-        .repository = options.repository_root, .wamr = "",
-        .compute = compute_path, .git = undefined, .tools = undefined,
-        .roots = undefined, .signal = &signal,
+        .allocator = scratch.allocator(),
+        .io = io,
+        .environ = undefined,
+        .runtime = runtime,
+        .repository = options.repository_root,
+        .wamr = "",
+        .compute = compute_path,
+        .git = undefined,
+        .tools = undefined,
+        .roots = undefined,
+        .signal = &signal,
     };
     var ctx: controller.boot_pipeline.Context = .{
-        .build_context = &base, .pinned = std.StringHashMap(controller.custody_files.File).init(scratch.allocator()),
+        .build_context = &base,
+        .pinned = std.StringHashMap(controller.custody_files.File).init(scratch.allocator()),
     };
     defer ctx.pinned.deinit();
     try controller.boot_pipeline.diagnostics(&ctx);
@@ -255,9 +807,17 @@ test "result refuses unpinned evidence files and directories before publication"
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     var base: controller.build_pipeline.Context = .{
-        .allocator = arena.allocator(), .io = io, .environ = undefined, .runtime = path,
-        .repository = options.repository_root, .wamr = "", .compute = path,
-        .git = undefined, .tools = undefined, .roots = undefined, .signal = &signal,
+        .allocator = arena.allocator(),
+        .io = io,
+        .environ = undefined,
+        .runtime = path,
+        .repository = options.repository_root,
+        .wamr = "",
+        .compute = path,
+        .git = undefined,
+        .tools = undefined,
+        .roots = undefined,
+        .signal = &signal,
     };
     var ctx: controller.boot_pipeline.Context = .{
         .build_context = &base,
@@ -278,6 +838,59 @@ test "result refuses unpinned evidence files and directories before publication"
     try std.testing.expectError(error.FileNotFound, evidence.openFile(io, "result.json", .{}));
     try evidence.deleteDir(io, "unlisted");
     try controller.boot_pipeline.testing.checkExactEvidence(&ctx);
+}
+
+test "boot recheck uses transient scratch and refuses changed pinned evidence with no persistent space" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "boot-recheck-{d}", .{std.os.linux.getpid()});
+    defer a.free(name);
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("boot recheck fixture cleanup failed");
+    const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    defer a.free(path);
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    try root.createDir(io, "evidence", .fromMode(0o700));
+    const evidence = try root.openDir(io, "evidence", .{ .iterate = true });
+    defer evidence.close(io);
+    try writeFixtureFile(io, evidence, "build.json", "{}\n");
+    try writeFixtureFile(io, evidence, "build-start.json", "{}\n");
+    const build_path = try std.fs.path.join(a, &.{ path, "evidence/build.json" });
+    defer a.free(build_path);
+    const start_path = try std.fs.path.join(a, &.{ path, "evidence/build-start.json" });
+    defer a.free(start_path);
+    var signal = try controller.build_pipeline.installCancellation();
+    defer signal.deinit();
+    var empty: [0]u8 = .{};
+    var no_growth = std.heap.FixedBufferAllocator.init(&empty);
+    var base: controller.build_pipeline.Context = .{
+        .allocator = no_growth.allocator(),
+        .io = io,
+        .environ = undefined,
+        .runtime = path,
+        .repository = options.repository_root,
+        .wamr = "",
+        .compute = path,
+        .git = undefined,
+        .tools = undefined,
+        .roots = undefined,
+        .signal = &signal,
+        .build_start_record = try controller.custody_files.readFile(io, start_path, 4096, true),
+    };
+    base.build_start_record.?.bytes += 1;
+    var ctx: controller.boot_pipeline.Context = .{
+        .build_context = &base,
+        .pinned = std.StringHashMap(controller.custody_files.File).init(a),
+    };
+    defer ctx.pinned.deinit();
+    try ctx.pinned.put("build.json", try controller.custody_files.readFile(io, build_path, 4096, true));
+    for (0..3) |_| try std.testing.expectError(error.BuildStartChanged, controller.boot_pipeline.testing.revalidateBase(&ctx));
+    try evidence.deleteFile(io, "build.json");
+    try writeFixtureFile(io, evidence, "build.json", "{\"changed\":true}\n");
+    try std.testing.expectError(error.EvidenceChanged, controller.boot_pipeline.testing.revalidateBase(&ctx));
 }
 
 test "changed raw QCOW2 and derived VHD images never publish compute evidence" {
@@ -304,9 +917,17 @@ test "changed raw QCOW2 and derived VHD images never publish compute evidence" {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     var base: controller.build_pipeline.Context = .{
-        .allocator = arena.allocator(), .io = io, .environ = undefined, .runtime = path,
-        .repository = options.repository_root, .wamr = "", .compute = path,
-        .git = undefined, .tools = undefined, .roots = undefined, .signal = &signal,
+        .allocator = arena.allocator(),
+        .io = io,
+        .environ = undefined,
+        .runtime = path,
+        .repository = options.repository_root,
+        .wamr = "",
+        .compute = path,
+        .git = undefined,
+        .tools = undefined,
+        .roots = undefined,
+        .signal = &signal,
     };
     var ctx: controller.boot_pipeline.Context = .{
         .build_context = &base,
@@ -315,8 +936,7 @@ test "changed raw QCOW2 and derived VHD images never publish compute evidence" {
     defer ctx.pinned.deinit();
     const source = "original-image";
     const hash = std.fmt.bytesToHex(controller.records.fileIdentity(source), .lower);
-    ctx.package = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
-        try std.fmt.allocPrint(arena.allocator(), "{{\"image\":{{\"raw\":{{\"sha256\":\"{s}\"}}}}}}", .{&hash}), .{});
+    ctx.package = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), try std.fmt.allocPrint(arena.allocator(), "{{\"image\":{{\"raw\":{{\"sha256\":\"{s}\"}}}}}}", .{&hash}), .{});
     const output = try std.fmt.allocPrint(arena.allocator(), "{{\"output\":{{\"sha256\":\"{s}\"}}}}", .{&hash});
     ctx.finalization = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), output, .{});
     ctx.derivation = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), output, .{});
@@ -330,8 +950,7 @@ test "changed raw QCOW2 and derived VHD images never publish compute evidence" {
         const image = try package_dir.openFile(io, filename, .{ .mode = .read_write, .follow_symlinks = false });
         try image.writePositionalAll(io, "changed--image", 0);
         image.close(io);
-        try std.testing.expectError(error.ArtifactChanged,
-            controller.boot_pipeline.testing.publishCompute(&ctx, index, .null));
+        try std.testing.expectError(error.ArtifactChanged, controller.boot_pipeline.testing.publishCompute(&ctx, index, .null));
         try std.testing.expectError(error.FileNotFound, evidence_dir.openFile(io, record_name, .{}));
     }
 }
@@ -463,7 +1082,7 @@ fn directSharedSupervisorFixtures() !void {
         seconds: u32 = 4,
         cancelled: bool = false,
     }{
-        .{ .name = "ok", .accepted = true, .kind = "exited" },
+        .{ .name = "ok", .accepted = true, .kind = "exited", .limit = 8 * 1024 * 1024, .seconds = 600 },
         .{ .name = "reported-error", .accepted = false, .kind = "exited" },
         .{ .name = "nonzero", .accepted = false, .kind = "exited" },
         .{ .name = "partial", .accepted = false, .kind = "exited" },
@@ -579,6 +1198,21 @@ fn directSharedSupervisorFixtures() !void {
             .test_output_limit = scenario.limit,
         }));
         if (std.mem.eql(u8, scenario.name, "ok")) {
+            const validated = try controller.accepted_run.validateCommandBinding(a, raw, .fixtures, .local_runtime);
+            try std.testing.expectEqual(controller.command_plan.Stage.fixtures, validated.stage);
+            _ = try controller.accepted_run.validateCommandBinding(a, raw, .fixtures, .trusted_inner_zip);
+            var mutated = try std.json.parseFromSlice(std.json.Value, a, raw, .{
+                .duplicate_field_behavior = .@"error",
+                .allocate = .alloc_always,
+            });
+            defer mutated.deinit();
+            const request = mutated.value.object.getPtr("supervisor").?.object.getPtr("request").?;
+            try request.object.put(a, "timeout_ns", .{ .integer = 1 });
+            const tampered_raw = try std.json.Stringify.valueAlloc(a, mutated.value, .{});
+            defer a.free(tampered_raw);
+            const tampered = try controller.records.canonicalAlloc(a, tampered_raw);
+            defer a.free(tampered);
+            try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBinding(a, tampered, .fixtures, .trusted_inner_zip));
             var cancellation = try controller.build_pipeline.installCancellation();
             defer cancellation.deinit();
             var context: controller.build_pipeline.Context = .{
@@ -647,19 +1281,524 @@ test "portable target installer refuses musl, v3 and incomplete overrides" {
     }
 }
 
+test "imported validator build binds the fixed portable plan with minimal tools" {
+    const plan = controller.command_plan;
+    const native = plan.spec(.@"public-validator-build");
+    const imported = plan.spec(.@"import-validator-build");
+    try std.testing.expectEqualStrings("tool:zig", imported.executable);
+    try std.testing.expectEqual(native.seconds, imported.seconds);
+    try std.testing.expectEqual(native.output_limit, imported.output_limit);
+    try std.testing.expectEqualSlices(plan.Binding, native.argv, imported.argv);
+    const env = try plan.environment(std.testing.allocator, .@"import-validator-build");
+    defer plan.freeEnvironment(std.testing.allocator, env);
+    var git = false;
+    var compiler = false;
+    var library = false;
+    for (env, 0..) |item, i| {
+        if (i > 0) try std.testing.expect(std.mem.lessThan(u8, env[i - 1].name, item.name));
+        if (std.mem.eql(u8, item.name, "WAMR_CI_GIT")) git = std.mem.eql(u8, item.value.path.role, "tool:git");
+        if (std.mem.eql(u8, item.name, "WAMR_CI_LAUNCH_EXECUTABLE")) compiler = std.mem.eql(u8, item.value.path.role, "tool:zig");
+        if (std.mem.eql(u8, item.name, "ZIG_LIB_DIR")) library = std.mem.eql(u8, item.value.path.role, "tool-tree:zig");
+        try std.testing.expect(!std.mem.startsWith(u8, item.name, "WAMR_CI_TOOL_"));
+    }
+    try std.testing.expect(git and compiler and library);
+}
+
+test "imported revalidation binds only the built validator and private bundle" {
+    const plan = controller.command_plan;
+    const spec = plan.spec(.@"import-native-revalidation");
+    try std.testing.expectEqualStrings("input:validator", spec.executable);
+    try std.testing.expectEqual(@as(u32, 600), spec.seconds);
+    try std.testing.expectEqual(@as(usize, 4096), spec.output_limit);
+    try std.testing.expectEqual(@as(usize, 3), spec.argv.len);
+    try std.testing.expectEqualStrings("input:validator", spec.argv[0].path.role);
+    try std.testing.expectEqualStrings("handoff", spec.argv[1].literal);
+    try std.testing.expectEqualStrings("input:bundle", spec.argv[2].path.role);
+    const env = try plan.environment(std.testing.allocator, .@"import-native-revalidation");
+    defer plan.freeEnvironment(std.testing.allocator, env);
+    try std.testing.expectEqual(@as(usize, 6), env.len);
+    for (env, 0..) |entry, i| {
+        if (i > 0) try std.testing.expect(std.mem.lessThan(u8, env[i - 1].name, entry.name));
+        try std.testing.expect(!std.mem.startsWith(u8, entry.name, "WAMR_CI_TOOL_"));
+        try std.testing.expect(!std.mem.eql(u8, entry.name, "WAMR_CI_LAUNCH_EXECUTABLE"));
+    }
+}
+
+test "trusted import authenticates relocated native tools without producer filesystem identities" {
+    var checkpoint: []const u8 = "setup";
+    errdefer std.debug.print("relocated import failed at {s}\n", .{checkpoint});
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "relocated-native-import-{d}", .{std.os.linux.getpid()});
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("relocated import cleanup failed");
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    for ([_][]const u8{ "producer", "destination" }) |runner| try root.createDir(io, runner, .fromMode(0o700));
+    const producer = try root.openDir(io, "producer", .{ .iterate = true });
+    defer producer.close(io);
+    const destination = try root.openDir(io, "destination", .{ .iterate = true });
+    defer destination.close(io);
+    const producer_repo = try std.fs.path.join(a, &.{ path, "producer/source" });
+    const repository = try std.fs.path.join(a, &.{ path, "destination/source" });
+    for ([_][]const u8{ producer_repo, repository }) |checkout| {
+        const cloned = try std.process.run(a, io, .{
+            .argv = &.{ options.git_executable, "clone", "-q", "--no-hardlinks", "--", options.repository_root, checkout },
+            .cwd = .{ .path = options.fixture_root },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, cloned.term);
+    }
+    checkpoint = "copy tools";
+    try copyFixtureExecutable(io, a, options.host_controller_cli, producer, "controller");
+    try copyFixtureExecutable(io, a, options.host_controller_cli, destination, "controller");
+    try copyFixtureExecutable(io, a, options.host_controller_cli, destination, "supervisor");
+    try copyFixtureExecutable(io, a, options.import_validator, destination, "validator");
+    try copyFixtureExecutable(io, a, options.git_executable, producer, "git");
+    {
+        const original_zig = try std.Io.Dir.openFileAbsolute(io, options.zig_executable, .{});
+        defer original_zig.close(io);
+        const copied_zig = try producer.createFile(io, "zig", .{ .exclusive = true, .permissions = .fromMode(0o500) });
+        defer copied_zig.close(io);
+        var buffer: [64 * 1024]u8 = undefined;
+        var offset: u64 = 0;
+        while (true) {
+            const count = try original_zig.readPositionalAll(io, &buffer, offset);
+            if (count == 0) break;
+            try copied_zig.writeStreamingAll(io, buffer[0..count]);
+            offset += count;
+        }
+    }
+    const producer_controller = try std.fs.path.join(a, &.{ path, "producer/controller" });
+    const owner = try std.fs.path.join(a, &.{ path, "destination/controller" });
+    const supervisor = try std.fs.path.join(a, &.{ path, "destination/supervisor" });
+    const validator = try std.fs.path.join(a, &.{ path, "destination/validator" });
+    const producer_git = try std.fs.path.join(a, &.{ path, "producer/git" });
+    const producer_zig = try std.fs.path.join(a, &.{ path, "producer/zig" });
+    const producer_identity = try controller.custody_files.readFile(io, producer_controller, 64 * 1024 * 1024, false);
+    const relocated_identity = try controller.custody_files.readFile(io, supervisor, 64 * 1024 * 1024, false);
+    try std.testing.expectEqualSlices(u8, &producer_identity.sha256, &relocated_identity.sha256);
+    try std.testing.expect(producer_identity.metadata[1] != relocated_identity.metadata[1]);
+    try std.testing.expect(producer_identity.metadata[7] != relocated_identity.metadata[7]);
+    checkpoint = "producer source";
+    try std.testing.expectError(error.FileNotFound, controller.source_custody.source(a, io, producer_repo, options.git_executable));
+    const origin = try controller.source_custody.portableSource(a, io, producer_repo, options.git_executable);
+    checkpoint = "capture producer inputs";
+    const source_identity = controller.accepted_run.SourceIdentity{ .revision = origin.revision, .tree = origin.tree };
+    var custody = try controller.input_custody.capture(a, io, &.{
+        .{ .role = "command-supervisor", .path = producer_controller },
+        .{ .role = "tool:git", .path = producer_git },
+        .{ .role = "tool:zig", .path = producer_zig },
+    }, &.{});
+    defer custody.deinit(a);
+    var start = std.json.Value{ .object = .empty };
+    try start.object.put(a, "source_custody", try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, origin.custody, .{}), .{}));
+    try start.object.put(a, "consumer_inputs", try std.json.parseFromSliceLeaky(std.json.Value, a, try custody.canonical(a), .{}));
+    try start.object.put(a, "command_supervisor", try controller.build_pipeline.captureSupervisorState(a, io, producer_repo, producer_controller));
+    start = try std.json.parseFromSliceLeaky(std.json.Value, a, try canonicalJsonValue(a, start), .{ .parse_numbers = false });
+    checkpoint = "bind relocated tools";
+    try producer.deleteFile(io, "git");
+    try producer.deleteFile(io, "zig");
+    const local = controller.import_validator_build.LocalTools{ .git = options.git_executable, .supervisor = supervisor, .validator = validator };
+    var bound = try controller.import_validator_build.PortableTools.bind(a, io, .trusted_inner_zip, source_identity, start, repository, owner, local, null);
+    defer bound.deinit(io);
+    try bound.verify(io, repository, local.git);
+    checkpoint = "owner identity";
+    const identity_command = try std.process.run(a, io, .{
+        .argv = &.{ owner, "--identity" },
+        .cwd = .{ .path = repository },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, identity_command.term);
+    const closure = try controller.import_supervisor_identity.nativeSourceContentClosure(a);
+    try std.testing.expectEqualStrings(try controller.import_supervisor_identity.identityBytes(a, &closure), identity_command.stdout);
+    try std.testing.expectError(error.InvalidContext, controller.import_validator_build.PortableTools.bind(a, io, .local_runtime, source_identity, start, repository, owner, local, null));
+
+    const producer_source = try std.Io.Dir.openDirAbsolute(io, producer_repo, .{ .iterate = true });
+    checkpoint = "rehash source";
+    defer producer_source.close(io);
+    const relative = "support/build/wamr-native-ci/controller/cli.zig";
+    const original = try producer_source.readFileAlloc(io, relative, a, .limited(1024 * 1024));
+    try appendRelativeFixtureFile(io, producer_source, relative, "\n");
+    var altered = start;
+    altered.object = try start.object.clone(a);
+    try altered.object.put(a, "command_supervisor", try controller.build_pipeline.captureSupervisorState(a, io, producer_repo, producer_controller));
+    altered = try std.json.parseFromSliceLeaky(std.json.Value, a, try canonicalJsonValue(a, altered), .{ .parse_numbers = false });
+    try std.testing.expectError(error.ImportSourceChanged, controller.import_validator_build.PortableTools.bind(a, io, .trusted_inner_zip, source_identity, altered, repository, owner, local, null));
+    {
+        const restored = try producer_source.openFile(io, relative, .{ .mode = .write_only, .follow_symlinks = false });
+        defer restored.close(io);
+        try restored.setLength(io, original.len);
+        try restored.writePositionalAll(io, original, 0);
+    }
+    checkpoint = "rehash supervisor";
+    const substituted_executable = options.command_fixture;
+    try producer.deleteFile(io, "controller");
+    try copyFixtureExecutable(io, a, substituted_executable, producer, "controller");
+    var substituted_custody = try controller.input_custody.capture(a, io, &.{.{ .role = "command-supervisor", .path = producer_controller }}, &.{});
+    defer substituted_custody.deinit(a);
+    try altered.object.put(a, "consumer_inputs", try std.json.parseFromSliceLeaky(std.json.Value, a, try substituted_custody.canonical(a), .{}));
+    try altered.object.put(a, "command_supervisor", try controller.build_pipeline.captureSupervisorState(a, io, producer_repo, producer_controller));
+    altered = try std.json.parseFromSliceLeaky(std.json.Value, a, try canonicalJsonValue(a, altered), .{ .parse_numbers = false });
+    const substituted = controller.import_validator_build.LocalTools{ .git = local.git, .supervisor = producer_controller, .validator = validator };
+    try std.testing.expectError(error.ImportSupervisorChanged, controller.import_validator_build.PortableTools.bind(a, io, .trusted_inner_zip, source_identity, altered, repository, owner, substituted, null));
+    try destination.deleteFile(io, "validator");
+    checkpoint = "substitute local validator";
+    try copyFixtureExecutable(io, a, substituted_executable, destination, "validator");
+    try std.testing.expectError(error.InvalidValidator, controller.import_validator_build.PortableTools.bind(a, io, .trusted_inner_zip, source_identity, start, repository, owner, local, null));
+    try std.testing.expectError(error.FileChanged, bound.verify(io, repository, local.git));
+    try destination.deleteFile(io, "validator");
+    try copyFixtureExecutable(io, a, options.import_validator, destination, "validator");
+    var source_bound = try controller.import_validator_build.PortableTools.bind(a, io, .trusted_inner_zip, source_identity, start, repository, owner, local, null);
+    defer source_bound.deinit(io);
+    const source_dir = try std.Io.Dir.openDirAbsolute(io, repository, .{ .iterate = true });
+    defer source_dir.close(io);
+    try appendRelativeFixtureFile(io, source_dir, relative, "\n");
+    try std.testing.expectError(error.DirtySource, source_bound.verify(io, repository, local.git));
+    try std.testing.expectError(error.DirtySource, controller.import_validator_build.PortableTools.bind(a, io, .trusted_inner_zip, source_identity, start, repository, owner, local, null));
+}
+
+test "native handoff revalidation is supervised and retains bounded refusal evidence" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "native-handoff-revalidation-{d}", .{std.os.linux.getpid()});
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("handoff revalidation fixture cleanup failed");
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    for ([_][]const u8{ "accepted", "reported-error", "nonzero", "overflow", "ok" }) |scenario| {
+        try root.createDir(io, scenario, .fromMode(0o700));
+        const work = try root.openDir(io, scenario, .{ .iterate = true });
+        defer work.close(io);
+        try writeFixtureFile(io, work, "bundle.json", scenario);
+        for ([_][]const u8{ "private", "evidence" }) |entry| try work.createDir(io, entry, .fromMode(0o700));
+        const private = try work.openDir(io, "private", .{ .iterate = true });
+        defer private.close(io);
+        const evidence = try work.openDir(io, "evidence", .{ .iterate = true });
+        defer evidence.close(io);
+        const path = try std.fs.path.join(a, &.{ options.fixture_root, name, scenario });
+        const checked = controller.import_validator_build.revalidateHandoffCommand(a, io, .{
+            .source_root = options.repository_root,
+            .work = path,
+            .runtime = options.fixture_root,
+            .zig = "",
+            .producer = "",
+            .supervisor = options.host_controller_cli,
+            .package_tool = "",
+            .validator = "",
+            .direct_validator = options.command_fixture,
+            .bundle = try std.fs.path.join(a, &.{ path, "bundle.json" }),
+            .tools = @splat(""),
+        }, private, evidence, null);
+        if (std.mem.eql(u8, scenario, "accepted")) {
+            try std.testing.expectEqual(controller.command_plan.Stage.@"import-native-revalidation", (try checked).stage);
+        } else try std.testing.expectError(error.StageRefused, checked);
+        const record = try evidence.readFileAlloc(io, "command-import-native-revalidation.json", a, .limited(controller.records.max_record_bytes));
+        try std.testing.expect(record.len != 0);
+        const log = try private.openFile(io, "import-native-revalidation.log", .{});
+        defer log.close(io);
+        try std.testing.expect((try log.stat(io)).size <= 4097);
+    }
+}
+
+test "imported handoff member rebasing preserves only safe expected relative paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var valid = std.json.Value{ .object = .empty };
+    try valid.object.put(a, "path", .{ .string = "artifacts/wasm" });
+    try controller.import_validator_build.Fixture.rebaseMember(a, "/trusted/stage", &valid, "artifacts/");
+    try std.testing.expectEqualStrings("/trusted/stage/artifacts/wasm", valid.object.get("path").?.string);
+    for ([_]struct { path: []const u8, expected: anyerror }{
+        .{ .path = "artifacts/../wasm", .expected = error.UnsafePath },
+        .{ .path = "evidence/wasm", .expected = error.InvalidImportedBundle },
+        .{ .path = "/trusted/wasm", .expected = error.UnsafePath },
+    }) |case| {
+        var item = std.json.Value{ .object = .empty };
+        try item.object.put(a, "path", .{ .string = case.path });
+        try std.testing.expectError(
+            case.expected,
+            controller.import_validator_build.Fixture.rebaseMember(a, "/trusted/stage", &item, "artifacts/"),
+        );
+    }
+}
+
+test "local consumer custody recaptures exact files trees and ancestry" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "local-consumer-custody-{d}", .{std.os.linux.getpid()});
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("local consumer fixture cleanup failed");
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    try writeFixtureFile(io, root, "input", "original");
+    try root.createDir(io, "tree", .fromMode(0o700));
+    const tree = try root.openDir(io, "tree", .{ .iterate = true });
+    defer tree.close(io);
+    try writeFixtureFile(io, tree, "member", "member");
+    const fixture_path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    const file_path = try std.fs.path.join(a, &.{ fixture_path, "input" });
+    const tree_path = try std.fs.path.join(a, &.{ fixture_path, "tree" });
+    var original = try controller.input_custody.capture(a, io, &.{
+        .{ .role = "tool:git", .path = file_path },
+    }, &.{
+        .{ .role = "zig", .path = tree_path },
+    });
+    defer original.deinit(a);
+    const encoded = try original.canonical(a);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, encoded, .{ .parse_numbers = false });
+    defer parsed.deinit();
+    try controller.local_consumer_custody.Fixture.recaptureDocument(a, io, parsed.value);
+    const digest_hex = std.fmt.bytesToHex(controller.records.fileIdentity(encoded), .lower);
+    const digest = try core.contracts.parseSha256(&digest_hex);
+    try controller.local_consumer_custody.Fixture.requireBuildStartDigest(encoded, digest);
+    try controller.local_consumer_custody.Fixture.requireBootInputsDigest(encoded, digest);
+    var other_digest = digest;
+    other_digest[0] ^= 1;
+    try std.testing.expectError(
+        error.BuildStartDigestMismatch,
+        controller.local_consumer_custody.Fixture.requireBuildStartDigest(encoded, other_digest),
+    );
+    try std.testing.expectError(
+        error.BootInputsDigestMismatch,
+        controller.local_consumer_custody.Fixture.requireBootInputsDigest(encoded, other_digest),
+    );
+
+    var allowed: std.StringHashMap(void) = .init(a);
+    defer allowed.deinit();
+    try allowed.put("tool:git", {});
+    try controller.local_consumer_custody.Fixture.exactRoleSet(&allowed, parsed.value.object.get("files").?);
+    var unexpected = std.json.Value{ .object = .empty };
+    try unexpected.object.put(a, "tool:other", .null);
+    try std.testing.expectError(
+        error.UnexpectedInputRole,
+        controller.local_consumer_custody.Fixture.exactRoleSet(&allowed, unexpected),
+    );
+    var substituted = std.json.Value{ .object = .empty };
+    var substituted_file = std.json.Value{ .object = .empty };
+    try substituted_file.object.put(a, "path", .{ .string = "/untrusted/qemu" });
+    try substituted.object.put(a, "qemu", substituted_file);
+    try std.testing.expectError(
+        error.UnexpectedInputPath,
+        controller.local_consumer_custody.Fixture.fixedRolePath(a, substituted, "qemu", fixture_path, "bin/qemu-system-x86_64"),
+    );
+    var native_paths = std.json.Value{ .object = .empty };
+    for ([_]struct { role: []const u8, relative: []const u8 }{
+        .{ .role = "command-supervisor", .relative = "controller/bin/uk-wamr-native-ci" },
+        .{ .role = "local_boot_tool", .relative = "compute/local-boot-tools/bin/uk-hyperv-local-boot" },
+        .{ .role = "log_validator", .relative = "compute/tools/bin/uk-wamr-log-validate" },
+    }) |item| {
+        var entry = std.json.Value{ .object = .empty };
+        try entry.object.put(a, "path", .{ .string = try std.fs.path.join(a, &.{ fixture_path, item.relative }) });
+        try native_paths.object.put(a, item.role, entry);
+        try controller.local_consumer_custody.Fixture.fixedRolePath(a, native_paths, item.role, fixture_path, item.relative);
+    }
+    try std.testing.expect(try controller.local_consumer_custody.Fixture.producer(a, fixture_path, native_paths));
+    native_paths.object.getPtr("command-supervisor").?.object.getPtr("path").?.* =
+        .{ .string = try std.fs.path.join(a, &.{ fixture_path, "compute/supervisor/bin/wamr-ci-supervisor" }) };
+    try std.testing.expect(!try controller.local_consumer_custody.Fixture.producer(a, fixture_path, native_paths));
+    native_paths.object.getPtr("command-supervisor").?.object.getPtr("path").?.* = .{ .string = "/unrecorded/controller" };
+    try std.testing.expectError(error.UnexpectedInputPath, controller.local_consumer_custody.Fixture.producer(a, fixture_path, native_paths));
+    const changed = try root.openFile(io, "input", .{ .mode = .write_only });
+    try changed.writePositionalAll(io, "modified", 0);
+    try changed.sync(io);
+    changed.close(io);
+    try std.testing.expectError(
+        error.RecordedCustodyChanged,
+        controller.local_consumer_custody.Fixture.recaptureDocument(a, io, parsed.value),
+    );
+}
+
+test "local consumer custody rejects non-stdlib python tree path" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const python = try std.Io.Dir.realPathFileAbsoluteAlloc(io, options.python_executable, a);
+    var files_map = std.json.Value{ .object = .empty };
+    var python_record = std.json.Value{ .object = .empty };
+    try python_record.object.put(a, "path", .{ .string = python });
+    try files_map.object.put(a, "tool:python3", python_record);
+    var tree_map = std.json.Value{ .object = .empty };
+    var stdlib_record = std.json.Value{ .object = .empty };
+    try stdlib_record.object.put(a, "path", .{ .string = "/not-the-recorded-python-stdlib" });
+    try tree_map.object.put(a, "python-stdlib", stdlib_record);
+    try std.testing.expectError(
+        error.UnexpectedInputPath,
+        controller.local_consumer_custody.Fixture.requirePythonStdlibTree(
+            a,
+            io,
+            options.repository_root,
+            files_map,
+            tree_map,
+        ),
+    );
+}
+
+test "imported validator retains runtime paths after the source buffer is released" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const path = try std.Io.Dir.realPathFileAbsoluteAlloc(io, options.python_executable, a);
+    const identity = try controller.custody_files.readFile(io, path, 64 * 1024 * 1024, false);
+    const encoded = try std.json.Stringify.valueAlloc(a, .{
+        .path = path,
+        .sha256 = identity.sha256,
+        .metadata = identity.metadata,
+    }, .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, encoded, .{ .parse_numbers = false });
+    defer parsed.deinit();
+    var file_records = std.json.Value{ .object = .empty };
+    try file_records.object.put(a, try std.fmt.allocPrint(a, "runtime:{s}", .{path}), parsed.value);
+    var consumer = std.json.Value{ .object = .empty };
+    try consumer.object.put(a, "files", file_records);
+    var start = std.json.Value{ .object = .empty };
+    try start.object.put(a, "consumer_inputs", consumer);
+    try controller.import_validator_build.Fixture.runtimePathRemainsPinned(
+        std.testing.allocator,
+        io,
+        start,
+        path,
+    );
+}
+
 test "CLI accepts only closed arguments and no caller-selected profile" {
     const cli = controller.cli;
     const build = try cli.parse(&.{ "uk-wamr-native-ci", "build", "--wamr-source", "/wamr", "--runtime", "/runtime" });
     try std.testing.expectEqual(cli.Action.build, build.action);
     try std.testing.expectEqualStrings("/wamr", build.wamr_source.?);
+    try std.testing.expectEqual(cli.Action.@"--identity", (try cli.parse(&.{ "uk-wamr-native-ci", "--identity" })).action);
     try std.testing.expectEqual(cli.Action.describe, (try cli.parse(&.{ "uk-wamr-native-ci", "describe", "--output", "json-v1" })).action);
+    const source_closure = try cli.parse(&.{ "uk-wamr-native-ci", "supervisor-source-closure", "--git", "/usr/bin/git", "--output", "sha256-v1" });
+    try std.testing.expectEqual(cli.Action.@"supervisor-source-closure", source_closure.action);
+    try std.testing.expectEqualStrings("/usr/bin/git", source_closure.git.?);
     try std.testing.expectEqual(cli.Action.boot, (try cli.parse(&.{ "uk-wamr-native-ci", "boot", "--runtime", "/runtime" })).action);
     try std.testing.expectEqual(cli.Action.diagnostics, (try cli.parse(&.{ "uk-wamr-native-ci", "diagnostics", "--runtime", "/runtime" })).action);
+    const local_records = try cli.parse(&.{ "uk-wamr-native-ci", "records", "--output", "handoff-v1", "--runtime", "/runtime" });
+    try std.testing.expectEqual(cli.Action.records, local_records.action);
+    try std.testing.expectEqualStrings("/runtime", local_records.runtime.?);
+    const imported_records = try cli.parse(&.{ "uk-wamr-native-ci", "records", "--stage-root", "/stage", "--transport", "trusted-inner-zip", "--output", "handoff-v1" });
+    try std.testing.expectEqual(cli.Action.records, imported_records.action);
+    try std.testing.expectEqualStrings("/stage", imported_records.stage_root.?);
+    const empty_digest = std.fmt.bytesToHex(controller.records.fileIdentity("{}\n"), .lower);
+    const local_custody = try cli.parse(&.{
+        "uk-wamr-native-ci",             "local-consumer-custody", "--runtime",                     "/runtime",
+        "--expected-build-start-sha256", &empty_digest,            "--expected-boot-inputs-sha256", &empty_digest,
+    });
+    try std.testing.expectEqual(cli.Action.@"local-consumer-custody", local_custody.action);
+    try std.testing.expectEqualStrings("/runtime", local_custody.runtime.?);
+    try std.testing.expectEqualDeep(
+        try core.contracts.parseSha256(&empty_digest),
+        local_custody.expected_build_start_sha256.?,
+    );
+    try std.testing.expectEqualDeep(
+        try core.contracts.parseSha256(&empty_digest),
+        local_custody.expected_boot_inputs_sha256.?,
+    );
+    const inspection = try cli.parse(&.{ "uk-wamr-native-ci", "handoff-inspect", "--output", "/private/inspection", "--runtime", "/runtime" });
+    try std.testing.expectEqual(cli.Action.@"handoff-inspect", inspection.action);
+    try std.testing.expectEqualStrings("/runtime", inspection.runtime.?);
+    try std.testing.expectEqualStrings("/private/inspection", inspection.output.?);
+    const validator_build = try cli.parse(&.{ "uk-wamr-native-ci", "public-validator-build", "--output", "/private/validator", "--runtime", "/runtime" });
+    try std.testing.expectEqual(cli.Action.@"public-validator-build", validator_build.action);
+    try std.testing.expectEqualStrings("/runtime", validator_build.runtime.?);
+    const local_revalidation = try cli.parse(&.{ "uk-wamr-native-ci", "local-handoff-revalidation", "--runtime", "/runtime", "--output", "/private/revalidation" });
+    try std.testing.expectEqual(cli.Action.@"local-handoff-revalidation", local_revalidation.action);
+    try std.testing.expectEqualStrings("/private/validator", validator_build.output.?);
+    const imported_validator = try cli.parse(&.{ "uk-wamr-native-ci", "import-validator-build", "--output", "/private/validator", "--stage-root", "/stage" });
+    try std.testing.expectEqual(cli.Action.@"import-validator-build", imported_validator.action);
+    try std.testing.expectEqualStrings("/stage", imported_validator.stage_root.?);
+    try std.testing.expectEqualStrings("/private/validator", imported_validator.output.?);
+    const revalidation = try cli.parse(&.{
+        "uk-wamr-native-ci", "import-native-revalidation", "--output", "/private/revalidated", "--stage-root", "/stage",
+    });
+    try std.testing.expectEqual(cli.Action.@"import-native-revalidation", revalidation.action);
+    const portable_import = try cli.parse(&.{
+        "uk-wamr-native-ci", "import-handoff-revalidation", "--stage-root", "/stage",
+        "--git",             "/local/git",                  "--supervisor", "/local/controller",
+        "--validator",       "/local/validator",            "--output",     "/private/revalidated",
+    });
+    try std.testing.expectEqual(cli.Action.@"import-handoff-revalidation", portable_import.action);
+    try std.testing.expectEqualStrings("/stage", revalidation.stage_root.?);
+    try std.testing.expectEqualStrings("/private/revalidated", revalidation.output.?);
+    const imported_identity = try cli.parse(&.{
+        "uk-wamr-native-ci", "supervisor-import-identity", "--stage-root", "/stage",
+        "--supervisor",      "/trusted/supervisor",        "--git",        "/usr/bin/git",
+        "--output",          "/private/identity",
+    });
+    try std.testing.expectEqual(cli.Action.@"supervisor-import-identity", imported_identity.action);
+    try std.testing.expectEqualStrings("/stage", imported_identity.stage_root.?);
+    try std.testing.expectEqualStrings("/trusted/supervisor", imported_identity.supervisor.?);
     const rejected = [_][]const []const u8{
         &.{"uk-wamr-native-ci"},
+        &.{ "uk-wamr-native-ci", "--identity", "--runtime", "/runtime" },
+        &.{ "uk-wamr-native-ci", "local-handoff-revalidation", "--runtime", "/runtime" },
+        &.{ "uk-wamr-native-ci", "local-handoff-revalidation", "--runtime", "/runtime", "--output", "/private/revalidation", "--validator", "/caller" },
+        &.{ "uk-wamr-native-ci", "supervised-command-record", "--record", "/record", "--identities", "/ids", "--stage", "adapter", "--transport", "trusted-inner-zip", "--profile", "tiny-aot-two-boot" },
+        &.{ "uk-wamr-native-ci", "handoff-inspect", "--runtime", "/runtime" },
+        &.{ "uk-wamr-native-ci", "handoff-inspect", "--runtime", "/runtime", "--output", "/private/../inspection" },
+        &.{ "uk-wamr-native-ci", "handoff-inspect", "--runtime", "/runtime", "--output", "/private/inspection", "--profile", "tiny" },
+        &.{ "uk-wamr-native-ci", "handoff-inspect", "--runtime", "/runtime", "--runtime", "/other" },
+        &.{ "uk-wamr-native-ci", "handoff-inspect", "--stage-root", "/stage", "--output", "/private/inspection" },
+        &.{ "uk-wamr-native-ci", "public-validator-build", "--runtime", "/runtime" },
+        &.{ "uk-wamr-native-ci", "public-validator-build", "--output", "/private/validator", "--runtime", "/runtime", "--profile", "tiny" },
+        &.{ "uk-wamr-native-ci", "public-validator-build", "--stage-root", "/stage", "--output", "/private/validator" },
+        &.{ "uk-wamr-native-ci", "import-validator-build", "--stage-root", "/stage" },
+        &.{ "uk-wamr-native-ci", "local-consumer-custody", "--runtime", "/runtime" },
+        &.{ "uk-wamr-native-ci", "local-consumer-custody", "--stage-root", "/stage" },
+        &.{
+            "uk-wamr-native-ci",             "local-consumer-custody", "--runtime",                     "/runtime",
+            "--expected-build-start-sha256", "bad",                    "--expected-boot-inputs-sha256", &empty_digest,
+        },
+        &.{ "uk-wamr-native-ci", "local-consumer-custody", "--runtime", "/runtime", "--output", "/result" },
+        &.{ "uk-wamr-native-ci", "local-consumer-custody", "--runtime", "/runtime/../other" },
+        &.{ "uk-wamr-native-ci", "import-validator-build", "--runtime", "/runtime", "--output", "/private/validator" },
+        &.{ "uk-wamr-native-ci", "import-validator-build", "--stage-root", "/stage", "--output", "/stage/../validator" },
+        &.{ "uk-wamr-native-ci", "import-validator-build", "--stage-root", "/stage", "--output", "/private/validator", "--zig", "/arbitrary/zig" },
+        &.{ "uk-wamr-native-ci", "import-validator-build", "--stage-root", "/stage", "--stage-root", "/another" },
+        &.{ "uk-wamr-native-ci", "import-native-revalidation", "--stage-root", "/stage" },
+        &.{ "uk-wamr-native-ci", "import-native-revalidation", "--runtime", "/runtime", "--output", "/private/revalidated" },
+        &.{ "uk-wamr-native-ci", "import-native-revalidation", "--stage-root", "/stage", "--output", "/private/../revalidated" },
+        &.{ "uk-wamr-native-ci", "import-native-revalidation", "--stage-root", "/stage", "--output", "/private/revalidated", "--validator", "/untrusted/validator" },
+        &.{ "uk-wamr-native-ci", "import-handoff-revalidation", "--stage-root", "/stage", "--git", "/local/git", "--supervisor", "/local/controller", "--output", "/private/revalidated" },
+        &.{ "uk-wamr-native-ci", "import-handoff-revalidation", "--stage-root", "/stage", "--git", "/local/git", "--supervisor", "/local/controller", "--validator", "/local/validator", "--output", "/private/../revalidated" },
+        &.{ "uk-wamr-native-ci", "import-handoff-revalidation", "--runtime", "/runtime", "--git", "/local/git", "--supervisor", "/local/controller", "--validator", "/local/validator", "--output", "/private/revalidated" },
+        &.{ "uk-wamr-native-ci", "supervisor-import-identity", "--stage-root", "/stage", "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git" },
+        &.{ "uk-wamr-native-ci", "supervisor-import-identity", "--stage-root", "/stage", "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git", "--output", "/stage/../identity" },
+        &.{ "uk-wamr-native-ci", "supervisor-import-identity", "--stage-root", "/stage", "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git", "--output", "/private/identity", "--profile", "tiny" },
+        &.{ "uk-wamr-native-ci", "supervisor-import-identity", "--stage-root", "/stage", "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git", "--git", "/another" },
+        &.{ "uk-wamr-native-ci", "supervisor-import-identity", "--runtime", "/runtime", "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git", "--output", "/private/identity" },
         &.{ "uk-wamr-native-ci", "records", "--runtime", "/runtime" },
+        &.{ "uk-wamr-native-ci", "records", "--runtime", "/runtime", "--transport", "trusted-inner-zip", "--output", "handoff-v1" },
+        &.{ "uk-wamr-native-ci", "records", "--stage-root", "/stage", "--output", "handoff-v1" },
+        &.{ "uk-wamr-native-ci", "records", "--runtime", "/runtime", "--stage-root", "/stage", "--output", "handoff-v1" },
+        &.{ "uk-wamr-native-ci", "records", "--stage-root", "/stage", "--transport", "producer-direct", "--output", "handoff-v1" },
+        &.{ "uk-wamr-native-ci", "records", "--stage-root", "/stage", "--transport", "trusted-inner-zip", "--output", "json-v1" },
+        &.{ "uk-wamr-native-ci", "records", "--runtime", "/root/../runtime", "--output", "handoff-v1" },
         &.{ "uk-wamr-native-ci", "describe" },
         &.{ "uk-wamr-native-ci", "describe", "--output", "text" },
+        &.{ "uk-wamr-native-ci", "supervisor-source-closure" },
+        &.{ "uk-wamr-native-ci", "supervisor-source-closure", "--output", "sha256-v1" },
+        &.{ "uk-wamr-native-ci", "supervisor-source-closure", "--git", "git", "--output", "sha256-v1" },
+        &.{ "uk-wamr-native-ci", "supervisor-source-closure", "--git", "/usr/bin/git" },
+        &.{ "uk-wamr-native-ci", "supervisor-source-closure", "--output", "json-v1" },
+        &.{ "uk-wamr-native-ci", "supervisor-source-closure", "--output", "sha256-v1", "--git", "/usr/bin/git", "--runtime", "/runtime" },
         &.{ "uk-wamr-native-ci", "boot", "--runtime", "/runtime", "--wamr-source", "/wamr" },
         &.{ "uk-wamr-native-ci", "build", "--runtime", "/runtime" },
         &.{ "uk-wamr-native-ci", "build", "--runtime", "/runtime", "--wamr-source", "../wamr" },
@@ -669,6 +1808,229 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
         &.{ "uk-wamr-native-ci", "boot", "--runtime", "/runtime", "--output", "json-v1" },
     };
     for (rejected) |argv| try std.testing.expectError(error.InvalidUsage, cli.parse(argv));
+}
+
+test "import identity source allowlist matches the historical supervisor source set" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const script =
+        \\import importlib.util, json, sys
+        \\spec=importlib.util.spec_from_file_location("ci",sys.argv[1])
+        \\ci=importlib.util.module_from_spec(spec); spec.loader.exec_module(ci)
+        \\sys.stdout.write(json.dumps({
+        \\    "names": ci.SUPERVISOR_SOURCE_FILES,
+        \\    "closure": ci.supervisor_source_map()["content_closure_sha256"],
+        \\}))
+    ;
+    const witness_path = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" });
+    const output = try std.process.run(a, std.testing.io, .{
+        .argv = &.{ options.python_executable, "-B", "-c", script, witness_path },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(8192),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, output.term);
+    const witness_json = try std.json.parseFromSliceLeaky(std.json.Value, a, output.stdout, .{});
+    try std.testing.expect(witness_json == .object);
+    const names = witness_json.object.get("names").?;
+    try std.testing.expect(names == .array);
+    var selected = std.json.Value{ .object = .empty };
+    var modified = std.json.Value{ .object = .empty };
+    for (names.array.items, 0..) |entry, index| {
+        try std.testing.expect(entry == .string);
+        try selected.object.put(a, entry.string, .null);
+        try modified.object.put(a, if (index == 0) "support/unexpected.zig" else entry.string, .null);
+    }
+    try controller.import_supervisor_identity.validateSourceNames(selected);
+    try std.testing.expectError(error.InvalidImportIdentity, controller.import_supervisor_identity.validateSourceNames(modified));
+    var native = std.json.Value{ .object = .empty };
+    for (controller.source_custody.closure) |entry|
+        try native.object.put(a, entry.name, .null);
+    try controller.import_supervisor_identity.validateSourceNames(native);
+    const closure = try controller.import_supervisor_identity.supervisorSourceContentClosure(a, std.testing.io, options.repository_root, options.git_executable);
+    try std.testing.expectEqualStrings(witness_json.object.get("closure").?.string, closure[0..]);
+}
+
+test "native import identity matches Python guarded source map under supervision" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var names: std.ArrayList([]const u8) = .empty;
+    for (controller.source_custody.closure) |entry| try names.append(a, entry.name);
+    const script =
+        \\import hashlib, importlib.util, json, pathlib, sys
+        \\spec=importlib.util.spec_from_file_location("ci",sys.argv[1])
+        \\ci=importlib.util.module_from_spec(spec); spec.loader.exec_module(ci)
+        \\records={}
+        \\for name in json.loads(sys.argv[2]):
+        \\    raw=pathlib.Path(name).read_bytes()
+        \\    records[name]={"bytes":len(raw),"sha256":hashlib.sha256(raw).hexdigest(),"metadata":[]}
+        \\closure=ci.guarded_record_map("uk.wamr.command-supervisor-source-v1", records)
+        \\sys.stdout.buffer.write(ci.canonical_json({
+        \\    "protocol":"uk.wamr.command-supervisor/1 process-command/1",
+        \\    "schema":"uk.wamr.command-supervisor-identity",
+        \\    "source_content_closure_sha256":closure["content_closure_sha256"],
+        \\    "version":1}))
+    ;
+    const oracle = try std.process.run(a, io, .{
+        .argv = &.{
+            options.python_executable,                                                                     "-B",                                                   "-c", script,
+            try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" }), try std.json.Stringify.valueAlloc(a, names.items, .{}),
+        },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, oracle.term);
+    try std.testing.expectEqualStrings("", oracle.stderr);
+
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "native-import-identity-{d}", .{std.os.linux.getpid()});
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("native identity fixture cleanup failed");
+    const work = try parent.openDir(io, name, .{ .iterate = true });
+    defer work.close(io);
+    for ([_][]const u8{ "private", "evidence" }) |entry| try work.createDir(io, entry, .fromMode(0o700));
+    const private = try work.openDir(io, "private", .{ .iterate = true });
+    defer private.close(io);
+    const evidence = try work.openDir(io, "evidence", .{ .iterate = true });
+    defer evidence.close(io);
+    const outcome = try controller.command_adapter.execute(a, io, .{
+        .roots = .{
+            .source_root = options.repository_root,
+            .work = try std.fs.path.join(a, &.{ options.fixture_root, name }),
+            .runtime = options.fixture_root,
+            .zig = "",
+            .producer = "",
+            .supervisor = options.host_controller_cli,
+            .package_tool = "",
+            .validator = "",
+            .tools = @splat(""),
+        },
+        .stage = .@"supervisor-import-identity",
+        .private_dir = private,
+        .evidence_dir = evidence,
+        .capture_stdout = true,
+    });
+    try std.testing.expect(outcome.accepted and !outcome.poisoned);
+    try std.testing.expectEqual(@as(usize, 0), outcome.stderr_bytes);
+    try std.testing.expectEqualStrings(oracle.stdout, outcome.stdout);
+    const command = try evidence.readFileAlloc(io, "command-supervisor-import-identity.json", a, .limited(controller.records.max_record_bytes));
+    _ = try controller.accepted_run.validateCommandBinding(a, command, .@"supervisor-import-identity", .trusted_inner_zip);
+}
+
+fn writeRelativeFixtureFile(io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: []const u8) !void {
+    if (std.fs.path.dirname(name)) |parent| try dir.createDirPath(io, parent);
+    try writeFixtureFile(io, dir, name, bytes);
+}
+
+fn writeSupervisorSourceFixture(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, skip: ?[]const u8) !void {
+    for (controller.import_supervisor_identity.historical_supervisor_sources) |relative| {
+        if (skip) |skipped| if (std.mem.eql(u8, relative, skipped)) continue;
+        const bytes = try std.fmt.allocPrint(allocator, "fixture:{s}\n", .{relative});
+        defer allocator.free(bytes);
+        try writeRelativeFixtureFile(io, dir, relative, bytes);
+    }
+}
+
+fn appendRelativeFixtureFile(io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: []const u8) !void {
+    const file = try dir.openFile(io, name, .{ .mode = .write_only });
+    defer file.close(io);
+    const size = (try file.stat(io)).size;
+    try file.writePositionalAll(io, bytes, size);
+}
+
+test "supervisor source closure requires tracked clean Git blobs" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const base_path = try allocator.dupe(u8, options.fixture_root);
+    defer allocator.free(base_path);
+    const base = try std.Io.Dir.openDirAbsolute(io, base_path, .{ .iterate = true });
+    defer base.close(io);
+    const name = try std.fmt.allocPrint(allocator, "supervisor-source-fixture-{d}", .{std.os.linux.getpid()});
+    defer allocator.free(name);
+    try base.createDir(io, name, .fromMode(0o700));
+    defer base.deleteTree(io, name) catch @panic("supervisor source fixture cleanup failed");
+    const repo = try base.openDir(io, name, .{ .iterate = true });
+    defer repo.close(io);
+    const path = try std.fs.path.join(allocator, &.{ base_path, name });
+    defer allocator.free(path);
+    try writeSupervisorSourceFixture(allocator, io, repo, null);
+    try fixtureGit(allocator, path, &.{ options.git_executable, "init", "-q" });
+    try fixtureGit(allocator, path, &.{ options.git_executable, "add", "-A" });
+    try fixtureGit(allocator, path, &.{
+        options.git_executable, "-c",  "user.name=Fixture",         "-c", "user.email=fixture@example.invalid",
+        "commit",               "-qm", "supervisor source fixture",
+    });
+    _ = try controller.import_supervisor_identity.supervisorSourceContentClosure(allocator, io, path, options.git_executable);
+    try appendRelativeFixtureFile(
+        io,
+        repo,
+        "support/build/wamr-native-ci/supervisor.zig",
+        "dirty\n",
+    );
+    try std.testing.expectError(error.SourceChanged, controller.import_supervisor_identity.supervisorSourceContentClosure(
+        allocator,
+        io,
+        path,
+        options.git_executable,
+    ));
+
+    const untracked_name = try std.fmt.allocPrint(allocator, "supervisor-source-untracked-{d}", .{std.os.linux.getpid()});
+    defer allocator.free(untracked_name);
+    try base.createDir(io, untracked_name, .fromMode(0o700));
+    defer base.deleteTree(io, untracked_name) catch @panic("supervisor untracked fixture cleanup failed");
+    const untracked_repo = try base.openDir(io, untracked_name, .{ .iterate = true });
+    defer untracked_repo.close(io);
+    const untracked_path = try std.fs.path.join(allocator, &.{ base_path, untracked_name });
+    defer allocator.free(untracked_path);
+    try writeSupervisorSourceFixture(allocator, io, untracked_repo, "support/build/wamr-native-ci/supervisor.zig");
+    try fixtureGit(allocator, untracked_path, &.{ options.git_executable, "init", "-q" });
+    try fixtureGit(allocator, untracked_path, &.{ options.git_executable, "add", "-A" });
+    try fixtureGit(allocator, untracked_path, &.{
+        options.git_executable, "-c",  "user.name=Fixture",         "-c", "user.email=fixture@example.invalid",
+        "commit",               "-qm", "supervisor source fixture",
+    });
+    try writeRelativeFixtureFile(io, untracked_repo, "support/build/wamr-native-ci/supervisor.zig", "untracked\n");
+    try std.testing.expectError(error.UntrackedManifest, controller.import_supervisor_identity.supervisorSourceContentClosure(
+        allocator,
+        io,
+        untracked_path,
+        options.git_executable,
+    ));
+    try untracked_repo.deleteFile(io, "support/build/wamr-native-ci/supervisor.zig");
+    try std.testing.expectError(error.UntrackedManifest, controller.import_supervisor_identity.supervisorSourceContentClosure(
+        allocator,
+        io,
+        untracked_path,
+        options.git_executable,
+    ));
+
+    const missing_name = try std.fmt.allocPrint(allocator, "supervisor-source-missing-{d}", .{std.os.linux.getpid()});
+    defer allocator.free(missing_name);
+    try base.createDir(io, missing_name, .fromMode(0o700));
+    defer base.deleteTree(io, missing_name) catch @panic("supervisor missing fixture cleanup failed");
+    const missing_repo = try base.openDir(io, missing_name, .{ .iterate = true });
+    defer missing_repo.close(io);
+    const missing_path = try std.fs.path.join(allocator, &.{ base_path, missing_name });
+    defer allocator.free(missing_path);
+    try writeSupervisorSourceFixture(allocator, io, missing_repo, null);
+    try fixtureGit(allocator, missing_path, &.{ options.git_executable, "init", "-q" });
+    try fixtureGit(allocator, missing_path, &.{ options.git_executable, "add", "-A" });
+    try fixtureGit(allocator, missing_path, &.{
+        options.git_executable, "-c",  "user.name=Fixture",         "-c", "user.email=fixture@example.invalid",
+        "commit",               "-qm", "supervisor source fixture",
+    });
+    try missing_repo.deleteFile(io, "support/build/wamr-native-ci/supervisor.zig");
+    try std.testing.expectError(error.FileNotFound, controller.import_supervisor_identity.supervisorSourceContentClosure(
+        allocator,
+        io,
+        missing_path,
+        options.git_executable,
+    ));
 }
 
 test "canonical bytes and domain-separated file versus record identity" {
@@ -683,6 +2045,401 @@ test "canonical bytes and domain-separated file versus record identity" {
     try std.testing.expect(!std.mem.eql(u8, &record, &file));
     try std.testing.expectError(error.IntegerOverflow, controller.records.identity(allocator, "{\"value\":18446744073709551616}"));
     try std.testing.expectError(error.DuplicateField, controller.records.identity(allocator, "{\"a\":1,\"a\":2}"));
+}
+
+test "historical v2 supervised bindings use the closed imported producer contract" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const script =
+        \\import copy, importlib.util, sys
+        \\s=importlib.util.spec_from_file_location("witness",sys.argv[1])
+        \\m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+        \\e=m.Evidence()
+        \\stages=("adapter","local-boot-tool","fixtures","prepare","config","native-image","package","raw-x2apic","raw-legacy-apic","finalize-qcow2","qcow2-x2apic","qcow2-legacy-apic","derive-fixed-vhd","vpc-x2apic","vpc-legacy-apic","inspect","log-validator-x2apic","log-validator-legacy")
+        \\records={name:e.supervised_binding(name)[0] for name in stages}
+        \\tampered=copy.deepcopy(records["adapter"]); tampered["supervisor"]["request"]["argv"][1]={"kind":"literal","value":"--arbitrary"}
+        \\records["tampered"]=e.rehash_supervised_binding(tampered)
+        \\sys.stdout.buffer.write(m.ci.canonical_json(records))
+    ;
+    const witness = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/tests/test_adapter.py" });
+    const response = try std.process.run(a, std.testing.io, .{
+        .argv = &.{ options.python_executable, "-B", "-c", script, witness },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(4096),
+    });
+    if (response.term != .exited or response.term.exited != 0)
+        std.debug.print("historical binding witness: {s}\n", .{response.stderr});
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, response.term);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, response.stdout, .{ .duplicate_field_behavior = .@"error" });
+    const values = parsed.object;
+    var verified: usize = 0;
+    for (values.keys(), values.values()) |name, value| {
+        const bytes = try fixtureCanonical(a, value);
+        if (std.mem.eql(u8, name, "tampered")) {
+            try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBinding(a, bytes, .adapter, .trusted_inner_zip));
+            continue;
+        }
+        const stage = std.meta.stringToEnum(controller.command_plan.Stage, name) orelse return error.UnexpectedStage;
+        const observed = try controller.accepted_run.validateCommandBinding(a, bytes, stage, .trusted_inner_zip);
+        try std.testing.expectEqual(stage, observed.stage);
+        if (stage == .adapter or stage == .@"local-boot-tool" or stage == .fixtures or controller.command_plan.isValidator(stage))
+            try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBinding(a, bytes, stage, .local_runtime));
+        verified += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 18), verified);
+}
+
+test "legacy handoff inspect command fixture matches Python strictness" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const script =
+        \\import copy, importlib.util, sys
+        \\s=importlib.util.spec_from_file_location("witness",sys.argv[1])
+        \\m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+        \\e=m.Evidence()
+        \\profile="tiny-aot-two-boot"
+        \\stage="handoff-inspect-legacy"
+        \\transport="producer_direct"
+        \\record,identities=e.supervised_binding(stage,profile=profile)
+        \\def check(record):
+        \\    m.ci.validate_supervised_command_binding(record,stage,identities,transport_context=transport,profile=profile)
+        \\check(record)
+        \\mutations={}
+        \\def refuse(name, changed, rehash=True):
+        \\    if rehash:
+        \\        e.rehash_supervised_binding(changed)
+        \\    try:
+        \\        check(changed)
+        \\    except m.ci.Refusal:
+        \\        mutations[name]=changed
+        \\    else:
+        \\        raise AssertionError(name+" admitted")
+        \\changed=copy.deepcopy(record)
+        \\changed["supervisor"]["request"]["retained_executables"]=[]
+        \\changed["supervisor"]["result"]["command"]["retained_executables"]=[]
+        \\refuse("retained-empty", changed)
+        \\changed=copy.deepcopy(record)
+        \\changed["sha256"]="0"*64
+        \\refuse("record-empty-sha", changed, rehash=False)
+        \\changed=copy.deepcopy(record)
+        \\changed["supervisor"]["result"]["command"]["output"]["combined_sha256"]="0"*64
+        \\refuse("output-empty-sha", changed)
+        \\changed=copy.deepcopy(record)
+        \\non_empty="1"*64
+        \\changed["sha256"]=non_empty
+        \\changed["supervisor"]["result"]["command"]["output"]["combined_sha256"]=non_empty
+        \\refuse("zero-bytes-non-empty-hash", changed)
+        \\changed=copy.deepcopy(record)
+        \\changed["supervisor"]["request"]["supervisor"]["identity"]["mode"]=65536
+        \\refuse("identity-mode-u16", changed)
+        \\sys.stdout.buffer.write(m.ci.canonical_json({"accepted":record,"mutations":mutations}))
+    ;
+    const witness = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/tests/test_adapter.py" });
+    const response = try std.process.run(a, std.testing.io, .{
+        .argv = &.{ options.python_executable, "-B", "-c", script, witness },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(2 * 1024 * 1024),
+        .stderr_limit = .limited(4096),
+    });
+    if (response.term != .exited or response.term.exited != 0)
+        std.debug.print("v1 command witness: {s}\n", .{response.stderr});
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, response.term);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, response.stdout, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false });
+    defer parsed.deinit();
+    const accepted = try fixtureField(parsed.value, "accepted");
+    const mutations = try fixtureField(parsed.value, "mutations");
+    const checked = try controller.command_validation.validateLegacyV1(
+        a,
+        accepted,
+        .@"handoff-inspect-legacy",
+        .local_runtime,
+    );
+    try std.testing.expectEqual(controller.command_plan.Stage.@"handoff-inspect-legacy", checked.stage);
+    var refused_count: usize = 0;
+    for (mutations.object.values()) |record| {
+        try std.testing.expectError(error.InvalidCommand, controller.command_validation.validateLegacyV1(
+            a,
+            record,
+            .@"handoff-inspect-legacy",
+            .local_runtime,
+        ));
+        refused_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 5), refused_count);
+    try std.testing.expectError(error.InvalidCommand, controller.command_validation.validateLegacyV1(
+        a,
+        accepted,
+        .@"handoff-inspect",
+        .local_runtime,
+    ));
+    try std.testing.expectError(error.InvalidCommand, controller.command_validation.validateLegacyV1(
+        a,
+        accepted,
+        .@"handoff-inspect-legacy",
+        .trusted_inner_zip,
+    ));
+}
+
+fn fixtureField(value: std.json.Value, name: []const u8) !std.json.Value {
+    if (value != .object) return error.InvalidFixture;
+    return value.object.get(name) orelse error.InvalidFixture;
+}
+
+fn canonicalJsonValue(a: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    return controller.records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, value, .{}));
+}
+
+fn writeCanonicalValue(io: std.Io, dir: std.Io.Dir, name: []const u8, a: std.mem.Allocator, value: std.json.Value) ![]const u8 {
+    const raw = try canonicalJsonValue(a, value);
+    try writeFixtureFile(io, dir, name, raw);
+    return raw;
+}
+
+fn expectInvalidLocalPostRun(
+    accepted: *controller.accepted_run.AcceptedRun,
+    raw: []const u8,
+    stage: controller.command_plan.Stage,
+) !void {
+    _ = controller.accepted_run.validateLocalPostRunCommand(accepted, raw, stage) catch |err| switch (err) {
+        error.InvalidContext, error.InvalidCommand, error.InvalidCommandIdentity => return,
+        else => return err,
+    };
+    return error.InvalidRouteAccepted;
+}
+
+fn expectInvalidHandoffRun(
+    a: std.mem.Allocator,
+    io: std.Io,
+    accepted: *controller.accepted_run.AcceptedRun,
+    output: []const u8,
+    legacy: bool,
+) !void {
+    _ = controller.handoff_inspect.run(a, io, accepted, output, legacy, null) catch |err| switch (err) {
+        error.InvalidContext, error.InvalidCommand, error.InvalidCommandIdentity => return,
+        else => return err,
+    };
+    return error.InvalidRouteAccepted;
+}
+
+fn legacyHandoffInspectLiveFixture() !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "legacy-handoff-inspect-{d}", .{std.os.linux.getpid()});
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("legacy handoff fixture cleanup failed");
+    const fixture_dir = try parent.openDir(io, name, .{ .iterate = true });
+    defer fixture_dir.close(io);
+    const root = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    const output_parent_name = try std.fmt.allocPrint(a, "{s}-outputs", .{name});
+    try parent.createDir(io, output_parent_name, .fromMode(0o700));
+    defer parent.deleteTree(io, output_parent_name) catch @panic("legacy handoff output cleanup failed");
+    const output_parent = try std.fs.path.join(a, &.{ options.fixture_root, output_parent_name });
+    const source = try std.fs.path.join(a, &.{ root, "source" });
+    const compute = try std.fs.path.join(a, &.{ root, "compute" });
+    try fixture_dir.createDir(io, "source", .fromMode(0o700));
+    try fixture_dir.createDir(io, "compute", .fromMode(0o700));
+    try fixture_dir.createDir(io, "bin", .fromMode(0o700));
+    try fixture_dir.createDir(io, "firmware", .fromMode(0o700));
+    const compute_root = try fixture_dir.openDir(io, "compute", .{ .iterate = true });
+    defer compute_root.close(io);
+    try compute_root.createDir(io, "evidence", .fromMode(0o700));
+    try compute_root.createDir(io, "package", .fromMode(0o700));
+    try compute_root.createDir(io, "tools", .fromMode(0o700));
+    try compute_root.createDir(io, "host-tools", .fromMode(0o700));
+    try compute_root.createDir(io, "supervisor", .fromMode(0o700));
+    const compute_tools = try compute_root.openDir(io, "tools", .{ .iterate = true });
+    defer compute_tools.close(io);
+    try compute_tools.createDir(io, "bin", .fromMode(0o700));
+    const compute_supervisor = try compute_root.openDir(io, "supervisor", .{ .iterate = true });
+    defer compute_supervisor.close(io);
+    try compute_supervisor.createDir(io, "bin", .fromMode(0o700));
+    try fixture_dir.createDirPath(io, "source/support/apps/wamr-aot/build/artifacts");
+    const source_build_path = try std.fs.path.join(a, &.{ source, "support/apps/wamr-aot/build" });
+    const source_artifacts_path = try std.fs.path.join(a, &.{ source, "support/apps/wamr-aot/build/artifacts" });
+    const source_app_path = try std.fs.path.join(a, &.{ source, "support/apps/wamr-aot" });
+    const package_path = try std.fs.path.join(a, &.{ compute, "package" });
+    const evidence_path = try std.fs.path.join(a, &.{ compute, "evidence" });
+    const tools_bin_path = try std.fs.path.join(a, &.{ compute, "tools/bin" });
+    const host_tools_path = try std.fs.path.join(a, &.{ compute, "host-tools" });
+    const supervisor_bin_path = try std.fs.path.join(a, &.{ compute, "supervisor/bin" });
+    const bin_path = try std.fs.path.join(a, &.{ root, "bin" });
+    const firmware_path = try std.fs.path.join(a, &.{ root, "firmware" });
+    const source_build = try std.Io.Dir.openDirAbsolute(io, source_build_path, .{ .iterate = true });
+    defer source_build.close(io);
+    const source_artifacts = try std.Io.Dir.openDirAbsolute(io, source_artifacts_path, .{ .iterate = true });
+    defer source_artifacts.close(io);
+    const source_app = try std.Io.Dir.openDirAbsolute(io, source_app_path, .{ .iterate = true });
+    defer source_app.close(io);
+    const compute_package = try std.Io.Dir.openDirAbsolute(io, package_path, .{ .iterate = true });
+    defer compute_package.close(io);
+    const evidence = try std.Io.Dir.openDirAbsolute(io, evidence_path, .{ .iterate = true });
+    defer evidence.close(io);
+    const tools_bin = try std.Io.Dir.openDirAbsolute(io, tools_bin_path, .{ .iterate = true });
+    defer tools_bin.close(io);
+    const host_tools_dir = try std.Io.Dir.openDirAbsolute(io, host_tools_path, .{ .iterate = true });
+    defer host_tools_dir.close(io);
+    const supervisor_bin = try std.Io.Dir.openDirAbsolute(io, supervisor_bin_path, .{ .iterate = true });
+    defer supervisor_bin.close(io);
+    const bin = try std.Io.Dir.openDirAbsolute(io, bin_path, .{ .iterate = true });
+    defer bin.close(io);
+    const firmware = try std.Io.Dir.openDirAbsolute(io, firmware_path, .{ .iterate = true });
+    defer firmware.close(io);
+
+    try writeFixtureFile(io, source_build, "wamr_hyperv-x86_64-efi", "efi");
+    try writeFixtureFile(io, source_build, "wamr_hyperv-x86_64-efi.dbg", "dbg");
+    try writeFixtureFile(io, source_build, "wamr_hyperv-x86_64-efi.bootinfo", "bootinfo");
+    try writeFixtureFile(io, source_artifacts, "libwamr-aot.a", "runtime");
+    try writeFixtureFile(io, source_artifacts, "wamrc", "compiler");
+    try writeFixtureFile(io, source_artifacts, "tiny.wasm", "wasm");
+    try writeFixtureFile(io, source_artifacts, "tiny.cwasm", "cwasm");
+    try writeFixtureFile(io, source_artifacts, "identity.json", "{}\n");
+    try writeFixtureFile(io, source_build, "image-identity.json", "{}\n");
+    try writeFixtureFile(io, source_app, ".config", "CONFIG_APP=y\n");
+    try writeFixtureFile(io, compute_package, "unikraft.raw", "raw");
+    try writeFixtureFile(io, compute_package, "unikraft.vhd", "vhd");
+    try writeFixtureFile(io, compute_package, "unikraft-derived.vhd", "vhd");
+    try writeFixtureFile(io, firmware, "code.fd", "code");
+    try writeFixtureFile(io, firmware, "vars.fd", "vars");
+    const package_value = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"image\":{\"efi\":{\"size\":3}},\"producer_sha256\":\"fixture\"}", .{});
+    const package_json = try writeCanonicalValue(io, evidence, "package.json", a, package_value);
+
+    const executable = try std.fs.path.resolve(a, &.{ options.repository_root, options.command_fixture });
+    const bound_tool = try std.Io.Dir.realPathFileAbsoluteAlloc(io, "/usr/bin/true", a);
+    try copyFixtureExecutable(io, a, executable, tools_bin, "wamr-ci-package");
+    var host_tool_paths: [controller.input_custody.host_tools.len][]const u8 = undefined;
+    for (controller.input_custody.host_tools, 0..) |tool, i| {
+        try copyFixtureExecutable(io, a, bound_tool, host_tools_dir, tool);
+        host_tool_paths[i] = try std.fs.path.join(a, &.{ compute, "host-tools", tool });
+    }
+    try copyFixtureExecutable(io, a, bound_tool, supervisor_bin, "wamr-ci-supervisor");
+    try copyFixtureExecutable(io, a, bound_tool, bin, "qemu-system-x86_64");
+    const package_tool = try std.fs.path.join(a, &.{ compute, "tools/bin/wamr-ci-package" });
+    const supervisor = try std.fs.path.join(a, &.{ compute, "supervisor/bin/wamr-ci-supervisor" });
+    const efi = try std.fs.path.join(a, &.{ source, "support/apps/wamr-aot/build/wamr_hyperv-x86_64-efi" });
+    const qemu = try std.fs.path.join(a, &.{ root, "bin/qemu-system-x86_64" });
+    const ovmf_code = try std.fs.path.join(a, &.{ root, "firmware/code.fd" });
+    const ovmf_vars = try std.fs.path.join(a, &.{ root, "firmware/vars.fd" });
+
+    for (controller.profile.modes(.tiny_v1_legacy)) |mode| {
+        const boot_name = try std.fmt.allocPrint(a, "boot-{s}", .{@tagName(mode)});
+        try compute_root.createDir(io, boot_name, .fromMode(0o700));
+        const boot_dir = try compute_root.openDir(io, boot_name, .{ .iterate = true });
+        defer boot_dir.close(io);
+        try writeFixtureFile(io, boot_dir, "hyperv-efi-boot.log", "serial\n");
+        try writeFixtureFile(io, boot_dir, "request.json", "{}\n");
+        try writeFixtureFile(io, boot_dir, "report.json", "{}\n");
+        const compute_name = try std.fmt.allocPrint(a, "{s}-compute.json", .{@tagName(mode)});
+        const compute_value = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"accepted\":true}", .{});
+        _ = try writeCanonicalValue(io, evidence, compute_name, a, compute_value);
+    }
+
+    var start_bindings: [controller.input_custody.host_tools.len + 1]controller.input_custody.Binding = undefined;
+    for (controller.input_custody.host_tools, 0..) |tool, i|
+        start_bindings[i] = .{ .role = try std.fmt.allocPrint(a, "tool:{s}", .{tool}), .path = host_tool_paths[i] };
+    start_bindings[controller.input_custody.host_tools.len] = .{ .role = "command-supervisor", .path = supervisor };
+    var start_custody = try controller.input_custody.capture(a, io, &start_bindings, &.{});
+    defer start_custody.deinit(a);
+    const start_custody_raw = try start_custody.canonical(a);
+    const consumer_inputs = try std.json.parseFromSliceLeaky(std.json.Value, a, start_custody_raw, .{ .parse_numbers = false });
+    const legacy_source = .{
+        .revision = "993e4d0d394c08202c0d0c57ea97450a19a4f394",
+        .tree = "54f8e118146c78c24e7c802657c6ec62b268a5de",
+    };
+    var start = std.json.Value{ .object = .empty };
+    try start.object.put(a, "source", try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, legacy_source, .{}), .{}));
+    try start.object.put(a, "consumer_inputs", consumer_inputs);
+    _ = try writeCanonicalValue(io, evidence, "build-start.json", a, start);
+
+    var build = std.json.Value{ .object = .empty };
+    try build.object.put(a, "source", try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, legacy_source, .{}), .{}));
+    _ = try writeCanonicalValue(io, evidence, "build.json", a, build);
+
+    const boot_bindings = [_]controller.input_custody.Binding{
+        .{ .role = "package_tool", .path = package_tool },
+        .{ .role = "local_boot_tool", .path = bound_tool },
+        .{ .role = "qemu", .path = qemu },
+        .{ .role = "ovmf_code", .path = ovmf_code },
+        .{ .role = "ovmf_vars", .path = ovmf_vars },
+        .{ .role = "efi", .path = efi },
+    };
+    var boot_custody = try controller.input_custody.capture(a, io, &boot_bindings, &.{});
+    defer boot_custody.deinit(a);
+    const boot_custody_raw = try boot_custody.canonical(a);
+    const boot_inputs = try std.json.parseFromSliceLeaky(std.json.Value, a, boot_custody_raw, .{ .parse_numbers = false });
+    _ = try writeCanonicalValue(io, evidence, "boot-inputs.json", a, boot_inputs);
+
+    var records_map = std.json.Value{ .object = .empty };
+    for ([_][]const u8{
+        "build-start.json",
+        "build.json",
+        "boot-inputs.json",
+        "package.json",
+        "raw-x2apic-compute.json",
+        "raw-legacy-apic-compute.json",
+        "vpc-x2apic-compute.json",
+        "vpc-legacy-apic-compute.json",
+    }) |record_name| {
+        const path = try std.fs.path.join(a, &.{ compute, "evidence", record_name });
+        const observed = try controller.custody_files.readFile(io, path, controller.records.max_record_bytes, true);
+        try records_map.object.put(a, record_name, .{ .string = try a.dupe(u8, &observed.sha256) });
+    }
+    var result = std.json.Value{ .object = .empty };
+    try result.object.put(a, "schema_version", .{ .integer = 1 });
+    try result.object.put(a, "scope", .{ .string = "local_native_compute_only" });
+    try result.object.put(a, "passed", .{ .bool = true });
+    try result.object.put(a, "hardware_acceptance", .{ .string = "not_established" });
+    try result.object.put(a, "cloud_authority", .{ .string = "not_admitted" });
+    try result.object.put(a, "benchmark", .{ .string = "not_measured" });
+    try result.object.put(a, "workload", .{ .string = "tiny" });
+    var modes = std.json.Value{ .array = std.array_list.Managed(std.json.Value).init(a) };
+    for (controller.profile.modes(.tiny_v1_legacy)) |mode|
+        try modes.array.append(.{ .string = @tagName(mode) });
+    try result.object.put(a, "modes", modes);
+    try result.object.put(a, "records", records_map);
+    _ = try writeCanonicalValue(io, evidence, "result.json", a, result);
+
+    const runtime_dir = try controller.layout.runtime(io, root);
+    defer runtime_dir.close(io);
+    var accepted = try controller.accepted_run.openAndValidateForHandoffInspectWithSignal(
+        a,
+        io,
+        std.process.Environ.empty,
+        &runtime_dir,
+        root,
+        source,
+        null,
+    );
+    defer accepted.deinit();
+    try std.testing.expectEqual(controller.profile.CompatibleRecordSet.tiny_v1_legacy, accepted.compatibility);
+    try expectInvalidHandoffRun(a, io, &accepted, try std.fs.path.join(a, &.{ output_parent, "wrong-v1-output" }), false);
+    const output = try std.fs.path.join(a, &.{ output_parent, "legacy-output" });
+    const checked = try controller.handoff_inspect.run(a, io, &accepted, output, true, null);
+    try std.testing.expectEqual(controller.command_plan.Stage.@"handoff-inspect-legacy", checked.stage);
+    try std.testing.expectEqual(@as(u64, package_json.len), checked.output_bytes);
+    const record_path = try std.fs.path.join(a, &.{ output, "evidence/command-handoff-inspect-legacy.json" });
+    const record = try controller.custody_files.readFile(io, record_path, controller.records.max_record_bytes, true);
+    const raw = try a.alloc(u8, @intCast(record.bytes));
+    const record_file = try std.Io.Dir.openFileAbsolute(io, record_path, .{ .follow_symlinks = false });
+    defer record_file.close(io);
+    try std.testing.expectEqual(raw.len, try record_file.readPositionalAll(io, raw, 0));
+    try expectInvalidLocalPostRun(&accepted, raw, .@"handoff-inspect");
+    var mutated = try std.json.parseFromSlice(std.json.Value, a, raw, .{ .duplicate_field_behavior = .@"error", .parse_numbers = false });
+    defer mutated.deinit();
+    mutated.value.object.getPtr("sha256").?.* = .{ .string = "0000000000000000000000000000000000000000000000000000000000000000" };
+    const mutated_raw = try canonicalJsonValue(a, mutated.value);
+    try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateLocalPostRunCommand(&accepted, mutated_raw, .@"handoff-inspect-legacy"));
+
+    var wrong = accepted;
+    wrong.compatibility = .tiny_v2_qcow2_derived_vhd;
+    try expectInvalidHandoffRun(a, io, &wrong, try std.fs.path.join(a, &.{ output_parent, "wrong-v2-output" }), true);
+    try expectInvalidLocalPostRun(&wrong, raw, .@"handoff-inspect-legacy");
 }
 
 fn fixture(allocator: std.mem.Allocator, v2: bool, commands: bool) ![]u8 {
@@ -728,6 +2485,654 @@ fn fixture(allocator: std.mem.Allocator, v2: bool, commands: bool) ![]u8 {
     }
     try w.writeAll("}}");
     return writer.toOwnedSlice();
+}
+
+test "python-produced local runtimes stay outside records and validator-build acceptance" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "python-produced-policy-{d}", .{std.os.linux.getpid()});
+    defer a.free(name);
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("python producer policy fixture cleanup failed");
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    try root.createDir(io, "compute", .fromMode(0o700));
+    const compute = try root.openDir(io, "compute", .{ .iterate = true });
+    defer compute.close(io);
+    try compute.createDir(io, "evidence", .fromMode(0o700));
+    const local = try compute.openDir(io, "evidence", .{ .iterate = true });
+    defer local.close(io);
+    const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    defer a.free(path);
+    const supervisor_path = try std.fs.path.join(a, &.{ path, "compute/supervisor/bin/wamr-ci-supervisor" });
+    defer a.free(supervisor_path);
+    const source = .{
+        .revision = "1111111111111111111111111111111111111111",
+        .tree = "2222222222222222222222222222222222222222",
+    };
+    const start_raw = try controller.records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, .{
+        .source = source,
+        .consumer_inputs = .{ .files = .{
+            .@"command-supervisor" = .{ .path = supervisor_path },
+        } },
+    }, .{}));
+    defer a.free(start_raw);
+    const build_raw = try controller.records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, .{ .source = source }, .{}));
+    defer a.free(build_raw);
+    const fixture_raw = try fixture(a, true, true);
+    defer a.free(fixture_raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, fixture_raw, .{
+        .duplicate_field_behavior = .@"error",
+        .parse_numbers = false,
+    });
+    defer parsed.deinit();
+    const start_digest = std.fmt.bytesToHex(controller.records.fileIdentity(start_raw), .lower);
+    const build_digest = std.fmt.bytesToHex(controller.records.fileIdentity(build_raw), .lower);
+    parsed.value.object.getPtr("records").?.object.getPtr("build-start.json").?.* = .{ .string = start_digest[0..] };
+    parsed.value.object.getPtr("records").?.object.getPtr("build.json").?.* = .{ .string = build_digest[0..] };
+    const result_raw = try controller.records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, parsed.value, .{}));
+    defer a.free(result_raw);
+    try writeFixtureFile(io, local, "result.json", result_raw);
+    for (parsed.value.object.get("records").?.object.keys()) |record| {
+        if (std.mem.eql(u8, record, "build-start.json")) {
+            try writeFixtureFile(io, local, record, start_raw);
+        } else if (std.mem.eql(u8, record, "build.json")) {
+            try writeFixtureFile(io, local, record, build_raw);
+        } else {
+            try writeFixtureFile(io, local, record, "{}\n");
+        }
+    }
+    const directory = try core.private_files.Directory.open(io, path);
+    defer directory.close(io);
+    try std.testing.expectError(error.UnsupportedLocalProducer, controller.accepted_run.openAndValidate(
+        a,
+        io,
+        std.process.Environ.empty,
+        &directory,
+        path,
+        options.repository_root,
+    ));
+    const local_refusal = try std.process.run(a, io, .{
+        .argv = &.{ options.host_controller_cli, "records", "--runtime", path, "--output", "handoff-v1" },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(256),
+        .stderr_limit = .limited(4096),
+    });
+    defer a.free(local_refusal.stdout);
+    defer a.free(local_refusal.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, local_refusal.term);
+    try std.testing.expectEqualStrings("", local_refusal.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, local_refusal.stderr, "cause: UnsupportedLocalProducer") != null);
+    const validation_path = try std.fs.path.join(a, &.{ path, "validator" });
+    defer a.free(validation_path);
+    const validator_build = try std.process.run(a, io, .{
+        .argv = &.{ options.host_controller_cli, "public-validator-build", "--runtime", path, "--output", validation_path },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(256),
+        .stderr_limit = .limited(4096),
+    });
+    defer a.free(validator_build.stdout);
+    defer a.free(validator_build.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, validator_build.term);
+    try std.testing.expectEqualStrings("", validator_build.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, validator_build.stderr, "cause: UnsupportedLocalProducer") != null);
+    try std.testing.expectError(error.FileNotFound, root.openDir(io, "validator", .{}));
+}
+
+test "accepted run requires complete local and trusted-inner-zip evidence before handoff" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "accepted-records-{d}", .{std.os.linux.getpid()});
+    defer a.free(name);
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("accepted records fixture cleanup failed");
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    try root.createDir(io, "compute", .fromMode(0o700));
+    try root.createDir(io, "artifacts", .fromMode(0o700));
+    try root.createDir(io, "evidence", .fromMode(0o700));
+    const compute = try root.openDir(io, "compute", .{ .iterate = true });
+    defer compute.close(io);
+    try compute.createDir(io, "evidence", .fromMode(0o700));
+    const local = try compute.openDir(io, "evidence", .{ .iterate = true });
+    defer local.close(io);
+    const imported = try root.openDir(io, "evidence", .{ .iterate = true });
+    defer imported.close(io);
+    const artifacts = try root.openDir(io, "artifacts", .{ .iterate = true });
+    defer artifacts.close(io);
+    const unencoded = try fixture(a, true, true);
+    defer a.free(unencoded);
+    const accepted = try controller.records.canonicalAlloc(a, unencoded);
+    defer a.free(accepted);
+    try writeFixtureFile(io, local, "result.json", accepted);
+    try writeFixtureFile(io, artifacts, "local_result", accepted);
+    const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    defer a.free(path);
+    const directory = try core.private_files.Directory.open(io, path);
+    defer directory.close(io);
+    {
+        var signal = try controller.build_pipeline.installCancellation();
+        defer signal.deinit();
+        var local_view = controller.accepted_run.AcceptedRun{
+            .arena = std.heap.ArenaAllocator.init(a),
+            .io = io,
+            .context = .local_runtime,
+            .compatibility = .tiny_v2_qcow2_derived_vhd,
+            .production_profile = null,
+            .source = undefined,
+            .result = undefined,
+            .records = &.{},
+            .artifacts = &.{},
+            .runtime_inputs = &.{},
+            .root = path,
+            .repository = options.repository_root,
+            .environ = std.process.Environ.empty,
+        };
+        defer local_view.deinit();
+        try std.testing.expectError(error.FileNotFound, local_view.revalidateWithSignal(&signal));
+        try std.testing.expectError(error.MissingEvidence, controller.accepted_run.openAndValidateWithSignal(
+            a,
+            io,
+            undefined,
+            &directory,
+            path,
+            options.repository_root,
+            &signal,
+        ));
+    }
+    try std.testing.expectError(error.MissingEvidence, controller.accepted_run.openImportedStage(a, io, &directory, path));
+    try std.testing.expectError(error.MissingEvidence, controller.accepted_run.openAndValidate(a, io, undefined, &directory, path, options.repository_root));
+    const local_refusal = try std.process.run(a, io, .{
+        .argv = &.{ options.host_controller_cli, "records", "--runtime", path, "--output", "handoff-v1" },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(256),
+        .stderr_limit = .limited(4096),
+    });
+    defer a.free(local_refusal.stdout);
+    defer a.free(local_refusal.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, local_refusal.term);
+    try std.testing.expectEqualStrings("", local_refusal.stdout);
+    const inspection_path = try std.fs.path.join(a, &.{ path, "inspection" });
+    defer a.free(inspection_path);
+    const inspection = try std.process.run(a, io, .{
+        .argv = &.{ options.host_controller_cli, "handoff-inspect", "--runtime", path, "--output", inspection_path },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(256),
+        .stderr_limit = .limited(4096),
+    });
+    defer a.free(inspection.stdout);
+    defer a.free(inspection.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, inspection.term);
+    try std.testing.expectEqualStrings("", inspection.stdout);
+    try std.testing.expectError(error.FileNotFound, root.openDir(io, "inspection", .{}));
+    const validation_path = try std.fs.path.join(a, &.{ path, "validator" });
+    defer a.free(validation_path);
+    const validator_build = try std.process.run(a, io, .{
+        .argv = &.{ options.host_controller_cli, "public-validator-build", "--runtime", path, "--output", validation_path },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(256),
+        .stderr_limit = .limited(4096),
+    });
+    defer a.free(validator_build.stdout);
+    defer a.free(validator_build.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, validator_build.term);
+    try std.testing.expectEqualStrings("", validator_build.stdout);
+    try std.testing.expectError(error.FileNotFound, root.openDir(io, "validator", .{}));
+
+    var parsed = try controller.records.parseCanonicalResult(a, accepted);
+    defer parsed.deinit();
+    for (parsed.value.records.keys()) |record| {
+        try writeFixtureFile(io, local, record, "{}\n");
+        try writeFixtureFile(io, imported, record, "{}\n");
+    }
+    try std.testing.expectError(error.InvalidEvidence, controller.accepted_run.openImportedStage(a, io, &directory, path));
+    try std.testing.expectError(error.InvalidEvidence, controller.accepted_run.openAndValidate(a, io, undefined, &directory, path, options.repository_root));
+    const changed = try imported.openFile(io, "build.json", .{ .mode = .read_write, .follow_symlinks = false });
+    try changed.setLength(io, 0);
+    try changed.writePositionalAll(io, "{\"forged\":true}\n", 0);
+    changed.close(io);
+    try std.testing.expectError(error.RecordChanged, controller.accepted_run.openImportedStage(a, io, &directory, path));
+}
+
+test "handoff document has a fixed canonical shape and finite output limit" {
+    const a = std.testing.allocator;
+    var view = controller.accepted_run.AcceptedRun{
+        .arena = std.heap.ArenaAllocator.init(a),
+        .io = std.testing.io,
+        .context = .trusted_inner_zip,
+        .compatibility = .tiny_v1_legacy,
+        .production_profile = null,
+        .source = .{ .revision = "993e4d0d394c08202c0d0c57ea97450a19a4f394", .tree = "54f8e118146c78c24e7c802657c6ec62b268a5de" },
+        .result = .{ .relative_path = "artifacts/local_result", .bytes = 1, .sha256 = [_]u8{'a'} ** 64 },
+        .records = &.{},
+        .artifacts = &.{},
+        .runtime_inputs = &.{},
+        .root = "/fixture",
+        .repository = null,
+        .environ = null,
+    };
+    defer view.deinit();
+    const raw = try view.handoffV1();
+    var document = try core.contracts.Document.parse(a, raw, .{});
+    defer document.deinit();
+    try document.requireCanonical(a, raw);
+    _ = try core.contracts.exactFields(document.value(), &.{
+        "schema",         "schema_version", "context", "compatibility", "profile",
+        "source",         "modes",          "result",  "records",       "artifacts",
+        "runtime_inputs",
+    });
+    try std.testing.expectEqualStrings("trusted-inner-zip", document.value().object.get("context").?.string);
+    try std.testing.expectEqual(@as(usize, 4), document.value().object.get("modes").?.array.items.len);
+    const result = document.value().object.get("result").?;
+    try std.testing.expect(result.object.get("sha256").? == .string);
+    const oversized = try view.arena.allocator().alloc(u8, 2 * 1024 * 1024);
+    @memset(oversized, 'a');
+    view.source.revision = oversized;
+    try std.testing.expectError(error.HandoffTooLarge, view.handoffV1());
+}
+
+fn fixtureCanonical(a: std.mem.Allocator, value: anytype) ![]const u8 {
+    return controller.records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, value, .{}));
+}
+
+fn fixtureMember(
+    a: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    members: *std.json.Value,
+    path: []const u8,
+    bytes: []const u8,
+) !std.json.Value {
+    try writeFixtureFile(io, dir, path, bytes);
+    const sha256 = try a.dupe(u8, &std.fmt.bytesToHex(controller.records.fileIdentity(bytes), .lower));
+    const size: u64 = @intCast(bytes.len);
+    try members.object.put(a, path, try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{
+        .size = size,
+        .sha256 = sha256,
+    }, .{}), .{}));
+    return std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{
+        .path = path,
+        .size = size,
+        .sha256 = sha256,
+    }, .{}), .{});
+}
+
+fn fixtureItem(a: std.mem.Allocator, members: std.json.Value, path: []const u8) !std.json.Value {
+    const member = members.object.get(path) orelse return error.MissingFixture;
+    return std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{
+        .path = path,
+        .size = member.object.get("size").?,
+        .sha256 = member.object.get("sha256").?,
+    }, .{}), .{});
+}
+
+fn fixtureSparseImage(
+    a: std.mem.Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    root_path: []const u8,
+    members: *std.json.Value,
+    role: []const u8,
+    footer: ?*const [512]u8,
+) !std.json.Value {
+    const path = try std.fmt.allocPrint(a, "artifacts/{s}", .{role});
+    const file = try root.createFile(io, path, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    defer file.close(io);
+    const bytes: u64 = 66 * 1024 * 1024;
+    try file.setLength(io, bytes + @as(u64, if (footer == null) 0 else 512));
+    if (footer) |value| try file.writePositionalAll(io, value, bytes);
+    const recorded = try controller.custody_files.readFile(io, try std.fs.path.join(a, &.{ root_path, path }), bytes + 512, true);
+    const size = recorded.bytes;
+    const digest = try a.dupe(u8, &recorded.sha256);
+    try members.object.put(a, path, try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{
+        .size = size,
+        .sha256 = digest,
+    }, .{}), .{}));
+    return fixtureItem(a, members.*, path);
+}
+
+test "trusted historical inner stage accepts complete records and refuses tampered boot bytes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "accepted-import-v1-{d}", .{std.os.linux.getpid()});
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("import fixture cleanup failed");
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    for ([_][]const u8{ "artifacts", "evidence", "boots" }) |part|
+        try root.createDir(io, part, .fromMode(0o700));
+    for (controller.profile.legacy_modes) |mode|
+        try root.createDir(io, try std.fmt.allocPrint(a, "boots/{s}", .{@tagName(mode)}), .fromMode(0o700));
+    const stage_root_path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    var members = std.json.Value{ .object = .empty };
+    var record_hashes = std.json.Value{ .object = .empty };
+    const source = .{
+        .revision = "993e4d0d394c08202c0d0c57ea97450a19a4f394",
+        .tree = "54f8e118146c78c24e7c802657c6ec62b268a5de",
+    };
+    const wamr_revision = controller.custody_limits.wamr_revision;
+    for ([_][]const u8{
+        "efi",      "debug_elf", "bootinfo", "runtime",
+        "compiler", "wasm",      "cwasm",    "config",
+    }) |role| {
+        const artifact_path = try std.fmt.allocPrint(a, "artifacts/{s}", .{role});
+        _ = try fixtureMember(a, io, root, &members, artifact_path, role);
+    }
+    var footer = [_]u8{0} ** 512;
+    footer[0..8].* = "conectix".*;
+    std.mem.writeInt(u32, footer[8..12], 2, .big);
+    std.mem.writeInt(u32, footer[12..16], 0x10000, .big);
+    std.mem.writeInt(u64, footer[16..24], std.math.maxInt(u64), .big);
+    footer[28..32].* = "miz ".*;
+    std.mem.writeInt(u64, footer[40..48], 66 * 1024 * 1024, .big);
+    std.mem.writeInt(u64, footer[48..56], 66 * 1024 * 1024, .big);
+    std.mem.writeInt(u16, footer[56..58], 134, .big);
+    footer[58] = 16;
+    footer[59] = 63;
+    std.mem.writeInt(u32, footer[60..64], 2, .big);
+    footer[68] = 1;
+    var footer_sum: u32 = 0;
+    for (footer, 0..) |byte, index| if (index < 64 or index >= 68) {
+        footer_sum +%= byte;
+    };
+    std.mem.writeInt(u32, footer[64..68], ~footer_sum, .big);
+    const footer_hash = std.fmt.bytesToHex(controller.records.fileIdentity(&footer), .lower);
+    _ = try fixtureSparseImage(a, io, root, stage_root_path, &members, "raw", null);
+    _ = try fixtureSparseImage(a, io, root, stage_root_path, &members, "vhd", &footer);
+    const identity = .{
+        .wamr_revision = wamr_revision,
+        .minimal_wasi = false,
+        .files = .{
+            .@"tiny.wasm" = members.object.get("artifacts/wasm").?.object.get("sha256").?.string,
+            .@"tiny.cwasm" = members.object.get("artifacts/cwasm").?.object.get("sha256").?.string,
+            .@"libwamr-aot.a" = members.object.get("artifacts/runtime").?.object.get("sha256").?.string,
+            .wamrc = members.object.get("artifacts/compiler").?.object.get("sha256").?.string,
+        },
+    };
+    const identity_raw = try fixtureCanonical(a, identity);
+    _ = try fixtureMember(a, io, root, &members, "artifacts/runtime_identity", identity_raw);
+    const image = .{
+        .files = .{
+            .@"wamr_hyperv-x86_64-efi" = members.object.get("artifacts/efi").?.object.get("sha256").?.string,
+            .@"wamr_hyperv-x86_64-efi.dbg" = members.object.get("artifacts/debug_elf").?.object.get("sha256").?.string,
+            .@"wamr_hyperv-x86_64-efi.bootinfo" = members.object.get("artifacts/bootinfo").?.object.get("sha256").?.string,
+        },
+        .solved_config_sha256 = members.object.get("artifacts/config").?.object.get("sha256").?.string,
+        .runtime_inputs_sha256 = members.object.get("artifacts/runtime_identity").?.object.get("sha256").?.string,
+    };
+    const image_raw = try fixtureCanonical(a, image);
+    _ = try fixtureMember(a, io, root, &members, "artifacts/image_identity", image_raw);
+
+    const start = try fixtureCanonical(a, .{ .source = source });
+    const built = try fixtureCanonical(a, .{ .source = source, .runtime = identity, .image = image });
+    const empty_hash = std.fmt.bytesToHex(controller.records.fileIdentity(""), .lower);
+    const boot_inputs = try fixtureCanonical(a, .{
+        .package_tool = empty_hash,
+        .local_boot_tool = empty_hash,
+        .qemu = empty_hash,
+        .ovmf_code = empty_hash,
+        .ovmf_vars = empty_hash,
+    });
+    const package = try fixtureCanonical(a, .{
+        .scope = "public_local_compute_packaging_only",
+        .acceptance = "not_established",
+        .producer_sha256 = empty_hash,
+        .image = .{
+            .schema_version = @as(u8, 1),
+            .miz_revision = controller.custody_limits.miz_revision,
+            .efi = .{ .size = @as(u64, 3), .sha256 = image.files.@"wamr_hyperv-x86_64-efi" },
+            .raw = .{ .size = @as(u64, 66 * 1024 * 1024), .sha256 = members.object.get("artifacts/raw").?.object.get("sha256").?.string },
+            .vhd = .{ .size = @as(u64, 66 * 1024 * 1024 + 512), .sha256 = members.object.get("artifacts/vhd").?.object.get("sha256").?.string },
+            .footer_sha256 = footer_hash,
+            .packaging = .{
+                .architecture = "x86_64",
+                .@"boot-file-sha256" = image.files.@"wamr_hyperv-x86_64-efi",
+                .@"boot-path" = "EFI/BOOT/BOOTX64.EFI",
+                .contract = "miz.efi-application-image",
+                .@"esp-length" = 64 * 1024 * 1024,
+                .@"esp-offset" = 1024 * 1024,
+                .@"file-size" = 66 * 1024 * 1024 + 512,
+                .format = "vhd",
+                .generation = 2,
+                .@"schema-version" = 1,
+                .subformat = "fixed",
+                .valid = true,
+                .@"virtual-size" = 66 * 1024 * 1024,
+            },
+        },
+    });
+    for ([_]struct { name: []const u8, value: []const u8 }{
+        .{ .name = "build-start.json", .value = start },
+        .{ .name = "build.json", .value = built },
+        .{ .name = "boot-inputs.json", .value = boot_inputs },
+        .{ .name = "package.json", .value = package },
+    }) |item| {
+        const path = try std.fmt.allocPrint(a, "evidence/{s}", .{item.name});
+        const descriptor = try fixtureMember(a, io, root, &members, path, item.value);
+        try record_hashes.object.put(a, item.name, descriptor.object.get("sha256").?);
+        const role: []const u8 = if (std.mem.eql(u8, item.name, "build.json"))
+            "build"
+        else
+            item.name[0 .. item.name.len - ".json".len];
+        const copy_path = try std.fmt.allocPrint(a, "artifacts/{s}", .{if (std.mem.eql(u8, role, "build-start"))
+            "build_start"
+        else if (std.mem.eql(u8, role, "boot-inputs"))
+            "boot_inputs"
+        else
+            role});
+        _ = try fixtureMember(a, io, root, &members, copy_path, item.value);
+    }
+    for ([_][]const u8{
+        "adapter", "local-boot-tool", "fixtures",        "prepare",    "config",          "native-image",
+        "package", "raw-x2apic",      "raw-legacy-apic", "vpc-x2apic", "vpc-legacy-apic", "inspect",
+    }) |stage| {
+        const filename = try std.fmt.allocPrint(a, "command-{s}.json", .{stage});
+        const bytes = try fixtureCanonical(a, .{
+            .scope = "command_diagnostic_not_acceptance",
+            .stage = stage,
+            .exit_code = @as(u8, 0),
+            .bytes = @as(u8, 0),
+            .sha256 = empty_hash,
+            .over_limit = false,
+            .known_error_markers = &[_][]const u8{},
+        });
+        const path = try std.fmt.allocPrint(a, "evidence/{s}", .{filename});
+        const descriptor = try fixtureMember(a, io, root, &members, path, bytes);
+        try record_hashes.object.put(a, filename, descriptor.object.get("sha256").?);
+    }
+    var boots = std.json.Value{ .array = std.array_list.Managed(std.json.Value).init(a) };
+    const compute_json = try std.fmt.allocPrint(
+        a,
+        "{{\"version\":1,\"workload\":\"tiny\",\"wamr_revision\":\"{s}\",\"wasm_sha256\":\"{s}\",\"cwasm_sha256\":\"{s}\",\"runtime_sha256\":\"{s}\",\"platform_status\":0,\"checks\":2,\"answer\":42,\"terminal\":1,\"detail\":2,\"reserved_bytes\":0,\"frame_bytes\":0,\"accessible_bytes\":0,\"allocation_bytes\":0,\"system_page_table_bytes\":4096,\"error_name\":\"\"}}",
+        .{ wamr_revision, identity.files.@"tiny.wasm", identity.files.@"tiny.cwasm", identity.files.@"libwamr-aot.a" },
+    );
+    const compute_value = try std.json.parseFromSliceLeaky(std.json.Value, a, compute_json, .{});
+    for (controller.profile.legacy_modes) |mode| {
+        const mode_name = @tagName(mode);
+        const serial = try std.fmt.allocPrint(
+            a,
+            "Hyper-V Hv#1 hypercall page enabled\nHyper-V SynIC:\nPowered by\n{s}Calling main(0, 0)\nWAMR_NATIVE_COMPUTE={s}\nWAMR_NATIVE_AOT_OK answer=42 teardown=0\n[    1.000001] Info: [libukboot] main returned 0\n",
+            .{ if (mode.legacyApic()) "Using legacy xAPIC MMIO\n" else "", compute_json },
+        );
+        const serial_path = try std.fmt.allocPrint(a, "boots/{s}/serial", .{mode_name});
+        const serial_item = try fixtureMember(a, io, root, &members, serial_path, serial);
+        const image_role: []const u8 = if (std.mem.startsWith(u8, mode_name, "raw-")) "raw" else "vhd";
+        const image_pin = members.object.get(try std.fmt.allocPrint(a, "artifacts/{s}", .{image_role})).?;
+        const image_hash = try core.contracts.parseSha256(image_pin.object.get("sha256").?.string);
+        const empty_digest = try core.contracts.parseSha256(&empty_hash);
+        const pins = [_]struct { size: u64, sha256: [32]u8 }{
+            .{ .size = if (std.mem.eql(u8, image_role, "raw")) 66 * 1024 * 1024 else 66 * 1024 * 1024 + 512, .sha256 = image_hash },
+            .{ .size = 1, .sha256 = empty_digest },
+            .{ .size = 1, .sha256 = empty_digest },
+            .{ .size = 1, .sha256 = empty_digest },
+        };
+        const request = try fixtureCanonical(a, .{
+            .schema_version = @as(u8, 1),
+            .supervisor_pid = @as(u32, 1234),
+            .config = try controller.boot_pipeline.expectedModeConfig(
+                a,
+                mode,
+                if (std.mem.startsWith(u8, mode_name, "raw-"))
+                    "/d/wamr-ci/wamr-native-runtime/compute/package/unikraft.raw"
+                else
+                    "/d/wamr-ci/wamr-native-runtime/compute/package/unikraft.vhd",
+                "/d/wamr-ci/wamr-native-runtime/firmware/code.fd",
+                "/d/wamr-ci/wamr-native-runtime/firmware/vars.fd",
+                "/d/wamr-ci/wamr-native-runtime/bin/qemu-system-x86_64",
+                try std.fmt.allocPrint(a, "/d/wamr-ci/wamr-native-runtime/compute/boot-{s}", .{mode_name}),
+            ),
+            .pins = pins,
+        });
+        const report = try fixtureCanonical(a, .{
+            .scope = "public_local_qemu_only",
+            .acceptance = "not_established",
+            .schema_version = @as(u8, 1),
+            .passed = true,
+            .consumed = true,
+            .cleanup_complete = true,
+            .input_unchanged = true,
+            .serial_valid = true,
+            .serial_limit_reached = false,
+            .termination = .{ .exited = @as(u8, 0) },
+            .failures = .{ .primary = @as(?[]const u8, null), .cleanup = @as(?[]const u8, null), .recording = @as(?[]const u8, null) },
+            .serial_bytes = serial_item.object.get("size").?,
+            .serial_sha256 = serial_item.object.get("sha256").?,
+        });
+        const request_item = try fixtureMember(a, io, root, &members, try std.fmt.allocPrint(a, "boots/{s}/request", .{mode_name}), request);
+        const report_item = try fixtureMember(a, io, root, &members, try std.fmt.allocPrint(a, "boots/{s}/report", .{mode_name}), report);
+        const pins_value = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, pins, .{}), .{});
+        const report_value = try std.json.parseFromSliceLeaky(std.json.Value, a, report, .{});
+        const evidence = try fixtureCanonical(a, .{
+            .scope = "local_native_compute_only",
+            .report = report_value,
+            .input_pins = pins_value,
+            .request_sha256 = request_item.object.get("sha256").?,
+            .report_sha256 = report_item.object.get("sha256").?,
+            .compute = compute_value,
+        });
+        const filename = try std.fmt.allocPrint(a, "{s}-compute.json", .{mode_name});
+        const evidence_item = try fixtureMember(a, io, root, &members, try std.fmt.allocPrint(a, "evidence/{s}", .{filename}), evidence);
+        try record_hashes.object.put(a, filename, evidence_item.object.get("sha256").?);
+        const compute_item = try fixtureMember(a, io, root, &members, try std.fmt.allocPrint(a, "boots/{s}/compute", .{mode_name}), evidence);
+        const boot = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{
+            .mode = mode_name,
+            .serial = serial_item,
+            .request = request_item,
+            .report = report_item,
+            .compute = compute_item,
+        }, .{}), .{});
+        try boots.array.append(boot);
+    }
+    const result = try fixtureCanonical(a, .{
+        .schema_version = @as(u8, 1),
+        .scope = "local_native_compute_only",
+        .passed = true,
+        .hardware_acceptance = "not_established",
+        .cloud_authority = "not_admitted",
+        .benchmark = "not_measured",
+        .workload = "tiny",
+        .modes = &[_][]const u8{
+            "raw-x2apic", "raw-legacy-apic", "vpc-x2apic", "vpc-legacy-apic",
+        },
+        .records = record_hashes,
+    });
+    _ = try fixtureMember(a, io, root, &members, "artifacts/local_result", result);
+    const artifact_names = [_][]const u8{
+        "efi",         "debug_elf", "bootinfo",         "raw",            "vhd",          "runtime", "compiler", "wasm",
+        "cwasm",       "config",    "runtime_identity", "image_identity", "local_result", "package", "build",    "build_start",
+        "boot_inputs",
+    };
+    var artifacts = std.json.Value{ .array = std.array_list.Managed(std.json.Value).init(a) };
+    for (artifact_names) |role|
+        try artifacts.array.append(try fixtureItem(a, members, try std.fmt.allocPrint(a, "artifacts/{s}", .{role})));
+    var evidence = std.json.Value{ .array = std.array_list.Managed(std.json.Value).init(a) };
+    const sorted = try a.dupe([]const u8, record_hashes.object.keys());
+    std.mem.sort([]const u8, sorted, {}, struct {
+        fn less(_: void, first: []const u8, second: []const u8) bool {
+            return std.mem.lessThan(u8, first, second);
+        }
+    }.less);
+    for (sorted) |entry|
+        try evidence.array.append(try fixtureItem(a, members, try std.fmt.allocPrint(a, "evidence/{s}", .{entry})));
+    const context = .{
+        .repository = "cataggar/unikraft",
+        .run_id = "1",
+        .run_attempt = "1",
+        .source_revision = source.revision,
+        .source_tree = source.tree,
+        .wamr_revision = wamr_revision,
+    };
+    try writeFixtureFile(io, root, "portable-bundle.json", try fixtureCanonical(a, .{
+        .schema = "uk.wamr.local-image-handoff",
+        .version = @as(u8, 1),
+        .authority = "not_admitted",
+        .source_revision = source.revision,
+        .source_tree = source.tree,
+        .identity = .{
+            .wamr_revision = wamr_revision,
+            .wasm_sha256 = identity.files.@"tiny.wasm",
+            .cwasm_sha256 = identity.files.@"tiny.cwasm",
+            .runtime_sha256 = identity.files.@"libwamr-aot.a",
+            .compiler_sha256 = identity.files.wamrc,
+            .config_sha256 = image.solved_config_sha256,
+        },
+        .artifacts = artifacts,
+        .boots = boots,
+        .evidence = evidence,
+    }));
+    try writeFixtureFile(io, root, "public-source.json", try fixtureCanonical(a, .{
+        .schema = "uk.wamr.public-source-bundle",
+        .version = @as(u8, 1),
+        .authority = "not_admitted",
+        .source = context,
+        .members = members,
+    }));
+    const directory = try core.private_files.Directory.open(io, stage_root_path);
+    defer directory.close(io);
+    var accepted = try controller.accepted_run.openImportedStage(a, io, &directory, stage_root_path);
+    defer accepted.deinit();
+    try accepted.revalidate();
+    const handoff = try accepted.handoffV1();
+    try std.testing.expect(std.mem.indexOf(u8, handoff, "\"context\":\"trusted-inner-zip\"") != null);
+    try std.testing.expectEqual(@as(usize, 20), accepted.records.len);
+    const cli_success = try std.process.run(a, io, .{
+        .argv = &.{ options.host_controller_cli, "records", "--stage-root", stage_root_path, "--transport", "trusted-inner-zip", "--output", "handoff-v1" },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(2 * 1024 * 1024),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, cli_success.term);
+    try std.testing.expectEqualStrings(handoff, cli_success.stdout);
+    try root.createDir(io, "boots/unexpected", .fromMode(0o700));
+    try std.testing.expectError(error.InvalidImportedBundle, accepted.revalidate());
+    try root.deleteDir(io, "boots/unexpected");
+    try writeFixtureFile(io, root, "evidence/extra.json", "{}\n");
+    try std.testing.expectError(error.UnexpectedImportedFile, accepted.revalidate());
+    try root.deleteFile(io, "evidence/extra.json");
+    const serial_path = try std.fmt.allocPrint(a, "boots/{s}/serial", .{@tagName(controller.profile.legacy_modes[0])});
+    const changed = try root.openFile(io, serial_path, .{ .mode = .read_write, .follow_symlinks = false });
+    try changed.writePositionalAll(io, "!", 0);
+    changed.close(io);
+    try std.testing.expectError(error.EvidenceChanged, accepted.revalidate());
+    try std.testing.expectError(error.BootChanged, accepted.pinBoot(.@"raw-x2apic", .serial));
+    const cli_refusal = try std.process.run(a, io, .{
+        .argv = &.{ options.host_controller_cli, "records", "--stage-root", stage_root_path, "--transport", "trusted-inner-zip", "--output", "handoff-v1" },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(256),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, cli_refusal.term);
+    try std.testing.expectEqualStrings("", cli_refusal.stdout);
 }
 
 test "v1 and v2 frozen result evidence sets reject rehashed fields" {
@@ -839,6 +3244,43 @@ test "embedded tracked source closure and physical/no-follow checks" {
     try std.testing.expectError(error.FileNotFound, source.verifyPhysical(std.testing.io, std.testing.allocator, "/d/does-not-exist-controller"));
 }
 
+test "recaptured source custody compares content, not allocated string addresses" {
+    const allocator = std.testing.allocator;
+    const source = controller.source_custody;
+    const before: source.Source = .{
+        .revision = "revision",
+        .tree = "tree",
+        .custody = .{
+            .object_format = "sha1",
+            .files = 4,
+            .directories = 2,
+            .bytes = 128,
+            .content_sha256 = [_]u8{'a'} ** 64,
+            .physical_sha256 = [_]u8{'b'} ** 64,
+        },
+    };
+    const revision = try allocator.dupe(u8, before.revision);
+    defer allocator.free(revision);
+    const tree = try allocator.dupe(u8, before.tree);
+    defer allocator.free(tree);
+    const format = try allocator.dupe(u8, before.custody.object_format);
+    defer allocator.free(format);
+    var actual = before;
+    actual.revision = revision;
+    actual.tree = tree;
+    actual.custody.object_format = format;
+    try std.testing.expect(before.same(actual));
+
+    actual.custody.physical_sha256[0] = 'c';
+    try std.testing.expect(!before.same(actual));
+    actual.custody = before.custody;
+    actual.custody.object_format = "sha256";
+    try std.testing.expect(!before.same(actual));
+    actual.custody = before.custody;
+    actual.custody.role_excluded_outputs[0] = "unexpected";
+    try std.testing.expect(!before.same(actual));
+}
+
 test "frozen custody limits, component-bound roles and first excess" {
     const l = controller.custody_limits;
     try std.testing.expectEqual(@as(usize, 40_000), l.tracked_entries);
@@ -903,9 +3345,29 @@ fn writeFixtureFile(io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: []cons
     try file.writePositionalAll(io, bytes, 0);
 }
 
+fn copyFixtureExecutable(io: std.Io, a: std.mem.Allocator, path: []const u8, dir: std.Io.Dir, name: []const u8) !void {
+    const source = try std.Io.Dir.openFileAbsolute(io, path, .{ .follow_symlinks = false });
+    defer source.close(io);
+    const size: usize = @intCast((try core.private_files.snapshot(source)).size);
+    if (size == 0 or size > 64 * 1024 * 1024) return error.TestFixtureTooLarge;
+    const bytes = try a.alloc(u8, size);
+    defer a.free(bytes);
+    if (try source.readPositionalAll(io, bytes, 0) != size) return error.TestFixtureChanged;
+    const target = try dir.createFile(io, name, .{ .exclusive = true, .permissions = .fromMode(0o700) });
+    defer target.close(io);
+    try target.writePositionalAll(io, bytes, 0);
+    try target.sync(io);
+}
+
 fn fixtureGit(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []const u8) !void {
+    const command = try allocator.alloc([]const u8, argv.len + 4);
+    defer allocator.free(command);
+    command[0] = argv[0];
+    const git_config = [_][]const u8{ "-c", "gc.auto=0", "-c", "maintenance.auto=false" };
+    @memcpy(command[1..5], &git_config);
+    @memcpy(command[5..], argv[1..]);
     const result = std.process.run(allocator, std.testing.io, .{
-        .argv = argv,
+        .argv = command,
         .cwd = .{ .path = cwd },
         .stdout_limit = .limited(4096),
         .stderr_limit = .limited(4096),
@@ -989,7 +3451,7 @@ test "native clean Git custody, stable physical identities and pinned archive re
     const exact_version = try controller.source_custody.gitOutput(allocator, io, path, options.git_executable, &.{"version"}, version.len, null);
     defer allocator.free(exact_version);
     try std.testing.expectEqualStrings(version, exact_version);
-    try std.testing.expectError(error.GitRefused, controller.source_custody.gitOutput(
+    try std.testing.expectError(error.GitOutputOverflow, controller.source_custody.gitOutput(
         allocator,
         io,
         path,
@@ -1012,6 +3474,25 @@ test "native clean Git custody, stable physical identities and pinned archive re
         allocator.free(captured.custody.object_format);
     }
     try std.testing.expectEqual(@as(usize, 4), captured.custody.files);
+    var signal = try controller.build_pipeline.installCancellation();
+    defer signal.deinit();
+    var empty: [0]u8 = .{};
+    var no_growth = std.heap.FixedBufferAllocator.init(&empty);
+    var context: controller.build_pipeline.Context = .{
+        .allocator = no_growth.allocator(),
+        .io = io,
+        .environ = undefined,
+        .runtime = path,
+        .repository = path,
+        .wamr = "",
+        .compute = path,
+        .git = options.git_executable,
+        .tools = undefined,
+        .roots = undefined,
+        .signal = &signal,
+        .source = captured,
+    };
+    for (0..3) |_| try controller.build_pipeline.requireSource(&context);
     const unchanged = try controller.source_custody.source(allocator, io, path, options.git_executable);
     defer {
         allocator.free(unchanged.revision);
@@ -1051,7 +3532,7 @@ test "native clean Git custody, stable physical identities and pinned archive re
     try limited_dir.createDir(io, "custody", .fromMode(0o700));
     const limited_path = try std.fs.path.join(allocator, &.{ path, ".d/runtime-limited" });
     defer allocator.free(limited_path);
-    try std.testing.expectError(error.GitRefused, controller.source_custody.Fixture.sealLimited(
+    if (controller.source_custody.Fixture.sealLimited(
         allocator,
         io,
         path,
@@ -1059,7 +3540,7 @@ test "native clean Git custody, stable physical identities and pinned archive re
         options.git_executable,
         captured.revision,
         1024,
-    ));
+    )) |_| return error.OversizedArchiveAccepted else |err| try std.testing.expect(err == error.GitExited or err == error.GitOutputOverflow);
     const limited_archive = try std.fs.path.join(allocator, &.{ limited_path, "custody/wamr-source.tar" });
     defer allocator.free(limited_archive);
     try std.testing.expect((try controller.custody_files.readFile(io, limited_archive, 1024, true)).bytes <= 1024);
@@ -1528,6 +4009,52 @@ test "direct shared supervisor retains bounded native success and failure eviden
     try directSharedSupervisorFixtures();
 }
 
+test "accepted build records replay at the 4 MiB boundary, not the tracked-file limit" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "build-record-replay-{d}", .{std.os.linux.getpid()});
+    defer a.free(name);
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("build record fixture cleanup failed");
+    const work = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    defer a.free(work);
+    const slot = try parent.openDir(io, name, .{ .iterate = true });
+    defer slot.close(io);
+    try slot.createDir(io, "evidence", .fromMode(0o700));
+    const evidence = try slot.openDir(io, "evidence", .{ .iterate = true });
+    defer evidence.close(io);
+    const boundary = 4 * 1024 * 1024;
+    const content = try a.alloc(u8, boundary + 1);
+    defer a.free(content);
+    @memset(content, 'x');
+    for ([_][]const u8{ "build-start.json", "build.json" }, 0..) |record, index| {
+        const file = try evidence.createFile(io, record, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+        defer file.close(io);
+        try file.writePositionalAll(io, content[0 .. boundary + index], 0);
+    }
+    var signal = try controller.build_pipeline.installCancellation();
+    defer signal.deinit();
+    var context: controller.build_pipeline.Context = .{
+        .allocator = a,
+        .io = io,
+        .environ = undefined,
+        .runtime = work,
+        .repository = options.repository_root,
+        .wamr = work,
+        .compute = work,
+        .git = undefined,
+        .tools = undefined,
+        .roots = undefined,
+        .signal = &signal,
+    };
+    const accepted = try controller.build_pipeline.readAcceptedRecord(&context, "build-start.json");
+    defer a.free(accepted);
+    try std.testing.expectEqualSlices(u8, content[0..boundary], accepted);
+    try std.testing.expectError(error.FileTooLarge, controller.build_pipeline.readAcceptedRecord(&context, "build.json"));
+}
+
 test "late cancellation refuses final build publication after record preparation" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -1731,4 +4258,9 @@ test "native command refuses changed executable after use and retains failed rec
     defer diagnostic.close(io);
     try std.testing.expect((try core.private_files.snapshot(public)).size > 100);
     try std.testing.expect((try core.private_files.snapshot(diagnostic)).size > 0);
+}
+
+test "handoff inspect supervises original roles, captures output and refuses missing custody" {
+    try handoffInspectFixtures();
+    try legacyHandoffInspectLiveFixture();
 }
