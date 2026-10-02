@@ -6,6 +6,7 @@ import copy
 import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -56,6 +57,76 @@ reset_command_bindings()
 
 
 class NativeRecordBridge(unittest.TestCase):
+    def test_publication_timings_preserve_transport_and_redact_refusals(self):
+        bridge = public_bundle.accepted_records
+        private = "/private/runtime/token"
+        arguments = ("records", "--runtime", private)
+        output, errors = io.StringIO(), io.StringIO()
+        with mock.patch.object(
+                bridge, "_controller_command_impl",
+                side_effect=[(b"unchanged native bytes", False),
+                             ValueError(private)]) as transport, \
+                contextlib.redirect_stdout(output), \
+                contextlib.redirect_stderr(errors):
+            with bridge.phase_timings():
+                self.assertEqual(bridge._controller_command(
+                    arguments, private, 600),
+                    (b"unchanged native bytes", False))
+                with self.assertRaisesRegex(ValueError, private):
+                    bridge._controller_command(arguments, private, 600)
+        self.assertEqual(transport.call_args_list, [
+            mock.call(arguments, private, 600),
+            mock.call(arguments, private, 600),
+        ])
+        self.assertEqual(output.getvalue(), "")
+        self.assertNotIn(private, errors.getvalue())
+        self.assertNotIn("unchanged native bytes", errors.getvalue())
+        lines = errors.getvalue().splitlines()
+        self.assertEqual(lines[0], "Native publication phase=records event=begin")
+        self.assertRegex(lines[1], r"^Native publication phase=records event=returned elapsed_ms=[0-9]+$")
+        self.assertEqual(lines[2], lines[0])
+        self.assertRegex(lines[3], r"^Native publication phase=records event=refused elapsed_ms=[0-9]+$")
+        self.assertFalse(bridge._TIMING_ENABLED)
+
+    def test_publication_cli_times_both_readers_without_changing_stdout(self):
+        handoff = self.handoff_module()
+        output, errors = io.StringIO(), io.StringIO()
+
+        def publish(actual):
+            self.assertIs(actual, handoff)
+            for reader in (
+                    handoff.accepted_records, public_bundle.accepted_records):
+                reader._controller_command(
+                    ("records", "--runtime", "/private/argument"),
+                    "private refusal")
+            return Path("/private/archive"), "a" * 64, "b" * 40
+
+        with mock.patch.dict(sys.modules, {
+                handoff.__name__: handoff, "public_bundle": public_bundle}), \
+                mock.patch.object(
+                    sys, "argv", ["handoff.py", "public-source-bundle"]), \
+                mock.patch.object(public_bundle, "publish_ci", side_effect=publish), \
+                mock.patch.object(
+                    handoff.accepted_records, "_controller_command_impl",
+                    return_value=(b"", False)) as local, \
+                mock.patch.object(
+                    public_bundle.accepted_records, "_controller_command_impl",
+                    return_value=(b"", False)) as public, \
+                contextlib.redirect_stdout(output), \
+                contextlib.redirect_stderr(errors):
+            handoff.main()
+        self.assertEqual(output.getvalue(),
+                         "Public source archive SHA-256: " + "a" * 64
+                         + "\nPublic source tree: " + "b" * 40
+                         + "\nCompute private contract prepared; "
+                         "no Azure operations.\n")
+        self.assertEqual(errors.getvalue().count("event=begin"), 2)
+        self.assertNotIn("/private/", errors.getvalue())
+        local.assert_called_once()
+        public.assert_called_once()
+        self.assertFalse(handoff.accepted_records._TIMING_ENABLED)
+        self.assertFalse(public_bundle.accepted_records._TIMING_ENABLED)
+
     def handoff_module(self):
         spec = importlib.util.spec_from_file_location(
             "wamr_handoff_native_records_test", HERE / "handoff.py")

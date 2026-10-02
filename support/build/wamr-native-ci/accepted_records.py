@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Bounded, fail-closed transport for native records and imported identity."""
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ import selectors
 import signal
 import stat
 import subprocess
+import sys
 import time
 
 
@@ -17,6 +19,45 @@ RECORDS_TIMEOUT_SECONDS = 600
 VALIDATOR_BUILD_TIMEOUT_SECONDS = 2100
 IMPORT_NATIVE_REVALIDATION_TIMEOUT_SECONDS = VALIDATOR_BUILD_TIMEOUT_SECONDS
 CONTROLLER_ENV = "WAMR_CI_CONTROLLER"
+_TIMING_ENABLED = False
+
+
+@contextlib.contextmanager
+def phase_timings():
+    """Opt-in CLI diagnostics never include arguments, records or child output."""
+    global _TIMING_ENABLED
+    previous = _TIMING_ENABLED
+    _TIMING_ENABLED = True
+    try:
+        yield
+    finally:
+        _TIMING_ENABLED = previous
+
+
+def _controller_command(arguments, refusal, timeout_seconds=None):
+    if not _TIMING_ENABLED:
+        return _controller_command_impl(arguments, refusal, timeout_seconds)
+    labels = {
+        name: name for name in (
+            "records", "local-consumer-custody", "public-validator-build",
+            "handoff-inspect", "handoff-inspect-legacy",
+            "local-handoff-revalidation", "import-native-revalidation",
+            "import-handoff-revalidation", "supervisor-import-identity",
+        )
+    }
+    label = labels.get(arguments[0], "other")
+    prefix = "Native publication phase=" + label
+    print(prefix + " event=begin", file=sys.stderr, flush=True)
+    started = time.monotonic()
+    event = "refused"
+    try:
+        result = _controller_command_impl(arguments, refusal, timeout_seconds)
+        event = "returned"
+        return result
+    finally:
+        elapsed = int((time.monotonic() - started) * 1000)
+        print(prefix + f" event={event} elapsed_ms={elapsed}",
+              file=sys.stderr, flush=True)
 
 
 def _refuse(reason="native controller records refused"):
@@ -161,7 +202,7 @@ def _decode(raw, context):
     return value
 
 
-def _controller_command(arguments, refusal, timeout_seconds=None):
+def _controller_command_impl(arguments, refusal, timeout_seconds=None):
     try:
         controller = _controller()
         if timeout_seconds is None:

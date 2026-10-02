@@ -1012,11 +1012,7 @@ The protected job builds and boots from the fixed private
 `/d/wamr-ci/wamr-native-runtime` root, with the sealed Zig distribution
 beside it under `/d/wamr-ci/wamr-native-tools`; the root-owned `/d` boundary
 and precreated private `wamr-ci` directory avoid mutable hosted-runner home
-ancestors while retaining exact component custody. Both paired-comparison
-output slots are created before the build-start baseline and checked empty
-before use. The source slot stays in place after worktree cleanup: creating
-or removing it later would change the recorded `/d/wamr-ci` ancestor metadata
-even if no retained input bytes changed. Its authenticated QEMU
+ancestors while retaining exact component custody. Its authenticated QEMU
 `libfdt` runtime is established before the build-input baseline and removed
 by exact recorded identity only after final handoff revalidation, so neither
 boot setup nor pre-export cleanup can mutate a recorded system-library
@@ -1029,6 +1025,17 @@ It uses only the validated recorded Git executable for the source/dependency
 recheck, recomputes the exact source, dependency, Bison, consumer and guarded
 supervisor custody, and only then binds the full recorded tool set and the
 fixed-runtime supervisor. It repeats the full custody check after binding.
+Public publication emits opt-in, fixed-label native phase timings on stderr;
+stdout retains its exact archive-digest/tree contract. Timings contain no
+arguments, paths, records, child output or refusal details, and a returned
+transport is not an acceptance result. Every existing revalidation boundary
+still runs, including the pre/post validator, export and final custody checks.
+Canonical custody framing uses a short-lived nested arena so its JSON workspace
+does not accumulate in the acceptance arena across inventory entries. Tree
+members are hashed through the already retained descriptor, using the same
+`readRetained` primitive as the #187 export foundation; before/after descriptor
+snapshots and full pathname/component verification remain intact. No digests
+or pathnames are cached across revalidation boundaries.
 Pre-export refusal names only a fixed result, build-start schema/consumer
 role/tree/custody (with a fixed allowlisted file or tree role when physical
 custody changes), physical path role/binary/runtime/tree, dependency/custody,

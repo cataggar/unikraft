@@ -1520,6 +1520,34 @@ test "imported handoff member rebasing preserves only safe expected relative pat
     }
 }
 
+test "borrowed custody hashing checks the held descriptor and its current name" {
+    const files = core.private_files;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const parent = try files.openDirectory(io, options.fixture_root, .private);
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "borrowed-custody-{d}", .{std.os.linux.getpid()});
+    defer a.free(name);
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch {};
+    const directory = try parent.openDir(io, name, .{ .iterate = true });
+    defer directory.close(io);
+    const path = try std.fs.path.join(a, &.{ options.fixture_root, name, "member" });
+    defer a.free(path);
+    try writeFixtureFile(io, directory, "member", "native inventory member");
+    var held = try files.RetainedFile.open(io, path, .private);
+    defer held.close(io);
+    const observed = try controller.custody_files.readRetained(io, &held, 4096);
+    try std.testing.expectEqualSlices(u8, &std.fmt.bytesToHex(controller.records.fileIdentity("native inventory member"), .lower), &observed.sha256);
+    try std.testing.expectEqualDeep(controller.custody_files.metadata(held.file_snapshot), observed.metadata);
+    try directory.deleteFile(io, "member");
+    try writeFixtureFile(io, directory, "member", "native inventory member");
+    try std.testing.expectError(
+        error.FileChanged,
+        controller.custody_files.readRetained(io, &held, 4096),
+    );
+}
+
 test "local consumer custody recaptures exact files trees and ancestry" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
