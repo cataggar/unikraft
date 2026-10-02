@@ -2542,6 +2542,11 @@ pub const CommandIdentityTest = struct {
         return (try readProcStat(proc, pid)).start_ticks;
     }
 
+    pub fn retainedStartTicks(pid: linux.pid_t, descriptor: linux.fd_t) !u64 {
+        if (!builtin.is_test) @compileError("command identity evidence is test-only");
+        return (try readProcStatDescriptor(descriptor, pid)).start_ticks;
+    }
+
     pub fn identityLive(pid: linux.pid_t, start_ticks: u64, descriptor: linux.fd_t) !bool {
         if (!builtin.is_test) @compileError("command identity evidence is test-only");
         const proc = try openCommandProc();
@@ -2661,6 +2666,10 @@ fn readProcStat(proc: linux.fd_t, pid: linux.pid_t) !ProcStat {
     }
     const descriptor: linux.fd_t = @intCast(opened);
     defer _ = linux.close(descriptor);
+    return readProcStatDescriptor(descriptor, pid);
+}
+
+fn readProcStatDescriptor(descriptor: linux.fd_t, pid: linux.pid_t) !ProcStat {
     var buffer: [4096]u8 = undefined;
     var length: usize = 0;
     while (true) {
@@ -2672,6 +2681,7 @@ fn readProcStat(proc: linux.fd_t, pid: linux.pid_t) !ProcStat {
                 if (length == buffer.len) return error.ProcUnavailable;
             },
             .INTR => continue,
+            .NOENT, .SRCH => return error.ProcessGone,
             else => return error.ProcUnavailable,
         }
     }

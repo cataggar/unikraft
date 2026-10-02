@@ -503,6 +503,12 @@ supervisor reap each tracked child and consume one final bounded `ECHILD`
 observation. Escaped writers cannot extend the primary deadline: pipes are
 nonblocking, bounded, finally drained after proven cleanup, and always closed.
 
+An `ENOENT` or `ESRCH` while opening or reading a stat entry means that the
+process disappeared, not that procfs is unavailable. Unpinned scan candidates
+are skipped; missing metadata for a pinned identity still requires its retained
+pidfd to corroborate exit. Other stat I/O errors and malformed records remain
+cleanup failures.
+
 Primary and cleanup time do not accumulate or restart per output event,
 descendant, signal or reap. Defaults are 64 KiB per output stream, 64
 descendants plus one bounded first-excess observation, one million primary and
