@@ -122,6 +122,13 @@ const max_handoff_bytes = 2 * 1024 * 1024;
 const max_artifact_bytes = 256 * 1024 * 1024 + 512;
 
 pub const Fixture = if (@import("builtin").is_test) struct {
+    pub const PinHooks = struct {
+        context: *anyopaque,
+        before_read: *const fn (*anyopaque, *const files.RetainedFile) anyerror!void,
+        after_read: *const fn (*anyopaque) anyerror!void,
+    };
+    pub threadlocal var pin_hooks: ?PinHooks = null;
+
     // The export differential fixture substitutes only the costly controller
     // acceptance/process boundary, never its path, record or pinning machinery.
     pub fn capture(allocator: std.mem.Allocator, io: std.Io, root: []const u8, repository: []const u8) !AcceptedRun {
@@ -177,6 +184,21 @@ pub const AcceptedRun = struct {
         return self.arena.allocator();
     }
 
+    fn readPin(self: *AcceptedRun, retained: *files.RetainedFile, limit: u64) !physical.File {
+        if (@import("builtin").is_test) {
+            if (Fixture.pin_hooks) |hooks| {
+                try hooks.before_read(hooks.context, retained);
+                const observed = physical.readRetained(self.io, retained, limit) catch |err| {
+                    try hooks.after_read(hooks.context);
+                    return err;
+                };
+                try hooks.after_read(hooks.context);
+                return observed;
+            }
+        }
+        return physical.readRetained(self.io, retained, limit);
+    }
+
     fn artifactPath(self: *AcceptedRun, role: ArtifactRole) ![]const u8 {
         for (artifact_specs) |spec| {
             if (spec.role != role) continue;
@@ -198,7 +220,7 @@ pub const AcceptedRun = struct {
             const path = try self.artifactPath(role);
             var retained = try files.RetainedFile.open(self.io, path, .private);
             errdefer retained.close(self.io);
-            const observed = try physical.readFile(self.io, path, 128, true);
+            const observed = try self.readPin(&retained, 128);
             if (!std.meta.eql(expected, observed)) return error.ArtifactChanged;
             try retained.verify(self.io);
             return retained;
@@ -209,7 +231,7 @@ pub const AcceptedRun = struct {
             const path = try self.artifactPath(role);
             var retained = try files.RetainedFile.open(self.io, path, if (self.context == .local_runtime and isSource(role)) .artifact else .private);
             errdefer retained.close(self.io);
-            const observed = try physical.readFile(self.io, path, max_artifact_bytes, !(self.context == .local_runtime and isSource(role)));
+            const observed = try self.readPin(&retained, max_artifact_bytes);
             if (observed.bytes != artifact.bytes or !std.meta.eql(observed.sha256, artifact.sha256) or
                 !std.meta.eql(observed.metadata, artifact.snapshot))
                 return error.ArtifactChanged;
@@ -230,7 +252,7 @@ pub const AcceptedRun = struct {
             const path = try recordPath(self, name);
             var retained = try files.RetainedFile.open(self.io, path, .private);
             errdefer retained.close(self.io);
-            const observed = try physical.readFile(self.io, path, records.max_record_bytes, true);
+            const observed = try self.readPin(&retained, records.max_record_bytes);
             if (observed.bytes != record.bytes or !std.meta.eql(observed.sha256, record.sha256) or
                 !std.meta.eql(observed.metadata, expected)) return error.RecordChanged;
             try retained.verify(self.io);
@@ -245,7 +267,7 @@ pub const AcceptedRun = struct {
             if (input.snapshot.tree != null) return error.InputIsTree;
             var retained = try files.RetainedFile.open(self.io, input.path, .artifact);
             errdefer retained.close(self.io);
-            const observed = try physical.readFile(self.io, input.path, limits.input_file, false);
+            const observed = try self.readPin(&retained, limits.input_file);
             if (observed.bytes != input.snapshot.bytes or !std.meta.eql(observed.sha256, input.snapshot.sha256) or
                 !std.meta.eql(observed.metadata, input.snapshot.metadata)) return error.InputChanged;
             try retained.verify(self.io);
@@ -275,7 +297,7 @@ pub const AcceptedRun = struct {
             const path = try bootPath(self, mode, part);
             var retained = try files.RetainedFile.open(self.io, path, .private);
             errdefer retained.close(self.io);
-            const observed = try physical.readFile(self.io, path, if (part == .serial) 4 * 1024 * 1024 else records.max_record_bytes, true);
+            const observed = try self.readPin(&retained, if (part == .serial) 4 * 1024 * 1024 else records.max_record_bytes);
             if (observed.bytes != item.bytes or !std.meta.eql(observed.sha256, item.sha256) or
                 !std.meta.eql(observed.metadata, item.snapshot))
                 return error.BootChanged;
@@ -554,7 +576,7 @@ fn loadResult(self: *AcceptedRun) !void {
         return error.InvalidRecords;
     self.compatibility = value.set;
     self.production_profile = if (value.set == .tiny_v2_qcow2_derived_vhd) .tiny_exact_v2 else null;
-    const observed = try physical.readFile(self.io, path, records.max_record_bytes, true);
+    const observed = try physical.readRetained(self.io, &retained, records.max_record_bytes);
     try retained.verify(self.io);
     self.result = .{
         .relative_path = if (self.context == .local_runtime)
@@ -1106,7 +1128,7 @@ fn collectArtifacts(self: *AcceptedRun) !void {
                 var bytes = try files.readSensitiveFile(self.io, a, retained.file, 128, .private);
                 defer bytes.deinit();
                 if (!std.mem.eql(u8, bytes.bytes(), "primary=0 cleanup=0\n")) return error.InvalidCleanup;
-                self.cleanup_snapshot = try physical.readFile(self.io, path, 128, true);
+                self.cleanup_snapshot = try physical.readRetained(self.io, &retained, 128);
                 try retained.verify(self.io);
             }
             continue;

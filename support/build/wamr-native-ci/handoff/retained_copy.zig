@@ -31,6 +31,8 @@ pub const TestFault = enum {
     mutate_source_after_first_chunk,
     cancel_after_first_chunk,
     replace_destination_before_reopen,
+    replace_destination_with_fifo,
+    replace_destination_with_fifo_and_cancel,
 };
 
 pub const Options = struct {
@@ -165,6 +167,18 @@ pub fn copyRetained(
             }
             try replacement.sync(io);
         }
+        if (options.fault == .replace_destination_with_fifo or options.fault == .replace_destination_with_fifo_and_cancel) {
+            try parent.dir.rename(leaf, parent.dir, "replaced-copy", io);
+            var name: [256:0]u8 = undefined;
+            @memcpy(name[0..leaf.len], leaf);
+            name[leaf.len] = 0;
+            if (linux.errno(linux.mknodat(parent.dir.handle, name[0..leaf.len :0], linux.S.IFIFO | 0o600, 0)) != .SUCCESS)
+                return error.FixtureFifo;
+            if (options.fault == .replace_destination_with_fifo_and_cancel) {
+                if (linux.errno(linux.kill(linux.getpid(), .INT)) != .SUCCESS) return error.FixtureSignal;
+                if (!(options.cancel orelse return error.InvalidFault).load(.acquire)) return error.FixtureSignal;
+            }
+        }
         const observed = try hashOpened(io, parent.dir, leaf, destination_snapshot, limit, options.cancel);
         if (!std.mem.eql(u8, &source_digest, &observed))
             return error.CopyChanged;
@@ -261,9 +275,10 @@ fn validatePrivateDir(dir: std.Io.Dir) !void {
 }
 
 fn hashOpened(io: std.Io, parent: std.Io.Dir, name: []const u8, expected: files.Snapshot, limit: u64, cancel: ?*const std.atomic.Value(bool)) ![64]u8 {
+    try checkCancellation(cancel);
     const size = expected.size;
     if (size == 0 or size > limit) return error.UnsafeDestination;
-    const file = try parent.openFile(io, name, .{ .follow_symlinks = false });
+    const file = try (files.FileParent{ .directory = parent, .name = name, .policy = .private }).openFile(io);
     defer file.close(io);
     const snapshot = try files.snapshot(file);
     try validateDestination(snapshot, size);

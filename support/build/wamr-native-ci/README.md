@@ -905,7 +905,12 @@ overwritten. Selected artifacts, boots and evidence are copied create-only as
 roots, the inspection command record, output files and lock anchors remain
 pinned until the attempt ends. Copies hash both sides, sync files and created
 directories, reopen the created inode and compare custody snapshots including
-gid. Publication barriers revalidate the accepted run, source pins, selected
+gid. Accepted record, input, artifact, boot and cleanup identities are measured
+on the exact retained descriptor returned to export, not a second pathname
+open. Descriptor and ancestor revalidation also guard result/cleanup capture.
+Destination reopening uses the shared nonblocking private-file opener, so a
+FIFO substitution refuses instead of trapping cancellation behind a blocking
+open. Publication barriers revalidate the accepted run, source pins, selected
 source directories, exact output membership, sealed destination directories,
 copied bytes and canonical root-bound manifest.
 
@@ -930,7 +935,9 @@ unlink an ambiguous publication as an unsafe rollback.
 `zig build test-handoff-contracts --summary all` exercise the complete export
 transitions, retained ownership, descriptor cleanup, phase/copy/durability and
 allocation faults, cancellation, swaps/symlinks/hardlinks and binary secret-scan
-boundaries.
+boundaries. Ancestor-directory ABA probes cover all five pin families; bounded
+FIFO/SIGINT helpers verify irreversible poisoning, no bundle and descriptor
+cleanup without hanging the runner.
 They invoke actual Python `handoff.export()` to compare all 83 selected v2
 members, canonical manifests after local-root rebasing and accepted result
 identity, and check Python reuse/I/O/producer-binding refusals. This complete

@@ -670,6 +670,130 @@ test "accepted record and runtime input pins reject identical-content replacemen
     }
 }
 
+test "accepted pin identity belongs to the returned descriptor across ancestor ABA" {
+    for ([_]enum { record, input, cleanup, artifact, boot }{ .record, .input, .cleanup, .artifact, .boot }) |role| {
+        var fixture = try ExportFixture.init(@tagName(role));
+        defer fixture.deinit();
+        var accepted = try fixture.capture();
+        defer accepted.deinit();
+        const relative = switch (role) {
+            .record => "compute/evidence/build.json",
+            .input => "inputs/tool",
+            .cleanup => "evidence/runtime-cleanup.txt",
+            .artifact => "compute/package/unikraft.raw",
+            .boot => "compute/boot-raw-x2apic/hyperv-efi-boot.log",
+        };
+        try fixture.root.rename("source/runtime", fixture.root, "accepted-runtime", std.testing.io);
+        try fixture.put(try std.fs.path.join(fixture.arena.allocator(), &.{ "source/runtime", relative }), "unaccepted-A\n");
+        var aba = PinAncestorAba{ .root = fixture.root };
+        controller.accepted_run.Fixture.pin_hooks = .{ .context = &aba, .before_read = PinAncestorAba.exposeAccepted, .after_read = PinAncestorAba.restoreUnaccepted };
+        defer controller.accepted_run.Fixture.pin_hooks = null;
+        const before = try descriptorCount();
+        const outcome = switch (role) {
+            .record => accepted.pinRecord("build.json"),
+            .input => accepted.pinInput("fixture-tool"),
+            .cleanup => accepted.pinArtifact(.cleanup),
+            .artifact => accepted.pinArtifact(.raw),
+            .boot => accepted.pinBoot(controller.profile.modes(accepted.compatibility)[0], .serial),
+        };
+        if (outcome) |value| {
+            var leaked = value;
+            leaked.close(std.testing.io);
+            return error.UnacceptedDescriptorPassedAncestorAba;
+        } else |err| switch (err) {
+            error.RecordChanged, error.InputChanged, error.ArtifactChanged, error.BootChanged, error.FileChanged => {},
+            else => return err,
+        }
+        try std.testing.expect(aba.opened_unaccepted and aba.restored);
+        try std.testing.expectEqual(before, try descriptorCount());
+    }
+}
+
+const PinAncestorAba = struct {
+    root: std.Io.Dir,
+    opened_unaccepted: bool = false,
+    restored: bool = false,
+
+    fn exposeAccepted(context: *anyopaque, retained: *const core.private_files.RetainedFile) !void {
+        const self: *PinAncestorAba = @ptrCast(@alignCast(context));
+        var data: [13]u8 = undefined;
+        try std.testing.expectEqual(data.len, try retained.file.readPositionalAll(std.testing.io, &data, 0));
+        try std.testing.expectEqualStrings("unaccepted-A\n", &data);
+        self.opened_unaccepted = true;
+        try self.root.rename("source/runtime", self.root, "unaccepted-runtime", std.testing.io);
+        try self.root.rename("accepted-runtime", self.root, "source/runtime", std.testing.io);
+    }
+
+    fn restoreUnaccepted(context: *anyopaque) !void {
+        const self: *PinAncestorAba = @ptrCast(@alignCast(context));
+        try self.root.rename("source/runtime", self.root, "accepted-runtime", std.testing.io);
+        try self.root.rename("unaccepted-runtime", self.root, "source/runtime", std.testing.io);
+        self.restored = true;
+    }
+};
+
+test "destination FIFO substitution refuses in a bounded helper and releases custody" {
+    try fifoSubstitutionBounded(.replace_destination_with_fifo);
+}
+
+test "SIGINT at destination FIFO reopen poisons in a bounded helper and releases custody" {
+    try fifoSubstitutionBounded(.replace_destination_with_fifo_and_cancel);
+}
+
+fn fifoSubstitutionBounded(fault: retained_copy.TestFault) !void {
+    var fixture = try ExportFixture.init(@tagName(fault));
+    defer fixture.deinit();
+    const linux = std.os.linux;
+    const forked = linux.fork();
+    if (linux.errno(forked) != .SUCCESS) return error.FixtureFork;
+    if (forked == 0) {
+        fifoSubstitutionChild(&fixture, fault) catch |err| {
+            std.debug.print("bounded FIFO helper failed: {s}\n", .{@errorName(err)});
+            linux.exit(1);
+        };
+        linux.exit(0);
+    }
+    const pid: linux.pid_t = @intCast(forked);
+    var reaped = false;
+    defer if (!reaped) {
+        _ = linux.kill(pid, .KILL);
+        var status: u32 = 0;
+        while (linux.errno(linux.waitpid(pid, &status, 0)) == .INTR) {}
+    };
+    const deadline = try core.process.Deadline.afterMilliseconds(5000);
+    while (true) {
+        var status: u32 = 0;
+        const result = linux.waitpid(pid, &status, linux.W.NOHANG);
+        switch (linux.errno(result)) {
+            .SUCCESS => if (result != 0) {
+                reaped = true;
+                try std.testing.expect(linux.W.IFEXITED(status));
+                try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+                break;
+            },
+            .INTR => continue,
+            else => return error.FixtureReap,
+        }
+        if (try deadline.expired()) return error.DestinationFifoReopenBlocked;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+    }
+    try fixture.noBundle();
+}
+
+fn fifoSubstitutionChild(fixture: *ExportFixture, fault: retained_copy.TestFault) !void {
+    const before = try descriptorCount();
+    {
+        const pinned = try fixture.begin(.{ .copy = fault });
+        defer pinned.deinit();
+        const outcome = native_export.Test.finishFixture(pinned);
+        try std.testing.expect(outcome == .poisoned);
+        try std.testing.expectEqual(if (fault == .replace_destination_with_fifo) error.UnsafeFile else error.Cancelled, outcome.poisoned.err);
+        try std.testing.expectEqual(outcome.poisoned, pinned.reserveOutput().poisoned);
+        try fixture.noBundle();
+    }
+    try std.testing.expectEqual(before, try descriptorCount());
+}
+
 test "symlinked source and replaced staged manifest poison the final publication barrier" {
     for ([_]bool{ false, true }) |source| {
         var fixture = try ExportFixture.init(if (source) "source-symlink" else "stage-replacement");
