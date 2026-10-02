@@ -324,7 +324,8 @@ reference on `06d1ff25`; native tests decode them with a finite bound instead
 of importing or executing the old Python controller or adapter test runner.
 The historical v1 inner-stage fixture also exercises native portable
 revalidation and rejects substituted supervisors and validators before
-creating output. The
+creating output. A dirty current reader checkout also refuses without
+reserving output. The
 installed fixture stage itself supervises bounded native success, nonzero,
 partial-output, signal, overflow, timeout, and cancellation children; its
 create-only private report binds the observed output hashes and cleanup states,

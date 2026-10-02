@@ -3246,6 +3246,30 @@ test "trusted historical inner stage accepts complete records and refuses tamper
         try std.testing.expectError(error.FileNotFound, parent.openDir(io, revalidated_name, .{}));
         try accepted.revalidate();
     }
+    const dirty_source_path = try std.fs.path.join(a, &.{ reader_repository, "support/build/wamr-native-ci/controller/import_validator_build.zig" });
+    {
+        const dirty_source = try std.Io.Dir.cwd().openFile(io, dirty_source_path, .{ .mode = .read_write, .follow_symlinks = false });
+        defer dirty_source.close(io);
+        try dirty_source.writePositionalAll(io, "\n", (try dirty_source.stat(io)).size);
+    }
+    const dirty_reader = try std.process.run(a, io, .{
+        .argv = &.{
+            options.host_controller_cli, "import-handoff-revalidation",
+            "--stage-root",              stage_root_path,
+            "--git",                     options.git_executable,
+            "--supervisor",              options.host_controller_cli,
+            "--validator",               options.import_validator,
+            "--output",                  revalidated_path,
+        },
+        .cwd = .{ .path = reader_repository },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, dirty_reader.term);
+    try std.testing.expectEqualStrings("", dirty_reader.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, dirty_reader.stderr, "DirtySource") != null);
+    try std.testing.expectError(error.FileNotFound, parent.openDir(io, revalidated_name, .{}));
+    try accepted.revalidate();
     try root.createDir(io, "boots/unexpected", .fromMode(0o700));
     try std.testing.expectError(error.InvalidImportedBundle, accepted.revalidate());
     try root.deleteDir(io, "boots/unexpected");
