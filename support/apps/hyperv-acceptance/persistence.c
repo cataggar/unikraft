@@ -82,29 +82,6 @@ static inline void hyperv_persistence_host_event(
 }
 #endif
 
-static int persistence_hex_id(const char *text, uint8_t output[16])
-{
-	for (unsigned int i = 0; i < 16; i++) {
-		unsigned int high;
-		unsigned int low;
-		char a = text[i * 2];
-		char b = text[i * 2 + 1];
-
-		if (!a || !b)
-			return -EINVAL;
-		high = a >= '0' && a <= '9' ? (unsigned int)(a - '0') :
-		       a >= 'a' && a <= 'f' ?
-			       (unsigned int)(a - 'a' + 10) : 16;
-		low = b >= '0' && b <= '9' ? (unsigned int)(b - '0') :
-		      b >= 'a' && b <= 'f' ?
-			      (unsigned int)(b - 'a' + 10) : 16;
-		if (high > 15 || low > 15)
-			return -EINVAL;
-		output[i] = (uint8_t)(high << 4 | low);
-	}
-	return text[32] ? -EINVAL : 0;
-}
-
 static void persistence_print_run(const uint8_t run_id[16])
 {
 	for (unsigned int i = 0; i < 16; i++)
@@ -121,10 +98,10 @@ static int persistence_expected(
 	struct hyperv_acceptance_persistence_expected *expected)
 {
 	memset(expected, 0, sizeof(*expected));
-	if (persistence_hex_id(
+	if (hyperv_acceptance_parse_hex_id(
 		    CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_RUN_ID,
 		    expected->run_id) ||
-	    persistence_hex_id(
+	    hyperv_acceptance_parse_hex_id(
 		    CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID,
 		    expected->disk_id))
 		return -EINVAL;

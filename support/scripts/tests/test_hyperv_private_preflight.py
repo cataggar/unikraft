@@ -1979,6 +1979,10 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
             )
             self.assertEqual(invoked.read_text(), str(zig.absolute()))
             self.assertIn("-j2", invoked_args.read_text().splitlines())
+            self.assertIn(
+                f"-Dmake-arg=ZIG={zig.absolute()}",
+                invoked_args.read_text().splitlines(),
+            )
             self.assertEqual(
                 validated["receipt"]["invocation"][
                     "materialization_returncode"

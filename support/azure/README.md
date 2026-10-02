@@ -259,11 +259,14 @@ Run the solve command with the controlled tool path shown above rather than an
 ambient developer shell. `python3` then resolves from the pinned runtime, the
 parser wrappers resolve first, source versioning uses the selected Git runtime,
 LLVM tools retain their symbolic command names, and the Make-backed facade
-uses the absolute `$MAKE` supplied by `-Dmake-command`.
+uses the absolute `$MAKE` supplied by `-Dmake-command`. Solve at the exact
+committed `HEAD` you will build: the solved configuration records the source
+version, and `build-private` rejects a configuration that its build rewrites.
 
 Then let the controller invoke the fixed native builder itself. It first
 copies and preflights the complete Git runtime, then uses only that relocated
-copy for source snapshots and Make's symbolic `git` invocation. The receipt
+copy for source snapshots and Make's symbolic `git` invocation. Make also
+receives the same absolute `--zig` path as `ZIG` for Hyper-V Zig objects. The receipt
 fingerprints the complete Git runtime, compiler, LLVM, Make, Python, parser
 tools and Bison data. Git configuration, hook, helper, fsmonitor, and
 repository-selection environment overrides are removed; system/global config
@@ -838,7 +841,14 @@ scheduled SMP workload or real-host reconnect result.
 `zig build test-storvsc-regression -j2` runs the StorVSC core, C/C++ public
 mapping ABI, native export metadata, and production topology/lifetime fixtures
 on either host architecture. It includes mixed polling/interrupt LUNs and
-retained-client interrupt restoration after same-controller rebind.
+retained-client interrupt restoration after same-controller rebind. The
+storage-binding fixtures also exercise reverse controller offers with shared
+LUN numbers, out-of-order and failed completions, per-controller request-pool
+exhaustion without blocking another controller, and continued reads from
+healthy disks after controller/LUN pool exhaustion. The optional read-only
+topology profile additionally checks distinct policy-2 seeds on two data LUNs
+under either controller-offer order, rejecting a swapped seed or duplicate OS
+boot signatures without issuing writes or flushes.
 
 `state.json` retains `local_platform_boot_modes` for the raw and fixed-VHD
 x2APIC/legacy-APIC boots, while `image_sha256` remains the deployment identity.
@@ -863,7 +873,10 @@ CONFIG_LIBSTORVSC_MAX_LUNS=4
 Each LUN has independent capacity, access mode, queue, and completion routing.
 The limits reserve controller/LUN identities for the boot; removed identities
 are not recycled into different devices. Pool exhaustion is reported without
-discarding healthy attached LUNs.
+discarding healthy attached LUNs; LUN diagnostics identify the controller,
+channel, and SCSI address. An incomplete inventory remains unavailable for
+guarded write authorization even when its known disks can still be read in
+ordinary, unguarded builds.
 
 `<uk/storvsc.h>` exposes `uk_storvsc_mapping_count`, `uk_storvsc_mapping_get`,
 and `uk_storvsc_mapping_find` to C and C++ callers. Active snapshots include
@@ -872,9 +885,624 @@ properties, and any supported LU-associated VPD designator. A missing VPD
 designator is explicit, not a fabricated stable identity. Snapshots do not
 pin a disk across removal and are not authorization to write.
 
-This driver support does not extend the existing smoke controller into a
-multi-disk or write-persistence acceptance lane. Those still require a
-run-owned data-disk guard and separate real-host evidence.
+The default smoke controller still selects a unique LUN-0 OS disk; it is not
+valid when an additional data disk occupies LUN 0. The opt-in read-only
+topology guest profile described in the
+[application README](../apps/hyperv-acceptance/README.md#read-only-storage-topology-profile)
+uses two independent policy-2 seeds instead. The existing Azure controller
+still provisions only one disk. Do not use it for #90 live acceptance: a
+separate two-data-disk controller (`support/scripts/hyperv_issue90_topology.py`)
+provides offline planning and synthetic checks for four local raw/fixed-VHD
+x2APIC/legacy-APIC boots, two distinct policy-2 fixed-VHD seeds of 8,388,608
+sectors, the exact resource envelope, and redacted serial evidence. **Prepare
+is blocked** even if all four boots and the EFI, raw/VHD, and miz fingerprints
+match: neither an ID-byte scan nor a mutable self-reported hash proves that the
+EFI was built from the reviewed source and the solved config. A trustworthy
+build-to-EFI provenance gate must be supplied and checked on a private build
+host before these artifacts can be accepted; do not fabricate or publish
+private build state. The distinct **live gate remains blocked**:
+the [group PUT](https://learn.microsoft.com/en-us/rest/api/resources/resource-groups/create-or-update?view=rest-resources-2021-04-01)
+returns a reusable name-based ID, not an immutable group incarnation. The
+[disk PUT](https://learn.microsoft.com/en-us/rest/api/compute/disks/create-or-update?view=rest-compute-2025-01-02)
+returns an Azure-assigned `uniqueId`, and the
+[deployment PUT](https://learn.microsoft.com/en-us/rest/api/resources/deployments/create-or-update?view=rest-resources-2025-04-01)
+returns an Azure-assigned correlation ID and this template's VM UUID output.
+The group ID is precomputable but does not identify a group incarnation; the
+disk UUID, deployment correlation, and VM UUID cannot be selected before
+their calls or reconstructed as the *original* from a same-name GET after a
+lost response or failed durable receipt write. Names, ARM IDs, parameters,
+and tags can match a replacement. A prechosen `x-ms-client-request-id` can
+aid investigation through the
+[Activity Log](https://learn.microsoft.com/en-us/azure/azure-monitor/fundamentals/activity-log-schema#administrative-category)
+but is not an immutable field on those resources. Activity logs
+[typically arrive after 3–20 minutes and expire after 90 days](https://learn.microsoft.com/en-us/azure/azure-monitor/fundamentals/activity-log);
+they do not alone bind the present resource incarnation to the original
+create or rule out an in-flight request. An absent group or inventory is
+not proof of completed cleanup while a create is unresolved.
+The controller refuses such cleanup (including stale `cleaned` state), and
+refuses to interpret temporary absence of a previously created group as
+deletion or delete a same-name group with no original disk receipts. Prior
+`cleaned` receipts for a created group without an observed deletion are
+rechecked, not silently accepted. No synthetic success path establishes a
+live ownership guarantee: retain manual owner verification and keep the
+live gate closed.
+
+The official
+[disk TypeSpec](https://github.com/Azure/azure-rest-api-specs/blob/main/specification/compute/resource-manager/Microsoft.Compute/Compute/ComputeDisk/models.tsp),
+[deployment TypeSpec](https://github.com/Azure/azure-rest-api-specs/blob/main/specification/resources/resource-manager/Microsoft.Resources/deployments/models.tsp),
+and [Compute 2025-11-01 OpenAPI](https://github.com/Azure/azure-rest-api-specs/blob/main/specification/compute/resource-manager/Microsoft.Compute/Compute/stable/2025-11-01/ComputeRP.json)
+document the disk read-only size/UUID and upload-size fields, ARM deployment
+outputs/correlation, and the Standard security response; they are **not**
+actual Azure CLI create/show records. The official
+[upload](https://github.com/Azure/azure-rest-api-specs/blob/main/specification/compute/resource-manager/Microsoft.Compute/Compute/ComputeDisk/examples/2025-01-02/diskExamples/Disk_Create_UploadDisk.json)
+and [disk GET](https://github.com/Azure/azure-rest-api-specs/blob/main/specification/compute/resource-manager/Microsoft.Compute/Compute/ComputeDisk/examples/2025-01-02/diskExamples/Disk_Get.json)
+examples omit both `uniqueId` and `diskSizeBytes`; the offline checks require
+them and fail closed if the selected CLI/region omits either. Disk
+create/show field presence is now captured below; deployment, VM and
+security response values still need redacted real response proof before any
+live use.
+
+Offline inspection of installed Azure CLI 2.90.0 and its
+[public release sources](https://github.com/Azure/azure-cli/tree/azure-cli-2.90.0/src/azure-cli/azure/cli/command_modules)
+confirms that `az disk create` maps `--upload-type Upload` and
+`--upload-size-bytes` (including the VHD footer) to a Compute `2025-01-02`
+disk PUT. Both [create](https://github.com/Azure/azure-cli/blob/azure-cli-2.90.0/src/azure-cli/azure/cli/command_modules/vm/aaz/latest/disk/_create.py)
+and [show](https://github.com/Azure/azure-cli/blob/azure-cli-2.90.0/src/azure-cli/azure/cli/command_modules/vm/aaz/latest/disk/_show.py)
+flatten disk properties for JSON output, with model fields for `diskSizeGB`,
+`diskSizeBytes`, `uniqueId`, and `creationData.uploadSizeBytes`. Those models
+do **not** guarantee that the service returns the optional fields or the
+expected values. `az deployment group create/show` use
+[deployment operations](https://github.com/Azure/azure-cli/blob/azure-cli-2.90.0/src/azure-cli/azure/cli/command_modules/resource/commands.py)
+and return service-backed deployment objects, not a fixed JSON example.
+`az resource show --ids ... --api-version 2025-11-01` passes that explicit
+version to the [generic resource GET](https://github.com/Azure/azure-cli/blob/azure-cli-2.90.0/src/azure-cli/azure/cli/command_modules/resource/custom.py);
+the pinned Compute schema documents a `Standard` security type, but there
+is no real VM response here. None of these offline command/model checks
+substitutes for approved, private, redacted create/show records.
+
+An authorized disposable `northeurope` capture with Azure CLI 2.90.0 recorded
+private, redacted upload-disk responses for one Gen2 Linux OS disk and one
+4 GiB data disk; no VM, network or deployment was created and the owned group
+was deleted. The `az disk create --upload-type Upload` response reported
+`provisioningState` `Succeeded`, `diskState` `ReadyToUpload`, `uniqueId`, the
+exact `creationData.uploadSizeBytes` and the expected SKU/generation/OS type,
+but **neither** `diskSizeBytes` nor `diskSizeGB`/`diskSizeGb`; a `disk show`
+before upload was the same. `grant-access` returned only `accessSAS` and
+`revoke-access` returned no JSON. After revocation `disk show` reported
+`Unattached`, exact `diskSizeBytes`, and `diskSizeGB` (not `diskSizeGb`), and
+the explicit `2025-01-02` generic resource read matched the size, UUID and
+tags. The controller therefore requires `ReadyToUpload` for its create
+receipt, allows size fields to be absent only while a disk is
+`ReadyToUpload` or `ActiveUpload` (any present value must still be exact),
+and otherwise requires exact `diskSizeBytes` plus at least one integer GiB
+spelling, with every present spelling exact.
+
+A second authorized disposable `northeurope` capture deployed the candidate
+dummy template with zero-content Gen2 dummy and acceptance-OS VHDs (no guest
+code ran), deallocated the VM after 75 seconds, swapped the OS disk while
+deallocated with `az vm update --os-disk`, and deleted the owner-checked
+group. `az deployment group create` returned synchronously with `Succeeded`
+and the same body as `show`; its `outputResources` entries carry `id` plus
+read-only `resourceGroup`, `resourceType` and null `apiVersion`, `extension`
+and `identifiers`. `az vm show` flattens VM properties and NIC options
+(`id`, `primary`, `deleteOption`, `resourceGroup`) and has no power state;
+`az vm show -d` adds the display text `powerState` (`VM running` or
+`VM deallocated`); the pinned `2025-11-01` read nests NIC options under
+`properties` and reported exactly `securityProfile: {securityType: Standard}`.
+`az vm deallocate` printed no JSON, and `az vm get-instance-view` reported
+exactly `ProvisioningState/succeeded` and `PowerState/deallocated`. A disk
+attached to the deallocated VM reported `diskState` `Reserved` and
+`managedBy` naming the exact VM ID; the attached state of a running VM was
+not captured. NSG rules add read-only `etag`, `id`, `type`, `resourceGroup`,
+`provisioningState` and empty plural prefix/port/ASG lists. The controller and
+offline custody validator accept exactly these read-only shapes and nothing
+wider.
+
+The same capture showed that the subscription's Azure Policy modifies VMs:
+deployment added two policy tags and a system-assigned managed identity, and
+`az vm update` added a user-assigned identity from a separate policy-managed
+resource group. The generic `2025-11-01` read reports a system-assigned
+identity with `userAssignedIdentities: null`. No VM extension appeared during
+the short capture. NSGs cannot block IMDS, so guest code could request tokens
+for such identities. By default the controller and custody validator reject
+any VM `identity`, and the exact owner-tag check rejects extra VM tags; a live
+run in such a subscription then fails closed and its cleanup needs manual
+owner verification.
+
+An operator may instead pin the exact footprint privately when planning:
+`plan --azure-policy POLICY.json` stores
+`{"vm_tags": {...}, "user_assigned_identity": ID-or-null}` in the private
+state and in the approved resource envelope. The 1–4 pinned tags cannot shadow
+an owner tag (case-insensitively); the identity must be a full user-assigned
+identity ID in another resource group of the planned subscription. With a pin,
+VM observations may carry only those tags with their exact values, and either
+no identity, a system-assigned identity, or a system-assigned identity plus
+exactly the pinned user-assigned identity. Other resources keep exact owner
+tags. The custody `Expected.azure_policy` must equal the admitted plan's pin.
+The pin accepts a known IMDS token exposure for the reviewed guest; it does
+not prove what those identities can access. Keep the pin and the identity ID
+private.
+
+The separate private builder can bind the physical tracked Git tree, solved
+configuration, tool fingerprints, and built EFI in a two-pass receipt. Its
+existing guarded producer contract applies to the **persistence** profile,
+not this read-only topology profile. There is no reviewed topology-specific
+build receipt or private EFI/raw/VHD in this worktree, so neither the builder
+implementation nor an operator-provided hash lifts the preparation blocker.
+Do not allocate Azure resources with this controller or reuse the one-disk
+lane until both gates and the response shapes are verified. Local QEMU boots
+without StorVSC devices are `UNAVAILABLE`, not real-host read evidence.
+Write/flush persistence remains a separate workload.
+
+### Offline #90 custodian record format (not a live handoff)
+
+`support/scripts/hyperv_issue90_custody_records.py` validates synthetic
+accountable custody records **offline**. It is not called by the live controller,
+does not authenticate a cloud account or authorize a boot, and never changes
+`require_live_cleanup_proof()`. It uses the pinned `cryptography==50.0.1`
+dependency in `support/azure/requirements.txt`, the existing strict JSON
+parser/canonical serializer, and Ed25519. Signed envelopes contain exactly
+`body` and `signature`; the signature is lowercase hex over
+`uk-hyperv-issue90-custody-v1-STAGE + "\n" + canonical_json(body)`.
+The three stages `prepared`, `handoff`, `closed` and the independent `ack`
+have separate domains. Unknown/duplicate fields, noncanonical signed JSON,
+unbounded data, bad signatures, absent archive bytes, and mismatched digests
+or lengths are errors. Original CLI/HTTP observation bytes need not be
+canonical, but their archived SHA-256 and exact length must match.
+
+Each signed stage body has `schema`, `version: 1`, `stage`, `sequence: 1/2/3`,
+`previous_sha256` (null only for PREPARED), `run_id`, `operation_id`,
+`issued_at_utc` (whole-second `Z`), a fresh nonzero `nonce`,
+`preprovision_authorization_sha256`, and stage-specific `evidence`.
+The predecessor hashes the **entire signed envelope**. `Expected` supplies the
+run, independently selected handoff challenge, resource paths, reviewed image
+and dummy VHD digests, both seed digests,
+source-provenance and revised dummy-OS-template digests, exact final envelope,
+pre-provision approval hash and optional private Azure policy pin independently
+of the records. Neither an
+approval nor a trusted key may be selected from a record under examination.
+
+PREPARED requires the original group, four uploaded disk, and deployment
+create bytes and terminal observations, with original disk UUIDs and deployment
+correlation. Unsettled creates require their original operation tracking
+observation and a matching successful terminal operation; a failed original
+response cannot borrow a successful LRO. For pending operations, the archived
+original response must itself contain `operation: {url, operation_id}` matching
+both the initial and terminal tracked results. If the original CLI response
+omits those fields, it cannot support this pending-evidence shape: no later
+same-name GET or invented tracking can substitute. Successful original
+responses cannot borrow unrelated tracking either. The original and terminal
+group/disk `issue90-run` and `issue90-operation` tags, deployment `runId` and
+`operationId` parameters, and both stages' child tags must match independent
+`Expected`. Original successful deployment outputs/inventory must match
+terminal outputs/inventory; any original VM UUID output must match the terminal
+VM UUID. Each uploaded VHD digest/size and SAS-revocation observation must
+match its reviewed input. Deployment outputs identify the
+original VM UUID and the four ARM-created VM/network children; **those child
+GETs are observations, not original child PUT receipts**. The complete
+inventory includes the dummy and final OS disks, and the observed deallocated
+VM must still attach the dummy and exactly the approved private NIC while the
+final OS disk is unattached. VM observations may be flattened CLI `vm show`
+bodies (NIC options at the attachment's top level) or REST bodies (options
+nested under `properties`), but no VM observation may carry a managed
+`identity` outside the pinned `Expected.azure_policy` footprint. A deallocated observation requires the `az vm show -d`
+`powerState` text `VM deallocated`. All four disk UUIDs/attachments are reobserved
+at handoff, including both seeded data disks; every observed VM and current
+disk must carry the independently expected run/operation tags. An inventory
+label or ARM ID alone cannot replace these checks.
+
+HANDED_OFF binds PREPARED, the settled deallocation and dummy-to-final swap,
+the unchanged VM/disk identities, exactly one attached approved private NIC,
+the final private network, full inventory including the now-unattached dummy,
+a fresh one-use challenge and an expiring window. The swap response, swap
+settlement and final VM observation each require matching run/operation tags.
+Because `az vm deallocate` prints no JSON, the deallocation outcome is the
+`az vm get-instance-view` body: it must name the original VM ID and UUID,
+carry the run/operation tags, have no unpinned managed identity, and report exactly
+`ProvisioningState/succeeded` and `PowerState/deallocated`. The HANDOFF `no_prior_acceptance_boot` and
+`exclusive_no_writer` fields are **signed custodian assertions**, not Azure
+or cryptographic proofs.
+The original swap must report success, or be pending with `swap_tracking`
+containing original/terminal LRO archive references bound to its original
+`operation` fields; `swap_tracking` is null for a successful original swap.
+The final settled VM observation is separately required. The synthetic
+`operation` field is a **protocol-required evidence-shape assumption**, not
+a documented ordinary `az` CLI output: capturing and authenticating original
+Azure LRO response metadata is outside this offline validator. If that
+metadata is unavailable, the pending path stays closed; a signer cannot
+recover omitted response headers or prove Azure provenance by signing them.
+Only *after* handoff may an independent approver issue the separate
+acceptance authorization. CLOSED subsequently binds that externally supplied
+authorization digest, custody return and disposition archive bytes; a
+separately pinned witness key must sign the exact CLOSED-envelope hash.
+No record can assert its own subsequent successful fsync.
+
+`inspect_handoff(..., expected=..., public_key=..., archive=...,
+registry=FileReplayRegistry(operator_directory), now=...)` consumes the
+run/challenge in a caller-injected, private, create-only, fsynced disk ledger
+and returns only the signed handoff digest. `inspect_closed(...)` additionally
+requires the previously consumed handoff, an independently supplied
+post-handoff authorization digest/time and independent witness key; it
+consumes a separate close claim and returns a `DispositionClaim` containing
+the claimed disposition (`disposed` or `quarantined`), closed-record digest
+and witness-acknowledgment digest, never a PASS or verified Azure deletion.
+Close the operator-supplied registry after use.
+No in-memory registry or missing registry qualifies. A failed
+registry fsync burns the attempted claim rather than allowing retry. Callers
+must independently authenticate approvals, both keys, the archive's custody,
+the clock and the operator-owned ledger; signatures authenticate the
+accountable signer, not historical boot counts or uninterrupted control.
+This format assumes a newly reviewed dummy-OS deployment template and
+original-response capture outside this module. The current pinned template
+attaches the final OS disk and cannot be relabeled as a dummy deployment.
+
+### Offline #90 custodian helper
+
+`support/scripts/hyperv_issue90_custodian.py` is an offline helper for the
+custody format above. It can generate self-held test Ed25519 keys, record an
+injectable `az`-like runner's original stdout bytes into a private
+content-addressed archive plus append-only journal, assemble PREPARED and
+HANDED_OFF envelopes from those observations, and call `inspect_handoff(...)`
+against an independently supplied `Expected`. Tests drive the phase sequence
+with fakes only.
+
+`hyperv_issue90_custodian.py keys <private-dir>` creates a new 0700 directory
+and refuses to reuse an existing one. It writes one 0600 raw private key and one
+0600 raw-public-key hex file for each role: `custodian`, `approver` and
+`witness`. These keys are **TEST-ONLY**. If one operator generates or holds all
+three keys, they provide no independent custodian, approval or witness
+separation of duties; real custody must pin independently controlled public
+keys out of band. Custodian plans require explicit nonzero reviewed-source and
+build-provenance hashes. Grant-access output is never archived with its SAS
+value: the journal records only sanitized argv and a redacted observation
+marker. Upload evidence is written only after an injected upload callable
+returns the actual uploaded SHA-256 and byte count matching the reviewed input,
+inventory summaries are derived from a real `resource list` observation with no
+extra or missing resources, and HANDOFF `running_seconds` is derived from
+journaled deployment/deallocation timestamps unless an explicit larger value is
+supplied. A private `azure_policy` pin in the supplied `Expected` context is
+honored exactly as by the topology controller; without it, any policy-added VM
+identity is refused.
+
+The `live` entry point exists **only for one signed disposable dry run**
+(zero-content VHDs, everything deleted afterwards). It refuses any approval
+mode other than `disposable-dry-run`, and without a valid approval `live`
+refuses before any Azure call. Acceptance is never run here: it exists only
+in the separate owner-attested acceptance lane below, behind a signed
+`acceptance` approval, its pre-provision statement and a passing remote
+verifier.
+`approve-dry-run` writes a new 0600 approval: canonical JSON
+`{"body", "signature"}`, where the signature is Ed25519 over
+`uk-hyperv-issue90-custodian-live-approval-v1\n` plus the canonical body. The
+body has exactly `schema`, `version` (1), `mode`, `subscription_sha256`,
+`location` (`northeurope`), `run_id`, `operation_id`, `group_id`,
+`not_before_utc`, `not_after_utc`, `max_vm_running_seconds` (1..3600),
+`cleanup` (`delete-owned-group`) and `nonce`. It takes the run, operation and
+group from an `--expected-json` whose preprovision digest may be a
+placeholder, then prints the approval digest. The caller must set
+`Expected.preprovision_authorization_sha256` to that digest.
+
+Before any Azure call, `live` checks the following. The approval must be a
+private file, signed by an approver key that differs from the custodian key.
+It must be bound to the SHA-256 of the private subscription UUID, the exact
+expected run, operation and group, and the plan's region. Every expected
+resource ID must lie inside that group. The current time must fall inside a
+positive window of at most 300 minutes. `Expected` must carry the approval's
+digest, the ARM template bytes must match `Expected.template_sha256`, and the
+custodian key pair must match. The records directory and replay registry must
+not already hold this run's records or claims. A replay-registry claim then
+consumes the approval once.
+
+Every `az` call is pinned with `--subscription`; the journal records argv
+without that flag, but ARM IDs in arguments still contain the subscription, so
+the journal stays private. After `not_after_utc`, the runner refuses further
+calls except write-access revocation.
+`az group exists` must report `false` before `group create`, so an existing
+group is never adopted. Each grant runs inside a block that always attempts
+`disk revoke-access`, even after a failed or lost grant response or a failed
+upload. The VHD
+upload checks the local file's digest and size before sending any bytes. If
+the journaled dummy VM runtime exceeds the approved budget, the run refuses
+the OS swap. Azure can briefly report `Updating` even after a write returned
+`Succeeded`. So each VM state read recorded as evidence (the deployment
+child VM, dummy, deallocation, swap-settlement and final reads) is polled
+until `Succeeded`, up to 30 times, 10 seconds apart, while the VM reports `Creating`,
+`Updating` or `Migrating`. Every unsettled read is journaled as
+`<step>.unsettled-<n>`, and only the settled read becomes evidence. Any other
+state fails closed. The tool then signs and verifies the records; the handoff
+expires by `not_after_utc`.
+
+Cleanup always runs, without a deadline, whenever this journal proved the group
+name was free before `group create`. If `group create` failed or timed out,
+cleanup first probes `group exists`. It deletes the group only if:
+
+- the group's ID and owner tags match;
+- every listed resource is inside the group and tagged with this run and
+  operation.
+
+It deallocates an undeallocated VM best-effort and retries `disk
+revoke-access` on every listed owned disk without a journaled revoke (an
+active SAS blocks deletion). It then requires `group exists` to report
+`false`. A `KeyboardInterrupt`, or the first SIGTERM/SIGHUP received by the
+CLI (later ones are ignored, and an inherited `nohup` ignore is kept), is
+reported as a failure after cleanup instead of skipping it; SIGKILL or host
+loss still requires checking the subscription by hand. The run passes only if verification
+passed **and** the group was deleted. Output is PASS/FAIL with a sanitized
+reason and the cleanup status. If self-held **TEST-ONLY** keys are used,
+they are not independent custody.
+
+#### Owner-attested #90 acceptance lane
+
+`support/scripts/hyperv_issue90_acceptance.py` runs **one** real acceptance
+attempt with self-held **TEST-ONLY** custodian, approver and witness keys
+(three distinct keys). One operator holds all three, so every result is
+**owner-attested, not independent custody**; the summary always says
+`owner_attested_test_keys: true` and `independent_custody: false`. The opt-in
+verifier below decides the result; this lane only drives Azure and signs
+the statements the verifier requires.
+
+Preparation, all offline:
+
+1. Run the offline admission once and record the reproducible digest
+   (`offline-digest --admission-json ...`).
+2. `sign-preprovision` signs the approver's verifier-v1 `preprovision`
+   statement P from the expected context, the plan and that digest. Set
+   `Expected.preprovision_authorization_sha256` to P's printed digest.
+3. `approve-acceptance` writes a live approval with
+   `mode: "acceptance"`. It has the dry-run fields plus
+   `preprovision_sha256` (P's digest), `max_vm_running_seconds` of at most
+   3600 and a window of at most 300 minutes.
+
+Times are in the **verifier host's clock domain**. When the local clock is
+skewed, pass `--clock-offset-seconds` (local minus verifier UTC, at most
+3600) to `sign-preprovision` and `approve-acceptance`. The verifier
+requires P's `issued_at_utc` to be no later than its own clock and earlier
+than PREPARED. `approve-acceptance` refuses a P issued in the verifier's
+future, and a window that has already ended.
+
+Before any Azure call, `acceptance` applies the dry-run approval checks,
+requires P to be a valid approver-signed statement that matches `Expected`
+and the plan and was issued before now, and requires `Expected` and the
+approval to bind P's digest. It then asks the verifier to re-run the offline
+admission, and refuses unless the reproducible digest equals P's. Only then
+does a registry claim consume the approval once.
+
+The verifier runs on a separate x86_64 KVM host because it re-runs `admit()`.
+`serve-verifier` (offline inputs, expected, registry and the three public
+keys) speaks newline-delimited canonical JSON on stdin/stdout: a `ready`
+line, then exactly one request per stage, in order (offline, handoff,
+dispatch, optional observation, disposal). Bytes are bounded base64. The
+protocol uses private descriptors; stdio and diagnostics go to `/dev/null`,
+so stdout carries only protocol lines, even on startup failure.
+`--verifier-argv-json` names the command, for example an `ssh` argv. Each
+call has a deadline. Pipes are non-blocking, so a stalled peer cannot hold
+a read or write past it. A transport or response error is a refusal.
+
+The `ready` line carries the verifier's UTC time (`now_utc`, microseconds).
+`acceptance` connects before any Azure call and refuses a missing,
+malformed or more-than-3600 s-distant time. It then runs entirely on the
+verifier's clock: `now_utc` carried forward by the local monotonic clock
+from the moment `ready` was received. That clock lags the verifier slightly
+and is never ahead of it. It drives every statement, journal time, approval
+window, deadline and the start-after-reservation wait. The measured offset,
+rounded to seconds, is journaled and reported in the summary.
+
+After the dry-run style provisioning and HANDOFF (lifetime at most 55
+minutes), the lane does the following:
+
+- **Witness statements.** It journals a baseline `get-boot-log`. Text reads
+  go through `CustodianRecorder.az_text`, which refuses storage tokens. It
+  then signs a witness assurance whose single dummy interval equals HANDOFF
+  `running_seconds`, and the approver authorization with a fresh challenge.
+  It sends the verifier only PREPARED/HANDOFF evidence and witness blobs.
+- **One start.** If the verifier reserves the start, the lane waits past
+  the reservation and issues **exactly one** `az vm start`, never retried.
+  A failed or lost response is recorded as a lost start.
+- **Polling.** It polls `get-boot-log` for at most 15 minutes, within the
+  runtime budget and expiries, until a final or failure marker.
+- **Evidence.** It deallocates and proves the deallocation with a settled
+  instance view. The witness observation binds the parsed controller/LUN
+  topology to the original disk UUIDs.
+- **Cleanup always runs**, even after errors and interrupts. CLOSED, the
+  witness ACK and the witness disposal statement follow only when owned-group
+  deletion is proven.
+
+PASS requires the verifier's `FinalAcceptance` **and** a deleted group.
+Records and a sanitized `summary.json` are written privately.
+`require_live_cleanup_proof()` and the topology `run()` live gate stay
+closed.
+
+### Separate offline dummy-OS ARM candidate (not a deployment approval)
+
+`support/azure/hyperv-issue90-dummy-topology.json` is a **candidate only**;
+the pinned `hyperv-issue90-topology.json`, its controller and both disabled
+live gates remain unchanged. No existing runner selects this candidate.
+An independent approver must review its exact bytes and put its SHA-256 in
+`custody_records.Expected.template_sha256` and the signed preprovision
+authorization; a tag, same-name GET or locally computed hash is not an
+independent approval.
+
+Before a deployment, an external custodian would have to create the resource
+group and **four distinct managed disks** with separately captured original
+CLI create/terminal/upload/revocation receipts: the disposable dummy Linux
+Gen2 OS disk, the unattached final Linux Gen2 acceptance OS disk, and two
+independently seeded policy-2 data disks. Both OS disks must be compatible
+fixed VHDs and `StandardSSD_LRS`; both data disks must be
+`StandardSSD_LRS`, 4 GiB (8,388,608 sectors of 512 bytes), with different
+reviewed seed hashes. Verify each original Azure-assigned disk `uniqueId`,
+`diskSizeBytes`, `creationData.uploadSizeBytes`, Gen2 `hyperVGeneration: V2`
+on both OS disks, exact ID/tags and image bytes separately. Template string
+bounds do **not** validate lowercase digests, canonical UUIDs, disk SKU,
+generation, actual byte digests, uniqueness or ownership: these need
+independent approval and the original-response custody checks. Supplying a
+UUID as a deployment parameter or VM tag does not prove it is Azure's UUID.
+
+The candidate deploys only the original VM, NIC, VNet and NSG as **nested
+deployment children** in North Europe. It selects `Standard_D2s_v5`, SCSI,
+explicit `Standard` security, a private NIC, and an NSG with exactly two
+wildcard rules: `DenyAllInbound` at priority 4095 and `DenyAllOutbound` at
+priority 4096. Both cover every source, destination, protocol and port,
+ahead of the default `AllowVnetInBound` and `AllowVnetOutBound` at priority
+65000 and `AllowInternetOutBound` at 65001. Without the inbound deny,
+same-VNet/peered sources can initiate ingress even without a public IP;
+without the outbound deny, the default outbound NSG allows still apply.
+The subnet also disables default outbound access; the candidate creates
+no public IP or NAT gateway. It attaches the externally created
+`dummyDiskId` as the initial VM OS disk and the two data disks at LUN 0 and
+7; the final acceptance OS disk is supplied in `parameters.osDiskId` with a
+distinct **unattached** original owner receipt, never deployed or attached
+here. `outputs.osDiskId` intentionally names `dummyDiskId`, **not**
+`parameters.osDiskId`; despite the shared name, an output is not evidence
+that the final OS disk was attached. The existing disabled controller's
+`deployment_proof()` expects its old final-OS output and must not be reused
+for this candidate. `outputs.vmUuid`
+uses the same pinned Compute 2025-11-01 `reference(...).properties.vmId`
+as the original template. The inherited `image-sha256` tag pins the reviewed
+**final** image, while `dummy-image-sha256` identifies the initially attached
+dummy; neither tag attests uploaded bytes. ARM's original deployment outputResources,
+correlation ID and VM UUID need separate original deployment-response
+capture and independently verified child GETs; outputResources do not
+constitute direct PUT receipts for individual VM/network children. The
+custodian must deallocate and account for **all dummy boots in the total
+60-minute runtime** before a later, separately authorized deallocated OS
+swap. Nothing in this template performs that swap or acceptance boot.
+
+The [ARM template schema](https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json),
+[Compute VM 2025-11-01](https://learn.microsoft.com/en-us/azure/templates/microsoft.compute/2025-11-01/virtualmachines),
+[disk 2025-01-02](https://learn.microsoft.com/en-us/azure/templates/microsoft.compute/2025-01-02/disks),
+[Network VNet 2024-05-01](https://learn.microsoft.com/en-us/azure/templates/microsoft.network/2024-05-01/virtualnetworks)
+and [NSG rule/default behavior](https://learn.microsoft.com/en-us/azure/virtual-network/network-security-groups-overview)
+references document the attached managed OS disk, explicit `Standard`
+security, disk `V2` generation and subnet `defaultOutboundAccess: false`.
+No AzurePlatformDNS/IMDS Allow rules were added. Azure platform DNS/IMDS
+exemptions may still exist: the NSG denies do **not** prove universal
+egress isolation or that every platform-service flow is filtered. Verify
+any required platform-flow controls independently.
+ARM does **not** set the generation of an externally attached OS disk in
+the VM resource: the original disk create/show proof must establish Gen2,
+and a template parameter/tag cannot replace it. The public template schema
+does not furnish the pinned Compute/Network provider resource schemas for a
+complete offline deployment validation; these synthetic tests verify JSON,
+parameter bounds and exact resource/output structure, not Azure acceptance.
+The actual Azure CLI response shapes, regional deployment behavior and
+private reviewed image/build evidence are still unavailable. Do not run
+`az deployment`, change the controller gate, or treat this candidate as
+provisioning permission.
+
+### Opt-in offline custody verifier (no Azure dispatch)
+
+`support/scripts/hyperv_issue90_custody_verifier.py` is a **separate offline
+API**, not a route through `hyperv_issue90_topology.run()` and not a cloud
+authorization. Instantiate `Verifier(OfflineInputs, Expected, archive,
+FileReplayRegistry, custodian_key=..., approver_key=..., witness_key=...,
+clock=...)`
+with **three different externally pinned Ed25519 public keys**, an
+operator-owned durable registry, a trusted independent UTC clock and a
+custodied original-response archive. Do not choose keys, expected IDs, or
+timestamps from the records being verified. The stages are
+`verify_offline() -> OfflineAdmission`,
+`verify_handoff(offline, prepared, handoff, preprovision, assurance,
+baseline, now=...) -> PreBootCandidate`,
+`reserve_dispatch(preboot, acceptance, fresh_challenge, now=...)
+-> DispatchPermit`,
+`verify_observation(permit, observation, serial, baseline, now=...)
+-> CandidateAcceptance`, and
+`verify_disposal(candidate_or_permit, closed, acknowledgment, disposal,
+now=...) -> FinalAcceptance | Refusal`. Each stage may instead return a
+typed `Refusal(stage, reason)`; `disposal_recorded=True` means an unsuccessful
+attempt was independently closed, **not PASS**. The sole PASS field belongs
+to `FinalAcceptance`, which still has `scope=offline_only` and
+`cloud_authorized=False`. A permit consumes an allowance before it is
+returned; it is **not** permission for this library to start Azure. There is
+no network client, production key selection, resource creation or cleanup
+implementation in this module. Do not feed handcrafted `OfflineAdmission`
+instances to downstream code: the verifier itself calls the actual admission
+helper, which requires reviewed source, solved configuration, EFI/raw/fixed
+VHD/Miz fingerprints, distinct 8,388,608-sector policy-2 seed VHDs and four
+real local QEMU boots. The synthetic test doubles exercise shape/refusal
+only, not private build or actual Azure evidence.
+
+The separate verifier statement protocol uses canonical, bounded JSON
+`{"body": ..., "signature": "<128 lowercase hex characters>"}`, signed
+with Ed25519 over
+`uk-hyperv-issue90-verifier-v1-STAGE + "\n" + canonical_json(body)`.
+`body.schema` is `uk-hyperv-issue90-verifier-v1`; stages are
+`preprovision` (approver), `assurance` (witness), `acceptance`
+(approver), `observation` (witness), and `disposal` (witness).
+All carry the exact run/operation IDs and whole-second UTC issue time;
+extra/missing fields, unknown intervals, incomplete ledgers, stale records,
+unbound hashes, noncanonical signatures and missing archive bytes refuse.
+Preprovision predates PREPARED and binds the **reproducible offline
+admission hash** and its reviewed head/source, config, EFI, raw, VHD and Miz
+digests; both seed hashes, dummy VHD, reviewed dummy template, envelope and
+all ten original resource IDs. The reproducible hash,
+`reproducible_offline_sha256(offline)`, is the SHA-256 of the canonical
+admission JSON with only each boot's `serial_sha256` and `report_sha256`
+removed: real boot serials carry timestamps, so a later `admit()` cannot
+reproduce them, while every other admission field must still match. Assurance is issued at/after HANDED_OFF and binds
+the handoff/preprovision digests, independent no-writer and no-prior-boot
+assertions, bounded RBAC and boot-history archive digests, original VM/disk
+UUIDs, fresh pre-dispatch serial baseline and generation, and a **complete**
+dummy-boot runtime ledger. The acceptance authorization is issued **after**
+handoff and binds its hash, prepared/preprovision/assurance/offline hashes,
+the exact VM/disk IDs and UUIDs, independently selected fresh challenge and
+remaining runtime. Its expiry cannot exceed the shorter assurance/handoff
+window. The private fsynced replay registry claims the run's **only start**
+and the fresh dispatch challenge before any permit is returned. It records the
+independent `clock()` reading with microsecond precision in the durable start
+claim and binds its hash and timestamp to the permit. Reservation refuses if
+that clock reading is before either the independently supplied trusted `now`
+at dispatch or the earlier trusted handoff-verification time; no unknown
+clock skew is accepted. Under an owner-only file lock, the registry also
+rejects timestamps at or before the latest retained start claim, including
+claims made by another verifier instance or process. Keep the **same**
+operator-owned, append-only registry across invocations; missing, malformed
+or legacy **retained** start claims refuse new reservations. This relies on
+reliable local file locking/fsync; deletion or replacement of earlier claims
+by the registry owner cannot be detected by scanning the remaining files.
+The external clock and `now` must both be independently trustworthy and
+stable: an initially wrong clock with an empty registry, or two clocks that
+roll back together before any retained high-water mark, cannot be proved
+correct by this offline verifier. Neither the approver's
+issue time nor an unpersisted later `now` substitutes for the reservation.
+Signed boot intervals must begin strictly after the persisted reservation,
+and the signed observation cannot predate it. A lost
+response or fsync uncertainty consumes that start. There is no retry.
+
+An independently signed observation binds the permit hash, an archived
+**normalized witness start receipt** (not an invented Azure CLI output
+shape), one dispatch, an authenticated boot
+generation different from the witnessed pre-dispatch baseline, and the
+bounded serial bytes. `parse_serial()` must parse complete, ordered OS MBR/GPT
+and two distinct policy-2 data reads at LUNs 0 and 7, with multiple observed
+controllers; the signed device binding must map each parsed controller,
+channel and LUN to its **original disk UUID** and resource ID. A disk UUID
+is an Azure resource identity, **not** a VHD byte digest: both identity
+and separately reviewed VHD/seed hashes must match. Stale/partial/unredacted
+serial or a synthetic parsed report
+is insufficient. The witness's complete nonoverlapping VM ledger must
+reconcile dummy plus acceptance time at **at most 3,600 seconds**. A failed
+or ambiguous start still needs CLOSED and its independently signed,
+durably recorded ACK. A separate signed post-run witness statement must
+reconcile VM quiescence, the total runtime and every original group, dummy
+and final disk, deployment, VM and network identity with an archived settled
+disposal/quarantine terminal. Quarantine or a failed boot records a refusal,
+never PASS.
+
+The independently signed disposal statement must be **strictly later** than
+the signed candidate observation (if present) and the authenticated
+CLOSED acknowledgment; CLOSED itself must follow the observation. The
+verified custody chain and its durable close acknowledgment remain mandatory.
+
+An authenticated signature binds *asserted evidence*, not actual Azure
+authority. The operator must independently establish control of the witness
+key and provenance of unedited original Azure CLI/LRO, RBAC, boot diagnostics
+and deletion/quarantine observations, uninterrupted no-writer custody,
+genuine private image/build artifacts and a reviewed dummy-OS template.
+Those inputs are presently unavailable; no locally fabricated response or
+test fixture satisfies them. Neither this verifier nor a signed assertion
+opens `require_reviewed_build_proof()` or `require_live_cleanup_proof()`;
+the existing live lane remains disabled.
 
 ## Private application-network peer
 

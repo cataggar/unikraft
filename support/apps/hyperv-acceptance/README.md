@@ -45,6 +45,131 @@ The default probe never writes to a block device. An environment without
 StorVSC or NetVSC returns 2 (`UNAVAILABLE`); a present device that cannot bind,
 configure, complete I/O, or meet the timeout returns 1.
 
+## Read-only storage topology profile
+
+Select `CONFIG_APPHYPERVACCEPTANCE_STORAGE_TOPOLOGY=y` for a separate,
+default-off storage-only workload. It selects guarded StorVSC read sessions
+and requires a nonempty LU-associated VPD identity for every target; unlike
+the default smoke workload, it cannot fall back to unpinned reads. Configure
+the 32-lowercase-hex-digit
+`CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_RUN_ID`, distinct
+`CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_DISK0_ID` and
+`CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_DISK_NONZERO_ID`, exact positive
+`CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_DISK0_SECTORS` and
+`CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_DISK_NONZERO_SECTORS`, and
+`CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_NONZERO_LUN=7`. The approved
+two-4-GiB-disk configuration uses 8,388,608 sectors of 512 bytes for
+**each** data disk, `CONFIG_LIBSTORVSC_MAX_DEVICES>=3`, and
+`CONFIG_LIBSTORVSC_MAX_LUNS=4`. Invalid or unset IDs and geometry fail
+before storage I/O.
+
+The workload waits for complete discovery, inventories a coherent generation,
+and reads LBAs 0-1 from each target. Exactly one LUN-0 target must have both
+MBR and primary GPT signatures. Independently on the two selected data disks,
+it reads LBAs 8-9 and compares **both complete 512-byte sectors** against the
+expected policy-2 seed manifest (run ID, distinct disk ID, LUN, exact
+capacity, CRC, and layout). It validates each read session and the final
+inventory; unexpected unseeded LUNs are reported but cannot substitute for
+either required data disk. Only `UK_HYPERV_TOPOLOGY_READ_OK` with
+`HYPERV_TOPOLOGY FINAL PASS` means all three reads and mappings passed.
+An empty inventory is `UNAVAILABLE` only after two coherent, driver-proven
+pristine-empty snapshots with no StorVSC offers. An unbound/rejected offer,
+previously observed storage lifetime, or mappings without an offer fail
+instead. Raw and fixed-VHD local QEMU boots without offered StorVSC can
+demonstrate only this `UNAVAILABLE` path, never a real-device `PASS`.
+On a read timeout, the probe fails closed: its request buffer and read session
+stay pinned while the I/O is outstanding, and subsequent probes cannot reuse
+either. If a delayed completion arrives, a later probe can release the session
+but still fails; only a fresh boot can retry acceptance.
+Serial evidence contains controller/channel/SCSI mappings and diagnostic
+CRC32 fingerprints, not raw run IDs, disk IDs, VPD IDs, or instance GUIDs.
+These CRC32 values are correlation hints, not security identities.
+
+This profile never issues block writes or flushes, does not run the DHCP/network
+workload, and cannot be used as the persistence two-boot workload. Its
+production-backed hosted fixture verifies reverse controller offers, two
+distinct seed reads, wrong-disk and corrupt-copy seed rejection, duplicate
+boot-disk rejection, and zero write/flush commands. A guest-side fixture at
+`support/apps/hyperv-acceptance/tests/topology-workload-test.sh` exercises
+both mapping orders, failure/timeout session ownership, and pristine-empty
+availability entirely offline. Run it with:
+
+```sh
+sh support/apps/hyperv-acceptance/tests/topology-workload-test.sh
+```
+
+The separate
+`support/scripts/hyperv_issue90_topology.py` controller describes offline
+fresh-image and two-seed preparation. Its `solved_config()` requires the
+guarded I/O selected by this profile, but preparation still refuses without
+reviewed-source/solved-config-to-EFI build proof; synthetic evidence cannot
+satisfy that gate. Its live run is **not yet safe**:
+if an Azure create response is lost, it cannot prove the original resource
+identity needed for mandatory owner-checked deletion. Do not allocate Azure
+resources through this lane until that failure path is resolved. The
+one-data-disk runner is not a substitute.
+
+The separate `support/scripts/hyperv_issue90_offline_admission.py` checks a
+fresh private plan against independently reviewed source/config/build/image
+and tool fingerprints, verifies both policy-2 seed VHDs, runs Miz against the
+complete fixed VHD, and executes four fresh local native QEMU boots (including
+real read-only `vpc` boots). It returns `OfflineAdmission` or an explicit
+`OfflineRefusal`, always scoped `offline_only` and never a cloud grant.
+It copies pinned Miz, native runner, and QEMU bytes from verified file
+descriptors into a fresh owner-only directory before execution; that
+directory and the private Git runtime require nonreplaceable ancestors.
+QEMU must provide a real `vpc` block driver; the pinned `cataggar/qemu`
+release used by `prepare` omits it (that path boots the fixed VHD through the
+raw driver), so it cannot pass the `vpc` boots. The runner's fixed q35/KVM
+command loads exactly `kvmvapic.bin` and `vgabios-stdvga.bin`, which QEMU
+resolves relative to its own directory. `OfflineInputs.qemu_support` names
+those two files as `[../]share/[dir/]<rom>` paths: the default is the
+relocatable `share/` layout, while a distribution QEMU in `/usr/bin` typically
+needs `../share/qemu/kvmvapic.bin` and `../share/seavgabios/vgabios-stdvga.bin`.
+Runner and QEMU are copied into a private `bin/` directory, the ROMs into the
+same relative paths, and `qemu_support_sha256` pins each path, size and hash.
+The caller must authenticate the reviewed build and tool pins independently;
+a self-reported build receipt or saved local-boot report is insufficient.
+No private pins, images, QEMU installation, or build proof are supplied here.
+This opt-in verifier does not replace the blocked `prepare` or live cleanup
+gates.
+
+### Outstanding local four-boot proof
+
+Fixtures, parsed or synthesized serial logs, and the default-smoke public CI
+image are **not** physical topology boot evidence. On a capable x86-64 host,
+build a fresh *public* topology-enabled EFI from a recorded source commit and
+solved config with non-secret, distinct local IDs; package and hash its complete
+raw GPT disk and complete fixed VHD independently. Record the source/config,
+EFI, raw, VHD (including footer), QEMU executable, and OVMF firmware SHA-256
+digests. Do not borrow private images, seeds, or Azure resources.
+
+Use the [native local-boot driver](../../tools/hyperv/local_boot/README.md)
+with real x86 QEMU/KVM, `/dev/kvm`, OVMF, and four distinct owned work
+directories. Boot both `--raw-disk` and **actual** `--fixed-vhd` (the native
+driver opens a read-only `vpc` node), each with and without `--disable-x2apic`.
+For every invocation require `--expect-main-return 2`,
+`--expect 'HYPERV_TOPOLOGY FINAL UNAVAILABLE reason=no-devices'` and
+`--require-marker 'HYPERV_TOPOLOGY RESULT UNAVAILABLE'`; forbid
+`HYPERV_TOPOLOGY FINAL PASS`, `UK_HYPERV_TOPOLOGY_READ_OK`,
+`HYPERV_TOPOLOGY TARGET INFO`, `HYPERV_TOPOLOGY OS_READ`,
+`HYPERV_TOPOLOGY DATA_READ`, `HYPERV_PERSISTENCE`, and
+`UK_HYPERV_IO_READY`. Require the
+`Using legacy xAPIC MMIO` marker only in the legacy boot and forbid it in
+the x2APIC boot. Inspect all four complete serial logs for exactly one
+UNAVAILABLE final/result pair, no real-device PASS or crash, and an anchored
+`main returned 2`; retain per-boot runner reports, raw serial hashes and
+input/command provenance. An offline parser test cannot replace any boot.
+
+The older Python `hyperv-azure.py` VHD path opens a **raw prefix** rather than
+a `vpc` node; its VHD-mode log is not proof of a fixed-VHD boot. The native
+driver currently requires `q35,accel=kvm` and a host CPU: a downloaded
+AArch64 QEMU/TCG executable does not make this four-boot recipe runnable on
+an AArch64 host without x86 KVM. QEMU can be obtained from
+[upstream signed source or distribution packages](https://www.qemu.org/download/);
+the repository also pins a public QEMU release in its x86 CI acquisition
+script. Neither acquisition path supplies the missing EFI, firmware, or KVM.
+
 The default private peer inputs are:
 
 | Input | Value |
