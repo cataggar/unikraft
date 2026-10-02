@@ -914,6 +914,12 @@ open. Publication barriers revalidate the accepted run, source pins, selected
 source directories, exact output membership, sealed destination directories,
 copied bytes and canonical root-bound manifest.
 
+Export reuses `controller/custody_files.readRetained()` for same-descriptor
+identity binding. The shared module retains its bounded nested canonicalization
+workspace; input-tree reads do not add an immediate duplicate verification after
+this helper. Independent alias, final directory/member and named publication
+barrier revalidations remain separate; no observation is cached across barriers.
+
 Completed native `records` replay, handoff inspection and validator builds run
 inside the managed runtime, before its outer owner publishes
 `evidence/runtime-cleanup.txt`. That export-only proof is not a prerequisite of
