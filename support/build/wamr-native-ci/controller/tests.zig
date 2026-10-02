@@ -2913,6 +2913,8 @@ test "trusted historical inner stage accepts complete records and refuses tamper
     _ = try fixtureSparseImage(a, io, root, stage_root_path, &members, "vhd", &footer);
     const identity = .{
         .wamr_revision = wamr_revision,
+        .compiler_profile = "unikraft-x86_64",
+        .zig_version = "0.16.0",
         .minimal_wasi = false,
         .files = .{
             .@"tiny.wasm" = members.object.get("artifacts/wasm").?.object.get("sha256").?.string,
@@ -2924,6 +2926,7 @@ test "trusted historical inner stage accepts complete records and refuses tamper
     const identity_raw = try fixtureCanonical(a, identity);
     _ = try fixtureMember(a, io, root, &members, "artifacts/runtime_identity", identity_raw);
     const image = .{
+        .unikraft_revision = source.revision,
         .files = .{
             .@"wamr_hyperv-x86_64-efi" = members.object.get("artifacts/efi").?.object.get("sha256").?.string,
             .@"wamr_hyperv-x86_64-efi.dbg" = members.object.get("artifacts/debug_elf").?.object.get("sha256").?.string,
