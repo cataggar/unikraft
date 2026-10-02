@@ -4,7 +4,7 @@ const core = @import("hyperv_core");
 const files = core.private_files;
 const contracts = core.contracts;
 
-pub const Action = enum { build, boot, diagnostics, describe, @"supervisor-source-closure", records, @"local-consumer-custody", @"handoff-inspect", @"handoff-inspect-legacy", @"public-validator-build", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation" };
+pub const Action = enum { build, boot, diagnostics, describe, @"--identity", @"supervisor-source-closure", records, @"local-consumer-custody", @"handoff-inspect", @"handoff-inspect-legacy", @"public-validator-build", @"local-handoff-revalidation", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation", @"import-handoff-revalidation" };
 pub const Command = struct {
     action: Action,
     runtime: ?[]const u8 = null,
@@ -13,6 +13,7 @@ pub const Command = struct {
     output: ?[]const u8 = null,
     supervisor: ?[]const u8 = null,
     git: ?[]const u8 = null,
+    validator: ?[]const u8 = null,
     expected_build_start_sha256: ?contracts.Sha256 = null,
     expected_boot_inputs_sha256: ?contracts.Sha256 = null,
 };
@@ -20,6 +21,10 @@ pub const Command = struct {
 pub fn parse(args: []const []const u8) !Command {
     if (args.len < 2) return error.InvalidUsage;
     const action = std.meta.stringToEnum(Action, args[1]) orelse return error.InvalidUsage;
+    if (action == .@"--identity") {
+        if (args.len != 2) return error.InvalidUsage;
+        return .{ .action = action };
+    }
     if (action == .describe) {
         if (args.len != 4 or !std.mem.eql(u8, args[2], "--output") or
             !std.mem.eql(u8, args[3], "json-v1"))
@@ -101,8 +106,9 @@ pub fn parse(args: []const []const u8) !Command {
             return error.InvalidUsage;
         return result;
     }
-    if (action == .@"supervisor-import-identity") {
-        if (args.len != 10) return error.InvalidUsage;
+    if (action == .@"supervisor-import-identity" or action == .@"import-handoff-revalidation") {
+        if (args.len != (if (action == .@"import-handoff-revalidation") @as(usize, 12) else 10))
+            return error.InvalidUsage;
         var result = Command{ .action = action };
         var i: usize = 2;
         while (i < args.len) : (i += 2) {
@@ -115,11 +121,16 @@ pub fn parse(args: []const []const u8) !Command {
                 result.supervisor = value;
             } else if (std.mem.eql(u8, flag, "--git") and result.git == null) {
                 result.git = value;
+            } else if (std.mem.eql(u8, flag, "--validator") and
+                action == .@"import-handoff-revalidation" and result.validator == null)
+            {
+                result.validator = value;
             } else if (std.mem.eql(u8, flag, "--output") and result.output == null) {
                 result.output = value;
             } else return error.InvalidUsage;
         }
-        if (result.stage_root == null or result.supervisor == null or result.git == null or result.output == null)
+        if (result.stage_root == null or result.supervisor == null or result.git == null or result.output == null or
+            (action == .@"import-handoff-revalidation" and result.validator == null))
             return error.InvalidUsage;
         return result;
     }
@@ -140,7 +151,7 @@ pub fn parse(args: []const []const u8) !Command {
         if (result.stage_root == null or result.output == null) return error.InvalidUsage;
         return result;
     }
-    if (action == .@"handoff-inspect" or action == .@"handoff-inspect-legacy" or action == .@"public-validator-build") {
+    if (action == .@"handoff-inspect" or action == .@"handoff-inspect-legacy" or action == .@"public-validator-build" or action == .@"local-handoff-revalidation") {
         if (args.len != 6) return error.InvalidUsage;
         var result = Command{ .action = action };
         var i: usize = 2;

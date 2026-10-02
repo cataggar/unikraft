@@ -2803,14 +2803,15 @@ class HypervWorkflowTest(unittest.TestCase):
         build_step = workflow.split(
             "      - name: Build the tiny AOT image with the installed native producer and safety graph\n",
             1,
-        )[1].split("\n      - name: Run six Python boots", 1)[0]
+        )[1].split("\n      - name: Run six native boots", 1)[0]
         slots = (
             "for output in /d/wamr-ci/wamr-differential-sources "
             "/d/wamr-ci/wamr-differential; do"
         )
         self.assertLess(
             build_step.index(slots),
-            build_step.index("python3 support/build/wamr-native-ci/run.py build"))
+            build_step.index('"${controller}" build --runtime "${root}"'))
+        self.assertIn('controller="${WAMR_CI_CONTROLLER:?}"', build_step)
         driver = (
             SUPPORT.parent / ".github/scripts/wamr-native-ci.sh"
         ).read_text()

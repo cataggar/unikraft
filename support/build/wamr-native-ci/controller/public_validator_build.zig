@@ -8,6 +8,69 @@ const handoff_inspect = @import("handoff_inspect.zig");
 const physical = @import("custody_files.zig");
 const records = @import("records.zig");
 
+pub fn revalidateHandoff(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    accepted: *accepted_run.AcceptedRun,
+    output: []const u8,
+    signal: ?*core.process.SignalCancellation,
+) !@import("command_validation.zig").ValidatedCommand {
+    if (accepted.context != .local_runtime or accepted.repository == null or
+        accepted.local_producer != .native or
+        accepted.compatibility != .tiny_v2_qcow2_derived_vhd)
+        return error.InvalidContext;
+    try accepted.revalidateWithSignal(signal);
+    var roots = try handoff_inspect.bind(accepted, output);
+    const build_output = try std.fs.path.join(allocator, &.{ accepted.root, "compute/public-source/validator-build" });
+    const command_path = try std.fs.path.join(allocator, &.{ build_output, "evidence/command-public-validator-build.json" });
+    var command = try files.RetainedFile.open(io, command_path, .private);
+    defer command.close(io);
+    var command_raw = try files.readSensitiveFile(io, allocator, command.file, records.max_record_bytes, .private);
+    defer command_raw.deinit();
+    var document = try core.contracts.Document.parse(allocator, command_raw.bytes(), .{
+        .bytes = records.max_record_bytes,
+        .depth = 32,
+        .items = 4096,
+        .tokens = 65536,
+    });
+    defer document.deinit();
+    const value = document.value();
+    if (value != .object) return error.CommandOutputChanged;
+    const expected_bytes = try core.contracts.integer(usize, value.object.get("bytes") orelse return error.CommandOutputChanged);
+    _ = try validateCommandEvidence(allocator, io, accepted, build_output, expected_bytes);
+    const build_log_path = try std.fs.path.join(allocator, &.{ build_output, "private/public-validator-build.log" });
+    var build_log = try files.RetainedFile.open(io, build_log_path, .private);
+    defer build_log.close(io);
+    roots.direct_validator = try std.fs.path.join(allocator, &.{ build_output, "public-source/tools/bin/uk-wamr-direct-validate" });
+    roots.bundle = try std.fs.path.join(allocator, &.{ accepted.root, "compute/public-source/handoff/bundle.json" });
+    var validator = try files.RetainedFile.open(io, roots.direct_validator, .tool);
+    defer validator.close(io);
+    var bundle = try files.RetainedFile.open(io, roots.bundle, .private);
+    defer bundle.close(io);
+    const parent_path = std.fs.path.dirname(output) orelse return error.UnsafePath;
+    const name = std.fs.path.basename(output);
+    try files.basename(name);
+    const parent = try files.openDirectory(io, parent_path, .private);
+    defer parent.close(io);
+    try parent.createDir(io, name, .fromMode(0o700));
+    const work = try files.openDirectory(io, output, .private);
+    defer work.close(io);
+    for ([_][]const u8{ "private", "evidence" }) |entry|
+        try work.createDir(io, entry, .fromMode(0o700));
+    const private = try work.openDir(io, "private", .{ .iterate = true });
+    defer private.close(io);
+    const evidence = try work.openDir(io, "evidence", .{ .iterate = true });
+    defer evidence.close(io);
+    const checked = try @import("import_validator_build.zig").revalidateHandoffCommand(allocator, io, roots, private, evidence, signal);
+    try accepted.revalidateWithSignal(signal);
+    _ = try validateCommandEvidence(allocator, io, accepted, build_output, expected_bytes);
+    try command.verify(io);
+    try build_log.verify(io);
+    try validator.verify(io);
+    try bundle.verify(io);
+    return checked;
+}
+
 pub fn run(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -95,7 +158,9 @@ pub fn validateCommandEvidence(
         !std.mem.eql(u8, &record.sha256, &observed_sha256)) return error.CommandOutputChanged;
     try pinned.verify(io);
     const checked = try accepted_run.validateLocalPostRunCommand(
-        accepted, raw, .@"public-validator-build",
+        accepted,
+        raw,
+        .@"public-validator-build",
     );
     const log_path = try std.fs.path.join(allocator, &.{ output, "private/public-validator-build.log" });
     defer allocator.free(log_path);

@@ -517,9 +517,12 @@ fn rawValue(allocator: std.mem.Allocator, raw: []const u8) !std.json.Value {
 }
 
 fn supervisorState(context: *Context) !std.json.Value {
-    const a = context.allocator;
-    const source_map = try supervisorSourceMap(context);
-    const runtime_map = try supervisorRuntimeMap(context);
+    return captureSupervisorState(context.allocator, context.io, context.repository, context.roots.supervisor);
+}
+
+pub fn captureSupervisorState(a: std.mem.Allocator, io: std.Io, repository: []const u8, supervisor: []const u8) !std.json.Value {
+    const source_map = try supervisorSourceMap(a, io, repository);
+    const runtime_map = try supervisorRuntimeMap(a, io, supervisor);
     return typedValue(a, .{
         .schema = "uk.wamr.command-supervisor",
         .version = 1,
@@ -538,8 +541,7 @@ const Map = struct {
 };
 const MapEntry = struct { name: []const u8, file: physical.File };
 
-fn guardedMap(context: *Context, domain: []const u8, sorted: []const MapEntry) !Map {
-    const a = context.allocator;
+fn guardedMap(a: std.mem.Allocator, domain: []const u8, sorted: []const MapEntry) !Map {
     var content = Sha256.init(.{});
     content.update(try std.fmt.allocPrint(a, "{s}-content\x00", .{domain}));
     var physical_hash = Sha256.init(.{});
@@ -565,27 +567,25 @@ fn guardedMap(context: *Context, domain: []const u8, sorted: []const MapEntry) !
     };
 }
 
-fn supervisorSourceMap(context: *Context) !Map {
-    const a = context.allocator;
+fn supervisorSourceMap(a: std.mem.Allocator, io: std.Io, repository: []const u8) !Map {
     var entries: std.ArrayList(MapEntry) = .empty;
     for (custody.closure) |entry| {
-        const file = try physical.readFile(context.io, try join(context, &.{ context.repository, entry.name }), limits.tracked_file, false);
+        const file = try physical.readFile(io, try std.fs.path.join(a, &.{ repository, entry.name }), limits.tracked_file, false);
         try entries.append(a, .{ .name = entry.name, .file = file });
     }
-    return guardedMap(context, "uk.wamr.command-supervisor-source-v1", entries.items);
+    return guardedMap(a, "uk.wamr.command-supervisor-source-v1", entries.items);
 }
 
-fn supervisorRuntimeMap(context: *Context) !Map {
-    const a = context.allocator;
+fn supervisorRuntimeMap(a: std.mem.Allocator, io: std.Io, supervisor: []const u8) !Map {
     var entries: std.ArrayList(MapEntry) = .empty;
-    const binary = try physical.readFile(context.io, context.roots.supervisor, limits.tracked_file, false);
+    const binary = try physical.readFile(io, supervisor, limits.tracked_file, false);
     try entries.append(a, .{ .name = "executable", .file = binary });
-    const runtime_paths = try inputs.executableRuntimePaths(a, context.io, context.roots.supervisor);
+    const runtime_paths = try inputs.executableRuntimePaths(a, io, supervisor);
     for (runtime_paths) |path| {
         const role = try std.fmt.allocPrint(a, "runtime:{s}", .{path});
-        try entries.append(a, .{ .name = role, .file = try physical.readFile(context.io, path, limits.tracked_file, false) });
+        try entries.append(a, .{ .name = role, .file = try physical.readFile(io, path, limits.tracked_file, false) });
     }
-    return guardedMap(context, "uk.wamr.command-supervisor-runtime-v1", entries.items);
+    return guardedMap(a, "uk.wamr.command-supervisor-runtime-v1", entries.items);
 }
 
 pub fn buildLocalBoot(state: AdapterBuilt) !LocalBootBuilt {

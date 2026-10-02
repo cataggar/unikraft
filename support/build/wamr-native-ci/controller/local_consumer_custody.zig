@@ -29,6 +29,17 @@ fn recordedPath(map: std.json.Value, role: []const u8) ![]const u8 {
     return path;
 }
 
+fn nativeProducer(allocator: std.mem.Allocator, runtime: []const u8, files_map: std.json.Value) !bool {
+    const supervisor = try recordedPath(files_map, "command-supervisor");
+    const native = try std.fs.path.join(allocator, &.{ runtime, "controller/bin/uk-wamr-native-ci" });
+    defer allocator.free(native);
+    if (std.mem.eql(u8, supervisor, native)) return true;
+    const python = try std.fs.path.join(allocator, &.{ runtime, "compute/supervisor/bin/wamr-ci-supervisor" });
+    defer allocator.free(python);
+    if (std.mem.eql(u8, supervisor, python)) return false;
+    return error.UnexpectedInputPath;
+}
+
 fn fixedPath(
     allocator: std.mem.Allocator,
     map: std.json.Value,
@@ -92,6 +103,7 @@ fn buildRoles(
     const files_map = try get(consumer, "files");
     const tree_map = try get(consumer, "trees");
     const tools = try get(start, "tools");
+    const native = try nativeProducer(allocator, runtime, files_map);
     if (files_map != .object or files_map.object.count() > 256 or
         tree_map != .object or tree_map.object.count() != 4 or
         tools != .object or tools.object.count() != inputs.host_tools.len)
@@ -108,11 +120,18 @@ fn buildRoles(
         try addRuntime(allocator, io, &allowed, try recordedPath(files_map, role));
     }
     for ([_]struct { role: []const u8, relative: []const u8 }{
-        .{ .role = "command-supervisor", .relative = "compute/supervisor/bin/wamr-ci-supervisor" },
+        .{ .role = "command-supervisor", .relative = if (native) "controller/bin/uk-wamr-native-ci" else "compute/supervisor/bin/wamr-ci-supervisor" },
         .{ .role = "native:wamr-aot-build", .relative = "compute/tools/bin/uk-wamr-aot-build" },
         .{ .role = "native:wamr-log-validate", .relative = "compute/tools/bin/uk-wamr-log-validate" },
+        .{ .role = "native:wamr-native-ci-fixtures", .relative = "compute/tools/bin/wamr-native-ci-fixtures" },
+        .{ .role = "native:wamr-ci-package", .relative = "compute/tools/bin/wamr-ci-package" },
+        .{ .role = "native:wamr-ci-supervisor-fixture", .relative = "compute/tools/bin/wamr-ci-supervisor-fixture" },
         .{ .role = "wamr-source-archive", .relative = "custody/wamr-source.tar" },
     }) |item| {
+        if (!native and (std.mem.eql(u8, item.role, "native:wamr-native-ci-fixtures") or
+            std.mem.eql(u8, item.role, "native:wamr-ci-package") or
+            std.mem.eql(u8, item.role, "native:wamr-ci-supervisor-fixture")))
+            continue;
         try addRole(&allowed, item.role);
         try fixedPath(allocator, files_map, item.role, runtime, item.relative);
         if (!std.mem.eql(u8, item.role, "wamr-source-archive")) {
@@ -150,6 +169,7 @@ fn bootRoles(
     repository: []const u8,
     runtime: []const u8,
     boot: std.json.Value,
+    native: bool,
     signal: ?*core.process.SignalCancellation,
 ) !void {
     const files_map = try get(boot, "files");
@@ -161,15 +181,19 @@ fn bootRoles(
     defer allowed.deinit();
     for ([_]struct { role: []const u8, root: []const u8, relative: []const u8 }{
         .{ .role = "efi", .root = repository, .relative = "support/apps/wamr-aot/build/wamr_hyperv-x86_64-efi" },
-        .{ .role = "local_boot_tool", .root = runtime, .relative = "compute/tools/bin/uk-hyperv-local-boot" },
+        .{ .role = "local_boot_tool", .root = runtime, .relative = if (native) "compute/local-boot-tools/bin/uk-hyperv-local-boot" else "compute/tools/bin/uk-hyperv-local-boot" },
+        .{ .role = "log_validator", .root = runtime, .relative = "compute/tools/bin/uk-wamr-log-validate" },
         .{ .role = "package_tool", .root = runtime, .relative = "compute/tools/bin/wamr-ci-package" },
         .{ .role = "qemu", .root = runtime, .relative = "bin/qemu-system-x86_64" },
         .{ .role = "ovmf_code", .root = runtime, .relative = "firmware/code.fd" },
         .{ .role = "ovmf_vars", .root = runtime, .relative = "firmware/vars.fd" },
     }) |item| {
+        if (!native and std.mem.eql(u8, item.role, "log_validator") and files_map.object.get("log_validator") == null)
+            continue;
         try addRole(&allowed, item.role);
         try fixedPath(allocator, files_map, item.role, item.root, item.relative);
         if (std.mem.eql(u8, item.role, "local_boot_tool") or
+            std.mem.eql(u8, item.role, "log_validator") or
             std.mem.eql(u8, item.role, "package_tool") or
             std.mem.eql(u8, item.role, "qemu"))
         {
@@ -207,6 +231,10 @@ fn recapture(allocator: std.mem.Allocator, io: std.Io, expected: std.json.Value)
 }
 
 pub const Fixture = if (@import("builtin").is_test) struct {
+    pub fn producer(allocator: std.mem.Allocator, runtime: []const u8, files_map: std.json.Value) !bool {
+        return nativeProducer(allocator, runtime, files_map);
+    }
+
     pub fn requireBuildStartDigest(bytes: []const u8, expected: contracts.Sha256) !void {
         try buildStartDigest(bytes, expected);
     }
@@ -310,7 +338,7 @@ pub fn run(
     try sameValue(allocator, try get(start, "source"), .{ .revision = before.revision, .tree = before.tree });
     try sameValue(allocator, try get(start, "source_custody"), before.custody);
     try buildRoles(allocator, io, repository, runtime, start, signal);
-    try bootRoles(allocator, io, repository, runtime, boot, signal);
+    try bootRoles(allocator, io, repository, runtime, boot, try nativeProducer(allocator, runtime, try get(consumer, "files")), signal);
     try notCancelled(signal);
     try recapture(allocator, io, consumer);
     try notCancelled(signal);

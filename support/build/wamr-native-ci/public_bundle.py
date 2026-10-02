@@ -23,6 +23,18 @@ MAX_MEMBERS = 96
 MAX_JSON = 65536
 V1_ZIP_MEMBERS = 55
 V2_ZIP_MEMBERS = 85
+PYTHON_SUPERVISOR_RELATIVE = Path("compute/supervisor/bin/wamr-ci-supervisor")
+NATIVE_CONTROLLER_RELATIVE = Path("controller/bin/uk-wamr-native-ci")
+NATIVE_PUBLIC_VALIDATOR_RELATIVE = Path(
+    "compute/public-source/validator-build/public-source/tools/bin/uk-wamr-direct-validate")
+NATIVE_PRODUCER_ROLES = (
+    (None, "command-supervisor", NATIVE_CONTROLLER_RELATIVE.as_posix()),
+    (None, "native:wamr-aot-build", "compute/tools/bin/uk-wamr-aot-build"),
+    (None, "native:wamr-log-validate", "compute/tools/bin/uk-wamr-log-validate"),
+    (None, "native:wamr-native-ci-fixtures", "compute/tools/bin/wamr-native-ci-fixtures"),
+    (None, "native:wamr-ci-package", "compute/tools/bin/wamr-ci-package"),
+    (None, "native:wamr-ci-supervisor-fixture", "compute/tools/bin/wamr-ci-supervisor-fixture"),
+)
 LEGACY_V1_SOURCES = frozenset({
     ("993e4d0d394c08202c0d0c57ea97450a19a4f394",
      "54f8e118146c78c24e7c802657c6ec62b268a5de"),
@@ -663,6 +675,11 @@ def consumer_file_path(start, role):
 
 def verify_public_build_side_checks(handoff, runtime, start, source, stage_prefix):
     ci = handoff.ci
+    if recorded_producer(runtime, start["consumer_inputs"]) == "native":
+        handoff.FAILURE_STAGE = stage_prefix + "-native-records"
+        accepted = accepted_records.local_runtime(runtime)
+        require(accepted["source"] == start["source"])
+        return
     handoff.FAILURE_STAGE = stage_prefix + "-command-supervisor-record"
     command_supervisor_record(start["command_supervisor"])
     handoff.FAILURE_STAGE = stage_prefix + "-dependencies"
@@ -680,6 +697,40 @@ def verify_public_build_side_checks(handoff, runtime, start, source, stage_prefi
     handoff.FAILURE_STAGE = stage_prefix + "-command-supervisor"
     require(ci.command_supervisor_state(runtime, start["consumer_inputs"])
             == start["command_supervisor"])
+
+
+def recorded_producer(runtime, consumer_inputs):
+    producer, unused_runtime = recorded_producer_info(
+        consumer_inputs, Path(runtime))
+    return producer
+
+
+def recorded_producer_info(consumer_inputs, runtime=None):
+    try:
+        files = consumer_inputs["files"]
+        supervisor = files["command-supervisor"]["path"]
+    except (KeyError, TypeError) as error:
+        raise ValueError("public-source bundle refused") from error
+    supervisor_path = Path(supervisor)
+    if (not supervisor_path.is_absolute()
+            or os.path.normpath(supervisor) != supervisor):
+        raise ValueError("public-source bundle refused")
+    if runtime is not None:
+        runtime = Path(runtime)
+        if supervisor == str(runtime / PYTHON_SUPERVISOR_RELATIVE):
+            return "python", runtime
+        if supervisor == str(runtime / NATIVE_CONTROLLER_RELATIVE):
+            return "native", runtime
+        raise ValueError("public-source bundle refused")
+    for producer, relative in (
+            ("python", PYTHON_SUPERVISOR_RELATIVE),
+            ("native", NATIVE_CONTROLLER_RELATIVE)):
+        root = supervisor_path
+        for unused in relative.parts:
+            root = root.parent
+        if supervisor_path == root / relative:
+            return producer, root
+    raise ValueError("public-source bundle refused")
 
 
 def accepted_public_build_start(handoff, runtime):
@@ -1262,12 +1313,31 @@ def publication_records(
         "tree": source["source_tree"],
     }
     if native_accepted is not None:
-        require(version == 2 and transport_context == "trusted_inner_zip"
-                and native_accepted["context"] == "trusted-inner-zip"
+        native_context = {
+            "producer_direct": "local-runtime",
+            "trusted_inner_zip": "trusted-inner-zip",
+        }.get(transport_context)
+        try:
+            accepted_records_by_name = {
+                record["name"]: record["sha256"]
+                for record in native_accepted["records"]
+            }
+            local_result_sha = next(
+                item["sha256"] for item in bundle["artifacts"]
+                if Path(item["path"]).name == "local_result")
+            accepted_result_sha = native_accepted["result"]["sha256"]
+            accepted_runtime_inputs = native_accepted["runtime_inputs"]
+        except (KeyError, StopIteration, TypeError):
+            require(False)
+        require(version == 2 and native_context is not None
+                and native_accepted["context"] == native_context
                 and native_accepted["compatibility"] == "tiny-v2"
+                and native_accepted["profile"] == ci.CURRENT_PROFILE
                 and native_accepted["source"] == expected_source
-                and {record["name"]: record["sha256"]
-                     for record in native_accepted["records"]} == {
+                and bool(accepted_runtime_inputs)
+                == (transport_context == "producer_direct")
+                and accepted_result_sha == local_result_sha
+                and accepted_records_by_name == {
                          Path(item["path"]).name: item["sha256"]
                          for item in bundle["evidence"]
                      })
@@ -1441,7 +1511,7 @@ def publication_records(
         publication_lineage_v2(handoff, stage, bundle)
 
 
-def pack(handoff, stage, archive, source, validator, supervisor):
+def pack(handoff, stage, archive, source, validator, supervisor, *, producer="python"):
     handoff.FAILURE_STAGE = "public-pack-context"
     source = context(source)
     handoff.private(stage)
@@ -1459,7 +1529,12 @@ def pack(handoff, stage, archive, source, validator, supervisor):
     handoff.FAILURE_STAGE = "public-pack-members"
     original = members(handoff, bundle, stage)
     handoff.FAILURE_STAGE = "public-pack-records"
-    publication_records(handoff, stage, source, "producer_direct")
+    native_accepted = None
+    if producer == "native":
+        native_accepted = accepted_records.local_runtime(stage.parents[2])
+    publication_records(
+        handoff, stage, source, "producer_direct",
+        native_accepted=native_accepted)
     # The private handoff's known inspection captures exist but are never copied.
     handoff.FAILURE_STAGE = "public-pack-tree"
     inspect_tree(stage, set(original) | {
@@ -1472,8 +1547,16 @@ def pack(handoff, stage, archive, source, validator, supervisor):
          else "evidence/command-handoff-inspect.json"),
     })
     handoff.FAILURE_STAGE = "public-pack-native"
-    native(
-        handoff, validator, supervisor, stage / "bundle.json", source)
+    if producer == "native":
+        runtime = stage.parents[2]
+        require(stage == runtime / "compute/public-source/handoff"
+                and Path(validator) == runtime / NATIVE_PUBLIC_VALIDATOR_RELATIVE
+                and Path(supervisor) == runtime / NATIVE_CONTROLLER_RELATIVE)
+        accepted_records.local_handoff_revalidation(
+            runtime, stage.with_name("handoff-revalidation"))
+    else:
+        native(
+            handoff, validator, supervisor, stage / "bundle.json", source)
     portable = copy.deepcopy(bundle)
     for item in members(handoff, portable, stage).values():
         item["path"] = Path(item["path"]).relative_to(stage).as_posix()
@@ -1663,12 +1746,22 @@ def import_bundle(
         })
     native_revalidation = None
     native_identity = None
+    producer = "python"
+    producer_runtime = None
     if bundle["version"] == 2:
         require(expected_archive_sha256 is not None
                 and type(artifact_id) is str
                 and re.fullmatch(r"[1-9][0-9]{0,19}", artifact_id)
                 and type(container_digest) is str)
         digest_string(container_digest)
+        start = handoff.ci.document(output / "evidence/build-start.json")
+        producer, producer_runtime = recorded_producer_info(
+            start["consumer_inputs"])
+        if producer == "native" and native_import_revalidation:
+            require(str(supervisor) == str(
+                producer_runtime / NATIVE_CONTROLLER_RELATIVE))
+            require(str(validator) == str(
+                producer_runtime / NATIVE_PUBLIC_VALIDATOR_RELATIVE))
         handoff.FAILURE_STAGE = "public-import-native-supervisor-identity"
         native_identity = identity_parent / "accepted"
         accepted_records.supervisor_import_identity(
@@ -1677,6 +1770,12 @@ def import_bundle(
             handoff.FAILURE_STAGE = "public-import-native-revalidation"
             native_revalidation = accepted_records.import_native_revalidation(
                 output, identity_parent / "revalidation")
+        elif producer == "native":
+            handoff.FAILURE_STAGE = "public-import-native-revalidation"
+            native_revalidation = accepted_records.import_native_revalidation(
+                output, identity_parent / "revalidation",
+                git=handoff.ci.tool("git"), supervisor=supervisor,
+                validator=validator)
         handoff.ci.save(output / "transport.json", {
             "schema": "uk.wamr.public-source-transport",
             "version": 2,
@@ -1698,12 +1797,13 @@ def import_bundle(
         handoff, output, expected, "trusted_inner_zip",
         "candidate-bundle.json",
         native_accepted=accepted if bundle["version"] == 2 else None)
-    if bundle["version"] == 2 and native_import_revalidation:
+    handoff.FAILURE_STAGE = "public-import-revalidation"
+    if bundle["version"] == 2 and (
+            native_import_revalidation or producer == "native"):
         require(native_revalidation is not None)
         handoff.private(native_revalidation)
     else:
         require(native_revalidation is None)
-        handoff.FAILURE_STAGE = "public-import-revalidation"
         native(
             handoff, validator, supervisor,
             output / "candidate-bundle.json", expected,
@@ -1721,6 +1821,7 @@ def publish_ci(handoff):
     handoff.result_records(runtime / "compute")
     build_start = accepted_public_build_start(handoff, runtime)
     start = build_start.start
+    producer = recorded_producer(runtime, start["consumer_inputs"])
     handoff.FAILURE_STAGE = "public-context-entry"
     source = ci_context(handoff, start)
     publication = runtime / "compute/public-source"
@@ -1733,43 +1834,59 @@ def publish_ci(handoff):
             == b"primary=0 cleanup=0\n")
     output.mkdir(mode=0o700)
     handoff.FAILURE_STAGE = "public-validator-build"
-    unused_output, validator_record = handoff.ci.execute(
-        runtime / "compute", "public-validator-build", [
-        handoff.ci.tool("zig"), "build", "--build-file",
-        handoff.ci.REPO / "support/tools/hyperv/direct/build.zig",
-        "--cache-dir", runtime / "compute/cache",
-        "--global-cache-dir", runtime / "compute/global-cache",
-        "--prefix", publication / "tools",
-        *handoff.ci.RECORDED_EXECUTABLE_TARGET,
-        "-Doptimize=ReleaseSafe", "-j2", "install"], 600,
-        input_records=handoff.ci.consumer_file_records(
-            start["consumer_inputs"]))
-    del unused_output
-    consumer_files = start["consumer_inputs"]["files"]
-    role_identities = {
-        "command-supervisor": handoff.ci.native_executable_identity(
-            consumer_files["command-supervisor"]),
-        **{
-            "tool:" + name: handoff.ci.native_executable_identity(
-                consumer_files["tool:" + name])
-            for name in handoff.ci.HOST_TOOLS
-        },
-    }
-    validator_record_path = (
-        runtime / "compute/evidence/command-public-validator-build.json")
+    native_validator_output = publication / "validator-build"
+    if producer == "native":
+        accepted_records.public_validator_build(runtime, native_validator_output)
 
-    def require_validator_record():
-        recorded = handoff.ci.document(validator_record_path)
-        require(recorded == validator_record)
-        supervised_command_record(
-            handoff.ci, recorded, "public-validator-build",
-            role_identities, "producer_direct")
-        native_public_build_custody(
-            handoff, runtime, build_start,
-            "public-validator-build-native-custody")
-        verify_public_build_side_checks(
-            handoff, runtime, start, source, "public-validator-build")
-        require(ci_context(handoff, start) == source)
+        def require_validator_record():
+            native_public_build_custody(
+                handoff, runtime, build_start,
+                "public-validator-build-native-custody")
+            accepted = accepted_records.local_runtime(runtime)
+            require(accepted["source"] == start["source"]
+                    and ci_context(handoff, start) == source)
+            accepted_records._completed_output(
+                native_validator_output, "public-validator-build",
+                8 * 1024 * 1024 + 1,
+                "native public validator build refused")
+    else:
+        unused_output, validator_record = handoff.ci.execute(
+            runtime / "compute", "public-validator-build", [
+            handoff.ci.tool("zig"), "build", "--build-file",
+            handoff.ci.REPO / "support/tools/hyperv/direct/build.zig",
+            "--cache-dir", runtime / "compute/cache",
+            "--global-cache-dir", runtime / "compute/global-cache",
+            "--prefix", publication / "tools",
+            *handoff.ci.RECORDED_EXECUTABLE_TARGET,
+            "-Doptimize=ReleaseSafe", "-j2", "install"], 600,
+            input_records=handoff.ci.consumer_file_records(
+                start["consumer_inputs"]))
+        del unused_output
+        consumer_files = start["consumer_inputs"]["files"]
+        role_identities = {
+            "command-supervisor": handoff.ci.native_executable_identity(
+                consumer_files["command-supervisor"]),
+            **{
+                "tool:" + name: handoff.ci.native_executable_identity(
+                    consumer_files["tool:" + name])
+                for name in handoff.ci.HOST_TOOLS
+            },
+        }
+        validator_record_path = (
+            runtime / "compute/evidence/command-public-validator-build.json")
+
+        def require_validator_record():
+            recorded = handoff.ci.document(validator_record_path)
+            require(recorded == validator_record)
+            supervised_command_record(
+                handoff.ci, recorded, "public-validator-build",
+                role_identities, "producer_direct")
+            native_public_build_custody(
+                handoff, runtime, build_start,
+                "public-validator-build-native-custody")
+            verify_public_build_side_checks(
+                handoff, runtime, start, source, "public-validator-build")
+            require(ci_context(handoff, start) == source)
 
     require_validator_record()
     handoff.FAILURE_STAGE = "public-export"
@@ -1779,12 +1896,16 @@ def publish_ci(handoff):
             handoff, "FAILURE_STAGE", "public-export-" + phase))
     handoff.FAILURE_STAGE = "public-export-postcheck"
     require_validator_record()
-    validator = publication / "tools/bin/uk-wamr-direct-validate"
+    validator = (
+        native_validator_output / "public-source/tools/bin/uk-wamr-direct-validate"
+        if producer == "native" else
+        publication / "tools/bin/uk-wamr-direct-validate")
     supervisor = Path(handoff.ci.COMMAND_SUPERVISOR_PATH)
     archive = output / "tiny-aot-public-source.zip"
     handoff.FAILURE_STAGE = "public-pack"
     archive_sha256 = pack(
-        handoff, stage, archive, source, validator, supervisor)
+        handoff, stage, archive, source, validator, supervisor,
+        producer=producer)
     # V2 production import is intentionally deferred until the exact uploaded
     # artifact ID has been redownloaded and its container digest is available.
     if exported["version"] == 1:

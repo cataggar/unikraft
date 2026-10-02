@@ -13,10 +13,10 @@ permissions:
 jobs:
   wamr-native-compute:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 300
     env:
-      WAMR_NATIVE_CONTROLLER_ROOT: /d/wamr-ci/wamr-native-controller
-      WAMR_CI_CONTROLLER: /d/wamr-ci/wamr-native-controller/controller/bin/uk-wamr-native-ci
+      WAMR_NATIVE_CONTROLLER_ROOT: /d/wamr-ci/wamr-native-runtime
+      WAMR_CI_CONTROLLER: /d/wamr-ci/wamr-native-runtime/controller/bin/uk-wamr-native-ci
     outputs:
       inner-zip-sha256: ${{ steps.public_binding.outputs.inner_zip_sha256 }}
       inner-zip-bytes: ${{ steps.public_binding.outputs.inner_zip_bytes }}
@@ -145,8 +145,8 @@ jobs:
           set -euo pipefail
           umask 077
           controller_root="${WAMR_NATIVE_CONTROLLER_ROOT:?}"
-          test ! -e "${controller_root}"
-          mkdir -m 0700 -- "${controller_root}"
+          test -d "${controller_root}"
+          test ! -e "${controller_root}/controller"
           mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-native-controller-cache"
           ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-native-controller-cache" \
             zig build --build-file support/build/wamr-native-ci/build.zig \
@@ -244,10 +244,12 @@ jobs:
           export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
           echo "${zig_dir}" >> "${GITHUB_PATH}"
           echo "${root}/llvm/bin" >> "${GITHUB_PATH}"
-          python3 support/build/wamr-native-ci/run.py build --runtime "${root}" \
+          controller="${WAMR_CI_CONTROLLER:?}"
+          test -x "${controller}"
+          "${controller}" build --runtime "${root}" \
             --wamr-source "${GITHUB_WORKSPACE}/.d/wamr-source"
 
-      - name: Run six Python boots and paired native success in the managed KVM process
+      - name: Run six native boots and paired Python/native success in the managed KVM process
         timeout-minutes: 150
         env:
           QUALIFICATION_REPOSITORY_ID: ${{ github.repository_id }}
@@ -259,7 +261,7 @@ jobs:
           export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
           bash .github/scripts/hyperv-qemu-candidate-runtime.sh "${root}" compute
 
-      - name: Keep Python-produced local records on their pinned source path
+      - name: Reopen the native-produced local handoff on its recorded controller path
         timeout-minutes: 10
         run: |
           set -euo pipefail
@@ -276,14 +278,14 @@ jobs:
           spec.loader.exec_module(handoff)
           records = handoff.result_records(runtime / "compute")
           if len(records) != 33:
-              raise SystemExit("Python handoff refused completed Python records")
+              raise SystemExit("local handoff refused completed native records")
           PY
 
       - name: Retain the expressly authorized public-source tiny image bundle
         id: public_bundle
-        timeout-minutes: 15
+        timeout-minutes: 75
         env:
-          WAMR_CI_CONTROLLER: /d/wamr-ci/wamr-native-controller/controller/bin/uk-wamr-native-ci
+          WAMR_CI_CONTROLLER: /d/wamr-ci/wamr-native-runtime/controller/bin/uk-wamr-native-ci
           GITHUB_REPOSITORY_VISIBILITY: ${{ github.event.repository.private == false && 'public' || 'private' }}
           WAMR_CI_RUNTIME: /d/wamr-ci/wamr-native-runtime
         run: |
@@ -456,7 +458,7 @@ jobs:
           ARTIFACT_URL: ${{ steps.public_upload.outputs.artifact-url }}
           REDOWNLOAD_DIR: ${{ steps.public_redownload.outputs.destination }}
           SOURCE_TREE: ${{ steps.public_bundle.outputs.source_tree }}
-          WAMR_CI_CONTROLLER: /d/wamr-ci/wamr-native-controller/controller/bin/uk-wamr-native-ci
+          WAMR_CI_CONTROLLER: /d/wamr-ci/wamr-native-runtime/controller/bin/uk-wamr-native-ci
         run: |
           set -euo pipefail
           export PYTHONDONTWRITEBYTECODE=1
@@ -513,8 +515,8 @@ jobs:
           root=/d/wamr-ci/wamr-native-runtime
           import_root="${root}/compute/public-source/exact-redownload"
           mkdir -m 700 "${import_root}"
-          validator="${root}/compute/public-source/tools/bin/uk-wamr-direct-validate"
-          supervisor="${root}/compute/supervisor/bin/wamr-ci-supervisor"
+          validator="${root}/compute/public-source/validator-build/public-source/tools/bin/uk-wamr-direct-validate"
+          supervisor="${root}/controller/bin/uk-wamr-native-ci"
           python3 support/build/wamr-native-ci/handoff.py \
             import-public-source-bundle \
             --archive "${archive}" \
@@ -723,7 +725,7 @@ jobs:
           test ! -e "${identity_parent}"
           mkdir -m 700 "${identity_parent}"
           identity="${identity_parent}/success"
-          supervisor=/d/wamr-ci/wamr-native-runtime/compute/supervisor/bin/wamr-ci-supervisor
+          supervisor=/d/wamr-ci/wamr-native-runtime/controller/bin/uk-wamr-native-ci
           test ! -e "${identity}"
           "${controller}" supervisor-import-identity \
             --stage-root "${stage}" \
@@ -798,7 +800,7 @@ jobs:
       - name: Retain redacted diagnostics separately from the public-source image bundle
         if: always()
         run: |
-          python3 support/build/wamr-native-ci/run.py diagnostics \
+          "${WAMR_CI_CONTROLLER:?}" diagnostics \
             --runtime /d/wamr-ci/wamr-native-runtime
 
       - name: Publish bounded local-only records

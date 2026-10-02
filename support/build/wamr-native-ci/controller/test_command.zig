@@ -4,6 +4,18 @@ const linux = std.os.linux;
 
 pub fn main(init: std.process.Init) void {
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch std.process.exit(2);
+    if (args.len == 3 and std.mem.eql(u8, args[1], "handoff")) {
+        const bundle = std.Io.Dir.openFileAbsolute(init.io, args[2], .{ .follow_symlinks = false }) catch std.process.exit(2);
+        defer bundle.close(init.io);
+        var scenario: [32]u8 = undefined;
+        const count = bundle.readPositionalAll(init.io, &scenario, 0) catch std.process.exit(2);
+        if (std.mem.eql(u8, scenario[0..count], "accepted")) {
+            std.Io.File.stdout().writeStreamingAll(init.io, "Compute handoff revalidated; authority=not_admitted.\n") catch std.process.exit(2);
+            return;
+        }
+        runScenario(init.io, scenario[0..count]);
+        return;
+    }
     if (args.len == 4 and std.mem.eql(u8, args[1], "inspect")) {
         const efi = std.Io.Dir.openFileAbsolute(init.io, args[2], .{ .follow_symlinks = false }) catch std.process.exit(2);
         defer efi.close(init.io);

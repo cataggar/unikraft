@@ -7,6 +7,12 @@ pub fn main(init: std.process.Init) void {
     const allocator = init.arena.allocator();
     const args = init.minimal.args.toSlice(allocator) catch refused(init.io);
     const command = controller.cli.parse(args) catch usage(init.io);
+    if (command.action == .@"--identity") {
+        const closure = controller.import_supervisor_identity.nativeSourceContentClosure(allocator) catch refused(init.io);
+        const encoded = controller.import_supervisor_identity.identityBytes(allocator, &closure) catch refused(init.io);
+        std.Io.File.stdout().writeStreamingAll(init.io, encoded) catch refused(init.io);
+        return;
+    }
     if (command.action == .describe) {
         const closure = std.fmt.bytesToHex(controller.source_custody.contentClosure(), .lower);
         const raw = std.json.Stringify.valueAlloc(allocator, .{
@@ -102,7 +108,7 @@ pub fn main(init: std.process.Init) void {
         ) catch |err| failed(init.io, stage, "", err);
         return;
     }
-    if (command.action == .@"import-validator-build" or command.action == .@"import-native-revalidation") {
+    if (command.action == .@"import-validator-build" or command.action == .@"import-native-revalidation" or command.action == .@"import-handoff-revalidation") {
         const stage = @tagName(command.action);
         const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
         const root = command.stage_root.?;
@@ -117,6 +123,18 @@ pub fn main(init: std.process.Init) void {
             root,
         ) catch |err| failed(init.io, stage, "", err);
         defer accepted.deinit();
+        if (command.action == .@"import-handoff-revalidation") {
+            controller.import_validator_build.runPortable(
+                allocator,
+                init.io,
+                &accepted,
+                repository,
+                command.output.?,
+                .{ .git = command.git.?, .supervisor = command.supervisor.?, .validator = command.validator.? },
+                &signal,
+            ) catch |err| failed(init.io, stage, "", err);
+            return;
+        }
         controller.import_validator_build.run(
             allocator,
             init.io,
@@ -128,7 +146,7 @@ pub fn main(init: std.process.Init) void {
         ) catch |err| failed(init.io, stage, "", err);
         return;
     }
-    if (command.action == .@"handoff-inspect" or command.action == .@"handoff-inspect-legacy" or command.action == .@"public-validator-build") {
+    if (command.action == .@"handoff-inspect" or command.action == .@"handoff-inspect-legacy" or command.action == .@"public-validator-build" or command.action == .@"local-handoff-revalidation") {
         const stage = @tagName(command.action);
         const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
         const root = command.runtime.?;
@@ -175,6 +193,13 @@ pub fn main(init: std.process.Init) void {
                 &signal,
             ),
             .@"public-validator-build" => controller.public_validator_build.run(
+                allocator,
+                init.io,
+                &accepted,
+                command.output.?,
+                &signal,
+            ),
+            .@"local-handoff-revalidation" => controller.public_validator_build.revalidateHandoff(
                 allocator,
                 init.io,
                 &accepted,
@@ -231,9 +256,11 @@ pub fn main(init: std.process.Init) void {
         .@"handoff-inspect" => unreachable,
         .@"handoff-inspect-legacy" => unreachable,
         .@"public-validator-build" => unreachable,
-        .@"supervisor-import-identity" => unreachable,
+        .@"local-handoff-revalidation" => unreachable,
+        .@"supervisor-import-identity", .@"--identity" => unreachable,
         .@"import-validator-build" => unreachable,
         .@"import-native-revalidation" => unreachable,
+        .@"import-handoff-revalidation" => unreachable,
     }
 }
 
@@ -246,10 +273,12 @@ fn usage(io: std.Io) noreturn {
             "       uk-wamr-native-ci supervisor-source-closure --git /usr/bin/git --output sha256-v1\n" ++
             "       uk-wamr-native-ci records --runtime ABS --output handoff-v1\n" ++
             "       uk-wamr-native-ci records --stage-root ABS --transport trusted-inner-zip --output handoff-v1\n" ++
+            "       uk-wamr-native-ci import-handoff-revalidation --stage-root ABS --git ABS --supervisor ABS --validator ABS --output ABS\n" ++
             "       uk-wamr-native-ci local-consumer-custody --runtime ABS --expected-build-start-sha256 HEX --expected-boot-inputs-sha256 HEX\n" ++
             "       uk-wamr-native-ci handoff-inspect --runtime ABS --output ABS\n" ++
             "       uk-wamr-native-ci handoff-inspect-legacy --runtime ABS --output ABS\n" ++
             "       uk-wamr-native-ci public-validator-build --runtime ABS --output ABS\n" ++
+            "       uk-wamr-native-ci local-handoff-revalidation --runtime ABS --output ABS\n" ++
             "       uk-wamr-native-ci supervisor-import-identity --stage-root ABS --supervisor ABS --git ABS --output ABS\n" ++
             "       uk-wamr-native-ci import-validator-build --stage-root ABS --output ABS\n" ++
             "       uk-wamr-native-ci import-native-revalidation --stage-root ABS --output ABS\n",
