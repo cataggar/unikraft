@@ -250,6 +250,7 @@ to masquerade as the historical producer checkout. No v1 build, boot,
 validator-build, profile admission, or Python fallback is enabled.
 The Python-owned archive/operator plumbing remains until its separate wiring
 cutover; merely adding this operation does not retire the Python controller.
+
 `local-consumer-custody --runtime ABS --expected-build-start-sha256 HEX
 --expected-boot-inputs-sha256 HEX` is the production owner for a completed
 v2 runtime's local checkout/source and build/boot consumer-input
@@ -318,14 +319,10 @@ Native boot reopens `build-start.json` and `build.json` with the 4-MiB
 evidence-record limit, not the 256-MiB tracked-source-file bound; physical
 custody of larger executables remains independently bounded.
 `test-controller` exercises native custody, build-command failures, production
-boundaries, tamper/refusal, and frozen historical command-binding vectors. The
-compressed JSON goldens under `controller/goldens` were captured from the
-reference on `06d1ff25`; native tests decode them with a finite bound instead
-of importing or executing the old Python controller or adapter test runner.
-The historical v1 inner-stage fixture also exercises native portable
-revalidation and rejects substituted supervisors and validators before
-creating output. A dirty current reader checkout also refuses without
-reserving output. The
+boundaries, tamper/refusal, and `run.py` differential record fixtures. Its
+historical v1 inner-stage fixture exercises real native portable revalidation
+and refuses substituted supervisors/validators, dirty readers, and clean
+readers with mismatched embedded source before reserving output. The
 installed fixture stage itself supervises bounded native success, nonzero,
 partial-output, signal, overflow, timeout, and cancellation children; its
 create-only private report binds the observed output hashes and cleanup states,
