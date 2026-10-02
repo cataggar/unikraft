@@ -3310,7 +3310,7 @@ test "trusted historical inner stage accepts complete records and refuses tamper
     const reader_name = try std.fmt.allocPrint(a, "{s}-reader-source", .{name});
     const reader_repository = try std.fs.path.join(a, &.{ options.fixture_root, reader_name });
     const cloned = try std.process.run(a, io, .{
-        .argv = &.{ options.git_executable, "clone", "-q", "--no-hardlinks", "--", options.repository_root, reader_repository },
+        .argv = &.{ options.git_executable, "-c", "gc.auto=0", "-c", "maintenance.auto=false", "clone", "-q", "--no-hardlinks", "--", options.repository_root, reader_repository },
         .cwd = .{ .path = options.fixture_root },
         .stdout_limit = .limited(4096),
         .stderr_limit = .limited(4096),
@@ -3407,8 +3407,9 @@ test "trusted historical inner stage accepts complete records and refuses tamper
     }
     const committed = try std.process.run(a, io, .{
         .argv = &.{
-            options.git_executable, "-c",  "user.name=Native reader fixture", "-c",                              "user.email=fixture@example.invalid",
-            "commit",               "-aq", "-m",                              "fixture: changed source closure",
+            options.git_executable, "-c",                              "gc.auto=0",                       "-c",                                 "maintenance.auto=false",
+            "-c",                   "user.name=Native reader fixture", "-c",                              "user.email=fixture@example.invalid", "commit",
+            "-aq",                  "-m",                              "fixture: changed source closure",
         },
         .cwd = .{ .path = reader_repository },
         .stdout_limit = .limited(4096),
