@@ -3201,8 +3201,14 @@ test "trusted historical inner stage accepts complete records and refuses tamper
         .stdout_limit = .limited(4096),
         .stderr_limit = .limited(4096),
     });
-    if (revalidated.term != .exited or revalidated.term.exited != 0)
+    if (revalidated.term != .exited or revalidated.term.exited != 0) {
         std.debug.print("legacy native revalidation: {s}\n", .{revalidated.stderr});
+        if (parent.openDir(io, revalidated_name, .{})) |refused_output| {
+            defer refused_output.close(io);
+            const log = refused_output.readFileAlloc(io, "private/import-native-revalidation.log", a, .limited(4096)) catch "private log unavailable";
+            std.debug.print("legacy validator log: {s}\n", .{log});
+        } else |_| {}
+    }
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, revalidated.term);
     try std.testing.expectEqualStrings("", revalidated.stdout);
     try std.testing.expectEqualStrings("", revalidated.stderr);
