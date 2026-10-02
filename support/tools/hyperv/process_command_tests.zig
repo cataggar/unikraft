@@ -721,6 +721,63 @@ test "pidfd liveness and proc start identity agree across exit and reap" {
     try support.noChildren();
 }
 
+test "proc stat read recognizes disappearance after open and exact child reap" {
+    try process.initialize();
+    const forked = linux.fork();
+    if (linux.errno(forked) != .SUCCESS) return error.FixtureFork;
+    if (forked == 0) linux.exit(0);
+    const pid: linux.pid_t = @intCast(forked);
+    var reaped = false;
+    defer if (!reaped) support.reapFixtureChildIfOwned(pid);
+
+    var path: [64:0]u8 = undefined;
+    const name = try std.fmt.bufPrintZ(&path, "/proc/{d}/stat", .{pid});
+    const opened = linux.openat(linux.AT.FDCWD, name, .{
+        .ACCMODE = .RDONLY,
+        .CLOEXEC = true,
+        .NOFOLLOW = true,
+    }, 0);
+    if (linux.errno(opened) != .SUCCESS) return error.FixtureOpen;
+    const descriptor: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(descriptor);
+
+    var status: u32 = 0;
+    while (true) switch (linux.errno(linux.waitpid(pid, &status, 0))) {
+        .SUCCESS => {
+            reaped = true;
+            break;
+        },
+        .INTR => continue,
+        else => return error.FixtureReap,
+    };
+    try testing.expectEqual(@as(u32, 0), status);
+    try testing.expectError(
+        error.ProcessGone,
+        process.CommandIdentityTest.retainedStartTicks(pid, descriptor),
+    );
+    try support.noChildren();
+}
+
+test "proc stat read still refuses invalid descriptors and empty records" {
+    const pid = linux.getpid();
+    try testing.expectError(
+        error.ProcUnavailable,
+        process.CommandIdentityTest.retainedStartTicks(pid, -1),
+    );
+    const opened = linux.openat(linux.AT.FDCWD, "/dev/null", .{
+        .ACCMODE = .RDONLY,
+        .CLOEXEC = true,
+        .NOFOLLOW = true,
+    }, 0);
+    if (linux.errno(opened) != .SUCCESS) return error.FixtureOpen;
+    const descriptor: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(descriptor);
+    try testing.expectError(
+        error.ProcUnavailable,
+        process.CommandIdentityTest.retainedStartTicks(pid, descriptor),
+    );
+}
+
 test "released command owns immediate ordinary setsid double-fork and closed-fd descendants" {
     var executable = try openExecutable();
     defer executable.close(io);
