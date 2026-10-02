@@ -24,6 +24,14 @@ twelve copy/scan/loader/manifest boundary checks **in memory**, never editing
 `handoff.py`; all twenty must change the golden or refuse a previously successful
 operation.
 
+The native fixture consumer independently enforces recursive exact field sets,
+scalar types, record versions, CLI option metadata, schema domains, and every
+fixed runtime isolation/resource/policy value against native literals. Permanent
+negative fixtures mutate the actual consumer input, re-canonicalizing both the
+embedded records and the outer document; malformed metadata, extra domains or
+nested fields, scalar coercions and unsupported versions must fail that same
+consumer, not a comparison against another golden.
+
 Run with Zig 0.16 and fresh owner-only roots (no credentials or cloud calls):
 
 ```sh

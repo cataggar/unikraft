@@ -28,7 +28,11 @@ const golden_fields = struct {
 };
 
 test "Python authority golden is canonical and matches native literal tables" {
-    var document = try contracts.parseCanonical(std.testing.allocator, golden);
+    try consumeGolden(golden);
+}
+
+fn consumeGolden(bytes: []const u8) !void {
+    var document = try contracts.parseCanonical(std.testing.allocator, bytes);
     defer document.deinit();
     const root = try c.exactFields(document.value(), &golden_fields.root);
     try expectLiteral(root, "schema", "uk.wamr.authority-contract-golden");
@@ -44,6 +48,142 @@ test "Python authority golden is canonical and matches native literal tables" {
     try expectUuid(root);
     try expectLiveRefusals(root.get("live_refusal_scenarios") orelse return error.MissingGolden);
     try expectRuntimeBounds(root.get("runtime_bound_scenarios") orelse return error.MissingGolden);
+}
+
+const Mutation = struct {
+    record: ?[]const u8 = null,
+    path: []const []const u8,
+    value: std.json.Value,
+    expected: anyerror,
+};
+
+test "native fixture consumer rejects each independent review mutation" {
+    const cases = [_]Mutation{
+        .{ .path = &.{ "cli", "commands", "plan", "options", "11", "type" }, .value = .{ .bool = false }, .expected = error.ExpectedString },
+        .{ .path = &.{ "cli", "commands", "plan", "options", "11", "unknown" }, .value = .null, .expected = error.UnexpectedFields },
+        .{ .path = &.{ "schemas", "unknown" }, .value = .null, .expected = error.UnexpectedFields },
+        .{ .path = &.{ "azure_runtime", "isolation", "host_loader_fallback" }, .value = .{ .string = "permitted" }, .expected = error.UnexpectedLiteral },
+        .{ .record = "authorization_approved", .path = &.{"version"}, .value = .null, .expected = error.ExpectedInteger },
+        .{ .record = "authorization_approved", .path = &.{ "azure_runtime", "unknown" }, .value = .null, .expected = error.UnexpectedFields },
+    };
+    for (cases) |case| try rejectMutations(&.{case}, case.expected);
+}
+
+test "native fixture consumer rejects the three combined reviewer fixtures" {
+    try rejectMutations(&.{
+        .{ .path = &.{ "cli", "commands", "plan", "options", "11", "type" }, .value = .{ .bool = false }, .expected = error.UnexpectedFields },
+        .{ .path = &.{ "cli", "commands", "plan", "options", "11", "unknown" }, .value = .null, .expected = error.UnexpectedFields },
+    }, error.UnexpectedFields);
+    try rejectMutations(&.{
+        .{ .path = &.{ "schemas", "unknown" }, .value = .null, .expected = error.UnexpectedLiteral },
+        .{ .path = &.{ "azure_runtime", "isolation", "host_loader_fallback" }, .value = .{ .string = "permitted" }, .expected = error.UnexpectedLiteral },
+    }, error.UnexpectedLiteral);
+    try rejectMutations(&.{
+        .{ .record = "authorization_approved", .path = &.{"version"}, .value = .null, .expected = error.ExpectedInteger },
+        .{ .record = "authorization_approved", .path = &.{ "azure_runtime", "unknown" }, .value = .null, .expected = error.ExpectedInteger },
+    }, error.ExpectedInteger);
+}
+
+test "native fixture consumer checks every canonical record version" {
+    for (golden_fields.records) |record| {
+        try rejectMutations(&.{.{ .record = record, .path = &.{"version"}, .value = .null, .expected = error.ExpectedInteger }}, error.ExpectedInteger);
+        try rejectMutations(&.{.{ .record = record, .path = &.{"version"}, .value = .{ .integer = 99 }, .expected = error.UnexpectedInteger }}, error.UnexpectedInteger);
+    }
+}
+
+test "native fixture consumer rejects scalar coercions and nested shape drift" {
+    const cases = [_]Mutation{
+        .{ .path = &.{ "cli", "commands", "plan", "options", "0", "required" }, .value = .{ .integer = 1 }, .expected = error.ExpectedBoolean },
+        .{ .path = &.{ "cli", "commands", "plan", "options", "0", "required" }, .value = .{ .bool = false }, .expected = error.UnexpectedBoolean },
+        .{ .path = &.{ "cli", "commands", "plan", "options", "0", "repeated" }, .value = .{ .string = "false" }, .expected = error.ExpectedBoolean },
+        .{ .path = &.{ "cli", "commands", "plan", "options", "0", "repeated" }, .value = .{ .bool = true }, .expected = error.UnexpectedBoolean },
+        .{ .path = &.{ "cli", "commands", "plan", "options", "0", "flags" }, .value = .{ .string = "--bundle" }, .expected = error.ExpectedArray },
+        .{ .path = &.{ "cli", "commands", "plan", "options", "0", "flags", "0" }, .value = .{ .string = "--unknown" }, .expected = error.UnexpectedOption },
+        .{ .path = &.{ "cli", "commands", "plan", "options", "0", "dest" }, .value = .null, .expected = error.ExpectedString },
+        .{ .path = &.{ "cli", "commands", "plan", "options", "0", "dest" }, .value = .{ .string = "wrong" }, .expected = error.UnexpectedLiteral },
+        .{ .path = &.{ "cli", "commands", "plan", "options", "0", "type" }, .value = .{ .string = "int" }, .expected = error.UnexpectedLiteral },
+        .{ .path = &.{ "cli", "commands", "plan", "options", "4", "type" }, .value = .{ .string = "str" }, .expected = error.ExpectedNull },
+        .{ .path = &.{ "cli", "commands", "record-authorization", "options", "3", "choices" }, .value = .null, .expected = error.ExpectedArray },
+        .{ .path = &.{ "schemas", "plan" }, .value = .{ .bool = false }, .expected = error.ExpectedArray },
+        .{ .record = "plan", .path = &.{"created_unix"}, .value = .{ .bool = true }, .expected = error.ExpectedInteger },
+        .{ .record = "authorization_approved", .path = &.{"version"}, .value = .{ .string = "2" }, .expected = error.ExpectedInteger },
+        .{ .record = "plan", .path = &.{"resources"}, .value = .null, .expected = error.ExpectedObject },
+        .{ .record = "plan", .path = &.{ "cleanup", "replacement_resources" }, .value = .{ .integer = 0 }, .expected = error.ExpectedBoolean },
+        .{ .record = "plan", .path = &.{ "cleanup", "replacement_resources" }, .value = .{ .bool = true }, .expected = error.UnexpectedBoolean },
+        .{ .record = "plan", .path = &.{ "cost", "policy" }, .value = .{ .string = "unknown" }, .expected = error.UnexpectedLiteral },
+        .{ .record = "plan", .path = &.{ "candidate", "size" }, .value = .{ .integer = -1 }, .expected = error.IntegerOverflow },
+        .{ .record = "plan", .path = &.{ "candidate", "sha256" }, .value = .{ .bool = false }, .expected = error.ExpectedString },
+        .{ .record = "plan", .path = &.{ "ledger", "version" }, .value = .null, .expected = error.ExpectedInteger },
+        .{ .record = "plan", .path = &.{ "ledger", "schema" }, .value = .{ .string = "unknown" }, .expected = error.UnexpectedLiteral },
+        .{ .record = "plan", .path = &.{ "ledger", "directory", "uid" }, .value = .{ .integer = 4294967296 }, .expected = error.IntegerOverflow },
+        .{ .record = "azure_runtime", .path = &.{ "loader_dependencies", "0" }, .value = .null, .expected = error.ExpectedObject },
+        .{ .record = "azure_runtime", .path = &.{ "observed", "depth" }, .value = .{ .string = "1" }, .expected = error.ExpectedInteger },
+        .{ .record = "authorization_approved", .path = &.{ "azure_runtime", "version" }, .value = .{ .integer = 2 }, .expected = error.UnexpectedInteger },
+        .{ .record = "authorization_approved", .path = &.{ "azure_runtime", "limits", "bytes" }, .value = .{ .integer = 1 }, .expected = error.UnexpectedInteger },
+        .{ .record = "admission", .path = &.{ "approval", "approver" }, .value = .{ .integer = 1 }, .expected = error.ExpectedString },
+        .{ .record = "plan", .path = &.{ "resources", "boot_count" }, .value = .{ .integer = 3 }, .expected = error.UnexpectedInteger },
+        .{ .record = "authorization_approved", .path = &.{ "azure_runtime", "isolation", "host_loader_fallback" }, .value = .{ .string = "permitted" }, .expected = error.UnexpectedLiteral },
+    };
+    for (cases) |case| try rejectMutations(&.{case}, case.expected);
+    const nested = [_][]const []const u8{
+        &.{"candidate"},                                   &.{"run"},
+        &.{"identity"},                                    &.{"lineage"},
+        &.{"ledger"},                                      &.{ "ledger", "directory" },
+        &.{"resources"},                                   &.{"substitution"},
+        &.{"cleanup"},                                     &.{"cost"},
+        &.{"tools"},                                       &.{"azure_runtime"},
+        &.{ "azure_runtime", "manifest" },                 &.{ "azure_runtime", "limits" },
+        &.{ "azure_runtime", "observed" },                 &.{ "azure_runtime", "isolation" },
+        &.{ "azure_runtime", "loader_dependencies", "0" },
+    };
+    for (nested) |path| {
+        var extended: [4][]const u8 = undefined;
+        @memcpy(extended[0..path.len], path);
+        extended[path.len] = "unknown";
+        const case = Mutation{ .record = "plan", .path = extended[0 .. path.len + 1], .value = .null, .expected = error.UnexpectedFields };
+        try rejectMutations(&.{case}, case.expected);
+    }
+    for ([_][]const u8{ "approval_template", "authorization_approved", "authorization_denied" }) |record| {
+        try rejectMutations(&.{.{ .record = record, .path = &.{ "limits", "unknown" }, .value = .null, .expected = error.UnexpectedFields }}, error.UnexpectedFields);
+    }
+    try rejectMutations(&.{.{ .record = "admission", .path = &.{ "approval", "unknown" }, .value = .null, .expected = error.UnexpectedFields }}, error.UnexpectedFields);
+}
+
+fn rejectMutations(mutations: []const Mutation, expected: anyerror) !void {
+    var document = try contracts.parseCanonical(std.testing.allocator, golden);
+    defer document.deinit();
+    const allocator = document.parsed.arena.allocator();
+    for (mutations) |mutation| {
+        if (mutation.record) |record| {
+            const entry = document.parsed.value.object.getPtr("canonical_records").?.object.getPtr(record).?;
+            var inner = try contracts.parseCanonical(std.testing.allocator, try c.string(entry.*));
+            defer inner.deinit();
+            try mutate(&inner.parsed.value, inner.parsed.arena.allocator(), mutation.path, mutation.value);
+            entry.* = .{ .string = try inner.canonicalAlloc(allocator) };
+        } else {
+            try mutate(&document.parsed.value, allocator, mutation.path, mutation.value);
+        }
+    }
+    const bytes = try document.canonicalAlloc(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectError(expected, consumeGolden(bytes));
+}
+
+fn mutate(root: *std.json.Value, allocator: std.mem.Allocator, path: []const []const u8, value: std.json.Value) !void {
+    var current = root;
+    for (path[0 .. path.len - 1]) |part| {
+        current = switch (current.*) {
+            .object => |*object| object.getPtr(part).?,
+            .array => |*items| &items.items[try std.fmt.parseInt(usize, part, 10)],
+            else => return error.InvalidMutation,
+        };
+    }
+    const last = path[path.len - 1];
+    switch (current.*) {
+        .object => |*object| try object.put(allocator, last, value),
+        .array => |*items| items.items[try std.fmt.parseInt(usize, last, 10)] = value,
+        else => return error.InvalidMutation,
+    }
 }
 
 test "authority contract helper boundaries are frozen" {
@@ -64,7 +204,7 @@ test "Python authority scenario inventory is checked and sorted" {
     try expectLiteral(root, "schema", "uk.wamr.authority-python-scenario-inventory");
     try expectInt(root, "schema_version", @as(u8, 1));
     try expectInt(root, "count", @as(u16, 174));
-    const items = (root.get("scenarios") orelse return error.MissingGolden).array.items;
+    const items = try array(root.get("scenarios") orelse return error.MissingGolden);
     try std.testing.expectEqual(@as(usize, 174), items.len);
     var previous: []const u8 = "";
     for (items) |item| {
@@ -105,7 +245,7 @@ fn expectCli(value: std.json.Value) !void {
     try expectExitMap(exits, "malformed_exit", 2);
     try expectInt(exits, "success_exit", @as(u8, 0));
     try expectInt(exits, "refusal_exit", @as(u8, 1));
-    try std.testing.expect(!(exits.get("validator_probe_streams_public") orelse return error.MissingGolden).bool);
+    try expectBool(exits, "validator_probe_streams_public", false);
 }
 
 fn expectCommand(commands: std.json.ObjectMap, name: []const u8, required: []const []const u8, optional: []const []const u8, repeated_required: []const []const u8, repeated_optional: []const []const u8) !void {
@@ -114,18 +254,43 @@ fn expectCommand(commands: std.json.ObjectMap, name: []const u8, required: []con
     try expectStringArray(m, "optional", optional);
     try expectStringArray(m, "repeated_required", repeated_required);
     try expectStringArray(m, "repeated_optional", repeated_optional);
-    if (std.mem.eql(u8, name, "record-authorization")) {
-        const options = (m.get("options") orelse return error.MissingGolden).array.items;
+    const groups = [_][]const []const u8{ required, optional, repeated_required, repeated_optional };
+    const options = try array(m.get("options") orelse return error.MissingGolden);
+    const count = required.len + optional.len + repeated_required.len + repeated_optional.len;
+    if (options.len != count or count > 64) return error.UnexpectedOptions;
+    var seen = [_]bool{false} ** 64;
+    for (options) |option| {
+        const object = try c.exactFields(option, &contracts.cli.option_fields);
+        const flags = try array(object.get("flags").?);
+        if (flags.len != 1) return error.UnexpectedOptions;
+        const flag = try c.string(flags[0]);
+        var offset: usize = 0;
         var found = false;
-        for (options) |option| {
-            const object = option.object;
-            const flags = (object.get("flags") orelse continue).array.items;
-            if (flags.len > 0 and std.mem.eql(u8, try c.string(flags[0]), "--decision")) {
-                try expectStringArray(object, "choices", &contracts.cli.decision_choices);
+        for (groups, 0..) |group, group_index| {
+            for (group, 0..) |expected, index| {
+                if (!std.mem.eql(u8, flag, expected)) continue;
+                if (seen[offset + index]) return error.DuplicateOption;
+                seen[offset + index] = true;
                 found = true;
+                try expectBool(object, "required", group_index == 0 or group_index == 2);
+                try expectBool(object, "repeated", group_index >= 2);
             }
+            offset += group.len;
         }
-        try std.testing.expect(found);
+        if (!found) return error.UnexpectedOption;
+        const dest = try c.string(object.get("dest").?);
+        if (dest.len != flag.len - 2) return error.UnexpectedLiteral;
+        for (flag[2..], dest) |letter, actual| {
+            if (actual != (if (letter == '-') @as(u8, '_') else letter)) return error.UnexpectedLiteral;
+        }
+        if (contains(flag, &contracts.cli.integer_flags)) {
+            try expectLiteral(object, "type", "int");
+        } else if (contains(flag, &contracts.cli.text_flags)) {
+            if (object.get("type").? != .null) return error.ExpectedNull;
+        } else {
+            try expectLiteral(object, "type", "Path");
+        }
+        try expectStringArray(object, "choices", if (std.mem.eql(u8, flag, "--decision")) &contracts.cli.decision_choices else &.{});
     }
 }
 
@@ -198,20 +363,27 @@ fn expectPolicy(value: std.json.Value) !void {
 fn expectAzureRuntime(value: std.json.Value) !void {
     const root = try c.exactFields(value, &golden_fields.azure_runtime);
     try expectCommandTable(root.get("commands") orelse return error.MissingGolden);
-    try expectStringObject(root.get("isolation") orelse return error.MissingGolden, &contracts.schema_fields.azure_runtime_isolation);
+    try expectIsolation(root.get("isolation") orelse return error.MissingGolden);
     const m = try c.exactFields(root.get("manifest") orelse return error.MissingGolden, &golden_fields.manifest);
     try expectLiteral(m, "header", contracts.manifest.header);
     try expectManifestLine(try c.string(m.get("directory") orelse return error.MissingGolden), "D", null);
     try expectManifestLine(try c.string(m.get("file") orelse return error.MissingGolden), "F", "launcher");
     try expectManifestLine(try c.string(m.get("loader") orelse return error.MissingGolden), "L", contracts.manifest.loader_role);
     try expectManifestLine(try c.string(m.get("parent") orelse return error.MissingGolden), "P", null);
+    _ = try c.string(m.get("sample") orelse return error.MissingGolden);
 }
 
 fn expectSchemas(value: std.json.Value) !void {
-    const m = value.object;
+    const domains = comptime blk: {
+        const declarations = std.meta.declarations(contracts.schema_fields);
+        var names: [declarations.len][]const u8 = undefined;
+        for (declarations, 0..) |decl, index| names[index] = decl.name;
+        break :blk names;
+    };
+    const m = try c.exactFields(value, &domains);
     inline for (comptime std.meta.declarations(contracts.schema_fields)) |decl| {
         const expected = &@field(contracts.schema_fields, decl.name);
-        const items = (m.get(decl.name) orelse return error.MissingGolden).array.items;
+        const items = try array(m.get(decl.name) orelse return error.MissingGolden);
         try std.testing.expectEqual(expected.len, items.len);
         var previous: []const u8 = "";
         for (items) |item| {
@@ -229,12 +401,12 @@ fn expectSchemas(value: std.json.Value) !void {
 
 fn expectCanonicalRecords(value: std.json.Value) !void {
     const records = try c.exactFields(value, &golden_fields.records);
-    const plan_bytes = try expectRecord(records, "plan", &contracts.schema_fields.plan, "uk.wamr.azure-execution-plan");
-    const template_bytes = try expectRecord(records, "approval_template", &contracts.schema_fields.approval_template, "uk.wamr.azure-execution-approval-template");
-    _ = try expectRecord(records, "azure_runtime", &contracts.schema_fields.azure_runtime, "uk.wamr.azure-cli-runtime-closure");
-    _ = try expectRecord(records, "authorization_approved", &contracts.schema_fields.authorization, "uk.wamr.azure-execution-authorization");
-    _ = try expectRecord(records, "authorization_denied", &contracts.schema_fields.authorization, "uk.wamr.azure-execution-authorization");
-    _ = try expectRecord(records, "admission", &contracts.schema_fields.admission, "uk.wamr.azure-execution-admission");
+    const plan_bytes = try expectRecord(records, "plan", "plan", "uk.wamr.azure-execution-plan", 2);
+    const template_bytes = try expectRecord(records, "approval_template", "approval_template", "uk.wamr.azure-execution-approval-template", 2);
+    _ = try expectRecord(records, "azure_runtime", "azure_runtime", "uk.wamr.azure-cli-runtime-closure", 1);
+    _ = try expectRecord(records, "authorization_approved", "authorization", "uk.wamr.azure-execution-authorization", 2);
+    _ = try expectRecord(records, "authorization_denied", "authorization", "uk.wamr.azure-execution-authorization", 2);
+    _ = try expectRecord(records, "admission", "admission", "uk.wamr.azure-execution-admission", 2);
     var digest: [32]u8 = undefined;
     core.Sha256.hash(plan_bytes, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
@@ -245,14 +417,14 @@ fn expectCanonicalRecords(value: std.json.Value) !void {
 }
 
 fn expectUuid(root: std.json.ObjectMap) !void {
-    const items = (root.get("uuid_normalization") orelse return error.MissingGolden).array.items;
+    const items = try array(root.get("uuid_normalization") orelse return error.MissingGolden);
     try std.testing.expectEqual(contracts.uuid.normalization_inputs.len, items.len);
     for (items, 0..) |item, index| {
         const m = try c.exactFields(item, &golden_fields.uuid_normalization);
         try expectLiteral(m, "input", contracts.uuid.normalization_inputs[index]);
         try expectLiteral(m, "normalized", contracts.uuid.normalization_outputs[index]);
     }
-    const rejected = (root.get("uuid_rejection") orelse return error.MissingGolden).array.items;
+    const rejected = try array(root.get("uuid_rejection") orelse return error.MissingGolden);
     try std.testing.expectEqual(contracts.uuid.rejection_fields.len * contracts.uuid.rejection_inputs.len, rejected.len);
     for (contracts.uuid.rejection_fields, 0..) |field, field_index| {
         for (contracts.uuid.rejection_inputs, 0..) |input, input_index| {
@@ -270,7 +442,7 @@ fn expectUuid(root: std.json.ObjectMap) !void {
 }
 
 fn expectRuntimeBounds(value: std.json.Value) !void {
-    const items = value.array.items;
+    const items = try array(value);
     const names = [_][]const u8{ "files", "directories", "bytes", "directory_depth", "file_depth", "scan_files", "scan_directories", "scan_bytes", "scan_depth", "file_bytes", "loader_files", "manifest_bytes" };
     const limits = [_]u64{
         contracts.limits.runtime_files,
@@ -298,7 +470,7 @@ fn expectRuntimeBounds(value: std.json.Value) !void {
 }
 
 fn expectLiveRefusals(value: std.json.Value) !void {
-    const items = value.array.items;
+    const items = try array(value);
     try std.testing.expect(items.len >= 16);
     for (items) |item| {
         const m = try c.exactFields(item, &golden_fields.live_refusal);
@@ -307,26 +479,138 @@ fn expectLiveRefusals(value: std.json.Value) !void {
         try expectBool(m, "output_file_appeared", false);
         _ = try c.string(m.get("name") orelse return error.MissingGolden);
         _ = try c.string(m.get("reason") orelse return error.MissingGolden);
-        _ = (m.get("outputs") orelse return error.MissingGolden).object;
+        if ((m.get("outputs") orelse return error.MissingGolden) != .object) return error.ExpectedObject;
     }
 }
 
-fn expectRecord(records: std.json.ObjectMap, key: []const u8, fields: []const []const u8, schema: []const u8) ![]const u8 {
+fn expectRecord(records: std.json.ObjectMap, key: []const u8, comptime domain: []const u8, schema: []const u8, version: u8) ![]const u8 {
     const bytes = try c.string(records.get(key) orelse return error.MissingGolden);
     var document = try contracts.parseCanonical(std.testing.allocator, bytes);
     defer document.deinit();
-    const m = try c.exactFields(document.value(), fields);
+    try expectRecordObject(domain, document.value());
+    const m = document.value().object;
     try expectLiteral(m, "schema", schema);
+    try expectInt(m, "version", version);
+    if (std.mem.eql(u8, key, "approval_template")) try expectLiteral(m, "decision", "pending");
     if (std.mem.eql(u8, key, "authorization_approved")) try expectLiteral(m, "decision", "approved");
     if (std.mem.eql(u8, key, "authorization_denied")) try expectLiteral(m, "decision", "denied");
     return bytes;
 }
 
+fn expectRecordObject(comptime domain: []const u8, value: std.json.Value) anyerror!void {
+    @setEvalBranchQuota(20_000);
+    if (comptime std.mem.eql(u8, domain, "resources")) return expectResources(value);
+    if (comptime std.mem.eql(u8, domain, "substitution")) return expectSubstitution(value);
+    if (comptime std.mem.eql(u8, domain, "cleanup")) return expectCleanup(value);
+    if (comptime std.mem.eql(u8, domain, "azure_runtime_isolation")) return expectIsolation(value);
+    const fields = comptime @field(contracts.schema_fields, domain);
+    const m = try c.exactFields(value, &fields);
+    inline for (fields) |key| {
+        const child = m.get(key).?;
+        if (comptime std.mem.eql(u8, domain, "tools") or contains(key, &.{ "candidate", "bundle", "public_bundle", "transport", "qcow2", "os_vhd", "azure_runtime_document", "plan", "authorization", "launcher", "interpreter", "dynamic_loader", "manifest" })) {
+            try expectRecordObject("artifact", child);
+        } else if (comptime std.mem.eql(u8, key, "azure_runtime")) {
+            try expectRecordObject(if (comptime contains(domain, &.{ "approval_template", "authorization" })) "azure_runtime_approval" else "azure_runtime", child);
+        } else if (comptime std.mem.eql(u8, key, "limits")) {
+            try expectRecordObject(if (comptime contains(domain, &.{ "azure_runtime", "azure_runtime_approval" })) "azure_runtime_limits" else "approval_limits", child);
+        } else if (comptime std.mem.eql(u8, key, "observed")) {
+            try expectRecordObject("azure_runtime_observed", child);
+        } else if (comptime std.mem.eql(u8, key, "isolation")) {
+            try expectRecordObject("azure_runtime_isolation", child);
+        } else if (comptime std.mem.eql(u8, key, "directory")) {
+            try expectRecordObject("ledger_directory", child);
+        } else if (comptime std.mem.eql(u8, key, "approval")) {
+            try expectRecordObject("admission_approval", child);
+        } else if (comptime contains(key, &.{ "ledger", "run", "identity", "lineage", "resources", "substitution", "cleanup", "cost", "tools" })) {
+            try expectRecordObject(key, child);
+        } else if (comptime std.mem.eql(u8, key, "commands")) {
+            try expectCommandTable(child);
+        } else if (comptime std.mem.eql(u8, key, "loader_dependencies")) {
+            for (try array(child)) |artifact| try expectRecordObject("artifact", artifact);
+        } else if (comptime contains(key, &.{ "initialization_required", "ledger_initialization_required" })) {
+            if (child != .bool) return error.ExpectedBoolean;
+        } else if (comptime std.mem.eql(u8, domain, "ledger_directory") and contains(key, &.{ "device_major", "device_minor", "uid" })) {
+            _ = try c.integer(u32, child);
+        } else if (comptime std.mem.eql(u8, domain, "ledger_directory") and std.mem.eql(u8, key, "mode")) {
+            _ = try c.integer(u16, child);
+        } else if (comptime std.mem.eql(u8, key, "version")) {
+            _ = try c.integer(u8, child);
+        } else if (comptime contains(domain, &.{ "azure_runtime_limits", "azure_runtime_observed", "approval_limits" }) or contains(key, &.{ "size", "created_unix", "runtime_seconds", "cleanup_seconds", "operation_seconds", "poll_seconds", "vhd_bytes", "vhd_capacity_bytes", "retry_count", "estimated_upper_bound", "maximum_authorized", "repository_policy_maximum", "estimated_cost_upper_bound_microusd", "maximum_authorized_cost_microusd", "recorded_unix", "expires_unix", "approved_unix", "inode" })) {
+            _ = try c.integer(u64, child);
+        } else {
+            const text = try c.string(child);
+            if (comptime std.mem.eql(u8, key, "sha256") or std.mem.endsWith(u8, key, "_sha256")) _ = try c.parseSha256(text);
+            if (comptime contains(key, &.{ "attempt_id", "campaign_id", "ledger_id", "subscription" })) _ = try c.parseUuid(text);
+        }
+    }
+    if (comptime contains(domain, &.{ "azure_runtime", "azure_runtime_approval" })) {
+        try expectLiteral(m, "schema", "uk.wamr.azure-cli-runtime-closure");
+        try expectInt(m, "version", @as(u8, 1));
+        try expectLiteral(m, "canonicalization", contracts.canonicalization);
+    } else if (comptime std.mem.eql(u8, domain, "ledger")) {
+        try expectLiteral(m, "schema", "uk.wamr.azure-campaign-ledger-binding");
+        try expectInt(m, "version", @as(u8, 1));
+        try expectLiteral(m, "purpose", contracts.policy.purpose);
+    } else if (comptime std.mem.eql(u8, domain, "azure_runtime_limits")) {
+        try expectInt(m, "files", contracts.limits.runtime_files);
+        try expectInt(m, "directories", contracts.limits.runtime_directories);
+        try expectInt(m, "bytes", contracts.limits.runtime_bytes);
+        try expectInt(m, "depth", contracts.limits.runtime_depth);
+        try expectInt(m, "file_bytes", contracts.limits.runtime_file_bytes);
+        try expectInt(m, "loader_files", contracts.limits.runtime_loader_files);
+    } else if (comptime std.mem.eql(u8, domain, "azure_runtime_observed")) {
+        inline for (contracts.schema_fields.azure_runtime_observed) |key| {
+            const maximum = comptime @field(contracts.limits, "runtime_" ++ key);
+            if (try c.integer(u64, m.get(key).?) > maximum) return error.RuntimeLimitExceeded;
+        }
+    } else if (comptime std.mem.eql(u8, domain, "approval_limits")) {
+        try expectInt(m, "runtime_seconds", contracts.policy.runtime_seconds);
+        try expectInt(m, "cleanup_seconds", contracts.policy.cleanup_seconds);
+        try expectInt(m, "operation_seconds", contracts.policy.operation_seconds);
+        try expectInt(m, "maximum_parallelism", contracts.policy.resources.maximum_parallelism);
+        try expectInt(m, "boot_count", contracts.policy.resources.boot_count);
+        try expectInt(m, "retry_count", contracts.policy.retry_count);
+    } else if (comptime std.mem.eql(u8, domain, "cost")) {
+        try expectLiteral(m, "unit", contracts.policy.cost_unit);
+        try expectLiteral(m, "policy", contracts.policy.cost_policy);
+        try expectInt(m, "estimated_upper_bound", contracts.policy.estimated_cost_upper_bound_microusd);
+        try expectInt(m, "repository_policy_maximum", contracts.policy.repository_maximum_cost_microusd);
+        try expectAuthorizedCost(m, "maximum_authorized");
+    } else if (comptime contains(domain, &.{ "plan", "admission" })) {
+        inline for ([_][]const u8{ "purpose", "profile", "location", "vm_size", "serial_mode" }) |key| {
+            try expectLiteral(m, key, @field(contracts.policy, key));
+        }
+        try expectLiteral(m, "campaign_profile", contracts.policy.profile);
+        try expectLiteral(m, "canonicalization", contracts.canonicalization);
+        try expectLiteral(m, "authority", if (comptime std.mem.eql(u8, domain, "plan")) contracts.policy.not_admitted else contracts.policy.approved);
+        inline for ([_][]const u8{ "runtime_seconds", "cleanup_seconds", "operation_seconds", "poll_seconds", "retry_count" }) |key| {
+            try expectInt(m, key, @field(contracts.policy, key));
+        }
+        try expectInt(m, "vhd_bytes", contracts.policy.fixed_vhd_bytes);
+        try expectInt(m, "vhd_capacity_bytes", contracts.policy.fixed_vhd_capacity_bytes);
+        if (try c.integer(u64, m.get("created_unix").?) == 0) return error.InvalidCreationTime;
+    } else if (comptime contains(domain, &.{ "approval_template", "authorization" })) {
+        try expectInt(m, "estimated_cost_upper_bound_microusd", contracts.policy.estimated_cost_upper_bound_microusd);
+        try expectAuthorizedCost(m, "maximum_authorized_cost_microusd");
+    }
+    if (comptime contains(domain, &.{ "authorization", "admission_approval" })) {
+        if (!contracts.boundedAuthorityText(try c.string(m.get("approver").?), contracts.limits.approver_min_bytes, contracts.limits.approver_max_bytes)) return error.InvalidApprover;
+        if (!contracts.boundedAuthorityText(try c.string(m.get("reference").?), contracts.limits.reference_min_bytes, contracts.limits.reference_max_bytes)) return error.InvalidReference;
+        const start = if (comptime std.mem.eql(u8, domain, "authorization")) "recorded_unix" else "approved_unix";
+        if (!contracts.validApprovalWindow(try c.integer(u64, m.get(start).?), try c.integer(u64, m.get("expires_unix").?))) return error.InvalidApprovalWindow;
+    }
+}
+
+fn expectAuthorizedCost(map: std.json.ObjectMap, key: []const u8) !void {
+    const amount = try c.integer(u64, map.get(key).?);
+    if (amount < contracts.policy.estimated_cost_upper_bound_microusd or amount > contracts.policy.repository_maximum_cost_microusd) return error.InvalidAuthorizedCost;
+}
+
 fn expectCommandTable(value: std.json.Value) !void {
-    const commands = value.array.items;
+    const commands = try array(value);
     try std.testing.expectEqual(contracts.azure_commands.len, commands.len);
     for (commands, contracts.azure_commands) |actual, expected| {
-        const words = actual.array.items;
+        const words = try array(actual);
         try std.testing.expectEqual(expected.len, words.len);
         for (words, expected) |word, text| try std.testing.expectEqualStrings(text, try c.string(word));
     }
@@ -351,25 +635,43 @@ fn expectManifestLine(line: []const u8, tag: []const u8, role: ?[]const u8) !voi
     try std.testing.expectEqual(@as(usize, 13), count);
 }
 
-fn expectStringObject(value: std.json.Value, keys: []const []const u8) !void {
-    const m = try c.exactFields(value, keys);
-    for (keys) |key| _ = try c.string(m.get(key) orelse return error.MissingGolden);
+fn expectIsolation(value: std.json.Value) !void {
+    const m = try c.exactFields(value, &contracts.schema_fields.azure_runtime_isolation);
+    inline for (contracts.schema_fields.azure_runtime_isolation) |key| {
+        try expectLiteral(m, key, @field(contracts.isolation, key));
+    }
 }
 
 fn expectStringArray(map: std.json.ObjectMap, key: []const u8, expected: []const []const u8) !void {
-    const items = (map.get(key) orelse return error.MissingGolden).array.items;
+    const items = try array(map.get(key) orelse return error.MissingGolden);
     try std.testing.expectEqual(expected.len, items.len);
     for (items, expected) |item, name| try std.testing.expectEqualStrings(name, try c.string(item));
 }
 
 fn expectLiteral(map: std.json.ObjectMap, key: []const u8, expected: []const u8) !void {
-    try std.testing.expectEqualStrings(expected, try c.string(map.get(key) orelse return error.MissingGolden));
+    if (!std.mem.eql(u8, expected, try c.string(map.get(key) orelse return error.MissingGolden))) return error.UnexpectedLiteral;
 }
 
 fn expectInt(map: std.json.ObjectMap, key: []const u8, expected: anytype) !void {
-    try std.testing.expectEqual(@as(@TypeOf(expected), expected), try c.integer(@TypeOf(expected), map.get(key) orelse return error.MissingGolden));
+    if (expected != try c.integer(@TypeOf(expected), map.get(key) orelse return error.MissingGolden)) return error.UnexpectedInteger;
 }
 
 fn expectBool(map: std.json.ObjectMap, key: []const u8, expected: bool) !void {
-    try std.testing.expectEqual(expected, (map.get(key) orelse return error.MissingGolden).bool);
+    const actual = switch (map.get(key) orelse return error.MissingGolden) {
+        .bool => |boolean| boolean,
+        else => return error.ExpectedBoolean,
+    };
+    if (actual != expected) return error.UnexpectedBoolean;
+}
+
+fn array(value: std.json.Value) ![]const std.json.Value {
+    return switch (value) {
+        .array => |items| items.items,
+        else => error.ExpectedArray,
+    };
+}
+
+fn contains(value: []const u8, choices: []const []const u8) bool {
+    for (choices) |choice| if (std.mem.eql(u8, value, choice)) return true;
+    return false;
 }

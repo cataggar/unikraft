@@ -118,6 +118,24 @@ pub const cli = struct {
     pub const admit_repeated_required = [_][]const u8{};
     pub const admit_repeated_optional = [_][]const u8{};
     pub const decision_choices = [_][]const u8{ "approved", "denied" };
+    pub const option_fields = [_][]const u8{ "flags", "dest", "type", "required", "repeated", "choices" };
+    pub const integer_flags = [_][]const u8{ "--maximum-authorized-cost-microusd", "--created-unix", "--recorded-unix", "--expires-unix" };
+    pub const text_flags = [_][]const u8{ "--campaign-id", "--subscription", "--prefix", "--attempt-id", "--ledger-id", "--decision", "--approver", "--reference" };
+};
+
+pub const isolation = struct {
+    pub const python_home = "closure_root";
+    pub const module_layout = "flat_python_home_v1";
+    pub const extensions = "closure_empty";
+    pub const dynamic_extension_install = "disabled";
+    pub const user_site = "disabled";
+    pub const site_import = "disabled";
+    pub const bytecode_writes = "disabled";
+    pub const path_environment = "forbidden";
+    pub const startup_hooks = "forbidden";
+    pub const loader_environment = "retained_readonly_root";
+    pub const host_loader_fallback = "forbidden";
+    pub const package_restore = "forbidden_after_custody";
 };
 
 pub const manifest = struct {
