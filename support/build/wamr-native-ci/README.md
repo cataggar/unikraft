@@ -1034,8 +1034,11 @@ Canonical custody framing uses a short-lived nested arena so its JSON workspace
 does not accumulate in the acceptance arena across inventory entries. Tree
 members are hashed through the already retained descriptor, using the same
 `readRetained` primitive as the #187 export foundation; before/after descriptor
-snapshots and full pathname/component verification remain intact. No digests
-or pathnames are cached across revalidation boundaries.
+snapshots and full pathname/component verification remain intact. Each newly
+hashed member uses that primitive's terminal verification without immediately
+repeating the same walk; alias reuse and final tree member/directory checks
+still verify independently. No digests or pathnames are cached across
+revalidation boundaries.
 Pre-export refusal names only a fixed result, build-start schema/consumer
 role/tree/custody (with a fixed allowlisted file or tree role when physical
 custody changes), physical path role/binary/runtime/tree, dependency/custody,

@@ -1548,6 +1548,170 @@ test "borrowed custody hashing checks the held descriptor and its current name" 
     );
 }
 
+const CustodyIoProbe = struct {
+    const Mode = enum { count, replace_ancestor, replace_fifo, cancel_verify };
+    table: std.Io.VTable = std.testing.io.vtable.*,
+    mode: Mode = .count,
+    root: ?std.Io.Dir = null,
+    directory_opens: usize = 0,
+    reads: usize = 0,
+    bytes: usize = 0,
+    eof: bool = false,
+    read_file: ?std.Io.File = null,
+    injected: bool = false,
+    threadlocal var active: ?*CustodyIoProbe = null;
+
+    fn install(self: *CustodyIoProbe) std.Io {
+        std.debug.assert(active == null);
+        active = self;
+        self.table.dirOpenDir = openDirectory;
+        self.table.fileReadPositional = read;
+        return .{ .userdata = std.testing.io.userdata, .vtable = &self.table };
+    }
+
+    fn deinit(_: *CustodyIoProbe) void {
+        active = null;
+    }
+
+    fn openDirectory(
+        userdata: ?*anyopaque,
+        directory: std.Io.Dir,
+        path: []const u8,
+        open_options: std.Io.Dir.OpenOptions,
+    ) std.Io.Dir.OpenError!std.Io.Dir {
+        const self = active.?;
+        self.directory_opens += 1;
+        if (self.eof and !self.injected and self.mode != .count) {
+            self.injected = true;
+            const io = std.testing.io;
+            switch (self.mode) {
+                .count => unreachable,
+                .cancel_verify => return error.Canceled,
+                .replace_ancestor => {
+                    const root = self.root.?;
+                    const held = core.private_files.snapshot(self.read_file.?) catch |err| return injectionError(err);
+                    std.Io.Dir.rename(root, "tree", root, "retained-tree", io) catch |err| return injectionError(err);
+                    root.createDir(io, "tree", .fromMode(0o700)) catch |err| return injectionError(err);
+                    const replacement = root.openDir(io, "tree", .{ .iterate = true }) catch |err| return injectionError(err);
+                    defer replacement.close(io);
+                    writeFixtureFile(io, replacement, "member", "native inventory member") catch |err| return injectionError(err);
+                    const after = core.private_files.snapshot(self.read_file.?) catch |err| return injectionError(err);
+                    if (!core.private_files.sameSnapshot(held, after)) return injectionError(error.FixtureDescriptorChanged);
+                },
+                .replace_fifo => {
+                    const tree = self.root.?.openDir(io, "tree", .{ .iterate = true }) catch |err| return injectionError(err);
+                    defer tree.close(io);
+                    tree.deleteFile(io, "member") catch |err| return injectionError(err);
+                    if (std.os.linux.errno(std.os.linux.mknodat(tree.handle, "member", std.os.linux.S.IFIFO | 0o600, 0)) != .SUCCESS)
+                        return injectionError(error.FixtureFifo);
+                },
+            }
+        }
+        return std.testing.io.vtable.dirOpenDir(userdata, directory, path, open_options);
+    }
+
+    fn injectionError(err: anyerror) error{Unexpected} {
+        std.debug.print("custody terminal fixture injection failed: {s}\n", .{@errorName(err)});
+        return error.Unexpected;
+    }
+
+    fn read(
+        userdata: ?*anyopaque,
+        file: std.Io.File,
+        data: []const []u8,
+        offset: u64,
+    ) std.Io.File.ReadPositionalError!usize {
+        const count = try std.testing.io.vtable.fileReadPositional(userdata, file, data, offset);
+        const self = active.?;
+        self.reads += 1;
+        self.bytes += count;
+        if (count == 0) {
+            self.eof = true;
+            self.read_file = file;
+        }
+        return count;
+    }
+};
+
+test "input tree uses one terminal borrowed descriptor verification and recaptures fresh bytes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const parent = try core.private_files.openDirectory(io, options.fixture_root, .private);
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "input-terminal-verification-{d}", .{std.os.linux.getpid()});
+    defer a.free(name);
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("terminal verification fixture cleanup failed");
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    defer a.free(path);
+    const binding: controller.input_custody.Binding = .{ .role = "test", .path = path };
+    var probe: CustodyIoProbe = .{};
+    const traced = probe.install();
+    defer probe.deinit();
+    _ = try controller.input_custody.tree(a, traced, binding);
+    const tree_directories = probe.directory_opens;
+    const names = [_][]const u8{ "first", "second", "third" };
+    for (names) |member| try writeFixtureFile(io, root, member, "native inventory member");
+    probe.directory_opens = 0;
+    for (names) |member| {
+        const file_path = try std.fs.path.join(a, &.{ path, member });
+        defer a.free(file_path);
+        _ = try controller.custody_files.readFile(traced, file_path, 4096, false);
+    }
+    const expected_directories = tree_directories + probe.directory_opens;
+    const expected_reads = probe.reads;
+    const expected_bytes = probe.bytes;
+    probe.directory_opens = 0;
+    probe.reads = 0;
+    probe.bytes = 0;
+    const first = try controller.input_custody.tree(a, traced, binding);
+    try std.testing.expectEqual(expected_directories, probe.directory_opens);
+    try std.testing.expectEqual(expected_reads, probe.reads);
+    try std.testing.expectEqual(expected_bytes, probe.bytes);
+    const second = try controller.input_custody.tree(a, traced, binding);
+    try std.testing.expectEqual(expected_directories * 2, probe.directory_opens);
+    try std.testing.expectEqual(expected_reads * 2, probe.reads);
+    try std.testing.expectEqual(expected_bytes * 2, probe.bytes);
+    try std.testing.expectEqualDeep(first, second);
+    try appendRelativeFixtureFile(io, root, "first", "\n");
+    const changed = try controller.input_custody.tree(a, traced, binding);
+    try std.testing.expect(!std.mem.eql(u8, &first.content_sha256, &changed.content_sha256));
+}
+
+test "input tree terminal verification refuses ancestor replacement FIFO and cancellation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const parent = try core.private_files.openDirectory(io, options.fixture_root, .private);
+    defer parent.close(io);
+    for ([_]CustodyIoProbe.Mode{ .replace_ancestor, .replace_fifo, .cancel_verify }) |mode| {
+        const name = try std.fmt.allocPrint(a, "input-terminal-{s}-{d}", .{ @tagName(mode), std.os.linux.getpid() });
+        defer a.free(name);
+        try parent.createDir(io, name, .fromMode(0o700));
+        defer parent.deleteTree(io, name) catch @panic("terminal refusal fixture cleanup failed");
+        const root = try parent.openDir(io, name, .{ .iterate = true });
+        defer root.close(io);
+        try root.createDir(io, "tree", .fromMode(0o700));
+        const tree = try root.openDir(io, "tree", .{ .iterate = true });
+        defer tree.close(io);
+        try writeFixtureFile(io, tree, "member", "native inventory member");
+        const path = try std.fs.path.join(a, &.{ options.fixture_root, name, "tree" });
+        defer a.free(path);
+        var probe: CustodyIoProbe = .{ .mode = mode, .root = root };
+        const traced = probe.install();
+        defer probe.deinit();
+        const expected: anyerror = switch (mode) {
+            .replace_ancestor => error.FileChanged,
+            .replace_fifo => error.UnsafeFile,
+            .cancel_verify => error.Canceled,
+            .count => unreachable,
+        };
+        try std.testing.expectError(expected, controller.input_custody.tree(a, traced, .{ .role = "test", .path = path }));
+        try std.testing.expect(probe.injected);
+    }
+}
+
 test "local consumer custody recaptures exact files trees and ancestry" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

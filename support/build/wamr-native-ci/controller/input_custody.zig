@@ -459,7 +459,6 @@ fn treeFile(io: std.Io, path: []const u8, state: *TreeCounter) !physical.File {
     try limits.addBounded(&state.hash_work, @intCast(before.size), state.hash_limit);
     const identity = try physical.readRetained(io, &retained, limits.input_file);
     if (!std.meta.eql(identity.metadata, metadata)) return error.InputChanged;
-    try retained.verify(io);
     try state.identities.put(metadata, identity.sha256);
     return identity;
 }
