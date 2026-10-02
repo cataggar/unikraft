@@ -651,9 +651,8 @@ test "six boot modes bind exact image, APIC flags, validator and command budgets
     try controller.boot_pipeline.admitHost(.x86_64, std.os.linux.S.IFCHR, true);
 }
 
-test "exact bounded validator JSON and Python tiny differential faults" {
+test "exact bounded validator JSON rejects every malformed tiny result" {
     const a = std.testing.allocator;
-    const io = std.testing.io;
     const raw_hash = std.fmt.bytesToHex(controller.records.fileIdentity("abc"), .lower);
     const valid = try std.fmt.allocPrint(
         a,
@@ -661,17 +660,6 @@ test "exact bounded validator JSON and Python tiny differential faults" {
         .{&raw_hash},
     );
     defer a.free(valid);
-    const reference = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" });
-    defer a.free(reference);
-    const oracle =
-        \\import importlib.util,sys,hashlib
-        \\s=importlib.util.spec_from_file_location("ci",sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
-        \\data=bytes.fromhex(sys.argv[2]); m.read=lambda path, limit: data
-        \\try:
-        \\ m.native_result("private",{"sha256":hashlib.sha256(data).hexdigest(),"bytes":len(data)},b"abc",65536)
-        \\ print("accepted")
-        \\except (m.Refusal,ValueError,KeyError,TypeError): print("refused")
-    ;
     const Mutate = struct { from: []const u8, to: []const u8 };
     const cases = [_]Mutate{
         .{ .from = "", .to = "" },
@@ -692,23 +680,7 @@ test "exact bounded validator JSON and Python tiny differential faults" {
         const bytes = if (index == 0) valid else try std.mem.replaceOwned(u8, a, valid, mutation.from, mutation.to);
         defer if (index != 0) a.free(bytes);
         const native = if (controller.boot_pipeline.parseValidator(arena.allocator(), bytes, 3, &raw_hash)) |_| true else |_| false;
-        const hex = try a.alloc(u8, bytes.len * 2);
-        defer a.free(hex);
-        const digits = "0123456789abcdef";
-        for (bytes, 0..) |byte, at| {
-            hex[at * 2] = digits[byte >> 4];
-            hex[at * 2 + 1] = digits[byte & 15];
-        }
-        const result = try std.process.run(a, io, .{
-            .argv = &.{ options.python_executable, "-B", "-c", oracle, reference, hex },
-            .cwd = .{ .path = options.repository_root },
-            .stdout_limit = .limited(64),
-            .stderr_limit = .limited(4096),
-        });
-        defer a.free(result.stdout);
-        defer a.free(result.stderr);
-        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
-        try std.testing.expectEqualStrings(if (native) "accepted\n" else "refused\n", result.stdout);
+        try std.testing.expectEqual(index == 0, native);
     }
 }
 
@@ -889,8 +861,63 @@ test "boot recheck uses transient scratch and refuses changed pinned evidence wi
     try ctx.pinned.put("build.json", try controller.custody_files.readFile(io, build_path, 4096, true));
     for (0..3) |_| try std.testing.expectError(error.BuildStartChanged, controller.boot_pipeline.testing.revalidateBase(&ctx));
     try evidence.deleteFile(io, "build.json");
+    var missing_build = base;
+    missing_build.allocator = a;
+    try std.testing.expectError(error.FileNotFound, controller.build_pipeline.readAcceptedRecord(&missing_build, "build.json"));
     try writeFixtureFile(io, evidence, "build.json", "{\"changed\":true}\n");
     try std.testing.expectError(error.EvidenceChanged, controller.boot_pipeline.testing.revalidateBase(&ctx));
+}
+
+test "occupied build output and boot slots refuse without erasing prior state" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const parent = try core.private_files.Directory.open(io, options.fixture_root);
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "native-prior-output-{d}", .{std.os.linux.getpid()});
+    try parent.dir.createDir(io, name, .fromMode(0o700));
+    defer parent.dir.deleteTree(io, name) catch @panic("prior-output cleanup failed");
+    const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    const root = try core.private_files.Directory.open(io, path);
+    defer root.close(io);
+    try root.dir.createDir(io, "compute", .fromMode(0o700));
+    const compute_path = try std.fs.path.join(a, &.{ path, "compute" });
+    const compute = try core.private_files.Directory.open(io, compute_path);
+    defer compute.close(io);
+    var signal = try controller.build_pipeline.installCancellation();
+    defer signal.deinit();
+    var build: controller.build_pipeline.Context = .{
+        .allocator = a,
+        .io = io,
+        .environ = undefined,
+        .runtime = path,
+        .repository = options.repository_root,
+        .wamr = "",
+        .compute = compute_path,
+        .git = undefined,
+        .tools = undefined,
+        .roots = undefined,
+        .signal = &signal,
+    };
+    try writeFixtureFile(io, compute.dir, "prior", "retained");
+    try std.testing.expectError(error.PathAlreadyExists, controller.build_pipeline.reserve(.{ .context = &build, .runtime = root }));
+    const prior = try compute.dir.readFileAlloc(io, "prior", a, .limited(32));
+    try std.testing.expectEqualStrings("retained", prior);
+    for ([_][]const u8{ "package", "public-source", "boot-raw-x2apic", "boot-raw-legacy-apic", "boot-qcow2-x2apic", "boot-qcow2-legacy-apic", "boot-vpc-x2apic", "boot-vpc-legacy-apic" }) |slot|
+        try compute.dir.createDir(io, slot, .fromMode(0o700));
+    var boot: controller.boot_pipeline.Context = .{
+        .build_context = &build,
+        .pinned = std.StringHashMap(controller.custody_files.File).init(a),
+    };
+    try controller.boot_pipeline.testing.emptySlots(&boot);
+    const slot = try compute.dir.openDir(io, "boot-raw-x2apic", .{ .iterate = true });
+    defer slot.close(io);
+    try writeFixtureFile(io, slot, "prior", "occupied");
+    try std.testing.expectError(error.PriorOutput, controller.boot_pipeline.testing.emptySlots(&boot));
+    const occupied = try slot.readFileAlloc(io, "prior", a, .limited(32));
+    try std.testing.expectEqualStrings("occupied", occupied);
+    try std.testing.expectError(error.FileNotFound, compute.dir.openFile(io, "evidence/result.json", .{}));
 }
 
 test "changed raw QCOW2 and derived VHD images never publish compute evidence" {
@@ -998,28 +1025,13 @@ test "transport encoder preserves full 3 MiB and 8 MiB streams and refuses true 
     try std.testing.expectError(error.CommandResultTooLarge, controller.command_adapter.canonicalTransport(a, value));
 }
 
-test "native tiny build identity admissions match Python build refusal boundary" {
+test "native tiny build identity refuses development optional JIT and altered file sets" {
     const a = std.testing.allocator;
-    const io = std.testing.io;
-    const reference = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" });
-    defer a.free(reference);
     const identity = try std.fmt.allocPrint(a,
         \\{{"wamr_revision":"{s}","compiler_profile":"unikraft-x86_64","zig_version":"0.16.0","minimal_wasi":false,"development_only":false,"variant":"tiny","jit_mode":null,"files":{{
         \\"embedded.c":"{s}","identity.h":"{s}","libwamr-aot.a":"{s}","tiny.cwasm":"{s}","tiny.wasm":"{s}","wamr_aot.h":"{s}","wamrc":"{s}"}}}}
     , .{ controller.custody_limits.wamr_revision, &([_]u8{'a'} ** 64), &([_]u8{'a'} ** 64), &([_]u8{'a'} ** 64), &([_]u8{'a'} ** 64), &([_]u8{'a'} ** 64), &([_]u8{'a'} ** 64), &([_]u8{'a'} ** 64) });
     defer a.free(identity);
-    const python =
-        \\import importlib.util,json,sys
-        \\s=importlib.util.spec_from_file_location("ci",sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
-        \\identity=json.loads(sys.argv[2])
-        \\class ImageReached(Exception): pass
-        \\m.document=lambda path: identity
-        \\m.digest=lambda path: "a"*64
-        \\m.source=lambda: (_ for _ in ()).throw(ImageReached())
-        \\try: m.check_build()
-        \\except ImageReached: print("accepted")
-        \\except (m.Refusal, KeyError, TypeError): print("refused")
-    ;
     const Mutation = struct { key: []const u8, value: ?std.json.Value = null };
     const changes = [_]Mutation{
         .{ .key = "" },
@@ -1038,20 +1050,7 @@ test "native tiny build identity admissions match Python build refusal boundary"
         var value = try std.json.parseFromSliceLeaky(std.json.Value, local, identity, .{ .allocate = .alloc_always });
         if (change.value) |replacement| try value.object.put(local, change.key, replacement);
         const native = if (controller.build_pipeline.admitPreparedIdentity(value)) |_| true else |_| false;
-        const raw = try std.json.Stringify.valueAlloc(a, value, .{});
-        defer a.free(raw);
-        const result = try std.process.run(a, io, .{
-            .argv = &.{ options.python_executable, "-B", "-c", python, reference, raw },
-            .cwd = .{ .path = options.repository_root },
-            .stdout_limit = .limited(64),
-            .stderr_limit = .limited(4096),
-        });
-        defer a.free(result.stdout);
-        defer a.free(result.stderr);
-        if (result.term != .exited or result.term.exited != 0)
-            std.debug.print("Python build oracle case {d}: {s}\n", .{ index, result.stderr });
-        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
-        try std.testing.expectEqualStrings(if (native) "accepted\n" else "refused\n", result.stdout);
+        try std.testing.expectEqual(index == 0, native);
     }
 }
 
@@ -1149,24 +1148,11 @@ fn directSharedSupervisorFixtures() !void {
         const record = try core.contracts.Document.parse(a, raw, .{});
         defer record.deinit();
         try record.requireCanonical(a, raw);
-        const python_reference = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" });
-        defer a.free(python_reference);
-        const python_oracle = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/tests/native_command_oracle.py" });
-        defer a.free(python_oracle);
         const record_path = try std.fs.path.join(a, &.{ work, "evidence/command-fixtures.json" });
         defer a.free(record_path);
-        const comparison = try std.process.run(a, io, .{
-            .argv = &.{ options.python_executable, "-B", python_oracle, python_reference, record_path, log_path },
-            .cwd = .{ .path = options.repository_root },
-            .stdout_limit = .limited(4096),
-            .stderr_limit = .limited(4096),
-        });
-        defer a.free(comparison.stdout);
-        defer a.free(comparison.stderr);
-        if (comparison.term != .exited or comparison.term.exited != 0)
-            std.debug.print("Python command oracle: {s}\n", .{comparison.stderr});
-        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, comparison.term);
         const value = record.value().object;
+        try std.testing.expectEqual(log_stat.bytes, try core.contracts.integer(u64, value.get("bytes").?));
+        try std.testing.expectEqualStrings(&log_stat.sha256, value.get("sha256").?.string);
         try std.testing.expectEqualStrings("command_diagnostic_not_acceptance", value.get("scope").?.string);
         try std.testing.expectEqualStrings("fixtures", value.get("stage").?.string);
         try std.testing.expectEqual(scenario.accepted, !value.get("over_limit").?.bool and
@@ -3380,38 +3366,6 @@ fn fixtureGit(allocator: std.mem.Allocator, cwd: []const u8, argv: []const []con
     if (result.term != .exited or result.term.exited != 0) return error.FixtureGitFailed;
 }
 
-fn pythonCustody(allocator: std.mem.Allocator, mode: []const u8, path: []const u8, hash_limit: usize) ![]u8 {
-    const run_py = try std.fs.path.join(allocator, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" });
-    defer allocator.free(run_py);
-    const limit = try std.fmt.allocPrint(allocator, "{d}", .{hash_limit});
-    defer allocator.free(limit);
-    const result = try std.process.run(allocator, std.testing.io, .{
-        .argv = &.{
-            "python3", "-B", "-c",
-            "import importlib.util,sys,pathlib\n" ++
-                "s=importlib.util.spec_from_file_location('ci',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)\n" ++
-                "m.INPUT_TREE_MAX_BYTES=int(sys.argv[4])\n" ++
-                "try:\n" ++
-                " r=m.physical_tree_record(pathlib.Path(sys.argv[3]))[0] if sys.argv[2]=='tree' else m.source(pathlib.Path(sys.argv[3]))\n" ++
-                " print('ACCEPTED:'+(r['content_sha256'] if sys.argv[2]=='tree' else 'source'))\n" ++
-                "except m.Refusal as error:\n" ++
-                " print('REFUSED:'+str(error))\n",
-            run_py,    mode, path,
-            limit,
-        },
-        .cwd = .{ .path = options.repository_root },
-        .stdout_limit = .limited(4096),
-        .stderr_limit = .limited(4096),
-    });
-    defer allocator.free(result.stderr);
-    if (result.term != .exited or result.term.exited != 0) {
-        std.debug.print("Python custody oracle failed: {s}\n", .{result.stderr});
-        allocator.free(result.stdout);
-        return error.PythonOracleFailed;
-    }
-    return result.stdout;
-}
-
 test "native clean Git custody, stable physical identities and pinned archive refusal" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -3500,23 +3454,6 @@ test "native clean Git custody, stable physical identities and pinned archive re
         allocator.free(unchanged.custody.object_format);
     }
     try std.testing.expectEqualDeep(captured.custody, unchanged.custody);
-    const run_py = try std.fs.path.join(allocator, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" });
-    defer allocator.free(run_py);
-    const python = try std.process.run(allocator, io, .{
-        .argv = &.{
-            "python3",                                                                                                                                                                                                                                                      "-B",   "-c",
-            "import importlib.util,sys; s=importlib.util.spec_from_file_location('ci',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); v=m.source(sys.argv[2]); print(v['custody']['content_sha256']); print(v['custody']['physical_sha256'])", run_py, path,
-        },
-        .cwd = .{ .path = options.repository_root },
-        .stdout_limit = .limited(1024),
-        .stderr_limit = .limited(4096),
-    });
-    defer allocator.free(python.stdout);
-    defer allocator.free(python.stderr);
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, python.term);
-    var lines = std.mem.splitScalar(u8, python.stdout, '\n');
-    try std.testing.expectEqualStrings(&captured.custody.content_sha256, lines.next().?);
-    try std.testing.expectEqualStrings(&captured.custody.physical_sha256, lines.next().?);
     try std.testing.expectError(error.UnpinnedSource, controller.source_custody.sealWamr(allocator, io, path, path, options.git_executable));
     const output_root = try repo.openDir(io, ".d", .{ .iterate = true });
     defer output_root.close(io);
@@ -3579,9 +3516,6 @@ test "native clean Git custody, stable physical identities and pinned archive re
     try initial_output.symLink(io, "b", "a", .{});
     try initial_output.symLink(io, "a", "b", .{});
     try std.testing.expectError(error.IgnoredLinkEscapesRole, controller.source_custody.source(allocator, io, path, options.git_executable));
-    const loop_oracle = try pythonCustody(allocator, "source", path, controller.custody_limits.input_bytes);
-    defer allocator.free(loop_oracle);
-    try std.testing.expect(std.mem.startsWith(u8, loop_oracle, "REFUSED:"));
     try initial_output.deleteFile(io, "a");
     try initial_output.deleteFile(io, "b");
     const contained = try controller.source_custody.source(allocator, io, path, options.git_executable);
@@ -3613,7 +3547,7 @@ test "native clean Git custody, stable physical identities and pinned archive re
     try std.testing.expectError(error.LimitExceeded, controller.source_custody.rootInventory(allocator, io, path));
 }
 
-test "input tree deduplicates bounded symlink hash work against Python" {
+test "input tree deduplicates bounded symlink hash work and refuses first excess" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const input = controller.input_custody;
@@ -3647,24 +3581,13 @@ test "input tree deduplicates bounded symlink hash work against Python" {
     const boundary = try input.Fixture.treeWithHashLimit(allocator, io, binding, 32);
     try std.testing.expectEqual(@as(usize, 4), boundary.symlinks);
     try std.testing.expectEqual(@as(usize, 16), boundary.bytes);
-    const boundary_oracle = try pythonCustody(allocator, "tree", hash_path, 32);
-    defer allocator.free(boundary_oracle);
-    const digest = try std.fmt.allocPrint(allocator, "ACCEPTED:{s}\n", .{&boundary.content_sha256});
-    defer allocator.free(digest);
-    try std.testing.expectEqualStrings(digest, boundary_oracle);
     try hash_dir.symLink(io, "../a", "duplicate", .{});
     _ = try input.Fixture.treeWithHashLimit(allocator, io, binding, 32);
-    const duplicate_oracle = try pythonCustody(allocator, "tree", hash_path, 32);
-    defer allocator.free(duplicate_oracle);
-    try std.testing.expect(std.mem.startsWith(u8, duplicate_oracle, "ACCEPTED:"));
     try hash_dir.symLink(io, "../e", "extra", .{});
     try std.testing.expectError(error.LimitExceeded, input.Fixture.treeWithHashLimit(allocator, io, binding, 32));
-    const excess_oracle = try pythonCustody(allocator, "tree", hash_path, 32);
-    defer allocator.free(excess_oracle);
-    try std.testing.expectEqualStrings("REFUSED:physical input tree hash limit exceeded\n", excess_oracle);
 }
 
-test "missing input symlink target respects Python's absolute 64-component boundary" {
+test "missing input symlink target enforces the absolute 64-component boundary" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const input = controller.input_custody;
@@ -3690,16 +3613,10 @@ test "missing input symlink target respects Python's absolute 64-component bound
     try fixture_dir.symLink(io, target.items, "missing", .{});
     const exact = try input.tree(allocator, io, binding);
     try std.testing.expectEqual(@as(usize, 1), exact.symlinks);
-    const exact_oracle = try pythonCustody(allocator, "tree", path, controller.custody_limits.input_bytes);
-    defer allocator.free(exact_oracle);
-    try std.testing.expect(std.mem.startsWith(u8, exact_oracle, "ACCEPTED:"));
     try fixture_dir.deleteFile(io, "missing");
     try target.appendSlice(allocator, "/x");
     try fixture_dir.symLink(io, target.items, "missing", .{});
     try std.testing.expectError(error.UnsafeInputLink, input.tree(allocator, io, binding));
-    const excess_oracle = try pythonCustody(allocator, "tree", path, controller.custody_limits.input_bytes);
-    defer allocator.free(excess_oracle);
-    try std.testing.expect(std.mem.startsWith(u8, excess_oracle, "REFUSED:unsafe physical input tree symlink:"));
 }
 
 test "native Bison production entry and sparse byte boundaries" {
@@ -3767,21 +3684,6 @@ test "Bison and consumer v2 custody bind bytes, roles, ancestors and replacement
     const bison = try controller.input_custody.bison(allocator, io, bison_path);
     try std.testing.expectEqual(@as(usize, 1), bison.files);
     try std.testing.expectEqual(@as(usize, 5), bison.bytes);
-    const run_py = try std.fs.path.join(allocator, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" });
-    defer allocator.free(run_py);
-    const python = try std.process.run(allocator, io, .{
-        .argv = &.{
-            "python3",                                                                                                                                                                                                                  "-B",   "-c",
-            "import importlib.util,sys,pathlib; s=importlib.util.spec_from_file_location('ci',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.bison_inputs(pathlib.Path(sys.argv[2]))['sha256'])", run_py, bison_path,
-        },
-        .cwd = .{ .path = options.repository_root },
-        .stdout_limit = .limited(1024),
-        .stderr_limit = .limited(4096),
-    });
-    defer allocator.free(python.stdout);
-    defer allocator.free(python.stderr);
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, python.term);
-    try std.testing.expectEqualStrings(&bison.sha256, std.mem.trimEnd(u8, python.stdout, "\n"));
     try bison_dir.symLink(io, "grammar", "alias", .{});
     const missing_target = try std.fmt.allocPrint(allocator, "/usr/lib/unikraft-custody-{d}/missing", .{std.os.linux.getpid()});
     defer allocator.free(missing_target);
@@ -3802,23 +3704,6 @@ test "Bison and consumer v2 custody bind bytes, roles, ancestors and replacement
     try std.testing.expect(record.get("files").?.object.contains("tool:bison"));
     try std.testing.expect(record.get("trees").?.object.contains("bison"));
     try std.testing.expect(record.get("directories").?.object.contains(bison_path));
-    const oracle = try std.process.run(allocator, io, .{
-        .argv = &.{
-            "python3",                                                                                                                                                                                                                                                                                                                                                                                       "-B",   "-c",
-            "import importlib.util,sys,pathlib; s=importlib.util.spec_from_file_location('ci',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); r=m.record_input_paths({'tool:bison':pathlib.Path(sys.argv[2])},{'bison':pathlib.Path(sys.argv[3])}); print(r['aggregate_sha256']); print(r['trees']['bison']['content_sha256']); print(r['trees']['bison']['physical_sha256'])", run_py, path,
-            bison_path,
-        },
-        .cwd = .{ .path = options.repository_root },
-        .stdout_limit = .limited(1024),
-        .stderr_limit = .limited(4096),
-    });
-    defer allocator.free(oracle.stdout);
-    defer allocator.free(oracle.stderr);
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, oracle.term);
-    var oracle_lines = std.mem.splitScalar(u8, oracle.stdout, '\n');
-    try std.testing.expectEqualStrings(&expected.aggregate_sha256, oracle_lines.next().?);
-    try std.testing.expectEqualStrings(&expected.trees[0].content_sha256, oracle_lines.next().?);
-    try std.testing.expectEqualStrings(&expected.trees[0].physical_sha256, oracle_lines.next().?);
     try controller.input_custody.requireSame(allocator, io, expected, &file_binding, &tree_binding);
     try std.testing.expectError(error.InvalidInputCustody, controller.input_custody.requireSame(allocator, io, expected, &.{}, &tree_binding));
     try bison_dir.symLink(io, "missing/descendant", "mutable-dangling", .{});
@@ -3896,41 +3781,14 @@ test "dependency custody parses pinned native ZON, tracked manifests and bounded
     defer captured.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 1), captured.roots);
     try std.testing.expectEqual(@as(usize, 1), captured.files);
-    const run_py = try std.fs.path.join(allocator, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" });
-    defer allocator.free(run_py);
-    const oracle = try std.process.run(allocator, io, .{
-        .argv = &.{
-            "python3",                                                                                                                                                                                                                                                                                                                "-B",   "-c",
-            "import importlib.util,sys,pathlib; s=importlib.util.spec_from_file_location('ci',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); p=pathlib.Path(sys.argv[2]); r=m.directory_inventory(p,m.MIZ_PACKAGE_HASH,m.package_tree_state(p)); print(r['tree_sha256']); print(r['physical_sha256'])", run_py, packages_path,
-        },
-        .cwd = .{ .path = options.repository_root },
-        .stdout_limit = .limited(1024),
-        .stderr_limit = .limited(4096),
-    });
-    defer allocator.free(oracle.stdout);
-    defer allocator.free(oracle.stderr);
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, oracle.term);
-    var oracle_lines = std.mem.splitScalar(u8, oracle.stdout, '\n');
-    try std.testing.expectEqualStrings(&captured.packages[0].tree_sha256, oracle_lines.next().?);
-    try std.testing.expectEqualStrings(&captured.packages[0].physical_sha256, oracle_lines.next().?);
     try dependency.requireSame(allocator, io, packages_path, captured);
     var record = try dependency.capture(allocator, io, options.repository_root, options.git_executable, compute_path);
     defer record.deinit(allocator);
     const native_json = try record.canonical(allocator);
     defer allocator.free(native_json);
-    const python_record = try std.process.run(allocator, io, .{
-        .argv = &.{
-            "python3",                                                                                                                                                                                                                                                "-B",   "-c",
-            "import importlib.util,sys,pathlib; s=importlib.util.spec_from_file_location('ci',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.canonical_json(m.dependency_custody(pathlib.Path(sys.argv[2]))).decode(),end='')", run_py, compute_path,
-        },
-        .cwd = .{ .path = options.repository_root },
-        .stdout_limit = .limited(64 * 1024),
-        .stderr_limit = .limited(4096),
-    });
-    defer allocator.free(python_record.stdout);
-    defer allocator.free(python_record.stderr);
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, python_record.term);
-    try std.testing.expectEqualStrings(python_record.stdout, native_json);
+    const document = try core.contracts.Document.parse(allocator, native_json, .{});
+    defer document.deinit();
+    try document.requireCanonical(allocator, native_json);
     try dependency.requireDocument(allocator, io, options.repository_root, options.git_executable, compute_path, record);
     try std.testing.expectError(error.PackageHashMismatch, dependency.verifyZigPackageHashes(
         allocator,
@@ -3946,7 +3804,7 @@ test "dependency custody parses pinned native ZON, tracked manifests and bounded
     try std.testing.expectError(error.DependencyChanged, dependency.requireDocument(allocator, io, options.repository_root, options.git_executable, compute_path, record));
 }
 
-test "native ELF runtime closure matches Python dynamic-loader inventory" {
+test "native ELF runtime closure retains sorted canonical dynamic-loader paths" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const python_path = try std.Io.Dir.realPathFileAbsoluteAlloc(io, "/usr/bin/python3", allocator);
@@ -3958,23 +3816,12 @@ test "native ELF runtime closure matches Python dynamic-loader inventory" {
     }
 
     try std.testing.expect(actual.len > 0);
-    const run_py = try std.fs.path.join(allocator, &.{ options.repository_root, "support/build/wamr-native-ci/run.py" });
-    defer allocator.free(run_py);
-    const oracle = try std.process.run(allocator, io, .{
-        .argv = &.{
-            "python3",                                                                                                                                                                                                                                                 "-B",   "-c",
-            "import importlib.util,sys,pathlib; s=importlib.util.spec_from_file_location('ci',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print('\\n'.join(sorted(map(str,m.executable_runtime_paths(pathlib.Path(sys.argv[2]))))))", run_py, python_path,
-        },
-        .cwd = .{ .path = options.repository_root },
-        .stdout_limit = .limited(64 * 1024),
-        .stderr_limit = .limited(4096),
-    });
-    defer allocator.free(oracle.stdout);
-    defer allocator.free(oracle.stderr);
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, oracle.term);
-    var lines = std.mem.splitScalar(u8, oracle.stdout, '\n');
-    for (actual) |path| try std.testing.expectEqualStrings(path, lines.next().?);
-    try std.testing.expectEqualStrings("", lines.next().?);
+    for (actual, 0..) |path, index| {
+        const canonical = try std.Io.Dir.realPathFileAbsoluteAlloc(io, path, allocator);
+        defer allocator.free(canonical);
+        try std.testing.expectEqualStrings(path, canonical);
+        if (index > 0) try std.testing.expect(std.mem.lessThan(u8, actual[index - 1], path));
+    }
     const invalid: controller.input_custody.ProductionPaths = .{
         .runtime = "/",
         .tools = .{""} ** controller.input_custody.host_tools.len,

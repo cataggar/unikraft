@@ -48,7 +48,6 @@ pub const previous_entries = [_]Entry{
     .{ .name = "support/build/wamr-native-ci/controller/target.zig", .content = @embedFile("build/wamr-native-ci/controller/target.zig") },
     .{ .name = "support/build/wamr-native-ci/controller/test_command.zig", .content = @embedFile("build/wamr-native-ci/controller/test_command.zig") },
     .{ .name = "support/build/wamr-native-ci/controller/tests.zig", .content = @embedFile("build/wamr-native-ci/controller/tests.zig") },
-    .{ .name = "support/build/wamr-native-ci/tests/native_command_oracle.py", .content = @embedFile("build/wamr-native-ci/tests/native_command_oracle.py") },
     .{ .name = "support/controller_source_closure.zig", .content = @embedFile("controller_source_closure.zig") },
     .{ .name = "support/tools/hyperv/contracts.zig", .content = @embedFile("tools/hyperv/contracts.zig") },
     .{ .name = "support/tools/hyperv/core.zig", .content = @embedFile("tools/hyperv/core.zig") },
