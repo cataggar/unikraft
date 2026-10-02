@@ -445,7 +445,7 @@ GUARDED_PRODUCER_FILES = {
         "b21ed97379de228acf41ecc4d5929058dc85368a009a6e0abf742bc5d3096c17"
     ),
     "drivers/hyperv/storvsc/storvsc.c": (
-        "c896f4d42dc0eb86ed8f001577446126e44a10ed9eb92c2c25d8eab7091e6767"
+        "1df869b7064df4c912fbe2254091573aa1da0be892390fdf50f6165d4aefb658"
     ),
     "drivers/hyperv/storvsc/storvsc_core.h": (
         "8422dd6de969b13a533fe0291a7019442712ae9b7f6177420e6fd4df22860ab7"
@@ -535,16 +535,16 @@ GUARDED_PRODUCER_FILES = {
         "325817c2c76a389c21358df535ac2ae0f1beb36b7e4cb73b62648d1f5faac8cc"
     ),
     "support/apps/hyperv-acceptance/Config.uk": (
-        "548e97aadb9b55101e2ec1dbb7a4b22f82b210a22d5f14eb441b17fdd2009aa7"
+        "d44be89b16152994c03fa5fee704e6dcb411ba635263d5f3971193108a97a129"
     ),
     "support/apps/hyperv-acceptance/Makefile.uk": (
         "2e5c23e4ca47bd306a4d4ab6d75b996ccf5b6ddc885698d25f478ead40df4ac3"
     ),
     "support/apps/hyperv-acceptance/acceptance_protocol.c": (
-        "5ba77f19e204c9bc3b9b579cf6ccd9e0184952fd9e0d14c123f5a19af05dd64e"
+        "c7b8cdd84f21e59fd93454e28ef3f99d03b17438b1d840042f852956af1237df"
     ),
     "support/apps/hyperv-acceptance/acceptance_protocol.h": (
-        "1b7d718ca10b760b61df07570b640586cce34d1d3c498c68fbd336a61669db4e"
+        "392efcb26a97cae7a93131a587318559c7801f7b6fa1646c19482253a5108b7e"
     ),
     "support/apps/hyperv-acceptance/application_network.c": (
         "829b522860c21278eec3c1e849a1b9259c200ee7270f38dbc5872cb5f3c6f82f"
@@ -553,10 +553,10 @@ GUARDED_PRODUCER_FILES = {
         "dba07b1331d6a6f02c3f017c2fabe5a0c1c03f61ffd1df7e07e49c84427d2231"
     ),
     "support/apps/hyperv-acceptance/main.c": (
-        "50e0dbc21c583d0bd7711cf928320574e4ade118d36def3d58fce9353af9efd4"
+        "36591c09ecaee3a4dadb03fc194682778f386758df47fc9016f37cb0eacf9400"
     ),
     "support/apps/hyperv-acceptance/persistence.c": (
-        "2393e8c46d83508c77a709036eb1cf5d249ee40ae87c9c5eaad0532ec6d1a363"
+        "a0fbe85754d6072f3411a498d2c3c13b11214688a625fc70b62795639cfd49c1"
     ),
     "support/apps/hyperv-acceptance/persistence.h": (
         "8ef53f9ed76286b945212ea487bed1e6d51ec161078d4a2283f9054b962bd70f"
@@ -565,10 +565,10 @@ GUARDED_PRODUCER_FILES = {
         "29f1f4f0f272225ae1d2578612a4f8320f1bc8d245e9447ce6696300b80ad23c"
     ),
     "support/apps/hyperv-acceptance/storage_target.c": (
-        "bafd1cee28270d5c251da83dcd89fcb670c2d87f3cf84b57fc5c0de1aafac94d"
+        "4bde9ddbcfaf29588c500e00aba2dc4438db8f1e524149982e103b0fc43b5de2"
     ),
     "support/apps/hyperv-acceptance/storage_target.h": (
-        "df7216687e9827977e58c675f4ca9640954524d174a87fa930e09084a933cc37"
+        "a283195fe8c0cbd8ca91365d7bcf12097d49dbe08ddf970234c62e071ed7dc37"
     ),
 }
 LIVE_IO_MARKERS = (
