@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Offline tests of the native-only fault gate, not guest execution evidence."""
+import argparse
+import contextlib
+import io
+import json
 import os
 from pathlib import Path
 import shutil
@@ -7,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from controller_record_fixtures import RecordFixtures
 import native_fault_qualification as gate
@@ -29,6 +34,109 @@ class NativeFaultGate(unittest.TestCase):
         return subprocess.CompletedProcess([], 1, b"", (
             f"WAMR_CI_FAILED_STAGE: {stage}; cause: {cause}; "
             "bounded private logs retained.\n").encode())
+
+    def test_all_fault_paths_launch_native_children_with_closed_build_bindings(self):
+        wamr = self.root / "wamr-source"
+        wamr.mkdir(mode=0o700)
+        path = os.environ["PATH"]
+        for case in gate.CASES:
+            for ambient in ("matching", "hostile"):
+                with self.subTest(case=case, ambient=ambient):
+                    runtime = self.root / f"{case}-{ambient}"
+                    output = self.root / f"{case}-{ambient}-output"
+                    runtime.mkdir(mode=0o700)
+                    output.mkdir(mode=0o700)
+                    bison = runtime / "bison"
+                    bison.mkdir(mode=0o700)
+                    (bison / "fixture").write_bytes(b"private Bison fixture")
+                    (bison / "fixture").chmod(0o600)
+                    args = argparse.Namespace(
+                        case=case, runtime=runtime, output=output, wamr_source=wamr,
+                        controller=runtime / "controller/bin/uk-wamr-native-ci")
+                    evidence = runtime / "compute/evidence"
+                    actions = []
+
+                    def child(argv, *, env, stdout, stderr):
+                        self.assertEqual(env, {
+                            "PATH": path, "LANG": "C", "LC_ALL": "C",
+                            "BISON_PKGDATADIR": str(bison),
+                        })
+                        action = argv[1]
+                        self.assertEqual(argv, [
+                            str(args.controller), action, "--runtime", str(runtime),
+                            *([] if action == "boot" else ["--wamr-source", str(wamr)]),
+                        ])
+                        actions.append(action)
+                        if action == "build" and case != "prior-build-output":
+                            evidence.mkdir(mode=0o700, parents=True)
+                            (runtime / "compute/boot-raw-x2apic").mkdir(mode=0o700)
+                            for name in gate.BUILD_RECORDS:
+                                record = (b'{"source":{"revision":"' + b"1" * 40
+                                          + b'"}}\n' if name == "build-start.json"
+                                          else b"{}\n")
+                                (evidence / name).write_bytes(record)
+                                (evidence / name).chmod(0o600)
+                            return mock.Mock(wait=mock.Mock(return_value=0))
+                        if case == "prior-build-output":
+                            self.assertEqual(action, "build")
+                            self.assertTrue((runtime / "compute").is_dir())
+                            self.assertFalse(evidence.exists())
+                        else:
+                            self.assertEqual(action, "boot")
+                            if case == "build-start-tamper":
+                                self.assertEqual(json.loads(
+                                    (evidence / "build-start.json").read_bytes())[
+                                        "source"]["revision"], "0" * 40)
+                            elif case == "missing-build":
+                                self.assertFalse((evidence / "build.json").exists())
+                            else:
+                                self.assertEqual(
+                                    (runtime / "compute/boot-raw-x2apic/prior").read_bytes(),
+                                    b"prior")
+                        self.assertFalse((evidence / "result.json").exists())
+                        stderr.write(self.refusal(case).stderr)
+                        return mock.Mock(wait=mock.Mock(return_value=1))
+
+                    inherited = {
+                        "PATH": path, "LANG": "ambient", "LC_ALL": "ambient",
+                        "BISON_PKGDATADIR": str(bison) if ambient == "matching"
+                        else str(self.root / "unrelated-bison"),
+                        "LD_PRELOAD": "/untrusted/loader", "MAKEFLAGS": "ambient",
+                        "HOME": "/untrusted/home", "PYTHONPATH": "/untrusted/python",
+                    }
+                    captured = io.StringIO()
+                    with mock.patch.dict(os.environ, inherited, clear=True), \
+                            mock.patch.object(gate.platform, "machine", return_value="x86_64"), \
+                            mock.patch.object(Path, "is_char_device", return_value=True), \
+                            mock.patch.object(gate.os, "access", return_value=True), \
+                            mock.patch.object(gate.subprocess, "Popen", side_effect=child), \
+                            contextlib.redirect_stdout(captured):
+                        gate.qualify(args)
+                    self.assertEqual(actions, ["build"] if case == "prior-build-output"
+                                     else ["build", "boot"])
+                    self.assertEqual(captured.getvalue(),
+                                     f"NATIVE_FAULT_QUALIFIED: {case}\n")
+
+    def test_invalid_tool_search_path_refuses_before_native_launch(self):
+        for index, path in enumerate(("", "/usr/bin:", "relative:/usr/bin")):
+            with self.subTest(path=path):
+                runtime = self.root / f"invalid-path-{index}"
+                output = self.root / f"invalid-path-{index}-output"
+                runtime.mkdir(mode=0o700)
+                output.mkdir(mode=0o700)
+                args = argparse.Namespace(
+                    case="prior-build-output", runtime=runtime, output=output,
+                    wamr_source=self.root,
+                    controller=runtime / "controller/bin/uk-wamr-native-ci")
+                with mock.patch.dict(os.environ, {"PATH": path}), \
+                        mock.patch.object(gate.platform, "machine", return_value="x86_64"), \
+                        mock.patch.object(Path, "is_char_device", return_value=True), \
+                        mock.patch.object(gate.os, "access", return_value=True), \
+                        mock.patch.object(gate.subprocess, "Popen") as launch:
+                    with self.assertRaises(ValueError):
+                        gate.qualify(args)
+                    launch.assert_not_called()
+                self.assertFalse((runtime / "compute").exists())
 
     def test_each_fault_requires_its_exact_failure_and_unchanged_state(self):
         for case in gate.CASES:

@@ -152,9 +152,12 @@ def qualify(args):
             and not args.output.is_relative_to(args.runtime))
     require(not (args.runtime / "compute").exists()
             and not (args.runtime / "compute").is_symlink())
-    environment = {"PATH": os.environ["PATH"], "LANG": "C", "LC_ALL": "C"}
+    environment = {
+        "PATH": os.environ["PATH"], "LANG": "C", "LC_ALL": "C",
+        "BISON_PKGDATADIR": str(args.runtime / "bison"),
+    }
     require(all(part.startswith("/") for part in environment["PATH"].split(":")))
-    # The native build selects the private runtime Bison root, not ambient data.
+    # Native startup requires this exact private Bison binding, not ambient data.
     roots = [args.runtime / name for name in (
         "compute", "controller", "custody", "bin", "runtime", "firmware",
         "bison", "llvm")]
