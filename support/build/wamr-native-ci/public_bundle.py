@@ -1757,7 +1757,7 @@ def import_bundle(
         start = handoff.ci.document(output / "evidence/build-start.json")
         producer, producer_runtime = recorded_producer_info(
             start["consumer_inputs"])
-        if producer == "native":
+        if producer == "native" and native_import_revalidation:
             require(str(supervisor) == str(
                 producer_runtime / NATIVE_CONTROLLER_RELATIVE))
             require(str(validator) == str(
@@ -1766,10 +1766,16 @@ def import_bundle(
         native_identity = identity_parent / "accepted"
         accepted_records.supervisor_import_identity(
             output, supervisor, handoff.ci.tool("git"), native_identity)
-        if native_import_revalidation or producer == "native":
+        if native_import_revalidation:
             handoff.FAILURE_STAGE = "public-import-native-revalidation"
             native_revalidation = accepted_records.import_native_revalidation(
                 output, identity_parent / "revalidation")
+        elif producer == "native":
+            handoff.FAILURE_STAGE = "public-import-native-revalidation"
+            native_revalidation = accepted_records.import_native_revalidation(
+                output, identity_parent / "revalidation",
+                git=handoff.ci.tool("git"), supervisor=supervisor,
+                validator=validator)
         handoff.ci.save(output / "transport.json", {
             "schema": "uk.wamr.public-source-transport",
             "version": 2,

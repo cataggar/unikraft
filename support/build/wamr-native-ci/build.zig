@@ -7,6 +7,24 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const portable_query = controller_target.portableQuery();
     const portable_target = b.resolveTargetQuery(portable_query);
+    const identity_writer = b.addExecutable(.{
+        .name = "wamr-validator-identity",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("build.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const portable_direct = b.dependency("direct_validator", .{
+        .target = portable_target,
+        .optimize = .ReleaseSafe,
+    }).artifact("uk-wamr-direct-validate");
+    const portable_identity = validatorIdentity(b, identity_writer, portable_direct, portable_target);
+    const host_direct = b.dependency("direct_validator", .{
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    }).artifact("uk-wamr-direct-validate");
+    const host_identity = validatorIdentity(b, identity_writer, host_direct, b.graph.host);
     const core = b.createModule(.{
         .root_source_file = b.path("../../tools/hyperv/core.zig"),
         .target = target,
@@ -100,6 +118,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "hyperv_core", .module = portable_core },
             .{ .name = "wamr_log_validator", .module = portable_validator },
             .{ .name = "controller_source_closure", .module = source_closure_module },
+            .{ .name = "import_validator_identity", .module = portable_identity },
         },
     });
     const controller_cli = b.addExecutable(.{
@@ -174,6 +193,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "hyperv_core", .module = host_core },
             .{ .name = "wamr_log_validator", .module = host_validator },
             .{ .name = "controller_source_closure", .module = host_closure },
+            .{ .name = "import_validator_identity", .module = host_identity },
         },
     });
     const host_cli = b.addExecutable(.{
@@ -225,6 +245,7 @@ pub fn build(b: *std.Build) void {
     });
     controller_tests.root_module.addOptions("test_options", controller_options);
     controller_options.addOptionPath("host_controller_cli", host_cli.getEmittedBin());
+    controller_options.addOptionPath("import_validator", host_direct.getEmittedBin());
     const fixture_host = b.addExecutable(.{
         .name = "wamr-native-ci-fixtures-host-test",
         .root_module = b.createModule(.{
@@ -374,6 +395,10 @@ pub fn build(b: *std.Build) void {
             .{ .name = "hyperv_core", .module = image.import_table.get("hyperv_core").? },
             .{ .name = "wamr_log_validator", .module = proof_validator },
             .{ .name = "controller_source_closure", .module = proof_closure },
+            .{ .name = "import_validator_identity", .module = validatorIdentity(b, identity_writer, b.dependency("direct_validator", .{
+                .target = target,
+                .optimize = .ReleaseSafe,
+            }).artifact("uk-wamr-direct-validate"), target) },
         },
     });
     const pipeline_tests = b.addTest(.{ .root_module = b.createModule(.{
@@ -398,4 +423,43 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&record_goldens_run.step);
     test_step.dependOn(&handoff_contracts_run.step);
     test_step.dependOn(&handoff_python_goldens.step);
+}
+
+fn validatorIdentity(
+    b: *std.Build,
+    writer: *std.Build.Step.Compile,
+    validator: *std.Build.Step.Compile,
+    target: std.Build.ResolvedTarget,
+) *std.Build.Module {
+    const run = b.addRunArtifact(writer);
+    run.addFileArg(validator.getEmittedBin());
+    const generated = b.addWriteFiles().addCopyFile(run.captureStdOut(.{}), "validator-identity.zig");
+    return b.createModule(.{
+        .root_source_file = generated,
+        .target = target,
+        .optimize = .ReleaseSafe,
+    });
+}
+
+pub fn main(init: std.process.Init) !void {
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len != 2) return error.InvalidUsage;
+    const file = try std.Io.Dir.cwd().openFile(init.io, args[1], .{ .follow_symlinks = false });
+    defer file.close(init.io);
+    const before = try file.stat(init.io);
+    if (before.size > 64 * 1024 * 1024) return error.ArtifactLimit;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < before.size) {
+        const count = try file.readPositionalAll(init.io, buffer[0..@intCast(@min(buffer.len, before.size - offset))], offset);
+        if (count == 0) return error.ArtifactChanged;
+        hash.update(buffer[0..count]);
+        offset += count;
+    }
+    const after = try file.stat(init.io);
+    if (before.size != after.size or !std.meta.eql(before.mtime, after.mtime))
+        return error.ArtifactChanged;
+    var stdout = std.Io.File.stdout().writerStreaming(init.io, &.{});
+    try stdout.interface.print("pub const sha256 = \"{s}\";\n", .{std.fmt.bytesToHex(hash.finalResult(), .lower)});
 }

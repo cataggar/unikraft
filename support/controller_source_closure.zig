@@ -6,7 +6,7 @@ pub const Entry = struct {
 
 // Compiled-in tracked source inputs; additions to the controller's import
 // graph must be added here before they can be admitted as its source closure.
-pub const entries = [_]Entry{
+pub const previous_entries = [_]Entry{
     .{ .name = "support/apps/wamr-aot/validator/base64.zig", .content = @embedFile("apps/wamr-aot/validator/base64.zig") },
     .{ .name = "support/apps/wamr-aot/validator/coremark.zig", .content = @embedFile("apps/wamr-aot/validator/coremark.zig") },
     .{ .name = "support/apps/wamr-aot/validator/input.zig", .content = @embedFile("apps/wamr-aot/validator/input.zig") },
@@ -60,4 +60,52 @@ pub const entries = [_]Entry{
     .{ .name = "support/tools/hyperv/sensitive.zig", .content = @embedFile("tools/hyperv/sensitive.zig") },
     .{ .name = "support/tools/hyperv/sha256.zig", .content = @embedFile("tools/hyperv/sha256.zig") },
     .{ .name = "support/tools/hyperv/sha256_clear_upper.S", .content = @embedFile("tools/hyperv/sha256_clear_upper.S") },
+};
+
+pub const entries = blk: {
+    @setEvalBranchQuota(100_000);
+    var all = previous_entries ++ import_validator_entries;
+    @import("std").mem.sort(Entry, &all, {}, struct {
+        fn less(_: void, first: Entry, second: Entry) bool {
+            return @import("std").mem.lessThan(u8, first.name, second.name);
+        }
+    }.less);
+    break :blk all;
+};
+
+const import_validator_entries = [_]Entry{
+    .{ .name = "support/build/kconfig.zig", .content = @embedFile("build/kconfig.zig") },
+    .{ .name = "support/tools/hyperv/direct/azure_runtime.zig", .content = @embedFile("tools/hyperv/direct/azure_runtime.zig") },
+    .{ .name = "support/tools/hyperv/direct/build.zig", .content = @embedFile("tools/hyperv/direct/build.zig") },
+    .{ .name = "support/tools/hyperv/direct/compute.zig", .content = @embedFile("tools/hyperv/direct/compute.zig") },
+    .{ .name = "support/tools/hyperv/direct/compute_main.zig", .content = @embedFile("tools/hyperv/direct/compute_main.zig") },
+    .{ .name = "support/tools/hyperv/direct/main.zig", .content = @embedFile("tools/hyperv/direct/main.zig") },
+    .{ .name = "support/tools/hyperv/local_boot/config.zig", .content = @embedFile("tools/hyperv/local_boot/config.zig") },
+    .{ .name = "support/tools/hyperv/persistence/contract.zig", .content = @embedFile("tools/hyperv/persistence/contract.zig") },
+    .{ .name = "support/tools/hyperv/persistence/evidence.zig", .content = @embedFile("tools/hyperv/persistence/evidence.zig") },
+    .{ .name = "support/tools/hyperv/persistence/local.zig", .content = @embedFile("tools/hyperv/persistence/local.zig") },
+    .{ .name = "support/tools/hyperv/preparation/admission.zig", .content = @embedFile("tools/hyperv/preparation/admission.zig") },
+    .{ .name = "support/tools/hyperv/preparation/budget.zig", .content = @embedFile("tools/hyperv/preparation/budget.zig") },
+    .{ .name = "support/tools/hyperv/preparation/config.zig", .content = @embedFile("tools/hyperv/preparation/config.zig") },
+    .{ .name = "support/tools/hyperv/preparation/contracts.zig", .content = @embedFile("tools/hyperv/preparation/contracts.zig") },
+    .{ .name = "support/tools/hyperv/preparation/direct_config.zig", .content = @embedFile("tools/hyperv/preparation/direct_config.zig") },
+    .{ .name = "support/tools/hyperv/preparation/environment.zig", .content = @embedFile("tools/hyperv/preparation/environment.zig") },
+    .{ .name = "support/tools/hyperv/preparation/files.zig", .content = @embedFile("tools/hyperv/preparation/files.zig") },
+    .{ .name = "support/tools/hyperv/preparation/git_entry.zig", .content = @embedFile("tools/hyperv/preparation/git_entry.zig") },
+    .{ .name = "support/tools/hyperv/preparation/inputs.zig", .content = @embedFile("tools/hyperv/preparation/inputs.zig") },
+    .{ .name = "support/tools/hyperv/preparation/namespace.zig", .content = @embedFile("tools/hyperv/preparation/namespace.zig") },
+    .{ .name = "support/tools/hyperv/preparation/origin.zig", .content = @embedFile("tools/hyperv/preparation/origin.zig") },
+    .{ .name = "support/tools/hyperv/preparation/origin_fixture.zig", .content = @embedFile("tools/hyperv/preparation/origin_fixture.zig") },
+    .{ .name = "support/tools/hyperv/preparation/origin_tests.zig", .content = @embedFile("tools/hyperv/preparation/origin_tests.zig") },
+    .{ .name = "support/tools/hyperv/preparation/original_seed.zig", .content = @embedFile("tools/hyperv/preparation/original_seed.zig") },
+    .{ .name = "support/tools/hyperv/preparation/package.zig", .content = @embedFile("tools/hyperv/preparation/package.zig") },
+    .{ .name = "support/tools/hyperv/preparation/producer.zig", .content = @embedFile("tools/hyperv/preparation/producer.zig") },
+    .{ .name = "support/tools/hyperv/preparation/production_local.zig", .content = @embedFile("tools/hyperv/preparation/production_local.zig") },
+    .{ .name = "support/tools/hyperv/preparation/provenance.zig", .content = @embedFile("tools/hyperv/preparation/provenance.zig") },
+    .{ .name = "support/tools/hyperv/preparation/receipts.zig", .content = @embedFile("tools/hyperv/preparation/receipts.zig") },
+    .{ .name = "support/tools/hyperv/preparation/root.zig", .content = @embedFile("tools/hyperv/preparation/root.zig") },
+    .{ .name = "support/tools/hyperv/preparation/runtime.zig", .content = @embedFile("tools/hyperv/preparation/runtime.zig") },
+    .{ .name = "support/tools/hyperv/preparation/seed.zig", .content = @embedFile("tools/hyperv/preparation/seed.zig") },
+    .{ .name = "support/tools/hyperv/preparation/source.zig", .content = @embedFile("tools/hyperv/preparation/source.zig") },
+    .{ .name = "support/tools/hyperv/preparation/tests.zig", .content = @embedFile("tools/hyperv/preparation/tests.zig") },
 };

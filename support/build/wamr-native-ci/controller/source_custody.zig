@@ -13,6 +13,7 @@ pub const Entry = inputs.Entry;
 // The embedded bytes make this executable's own compile-time source inputs
 // independently checkable. Git revision/clean-tree admission is owned by PR 02.
 pub const closure = inputs.entries;
+pub const previous_closure = inputs.previous_entries;
 
 pub fn contentClosure() [Sha256.digest_length]u8 {
     var hash = Sha256.init(.{});
@@ -254,6 +255,7 @@ fn inspectOutput(
     relative: []const u8,
     state: *Ignored,
     hash: *Sha256,
+    allow_missing_roots: bool,
 ) !void {
     try limits.relative(relative, limits.ignored_path, limits.ignored_depth);
     _ = try limits.outputRole(relative);
@@ -262,7 +264,13 @@ fn inspectOutput(
     const parent_path = std.fs.path.dirname(path).?;
     const parent = try files.openDirectory(io, parent_path, .artifact);
     defer parent.close(io);
-    const named = try parent.openFile(io, std.fs.path.basename(path), .{ .path_only = true, .follow_symlinks = false });
+    const named = parent.openFile(io, std.fs.path.basename(path), .{ .path_only = true, .follow_symlinks = false }) catch |err| {
+        if (allow_missing_roots and err == error.FileNotFound and std.mem.eql(u8, relative, role)) {
+            try physical.bind(allocator, hash, .{ "absent", relative });
+            return;
+        }
+        return err;
+    };
     defer named.close(io);
     const before = try files.snapshot(named);
     if (before.uid != std.os.linux.geteuid()) return error.UnsafeIgnoredEntry;
@@ -297,7 +305,7 @@ fn inspectOutput(
         for (names.items) |name| {
             const child = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ relative, name });
             defer allocator.free(child);
-            try inspectOutput(allocator, io, repo, git, role, child, state, hash);
+            try inspectOutput(allocator, io, repo, git, role, child, state, hash, allow_missing_roots);
         }
     } else if (kind == std.os.linux.S.IFREG) {
         if (before.nlink != 1 or before.size > limits.ignored_file)
@@ -347,7 +355,7 @@ fn inspectOutput(
         return error.IgnoredChanged;
 }
 
-fn ignoredState(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: []const u8) !Ignored {
+fn ignoredState(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: []const u8, allow_missing_roots: bool) !Ignored {
     const inventory = try gitOutput(allocator, io, repo, git, &.{
         "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z",
     }, limits.ignored_git_output, null);
@@ -372,7 +380,7 @@ fn ignoredState(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git:
     hash.update("uk.wamr.ignored-source-policy-v1\x00");
     var state: Ignored = .{ .entries = 0, .bytes = 0, .physical_sha256 = undefined, .inventory_sha256 = std.fmt.bytesToHex(inventory_hash, .lower) };
     for (limits.roles) |role| {
-        try inspectOutput(allocator, io, repo, git, role, role, &state, &hash);
+        try inspectOutput(allocator, io, repo, git, role, role, &state, &hash, allow_missing_roots);
     }
     state.physical_sha256 = physical.hex(&hash);
     return state;
@@ -496,8 +504,16 @@ fn trackedFile(
 }
 
 pub fn source(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: []const u8) !Source {
+    return captureSource(allocator, io, repo, git, false);
+}
+
+pub fn portableSource(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: []const u8) !Source {
+    return captureSource(allocator, io, repo, git, true);
+}
+
+fn captureSource(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: []const u8, allow_missing_roots: bool) !Source {
     _ = try directoryBefore(io, repo);
-    const ignored_before = try ignoredState(allocator, io, repo, git);
+    const ignored_before = try ignoredState(allocator, io, repo, git, allow_missing_roots);
     try clean(allocator, io, repo, git);
     const revision = try gitLine(allocator, io, repo, git, &.{ "rev-parse", "HEAD" });
     const tree = try gitLine(allocator, io, repo, git, &.{ "rev-parse", "HEAD^{tree}" });
@@ -555,7 +571,7 @@ pub fn source(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: [
     defer allocator.free(final_tree);
     if (!std.mem.eql(u8, revision, final_revision) or !std.mem.eql(u8, tree, final_tree))
         return error.SourceChanged;
-    const ignored_after = try ignoredState(allocator, io, repo, git);
+    const ignored_after = try ignoredState(allocator, io, repo, git, allow_missing_roots);
     if (!std.meta.eql(ignored_before, ignored_after)) return error.IgnoredChanged;
     return .{
         .revision = revision,

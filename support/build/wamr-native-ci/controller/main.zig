@@ -108,7 +108,7 @@ pub fn main(init: std.process.Init) void {
         ) catch |err| failed(init.io, stage, "", err);
         return;
     }
-    if (command.action == .@"import-validator-build" or command.action == .@"import-native-revalidation") {
+    if (command.action == .@"import-validator-build" or command.action == .@"import-native-revalidation" or command.action == .@"import-handoff-revalidation") {
         const stage = @tagName(command.action);
         const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
         const root = command.stage_root.?;
@@ -123,6 +123,18 @@ pub fn main(init: std.process.Init) void {
             root,
         ) catch |err| failed(init.io, stage, "", err);
         defer accepted.deinit();
+        if (command.action == .@"import-handoff-revalidation") {
+            controller.import_validator_build.runPortable(
+                allocator,
+                init.io,
+                &accepted,
+                repository,
+                command.output.?,
+                .{ .git = command.git.?, .supervisor = command.supervisor.?, .validator = command.validator.? },
+                &signal,
+            ) catch |err| failed(init.io, stage, "", err);
+            return;
+        }
         controller.import_validator_build.run(
             allocator,
             init.io,
@@ -248,6 +260,7 @@ pub fn main(init: std.process.Init) void {
         .@"supervisor-import-identity", .@"--identity" => unreachable,
         .@"import-validator-build" => unreachable,
         .@"import-native-revalidation" => unreachable,
+        .@"import-handoff-revalidation" => unreachable,
     }
 }
 
@@ -260,6 +273,7 @@ fn usage(io: std.Io) noreturn {
             "       uk-wamr-native-ci supervisor-source-closure --git /usr/bin/git --output sha256-v1\n" ++
             "       uk-wamr-native-ci records --runtime ABS --output handoff-v1\n" ++
             "       uk-wamr-native-ci records --stage-root ABS --transport trusted-inner-zip --output handoff-v1\n" ++
+            "       uk-wamr-native-ci import-handoff-revalidation --stage-root ABS --git ABS --supervisor ABS --validator ABS --output ABS\n" ++
             "       uk-wamr-native-ci local-consumer-custody --runtime ABS --expected-build-start-sha256 HEX --expected-boot-inputs-sha256 HEX\n" ++
             "       uk-wamr-native-ci handoff-inspect --runtime ABS --output ABS\n" ++
             "       uk-wamr-native-ci handoff-inspect-legacy --runtime ABS --output ABS\n" ++

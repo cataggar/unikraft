@@ -383,8 +383,9 @@ def local_consumer_custody(
         _refuse(refusal)
 
 
-def import_native_revalidation(stage_root, output):
-    """Build and run the fixed native validator for a pristine trusted v2 stage."""
+def import_native_revalidation(
+        stage_root, output, *, git=None, supervisor=None, validator=None):
+    """Revalidate with authenticated local tools or the strict recorded build."""
     stage_root, output = map(Path, (stage_root, output))
     refusal = "native controller import revalidation refused"
     try:
@@ -396,9 +397,23 @@ def import_native_revalidation(stage_root, output):
             or os.path.normpath(str(output)) != str(output)
             or os.path.lexists(output)):
         _refuse(refusal)
-    raw, stderr_seen = _controller_command((
-        "import-native-revalidation",
-        "--stage-root", str(stage_root), "--output", str(output)), refusal,
+    portable = any(value is not None for value in (git, supervisor, validator))
+    if portable:
+        if any(value is None for value in (git, supervisor, validator)):
+            _refuse(refusal)
+        try:
+            git, supervisor, validator = map(
+                _absolute, (git, supervisor, validator))
+        except (OSError, ValueError) as error:
+            raise ValueError(refusal) from error
+    arguments = [
+        "import-handoff-revalidation" if portable else "import-native-revalidation",
+        "--stage-root", str(stage_root), "--output", str(output)]
+    if portable:
+        arguments.extend((
+            "--git", str(git), "--supervisor", str(supervisor),
+            "--validator", str(validator)))
+    raw, stderr_seen = _controller_command(tuple(arguments), refusal,
         timeout_seconds=IMPORT_NATIVE_REVALIDATION_TIMEOUT_SECONDS)
     if raw or stderr_seen:
         _refuse(refusal)

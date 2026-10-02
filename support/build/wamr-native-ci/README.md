@@ -127,10 +127,10 @@ non-legacy supervisor record refuses rather than taking the Python path.
 accepted run and public-validator build evidence, then supervises only the
 fixed public validator and local handoff paths with the existing 600-second
 deadline, bounded streams and cleanup proof. Its private diagnostic records
-are outside the archive. Native-produced imports use the existing native
-import revalidation owner even when the historical compatibility flag is
-omitted; neither local nor imported native validation launches an unsupervised
-Python subprocess or falls back after refusal.
+are outside the archive. Native-produced imports stay native-owned, but
+portable downloaded imports and explicit same-runner imports have distinct
+tool-authentication contexts. Neither launches an unsupervised Python
+subprocess or falls back after refusal.
 `import-validator-build --stage-root ABS --output ABS` is a support-only
 trusted-v2 companion for a pristine imported stage. It accepts no caller
 selected executable: it requires the current clean physical checkout to
@@ -154,8 +154,8 @@ imported portable bundle; neither the candidate nor the validator is a public
 bundle member. The validator is retained from build through execution and its
 exact success stdout, empty stderr, bounded log, and command binding are
 checked before returning. A caller cannot select a validator or manifest. The
-protected in-job import path invokes this native operation when the explicit
-handoff option is present or the recorded producer is native, before writing
+protected in-job import path invokes this strict native operation only when the
+explicit handoff option is present, before writing
 transport or candidate records; native refusal fails the import with no Python
 fallback. Default Python-produced
 trusted-v2 imports (including the documented off-runner operator flow),
@@ -165,7 +165,27 @@ they either need
 the caller-supplied validator or do not satisfy the pristine same-revision
 trusted-stage preconditions. Native-produced production imports bind the
 recorded controller identity and direct validator built by
-`public-validator-build --runtime`.
+`public-validator-build --runtime` in that explicit same-runner lane.
+
+Default native-produced downloads instead invoke
+`import-handoff-revalidation --stage-root ABS --git ABS --supervisor ABS
+--validator ABS --output ABS`. This closed trusted-inner-ZIP owner authenticates
+the explicitly supplied local native supervisor by producer content/runtime
+commitments and the exact Git source tree. The local controller must have the
+same authenticated native executable content; the validator must match the
+native owner's build-derived direct-validator digest, not a caller-provided
+claim or an identity string emitted by an untrusted executable. The build
+graph obtains that digest from the existing direct-validator artifact and
+includes its tracked source inputs in the native source closure.
+Source and destination tool paths, inodes and timestamps need not agree.
+Producer filesystem identities remain observations of the producer context:
+portable import neither opens the producer's Git/Zig paths nor compares local
+filesystem metadata to their recorded metadata. Native ownership retains
+local executable and loader pins and local clean source snapshots before and
+after supervised validation. A fresh portable checkout need not contain the
+producer's generated output roots; present ignored outputs still use the
+existing closed role allowlist and bounds. Source/tool substitution or mutation refuses;
+the same-runner option cannot weaken these checks or select Python fallback.
 `local-consumer-custody --runtime ABS --expected-build-start-sha256 HEX
 --expected-boot-inputs-sha256 HEX` is the production owner for a completed
 v2 runtime's local checkout/source and build/boot consumer-input

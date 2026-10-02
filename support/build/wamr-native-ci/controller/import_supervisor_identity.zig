@@ -94,13 +94,16 @@ pub fn validateSourceNames(records_map: std.json.Value) !void {
     } else if (records_map.object.count() == source.closure.len) {
         for (source.closure) |entry|
             _ = try get(records_map, entry.name);
+    } else if (records_map.object.count() == source.previous_closure.len) {
+        for (source.previous_closure) |entry|
+            _ = try get(records_map, entry.name);
     } else return error.UnsupportedSupervisorSource;
 }
 
-fn verifyGitSource(
+pub fn verifyGitSource(
     allocator: std.mem.Allocator,
     io: std.Io,
-    accepted: *accepted_run.AcceptedRun,
+    identity: accepted_run.SourceIdentity,
     repository: []const u8,
     git: []const u8,
     source_map: std.json.Value,
@@ -109,14 +112,14 @@ fn verifyGitSource(
     const a = allocator;
     const records_map = try get(source_map, "records");
     try validateSourceNames(records_map);
-    const revision_ref = try std.mem.concat(a, u8, &.{ accepted.source.revision, "^{commit}" });
-    const tree_ref = try std.mem.concat(a, u8, &.{ accepted.source.revision, "^{tree}" });
+    const revision_ref = try std.mem.concat(a, u8, &.{ identity.revision, "^{commit}" });
+    const tree_ref = try std.mem.concat(a, u8, &.{ identity.revision, "^{tree}" });
     try notCancelled(signal);
     const commit = try source.gitOutput(a, io, repository, git, &.{ "rev-parse", "--verify", revision_ref }, 65, null);
-    try same(commit, try std.fmt.allocPrint(a, "{s}\n", .{accepted.source.revision}));
+    try same(commit, try std.fmt.allocPrint(a, "{s}\n", .{identity.revision}));
     try notCancelled(signal);
     const tree = try source.gitOutput(a, io, repository, git, &.{ "rev-parse", tree_ref }, 65, null);
-    try same(tree, try std.fmt.allocPrint(a, "{s}\n", .{accepted.source.tree}));
+    try same(tree, try std.fmt.allocPrint(a, "{s}\n", .{identity.tree}));
     for (records_map.object.keys(), records_map.object.values()) |name, value| {
         try notCancelled(signal);
         try @import("custody_limits.zig").relative(name, 256, 8);
@@ -124,7 +127,7 @@ fn verifyGitSource(
         if (size == 0 or size > 8 * 1024 * 1024) return error.InvalidImportIdentity;
         const digest = try text(try get(value, "sha256"));
         const listing = try source.gitOutput(a, io, repository, git, &.{
-            "ls-tree", "-z", accepted.source.tree, "--", name,
+            "ls-tree", "-z", identity.tree, "--", name,
         }, 512, null);
         if (listing.len == 0 or listing[listing.len - 1] != 0 or
             std.mem.indexOfScalar(u8, listing[0 .. listing.len - 1], 0) != null)
@@ -153,16 +156,16 @@ fn verifyGitSource(
 }
 
 const Library = struct { bytes: u64, sha256: [64]u8 };
-const PinnedRuntime = struct {
+pub const PinnedRuntime = struct {
     supervisor: files.RetainedFile,
     loaders: []files.RetainedFile,
 
-    fn verify(self: *PinnedRuntime, io: std.Io) !void {
+    pub fn verify(self: *PinnedRuntime, io: std.Io) !void {
         try self.supervisor.verify(io);
         for (self.loaders) |*loader| try loader.verify(io);
     }
 
-    fn deinit(self: *PinnedRuntime, allocator: std.mem.Allocator, io: std.Io) void {
+    pub fn deinit(self: *PinnedRuntime, allocator: std.mem.Allocator, io: std.Io) void {
         self.supervisor.close(io);
         for (self.loaders) |*loader| loader.close(io);
         allocator.free(self.loaders);
@@ -174,7 +177,7 @@ fn libraryLess(_: void, first: Library, second: Library) bool {
     return std.mem.lessThan(u8, &first.sha256, &second.sha256);
 }
 
-fn verifyRuntime(
+pub fn verifyRuntime(
     allocator: std.mem.Allocator,
     io: std.Io,
     supervisor_path: []const u8,
@@ -282,7 +285,7 @@ pub fn run(
     try document.requireCanonical(allocator, raw.bytes());
     const start = document.value();
     const source_map = try get(try get(start, "command_supervisor"), "source_map");
-    const source_sha256 = try verifyGitSource(allocator, io, accepted, repository, git, source_map, signal);
+    const source_sha256 = try verifyGitSource(allocator, io, accepted.source, repository, git, source_map, signal);
     var supervisor = try verifyRuntime(allocator, io, supervisor_path, start, signal);
     defer supervisor.deinit(allocator, io);
     try git_file.verify(io);

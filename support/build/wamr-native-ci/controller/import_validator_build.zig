@@ -12,8 +12,121 @@ const plan = @import("command_plan.zig");
 const profile = @import("profile.zig");
 const records = @import("records.zig");
 const source = @import("source_custody.zig");
+const supervisor_identity = @import("import_supervisor_identity.zig");
 
 const handoff_success = "Compute handoff revalidated; authority=not_admitted.\n";
+
+pub const LocalTools = struct {
+    git: []const u8,
+    supervisor: []const u8,
+    validator: []const u8,
+};
+
+pub const PortableTools = struct {
+    allocator: std.mem.Allocator,
+    git: files.RetainedFile,
+    controller: files.RetainedFile,
+    supervisor: supervisor_identity.PinnedRuntime,
+    validator: files.RetainedFile,
+    runtime: std.ArrayList(RuntimePin),
+    before: source.Source,
+
+    pub fn bind(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        context: accepted_run.EvidenceContext,
+        identity: accepted_run.SourceIdentity,
+        start: std.json.Value,
+        repository: []const u8,
+        controller_path: []const u8,
+        local: LocalTools,
+        signal: ?*core.process.SignalCancellation,
+    ) !PortableTools {
+        if (context != .trusted_inner_zip) return error.InvalidContext;
+        if (signal) |active|
+            if (active.flag().load(.acquire)) return error.Cancelled;
+        var git = try adapter.openPinnedTool(io, local.git, "tool:git");
+        errdefer git.close(io);
+        var native = try files.RetainedFile.open(io, controller_path, .tool);
+        errdefer native.close(io);
+        var validator = try adapter.openPinnedTool(io, local.validator, "input:validator");
+        errdefer validator.close(io);
+        const validator_identity = try physical.readFile(io, local.validator, 64 * limits.mib, false);
+        if (!std.mem.eql(u8, &validator_identity.sha256, @import("import_validator_identity").sha256) or
+            !std.meta.eql(validator_identity.metadata, physical.metadata(validator.file_snapshot)))
+            return error.InvalidValidator;
+
+        var runtime: std.ArrayList(RuntimePin) = .empty;
+        errdefer {
+            for (runtime.items) |*entry| entry.deinit(allocator, io);
+            runtime.deinit(allocator);
+        }
+        for ([_][]const u8{ local.git, controller_path, local.validator }) |path|
+            try pinLocalRuntime(allocator, io, path, &runtime);
+        try git.verify(io);
+        try native.verify(io);
+        try validator.verify(io);
+        for (runtime.items) |*entry| try entry.file.verify(io);
+        const source_map = try get(try get(start, "command_supervisor"), "source_map");
+        const source_records = try get(source_map, "records");
+        if (source_records != .object or source_records.object.count() != source.closure.len)
+            return error.UnsupportedSupervisorSource;
+        const source_sha = try supervisor_identity.verifyGitSource(allocator, io, identity, repository, local.git, source_map, signal);
+        const native_source_sha = try supervisor_identity.nativeSourceContentClosure(allocator);
+        if (!std.mem.eql(u8, source_sha, &native_source_sha)) return error.ImportSourceChanged;
+        var supervisor = try supervisor_identity.verifyRuntime(allocator, io, local.supervisor, start, signal);
+        errdefer supervisor.deinit(allocator, io);
+        const owner = try physical.readFile(io, controller_path, 64 * limits.mib, false);
+        const supplied = try physical.readFile(io, local.supervisor, 64 * limits.mib, false);
+        if (!std.meta.eql(owner.sha256, supplied.sha256) or owner.bytes != supplied.bytes or
+            !std.meta.eql(owner.metadata, physical.metadata(native.file_snapshot)))
+            return error.ImportSupervisorChanged;
+
+        try git.verify(io);
+        const before = try source.portableSource(allocator, io, repository, local.git);
+        if (!std.mem.eql(u8, before.revision, identity.revision) or
+            !std.mem.eql(u8, before.tree, identity.tree) or
+            !std.mem.eql(u8, before.custody.object_format, "sha1"))
+            return error.ImportSourceChanged;
+        try checkoutSource(before, start);
+        try source.verifyPhysical(io, allocator, repository);
+        var result = PortableTools{
+            .allocator = allocator,
+            .git = git,
+            .controller = native,
+            .supervisor = supervisor,
+            .validator = validator,
+            .runtime = runtime,
+            .before = before,
+        };
+        try result.verify(io, repository, local.git);
+        return result;
+    }
+
+    pub fn verify(self: *PortableTools, io: std.Io, repository: []const u8, git: []const u8) !void {
+        try self.verifyExecutables(io);
+        const after = try source.portableSource(self.allocator, io, repository, git);
+        if (!self.before.same(after)) return error.SourceChanged;
+        try self.verifyExecutables(io);
+    }
+
+    fn verifyExecutables(self: *PortableTools, io: std.Io) !void {
+        try self.git.verify(io);
+        try self.controller.verify(io);
+        try self.supervisor.verify(io);
+        try self.validator.verify(io);
+        for (self.runtime.items) |*entry| try entry.file.verify(io);
+    }
+
+    pub fn deinit(self: *PortableTools, io: std.Io) void {
+        self.git.close(io);
+        self.controller.close(io);
+        self.supervisor.deinit(self.allocator, io);
+        self.validator.close(io);
+        for (self.runtime.items) |*entry| entry.deinit(self.allocator, io);
+        self.runtime.deinit(self.allocator);
+    }
+};
 
 const Tool = struct {
     path: []const u8,
@@ -33,6 +146,110 @@ const RuntimePin = struct {
         allocator.free(self.path);
     }
 };
+
+fn pinLocalRuntime(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    executable: []const u8,
+    pinned: *std.ArrayList(RuntimePin),
+) !void {
+    const paths = try inputs.executableRuntimePaths(allocator, io, executable);
+    defer {
+        for (paths) |path| allocator.free(path);
+        allocator.free(paths);
+    }
+    if (paths.len > 256 or paths.len > 512 - pinned.items.len) return error.RuntimeInventoryRefused;
+    for (paths) |path| {
+        const owned = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned);
+        var file = try files.RetainedFile.open(io, owned, .artifact);
+        errdefer file.close(io);
+        try file.verify(io);
+        try pinned.append(allocator, .{ .path = owned, .file = file });
+    }
+}
+
+pub fn runPortable(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    accepted: *accepted_run.AcceptedRun,
+    repository: []const u8,
+    output: []const u8,
+    local: LocalTools,
+    signal: ?*core.process.SignalCancellation,
+) !void {
+    if (accepted.context != .trusted_inner_zip or
+        accepted.compatibility != .tiny_v2_qcow2_derived_vhd)
+        return error.InvalidContext;
+    try files.absoluteFilePath(output);
+    if (contained(output, accepted.root) or contained(output, repository) or
+        contained(accepted.root, output) or contained(repository, output))
+        return error.AliasedOutput;
+    try accepted.revalidateWithSignal(signal);
+    var pinned_start = try accepted.pinArtifact(.build_start);
+    defer pinned_start.close(io);
+    var raw = try files.readSensitiveFile(io, allocator, pinned_start.file, records.max_record_bytes, .private);
+    defer raw.deinit();
+    var document = try contracts.Document.parse(allocator, raw.bytes(), .{
+        .bytes = records.max_record_bytes,
+        .depth = 32,
+        .items = 4096,
+        .tokens = 65536,
+    });
+    defer document.deinit();
+    try document.requireCanonical(allocator, raw.bytes());
+    const owner_path = try std.process.executablePathAlloc(io, allocator);
+    var authenticated = try PortableTools.bind(allocator, io, accepted.context, accepted.source, document.value(), repository, owner_path, local, signal);
+    defer authenticated.deinit(io);
+    const candidate = try handoffCandidate(allocator, io, accepted);
+    const parent_path = std.fs.path.dirname(output) orelse return error.UnsafePath;
+    const name = std.fs.path.basename(output);
+    try files.basename(name);
+    const parent = try files.openDirectory(io, parent_path, .private);
+    defer parent.close(io);
+    try parent.createDir(io, name, .fromMode(0o700));
+    const work = try files.openDirectory(io, output, .private);
+    defer work.close(io);
+    for ([_][]const u8{ "private", "evidence" }) |entry| try work.createDir(io, entry, .fromMode(0o700));
+    const private = try work.openDir(io, "private", .{ .iterate = true });
+    defer private.close(io);
+    const evidence = try work.openDir(io, "evidence", .{ .iterate = true });
+    defer evidence.close(io);
+    const candidate_path = try std.fs.path.join(allocator, &.{ output, "private/candidate-bundle.json" });
+    {
+        const file = try private.createFile(io, "candidate-bundle.json", .{ .exclusive = true, .permissions = .fromMode(0o600) });
+        defer file.close(io);
+        try file.writeStreamingAll(io, candidate);
+        try file.sync(io);
+    }
+    const observed = try physical.readFile(io, candidate_path, 65536, true);
+    const candidate_sha = std.fmt.bytesToHex(records.fileIdentity(candidate), .lower);
+    if (observed.bytes != candidate.len or !std.mem.eql(u8, &observed.sha256, &candidate_sha))
+        return error.CandidateChanged;
+    var pinned_candidate = try files.RetainedFile.open(io, candidate_path, .private);
+    defer pinned_candidate.close(io);
+    if (!std.meta.eql(observed.metadata, physical.metadata(pinned_candidate.file_snapshot)))
+        return error.CandidateChanged;
+    try authenticated.verify(io, repository, local.git);
+    try accepted.revalidateWithSignal(signal);
+    _ = try revalidateHandoffCommand(allocator, io, .{
+        .source_root = repository,
+        .work = output,
+        .runtime = accepted.root,
+        .zig = "",
+        .producer = "",
+        .supervisor = local.supervisor,
+        .package_tool = "",
+        .validator = "",
+        .direct_validator = local.validator,
+        .bundle = candidate_path,
+        .tools = @splat(""),
+    }, private, evidence, signal);
+    try authenticated.verify(io, repository, local.git);
+    try accepted.revalidateWithSignal(signal);
+    try pinned_start.verify(io);
+    try pinned_candidate.verify(io);
+}
 
 fn get(value: std.json.Value, key: []const u8) !std.json.Value {
     if (value != .object) return error.InvalidImportedTool;

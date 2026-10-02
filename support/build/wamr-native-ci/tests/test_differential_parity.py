@@ -61,7 +61,7 @@ FROZEN_HOST_TOOLS = (
     "uname", "zig", "make", "llvm-nm", "llvm-objcopy", "llvm-objdump",
     "llvm-readelf", "llvm-strip", "bison", "flex", "m4",
 )
-NATIVE_SOURCE_FILES = (
+NATIVE_SOURCE_FILES = tuple(sorted((
     "support/apps/wamr-aot/validator/base64.zig",
     "support/apps/wamr-aot/validator/coremark.zig",
     "support/apps/wamr-aot/validator/input.zig",
@@ -115,7 +115,41 @@ NATIVE_SOURCE_FILES = (
     "support/tools/hyperv/sensitive.zig",
     "support/tools/hyperv/sha256.zig",
     "support/tools/hyperv/sha256_clear_upper.S",
-)
+    "support/build/kconfig.zig",
+    "support/tools/hyperv/direct/azure_runtime.zig",
+    "support/tools/hyperv/direct/build.zig",
+    "support/tools/hyperv/direct/compute.zig",
+    "support/tools/hyperv/direct/compute_main.zig",
+    "support/tools/hyperv/direct/main.zig",
+    "support/tools/hyperv/local_boot/config.zig",
+    "support/tools/hyperv/persistence/contract.zig",
+    "support/tools/hyperv/persistence/evidence.zig",
+    "support/tools/hyperv/persistence/local.zig",
+    "support/tools/hyperv/preparation/admission.zig",
+    "support/tools/hyperv/preparation/budget.zig",
+    "support/tools/hyperv/preparation/config.zig",
+    "support/tools/hyperv/preparation/contracts.zig",
+    "support/tools/hyperv/preparation/direct_config.zig",
+    "support/tools/hyperv/preparation/environment.zig",
+    "support/tools/hyperv/preparation/files.zig",
+    "support/tools/hyperv/preparation/git_entry.zig",
+    "support/tools/hyperv/preparation/inputs.zig",
+    "support/tools/hyperv/preparation/namespace.zig",
+    "support/tools/hyperv/preparation/origin.zig",
+    "support/tools/hyperv/preparation/origin_fixture.zig",
+    "support/tools/hyperv/preparation/origin_tests.zig",
+    "support/tools/hyperv/preparation/original_seed.zig",
+    "support/tools/hyperv/preparation/package.zig",
+    "support/tools/hyperv/preparation/producer.zig",
+    "support/tools/hyperv/preparation/production_local.zig",
+    "support/tools/hyperv/preparation/provenance.zig",
+    "support/tools/hyperv/preparation/receipts.zig",
+    "support/tools/hyperv/preparation/root.zig",
+    "support/tools/hyperv/preparation/runtime.zig",
+    "support/tools/hyperv/preparation/seed.zig",
+    "support/tools/hyperv/preparation/source.zig",
+    "support/tools/hyperv/preparation/tests.zig",
+)))
 NATIVE_CONSUMER_ROLES = {
     "command-supervisor": "controller/bin/uk-wamr-native-ci",
     "wamr-source-archive": "custody/wamr-source.tar",
@@ -754,7 +788,7 @@ def verified_supervisor_source_map(reference, value, side):
                     ).read_text()
         declared = re.findall(r'\.name = "([^"]+)", \.content = @embedFile\(',
                               embedded)
-        check(tuple(declared) == NATIVE_SOURCE_FILES,
+        check(tuple(sorted(declared)) == NATIVE_SOURCE_FILES,
               "build-start native controller source closure membership changed")
     records = {}
     for name in names:

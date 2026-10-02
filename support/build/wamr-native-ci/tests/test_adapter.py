@@ -246,6 +246,51 @@ class NativeRecordBridge(unittest.TestCase):
                 bridge.import_native_revalidation(stage, output), output)
         command.assert_called_once()
 
+    def test_portable_import_transport_requires_all_explicit_local_tools(self):
+        bridge = public_bundle.accepted_records
+        root, unused_controller = self.controller_fixture("")
+        stage = root / "stage"
+        stage.mkdir(mode=0o700)
+        tools = {}
+        for role in ("git", "supervisor", "validator"):
+            path = root / role
+            path.write_bytes(b"local tool")
+            path.chmod(0o500)
+            tools[role] = path
+        with mock.patch.object(bridge, "_controller_command") as command:
+            for missing in tools:
+                with self.subTest(missing=missing), self.assertRaises(ValueError):
+                    bridge.import_native_revalidation(
+                        stage, root / "incomplete",
+                        **{key: value for key, value in tools.items()
+                           if key != missing})
+            command.assert_not_called()
+
+        output = root / "accepted"
+        def accepted(arguments, refusal, *, timeout_seconds):
+            self.assertEqual(arguments, (
+                "import-handoff-revalidation",
+                "--stage-root", str(stage), "--output", str(output),
+                "--git", str(tools["git"]),
+                "--supervisor", str(tools["supervisor"]),
+                "--validator", str(tools["validator"])))
+            output.mkdir(mode=0o700)
+            for name in ("private", "evidence"):
+                (output / name).mkdir(mode=0o700)
+            for path, content in (
+                    (output / "private/import-native-revalidation.log",
+                     b"Compute handoff revalidated; authority=not_admitted.\n"),
+                    (output / "evidence/command-import-native-revalidation.json",
+                     b"{}")):
+                path.write_bytes(content)
+                path.chmod(0o600)
+            return b"", False
+        with mock.patch.object(
+                bridge, "_controller_command", side_effect=accepted) as command:
+            self.assertEqual(
+                bridge.import_native_revalidation(stage, output, **tools), output)
+        command.assert_called_once()
+
     def test_public_validator_build_uses_dedicated_timeout(self):
         bridge = public_bundle.accepted_records
         root, unused_controller = self.controller_fixture("")
@@ -1619,13 +1664,13 @@ class NativeRecordBridge(unittest.TestCase):
                         public_bundle.accepted_records, "import_native_revalidation",
                         side_effect=(
                             ValueError("native revalidation refused") if refusal else
-                            lambda unused_stage, path: Path(path))) as native, \
+                            lambda unused_stage, path, **unused_tools: Path(path))) as native, \
                     mock.patch.object(public_bundle, "publication_records"), \
                     mock.patch.object(public_bundle, "native") as python:
                 args = (
                     handoff, native_archive, output, source, ci.digest(native_archive),
-                    producer_runtime / public_bundle.NATIVE_PUBLIC_VALIDATOR_RELATIVE,
-                    producer_runtime / public_bundle.NATIVE_CONTROLLER_RELATIVE,
+                    root / "relocated-validator",
+                    root / "relocated-supervisor",
                 )
                 if refusal:
                     with self.assertRaisesRegex(ValueError, "native revalidation refused"):
@@ -1635,9 +1680,24 @@ class NativeRecordBridge(unittest.TestCase):
                     public_bundle.import_bundle(
                         *args, artifact_id="123", container_digest="0" * 64)
             native.assert_called_once_with(
-                output, output.with_name(output.name + "-native-identity") / "revalidation")
+                output, output.with_name(output.name + "-native-identity") / "revalidation",
+                git=ci.tool("git"), supervisor=root / "relocated-supervisor",
+                validator=root / "relocated-validator")
             python.assert_not_called()
             self.assertEqual((output / "bundle.json").exists(), not refusal)
+        with mock.patch.object(
+                public_bundle.accepted_records, "imported_stage",
+                return_value=native_accepted), \
+                mock.patch.object(
+                    public_bundle.accepted_records, "supervisor_import_identity"
+                ) as identity:
+            with self.assertRaises(ValueError):
+                public_bundle.import_bundle(
+                    handoff, native_archive, root / "strict-relocation", source,
+                    ci.digest(native_archive), root / "relocated-validator",
+                    root / "relocated-supervisor", artifact_id="123",
+                    container_digest="0" * 64, native_import_revalidation=True)
+        identity.assert_not_called()
 
     def test_real_archive_requires_native_acceptance_before_publication(self):
         bridge = public_bundle.accepted_records

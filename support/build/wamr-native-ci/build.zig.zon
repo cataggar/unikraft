@@ -6,6 +6,7 @@
     .dependencies = .{
         .public_image = .{ .path = "../../tools/hyperv/public_image" },
         .wamr_aot_build = .{ .path = "../../apps/wamr-aot" },
+        .direct_validator = .{ .path = "../../tools/hyperv/direct" },
     },
     .paths = .{""},
 }

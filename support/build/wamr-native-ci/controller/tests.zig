@@ -1324,6 +1324,147 @@ test "imported revalidation binds only the built validator and private bundle" {
     }
 }
 
+test "trusted import authenticates relocated native tools without producer filesystem identities" {
+    var checkpoint: []const u8 = "setup";
+    errdefer std.debug.print("relocated import failed at {s}\n", .{checkpoint});
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "relocated-native-import-{d}", .{std.os.linux.getpid()});
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("relocated import cleanup failed");
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    for ([_][]const u8{ "producer", "destination" }) |runner| try root.createDir(io, runner, .fromMode(0o700));
+    const producer = try root.openDir(io, "producer", .{ .iterate = true });
+    defer producer.close(io);
+    const destination = try root.openDir(io, "destination", .{ .iterate = true });
+    defer destination.close(io);
+    const producer_repo = try std.fs.path.join(a, &.{ path, "producer/source" });
+    const repository = try std.fs.path.join(a, &.{ path, "destination/source" });
+    for ([_][]const u8{ producer_repo, repository }) |checkout| {
+        const cloned = try std.process.run(a, io, .{
+            .argv = &.{ options.git_executable, "clone", "-q", "--no-hardlinks", "--", options.repository_root, checkout },
+            .cwd = .{ .path = options.fixture_root },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, cloned.term);
+    }
+    checkpoint = "copy tools";
+    try copyFixtureExecutable(io, a, options.host_controller_cli, producer, "controller");
+    try copyFixtureExecutable(io, a, options.host_controller_cli, destination, "controller");
+    try copyFixtureExecutable(io, a, options.host_controller_cli, destination, "supervisor");
+    try copyFixtureExecutable(io, a, options.import_validator, destination, "validator");
+    try copyFixtureExecutable(io, a, options.git_executable, producer, "git");
+    {
+        const original_zig = try std.Io.Dir.openFileAbsolute(io, options.zig_executable, .{});
+        defer original_zig.close(io);
+        const copied_zig = try producer.createFile(io, "zig", .{ .exclusive = true, .permissions = .fromMode(0o500) });
+        defer copied_zig.close(io);
+        var buffer: [64 * 1024]u8 = undefined;
+        var offset: u64 = 0;
+        while (true) {
+            const count = try original_zig.readPositionalAll(io, &buffer, offset);
+            if (count == 0) break;
+            try copied_zig.writeStreamingAll(io, buffer[0..count]);
+            offset += count;
+        }
+    }
+    const producer_controller = try std.fs.path.join(a, &.{ path, "producer/controller" });
+    const owner = try std.fs.path.join(a, &.{ path, "destination/controller" });
+    const supervisor = try std.fs.path.join(a, &.{ path, "destination/supervisor" });
+    const validator = try std.fs.path.join(a, &.{ path, "destination/validator" });
+    const producer_git = try std.fs.path.join(a, &.{ path, "producer/git" });
+    const producer_zig = try std.fs.path.join(a, &.{ path, "producer/zig" });
+    const producer_identity = try controller.custody_files.readFile(io, producer_controller, 64 * 1024 * 1024, false);
+    const relocated_identity = try controller.custody_files.readFile(io, supervisor, 64 * 1024 * 1024, false);
+    try std.testing.expectEqualSlices(u8, &producer_identity.sha256, &relocated_identity.sha256);
+    try std.testing.expect(producer_identity.metadata[1] != relocated_identity.metadata[1]);
+    try std.testing.expect(producer_identity.metadata[7] != relocated_identity.metadata[7]);
+    checkpoint = "producer source";
+    try std.testing.expectError(error.FileNotFound, controller.source_custody.source(a, io, producer_repo, options.git_executable));
+    const origin = try controller.source_custody.portableSource(a, io, producer_repo, options.git_executable);
+    checkpoint = "capture producer inputs";
+    const source_identity = controller.accepted_run.SourceIdentity{ .revision = origin.revision, .tree = origin.tree };
+    var custody = try controller.input_custody.capture(a, io, &.{
+        .{ .role = "command-supervisor", .path = producer_controller },
+        .{ .role = "tool:git", .path = producer_git },
+        .{ .role = "tool:zig", .path = producer_zig },
+    }, &.{});
+    defer custody.deinit(a);
+    var start = std.json.Value{ .object = .empty };
+    try start.object.put(a, "source_custody", try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, origin.custody, .{}), .{}));
+    try start.object.put(a, "consumer_inputs", try std.json.parseFromSliceLeaky(std.json.Value, a, try custody.canonical(a), .{}));
+    try start.object.put(a, "command_supervisor", try controller.build_pipeline.captureSupervisorState(a, io, producer_repo, producer_controller));
+    start = try std.json.parseFromSliceLeaky(std.json.Value, a, try canonicalJsonValue(a, start), .{ .parse_numbers = false });
+    checkpoint = "bind relocated tools";
+    try producer.deleteFile(io, "git");
+    try producer.deleteFile(io, "zig");
+    const local = controller.import_validator_build.LocalTools{ .git = options.git_executable, .supervisor = supervisor, .validator = validator };
+    var bound = try controller.import_validator_build.PortableTools.bind(a, io, .trusted_inner_zip, source_identity, start, repository, owner, local, null);
+    defer bound.deinit(io);
+    try bound.verify(io, repository, local.git);
+    checkpoint = "owner identity";
+    const identity_command = try std.process.run(a, io, .{
+        .argv = &.{ owner, "--identity" },
+        .cwd = .{ .path = repository },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, identity_command.term);
+    const closure = try controller.import_supervisor_identity.nativeSourceContentClosure(a);
+    try std.testing.expectEqualStrings(try controller.import_supervisor_identity.identityBytes(a, &closure), identity_command.stdout);
+    try std.testing.expectError(error.InvalidContext, controller.import_validator_build.PortableTools.bind(a, io, .local_runtime, source_identity, start, repository, owner, local, null));
+
+    const producer_source = try std.Io.Dir.openDirAbsolute(io, producer_repo, .{ .iterate = true });
+    checkpoint = "rehash source";
+    defer producer_source.close(io);
+    const relative = "support/build/wamr-native-ci/controller/cli.zig";
+    const original = try producer_source.readFileAlloc(io, relative, a, .limited(1024 * 1024));
+    try appendRelativeFixtureFile(io, producer_source, relative, "\n");
+    var altered = start;
+    altered.object = try start.object.clone(a);
+    try altered.object.put(a, "command_supervisor", try controller.build_pipeline.captureSupervisorState(a, io, producer_repo, producer_controller));
+    altered = try std.json.parseFromSliceLeaky(std.json.Value, a, try canonicalJsonValue(a, altered), .{ .parse_numbers = false });
+    try std.testing.expectError(error.ImportSourceChanged, controller.import_validator_build.PortableTools.bind(a, io, .trusted_inner_zip, source_identity, altered, repository, owner, local, null));
+    {
+        const restored = try producer_source.openFile(io, relative, .{ .mode = .write_only, .follow_symlinks = false });
+        defer restored.close(io);
+        try restored.setLength(io, original.len);
+        try restored.writePositionalAll(io, original, 0);
+    }
+    checkpoint = "rehash supervisor";
+    const substituted_executable = options.command_fixture;
+    try producer.deleteFile(io, "controller");
+    try copyFixtureExecutable(io, a, substituted_executable, producer, "controller");
+    var substituted_custody = try controller.input_custody.capture(a, io, &.{.{ .role = "command-supervisor", .path = producer_controller }}, &.{});
+    defer substituted_custody.deinit(a);
+    try altered.object.put(a, "consumer_inputs", try std.json.parseFromSliceLeaky(std.json.Value, a, try substituted_custody.canonical(a), .{}));
+    try altered.object.put(a, "command_supervisor", try controller.build_pipeline.captureSupervisorState(a, io, producer_repo, producer_controller));
+    altered = try std.json.parseFromSliceLeaky(std.json.Value, a, try canonicalJsonValue(a, altered), .{ .parse_numbers = false });
+    const substituted = controller.import_validator_build.LocalTools{ .git = local.git, .supervisor = producer_controller, .validator = validator };
+    try std.testing.expectError(error.ImportSupervisorChanged, controller.import_validator_build.PortableTools.bind(a, io, .trusted_inner_zip, source_identity, altered, repository, owner, substituted, null));
+    try destination.deleteFile(io, "validator");
+    checkpoint = "substitute local validator";
+    try copyFixtureExecutable(io, a, substituted_executable, destination, "validator");
+    try std.testing.expectError(error.InvalidValidator, controller.import_validator_build.PortableTools.bind(a, io, .trusted_inner_zip, source_identity, start, repository, owner, local, null));
+    try std.testing.expectError(error.FileChanged, bound.verify(io, repository, local.git));
+    try destination.deleteFile(io, "validator");
+    try copyFixtureExecutable(io, a, options.import_validator, destination, "validator");
+    var source_bound = try controller.import_validator_build.PortableTools.bind(a, io, .trusted_inner_zip, source_identity, start, repository, owner, local, null);
+    defer source_bound.deinit(io);
+    const source_dir = try std.Io.Dir.openDirAbsolute(io, repository, .{ .iterate = true });
+    defer source_dir.close(io);
+    try appendRelativeFixtureFile(io, source_dir, relative, "\n");
+    try std.testing.expectError(error.DirtySource, source_bound.verify(io, repository, local.git));
+    try std.testing.expectError(error.DirtySource, controller.import_validator_build.PortableTools.bind(a, io, .trusted_inner_zip, source_identity, start, repository, owner, local, null));
+}
+
 test "native handoff revalidation is supervised and retains bounded refusal evidence" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1588,6 +1729,12 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
         "uk-wamr-native-ci", "import-native-revalidation", "--output", "/private/revalidated", "--stage-root", "/stage",
     });
     try std.testing.expectEqual(cli.Action.@"import-native-revalidation", revalidation.action);
+    const portable_import = try cli.parse(&.{
+        "uk-wamr-native-ci", "import-handoff-revalidation", "--stage-root", "/stage",
+        "--git",             "/local/git",                  "--supervisor", "/local/controller",
+        "--validator",       "/local/validator",            "--output",     "/private/revalidated",
+    });
+    try std.testing.expectEqual(cli.Action.@"import-handoff-revalidation", portable_import.action);
     try std.testing.expectEqualStrings("/stage", revalidation.stage_root.?);
     try std.testing.expectEqualStrings("/private/revalidated", revalidation.output.?);
     const imported_identity = try cli.parse(&.{
@@ -1629,6 +1776,9 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
         &.{ "uk-wamr-native-ci", "import-native-revalidation", "--runtime", "/runtime", "--output", "/private/revalidated" },
         &.{ "uk-wamr-native-ci", "import-native-revalidation", "--stage-root", "/stage", "--output", "/private/../revalidated" },
         &.{ "uk-wamr-native-ci", "import-native-revalidation", "--stage-root", "/stage", "--output", "/private/revalidated", "--validator", "/untrusted/validator" },
+        &.{ "uk-wamr-native-ci", "import-handoff-revalidation", "--stage-root", "/stage", "--git", "/local/git", "--supervisor", "/local/controller", "--output", "/private/revalidated" },
+        &.{ "uk-wamr-native-ci", "import-handoff-revalidation", "--stage-root", "/stage", "--git", "/local/git", "--supervisor", "/local/controller", "--validator", "/local/validator", "--output", "/private/../revalidated" },
+        &.{ "uk-wamr-native-ci", "import-handoff-revalidation", "--runtime", "/runtime", "--git", "/local/git", "--supervisor", "/local/controller", "--validator", "/local/validator", "--output", "/private/revalidated" },
         &.{ "uk-wamr-native-ci", "supervisor-import-identity", "--stage-root", "/stage", "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git" },
         &.{ "uk-wamr-native-ci", "supervisor-import-identity", "--stage-root", "/stage", "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git", "--output", "/stage/../identity" },
         &.{ "uk-wamr-native-ci", "supervisor-import-identity", "--stage-root", "/stage", "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git", "--output", "/private/identity", "--profile", "tiny" },
