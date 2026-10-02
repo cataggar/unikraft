@@ -2715,9 +2715,9 @@ class HypervWorkflowTest(unittest.TestCase):
         for required in (
             "git worktree add --detach",
             "test-controller-limits",
-            "source_custody_production_limits.py",
         ):
             self.assertIn(required, source_limits)
+        self.assertNotIn("source_custody_production_limits.py", source_limits)
         for required in (
             "for name in llvm-readelf llvm-strip; do",
             'target="$(readlink -f "${alias}")"',
@@ -2786,7 +2786,7 @@ class HypervWorkflowTest(unittest.TestCase):
         ):
             self.assertIn(f"refuse {refusal}", driver)
 
-    def test_wamr_paired_slots_are_reserved_before_build_custody(self):
+    def test_wamr_native_only_qualification_preserves_required_fault_contexts(self):
         workflow = (
             SUPPORT.parent / ".github/workflows/wamr-native-compute.yaml"
         ).read_text()
@@ -2803,26 +2803,26 @@ class HypervWorkflowTest(unittest.TestCase):
         build_step = workflow.split(
             "      - name: Build the tiny AOT image with the installed native producer and safety graph\n",
             1,
-        )[1].split("\n      - name: Run six native boots", 1)[0]
-        slots = (
-            "for output in /d/wamr-ci/wamr-differential-sources "
-            "/d/wamr-ci/wamr-differential; do"
-        )
-        self.assertLess(
-            build_step.index(slots),
-            build_step.index('"${controller}" build --runtime "${root}"'))
+        )[1].split("\n      - name: Run the six-mode native tiny chain", 1)[0]
+        self.assertNotIn("wamr-differential-sources", build_step)
         self.assertIn('controller="${WAMR_CI_CONTROLLER:?}"', build_step)
         driver = (
             SUPPORT.parent / ".github/scripts/wamr-native-ci.sh"
         ).read_text()
-        for required in (
-            "shopt -s nullglob dotglob",
-            'entries=("${output}"/*)',
-            'entries=("${source_root}"/*)',
-            'refuse prior-parity-output',
-        ):
-            self.assertIn(required, driver)
-        self.assertNotIn('rmdir -- "${source_root}"', driver)
+        self.assertIn('exec "${controller}" boot --runtime "$1"', driver)
+        self.assertNotIn("python", driver)
+        self.assertNotIn("worktree", driver)
+        self.assertIn("  wamr-differential-parity:", workflow)
+        self.assertIn(
+            "case: [build-start-tamper, missing-build, occupied-boot-slot, prior-build-output]",
+            workflow)
+        self.assertIn('"${root}" fault "${NATIVE_FAULT_CASE}"', workflow)
+        self.assertNotIn("test_differential_parity", workflow)
+        runtime = (
+            SUPPORT.parent / ".github/scripts/hyperv-qemu-candidate-runtime.sh"
+        ).read_text()
+        self.assertIn("wamr-native-fault-ci.sh", runtime)
+        self.assertNotIn("wamr-native-differential-ci.sh", runtime)
 
     def test_wamr_cpu_report_preserves_source_without_bytecode_environment(self):
         workflow = (

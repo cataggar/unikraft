@@ -99,11 +99,6 @@ jobs:
           ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-source-custody-limits-cache" \
             zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
             -Doptimize=ReleaseSafe -j2 test-controller-limits
-          (
-            cd "${source_root}"
-            export PYTHONDONTWRITEBYTECODE=1
-            python3 -B support/build/wamr-native-ci/tests/source_custody_production_limits.py
-          )
 
       - name: Exercise native controller, custody limits, and package-boot fixtures in an isolated x86 worktree
         timeout-minutes: 15
@@ -116,6 +111,8 @@ jobs:
           trap cleanup EXIT
           mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-controller-fixture-cache"
           mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-controller-pipeline-root"
+          mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-controller-python-private"
+          export TMPDIR="${RUNNER_TEMP}/wamr-controller-python-private"
           if ! ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
             zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
             -Doptimize=ReleaseSafe -j2 test-controller; then
@@ -136,7 +133,7 @@ jobs:
             cd "${source_root}"
             PYTHONDONTWRITEBYTECODE=1 \
               PYTHONPATH="${source_root}/support/build/wamr-native-ci/tests:${source_root}/support/build/wamr-native-ci" \
-              python3 -B -m unittest -q test_differential_parity.DeterministicContracts
+              python3 -B -m unittest -q test_native_qualification
           )
 
       - name: Install the production portable native controller
@@ -149,7 +146,7 @@ jobs:
           test ! -e "${controller_root}/controller"
           mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-native-controller-cache"
           ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-native-controller-cache" \
-            zig build --build-file support/build/wamr-native-ci/build.zig \
+            zig build --build-file "${GITHUB_WORKSPACE}/support/build/wamr-native-ci/build.zig" \
               -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=ReleaseSafe \
               -Dcontroller-runtime="${controller_root}" -j2 install-controller
           rm -rf support/build/wamr-native-ci/.zig-cache support/build/wamr-native-ci/zig-pkg
@@ -220,11 +217,6 @@ jobs:
           mkdir -p -m 700 "${zig_dir}"
           cp -a -- "${zig_source}/." "${zig_dir}/"
           chmod -R u=rwX,go= "${zig_dir}"
-          for output in /d/wamr-ci/wamr-differential-sources /d/wamr-ci/wamr-differential; do
-            test ! -e "${output}"
-            test ! -L "${output}"
-            mkdir -m 700 -- "${output}"
-          done
           mkdir -m 700 "${root}/firmware"
           cp --no-preserve=mode,ownership \
             "$(readlink -f /usr/share/OVMF/OVMF_CODE_4M.fd)" "${root}/firmware/code.fd"
@@ -249,7 +241,7 @@ jobs:
           "${controller}" build --runtime "${root}" \
             --wamr-source "${GITHUB_WORKSPACE}/.d/wamr-source"
 
-      - name: Run six native boots and paired Python/native success in the managed KVM process
+      - name: Run the six-mode native tiny chain in the managed KVM process
         timeout-minutes: 150
         env:
           QUALIFICATION_REPOSITORY_ID: ${{ github.repository_id }}
@@ -813,15 +805,8 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      - name: Retain bounded paired native replay for handoff diagnosis
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: wamr-native-replay-${{ github.run_id }}-${{ github.run_attempt }}
-          path: /d/wamr-ci/wamr-differential/native-records.json
-          if-no-files-found: ignore
-          retention-days: 7
-
+  # Legacy required context names: these four jobs now qualify native-only
+  # fault outcomes. Rename only with a coordinated required-check transition.
   wamr-differential-parity:
     needs: wamr-native-compute
     runs-on: ubuntu-24.04
@@ -926,29 +911,28 @@ jobs:
             mv -- "${temporary}" "${alias}"
           done
           export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
-          controller_root=/d/wamr-ci/wamr-differential-controller
-          test ! -e "${controller_root}"
-          mkdir -m 0700 -- "${controller_root}"
-          mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-differential-controller-cache"
-          ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-differential-controller-cache" \
-            zig build --build-file support/build/wamr-native-ci/build.zig \
+          test ! -e "${root}/controller"
+          mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-native-fault-controller-cache"
+          ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-native-fault-controller-cache" \
+            zig build --build-file "${GITHUB_WORKSPACE}/support/build/wamr-native-ci/build.zig" \
               -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=ReleaseSafe \
-              -Dcontroller-runtime="${controller_root}" -j2 install-controller
-          test -x "${controller_root}/controller/bin/uk-wamr-native-ci"
+              -Dcontroller-runtime="${root}" -j2 install-controller
+          rm -rf support/build/wamr-native-ci/.zig-cache support/build/wamr-native-ci/zig-pkg
+          test -x "${root}/controller/bin/uk-wamr-native-ci"
 
-      - name: Compare paired real fault outcomes with managed KVM
+      - name: Qualify the exact native fault outcome with managed KVM
         timeout-minutes: 150
         env:
           QUALIFICATION_REPOSITORY_ID: ${{ github.repository_id }}
           QUALIFICATION_SOURCE_JOB: wamr-differential-parity
-          DIFFERENTIAL_CASE: ${{ matrix.case }}
+          NATIVE_FAULT_CASE: ${{ matrix.case }}
         run: |
           set -euo pipefail
           root=/d/wamr-ci/wamr-native-runtime
           zig_dir="$(dirname "$(readlink -f "$(command -v zig)")")"
           export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
           bash .github/scripts/hyperv-qemu-candidate-runtime.sh \
-            "${root}" differential "${DIFFERENTIAL_CASE}"
+            "${root}" fault "${NATIVE_FAULT_CASE}"
 
       - name: Remove only the managed QEMU dynamic runtime
         if: always()

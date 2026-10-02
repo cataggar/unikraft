@@ -154,7 +154,7 @@ pub fn build(b: *std.Build) void {
         @panic("cannot resolve source root"));
     controller_options.addOption([]const u8, "zig_executable", b.graph.zig_exe);
     controller_options.addOption([]const u8, "git_executable", b.findProgram(&.{"git"}, &.{}) catch @panic("Git required for controller custody tests"));
-    controller_options.addOption([]const u8, "python_executable", b.findProgram(&.{"python3"}, &.{}) catch @panic("Python required for differential command tests"));
+    controller_options.addOption([]const u8, "python_executable", b.findProgram(&.{"python3"}, &.{}) catch @panic("Python required for handoff compatibility fixtures"));
     controller_options.addOption([]const u8, "fixture_root", std.fs.path.resolve(b.allocator, &.{
         b.graph.cache.cwd, b.cache_root.path orelse ".",
     }) catch @panic("cannot resolve private controller test root"));

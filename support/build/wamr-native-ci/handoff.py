@@ -1971,8 +1971,10 @@ def main():
 
         if args.command == "public-source-bundle":
             FAILURE_STAGE = "public-entry"
-            unused_archive, archive_sha256, source_tree = (
-                public_bundle.publish_ci(sys.modules[__name__]))
+            with (accepted_records.phase_timings(),
+                  public_bundle.accepted_records.phase_timings()):
+                unused_archive, archive_sha256, source_tree = (
+                    public_bundle.publish_ci(sys.modules[__name__]))
             del unused_archive
             print("Public source archive SHA-256: " + archive_sha256)
             print("Public source tree: " + source_tree)

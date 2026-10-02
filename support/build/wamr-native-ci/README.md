@@ -30,7 +30,7 @@ without self-hashing. Historical four-mode v1 is read-only; there is no
 caller-selected downgrade. `diagnostics --runtime ABS` emits allowlisted
 redacted observations only, never acceptance. The protected production
 workflow now invokes the installed portable controller for build, boot and
-diagnostics; `run.py` remains only as the Python differential reference and
+diagnostics; `run.py` remains temporarily for the unmigrated #187/#189 oracles and
 historical compatibility reader until its later removal slices.
 
 ## Native record-consumer bridge (Python still performs the handoff)
@@ -224,9 +224,9 @@ from the checked-out source after pinned Zig setup at
 `/d/wamr-ci/wamr-native-runtime/controller/bin/uk-wamr-native-ci`. That
 path is the production build/boot/diagnostics controller; the workflow obtains
 the recorded executable target from native
-`describe --output json-v1` instead of importing `run.py`. The separate
-`/d/wamr-ci/wamr-differential-controller` install name remains limited to the
-paired differential fault jobs.
+`describe --output json-v1` instead of importing `run.py`. Native fault jobs
+install the same controller at the same runtime-relative path. There is no
+Python controller replay or orchestration fallback.
 
 The native custody library now exposes clean Git tracked-object/physical
 source and ignored-output checks, fixed-revision create-only WAMR archive
@@ -776,49 +776,56 @@ ARM development can run these fixtures, but cannot qualify the guest.
 Only a successful real x86 PR run of the corrected, committed native base
 establishes the first local tiny-compute observation.
 
-## Differential parity preparation
+## Native-only qualification
 
 `test-controller` now includes native source-custody production limits, twelve
 physical Bison/consumer/dependency/supervision fault fixtures, frozen v1/v2
 result-parser goldens, and the #187 handoff/public-bundle contract golden.
 `test-controller-limits`, `test-controller-fault-parity`,
 `test-differential-records`, and `test-handoff-contracts` run those suites separately.
-The matching Python
-parser fixtures run with
-`python3 -B -m unittest test_differential_parity.DeterministicContracts`
-from the tests directory. These goldens contain synthetic records, not guest
-boot evidence.
+The neutral v1/v2 fixture constructors in `tests/controller_record_fixtures.py`
+remain available to #187/#189. `test_differential_parity.DeterministicContracts`
+is only a compatibility import of their neutral byte tests, not a controller
+comparison or an executable `local`/`full` harness. No acceptance is inferred
+from these synthetic records. The handoff/public-bundle and authority oracles
+remain in their owners until those migrations; `run.py` is not deleted here.
 
-On a host without accessible x86 KVM,
-`python3 -B support/build/wamr-native-ci/tests/test_differential_parity.py local`
-compares actual Python and native controller CLI refusals in separate private
-roots. Its three documented legacy-CLI exceptions require exact refusal
-versus closed-grammar usage outcomes; they do not make a failed controller
-run successful. The `full` action requires separate clean worktrees, real
-pinned tools and WAMR source, an empty private `.d` output role in each
-worktree, an owner-only runtime template and portable controller, and
-accessible x86 KVM. The protected x86 job installs that
-controller from its isolated fixture worktree into a separate private root,
-then runs one paired six-mode success case after the native production boot
-within the same managed, non-root KVM process. An unexplained difference fails
-the job before the public bundle is published. Unequal build records fail before
-the paired boots; only equal builds proceed to six-mode boot comparison.
-Passing this one case does not
-change production acceptance authority or invoke Azure. Once the production job
-passes, four separate bounded, credential-free x86/KVM matrix jobs run paired
-`build-start-tamper`, `missing-build`, `occupied-boot-slot`, and
-`prior-build-output` cases from fresh worktrees. Each retains strict fault
-and evidence parity; there is no TCG or successful-skip fallback.
-For the three post-build faults, both builds must first pass the full paired
-physical comparison. After injecting the same named fault into each side,
-the oracle requires the case-specific Python refusal and native boot-platform
-error, rechecks the original source and consumer custody, and compares each
-side's complete evidence, artifacts and retained outputs with its own
-previously verified build. Only the exact injected record rewrite, missing
-build record or occupied boot-slot file may differ. The rewritten
-`build-start.json` necessarily has a newer timestamp; only that named fault
-excludes its timestamp from evidence-order checking, while the order of
-every other record remains strict. No fault may publish an acceptance result.
+The credential-free KVM workflow runs the real native build and six-mode tiny
+chain once, then reopens its accepted native records and exercises the existing
+handoff/public-source import gates. The managed wrapper still requires an
+ordinary user, accessible x86 KVM, credential clearing, capability drop and
+no-new-privileges; missing capability fails, never skips or falls back to TCG.
+
+The four required contexts retain their **legacy names**:
+`wamr-differential-parity (build-start-tamper|missing-build|occupied-boot-slot|prior-build-output)`.
+Their unchanged matrix job ID is a branch-protection compatibility constraint,
+not a differential implementation. Each invokes `wamr-native-fault-ci.sh` and
+`tests/native_fault_qualification.py`, which execute only the installed native
+controller. The three boot faults first require a successful real native build;
+then they mutate precisely the build-start revision, remove `build.json`, or
+occupy the first boot slot. They require exit 1, empty stdout and the exact native
+boot-platform cause (`BuildStartChanged`, `FileNotFound`, or `PriorOutput`).
+The prior-output case requires the exact startup `PathAlreadyExists` failure.
+Every case compares physical metadata and content before/after the refused
+command, including retained records, outputs, tools and images, and forbids
+`result.json`; prior-output also forbids `build.json`. Unexpected success, a
+different failure, later publication, changed bytes or incomplete build fails
+the gate. Renaming these required contexts needs a separate coordinator-owned
+protection transition; this PR does not change protection.
+
+Offline gate-driver tests run from the repository root with
+`PYTHONPATH=support/build/wamr-native-ci/tests python3 -B -m unittest -q test_native_qualification`,
+using a fresh owner-only `TMPDIR` outside the source. Native gates must likewise
+use an absolute `--build-file`, fresh private caches and an explicit private
+`-Dtest-root` for `test-pipeline`. Native test/fixture-runner coverage owns the
+controller's six-mode order, records, custody, supervision, reap and poison
+semantics; no Python controller reference decides those outcomes.
+
+### Historical reproducibility work retained after differential retirement
+
+The former paired comparison required the following production reproducibility
+properties. Its live runner and diagnostics have been removed; this history does
+not describe a currently executable gate.
 The different Python/native supervised build commands, controller closures,
 local-boot installation paths, and native-only boot-input validator role are
 checked against their own exact physical contracts; each QCOW2 acceptance
@@ -1005,11 +1012,7 @@ The protected job builds and boots from the fixed private
 `/d/wamr-ci/wamr-native-runtime` root, with the sealed Zig distribution
 beside it under `/d/wamr-ci/wamr-native-tools`; the root-owned `/d` boundary
 and precreated private `wamr-ci` directory avoid mutable hosted-runner home
-ancestors while retaining exact component custody. Both paired-comparison
-output slots are created before the build-start baseline and checked empty
-before use. The source slot stays in place after worktree cleanup: creating
-or removing it later would change the recorded `/d/wamr-ci` ancestor metadata
-even if no retained input bytes changed. Its authenticated QEMU
+ancestors while retaining exact component custody. Its authenticated QEMU
 `libfdt` runtime is established before the build-input baseline and removed
 by exact recorded identity only after final handoff revalidation, so neither
 boot setup nor pre-export cleanup can mutate a recorded system-library
@@ -1022,6 +1025,20 @@ It uses only the validated recorded Git executable for the source/dependency
 recheck, recomputes the exact source, dependency, Bison, consumer and guarded
 supervisor custody, and only then binds the full recorded tool set and the
 fixed-runtime supervisor. It repeats the full custody check after binding.
+Public publication emits opt-in, fixed-label native phase timings on stderr;
+stdout retains its exact archive-digest/tree contract. Timings contain no
+arguments, paths, records, child output or refusal details, and a returned
+transport is not an acceptance result. Every existing revalidation boundary
+still runs, including the pre/post validator, export and final custody checks.
+Canonical custody framing uses a short-lived nested arena so its JSON workspace
+does not accumulate in the acceptance arena across inventory entries. Tree
+members are hashed through the already retained descriptor, using the same
+`readRetained` primitive as the #187 export foundation; before/after descriptor
+snapshots and full pathname/component verification remain intact. Each newly
+hashed member uses that primitive's terminal verification without immediately
+repeating the same walk; alias reuse and final tree member/directory checks
+still verify independently. No digests or pathnames are cached across
+revalidation boundaries.
 Pre-export refusal names only a fixed result, build-start schema/consumer
 role/tree/custody (with a fixed allowlisted file or tree role when physical
 custody changes), physical path role/binary/runtime/tree, dependency/custody,

@@ -255,16 +255,20 @@ pub fn admit(context: *Context) !HostAdmitted {
     const work = try files.Directory.open(context.io(), context.build_context.compute);
     defer work.close(context.io());
     try build.loadAccepted(context.build_context);
+    try requireEmptySlots(context);
+    for ([_][]const u8{ "build-start.json", "build.json", "command-adapter.json", "command-local-boot-tool.json", "command-fixtures.json", "command-prepare.json", "command-config.json", "command-native-image.json" }) |name|
+        try context.pin(name);
+    try context.base();
+    return .{ .context = context };
+}
+
+fn requireEmptySlots(context: *Context) !void {
     for ([_][]const u8{ "package", "public-source", "boot-raw-x2apic", "boot-raw-legacy-apic", "boot-qcow2-x2apic", "boot-qcow2-legacy-apic", "boot-vpc-x2apic", "boot-vpc-legacy-apic" }) |name| {
         const slot = try files.Directory.open(context.io(), try context.path(name));
         defer slot.close(context.io());
         var iterator = slot.dir.iterate();
         if (try iterator.next(context.io()) != null) return error.PriorOutput;
     }
-    for ([_][]const u8{ "build-start.json", "build.json", "command-adapter.json", "command-local-boot-tool.json", "command-fixtures.json", "command-prepare.json", "command-config.json", "command-native-image.json" }) |name|
-        try context.pin(name);
-    try context.base();
-    return .{ .context = context };
 }
 
 pub fn bindInputs(state: HostAdmitted) !BootInputsBound {
@@ -1184,6 +1188,10 @@ fn revalidateChain(ctx: *Context) !void {
 }
 
 pub const testing = if (builtin.is_test) struct {
+    pub fn emptySlots(ctx: *Context) !void {
+        return requireEmptySlots(ctx);
+    }
+
     pub fn revalidateBase(ctx: *Context) !void {
         return ctx.base();
     }
