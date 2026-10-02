@@ -241,6 +241,24 @@ pub const AcceptedRun = struct {
         return error.UnknownArtifactRole;
     }
 
+    /// Wrapper cleanup is export-owned proof, not a completed-record prerequisite.
+    pub fn pinExportCleanup(self: *AcceptedRun) !files.RetainedFile {
+        if (self.context != .local_runtime or self.local_producer != .native or
+            self.compatibility != .tiny_v2_qcow2_derived_vhd)
+            return error.InvalidContext;
+        if (self.cleanup_snapshot != null) return self.pinArtifact(.cleanup);
+        const path = try self.artifactPath(.cleanup);
+        var retained = try files.RetainedFile.open(self.io, path, .private);
+        errdefer retained.close(self.io);
+        var bytes = try files.readSensitiveFile(self.io, self.allocator(), retained.file, 128, .private);
+        defer bytes.deinit();
+        if (!std.mem.eql(u8, bytes.bytes(), "primary=0 cleanup=0\n")) return error.InvalidCleanup;
+        const observed = try self.readPin(&retained, 128);
+        try retained.verify(self.io);
+        self.cleanup_snapshot = observed;
+        return retained;
+    }
+
     pub fn pinRecord(self: *AcceptedRun, name: []const u8) !files.RetainedFile {
         for (self.records) |record| {
             if (!std.mem.eql(u8, record.name, name)) continue;
@@ -1120,19 +1138,7 @@ fn collectArtifacts(self: *AcceptedRun) !void {
     const a = self.allocator();
     var result: std.ArrayList(PinnedArtifact) = .empty;
     for (artifact_specs) |spec| {
-        if (self.context == .local_runtime and spec.role == .cleanup) {
-            if (self.local_producer == .native) {
-                const path = try self.artifactPath(.cleanup);
-                var retained = try files.RetainedFile.open(self.io, path, .private);
-                defer retained.close(self.io);
-                var bytes = try files.readSensitiveFile(self.io, a, retained.file, 128, .private);
-                defer bytes.deinit();
-                if (!std.mem.eql(u8, bytes.bytes(), "primary=0 cleanup=0\n")) return error.InvalidCleanup;
-                self.cleanup_snapshot = try physical.readRetained(self.io, &retained, 128);
-                try retained.verify(self.io);
-            }
-            continue;
-        }
+        if (self.context == .local_runtime and spec.role == .cleanup) continue;
         if (self.compatibility == .tiny_v1_legacy and
             (spec.role == .qcow2 or spec.role == .cleanup or
                 @intFromEnum(spec.role) >= @intFromEnum(ArtifactRole.qcow2_finalization_intent)))

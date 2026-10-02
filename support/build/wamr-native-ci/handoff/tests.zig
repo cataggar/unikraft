@@ -653,6 +653,33 @@ test "source evidence additions and retained input directory replacement poison 
     }
 }
 
+test "completed record view precedes runtime cleanup but export requires its actual proof" {
+    var fixture = try ExportFixture.initPhase("records-before-cleanup", false);
+    defer fixture.deinit();
+    const before = try descriptorCount();
+    {
+        var accepted = try fixture.capture();
+        defer accepted.deinit();
+        var view = try c.Document.parse(fixture.arena.allocator(), try accepted.handoffV1(), .{});
+        defer view.deinit();
+        try std.testing.expectEqual(@as(usize, 49), view.value().object.get("artifacts").?.array.items.len);
+        try std.testing.expectEqual(layout.evidence_v2.len, view.value().object.get("records").?.array.items.len);
+        try std.testing.expectEqualStrings(&fixture.result_sha256, view.value().object.get("result").?.object.get("sha256").?.string);
+        try std.testing.expectError(error.FileNotFound, fixture.begin(.{}));
+        try fixture.noBundle();
+        try std.testing.expectError(error.FileNotFound, fixture.root.openDir(std.testing.io, "handoff", .{}));
+        try fixture.put("source/runtime/evidence/runtime-cleanup.txt", "primary=1 cleanup=0\n");
+        try std.testing.expectError(error.InvalidCleanup, fixture.begin(.{}));
+        try fixture.noBundle();
+        try fixture.root.deleteFile(std.testing.io, "source/runtime/evidence/runtime-cleanup.txt");
+        try fixture.put("source/runtime/evidence/runtime-cleanup.txt", "primary=0 cleanup=0\n");
+        const pinned = try fixture.begin(.{});
+        defer pinned.deinit();
+        try std.testing.expect(native_export.Test.finishFixture(pinned) == .success);
+    }
+    try std.testing.expectEqual(before, try descriptorCount());
+}
+
 test "accepted record and runtime input pins reject identical-content replacement" {
     for ([_]bool{ false, true }) |input| {
         var fixture = try ExportFixture.init(if (input) "input-pin" else "record-pin");
@@ -676,6 +703,10 @@ test "accepted pin identity belongs to the returned descriptor across ancestor A
         defer fixture.deinit();
         var accepted = try fixture.capture();
         defer accepted.deinit();
+        if (role == .cleanup) {
+            var cleanup = try accepted.pinExportCleanup();
+            cleanup.close(std.testing.io);
+        }
         const relative = switch (role) {
             .record => "compute/evidence/build.json",
             .input => "inputs/tool",
@@ -1757,6 +1788,10 @@ const ExportFixture = struct {
     result_sha256: [64]u8,
 
     fn init(label: []const u8) !ExportFixture {
+        return initPhase(label, true);
+    }
+
+    fn initPhase(label: []const u8, cleanup_complete: bool) !ExportFixture {
         var base = try CopyFixture.init(label);
         errdefer base.deinit();
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1780,11 +1815,11 @@ const ExportFixture = struct {
             .result_sha256 = undefined,
         };
         errdefer arena = self.arena;
-        try self.materialize();
+        try self.materialize(cleanup_complete);
         return self;
     }
 
-    fn materialize(self: *ExportFixture) !void {
+    fn materialize(self: *ExportFixture, cleanup_complete: bool) !void {
         const a = self.arena.allocator();
         const io = std.testing.io;
         const result_file = try core.private_files.openAbsolute(io, test_options.accepted_result_fixture, .artifact);
@@ -1837,7 +1872,7 @@ const ExportFixture = struct {
         };
         for (source_paths, 0..) |path, i|
             try self.put(try std.fmt.allocPrint(a, "source/{s}", .{path}), try std.fmt.allocPrint(a, "{s}\x00\xff\n", .{layout.artifact_names_v2[i]}));
-        try self.put("source/runtime/evidence/runtime-cleanup.txt", "primary=0 cleanup=0\n");
+        if (cleanup_complete) try self.put("source/runtime/evidence/runtime-cleanup.txt", "primary=0 cleanup=0\n");
         try self.put("source/runtime/inputs/tool", "fixture-tool\x00\xff\n");
         try self.put("source/runtime/inputs/tree/data", "fixture-tree-data\n");
         for (profile.production_modes) |mode| {

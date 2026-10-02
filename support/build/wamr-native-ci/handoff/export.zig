@@ -332,7 +332,10 @@ const Attempt = struct {
         for (layout.artifact_names_v2, 0..) |name, i| {
             const role = if (std.mem.eql(u8, name, "build")) accepted_run.ArtifactRole.build_record else std.meta.stringToEnum(accepted_run.ArtifactRole, name) orelse return error.UnknownArtifactRole;
             const relative = try std.fmt.allocPrint(self.a(), "artifacts/{s}", .{name});
-            const retained = try accepted.pinArtifact(role);
+            const retained = if (role == .cleanup)
+                try accepted.pinExportCleanup()
+            else
+                try accepted.pinArtifact(role);
             try self.addSource(retained, .artifacts_copied, relative, &self.artifacts[i], layout.artifactLimit(name));
         }
         for (controller.profile.modes(accepted.compatibility), 0..) |mode, i| {

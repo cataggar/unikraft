@@ -367,7 +367,7 @@ def check_export_parity(root):
     ]
     boots = iter(boot_proofs)
 
-    def inspect(unused_runtime, destination, *, legacy):
+    def inspect(unused_runtime, destination, *, legacy=False):
         assert unused_runtime == runtime and not legacy
         destination.mkdir(mode=0o700)
         (destination / "private").mkdir(mode=0o700)
@@ -425,8 +425,7 @@ def check_export_parity(root):
         assert (changed_output / "artifacts/local_result").is_file()
         assert not (changed_output / "bundle.json").exists()
     assert phases == [
-        "records", "custody", "build", "boots", "inspect",
-        "copy", "recheck", "publish",
+        "records", "inspect", "copy", "recheck", "publish",
     ], phases
     native = handoff.ci.document(native_output / "bundle.json")
     selected = public_bundle.members(handoff, native, native_output)

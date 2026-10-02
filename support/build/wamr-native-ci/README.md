@@ -914,6 +914,15 @@ open. Publication barriers revalidate the accepted run, source pins, selected
 source directories, exact output membership, sealed destination directories,
 copied bytes and canonical root-bound manifest.
 
+Completed native `records` replay, handoff inspection and validator builds run
+inside the managed runtime, before its outer owner publishes
+`evidence/runtime-cleanup.txt`. That export-only proof is not a prerequisite of
+the controller's completed record view. Export's `AcceptedRunPinned` transition
+must instead admit and retain the actual owner-private cleanup descriptor with
+the exact successful literal, hash and metadata before reserving output.
+Missing, failed or changed cleanup refuses; it is never optional at export,
+manufactured by the controller, or adopted from an earlier failed attempt.
+
 The manifest is staged and reopened as `private/export/handoff.json` before
 validation. Bounded phase/failure journals and publication intent also stay in
 that private directory, outside the frozen public member table. Cancellation,
