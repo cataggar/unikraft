@@ -244,7 +244,68 @@ fn clean(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: []cons
     if (output.len != 0) return error.DirtySource;
 }
 
-const Ignored = struct { entries: usize, bytes: usize, physical_sha256: [64]u8, inventory_sha256: [64]u8 };
+const Ignored = struct {
+    entries: usize,
+    bytes: usize,
+    physical_sha256: [64]u8,
+    inventory_sha256: [64]u8,
+    tracked_queries: usize = 0,
+};
+
+const TrackedLinks = struct {
+    buffer: [64][limits.ignored_path]u8 = undefined,
+    paths: [64][]const u8 = undefined,
+    count: usize = 0,
+    queries: usize = 0,
+
+    fn add(self: *TrackedLinks, allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: []const u8, path: []const u8) !void {
+        const pathspec = path[0] == ':' or std.mem.indexOfAny(u8, path, "*?[]\\") != null;
+        if (pathspec)
+            try self.verify(allocator, io, repo, git);
+        for (self.paths[0..self.count]) |prior|
+            if (std.mem.eql(u8, prior, path)) return;
+        if (self.count == self.paths.len)
+            try self.verify(allocator, io, repo, git);
+        const stored = self.buffer[self.count][0..path.len];
+        @memcpy(stored, path);
+        self.paths[self.count] = stored;
+        self.count += 1;
+        if (pathspec)
+            try self.verify(allocator, io, repo, git);
+    }
+
+    fn verify(self: *TrackedLinks, allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: []const u8) !void {
+        if (self.count == 0) return;
+        const prefix = [_][]const u8{ "ls-files", "--error-unmatch", "-z", "--" };
+        var args: [prefix.len + 64][]const u8 = undefined;
+        @memcpy(args[0..prefix.len], &prefix);
+        @memcpy(args[prefix.len..][0..self.count], self.paths[0..self.count]);
+        var expected_bytes: usize = 0;
+        for (self.paths[0..self.count]) |path| expected_bytes += path.len + 1;
+        const listed = gitOutput(allocator, io, repo, git, args[0 .. prefix.len + self.count], expected_bytes, null) catch
+            return error.IgnoredLinkEscapesRole;
+        defer allocator.free(listed);
+        if (listed.len != expected_bytes or listed[listed.len - 1] != 0)
+            return error.IgnoredLinkEscapesRole;
+        var seen = std.StaticBitSet(64).initEmpty();
+        var entries = std.mem.splitScalar(u8, listed[0 .. listed.len - 1], 0);
+        while (entries.next()) |entry| {
+            var matched: ?usize = null;
+            for (self.paths[0..self.count], 0..) |path, index| {
+                if (std.mem.eql(u8, entry, path)) {
+                    matched = index;
+                    break;
+                }
+            }
+            const index = matched orelse return error.IgnoredLinkEscapesRole;
+            if (seen.isSet(index)) return error.IgnoredLinkEscapesRole;
+            seen.set(index);
+        }
+        if (seen.count() != self.count) return error.IgnoredLinkEscapesRole;
+        self.queries += 1;
+        self.count = 0;
+    }
+};
 
 fn inspectOutput(
     allocator: std.mem.Allocator,
@@ -255,6 +316,7 @@ fn inspectOutput(
     relative: []const u8,
     state: *Ignored,
     hash: *Sha256,
+    tracked_links: *TrackedLinks,
     allow_missing_roots: bool,
 ) !void {
     try limits.relative(relative, limits.ignored_path, limits.ignored_depth);
@@ -305,7 +367,7 @@ fn inspectOutput(
         for (names.items) |name| {
             const child = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ relative, name });
             defer allocator.free(child);
-            try inspectOutput(allocator, io, repo, git, role, child, state, hash, allow_missing_roots);
+            try inspectOutput(allocator, io, repo, git, role, child, state, hash, tracked_links, allow_missing_roots);
         }
     } else if (kind == std.os.linux.S.IFREG) {
         if (before.nlink != 1 or before.size > limits.ignored_file)
@@ -338,13 +400,7 @@ fn inspectOutput(
             const tracked = target[repo.len + 1 ..];
             try limits.relative(tracked, limits.ignored_path, limits.ignored_depth);
             _ = physical.readFile(io, target, limits.tracked_file, false) catch return error.IgnoredLinkEscapesRole;
-            const listed = gitOutput(allocator, io, repo, git, &.{
-                "ls-files", "--error-unmatch", "-z", "--", tracked,
-            }, limits.ignored_path + 1, null) catch return error.IgnoredLinkEscapesRole;
-            defer allocator.free(listed);
-            if (listed.len != tracked.len + 1 or
-                !std.mem.eql(u8, listed[0..tracked.len], tracked) or listed[tracked.len] != 0)
-                return error.IgnoredLinkEscapesRole;
+            try tracked_links.add(allocator, io, repo, git, tracked);
         }
         try physical.bind(allocator, hash, .{ "symlink", relative, physical.metadata(before), buffer[0..length] });
     } else return error.UnsafeIgnoredEntry;
@@ -379,9 +435,12 @@ fn ignoredState(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git:
     var hash = Sha256.init(.{});
     hash.update("uk.wamr.ignored-source-policy-v1\x00");
     var state: Ignored = .{ .entries = 0, .bytes = 0, .physical_sha256 = undefined, .inventory_sha256 = std.fmt.bytesToHex(inventory_hash, .lower) };
+    var tracked_links: TrackedLinks = .{};
     for (limits.roles) |role| {
-        try inspectOutput(allocator, io, repo, git, role, role, &state, &hash, allow_missing_roots);
+        try inspectOutput(allocator, io, repo, git, role, role, &state, &hash, &tracked_links, allow_missing_roots);
     }
+    try tracked_links.verify(allocator, io, repo, git);
+    state.tracked_queries = tracked_links.queries;
     state.physical_sha256 = physical.hex(&hash);
     return state;
 }
@@ -592,6 +651,9 @@ pub fn sealWamr(allocator: std.mem.Allocator, io: std.Io, checkout: []const u8, 
 }
 
 pub const Fixture = if (@import("builtin").is_test) struct {
+    pub fn ignoredQueries(allocator: std.mem.Allocator, io: std.Io, repository: []const u8, git: []const u8) !usize {
+        return (try ignoredState(allocator, io, repository, git, false)).tracked_queries;
+    }
     pub fn seal(allocator: std.mem.Allocator, io: std.Io, checkout: []const u8, runtime: []const u8, git: []const u8, revision: []const u8) !physical.File {
         return sealRevision(allocator, io, checkout, runtime, git, revision);
     }

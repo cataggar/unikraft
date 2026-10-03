@@ -444,6 +444,13 @@ at inspection/handoff. This detects accidental mutation and mutation that
 persists across an observation boundary; it is not continuous isolation from
 a hostile same-UID process between those checks.
 
+Ignored output links into tracked source retain their no-follow metadata and
+target-byte checks. Each ignored-output scan freshly proves Git index membership
+in bounded batches of at most 64 ordinary paths, rejecting missing, unexpected,
+duplicate or partially matched results. Names containing Git pathspec syntax
+retain the original single-path check and refusals. No membership proof is reused
+across scans or replaces a build, boot or handoff revalidation boundary.
+
 `build-start.json` now carries
 `uk.wamr.consumer-input-custody` version 2. It inventories each selected host
 tool and dynamic runtime object plus the bounded Zig, LLVM,
