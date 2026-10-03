@@ -3042,6 +3042,8 @@ test "trusted historical inner stage accepts complete records and refuses tamper
     _ = try fixtureSparseImage(a, io, root, stage_root_path, &members, "vhd", &footer);
     const identity = .{
         .wamr_revision = wamr_revision,
+        .compiler_profile = "unikraft-x86_64",
+        .zig_version = "0.16.0",
         .minimal_wasi = false,
         .files = .{
             .@"tiny.wasm" = members.object.get("artifacts/wasm").?.object.get("sha256").?.string,
@@ -3053,6 +3055,7 @@ test "trusted historical inner stage accepts complete records and refuses tamper
     const identity_raw = try fixtureCanonical(a, identity);
     _ = try fixtureMember(a, io, root, &members, "artifacts/runtime_identity", identity_raw);
     const image = .{
+        .unikraft_revision = source.revision,
         .files = .{
             .@"wamr_hyperv-x86_64-efi" = members.object.get("artifacts/efi").?.object.get("sha256").?.string,
             .@"wamr_hyperv-x86_64-efi.dbg" = members.object.get("artifacts/debug_elf").?.object.get("sha256").?.string,
@@ -3304,6 +3307,133 @@ test "trusted historical inner stage accepts complete records and refuses tamper
     });
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, cli_success.term);
     try std.testing.expectEqualStrings(handoff, cli_success.stdout);
+    const reader_name = try std.fmt.allocPrint(a, "{s}-reader-source", .{name});
+    const reader_repository = try std.fs.path.join(a, &.{ options.fixture_root, reader_name });
+    const cloned = try std.process.run(a, io, .{
+        .argv = &.{ options.git_executable, "-c", "gc.auto=0", "-c", "maintenance.auto=false", "clone", "-q", "--no-hardlinks", "--", options.repository_root, reader_repository },
+        .cwd = .{ .path = options.fixture_root },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, cloned.term);
+    defer parent.deleteTree(io, reader_name) catch @panic("legacy reader source cleanup failed");
+    const revalidated_name = try std.fmt.allocPrint(a, "{s}-native-revalidation", .{name});
+    const revalidated_path = try std.fs.path.join(a, &.{ options.fixture_root, revalidated_name });
+    defer parent.deleteTree(io, revalidated_name) catch @panic("legacy revalidation cleanup failed");
+    const revalidated = try std.process.run(a, io, .{
+        .argv = &.{
+            options.host_controller_cli, "import-handoff-revalidation",
+            "--stage-root",              stage_root_path,
+            "--git",                     options.git_executable,
+            "--supervisor",              options.host_controller_cli,
+            "--validator",               options.import_validator,
+            "--output",                  revalidated_path,
+        },
+        .cwd = .{ .path = reader_repository },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    if (revalidated.term != .exited or revalidated.term.exited != 0) {
+        std.debug.print("legacy native revalidation: {s}\n", .{revalidated.stderr});
+        if (parent.openDir(io, revalidated_name, .{})) |refused_output| {
+            defer refused_output.close(io);
+            const log = refused_output.readFileAlloc(io, "private/import-native-revalidation.log", a, .limited(4096)) catch "private log unavailable";
+            std.debug.print("legacy validator log: {s}\n", .{log});
+        } else |_| {}
+    }
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, revalidated.term);
+    try std.testing.expectEqualStrings("", revalidated.stdout);
+    try std.testing.expectEqualStrings("", revalidated.stderr);
+    const revalidated_output = try parent.openDir(io, revalidated_name, .{ .iterate = true });
+    defer revalidated_output.close(io);
+    try std.testing.expectEqualStrings(
+        "Compute handoff revalidated; authority=not_admitted.\n",
+        try revalidated_output.readFileAlloc(io, "private/import-native-revalidation.log", a, .limited(4096)),
+    );
+    const command = try revalidated_output.readFileAlloc(io, "evidence/command-import-native-revalidation.json", a, .limited(controller.records.max_record_bytes));
+    _ = try controller.accepted_run.validateCommandBinding(a, command, .@"import-native-revalidation", .trusted_inner_zip);
+    try accepted.revalidate();
+    try parent.deleteTree(io, revalidated_name);
+
+    for ([_][]const u8{ "supervisor", "validator" }) |substituted| {
+        const refused = try std.process.run(a, io, .{
+            .argv = &.{
+                options.host_controller_cli, "import-handoff-revalidation",
+                "--stage-root",              stage_root_path,
+                "--git",                     options.git_executable,
+                "--supervisor",              if (std.mem.eql(u8, substituted, "supervisor")) options.command_fixture else options.host_controller_cli,
+                "--validator",               if (std.mem.eql(u8, substituted, "validator")) options.command_fixture else options.import_validator,
+                "--output",                  revalidated_path,
+            },
+            .cwd = .{ .path = reader_repository },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, refused.term);
+        try std.testing.expectEqualStrings("", refused.stdout);
+        try std.testing.expect(std.mem.indexOf(u8, refused.stderr, if (std.mem.eql(u8, substituted, "supervisor")) "ImportSupervisorChanged" else "InvalidValidator") != null);
+        try std.testing.expectError(error.FileNotFound, parent.openDir(io, revalidated_name, .{}));
+        try accepted.revalidate();
+    }
+    const dirty_source_path = try std.fs.path.join(a, &.{ reader_repository, "support/build/wamr-native-ci/controller/import_validator_build.zig" });
+    {
+        const dirty_source = try std.Io.Dir.cwd().openFile(io, dirty_source_path, .{ .mode = .read_write, .follow_symlinks = false });
+        defer dirty_source.close(io);
+        try dirty_source.writePositionalAll(io, "\n", (try dirty_source.stat(io)).size);
+    }
+    const dirty_reader = try std.process.run(a, io, .{
+        .argv = &.{
+            options.host_controller_cli, "import-handoff-revalidation",
+            "--stage-root",              stage_root_path,
+            "--git",                     options.git_executable,
+            "--supervisor",              options.host_controller_cli,
+            "--validator",               options.import_validator,
+            "--output",                  revalidated_path,
+        },
+        .cwd = .{ .path = reader_repository },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, dirty_reader.term);
+    try std.testing.expectEqualStrings("", dirty_reader.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, dirty_reader.stderr, "DirtySource") != null);
+    try std.testing.expectError(error.FileNotFound, parent.openDir(io, revalidated_name, .{}));
+    try accepted.revalidate();
+    {
+        const mismatched_source = try std.Io.Dir.cwd().openFile(io, dirty_source_path, .{ .mode = .read_write, .follow_symlinks = false });
+        defer mismatched_source.close(io);
+        try mismatched_source.setLength(io, (try mismatched_source.stat(io)).size - 1);
+        try mismatched_source.writePositionalAll(io, "X", 3);
+    }
+    const committed = try std.process.run(a, io, .{
+        .argv = &.{
+            options.git_executable, "-c",                              "gc.auto=0",                       "-c",                                 "maintenance.auto=false",
+            "-c",                   "user.name=Native reader fixture", "-c",                              "user.email=fixture@example.invalid", "commit",
+            "-aq",                  "-m",                              "fixture: changed source closure",
+        },
+        .cwd = .{ .path = reader_repository },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, committed.term);
+    const mismatched_reader = try std.process.run(a, io, .{
+        .argv = &.{
+            options.host_controller_cli, "import-handoff-revalidation",
+            "--stage-root",              stage_root_path,
+            "--git",                     options.git_executable,
+            "--supervisor",              options.host_controller_cli,
+            "--validator",               options.import_validator,
+            "--output",                  revalidated_path,
+        },
+        .cwd = .{ .path = reader_repository },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, mismatched_reader.term);
+    try std.testing.expectEqualStrings("", mismatched_reader.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, mismatched_reader.stderr, "SourceChanged") != null);
+    try std.testing.expectError(error.FileNotFound, parent.openDir(io, revalidated_name, .{}));
+    try accepted.revalidate();
     try root.createDir(io, "boots/unexpected", .fromMode(0o700));
     try std.testing.expectError(error.InvalidImportedBundle, accepted.revalidate());
     try root.deleteDir(io, "boots/unexpected");
