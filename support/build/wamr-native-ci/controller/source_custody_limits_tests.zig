@@ -328,6 +328,26 @@ test "ignored tracked link batches deduplicate targets and preserve pathspec ref
     try refuseSource(repo, error.IgnoredLinkEscapesRole);
 }
 
+test "queued tracked-link membership retains the named descriptor through Git verification" {
+    var fixture = try Fixture.init("pending-tracked-link");
+    defer fixture.deinit();
+    var repo = try Repo.withOutputs(&fixture, "pending", output_ignore);
+    defer repo.deinit();
+    const tracked = "support/apps/wamr-aot/defconfig";
+    const target = try std.fs.path.join(a, &.{ repo.path, tracked });
+    defer a.free(target);
+    const link = "support/apps/wamr-aot/build/pending";
+    try repo.dir.symLink(io, target, link, .{});
+    try std.testing.expectError(error.IgnoredChanged, source.Fixture.verifyReplacedIgnoredLink(
+        a,
+        io,
+        repo.path,
+        fixture.git,
+        link,
+        tracked,
+    ));
+}
+
 fn boundaryPath(parts: usize, size: usize) ![]u8 {
     var components = try a.alloc([]u8, parts);
     defer a.free(components);

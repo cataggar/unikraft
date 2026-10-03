@@ -253,36 +253,70 @@ const Ignored = struct {
 };
 
 const TrackedLinks = struct {
+    const Proof = struct {
+        parent: std.Io.Dir,
+        named: std.Io.File,
+        snapshot: files.Snapshot,
+        name: []const u8,
+    };
+
     buffer: [64][limits.ignored_path]u8 = undefined,
+    names: [64][limits.ignored_path]u8 = undefined,
     paths: [64][]const u8 = undefined,
+    proofs: [64]Proof = undefined,
     count: usize = 0,
     queries: usize = 0,
 
-    fn add(self: *TrackedLinks, allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: []const u8, path: []const u8) !void {
-        const pathspec = path[0] == ':' or std.mem.indexOfAny(u8, path, "*?[]\\") != null;
-        if (pathspec)
+    fn deinit(self: *TrackedLinks, io: std.Io) void {
+        for (self.proofs[0..self.count]) |proof| {
+            proof.named.close(io);
+            proof.parent.close(io);
+        }
+        self.count = 0;
+    }
+
+    fn pathspec(path: []const u8) bool {
+        return path[0] == ':' or std.mem.indexOfAny(u8, path, "*?[]\\") != null;
+    }
+
+    fn add(self: *TrackedLinks, allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: []const u8, path: []const u8, parent: std.Io.Dir, named: std.Io.File, before: files.Snapshot, name: []const u8) !void {
+        if (pathspec(path))
             try self.verify(allocator, io, repo, git);
-        for (self.paths[0..self.count]) |prior|
-            if (std.mem.eql(u8, prior, path)) return;
         if (self.count == self.paths.len)
             try self.verify(allocator, io, repo, git);
         const stored = self.buffer[self.count][0..path.len];
         @memcpy(stored, path);
         self.paths[self.count] = stored;
+        const stored_name = self.names[self.count][0..name.len];
+        @memcpy(stored_name, name);
+        self.proofs[self.count] = .{ .parent = parent, .named = named, .snapshot = before, .name = stored_name };
         self.count += 1;
-        if (pathspec)
-            try self.verify(allocator, io, repo, git);
     }
 
     fn verify(self: *TrackedLinks, allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: []const u8) !void {
         if (self.count == 0) return;
+        var selected: [64][]const u8 = undefined;
+        var selected_count: usize = 0;
+        for (self.paths[0..self.count]) |path| {
+            var duplicate = false;
+            for (selected[0..selected_count]) |prior| {
+                if (std.mem.eql(u8, path, prior)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                selected[selected_count] = path;
+                selected_count += 1;
+            }
+        }
         const prefix = [_][]const u8{ "ls-files", "--error-unmatch", "-z", "--" };
         var args: [prefix.len + 64][]const u8 = undefined;
         @memcpy(args[0..prefix.len], &prefix);
-        @memcpy(args[prefix.len..][0..self.count], self.paths[0..self.count]);
+        @memcpy(args[prefix.len..][0..selected_count], selected[0..selected_count]);
         var expected_bytes: usize = 0;
-        for (self.paths[0..self.count]) |path| expected_bytes += path.len + 1;
-        const listed = gitOutput(allocator, io, repo, git, args[0 .. prefix.len + self.count], expected_bytes, null) catch
+        for (selected[0..selected_count]) |path| expected_bytes += path.len + 1;
+        const listed = gitOutput(allocator, io, repo, git, args[0 .. prefix.len + selected_count], expected_bytes, null) catch
             return error.IgnoredLinkEscapesRole;
         defer allocator.free(listed);
         if (listed.len != expected_bytes or listed[listed.len - 1] != 0)
@@ -291,7 +325,7 @@ const TrackedLinks = struct {
         var entries = std.mem.splitScalar(u8, listed[0 .. listed.len - 1], 0);
         while (entries.next()) |entry| {
             var matched: ?usize = null;
-            for (self.paths[0..self.count], 0..) |path, index| {
+            for (selected[0..selected_count], 0..) |path, index| {
                 if (std.mem.eql(u8, entry, path)) {
                     matched = index;
                     break;
@@ -301,9 +335,16 @@ const TrackedLinks = struct {
             if (seen.isSet(index)) return error.IgnoredLinkEscapesRole;
             seen.set(index);
         }
-        if (seen.count() != self.count) return error.IgnoredLinkEscapesRole;
+        if (seen.count() != selected_count) return error.IgnoredLinkEscapesRole;
+        for (self.proofs[0..self.count]) |proof| {
+            const reopened = try proof.parent.openFile(io, proof.name, .{ .path_only = true, .follow_symlinks = false });
+            defer reopened.close(io);
+            if (!files.sameSnapshot(proof.snapshot, try files.snapshot(proof.named)) or
+                !files.sameSnapshot(proof.snapshot, try files.snapshot(reopened)))
+                return error.IgnoredChanged;
+        }
         self.queries += 1;
-        self.count = 0;
+        self.deinit(io);
     }
 };
 
@@ -325,7 +366,8 @@ fn inspectOutput(
     defer allocator.free(path);
     const parent_path = std.fs.path.dirname(path).?;
     const parent = try files.openDirectory(io, parent_path, .artifact);
-    defer parent.close(io);
+    var transferred = false;
+    defer if (!transferred) parent.close(io);
     const named = parent.openFile(io, std.fs.path.basename(path), .{ .path_only = true, .follow_symlinks = false }) catch |err| {
         if (allow_missing_roots and err == error.FileNotFound and std.mem.eql(u8, relative, role)) {
             try physical.bind(allocator, hash, .{ "absent", relative });
@@ -333,7 +375,7 @@ fn inspectOutput(
         }
         return err;
     };
-    defer named.close(io);
+    defer if (!transferred) named.close(io);
     const before = try files.snapshot(named);
     if (before.uid != std.os.linux.geteuid()) return error.UnsafeIgnoredEntry;
     const kind = before.mode & std.os.linux.S.IFMT;
@@ -369,6 +411,7 @@ fn inspectOutput(
             defer allocator.free(child);
             try inspectOutput(allocator, io, repo, git, role, child, state, hash, tracked_links, allow_missing_roots);
         }
+        try tracked_links.verify(allocator, io, repo, git);
     } else if (kind == std.os.linux.S.IFREG) {
         if (before.nlink != 1 or before.size > limits.ignored_file)
             return error.UnsafeIgnoredEntry;
@@ -400,15 +443,20 @@ fn inspectOutput(
             const tracked = target[repo.len + 1 ..];
             try limits.relative(tracked, limits.ignored_path, limits.ignored_depth);
             _ = physical.readFile(io, target, limits.tracked_file, false) catch return error.IgnoredLinkEscapesRole;
-            try tracked_links.add(allocator, io, repo, git, tracked);
+            try tracked_links.add(allocator, io, repo, git, tracked, parent, named, before, std.fs.path.basename(path));
+            transferred = true;
+            if (TrackedLinks.pathspec(tracked))
+                try tracked_links.verify(allocator, io, repo, git);
         }
         try physical.bind(allocator, hash, .{ "symlink", relative, physical.metadata(before), buffer[0..length] });
     } else return error.UnsafeIgnoredEntry;
-    const reopened = try parent.openFile(io, std.fs.path.basename(path), .{ .path_only = true, .follow_symlinks = false });
-    defer reopened.close(io);
-    if (!files.sameSnapshot(before, try files.snapshot(named)) or
-        !files.sameSnapshot(before, try files.snapshot(reopened)))
-        return error.IgnoredChanged;
+    if (!transferred) {
+        const reopened = try parent.openFile(io, std.fs.path.basename(path), .{ .path_only = true, .follow_symlinks = false });
+        defer reopened.close(io);
+        if (!files.sameSnapshot(before, try files.snapshot(named)) or
+            !files.sameSnapshot(before, try files.snapshot(reopened)))
+            return error.IgnoredChanged;
+    }
 }
 
 fn ignoredState(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: []const u8, allow_missing_roots: bool) !Ignored {
@@ -436,6 +484,7 @@ fn ignoredState(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git:
     hash.update("uk.wamr.ignored-source-policy-v1\x00");
     var state: Ignored = .{ .entries = 0, .bytes = 0, .physical_sha256 = undefined, .inventory_sha256 = std.fmt.bytesToHex(inventory_hash, .lower) };
     var tracked_links: TrackedLinks = .{};
+    defer tracked_links.deinit(io);
     for (limits.roles) |role| {
         try inspectOutput(allocator, io, repo, git, role, role, &state, &hash, &tracked_links, allow_missing_roots);
     }
@@ -653,6 +702,25 @@ pub fn sealWamr(allocator: std.mem.Allocator, io: std.Io, checkout: []const u8, 
 pub const Fixture = if (@import("builtin").is_test) struct {
     pub fn ignoredQueries(allocator: std.mem.Allocator, io: std.Io, repository: []const u8, git: []const u8) !usize {
         return (try ignoredState(allocator, io, repository, git, false)).tracked_queries;
+    }
+    pub fn verifyReplacedIgnoredLink(allocator: std.mem.Allocator, io: std.Io, repository: []const u8, git: []const u8, link: []const u8, tracked: []const u8) !void {
+        const path = try std.fs.path.join(allocator, &.{ repository, link });
+        defer allocator.free(path);
+        const target = try std.fs.path.join(allocator, &.{ repository, tracked });
+        defer allocator.free(target);
+        const parent = try files.openDirectory(io, std.fs.path.dirname(path).?, .artifact);
+        var transferred = false;
+        defer if (!transferred) parent.close(io);
+        const name = std.fs.path.basename(path);
+        const named = try parent.openFile(io, name, .{ .path_only = true, .follow_symlinks = false });
+        defer if (!transferred) named.close(io);
+        var pending: TrackedLinks = .{};
+        defer pending.deinit(io);
+        try pending.add(allocator, io, repository, git, tracked, parent, named, try files.snapshot(named), name);
+        transferred = true;
+        try parent.deleteFile(io, name);
+        try parent.symLink(io, target, name, .{});
+        try pending.verify(allocator, io, repository, git);
     }
     pub fn seal(allocator: std.mem.Allocator, io: std.Io, checkout: []const u8, runtime: []const u8, git: []const u8, revision: []const u8) !physical.File {
         return sealRevision(allocator, io, checkout, runtime, git, revision);
