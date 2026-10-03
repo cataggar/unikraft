@@ -42,6 +42,36 @@ pub const PortableTools = struct {
         local: LocalTools,
         signal: ?*core.process.SignalCancellation,
     ) !PortableTools {
+        return bindWithPolicy(allocator, io, context, identity, start, repository, controller_path, local, signal, false);
+    }
+
+    fn bindLegacy(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        accepted: *accepted_run.AcceptedRun,
+        start: std.json.Value,
+        repository: []const u8,
+        controller_path: []const u8,
+        local: LocalTools,
+        signal: ?*core.process.SignalCancellation,
+    ) !PortableTools {
+        if (accepted.compatibility != .tiny_v1_legacy)
+            return error.InvalidContext;
+        return bindWithPolicy(allocator, io, accepted.context, accepted.source, start, repository, controller_path, local, signal, true);
+    }
+
+    fn bindWithPolicy(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        context: accepted_run.EvidenceContext,
+        identity: accepted_run.SourceIdentity,
+        start: std.json.Value,
+        repository: []const u8,
+        controller_path: []const u8,
+        local: LocalTools,
+        signal: ?*core.process.SignalCancellation,
+        legacy: bool,
+    ) !PortableTools {
         if (context != .trusted_inner_zip) return error.InvalidContext;
         if (signal) |active|
             if (active.flag().load(.acquire)) return error.Cancelled;
@@ -67,14 +97,25 @@ pub const PortableTools = struct {
         try native.verify(io);
         try validator.verify(io);
         for (runtime.items) |*entry| try entry.file.verify(io);
-        const source_map = try get(try get(start, "command_supervisor"), "source_map");
-        const source_records = try get(source_map, "records");
-        if (source_records != .object or source_records.object.count() != source.closure.len)
-            return error.UnsupportedSupervisorSource;
-        const source_sha = try supervisor_identity.verifyGitSource(allocator, io, identity, repository, local.git, source_map, signal);
-        const native_source_sha = try supervisor_identity.nativeSourceContentClosure(allocator);
-        if (!std.mem.eql(u8, source_sha, &native_source_sha)) return error.ImportSourceChanged;
-        var supervisor = try supervisor_identity.verifyRuntime(allocator, io, local.supervisor, start, signal);
+        var supervisor = if (legacy) blk: {
+            // Historical v1 predates recorded supervisor custody. Its reader
+            // uses the current native owner, never an unauthenticated old tool.
+            var retained = try files.RetainedFile.open(io, local.supervisor, .tool);
+            errdefer retained.close(io);
+            break :blk supervisor_identity.PinnedRuntime{
+                .supervisor = retained,
+                .loaders = try allocator.alloc(files.RetainedFile, 0),
+            };
+        } else blk: {
+            const source_map = try get(try get(start, "command_supervisor"), "source_map");
+            const source_records = try get(source_map, "records");
+            if (source_records != .object or source_records.object.count() != source.closure.len)
+                return error.UnsupportedSupervisorSource;
+            const source_sha = try supervisor_identity.verifyGitSource(allocator, io, identity, repository, local.git, source_map, signal);
+            const native_source_sha = try supervisor_identity.nativeSourceContentClosure(allocator);
+            if (!std.mem.eql(u8, source_sha, &native_source_sha)) return error.ImportSourceChanged;
+            break :blk try supervisor_identity.verifyRuntime(allocator, io, local.supervisor, start, signal);
+        };
         errdefer supervisor.deinit(allocator, io);
         const owner = try physical.readFile(io, controller_path, 64 * limits.mib, false);
         const supplied = try physical.readFile(io, local.supervisor, 64 * limits.mib, false);
@@ -84,11 +125,11 @@ pub const PortableTools = struct {
 
         try git.verify(io);
         const before = try source.portableSource(allocator, io, repository, local.git);
-        if (!std.mem.eql(u8, before.revision, identity.revision) or
-            !std.mem.eql(u8, before.tree, identity.tree) or
-            !std.mem.eql(u8, before.custody.object_format, "sha1"))
+        if (!std.mem.eql(u8, before.custody.object_format, "sha1") or
+            (!legacy and (!std.mem.eql(u8, before.revision, identity.revision) or
+                !std.mem.eql(u8, before.tree, identity.tree))))
             return error.ImportSourceChanged;
-        try checkoutSource(before, start);
+        if (!legacy) try checkoutSource(before, start);
         try source.verifyPhysical(io, allocator, repository);
         var result = PortableTools{
             .allocator = allocator,
@@ -178,8 +219,7 @@ pub fn runPortable(
     local: LocalTools,
     signal: ?*core.process.SignalCancellation,
 ) !void {
-    if (accepted.context != .trusted_inner_zip or
-        accepted.compatibility != .tiny_v2_qcow2_derived_vhd)
+    if (accepted.context != .trusted_inner_zip)
         return error.InvalidContext;
     try files.absoluteFilePath(output);
     if (contained(output, accepted.root) or contained(output, repository) or
@@ -199,7 +239,10 @@ pub fn runPortable(
     defer document.deinit();
     try document.requireCanonical(allocator, raw.bytes());
     const owner_path = try std.process.executablePathAlloc(io, allocator);
-    var authenticated = try PortableTools.bind(allocator, io, accepted.context, accepted.source, document.value(), repository, owner_path, local, signal);
+    var authenticated = if (accepted.compatibility == .tiny_v1_legacy)
+        try PortableTools.bindLegacy(allocator, io, accepted, document.value(), repository, owner_path, local, signal)
+    else
+        try PortableTools.bind(allocator, io, accepted.context, accepted.source, document.value(), repository, owner_path, local, signal);
     defer authenticated.deinit(io);
     const candidate = try handoffCandidate(allocator, io, accepted);
     const parent_path = std.fs.path.dirname(output) orelse return error.UnsafePath;
@@ -411,14 +454,15 @@ fn handoffCandidate(
     const artifacts = try get(bundle, "artifacts");
     const boots = try get(bundle, "boots");
     const evidence = try get(bundle, "evidence");
-    const mode_count = profile.modes(.tiny_v2_qcow2_derived_vhd).len;
+    const modes = profile.modes(accepted.compatibility);
+    const mode_count = modes.len;
     if (accepted.artifacts.len < mode_count * 4 or
         artifacts != .array or artifacts.array.items.len != accepted.artifacts.len - mode_count * 4 or
-        boots != .array or boots.array.items.len != profile.modes(.tiny_v2_qcow2_derived_vhd).len or
+        boots != .array or boots.array.items.len != modes.len or
         evidence != .array or evidence.array.items.len != accepted.records.len)
         return error.InvalidImportedBundle;
     for (artifacts.array.items) |*item| try rebase(allocator, root, item, "artifacts/");
-    for (profile.modes(.tiny_v2_qcow2_derived_vhd), boots.array.items) |mode, *boot| {
+    for (modes, boots.array.items) |mode, *boot| {
         if (boot.* != .object or
             !std.mem.eql(u8, try contracts.string(try get(boot.*, "mode")), @tagName(mode)))
             return error.InvalidImportedBundle;

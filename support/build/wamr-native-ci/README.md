@@ -237,6 +237,20 @@ after supervised validation. A fresh portable checkout need not contain the
 producer's generated output roots; present ignored outputs still use the
 existing closed role allowlist and bounds. Source/tool substitution or mutation refuses;
 the same-runner option cannot weaken these checks or select Python fallback.
+
+The explicit `import-handoff-revalidation` operation also accepts an already
+validated historical v1 inner stage. Its four-mode member rebasing uses the
+same typed `AcceptedRun` and unchanged historical source/tree exceptions.
+Because those records predate supervisor custody, this read-only path requires
+the supplied supervisor to match the current native owner and the supplied
+validator to match its build-derived validator digest. The current reader
+checkout must be clean, match the owner's embedded tracked source closure,
+and remain unchanged throughout bounded native supervision. It is not required
+to masquerade as the historical producer checkout. No v1 build, boot,
+validator-build, profile admission, or Python fallback is enabled.
+The Python-owned archive/operator plumbing remains until its separate wiring
+cutover; merely adding this operation does not retire the Python controller.
+
 `local-consumer-custody --runtime ABS --expected-build-start-sha256 HEX
 --expected-boot-inputs-sha256 HEX` is the production owner for a completed
 v2 runtime's local checkout/source and build/boot consumer-input
@@ -305,7 +319,10 @@ Native boot reopens `build-start.json` and `build.json` with the 4-MiB
 evidence-record limit, not the 256-MiB tracked-source-file bound; physical
 custody of larger executables remains independently bounded.
 `test-controller` exercises native custody, build-command failures, production
-boundaries, tamper/refusal, and `run.py` differential record fixtures. The
+boundaries, tamper/refusal, and `run.py` differential record fixtures. Its
+historical v1 inner-stage fixture exercises real native portable revalidation
+and refuses substituted supervisors/validators, dirty readers, and clean
+readers with mismatched embedded source before reserving output. The
 installed fixture stage itself supervises bounded native success, nonzero,
 partial-output, signal, overflow, timeout, and cancellation children; its
 create-only private report binds the observed output hashes and cleanup states,
