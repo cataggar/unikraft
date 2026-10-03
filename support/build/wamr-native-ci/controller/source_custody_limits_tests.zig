@@ -272,6 +272,82 @@ fn addIgnored(repo: Repo, path: []const u8) !void {
     try write(repo.dir, path, "");
 }
 
+test "ignored tracked links use bounded fresh Git batches and reject partial membership" {
+    var fixture = try Fixture.init("tracked-link-batches");
+    defer fixture.deinit();
+    var repo = try Repo.withOutputs(&fixture, "links", output_ignore);
+    defer repo.deinit();
+    try std.testing.expectEqual(@as(usize, 0), try source.Fixture.ignoredQueries(a, io, repo.path, fixture.git));
+    for (0..129) |index| {
+        const name = try std.fmt.allocPrint(a, "tracked-{d:0>3}", .{index});
+        defer a.free(name);
+        try write(repo.dir, name, "tracked\n");
+        const target = try std.fs.path.join(a, &.{ repo.path, name });
+        defer a.free(target);
+        const link = try std.fmt.allocPrint(a, "support/apps/wamr-aot/build/link-{d:0>3}", .{index});
+        defer a.free(link);
+        try repo.dir.symLink(io, target, link, .{});
+    }
+    try repo.git(&.{ "add", "." });
+    try repo.commit();
+    try std.testing.expectEqual(@as(usize, 3), try source.Fixture.ignoredQueries(a, io, repo.path, fixture.git));
+    try checkSource(repo, 131, output_ignore.len + "CONFIG_FIXTURE=y\n".len + 129 * "tracked\n".len);
+    try write(repo.dir, "untracked", "not in the index\n");
+    const untracked = try std.fs.path.join(a, &.{ repo.path, "untracked" });
+    defer a.free(untracked);
+    try repo.dir.symLink(io, untracked, "support/apps/wamr-aot/build/zzz-untracked", .{});
+    try std.testing.expectError(error.IgnoredLinkEscapesRole, source.Fixture.ignoredQueries(a, io, repo.path, fixture.git));
+    try refuseSource(repo, error.IgnoredLinkEscapesRole);
+}
+
+test "ignored tracked link batches deduplicate targets and preserve pathspec refusals" {
+    var fixture = try Fixture.init("literal-tracked-links");
+    defer fixture.deinit();
+    var repo = try Repo.withOutputs(&fixture, "literal", output_ignore);
+    defer repo.deinit();
+    try write(repo.dir, "ordinary.h", "ordinary\n");
+    try repo.git(&.{ "add", "." });
+    try repo.commit();
+    const target = try std.fs.path.join(a, &.{ repo.path, "ordinary.h" });
+    defer a.free(target);
+    for ([_][]const u8{ "a", "b" }) |name| {
+        const link = try std.fs.path.join(a, &.{ "support/apps/wamr-aot/build", name });
+        defer a.free(link);
+        try repo.dir.symLink(io, target, link, .{});
+    }
+    try std.testing.expectEqual(@as(usize, 1), try source.Fixture.ignoredQueries(a, io, repo.path, fixture.git));
+    try checkSource(repo, 3, output_ignore.len + "CONFIG_FIXTURE=y\n".len + "ordinary\n".len);
+    try write(repo.dir, "literal[0].h", "literal\n");
+    try write(repo.dir, "literal0.h", "different\n");
+    try repo.git(&.{ "add", "." });
+    try repo.commit();
+    const pattern = try std.fs.path.join(a, &.{ repo.path, "literal[0].h" });
+    defer a.free(pattern);
+    try repo.dir.symLink(io, pattern, "support/apps/wamr-aot/build/c", .{});
+    try std.testing.expectError(error.IgnoredLinkEscapesRole, source.Fixture.ignoredQueries(a, io, repo.path, fixture.git));
+    try refuseSource(repo, error.IgnoredLinkEscapesRole);
+}
+
+test "queued tracked-link membership retains the named descriptor through Git verification" {
+    var fixture = try Fixture.init("pending-tracked-link");
+    defer fixture.deinit();
+    var repo = try Repo.withOutputs(&fixture, "pending", output_ignore);
+    defer repo.deinit();
+    const tracked = "support/apps/wamr-aot/defconfig";
+    const target = try std.fs.path.join(a, &.{ repo.path, tracked });
+    defer a.free(target);
+    const link = "support/apps/wamr-aot/build/pending";
+    try repo.dir.symLink(io, target, link, .{});
+    try std.testing.expectError(error.IgnoredChanged, source.Fixture.verifyReplacedIgnoredLink(
+        a,
+        io,
+        repo.path,
+        fixture.git,
+        link,
+        tracked,
+    ));
+}
+
 fn boundaryPath(parts: usize, size: usize) ![]u8 {
     var components = try a.alloc([]u8, parts);
     defer a.free(components);
