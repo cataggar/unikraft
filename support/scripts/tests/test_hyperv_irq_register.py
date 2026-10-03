@@ -7,6 +7,7 @@ import unittest
 from unittest import mock
 
 TESTS = Path(__file__).resolve().parents[2] / "build/tests"
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(TESTS))
 irq = importlib.import_module("hyperv-irq-register-test")
 smp = importlib.import_module("hyperv-smp-link-test")
