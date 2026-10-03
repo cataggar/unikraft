@@ -2598,7 +2598,9 @@ fn legacyHandoffInspectLiveFixture() !void {
     try std.testing.expectEqual(controller.profile.CompatibleRecordSet.tiny_v1_legacy, accepted.compatibility);
     try expectInvalidHandoffRun(a, io, &accepted, try std.fs.path.join(a, &.{ output_parent, "wrong-v1-output" }), false);
     const output = try std.fs.path.join(a, &.{ output_parent, "legacy-output" });
-    const checked = try controller.handoff_inspect.run(a, io, &accepted, output, true, null);
+    var inspection = try controller.handoff_inspect.runRetained(a, io, &accepted, output, true, null);
+    defer inspection.deinit(io);
+    const checked = inspection.command;
     try std.testing.expectEqual(controller.command_plan.Stage.@"handoff-inspect-legacy", checked.stage);
     try std.testing.expectEqual(@as(u64, package_json.len), checked.output_bytes);
     const record_path = try std.fs.path.join(a, &.{ output, "evidence/command-handoff-inspect-legacy.json" });
@@ -2618,6 +2620,17 @@ fn legacyHandoffInspectLiveFixture() !void {
     wrong.compatibility = .tiny_v2_qcow2_derived_vhd;
     try expectInvalidHandoffRun(a, io, &wrong, try std.fs.path.join(a, &.{ output_parent, "wrong-v2-output" }), true);
     try expectInvalidLocalPostRun(&wrong, raw, .@"handoff-inspect-legacy");
+    const record_parent = try core.private_files.FileParent.open(io, record_path, .private);
+    defer record_parent.close(io);
+    try record_parent.directory.rename(record_parent.name, record_parent.directory, "original-inspection", io);
+    const replacement = try record_parent.directory.createFile(io, record_parent.name, .{
+        .exclusive = true,
+        .permissions = .fromMode(0o600),
+    });
+    defer replacement.close(io);
+    try replacement.writePositionalAll(io, raw, 0);
+    try replacement.sync(io);
+    if (inspection.record.verify(io)) |_| return error.ReplacedInspectionAccepted else |_| {}
 }
 
 fn fixture(allocator: std.mem.Allocator, v2: bool, commands: bool) ![]u8 {

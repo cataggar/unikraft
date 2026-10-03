@@ -7,6 +7,7 @@ Regenerate intentionally with:
 """
 import contextlib, copy, hashlib, importlib.util, io, json, os, shutil, stat, sys, tempfile, unittest, zipfile
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[4]
 WAMR_CI = ROOT / "support/build/wamr-native-ci"
@@ -23,6 +24,7 @@ PACK_V2_PUBLIC_SOURCE = WAMR_CI / "handoff/goldens/zip-pack-v2-public-source.jso
 PACK_HASHES = WAMR_CI / "handoff/goldens/zip-pack-hashes.json"
 ROOT_BOUND_V1 = WAMR_CI / "handoff/goldens/root-bound-v1.json"
 ROOT_BOUND_V2 = WAMR_CI / "handoff/goldens/root-bound-v2.json"
+EXPORT_BUNDLE_V2 = WAMR_CI / "handoff/goldens/export-bundle-v2.json"
 ROOT_BOUND_STAGE = "/opt/wamr-handoff-golden-stage"
 SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 REV = "0123456789012345678901234567890123456789"
@@ -41,7 +43,8 @@ def artifact(path, size=1):
 
 
 def scratch_parent():
-    path = ROOT / ".zig-cache/handoff-python-goldens"
+    root = os.environ.get("WAMR_HANDOFF_GOLDEN_ROOT") or os.environ.get("ZIG_LOCAL_CACHE_DIR")
+    path = (Path(root) if root else ROOT / ".zig-cache") / "handoff-python-goldens"
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(path, 0o700)
     return path
@@ -312,6 +315,153 @@ def root_bound_bundle(handoff, public_bundle, version):
     return public_bundle.encoded(normalized)
 
 
+def export_bundle_v2(handoff, public_bundle):
+    with private_tempdir("handoff-export-bundle-") as root:
+        stage = root / "stage"
+        stage.mkdir(mode=0o700)
+        bundle = materialize_bundle(handoff, public_bundle, stage, 2)
+        by_name = dict(zip(handoff.V2_NAMES, bundle["artifacts"]))
+        bundle["identity"] = {
+            "wamr_revision": handoff.ci.REVISION,
+            **{name + "_sha256": by_name[name]["sha256"]
+               for name in ("wasm", "cwasm", "runtime", "compiler", "config")},
+        }
+        actual = stage.as_posix()
+
+    def normalize(value):
+        if isinstance(value, dict):
+            return {
+                key: (ROOT_BOUND_STAGE + raw[len(actual):]
+                      if key == "path" and isinstance(raw := item, str)
+                      and raw.startswith(actual + "/") else normalize(item))
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [normalize(item) for item in value]
+        return value
+
+    normalized = normalize(bundle)
+    public_bundle.members(handoff, normalized, Path(ROOT_BOUND_STAGE))
+    return public_bundle.encoded(normalized)
+
+
+def check_export_parity(root):
+    """Compare actual export(), not a handwritten export-shaped document.
+
+    The complete typed fixture is synthetic/nonbootable. Only the expensive
+    controller acceptance and supervised process boundaries are substituted;
+    Python's selector, filesystem copy/hash, recheck, manifest and publisher run.
+    """
+    root = Path(root).resolve(strict=True)
+    handoff, public_bundle = load("handoff"), load("public_bundle")
+    runtime = root / "source/runtime"
+    compute = runtime / "compute"
+    native_output, output = root / "handoff", root / "python-handoff"
+    accepted = handoff.ci.document(root / "controller-records.json")
+    start = handoff.ci.document(compute / "evidence/build-start.json")
+    build = handoff.ci.document(compute / "evidence/build.json")
+    packaged = handoff.ci.document(compute / "evidence/package.json")
+    boot_proofs = [
+        handoff.ci.document(compute / "evidence" / (mode + "-compute.json"))
+        for mode in handoff.ci.SIX_MODES
+    ]
+    boots = iter(boot_proofs)
+
+    def inspect(unused_runtime, destination, *, legacy=False):
+        assert unused_runtime == runtime and not legacy
+        destination.mkdir(mode=0o700)
+        (destination / "private").mkdir(mode=0o700)
+        (destination / "evidence").mkdir(mode=0o700)
+        inspected = destination / "private/inspection.json"
+        handoff.ci.save(inspected, packaged)
+        return inspected, {}
+
+    with mock.patch.object(handoff.ci, "APP", root / "source/repository/support/apps/wamr-aot"), \
+            mock.patch.object(handoff.accepted_records, "local_runtime", return_value=accepted), \
+            mock.patch.object(handoff.accepted_records, "handoff_inspect", side_effect=inspect), \
+            mock.patch.object(handoff.ci, "bind_command_tools", return_value={}), \
+            mock.patch.object(handoff.ci, "producer_inputs", return_value=start), \
+            mock.patch.object(handoff.ci, "check_build", return_value=build), \
+            mock.patch.object(handoff.ci, "boot_input_state"), \
+            mock.patch.object(handoff.ci, "check_boot", side_effect=lambda *a, **kw: next(boots)), \
+            mock.patch.object(handoff.ci, "require_build_custody"), \
+            mock.patch.dict(os.environ, {
+                "GITHUB_REPOSITORY": "cataggar/unikraft",
+                "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1",
+            }):
+        phases = []
+        exported = handoff.export(runtime, output, on_phase=phases.append)
+        testcase = unittest.TestCase()
+        saved_bundle = (output / "bundle.json").read_bytes()
+        boots = iter(boot_proofs)
+        with testcase.assertRaises(FileExistsError):
+            handoff.export(runtime, output)
+        assert (output / "bundle.json").read_bytes() == saved_bundle
+
+        boots = iter(boot_proofs)
+        io_output = root / "python-io-failure"
+        with mock.patch.object(handoff.shutil, "copyfileobj", side_effect=OSError("injected copy failure")), \
+                testcase.assertRaises(OSError):
+            handoff.export(runtime, io_output)
+        assert (io_output / "private/inspection.json").is_file()
+        assert not (io_output / "bundle.json").exists()
+
+        changed = compute / "evidence/build-start.json"
+        original = changed.read_bytes()
+        changed_output = root / "python-source-changed"
+
+        def change_source(phase):
+            if phase == "recheck":
+                mutation = json.loads(original)
+                mutation["consumer_inputs"]["files"]["command-supervisor"]["path"] += "-changed"
+                changed.write_bytes(public_bundle.encoded(mutation))
+
+        boots = iter(boot_proofs)
+        try:
+            with testcase.assertRaises(ValueError):
+                handoff.export(runtime, changed_output, on_phase=change_source)
+        finally:
+            changed.write_bytes(original)
+        assert (changed_output / "artifacts/local_result").is_file()
+        assert not (changed_output / "bundle.json").exists()
+    assert phases == [
+        "records", "inspect", "copy", "recheck", "publish",
+    ], phases
+    native = handoff.ci.document(native_output / "bundle.json")
+    selected = public_bundle.members(handoff, native, native_output)
+    python_selected = public_bundle.members(handoff, exported, output)
+    assert selected.keys() == python_selected.keys()
+    assert len(selected) + 2 == public_bundle.V2_ZIP_MEMBERS
+    for name in selected:
+        assert (native_output / name).read_bytes() == (output / name).read_bytes(), name
+        assert stat.S_IMODE((native_output / name).stat().st_mode) == 0o600, name
+    assert stat.S_IMODE(native_output.stat().st_mode) == 0o700
+
+    def rebase(value):
+        if isinstance(value, dict):
+            return {
+                key: (str(native_output) + item[len(str(output)):]
+                      if key == "path" and isinstance(item, str)
+                      and item.startswith(str(output) + "/") else rebase(item))
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [rebase(item) for item in value]
+        return value
+
+    assert (output / "bundle.json").read_bytes() == public_bundle.encoded(exported)
+    assert (native_output / "bundle.json").read_bytes() == public_bundle.encoded(rebase(exported))
+    by_name = dict(zip(handoff.V2_NAMES, native["artifacts"], strict=True))
+    assert by_name["local_result"]["sha256"] == accepted["result"]["sha256"]
+    assert hashlib.sha256((output / "artifacts/local_result").read_bytes()).hexdigest() == accepted["result"]["sha256"]
+    for pattern in public_bundle.SENSITIVE:
+        data = b"\xff" * (65537 - len(pattern)) + pattern
+        expected = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+        with unittest.TestCase().assertRaises(ValueError):
+            public_bundle.copy_checked(io.BytesIO(data), None, expected)
+    print("PASS: typed fixture export byte/manifest/result parity, reuse/I/O/mutation refusals and binary scan oracle")
+
+
 def contract_golden():
     handoff, public_bundle = load("handoff"), load("public_bundle")
     packed = {version: packed_records(handoff, public_bundle, version) for version in (1, 2)}
@@ -416,6 +566,7 @@ class HandoffContractGoldens(unittest.TestCase):
         self.assertEqual(PACK_HASHES.read_text(encoding="utf-8"), pack_hashes(packed))
         self.assertEqual(ROOT_BOUND_V1.read_bytes(), root_bound_bundle(handoff, public_bundle, 1))
         self.assertEqual(ROOT_BOUND_V2.read_bytes(), root_bound_bundle(handoff, public_bundle, 2))
+        self.assertEqual(EXPORT_BUNDLE_V2.read_bytes(), export_bundle_v2(handoff, public_bundle))
 
     def test_python_members_match_zig_sample_verdicts(self):
         handoff, public_bundle = load("handoff"), load("public_bundle")
@@ -456,7 +607,9 @@ class HandoffContractGoldens(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["--write"]:
+    if len(sys.argv) == 3 and sys.argv[1] == "--export-parity":
+        check_export_parity(sys.argv[2])
+    elif sys.argv[1:] == ["--write"]:
         GOLDEN.write_text(contract_golden(), encoding="utf-8")
         ZIP_MULTI.write_bytes(zip_multi_golden())
         ZIP_EMPTY.write_bytes(zip_empty_golden())
@@ -471,5 +624,6 @@ if __name__ == "__main__":
         PACK_HASHES.write_text(pack_hashes(packed), encoding="utf-8")
         ROOT_BOUND_V1.write_bytes(root_bound_bundle(handoff, public_bundle, 1))
         ROOT_BOUND_V2.write_bytes(root_bound_bundle(handoff, public_bundle, 2))
+        EXPORT_BUNDLE_V2.write_bytes(export_bundle_v2(handoff, public_bundle))
     else:
         unittest.main()

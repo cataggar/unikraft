@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: BSD-3-Clause
 const std = @import("std");
 const core = @import("hyperv_core");
+const controller = @import("wamr_controller");
 const c = core.contracts;
 const handoff = @import("root.zig");
 const contracts = handoff.contracts;
 const layout = handoff.layout;
+const native_export = handoff.export_state;
 const profile = handoff.profile;
+const retained_copy = handoff.retained_copy;
 const zip = handoff.zip;
+const test_options = @import("test_options");
 
 const golden = @embedFile("goldens/contracts-profile-layout.json");
 const zip_multi_golden = @embedFile("goldens/zip-stored-multi.zip");
@@ -19,6 +23,7 @@ const zip_pack_v2_bundle = @embedFile("goldens/zip-pack-v2-bundle.json");
 const zip_pack_v2_public_source = @embedFile("goldens/zip-pack-v2-public-source.json");
 const root_bound_v1_golden = @embedFile("goldens/root-bound-v1.json");
 const root_bound_v2_golden = @embedFile("goldens/root-bound-v2.json");
+const export_bundle_v2_golden = @embedFile("goldens/export-bundle-v2.json");
 const root_bound_stage = "/opt/wamr-handoff-golden-stage";
 const sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const rev = "0123456789012345678901234567890123456789";
@@ -185,6 +190,801 @@ test "real Python pack goldens are byte-identical and accepted by strict native 
 test "Python-written root-bound local handoff goldens validate only with their root" {
     try expectRootBoundGolden(root_bound_v1_golden, .frozen_tiny_v1);
     try expectRootBoundGolden(root_bound_v2_golden, .tiny_qcow2_derived_vhd_v2);
+}
+
+test "native v2 handoff manifest builder is byte-identical to Python export-shaped golden" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const bytes = try native_export.Test.buildRootBoundBundleV2(
+        arena.allocator(),
+        root_bound_stage,
+        "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+    );
+    try expectEqualManifest(export_bundle_v2_golden, bytes);
+}
+
+test "retained copy hashes, fsyncs and reopens a private member" {
+    var fixture = try CopyFixture.init("success");
+    defer fixture.deinit();
+    try fixture.writeSource("input.bin", "member-bytes\n");
+    var retained = try core.private_files.RetainedFile.open(std.testing.io, fixture.source_path, .private);
+    defer retained.close(std.testing.io);
+    var budget: retained_copy.Budget = .{};
+    const copied = try retained_copy.copyRetained(
+        std.testing.allocator,
+        std.testing.io,
+        &retained,
+        fixture.output.dir,
+        fixture.output_path,
+        "artifacts/efi",
+        layout.max_json_bytes,
+        &budget,
+        .{},
+    );
+    defer std.testing.allocator.free(copied.path);
+    try std.testing.expectEqual(@as(u64, 13), copied.size);
+    try std.testing.expectEqual(@as(u64, 13), budget.used);
+    const observed = try fixture.readOutput("artifacts/efi", 64);
+    defer std.testing.allocator.free(observed);
+    try std.testing.expectEqualStrings("member-bytes\n", observed);
+}
+
+test "retained copy refuses sensitive public pattern across chunk boundary" {
+    var fixture = try CopyFixture.init("sensitive");
+    defer fixture.deinit();
+    const pattern = "Authorization: Bearer ";
+    const bytes = try std.testing.allocator.alloc(u8, 64 * 1024 + pattern.len);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes, 'a');
+    @memcpy(bytes[64 * 1024 - 7 .. 64 * 1024], pattern[0..7]);
+    @memcpy(bytes[64 * 1024 .. 64 * 1024 + pattern.len - 7], pattern[7..]);
+    try fixture.writeSource("input.bin", bytes);
+    var retained = try core.private_files.RetainedFile.open(std.testing.io, fixture.source_path, .private);
+    defer retained.close(std.testing.io);
+    var budget: retained_copy.Budget = .{};
+    try std.testing.expectError(error.SensitivePattern, retained_copy.copyRetained(
+        std.testing.allocator,
+        std.testing.io,
+        &retained,
+        fixture.output.dir,
+        fixture.output_path,
+        "evidence/build.json",
+        layout.max_large_artifact_bytes,
+        &budget,
+        .{ .scan = .public_bundle },
+    ));
+}
+
+test "retained copy refuses budget overflow and existing output" {
+    var fixture = try CopyFixture.init("budget-existing");
+    defer fixture.deinit();
+    try fixture.writeSource("input.bin", "12345");
+    var retained = try core.private_files.RetainedFile.open(std.testing.io, fixture.source_path, .private);
+    defer retained.close(std.testing.io);
+    var small: retained_copy.Budget = .{ .limit = 4 };
+    try std.testing.expectError(error.CopyBudgetExceeded, retained_copy.copyRetained(
+        std.testing.allocator,
+        std.testing.io,
+        &retained,
+        fixture.output.dir,
+        fixture.output_path,
+        "artifacts/efi",
+        layout.max_json_bytes,
+        &small,
+        .{},
+    ));
+    try fixture.writeOutput("artifacts/efi", "old");
+    var budget: retained_copy.Budget = .{};
+    try std.testing.expectError(error.OutputExists, retained_copy.copyRetained(
+        std.testing.allocator,
+        std.testing.io,
+        &retained,
+        fixture.output.dir,
+        fixture.output_path,
+        "artifacts/efi",
+        layout.max_json_bytes,
+        &budget,
+        .{},
+    ));
+}
+
+test "retained copy poisons source mutation and ambiguous durability faults" {
+    var fixture = try CopyFixture.init("faults");
+    defer fixture.deinit();
+    const bytes = try std.testing.allocator.alloc(u8, 70 * 1024);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes, 'm');
+    try fixture.writeSource("input.bin", bytes);
+    var retained = try core.private_files.RetainedFile.open(std.testing.io, fixture.source_path, .private);
+    defer retained.close(std.testing.io);
+    var budget: retained_copy.Budget = .{};
+    try std.testing.expectError(error.FileChanged, retained_copy.copyRetained(
+        std.testing.allocator,
+        std.testing.io,
+        &retained,
+        fixture.output.dir,
+        fixture.output_path,
+        "artifacts/raw",
+        layout.max_large_artifact_bytes,
+        &budget,
+        .{ .fault = .mutate_source_after_first_chunk },
+    ));
+
+    try fixture.writeSource("second.bin", "durability");
+    var second = try core.private_files.RetainedFile.open(std.testing.io, fixture.second_source_path, .private);
+    defer second.close(std.testing.io);
+    try std.testing.expectError(error.AmbiguousWrite, retained_copy.copyRetained(
+        std.testing.allocator,
+        std.testing.io,
+        &second,
+        fixture.output.dir,
+        fixture.output_path,
+        "artifacts/vhd",
+        layout.max_json_bytes,
+        null,
+        .{ .fault = .before_file_sync },
+    ));
+}
+
+test "handoff manifest publish fault is poisoned before bundle is visible" {
+    var fixture = try CopyFixture.init("publish-fault");
+    defer fixture.deinit();
+    try std.testing.expectError(error.AmbiguousWrite, native_export.Test.publishBundleForTest(
+        std.testing.io,
+        fixture.output.dir,
+        "{}\n",
+        .before_file_sync,
+    ));
+    const bundle_path = try std.fs.path.join(std.testing.allocator, &.{ fixture.output_path, "bundle.json" });
+    defer std.testing.allocator.free(bundle_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.openFileAbsolute(
+        std.testing.io,
+        bundle_path,
+        .{ .mode = .read_only, .follow_symlinks = false },
+    ));
+}
+
+test "export runner refuses absent runtime" {
+    const outcome = native_export.run(.{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .environ = .empty,
+        .runtime_path = "/missing-export-review-runtime",
+        .repository_path = "/missing-export-review-repository",
+        .output_path = "/missing-export-review-output",
+    });
+    try std.testing.expect(outcome == .refused);
+}
+
+fn descriptorCount() !usize {
+    const proc = try std.Io.Dir.openDirAbsolute(std.testing.io, "/proc/self/fd", .{ .iterate = true });
+    defer proc.close(std.testing.io);
+    var iterator = proc.iterate();
+    var count: usize = 0;
+    while (try iterator.next(std.testing.io)) |_| count += 1;
+    return count;
+}
+
+test "export accepted-record refusal releases runtime descriptor" {
+    var fixture = try CopyFixture.init("runtime-refusal");
+    defer fixture.deinit();
+    const before = try descriptorCount();
+    const outcome = native_export.run(.{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .environ = .empty,
+        .runtime_path = std.fs.path.dirname(fixture.source_path).?,
+        .repository_path = std.fs.path.dirname(fixture.source_path).?,
+        .output_path = fixture.output_path,
+    });
+    try std.testing.expect(outcome == .refused);
+    try std.testing.expectEqual(before, try descriptorCount());
+}
+
+test "strict scan refuses binary pattern ending in one-byte final chunk" {
+    var fixture = try CopyFixture.init("sensitive-final-byte");
+    defer fixture.deinit();
+    const pattern = "Authorization: Bearer ";
+    const bytes = try std.testing.allocator.alloc(u8, 64 * 1024 + 1);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes, 0xff);
+    @memcpy(bytes[bytes.len - pattern.len ..], pattern);
+    try fixture.writeSource("input.bin", bytes);
+    var retained = try core.private_files.RetainedFile.open(std.testing.io, fixture.source_path, .private);
+    defer retained.close(std.testing.io);
+    try std.testing.expectError(error.SensitivePattern, retained_copy.copyRetained(
+        std.testing.allocator,
+        std.testing.io,
+        &retained,
+        fixture.output.dir,
+        fixture.output_path,
+        "evidence/build.json",
+        layout.max_large_artifact_bytes,
+        null,
+        .{ .scan = .public_bundle },
+    ));
+}
+
+test "copied root path must identify retained output directory" {
+    var fixture = try CopyFixture.init("output-binding");
+    defer fixture.deinit();
+    try fixture.writeSource("input.bin", "member\n");
+    var retained = try core.private_files.RetainedFile.open(std.testing.io, fixture.source_path, .private);
+    defer retained.close(std.testing.io);
+    try std.testing.expectError(error.UnsafeDestination, retained_copy.copyRetained(
+        std.testing.allocator,
+        std.testing.io,
+        &retained,
+        fixture.output.dir,
+        std.fs.path.dirname(fixture.source_path).?,
+        "artifacts/efi",
+        layout.max_json_bytes,
+        null,
+        .{},
+    ));
+}
+
+test "staged validation refuses absent members and latches refusal across tokens" {
+    var fixture = try CopyFixture.init("missing-stage");
+    defer fixture.deinit();
+    const staged = try native_export.Test.stagedWithoutMembers(.{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .environ = .empty,
+        .runtime_path = fixture.source_path,
+        .repository_path = fixture.source_path,
+        .output_path = fixture.output_path,
+    });
+    defer staged.deinit();
+    const alias = staged;
+    const result = staged.validateHandoff();
+    const replay = alias.validateHandoff();
+    try std.testing.expect(result == .refused and replay == .refused);
+    try std.testing.expectEqual(error.MissingMembers, result.refused.err);
+    try std.testing.expectEqual(result.refused, replay.refused);
+}
+
+test "failed prepublication parent sync barrier leaves no final bundle" {
+    var fixture = try CopyFixture.init("parent-sync");
+    defer fixture.deinit();
+    try std.testing.expectError(error.AmbiguousWrite, native_export.Test.publishBundleForTest(
+        std.testing.io,
+        fixture.output.dir,
+        "{}\n",
+        .before_parent_sync,
+    ));
+    try std.testing.expectError(error.FileNotFound, fixture.output.dir.openFile(std.testing.io, "bundle.json", .{ .follow_symlinks = false }));
+}
+
+test "sensitive scan matches streaming byte semantics for every pattern and split" {
+    for (retained_copy.sensitive_patterns) |pattern| {
+        for (1..pattern.len) |split| {
+            var scanner: retained_copy.Scanner = .{};
+            try scanner.observe("\x00\xffbinary");
+            try scanner.observe(pattern[0..split]);
+            try std.testing.expectError(error.SensitivePattern, scanner.observe(pattern[split..]));
+        }
+        var scanner: retained_copy.Scanner = .{};
+        for (pattern[0 .. pattern.len - 1]) |byte| try scanner.observe(&.{byte});
+        try std.testing.expectError(error.SensitivePattern, scanner.observe(pattern[pattern.len - 1 ..]));
+    }
+    var scanner: retained_copy.Scanner = .{};
+    try scanner.observe("\xffAuthorization: bearer \x00accesssas\x80?SV=&SIG=");
+}
+
+test "complete typed v2 runtime exports every byte with live Python export parity" {
+    var fixture = try ExportFixture.init("export-parity");
+    defer fixture.deinit();
+    const before = try descriptorCount();
+    {
+        const pinned = try fixture.begin(.{});
+        defer pinned.deinit();
+        const result = native_export.Test.finishFixture(pinned);
+        if (result != .success) {
+            std.debug.print("export parity failed: {any}\n", .{result});
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expectEqualStrings(&fixture.result_sha256, &result.success.result_sha256);
+        try std.testing.expectEqual(@as(usize, 26), result.success.artifacts);
+        try std.testing.expectEqual(@as(usize, 6), result.success.boots);
+        try std.testing.expectEqual(@as(usize, 33), result.success.evidence);
+    }
+    try std.testing.expectEqual(before, try descriptorCount());
+    const parity = try std.process.run(std.testing.allocator, std.testing.io, .{
+        .argv = &.{ "python3", "-B", test_options.python_oracle, "--export-parity", fixture.root_path },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(8192),
+    });
+    defer std.testing.allocator.free(parity.stdout);
+    defer std.testing.allocator.free(parity.stderr);
+    if (!std.meta.eql(parity.term, std.process.Child.Term{ .exited = 0 })) {
+        std.debug.print("Python export parity: {s}\n", .{parity.stderr});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "every export phase failure retains private evidence forbids final bundle and replay" {
+    for ([_]native_export.Phase{
+        .output_reserved,    .artifacts_copied, .boots_copied,      .evidence_copied,
+        .source_revalidated, .handoff_staged,   .handoff_validated, .handoff_published,
+    }) |phase| {
+        var fixture = try ExportFixture.init(@tagName(phase));
+        defer fixture.deinit();
+        const before = try descriptorCount();
+        {
+            const pinned = try fixture.begin(.{ .phase = phase });
+            defer pinned.deinit();
+            const result = native_export.Test.finishFixture(pinned);
+            try std.testing.expect(result == .poisoned);
+            try std.testing.expectEqual(phase, result.poisoned.phase);
+            try std.testing.expectEqual(result.poisoned, pinned.reserveOutput().poisoned);
+            try fixture.noBundle();
+            if (phase != .output_reserved) {
+                const output = try core.private_files.Directory.open(std.testing.io, fixture.output_path);
+                defer output.close(std.testing.io);
+                const journal = try std.fmt.allocPrint(std.testing.allocator, "private/export/failed-{s}.json", .{@tagName(phase)});
+                defer std.testing.allocator.free(journal);
+                const diagnostic = try output.dir.openFile(std.testing.io, journal, .{ .follow_symlinks = false });
+                defer diagnostic.close(std.testing.io);
+                try std.testing.expect((try diagnostic.stat(std.testing.io)).size <= 64 * 1024);
+            }
+        }
+        try std.testing.expectEqual(before, try descriptorCount());
+        if (phase != .output_reserved) {
+            const retry = try fixture.begin(.{});
+            defer retry.deinit();
+            try std.testing.expect(retry.reserveOutput() == .refused);
+        }
+    }
+}
+
+test "copied tokens cannot replay or skip export ownership transitions" {
+    var fixture = try ExportFixture.init("ownership");
+    defer fixture.deinit();
+    {
+        const pinned = try fixture.begin(.{});
+        defer pinned.deinit();
+        const reserved = pinned.reserveOutput().success;
+        const alias = reserved;
+        const artifacts = reserved.copyArtifacts().success;
+        const result = alias.copyArtifacts();
+        try std.testing.expect(result == .poisoned);
+        try std.testing.expectEqual(error.InvalidTransition, result.poisoned.err);
+        try std.testing.expectEqual(result.poisoned, artifacts.copyBoots().poisoned);
+        try fixture.noBundle();
+    }
+    var skipped_fixture = try ExportFixture.init("skip-phase");
+    defer skipped_fixture.deinit();
+    const other = try skipped_fixture.begin(.{});
+    defer other.deinit();
+    const forged = native_export.HandoffValidated{ .attempt = other.attempt };
+    try std.testing.expect(forged.publish() == .refused);
+    try std.testing.expect(other.reserveOutput() == .refused);
+    try skipped_fixture.noBundle();
+}
+
+test "source and destination inode replacements are poisoned before publication" {
+    for ([_]bool{ false, true }) |source| {
+        var fixture = try ExportFixture.init(if (source) "source-replacement" else "output-replacement");
+        defer fixture.deinit();
+        const pinned = try fixture.begin(.{});
+        defer pinned.deinit();
+        const reserved = pinned.reserveOutput().success;
+        const artifacts = reserved.copyArtifacts().success;
+        const boots = artifacts.copyBoots().success;
+        const evidence = boots.copyEvidence().success;
+        const relative = if (source) "source/repository/support/apps/wamr-aot/build/artifacts/tiny.wasm" else "handoff/artifacts/wasm";
+        try fixture.replaceIdentical(relative);
+        const result = evidence.revalidateSource();
+        try std.testing.expect(result == .poisoned);
+        try fixture.noBundle();
+    }
+}
+
+test "concurrent token aliases serialize before latching irreversible refusal" {
+    var fixture = try ExportFixture.init("concurrent-alias");
+    defer fixture.deinit();
+    const pinned = try fixture.begin(.{});
+    defer pinned.deinit();
+    const reserved = pinned.reserveOutput().success;
+    var start = std.atomic.Value(bool).init(false);
+    var outcomes: [2]native_export.Outcome(native_export.ArtifactsCopied) = undefined;
+    const first = try std.Thread.spawn(.{}, copyAlias, .{ reserved, &start, &outcomes[0] });
+    const second = std.Thread.spawn(.{}, copyAlias, .{ reserved, &start, &outcomes[1] }) catch |err| {
+        start.store(true, .release);
+        first.join();
+        return err;
+    };
+    start.store(true, .release);
+    first.join();
+    second.join();
+    const failure = if (outcomes[0] == .poisoned) outcomes[0] else outcomes[1];
+    try std.testing.expect(failure == .poisoned);
+    try std.testing.expectEqual(error.InvalidTransition, failure.poisoned.err);
+    try std.testing.expectEqual(failure.poisoned, reserved.copyArtifacts().poisoned);
+    try fixture.noBundle();
+}
+
+fn copyAlias(token: native_export.OutputReserved, start: *std.atomic.Value(bool), outcome: *native_export.Outcome(native_export.ArtifactsCopied)) void {
+    while (!start.load(.acquire)) std.atomic.spinLoopHint();
+    outcome.* = token.copyArtifacts();
+}
+
+test "allocation refusal while acquiring source pins releases every descriptor" {
+    var fixture = try ExportFixture.init("pin-allocation");
+    defer fixture.deinit();
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, pinWithAllocator, .{&fixture});
+}
+
+fn pinWithAllocator(allocator: std.mem.Allocator, fixture: *ExportFixture) !void {
+    const before = try descriptorCount();
+    const accepted = try fixture.capture();
+    const pinned = native_export.Test.begin(.{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .environ = fixture_environment,
+        .runtime_path = fixture.runtime_path,
+        .repository_path = fixture.repository_path,
+        .output_path = fixture.output_path,
+    }, accepted) catch |err| {
+        try std.testing.expectEqual(before, try descriptorCount());
+        return err;
+    };
+    pinned.deinit();
+    try std.testing.expectEqual(before, try descriptorCount());
+}
+
+test "source evidence additions and retained input directory replacement poison export" {
+    for ([_]bool{ false, true }) |tree| {
+        var fixture = try ExportFixture.init(if (tree) "input-tree" else "source-directory");
+        defer fixture.deinit();
+        const pinned = try fixture.begin(.{});
+        defer pinned.deinit();
+        const reserved = pinned.reserveOutput().success;
+        const evidence = reserved.copyArtifacts().success.copyBoots().success.copyEvidence().success;
+        if (tree) {
+            try fixture.root.rename("source/runtime/inputs/tree", fixture.root, "old-input-tree", std.testing.io);
+            try fixture.root.createDir(std.testing.io, "source/runtime/inputs/tree", .fromMode(0o700));
+        } else {
+            try fixture.put("source/runtime/compute/evidence/unexpected.json", "{}\n");
+        }
+        try std.testing.expect(evidence.revalidateSource() == .poisoned);
+        try fixture.noBundle();
+    }
+}
+
+test "completed record view precedes runtime cleanup but export requires its actual proof" {
+    var fixture = try ExportFixture.initPhase("records-before-cleanup", false);
+    defer fixture.deinit();
+    const before = try descriptorCount();
+    {
+        var accepted = try fixture.capture();
+        defer accepted.deinit();
+        var view = try c.Document.parse(fixture.arena.allocator(), try accepted.handoffV1(), .{});
+        defer view.deinit();
+        try std.testing.expectEqual(@as(usize, 49), view.value().object.get("artifacts").?.array.items.len);
+        try std.testing.expectEqual(layout.evidence_v2.len, view.value().object.get("records").?.array.items.len);
+        try std.testing.expectEqualStrings(&fixture.result_sha256, view.value().object.get("result").?.object.get("sha256").?.string);
+        try std.testing.expectError(error.FileNotFound, fixture.begin(.{}));
+        try fixture.noBundle();
+        try std.testing.expectError(error.FileNotFound, fixture.root.openDir(std.testing.io, "handoff", .{}));
+        try fixture.put("source/runtime/evidence/runtime-cleanup.txt", "primary=1 cleanup=0\n");
+        try std.testing.expectError(error.InvalidCleanup, fixture.begin(.{}));
+        try fixture.noBundle();
+        try fixture.root.deleteFile(std.testing.io, "source/runtime/evidence/runtime-cleanup.txt");
+        try fixture.put("source/runtime/evidence/runtime-cleanup.txt", "primary=0 cleanup=0\n");
+        const pinned = try fixture.begin(.{});
+        defer pinned.deinit();
+        try std.testing.expect(native_export.Test.finishFixture(pinned) == .success);
+    }
+    try std.testing.expectEqual(before, try descriptorCount());
+}
+
+test "accepted record and runtime input pins reject identical-content replacement" {
+    for ([_]bool{ false, true }) |input| {
+        var fixture = try ExportFixture.init(if (input) "input-pin" else "record-pin");
+        defer fixture.deinit();
+        var accepted = try fixture.capture();
+        defer accepted.deinit();
+        const before = try descriptorCount();
+        try fixture.replaceIdentical(if (input) "source/runtime/inputs/tool" else "source/runtime/compute/evidence/build.json");
+        if (input) {
+            try std.testing.expectError(error.InputChanged, accepted.pinInput("fixture-tool"));
+        } else {
+            try std.testing.expectError(error.RecordChanged, accepted.pinRecord("build.json"));
+        }
+        try std.testing.expectEqual(before, try descriptorCount());
+    }
+}
+
+test "accepted pin identity belongs to the returned descriptor across ancestor ABA" {
+    for ([_]enum { record, input, cleanup, artifact, boot }{ .record, .input, .cleanup, .artifact, .boot }) |role| {
+        var fixture = try ExportFixture.init(@tagName(role));
+        defer fixture.deinit();
+        var accepted = try fixture.capture();
+        defer accepted.deinit();
+        if (role == .cleanup) {
+            var cleanup = try accepted.pinExportCleanup();
+            cleanup.close(std.testing.io);
+        }
+        const relative = switch (role) {
+            .record => "compute/evidence/build.json",
+            .input => "inputs/tool",
+            .cleanup => "evidence/runtime-cleanup.txt",
+            .artifact => "compute/package/unikraft.raw",
+            .boot => "compute/boot-raw-x2apic/hyperv-efi-boot.log",
+        };
+        try fixture.root.rename("source/runtime", fixture.root, "accepted-runtime", std.testing.io);
+        try fixture.put(try std.fs.path.join(fixture.arena.allocator(), &.{ "source/runtime", relative }), "unaccepted-A\n");
+        var aba = PinAncestorAba{ .root = fixture.root };
+        controller.accepted_run.Fixture.pin_hooks = .{ .context = &aba, .before_read = PinAncestorAba.exposeAccepted, .after_read = PinAncestorAba.restoreUnaccepted };
+        defer controller.accepted_run.Fixture.pin_hooks = null;
+        const before = try descriptorCount();
+        const outcome = switch (role) {
+            .record => accepted.pinRecord("build.json"),
+            .input => accepted.pinInput("fixture-tool"),
+            .cleanup => accepted.pinArtifact(.cleanup),
+            .artifact => accepted.pinArtifact(.raw),
+            .boot => accepted.pinBoot(controller.profile.modes(accepted.compatibility)[0], .serial),
+        };
+        if (outcome) |value| {
+            var leaked = value;
+            leaked.close(std.testing.io);
+            return error.UnacceptedDescriptorPassedAncestorAba;
+        } else |err| switch (err) {
+            error.RecordChanged, error.InputChanged, error.ArtifactChanged, error.BootChanged, error.FileChanged => {},
+            else => return err,
+        }
+        try std.testing.expect(aba.opened_unaccepted and aba.restored);
+        try std.testing.expectEqual(before, try descriptorCount());
+    }
+}
+
+const PinAncestorAba = struct {
+    root: std.Io.Dir,
+    opened_unaccepted: bool = false,
+    restored: bool = false,
+
+    fn exposeAccepted(context: *anyopaque, retained: *const core.private_files.RetainedFile) !void {
+        const self: *PinAncestorAba = @ptrCast(@alignCast(context));
+        var data: [13]u8 = undefined;
+        try std.testing.expectEqual(data.len, try retained.file.readPositionalAll(std.testing.io, &data, 0));
+        try std.testing.expectEqualStrings("unaccepted-A\n", &data);
+        self.opened_unaccepted = true;
+        try self.root.rename("source/runtime", self.root, "unaccepted-runtime", std.testing.io);
+        try self.root.rename("accepted-runtime", self.root, "source/runtime", std.testing.io);
+    }
+
+    fn restoreUnaccepted(context: *anyopaque) !void {
+        const self: *PinAncestorAba = @ptrCast(@alignCast(context));
+        try self.root.rename("source/runtime", self.root, "accepted-runtime", std.testing.io);
+        try self.root.rename("unaccepted-runtime", self.root, "source/runtime", std.testing.io);
+        self.restored = true;
+    }
+};
+
+test "destination FIFO substitution refuses in a bounded helper and releases custody" {
+    try fifoSubstitutionBounded(.replace_destination_with_fifo);
+}
+
+test "SIGINT at destination FIFO reopen poisons in a bounded helper and releases custody" {
+    try fifoSubstitutionBounded(.replace_destination_with_fifo_and_cancel);
+}
+
+fn fifoSubstitutionBounded(fault: retained_copy.TestFault) !void {
+    var fixture = try ExportFixture.init(@tagName(fault));
+    defer fixture.deinit();
+    const linux = std.os.linux;
+    const forked = linux.fork();
+    if (linux.errno(forked) != .SUCCESS) return error.FixtureFork;
+    if (forked == 0) {
+        fifoSubstitutionChild(&fixture, fault) catch |err| {
+            std.debug.print("bounded FIFO helper failed: {s}\n", .{@errorName(err)});
+            linux.exit(1);
+        };
+        linux.exit(0);
+    }
+    const pid: linux.pid_t = @intCast(forked);
+    var reaped = false;
+    defer if (!reaped) {
+        _ = linux.kill(pid, .KILL);
+        var status: u32 = 0;
+        while (linux.errno(linux.waitpid(pid, &status, 0)) == .INTR) {}
+    };
+    const deadline = try core.process.Deadline.afterMilliseconds(5000);
+    while (true) {
+        var status: u32 = 0;
+        const result = linux.waitpid(pid, &status, linux.W.NOHANG);
+        switch (linux.errno(result)) {
+            .SUCCESS => if (result != 0) {
+                reaped = true;
+                try std.testing.expect(linux.W.IFEXITED(status));
+                try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+                break;
+            },
+            .INTR => continue,
+            else => return error.FixtureReap,
+        }
+        if (try deadline.expired()) return error.DestinationFifoReopenBlocked;
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake);
+    }
+    try fixture.noBundle();
+}
+
+fn fifoSubstitutionChild(fixture: *ExportFixture, fault: retained_copy.TestFault) !void {
+    const before = try descriptorCount();
+    {
+        const pinned = try fixture.begin(.{ .copy = fault });
+        defer pinned.deinit();
+        const outcome = native_export.Test.finishFixture(pinned);
+        try std.testing.expect(outcome == .poisoned);
+        try std.testing.expectEqual(if (fault == .replace_destination_with_fifo) error.UnsafeFile else error.Cancelled, outcome.poisoned.err);
+        try std.testing.expectEqual(outcome.poisoned, pinned.reserveOutput().poisoned);
+        try fixture.noBundle();
+    }
+    try std.testing.expectEqual(before, try descriptorCount());
+}
+
+test "symlinked source and replaced staged manifest poison the final publication barrier" {
+    for ([_]bool{ false, true }) |source| {
+        var fixture = try ExportFixture.init(if (source) "source-symlink" else "stage-replacement");
+        defer fixture.deinit();
+        const pinned = try fixture.begin(.{});
+        defer pinned.deinit();
+        const reserved = pinned.reserveOutput().success;
+        const validated = reserved.copyArtifacts().success.copyBoots().success.copyEvidence().success.revalidateSource().success.stageHandoff().success.validateHandoff().success;
+        const relative = if (source) "source/repository/support/apps/wamr-aot/build/artifacts/tiny.wasm" else "handoff/private/export/handoff.json";
+        try fixture.replaceIdentical(relative);
+        if (source) {
+            try fixture.root.deleteFile(std.testing.io, relative);
+            const target = try std.fs.path.join(fixture.arena.allocator(), &.{ fixture.root_path, "replaced-original" });
+            try fixture.root.symLink(std.testing.io, target, relative, .{});
+        }
+        try std.testing.expect(validated.publish() == .poisoned);
+        try fixture.noBundle();
+    }
+}
+
+test "output directory replacement and member hardlinks are poisoned at final barrier" {
+    for ([_]bool{ false, true }) |swap| {
+        var fixture = try ExportFixture.init(if (swap) "root-swap" else "output-hardlink");
+        defer fixture.deinit();
+        const pinned = try fixture.begin(.{});
+        defer pinned.deinit();
+        const reserved = pinned.reserveOutput().success;
+        const artifacts = reserved.copyArtifacts().success;
+        const boots = artifacts.copyBoots().success;
+        const evidence = boots.copyEvidence().success;
+        const validated = evidence.revalidateSource().success.stageHandoff().success.validateHandoff().success;
+        if (swap) {
+            try fixture.root.rename("handoff", fixture.root, "old-handoff", std.testing.io);
+            try fixture.root.createDir(std.testing.io, "handoff", .fromMode(0o700));
+        } else {
+            try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.linkat(fixture.root.handle, "handoff/artifacts/wasm", fixture.root.handle, "extra-hardlink", 0)));
+        }
+        const result = validated.publish();
+        try std.testing.expect(result == .poisoned);
+        try fixture.noBundle();
+    }
+}
+
+test "private namespace replacement cannot adopt an earlier export journal" {
+    var fixture = try ExportFixture.init("private-swap");
+    defer fixture.deinit();
+    const pinned = try fixture.begin(.{});
+    defer pinned.deinit();
+    const reserved = pinned.reserveOutput().success;
+    const artifacts = reserved.copyArtifacts().success;
+    try fixture.root.rename("handoff/private", fixture.root, "old-private", std.testing.io);
+    try fixture.root.createDir(std.testing.io, "handoff/private", .fromMode(0o700));
+    try fixture.root.rename("old-private/export", fixture.root, "handoff/private/export", std.testing.io);
+    try std.testing.expect(artifacts.copyBoots() == .poisoned);
+    try fixture.noBundle();
+    try std.testing.expectError(error.FileNotFound, fixture.root.openFile(std.testing.io, "handoff/private/export/phase-boots_copied.json", .{ .follow_symlinks = false }));
+}
+
+test "known publication failures retain staged manifest and unknown durability never succeeds" {
+    for ([_]native_export.PublishFault{ .before_file_sync, .before_parent_sync, .after_publication }) |fault| {
+        var fixture = try ExportFixture.init(@tagName(fault));
+        defer fixture.deinit();
+        const pinned = try fixture.begin(.{ .publish = fault });
+        defer pinned.deinit();
+        const result = native_export.Test.finishFixture(pinned);
+        try std.testing.expect(result == .poisoned);
+        const output = try core.private_files.Directory.open(std.testing.io, fixture.output_path);
+        defer output.close(std.testing.io);
+        const staged = try output.dir.openFile(std.testing.io, "private/export/handoff.json", .{ .follow_symlinks = false });
+        defer staged.close(std.testing.io);
+        try std.testing.expect((try staged.stat(std.testing.io)).size > 0);
+        if (fault == .after_publication) {
+            try std.testing.expectEqual(core.private_files.CommitStatus.visible_not_durable, result.poisoned.publication);
+            const uncertain = try output.dir.openFile(std.testing.io, "bundle.json", .{ .follow_symlinks = false });
+            defer uncertain.close(std.testing.io);
+        } else {
+            try fixture.noBundle();
+        }
+        try std.testing.expectEqual(result.poisoned, pinned.reserveOutput().poisoned);
+    }
+}
+
+test "copy cancellation and I/O faults poison the attempt and retain only private partials" {
+    for ([_]retained_copy.TestFault{
+        .cancel_after_first_chunk, .before_file_sync, .before_parent_sync, .replace_destination_before_reopen,
+    }) |fault| {
+        var fixture = try ExportFixture.init(@tagName(fault));
+        defer fixture.deinit();
+        const before = try descriptorCount();
+        {
+            const pinned = try fixture.begin(.{ .copy = fault });
+            defer pinned.deinit();
+            const result = native_export.Test.finishFixture(pinned);
+            try std.testing.expect(result == .poisoned);
+            try std.testing.expectEqual(native_export.Phase.artifacts_copied, result.poisoned.phase);
+            try std.testing.expectEqual(result.poisoned, pinned.reserveOutput().poisoned);
+            try fixture.noBundle();
+        }
+        try std.testing.expectEqual(before, try descriptorCount());
+    }
+}
+
+test "late cancellation and missing staged output member forbid publication" {
+    for ([_]bool{ false, true }) |cancelled| {
+        var fixture = try ExportFixture.init(if (cancelled) "late-cancel" else "missing-output");
+        defer fixture.deinit();
+        const pinned = try fixture.begin(.{});
+        defer pinned.deinit();
+        const reserved = pinned.reserveOutput().success;
+        const staged = reserved.copyArtifacts().success.copyBoots().success.copyEvidence().success.revalidateSource().success.stageHandoff().success;
+        if (cancelled) native_export.Test.cancelAttempt(staged) else try fixture.root.deleteFile(std.testing.io, "handoff/artifacts/wasm");
+        const result = staged.validateHandoff();
+        try std.testing.expect(result == .poisoned);
+        try std.testing.expectEqual(result.poisoned, staged.validateHandoff().poisoned);
+        try fixture.noBundle();
+    }
+}
+
+test "native publication cannot be repeated and an existing output cannot be adopted" {
+    var fixture = try ExportFixture.init("success-terminal");
+    defer fixture.deinit();
+    {
+        const pinned = try fixture.begin(.{});
+        defer pinned.deinit();
+        const reserved = pinned.reserveOutput().success;
+        const validated = reserved.copyArtifacts().success.copyBoots().success.copyEvidence().success.revalidateSource().success.stageHandoff().success.validateHandoff().success;
+        try std.testing.expect(validated.publish() == .success);
+        const replay = validated.publish();
+        try std.testing.expect(replay == .refused);
+        try std.testing.expectEqual(error.AttemptFinished, replay.refused.err);
+    }
+    const fresh_attempt = try fixture.begin(.{});
+    defer fresh_attempt.deinit();
+    try std.testing.expect(fresh_attempt.reserveOutput() == .refused);
+}
+
+test "export refuses caller budget expansion and unsafe output directory mode" {
+    var fixture = try ExportFixture.init("policy-modes");
+    defer fixture.deinit();
+    const before = try descriptorCount();
+    const expanded = native_export.run(.{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .environ = fixture_environment,
+        .runtime_path = fixture.runtime_path,
+        .repository_path = fixture.repository_path,
+        .output_path = fixture.output_path,
+        .aggregate_limit = retained_copy.aggregate_budget + 1,
+    });
+    try std.testing.expect(expanded == .refused);
+    try fixture.noBundle();
+    try std.testing.expectEqual(before, try descriptorCount());
+    const pinned = try fixture.begin(.{});
+    defer pinned.deinit();
+    const reserved = pinned.reserveOutput().success;
+    const output = try core.private_files.Directory.open(std.testing.io, fixture.output_path);
+    defer output.close(std.testing.io);
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.fchmod(output.dir.handle, 0o750)));
+    try std.testing.expect(reserved.copyArtifacts() == .poisoned);
+    try fixture.noBundle();
 }
 
 test "strict ZIP32 reader refuses malformed archives with typed errors" {
@@ -946,4 +1746,331 @@ fn generatedPublicMembers(a: std.mem.Allocator, compatibility: profile.Compatibi
 fn freeMembers(a: std.mem.Allocator, members: []const []const u8) void {
     for (members) |member| a.free(member);
     a.free(members);
+}
+
+fn expectEqualManifest(expected: []const u8, actual: []const u8) !void {
+    if (std.mem.eql(u8, expected, actual)) return;
+    const end = @min(expected.len, actual.len);
+    var index: usize = 0;
+    while (index < end and expected[index] == actual[index]) : (index += 1) {}
+    const start = index - @min(index, 96);
+    const stop_expected = @min(expected.len, index + 96);
+    const stop_actual = @min(actual.len, index + 96);
+    std.debug.print(
+        "manifest diff at byte {d}: expected 0x{x:0>2}, actual 0x{x:0>2}\nexpected: {s}\nactual:   {s}\n",
+        .{
+            index,
+            if (index < expected.len) expected[index] else 0,
+            if (index < actual.len) actual[index] else 0,
+            expected[start..stop_expected],
+            actual[start..stop_actual],
+        },
+    );
+    return error.TestExpectedEqual;
+}
+
+var copy_fixture_counter: usize = 0;
+
+const fixture_environment: std.process.Environ = .{ .block = .{ .slice = &.{
+    "GITHUB_REPOSITORY=cataggar/unikraft",
+    "GITHUB_RUN_ID=1",
+    "GITHUB_RUN_ATTEMPT=1",
+} } };
+
+const ExportFixture = struct {
+    copy_fixture: CopyFixture,
+    arena: std.heap.ArenaAllocator,
+    root: std.Io.Dir,
+    root_path: []const u8,
+    runtime_path: []const u8,
+    repository_path: []const u8,
+    output_path: []const u8,
+    result_sha256: [64]u8,
+
+    fn init(label: []const u8) !ExportFixture {
+        return initPhase(label, true);
+    }
+
+    fn initPhase(label: []const u8, cleanup_complete: bool) !ExportFixture {
+        var base = try CopyFixture.init(label);
+        errdefer base.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const io = std.testing.io;
+        const root_path = try std.Io.Dir.cwd().realPathFileAlloc(io, base.rel_path, a);
+        const root = try core.private_files.Directory.open(io, root_path);
+        errdefer root.close(io);
+        const runtime_path = try std.fs.path.join(a, &.{ root_path, "source/runtime" });
+        const repository_path = try std.fs.path.join(a, &.{ root_path, "source/repository" });
+        const output_path = try std.fs.path.join(a, &.{ root_path, "handoff" });
+        var self: ExportFixture = .{
+            .copy_fixture = base,
+            .arena = arena,
+            .root = root.dir,
+            .root_path = root_path,
+            .runtime_path = runtime_path,
+            .repository_path = repository_path,
+            .output_path = output_path,
+            .result_sha256 = undefined,
+        };
+        errdefer arena = self.arena;
+        try self.materialize(cleanup_complete);
+        return self;
+    }
+
+    fn materialize(self: *ExportFixture, cleanup_complete: bool) !void {
+        const a = self.arena.allocator();
+        const io = std.testing.io;
+        const result_file = try core.private_files.openAbsolute(io, test_options.accepted_result_fixture, .artifact);
+        defer result_file.close(io);
+        var result_raw_fixture = try core.private_files.readSensitiveFile(io, a, result_file, 64 * 1024, .artifact);
+        defer result_raw_fixture.deinit();
+        var result = try c.Document.parse(a, result_raw_fixture.bytes(), .{});
+        defer result.deinit();
+        var hashes = result.value().object.get("records").?.object;
+        for (layout.evidence_v2) |name| {
+            const bytes = if (std.mem.eql(u8, name, "build-start.json"))
+                try fixtureJson(a, .{
+                    .source = .{ .revision = rev, .tree = rev },
+                    .command_supervisor = .{},
+                    .consumer_inputs = .{
+                        .schema = "uk.wamr.consumer-input-custody",
+                        .version = 2,
+                        .files = .{ .@"command-supervisor" = .{ .path = try std.fs.path.join(a, &.{ self.runtime_path, "controller/bin/uk-wamr-native-ci" }) } },
+                    },
+                })
+            else if (std.mem.eql(u8, name, "build.json"))
+                try fixtureJson(a, .{ .source = .{ .revision = rev, .tree = rev }, .runtime = .{} })
+            else if (std.mem.eql(u8, name, "boot-inputs.json"))
+                try fixtureJson(a, .{ .files = .{} })
+            else if (std.mem.eql(u8, name, "package.json"))
+                try fixtureJson(a, .{ .producer_sha256 = sha, .image = .{ .fixture = true } })
+            else
+                try fixtureJson(a, .{ .fixture_record = name });
+            try self.put(try std.fmt.allocPrint(a, "source/runtime/compute/evidence/{s}", .{name}), bytes);
+            hashes.getPtr(name).?.* = .{ .string = try a.dupe(u8, &std.fmt.bytesToHex(controller.records.fileIdentity(bytes), .lower)) };
+        }
+        const result_raw = try std.json.Stringify.valueAlloc(a, result.value(), .{});
+        const result_bytes = try controller.records.canonicalAlloc(a, result_raw);
+        try self.put("source/runtime/compute/evidence/result.json", result_bytes);
+        self.result_sha256 = std.fmt.bytesToHex(controller.records.fileIdentity(result_bytes), .lower);
+        const source_paths = [_][]const u8{
+            "repository/support/apps/wamr-aot/build/wamr_hyperv-x86_64-efi",
+            "repository/support/apps/wamr-aot/build/wamr_hyperv-x86_64-efi.dbg",
+            "repository/support/apps/wamr-aot/build/wamr_hyperv-x86_64-efi.bootinfo",
+            "runtime/compute/package/unikraft.raw",
+            "runtime/compute/package/unikraft.qcow2",
+            "runtime/compute/package/unikraft-derived.vhd",
+            "repository/support/apps/wamr-aot/build/artifacts/libwamr-aot.a",
+            "repository/support/apps/wamr-aot/build/artifacts/wamrc",
+            "repository/support/apps/wamr-aot/build/artifacts/tiny.wasm",
+            "repository/support/apps/wamr-aot/build/artifacts/tiny.cwasm",
+            "repository/support/apps/wamr-aot/.config",
+            "repository/support/apps/wamr-aot/build/artifacts/identity.json",
+            "repository/support/apps/wamr-aot/build/image-identity.json",
+        };
+        for (source_paths, 0..) |path, i|
+            try self.put(try std.fmt.allocPrint(a, "source/{s}", .{path}), try std.fmt.allocPrint(a, "{s}\x00\xff\n", .{layout.artifact_names_v2[i]}));
+        if (cleanup_complete) try self.put("source/runtime/evidence/runtime-cleanup.txt", "primary=0 cleanup=0\n");
+        try self.put("source/runtime/inputs/tool", "fixture-tool\x00\xff\n");
+        try self.put("source/runtime/inputs/tree/data", "fixture-tree-data\n");
+        for (profile.production_modes) |mode| {
+            inline for (.{ "serial", "request", "report" }) |part|
+                try self.put(try std.fmt.allocPrint(a, "source/runtime/compute/boot-{s}/{s}", .{ @tagName(mode), if (std.mem.eql(u8, part, "serial")) "hyperv-efi-boot.log" else part ++ ".json" }), try fixtureJson(a, .{ .mode = @tagName(mode), .part = part }));
+        }
+        var accepted = try self.capture();
+        defer accepted.deinit();
+        try self.put("controller-records.json", try accepted.handoffV1());
+    }
+
+    fn begin(self: *ExportFixture, faults: native_export.Faults) !native_export.AcceptedRunPinned {
+        const accepted = try self.capture();
+        return native_export.Test.begin(.{
+            .allocator = std.testing.allocator,
+            .io = std.testing.io,
+            .environ = fixture_environment,
+            .runtime_path = self.runtime_path,
+            .repository_path = self.repository_path,
+            .output_path = self.output_path,
+            .faults = faults,
+        }, accepted);
+    }
+
+    fn capture(self: *ExportFixture) !controller.accepted_run.AcceptedRun {
+        const io = std.testing.io;
+        var accepted = try controller.accepted_run.Fixture.capture(std.testing.allocator, io, self.runtime_path, self.repository_path);
+        errdefer accepted.deinit();
+        const a = accepted.arena.allocator();
+        const tool_path = try std.fs.path.join(a, &.{ self.runtime_path, "inputs/tool" });
+        const tree_path = try std.fs.path.join(a, &.{ self.runtime_path, "inputs/tree" });
+        const tool = try controller.custody_files.readFile(io, tool_path, 64 * 1024, false);
+        const tree = try controller.input_custody.tree(a, io, .{ .role = "fixture-tree", .path = tree_path });
+        const selected = try a.alloc(controller.accepted_run.PinnedInput, 2);
+        selected[0] = .{ .role = "fixture-tool", .path = tool_path, .snapshot = .{
+            .bytes = tool.bytes,
+            .sha256 = tool.sha256,
+            .metadata = tool.metadata,
+        } };
+        selected[1] = .{ .role = "tree:fixture-tree", .path = tree_path, .snapshot = .{
+            .bytes = tree.bytes,
+            .sha256 = tree.content_sha256,
+            .metadata = controller.custody_files.metadata(try controller.custody_files.directory(io, tree_path, false)),
+            .tree = .{ .files = tree.files, .directories = tree.directories, .symlinks = tree.symlinks, .physical_sha256 = tree.physical_sha256 },
+        } };
+        accepted.runtime_inputs = selected;
+        return accepted;
+    }
+
+    fn put(self: *ExportFixture, path: []const u8, bytes: []const u8) !void {
+        var parent = try testEnsureParent(std.testing.io, self.root, path);
+        defer parent.close(std.testing.io);
+        try writeFile(std.testing.io, parent.dir, std.fs.path.basename(path), bytes);
+    }
+    fn noBundle(self: *ExportFixture) !void {
+        try std.testing.expectError(error.FileNotFound, self.root.openFile(std.testing.io, "handoff/bundle.json", .{ .follow_symlinks = false }));
+    }
+    fn replaceIdentical(self: *ExportFixture, relative: []const u8) !void {
+        const io = std.testing.io;
+        const file = try self.root.openFile(io, relative, .{ .follow_symlinks = false });
+        const size = (try file.stat(io)).size;
+        const bytes = try self.arena.allocator().alloc(u8, @intCast(size));
+        try std.testing.expectEqual(bytes.len, try file.readPositionalAll(io, bytes, 0));
+        file.close(io);
+        try self.root.rename(relative, self.root, "replaced-original", io);
+        try self.put(relative, bytes);
+    }
+    fn deinit(self: *ExportFixture) void {
+        self.root.close(std.testing.io);
+        self.arena.deinit();
+        self.copy_fixture.deinit();
+        self.* = undefined;
+    }
+};
+
+fn fixtureJson(a: std.mem.Allocator, value: anytype) ![]const u8 {
+    const raw = try std.json.Stringify.valueAlloc(a, value, .{});
+    defer a.free(raw);
+    return controller.records.canonicalAlloc(a, raw);
+}
+
+const CopyFixture = struct {
+    rel_path: []const u8,
+    source_path: []const u8,
+    second_source_path: []const u8,
+    output_path: []const u8,
+    source_dir: std.Io.Dir,
+    output: core.private_files.Directory,
+
+    fn init(label: []const u8) !CopyFixture {
+        const a = std.testing.allocator;
+        const io = std.testing.io;
+        var fixture_root = try std.Io.Dir.openDirAbsolute(io, test_options.fixture_root, .{ .iterate = true });
+        defer fixture_root.close(io);
+        try fixture_root.createDirPath(io, "handoff-export-tests");
+        var parent = try fixture_root.openDir(io, "handoff-export-tests", .{ .iterate = true });
+        defer parent.close(io);
+        copy_fixture_counter += 1;
+        const leaf = try std.fmt.allocPrint(a, "{s}-{d}-{d}", .{ label, std.os.linux.getpid(), copy_fixture_counter });
+        defer a.free(leaf);
+        try parent.createDir(io, leaf, .fromMode(0o700));
+        const rel_path = try std.fs.path.join(a, &.{ test_options.fixture_root, "handoff-export-tests", leaf });
+        var root = try parent.openDir(io, leaf, .{ .iterate = true });
+        defer root.close(io);
+        try root.createDir(io, "source", .fromMode(0o700));
+        try root.createDir(io, "output", .fromMode(0o700));
+        const source_dir = try root.openDir(io, "source", .{ .iterate = true });
+        const root_path = try std.Io.Dir.cwd().realPathFileAlloc(io, rel_path, a);
+        defer a.free(root_path);
+        const source_path = try std.fs.path.join(a, &.{ root_path, "source/input.bin" });
+        const second_source_path = try std.fs.path.join(a, &.{ root_path, "source/second.bin" });
+        const output_path = try std.fs.path.join(a, &.{ root_path, "output" });
+        const output = try core.private_files.Directory.open(io, output_path);
+        return .{
+            .rel_path = rel_path,
+            .source_path = source_path,
+            .second_source_path = second_source_path,
+            .output_path = output_path,
+            .source_dir = source_dir,
+            .output = output,
+        };
+    }
+
+    fn deinit(self: *CopyFixture) void {
+        const a = std.testing.allocator;
+        const io = std.testing.io;
+        self.output.close(io);
+        self.source_dir.close(io);
+        std.Io.Dir.cwd().deleteTree(io, self.rel_path) catch @panic("handoff copy fixture cleanup failed");
+        a.free(self.rel_path);
+        a.free(self.source_path);
+        a.free(self.second_source_path);
+        a.free(self.output_path);
+        self.* = undefined;
+    }
+
+    fn writeSource(self: *CopyFixture, name: []const u8, bytes: []const u8) !void {
+        try writeFile(std.testing.io, self.source_dir, name, bytes);
+    }
+
+    fn writeOutput(self: *CopyFixture, relative: []const u8, bytes: []const u8) !void {
+        var parent = try testEnsureParent(std.testing.io, self.output.dir, relative);
+        defer parent.close(std.testing.io);
+        try writeFile(std.testing.io, parent.dir, std.fs.path.basename(relative), bytes);
+    }
+
+    fn readOutput(self: *CopyFixture, relative: []const u8, limit: usize) ![]const u8 {
+        const path = try std.fs.path.join(std.testing.allocator, &.{ self.output_path, relative });
+        defer std.testing.allocator.free(path);
+        const file = try std.Io.Dir.openFileAbsolute(std.testing.io, path, .{ .mode = .read_only, .follow_symlinks = false });
+        defer file.close(std.testing.io);
+        const stat = try file.stat(std.testing.io);
+        if (stat.size > limit) return error.FileTooLarge;
+        const data = try std.testing.allocator.alloc(u8, @intCast(stat.size));
+        errdefer std.testing.allocator.free(data);
+        try std.testing.expectEqual(data.len, try file.readPositionalAll(std.testing.io, data, 0));
+        return data;
+    }
+};
+
+const TestParent = struct {
+    dir: std.Io.Dir,
+    close_dir: bool,
+
+    fn close(self: *TestParent, io: std.Io) void {
+        if (self.close_dir) self.dir.close(io);
+        self.* = undefined;
+    }
+};
+
+fn testEnsureParent(io: std.Io, root: std.Io.Dir, relative: []const u8) !TestParent {
+    var parts = std.mem.splitScalar(u8, relative, '/');
+    var component = parts.next() orelse return error.InvalidPath;
+    var current = root;
+    var close_current = false;
+    errdefer if (close_current) current.close(io);
+    while (parts.next()) |next| {
+        current.createDir(io, component, .fromMode(0o700)) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+        const child = try current.openDir(io, component, .{ .iterate = true, .follow_symlinks = false });
+        if (close_current) current.close(io);
+        current = child;
+        close_current = true;
+        component = next;
+    }
+    return .{ .dir = current, .close_dir = close_current };
+}
+
+fn writeFile(io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: []const u8) !void {
+    const file = try dir.createFile(io, name, .{
+        .exclusive = true,
+        .read = true,
+        .permissions = .fromMode(0o600),
+    });
+    defer file.close(io);
+    try file.writePositionalAll(io, bytes, 0);
+    try file.sync(io);
+    try (std.Io.File{ .handle = dir.handle, .flags = .{ .nonblocking = false } }).sync(io);
 }

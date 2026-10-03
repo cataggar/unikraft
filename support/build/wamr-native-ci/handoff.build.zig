@@ -11,16 +11,67 @@ pub fn build(b: *std.Build) void {
     });
     if (target.result.cpu.arch == .x86_64)
         core.addAssemblyFile(b.path("../../tools/hyperv/sha256_clear_upper.S"));
+    const serial = b.createModule(.{
+        .root_source_file = b.path("../../tools/hyperv/local_boot/serial.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "hyperv_core", .module = core }},
+    });
+    const validator = b.createModule(.{
+        .root_source_file = b.path("../../apps/wamr-aot/validator/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = core },
+            .{ .name = "local_boot_serial", .module = serial },
+        },
+    });
+    const source_closure = b.createModule(.{
+        .root_source_file = b.path("../../controller_source_closure.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const controller = b.createModule(.{
+        .root_source_file = b.path("controller/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = core },
+            .{ .name = "wamr_log_validator", .module = validator },
+            .{ .name = "controller_source_closure", .module = source_closure },
+        },
+    });
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("handoff/tests.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "hyperv_core", .module = core }},
+            .imports = &.{
+                .{ .name = "hyperv_core", .module = core },
+                .{ .name = "wamr_controller", .module = controller },
+            },
         }),
     });
+    const fixture_root = std.fs.path.resolve(b.allocator, &.{
+        b.graph.cache.cwd, b.cache_root.path orelse ".",
+    }) catch @panic("cannot resolve private handoff test root");
+    const options = b.addOptions();
+    options.addOption([]const u8, "fixture_root", fixture_root);
+    // Nested --build-file invocations can render source LazyPaths relatively.
+    options.addOptionPath("python_oracle", .{
+        .cwd_relative = std.fs.path.resolve(b.allocator, &.{
+            b.graph.cache.cwd, b.path("tests/test_handoff_contract_goldens.py").getPath(b),
+        }) catch @panic("cannot resolve handoff Python oracle"),
+    });
+    options.addOptionPath("accepted_result_fixture", .{
+        .cwd_relative = std.fs.path.resolve(b.allocator, &.{
+            b.graph.cache.cwd, b.path("tests/fixtures/differential/accepted-v2.json").getPath(b),
+        }) catch @panic("cannot resolve accepted handoff fixture"),
+    });
+    tests.root_module.addOptions("test_options", options);
     const run = b.addRunArtifact(tests);
     const python = b.addSystemCommand(&.{ "python3", "-B" });
+    python.setEnvironmentVariable("WAMR_HANDOFF_GOLDEN_ROOT", fixture_root);
     python.addFileArg(b.path("tests/test_handoff_contract_goldens.py"));
     const step = b.step("test", "Run native and Python handoff contract goldens");
     step.dependOn(&run.step);
