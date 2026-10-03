@@ -369,12 +369,16 @@ directory except for exactly its top-level `wamr-native-ci` subtree, including
 production validation gates even when they live below `tests/`, plus every
 external native-image helper invoked by the root Make/facade/postprocessing
 path. Unknown additions, removals, or byte changes outside that excluded
-subtree fail closed. The input-manifest-v9 and private-build-receipt-v6
-contracts bind the copied Git runtime used for every source query and
-native-build invocation, the exact reviewed producer files, protocol 1,
-identity policy 2, `no-devices`, guest return 2, and the private solved
-run/LUN/geometry. Updating a pinned producer or build-closure file requires an
-explicit reviewed source change. The exact same causal
+subtree fail closed. The Python fixtures importing `support/build/tests`
+helpers suppress bytecode writes even when invoked directly without
+`PYTHONDONTWRITEBYTECODE=1`. A pin mismatch names the affected file or
+closure and any detected bytecode entry; remove unexpected generated files
+rather than excluding them from the guarded closure. The input-manifest-v9
+and private-build-receipt-v6 contracts bind the copied Git runtime used for
+every source query and native-build invocation, the exact reviewed producer
+files, protocol 1, identity policy 2, `no-devices`, guest return 2, and the
+private solved run/LUN/geometry. Updating a pinned producer or build-closure
+file requires an explicit reviewed source change. The exact same causal
 `private.efi`, raw disk, and fixed VHD are used for all four private platform
 boots and must be retained unchanged for the later real-data workload; there
 is no preflight-only guest flag, rebuild, or reseed.

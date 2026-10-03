@@ -998,24 +998,52 @@ def verify_guarded_producer_sources(repository):
         raise RuntimeError("Guarded build proof closure is incomplete")
     for relative, expected in GUARDED_PRODUCER_FILES.items():
         path = repository / relative
-        if (
-            path.is_symlink()
-            or not path.is_file()
-            or azure.image_sha256(path) != expected
-        ):
-            raise ValueError(
-                "Guarded producer differs from the reviewed V2 contract"
-            )
+        if path.is_symlink():
+            reason = "is a symlink"
+        elif not path.is_file():
+            reason = "is missing" if not path.exists() else "is not a file"
+        elif azure.image_sha256(path) != expected:
+            reason = "has a different hash"
+        else:
+            continue
+        raise ValueError(
+            f"Guarded producer file {relative} {reason}; "
+            "differs from the reviewed V2 contract"
+        )
     for relative, expected in GUARDED_PRODUCER_CLOSURES.items():
-        if directory_record(
-            repository / relative, relative,
-            "Guarded producer execution closure",
-            exclude_top_level_subtrees=(
-                GUARDED_PRODUCER_DIRECTORY_EXCLUSIONS.get(relative, ())
-            ),
-        ) != expected:
+        path = repository / relative
+        exclusions = GUARDED_PRODUCER_DIRECTORY_EXCLUSIONS.get(relative, ())
+        try:
+            actual = directory_record(
+                path, relative, "Guarded producer execution closure",
+                exclude_top_level_subtrees=exclusions,
+            )
+        except (FileNotFoundError, ValueError) as error:
             raise ValueError(
-                "Guarded producer differs from the reviewed V2 contract"
+                f"Guarded producer execution closure {relative} differs "
+                f"from the reviewed V2 contract: {error}"
+            ) from error
+        if actual != expected:
+            bytecode = None
+            for top in sorted(path.iterdir()):
+                if top.name in exclusions:
+                    continue
+                candidates = top.rglob("*.pyc") if top.is_dir() else (top,)
+                bytecode = next(
+                    (
+                        entry.relative_to(repository).as_posix()
+                        for entry in candidates if entry.suffix == ".pyc"
+                    ),
+                    None,
+                )
+                if bytecode is not None:
+                    break
+            raise ValueError(
+                f"Guarded producer execution closure {relative} differs "
+                "from the reviewed V2 contract "
+                f"(files {actual['files']} vs {expected['files']}, "
+                f"bytes {actual['size']} vs {expected['size']})"
+                + (f"; bytecode entry {bytecode}" if bytecode else "")
             )
 
 
@@ -1795,11 +1823,13 @@ def directory_record(
         relative = relative_path.as_posix()
         metadata = entry.lstat()
         if stat.S_ISLNK(metadata.st_mode):
-            raise ValueError(f"{description} contains a symlink")
+            raise ValueError(f"{description} contains a symlink: {relative}")
         if stat.S_ISDIR(metadata.st_mode):
             continue
         if not stat.S_ISREG(metadata.st_mode):
-            raise ValueError(f"{description} contains a nonregular file")
+            raise ValueError(
+                f"{description} contains a nonregular file: {relative}"
+            )
         encoded = relative.encode()
         fingerprint = azure.image_sha256(entry)
         digest.update(len(encoded).to_bytes(4, "big"))

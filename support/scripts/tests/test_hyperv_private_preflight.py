@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import shutil
 import subprocess
 import sys
@@ -762,6 +763,85 @@ class PrivatePreflightFixture(unittest.TestCase):
 
 
 class PrivatePreflightManifestTest(PrivatePreflightFixture):
+    def test_guarded_fixture_imports_do_not_write_build_bytecode(self):
+        helpers = (
+            "hyperv-efi-boot-test",
+            "hyperv-irq-register-test",
+            "hyperv-smp-link-test",
+        )
+        with mock.patch.dict(sys.modules) as modules, \
+                mock.patch.object(sys, "path", sys.path.copy()), \
+                mock.patch.object(sys, "dont_write_bytecode", False):
+            for helper in helpers:
+                modules.pop(helper, None)
+            for module in (
+                "test_hyperv_efi_boot.py",
+                "test_hyperv_irq_register.py",
+            ):
+                runpy.run_path(str(Path(__file__).with_name(module)))
+            self.assertFalse(
+                (SUPPORT / "build/tests/__pycache__").exists()
+            )
+            preflight.verify_guarded_producer_sources(SUPPORT.parent)
+
+    def test_guarded_source_mismatch_names_file_and_bytecode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            closure = root / "support/build"
+            closure.mkdir(parents=True)
+            source = closure / "helper.py"
+            source.write_bytes(b"clean\n")
+            files = {
+                "support/build/helper.py": hashlib.sha256(
+                    source.read_bytes()
+                ).hexdigest(),
+            }
+            closures = {
+                "support/build": preflight.directory_record(
+                    closure, "support/build",
+                    "Guarded producer execution closure",
+                ),
+            }
+            with mock.patch.multiple(
+                preflight,
+                SUPPORT=root / "support",
+                GUARDED_BUILD_CONTROL_FILES=(),
+                GUARDED_EXECUTED_HELPER_FILES=(),
+                GUARDED_PRODUCER_FILES=files,
+                GUARDED_PRODUCER_CLOSURES=closures,
+                GUARDED_PRODUCER_DIRECTORY_EXCLUSIONS={},
+            ):
+                preflight.verify_guarded_producer_sources(root)
+                source.write_bytes(b"changed\n")
+                with self.assertRaisesRegex(
+                    ValueError, "support/build/helper.py.*different hash"
+                ):
+                    preflight.verify_guarded_producer_sources(root)
+                source.unlink()
+                with self.assertRaisesRegex(
+                    ValueError, "support/build/helper.py.*missing"
+                ):
+                    preflight.verify_guarded_producer_sources(root)
+                source.write_bytes(b"clean\n")
+                cache = closure / "tests/__pycache__/helper.cpython.pyc"
+                cache.parent.mkdir(parents=True)
+                cache.write_bytes(b"unreviewed bytecode")
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "support/build.*support/build/tests/__pycache__/"
+                    "helper.cpython.pyc",
+                ):
+                    preflight.verify_guarded_producer_sources(root)
+                cache.unlink()
+                cache.parent.rmdir()
+                cache.parent.parent.rmdir()
+                link = closure / "linked.py"
+                link.symlink_to(source)
+                with self.assertRaisesRegex(
+                    ValueError, "support/build.*linked.py"
+                ):
+                    preflight.verify_guarded_producer_sources(root)
+
     def test_guarded_source_pin_covers_pristine_proof_dependency_closure(self):
         self.assertEqual(
             preflight.GUARDED_PRODUCER_FILES,
