@@ -1,5 +1,56 @@
 # Credential-free tiny native WAMR PR gate
 
+## Authority contract freeze (#189 PR1; no caller cutover)
+
+`authority/root.zig` is a contract/test surface importing only `hyperv_core`;
+it does not install an authority executable or change the four Python operator
+commands. The goldens call the existing `handoff.py` runtime, plan, decision and
+admission constructors. Only external candidate/ledger inputs, executable/ELF
+and process boundaries, time/UUID generation, and physical metadata are stubbed.
+The runtime tree, canonical publication, manifest scan, and content/metadata/
+parent hashes use the real implementation. Schema inventories are sorted field
+sets, not incidental Python dictionary insertion order; canonical record bytes
+remain unchanged.
+
+Live probes freeze text byte bounds (including UTF-8, every C0 byte and DEL),
+all four UUID inputs, cost/window bounds and refusal output absence. Runtime
+copy-budget and scan probes test each exact limit and its first overflow;
+virtual scan entries and metadata avoid allocating 2 GiB, and a synthetic
+manifest exercises the 32-MiB publication cap. Deterministic external validator
+stubs are not evidence of independent validation or decision freshness: the
+existing `test_v2_lineage.py` native-validator fixtures remain that gate.
+Mutation verification changes eight representative constructor behaviors plus
+twelve copy/scan/loader/manifest boundary checks **in memory**, never editing
+`handoff.py`; all twenty must change the golden or refuse a previously successful
+operation.
+
+The native fixture consumer independently enforces recursive exact field sets,
+scalar types, record versions, CLI option metadata, schema domains, and every
+fixed runtime isolation/resource/policy value against native literals. Permanent
+negative fixtures mutate the actual consumer input, re-canonicalizing both the
+embedded records and the outer document; malformed metadata, extra domains or
+nested fields, scalar coercions and unsupported versions must fail that same
+consumer, not a comparison against another golden.
+
+Run with Zig 0.16 and fresh owner-only roots (no credentials or cloud calls):
+
+```sh
+umask 077
+mkdir -p .d
+mkdir .d/authority-contract-check
+export WAMR_AUTHORITY_CONTRACT_SCRATCH="$PWD/.d/authority-contract-check/python"
+export ZIG_LOCAL_CACHE_DIR="$PWD/.d/authority-contract-check/cache"
+export ZIG_GLOBAL_CACHE_DIR="$PWD/.d/authority-contract-check/global"
+(cd support/build/wamr-native-ci && zig build --build-file authority.build.zig test)
+python3 -B support/build/wamr-native-ci/tests/test_authority_contract_goldens.py --mutations
+```
+
+The full package build's `test-authority-contracts`, `test-controller`, and
+`test` targets include the same native/Python gate. Each oracle invocation owns
+and removes only its fresh child below the scratch parent, preserving existing
+parent contents. `--write` intentionally regenerates checked-in goldens for
+review; it is not part of verification.
+
 ## Native package and boot chain (production caller)
 
 The installed controller now implements `boot --runtime ABS` as a closed,
