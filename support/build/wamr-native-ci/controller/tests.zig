@@ -1871,6 +1871,10 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
     const local_records = try cli.parse(&.{ "uk-wamr-native-ci", "records", "--output", "handoff-v1", "--runtime", "/runtime" });
     try std.testing.expectEqual(cli.Action.records, local_records.action);
     try std.testing.expectEqualStrings("/runtime", local_records.runtime.?);
+    const readonly_records = try cli.parse(&.{
+        "uk-wamr-native-ci", "readonly-records", "--runtime", "/runtime", "--git", "/reader/git", "--output", "handoff-v1",
+    });
+    try std.testing.expectEqualStrings("/reader/git", readonly_records.git.?);
     const imported_records = try cli.parse(&.{ "uk-wamr-native-ci", "records", "--stage-root", "/stage", "--transport", "trusted-inner-zip", "--output", "handoff-v1" });
     try std.testing.expectEqual(cli.Action.records, imported_records.action);
     try std.testing.expectEqualStrings("/stage", imported_records.stage_root.?);
@@ -1963,6 +1967,8 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
         &.{ "uk-wamr-native-ci", "supervisor-import-identity", "--stage-root", "/stage", "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git", "--git", "/another" },
         &.{ "uk-wamr-native-ci", "supervisor-import-identity", "--runtime", "/runtime", "--supervisor", "/trusted/supervisor", "--git", "/usr/bin/git", "--output", "/private/identity" },
         &.{ "uk-wamr-native-ci", "records", "--runtime", "/runtime" },
+        &.{ "uk-wamr-native-ci", "records", "--runtime", "/runtime", "--git", "/reader/git", "--output", "handoff-v1" },
+        &.{ "uk-wamr-native-ci", "readonly-records", "--runtime", "/runtime", "--git", "git", "--output", "handoff-v1" },
         &.{ "uk-wamr-native-ci", "records", "--runtime", "/runtime", "--transport", "trusted-inner-zip", "--output", "handoff-v1" },
         &.{ "uk-wamr-native-ci", "records", "--stage-root", "/stage", "--output", "handoff-v1" },
         &.{ "uk-wamr-native-ci", "records", "--runtime", "/runtime", "--stage-root", "/stage", "--output", "handoff-v1" },
@@ -2119,6 +2125,44 @@ fn appendRelativeFixtureFile(io: std.Io, dir: std.Io.Dir, name: []const u8, byte
     defer file.close(io);
     const size = (try file.stat(io)).size;
     try file.writePositionalAll(io, bytes, size);
+}
+
+test "current native reader authenticates its closure without historical Python files" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "native-reader-source-{d}", .{std.os.linux.getpid()});
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("native reader fixture cleanup failed");
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    for (controller.source_custody.closure) |entry|
+        try writeRelativeFixtureFile(io, root, entry.name, entry.content);
+    try fixtureGit(a, path, &.{ options.git_executable, "init", "-q" });
+    try fixtureGit(a, path, &.{ options.git_executable, "add", "-A" });
+    try fixtureGit(a, path, &.{
+        options.git_executable, "-c",  "user.name=Fixture",                                                                                      "-c", "user.email=fixture@example.invalid",
+        "commit",               "-qm", "fixture: current native reader\n\nCo-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>",
+    });
+    const expected = try controller.import_supervisor_identity.nativeSourceContentClosure(a);
+    const observed = try controller.import_supervisor_identity.currentReaderSourceContentClosure(a, io, path, options.git_executable);
+    try std.testing.expectEqualStrings(&expected, &observed);
+    try std.testing.expectError(error.FileNotFound, root.openFile(io, "support/build/wamr-native-ci/run.py", .{}));
+    try std.testing.expectError(error.UntrackedManifest, controller.import_supervisor_identity.supervisorSourceContentClosure(a, io, path, options.git_executable));
+    const response = try std.process.run(a, io, .{
+        .argv = &.{ options.host_controller_cli, "reader-source-closure", "--git", options.git_executable, "--output", "sha256-v1" },
+        .cwd = .{ .path = path },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, response.term);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}\n", .{expected}), response.stdout);
+    try appendRelativeFixtureFile(io, root, "support/build/wamr-native-ci/controller/cli.zig", "\n");
+    try std.testing.expectError(error.UnsafeSource, controller.import_supervisor_identity.currentReaderSourceContentClosure(a, io, path, options.git_executable));
 }
 
 test "supervisor source closure requires tracked clean Git blobs" {
@@ -3310,13 +3354,153 @@ test "trusted historical inner stage accepts complete records and refuses tamper
     const reader_name = try std.fmt.allocPrint(a, "{s}-reader-source", .{name});
     const reader_repository = try std.fs.path.join(a, &.{ options.fixture_root, reader_name });
     const cloned = try std.process.run(a, io, .{
-        .argv = &.{ options.git_executable, "-c", "gc.auto=0", "-c", "maintenance.auto=false", "clone", "-q", "--no-hardlinks", "--", options.repository_root, reader_repository },
+        .argv = &.{ options.git_executable, "-c", "gc.auto=0", "-c", "maintenance.auto=false", "clone", "-q", "--depth=1", "--no-local", "--no-hardlinks", "--", options.repository_root, reader_repository },
         .cwd = .{ .path = options.fixture_root },
         .stdout_limit = .limited(4096),
         .stderr_limit = .limited(4096),
     });
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, cloned.term);
     defer parent.deleteTree(io, reader_name) catch @panic("legacy reader source cleanup failed");
+    // Keep the historical commit loose so a packed duplicate cannot mask replacement.
+    const historical_seed =
+        \\import subprocess,sys
+        \\git,producer,reader,revision,tree=sys.argv[1:]
+        \\for kind,identity in (("tree",tree),("commit",revision)):
+        \\    raw=subprocess.run([git,"-C",producer,"cat-file",kind,identity],capture_output=True,check=True).stdout
+        \\    stored=subprocess.run([git,"-C",reader,"hash-object","-w","-t",kind,"--stdin"],input=raw,capture_output=True,check=True).stdout
+        \\    assert stored==identity.encode()+b"\n"
+    ;
+    const seeded = try std.process.run(a, io, .{
+        .argv = &.{ options.python_executable, "-B", "-c", historical_seed, options.git_executable, options.repository_root, reader_repository, source.revision, source.tree },
+        .stdout_limit = .limited(256),
+        .stderr_limit = .limited(2048),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, seeded.term);
+    const self = try std.process.executablePathAlloc(io, a);
+    const local_tools = controller.import_validator_build.LocalTools{
+        .git = options.git_executable,
+        .supervisor = self,
+        .validator = options.import_validator,
+    };
+    try std.testing.expectError(error.FileNotFound, controller.accepted_run.PrivateBundle.open(
+        a,
+        io,
+        &directory,
+        stage_root_path,
+        reader_repository,
+        local_tools,
+        null,
+    ));
+    var private_value = try std.json.parseFromSliceLeaky(std.json.Value, a, try root.readFileAlloc(io, "portable-bundle.json", a, .limited(64 * 1024)), .{ .parse_numbers = false });
+    for ([_][]const u8{ "artifacts", "evidence" }) |key| {
+        for (private_value.object.getPtr(key).?.array.items) |*item| {
+            const relative = item.object.get("path").?.string;
+            item.object.getPtr("path").?.* = .{ .string = try std.fs.path.join(a, &.{ stage_root_path, relative }) };
+        }
+    }
+    for (private_value.object.getPtr("boots").?.array.items) |*entry| {
+        for ([_][]const u8{ "serial", "request", "report", "compute" }) |key| {
+            const item = entry.object.getPtr(key).?;
+            const relative = item.object.get("path").?.string;
+            item.object.getPtr("path").?.* = .{ .string = try std.fs.path.join(a, &.{ stage_root_path, relative }) };
+        }
+    }
+    const private_bytes = try fixtureCanonical(a, private_value);
+    try writeFixtureFile(io, root, "bundle.json", private_bytes);
+    try writeFixtureFile(io, root, "evidence/private-inspection-diagnostic.json", "{}\n");
+    {
+        var private_bundle = try controller.accepted_run.PrivateBundle.open(a, io, &directory, stage_root_path, reader_repository, local_tools, null);
+        defer private_bundle.deinit();
+        try private_bundle.revalidate(null);
+        try std.testing.expectError(error.InvalidContext, private_bundle.evidence.handoffV1());
+        const private_output = try std.fs.path.join(a, &.{ stage_root_path, "refused-private-output" });
+        try std.testing.expectError(error.AliasedOutput, controller.import_validator_build.runPrivate(a, io, &private_bundle, private_output, null));
+        var wrong_origin = private_bundle;
+        wrong_origin.evidence.context = .trusted_inner_zip;
+        try std.testing.expectError(error.InvalidContext, controller.import_validator_build.runPrivate(
+            a,
+            io,
+            &wrong_origin,
+            try std.fs.path.join(a, &.{ options.fixture_root, "refused-private-origin" }),
+            null,
+        ));
+        const private_run_name = try std.fmt.allocPrint(a, "{s}-private-revalidation", .{name});
+        defer parent.deleteTree(io, private_run_name) catch @panic("private revalidation cleanup failed");
+        try controller.import_validator_build.runPrivate(
+            a,
+            io,
+            &private_bundle,
+            try std.fs.path.join(a, &.{ options.fixture_root, private_run_name }),
+            null,
+        );
+        try private_bundle.revalidate(null);
+        {
+            var cancelled = try core.process.SignalCancellation.install();
+            defer cancelled.deinit();
+            try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.kill(std.os.linux.getpid(), .INT)));
+            try std.testing.expectError(error.Cancelled, private_bundle.revalidate(&cancelled));
+        }
+        const git_object_script =
+            \\import os, pathlib, subprocess, sys, zlib
+            \\root,git,revision,tree,action=sys.argv[1:]
+            \\path=pathlib.Path(root)/".git"/"objects"/revision[:2]/revision[2:]
+            \\saved=path.with_name(path.name+".fixture-saved")
+            \\if action=="replace":
+            \\    raw=subprocess.run([git,"-C",root,"cat-file","commit",revision],capture_output=True,check=True).stdout
+            \\    original,tail=raw.split(b"\n",1)
+            \\    assert original.startswith(b"tree ") and original!=b"tree "+tree.encode()
+            \\    changed=b"tree "+tree.encode()+b"\n"+tail
+            \\    path.parent.mkdir(mode=0o700,exist_ok=True)
+            \\    if path.exists():
+            \\        path.rename(saved)
+            \\    with path.open("xb") as output:
+            \\        output.write(zlib.compress(b"commit "+str(len(changed)).encode()+b"\0"+changed))
+            \\    path.chmod(0o600)
+            \\    observed=subprocess.run([git,"-C",root,"rev-parse","--verify",revision+"^{commit}"],capture_output=True)
+            \\    assert observed.returncode!=0 and b"hash mismatch "+revision.encode() in observed.stderr
+            \\else:
+            \\    path.unlink()
+            \\    if saved.exists():
+            \\        saved.rename(path)
+        ;
+        {
+            const replaced = try std.process.run(a, io, .{
+                .argv = &.{ options.python_executable, "-B", "-c", git_object_script, reader_repository, options.git_executable, source.revision, private_bundle.tools.before.tree, "replace" },
+                .stdout_limit = .limited(256),
+                .stderr_limit = .limited(2048),
+            });
+            try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, replaced.term);
+            defer {
+                const restored = std.process.run(a, io, .{
+                    .argv = &.{ options.python_executable, "-B", "-c", git_object_script, reader_repository, options.git_executable, source.revision, private_bundle.tools.before.tree, "restore" },
+                    .stdout_limit = .limited(256),
+                    .stderr_limit = .limited(2048),
+                }) catch @panic("historical object restore failed");
+                if (restored.term != .exited or restored.term.exited != 0)
+                    @panic("historical object restore failed");
+            }
+            try std.testing.expectError(error.GitExited, private_bundle.revalidate(null));
+        }
+        try private_bundle.revalidate(null);
+        try std.testing.expectError(error.InvalidContext, controller.import_validator_build.PortableTools.bindPrivate(
+            a,
+            io,
+            &accepted,
+            .null,
+            reader_repository,
+            self,
+            local_tools,
+            null,
+        ));
+        try root.rename("bundle.json", root, "original-private-manifest", io);
+        try writeFixtureFile(io, root, "bundle.json", private_bytes);
+        if (private_bundle.revalidate(null)) |_| return error.ReplacedPrivateManifestAccepted else |_| {}
+    }
+    try root.deleteFile(io, "bundle.json");
+    try root.deleteFile(io, "original-private-manifest");
+    try root.deleteFile(io, "evidence/private-inspection-diagnostic.json");
+    try qualifyLegacyLocalReadOnly(a, io, stage_root_path, source.revision);
+    try @import("local_acceptance_tests.zig").qualify(a, io, stage_root_path);
     const revalidated_name = try std.fmt.allocPrint(a, "{s}-native-revalidation", .{name});
     const revalidated_path = try std.fs.path.join(a, &.{ options.fixture_root, revalidated_name });
     defer parent.deleteTree(io, revalidated_name) catch @panic("legacy revalidation cleanup failed");
@@ -3456,6 +3640,130 @@ test "trusted historical inner stage accepts complete records and refuses tamper
     try std.testing.expectEqualStrings("", cli_refusal.stdout);
 }
 
+fn qualifyLegacyLocalReadOnly(a: std.mem.Allocator, io: std.Io, stage: []const u8, revision: []const u8) !void {
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "readonly-legacy-{d}", .{std.os.linux.getpid()});
+    const work_path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("legacy local reader cleanup failed");
+    const work = try parent.openDir(io, name, .{ .iterate = true });
+    defer work.close(io);
+    try work.createDir(io, "bin", .fromMode(0o700));
+    const bin = try work.openDir(io, "bin", .{});
+    defer bin.close(io);
+    try copyFixtureExecutable(io, a, options.git_executable, bin, "reader-git");
+    const git = try std.fs.path.join(a, &.{ work_path, "bin/reader-git" });
+    const repository = try std.fs.path.join(a, &.{ work_path, "producer" });
+    const runtime = try std.fs.path.join(a, &.{ work_path, "runtime" });
+    const script =
+        \\import hashlib,json,os,pathlib,shutil,subprocess,sys
+        \\os.umask(0o077)
+        \\git,source,stage,repository,runtime,revision,reader_git=sys.argv[1:]
+        \\stage,repository,runtime=map(pathlib.Path,(stage,repository,runtime))
+        \\original_lib=pathlib.Path(git).parent.parent/"lib"
+        \\if original_lib.is_dir():
+        \\    fixture_lib=pathlib.Path(reader_git).parent.parent/"lib"
+        \\    fixture_lib.mkdir(mode=0o700)
+        \\    for library in original_lib.iterdir():
+        \\        if library.is_file() and ".so" in library.name:
+        \\            target=fixture_lib/library.name
+        \\            shutil.copyfile(library,target)
+        \\            target.chmod(0o600)
+        \\subprocess.run([git,"-c","gc.auto=0","-c","maintenance.auto=false","clone","-q","--no-hardlinks","--",source,str(repository)],check=True)
+        \\subprocess.run([git,"-C",str(repository),"-c","gc.auto=0","-c","maintenance.auto=false","checkout","-q","--detach",revision],check=True)
+        \\def save(path,value):
+        \\    path.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+        \\    path.write_bytes((json.dumps(value,sort_keys=True,separators=(",",":"))+"\n").encode())
+        \\    path.chmod(0o600)
+        \\def copy(original,path):
+        \\    path.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+        \\    shutil.copyfile(original,path)
+        \\    path.chmod(0o600)
+        \\app=repository/"support/apps/wamr-aot"
+        \\for role,relative in {
+        \\    "efi":"build/wamr_hyperv-x86_64-efi","debug_elf":"build/wamr_hyperv-x86_64-efi.dbg",
+        \\    "bootinfo":"build/wamr_hyperv-x86_64-efi.bootinfo","config":".config",
+        \\    "runtime":"build/artifacts/libwamr-aot.a","compiler":"build/artifacts/wamrc",
+        \\    "wasm":"build/artifacts/tiny.wasm","cwasm":"build/artifacts/tiny.cwasm",
+        \\    "runtime_identity":"build/artifacts/identity.json","image_identity":"build/image-identity.json",
+        \\}.items():
+        \\    copy(stage/"artifacts"/role,app/relative)
+        \\for role,suffix in (("raw","raw"),("vhd","vhd")):
+        \\    copy(stage/"artifacts"/role,runtime/"compute/package"/("unikraft."+suffix))
+        \\for original in (stage/"evidence").iterdir():
+        \\    copy(original,runtime/"compute/evidence"/original.name)
+        \\result=json.loads((stage/"artifacts/local_result").read_bytes())
+        \\old="/d/wamr-ci/wamr-native-runtime"
+        \\def relocate(value):
+        \\    if isinstance(value,dict): return {key:relocate(part) for key,part in value.items()}
+        \\    if isinstance(value,list): return [relocate(part) for part in value]
+        \\    if isinstance(value,str) and value.startswith(old+"/"): return str(runtime)+value[len(old):]
+        \\    return value
+        \\for mode in result["modes"]:
+        \\    boot=runtime/"compute"/("boot-"+mode)
+        \\    request=relocate(json.loads((stage/"boots"/mode/"request").read_bytes()))
+        \\    save(boot/"request.json",request)
+        \\    copy(stage/"boots"/mode/"report",boot/"report.json")
+        \\    copy(stage/"boots"/mode/"serial",boot/"hyperv-efi-boot.log")
+        \\    evidence=json.loads((stage/"boots"/mode/"compute").read_bytes())
+        \\    evidence["request_sha256"]=hashlib.sha256((boot/"request.json").read_bytes()).hexdigest()
+        \\    path=runtime/"compute/evidence"/(mode+"-compute.json")
+        \\    save(path,evidence)
+        \\    result["records"][path.name]=hashlib.sha256(path.read_bytes()).hexdigest()
+        \\save(runtime/"compute/evidence/result.json",result)
+    ;
+    const prepared = try std.process.run(a, io, .{
+        .argv = &.{ options.python_executable, "-B", "-c", script, options.git_executable, options.repository_root, stage, repository, runtime, revision, git },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    if (prepared.term != .exited or prepared.term.exited != 0)
+        std.debug.print("legacy local fixture: {s}\n", .{prepared.stderr});
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, prepared.term);
+    const directory = try controller.layout.runtime(io, runtime);
+    defer directory.close(io);
+    try std.testing.expectError(error.InvalidEvidence, controller.accepted_run.openAndValidateReadOnlyWithSignal(a, io, .empty, &directory, runtime, repository, null));
+    var accepted = try controller.accepted_run.openAndValidateReadOnlyWithGit(a, io, .empty, &directory, runtime, repository, git, null);
+    defer accepted.deinit();
+    try accepted.revalidate();
+    try std.testing.expect(accepted.runtime_inputs.len >= 2);
+    const encoded = try accepted.handoffV1();
+    try std.testing.expect(std.mem.indexOf(u8, encoded, controller.accepted_run.readonly_git_role) != null);
+    try std.testing.expectError(error.MissingInput, controller.handoff_inspect.run(a, io, &accepted, try std.fs.path.join(a, &.{ work_path, "refused-export" }), true, null));
+    try std.testing.expectError(error.FileNotFound, work.openDir(io, "refused-export", .{}));
+    const emitted = try std.process.run(a, io, .{
+        .argv = &.{ options.host_controller_cli, "readonly-records", "--runtime", runtime, "--git", git, "--output", "handoff-v1" },
+        .cwd = .{ .path = repository },
+        .stdout_limit = .limited(2 * 1024 * 1024),
+        .stderr_limit = .limited(4096),
+    });
+    if (emitted.term != .exited or emitted.term.exited != 0)
+        std.debug.print("legacy local admission: {s}\n", .{emitted.stderr});
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, emitted.term);
+    try std.testing.expect(std.mem.indexOf(u8, emitted.stdout, "\"context\":\"local-runtime\"") != null);
+    const tracked_path = try std.fs.path.join(a, &.{ repository, "README.md" });
+    const tracked = try std.Io.Dir.openFileAbsolute(io, tracked_path, .{ .mode = .read_write, .follow_symlinks = false });
+    defer tracked.close(io);
+    try tracked.writePositionalAll(io, "\n", (try tracked.stat(io)).size);
+    try std.testing.expectError(error.DirtySource, accepted.revalidate());
+    var mutated_runtime = false;
+    for (accepted.runtime_inputs) |input| {
+        if (!std.mem.startsWith(u8, input.path, try std.fs.path.join(a, &.{ work_path, "lib/" }))) continue;
+        const changed = try std.Io.Dir.openFileAbsolute(io, input.path, .{ .mode = .read_write, .follow_symlinks = false });
+        defer changed.close(io);
+        try changed.writePositionalAll(io, "!", (try changed.stat(io)).size - 1);
+        try std.testing.expectError(error.InputChanged, accepted.revalidate());
+        mutated_runtime = true;
+        break;
+    }
+    try std.testing.expect(mutated_runtime);
+    const changed_git = try bin.openFile(io, "reader-git", .{ .mode = .read_write, .follow_symlinks = false });
+    defer changed_git.close(io);
+    try changed_git.writePositionalAll(io, "!", (try changed_git.stat(io)).size - 1);
+    try std.testing.expectError(error.FileChanged, accepted.revalidate());
+}
+
 test "v1 and v2 frozen result evidence sets reject rehashed fields" {
     const allocator = std.testing.allocator;
     for ([_]bool{ false, true }) |v2| {
@@ -3512,6 +3820,23 @@ test "v1 and v2 frozen result evidence sets reject rehashed fields" {
 
 test "v2 results bind every supervised stage; v1 remains read-only compatible" {
     const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tool_hash = std.fmt.bytesToHex(controller.records.fileIdentity("historical tool"), .lower);
+    var tools = std.json.Value{ .object = .empty };
+    for (controller.input_custody.host_tools) |name|
+        try tools.object.put(a, name, .{ .string = &tool_hash });
+    try controller.accepted_run.Fixture.importedTools(tools, true);
+    try std.testing.expectError(error.InvalidInputCustody, controller.accepted_run.Fixture.importedTools(tools, false));
+    try tools.object.put(a, "head", .{ .string = &tool_hash });
+    try tools.object.put(a, "timeout", .{ .string = &tool_hash });
+    try controller.accepted_run.Fixture.importedTools(tools, false);
+    try std.testing.expectError(error.InvalidInputCustody, controller.accepted_run.Fixture.importedTools(tools, true));
+    _ = tools.object.swapRemove("head");
+    try tools.object.put(a, "unexpected", .{ .string = &tool_hash });
+    try std.testing.expectError(error.InvalidEvidence, controller.accepted_run.Fixture.importedTools(tools, false));
+
     const bare_v1 = try fixture(allocator, false, false);
     defer allocator.free(bare_v1);
     const legacy = try core.contracts.Document.parse(allocator, bare_v1, .{});
@@ -3763,6 +4088,24 @@ test "native clean Git custody, stable physical identities and pinned archive re
         allocator.free(captured.custody.object_format);
     }
     try std.testing.expectEqual(@as(usize, 4), captured.custody.files);
+    {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const start = try std.json.parseFromSliceLeaky(std.json.Value, a, try fixtureCanonical(a, .{
+            .source = .{ .revision = captured.revision, .tree = captured.tree },
+            .source_custody = captured.custody,
+        }), .{ .parse_numbers = false });
+        const recorded = try controller.local_consumer_custody.Fixture.requireRecordedSource(a, io, path, options.git_executable, start, true);
+        try std.testing.expect(captured.same(recorded));
+        try std.testing.expectError(error.FileNotFound, controller.local_consumer_custody.Fixture.requireRecordedSource(a, io, path, options.git_executable, start, false));
+        var changed_start = start;
+        changed_start.object.getPtr("source").?.object.getPtr("tree").?.* = .{ .string = "0000000000000000000000000000000000000000" };
+        try std.testing.expectError(error.RecordedCustodyChanged, controller.local_consumer_custody.Fixture.requireRecordedSource(a, io, path, options.git_executable, changed_start, true));
+        changed_start.object.getPtr("source").?.object.getPtr("tree").?.* = .{ .string = captured.tree };
+        changed_start.object.getPtr("source_custody").?.object.getPtr("physical_sha256").?.* = .{ .string = "0000000000000000000000000000000000000000000000000000000000000000" };
+        try std.testing.expectError(error.RecordedCustodyChanged, controller.local_consumer_custody.Fixture.requireRecordedSource(a, io, path, options.git_executable, changed_start, true));
+    }
     var signal = try controller.build_pipeline.installCancellation();
     defer signal.deinit();
     var empty: [0]u8 = .{};

@@ -904,14 +904,20 @@ def prepare_azure_runtime(output, azure, az_python, stdlib, *,
     return value
 
 
-def _native_local_result(root):
-    """Accept a native-produced v2 run through its bound controller."""
+def _native_local_result(root, *, readonly=False, git=None):
+    """Use distinct native production and read-only admission policies."""
     ci.require(root.name == "compute" and root.is_absolute(),
                "local compute root required")
-    accepted = accepted_records.local_runtime(root.parent)
-    ci.require(accepted["compatibility"] == "tiny-v2"
-               and accepted["profile"] == ci.CURRENT_PROFILE
-               and accepted["modes"] == list(ci.SIX_MODES),
+    if readonly:
+        accepted = accepted_records.readonly_local_runtime(
+            root.parent, **({"git": git} if git is not None else {}))
+    else:
+        accepted = accepted_records.local_runtime(root.parent)
+    legacy = accepted["compatibility"] == "tiny-v1"
+    ci.require((readonly or not legacy)
+               and accepted["profile"] == (None if legacy else ci.CURRENT_PROFILE)
+               and accepted["modes"] == list(
+                   ci.MODES if legacy else ci.SIX_MODES),
                "unexpected native local modes")
     records = {record["name"]: record["sha256"]
                for record in accepted["records"]}
@@ -1010,7 +1016,7 @@ def _local_result(root):
     return result
 
 
-def _selected_records(root, result):
+def _selected_records_oracle(root, result):
     if result["schema_version"] == 1:
         accepted, records = None, _historical_v1_records(root, result)
     else:
@@ -1036,6 +1042,46 @@ def _selected_records(root, result):
 
 
 def result_records(root):
+    """Retained offline Python oracle; operational acceptance uses native code."""
+    unused_accepted, records = _selected_records_oracle(root, _local_result(root))
+    return records
+
+
+def _selected_records(root, result):
+    git = None
+    if result["schema_version"] == 1:
+        readonly = True
+        start = ci.document(root / "evidence/build-start.json")
+        ci.require(type(start) is dict, "historical v1 source required")
+        if "consumer_inputs" not in start:
+            git = Path(ci.tool("git")).resolve(strict=True)
+    else:
+        start = ci.document(root / "evidence/build-start.json")
+        ci.require(
+            type(start) is dict
+            and type(start.get("consumer_inputs")) is dict
+            and type(start["consumer_inputs"].get("files")) is dict
+            and type(start["consumer_inputs"]["files"].get(
+                "command-supervisor")) is dict,
+            "local v2 producer custody required")
+        supervisor = start["consumer_inputs"]["files"][
+            "command-supervisor"].get("path")
+        readonly = supervisor == str(
+            root / "supervisor/bin/wamr-ci-supervisor")
+        ci.require(
+            readonly or supervisor == str(
+                root.parent / "controller/bin/uk-wamr-native-ci"),
+            "unsupported local v2 producer")
+    accepted, records = _native_local_result(root, readonly=readonly, git=git)
+    ci.require(
+        accepted["compatibility"] == (
+            "tiny-v1" if result["schema_version"] == 1 else "tiny-v2")
+        and _local_result(root) == result,
+        "local result changed")
+    return accepted, records
+
+
+def accepted_result_records(root):
     unused_accepted, records = _selected_records(root, _local_result(root))
     return records
 
@@ -1053,12 +1099,16 @@ def export(runtime, output, *, on_phase=None):
     result = _local_result(root)
     version = result["schema_version"]
     accepted, records = _selected_records(root, result)
-    modes = ci.MODES if version == 1 else (
-        ci.SIX_MODES if accepted is None else tuple(accepted["modes"]))
+    ci.require(accepted is not None, "native local acceptance required")
+    modes = tuple(accepted["modes"])
     names = NAMES if version == 1 else V2_NAMES
     expected = ci.document(root / "evidence/build-start.json")
     legacy_supervision = "command_supervisor" not in expected
-    ci.require(accepted is None or not legacy_supervision,
+    supervisor = expected.get("consumer_inputs", {}).get(
+        "files", {}).get("command-supervisor", {}).get("path")
+    native_produced = (
+        supervisor == str(runtime / "controller/bin/uk-wamr-native-ci"))
+    ci.require(not native_produced or not legacy_supervision,
                "native command supervision required")
     if not legacy_supervision:
         ci.COMMAND_ENVIRONMENT.update(ci.bind_command_tools(
@@ -1069,47 +1119,15 @@ def export(runtime, output, *, on_phase=None):
         supervisor_path = ci.bind_command_supervisor(
             expected["consumer_inputs"])
         ci.COMMAND_ENVIRONMENT["WAMR_CI_SUPERVISOR"] = supervisor_path
-    native_produced = accepted is not None and not legacy_supervision
-    if native_produced:
-        build = ci.document(root / "evidence/build.json")
-        ci.require(build["source"] == accepted["source"], "native source changed")
-        phase("inspect")
-        inspected_output, unused_inspected_command = (
-            accepted_records.handoff_inspect(runtime, output))
-        del unused_inspected_command
-        for name in ("artifacts", "boots"):
-            (output / name).mkdir(mode=0o700)
-    else:
-        phase("custody")
-        before = ci.producer_inputs(runtime, expected["consumer_inputs"])
-        ci.require(before == expected,
-                   "producer inputs changed")
-        phase("build")
-        build = ci.check_build()
-        ci.require(build == ci.document(root / "evidence/build.json"), "build changed")
-        inputs = ci.document(root / "evidence/boot-inputs.json")
-        tools = {"package_tool": root / "tools/bin/wamr-ci-package",
-                 "local_boot_tool": root / "tools/bin/uk-hyperv-local-boot",
-                 "qemu": runtime / "bin/qemu-system-x86_64",
-                 "ovmf_code": runtime / "firmware/code.fd",
-                 "ovmf_vars": runtime / "firmware/vars.fd",
-                 "efi": ci.APP / "build" / ci.EFI}
-        phase("boots")
-        ci.boot_input_state(runtime, tools, expected=inputs)
-        for i, mode in enumerate(modes):
-            checked = ci.check_boot(
-                ci.config_for(runtime, root, i, modes), build["runtime"], inputs,
-                consumer_inputs=expected["consumer_inputs"])
-            ci.require(checked == ci.document(root / "evidence" / (mode + "-compute.json")),
-                       "physical local result changed")
-        ci.require_build_custody(runtime, before)
-        phase("inspect")
-        inspected_output, unused_inspected_command = (
-            accepted_records.handoff_inspect(
-                runtime, output, legacy=legacy_supervision))
-        del unused_inspected_command
-        for name in ("artifacts", "boots"):
-            (output / name).mkdir(mode=0o700)
+    build = ci.document(root / "evidence/build.json")
+    ci.require(build["source"] == accepted["source"], "native source changed")
+    phase("inspect")
+    inspected_output, unused_inspected_command = (
+        accepted_records.handoff_inspect(
+            runtime, output, legacy=legacy_supervision))
+    del unused_inspected_command
+    for name in ("artifacts", "boots"):
+        (output / name).mkdir(mode=0o700)
     inspected = ci.document(inspected_output)
     packaged = ci.document(root / "evidence/package.json")
     ci.require(inspected["producer_sha256"] == packaged["producer_sha256"]
@@ -1181,15 +1199,8 @@ def export(runtime, output, *, on_phase=None):
     evidence = [retain(root / "evidence" / name, output / "evidence" / name)
                 for name in sorted(records)]
     phase("recheck")
-    if native_produced:
-        ci.require(result_records(root) == records,
-                   "inputs changed during handoff")
-    else:
-        ci.require(result_records(root) == records and ci.check_build() == build
-                   and ci.producer_inputs(
-                       runtime, expected["consumer_inputs"]) == before,
-                   "inputs changed during handoff")
-        ci.boot_input_state(runtime, tools, content=True, expected=inputs)
+    ci.require(accepted_result_records(root) == records,
+               "inputs changed during handoff")
     by_name = dict(zip(names, artifacts))
     bundle = {
         "schema": "uk.wamr.local-image-handoff", "version": 1,

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 const std = @import("std");
-const layout = @import("layout.zig");
+const layout = @import("wamr_controller").handoff_contracts.layout;
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Crc32 = std.hash.Crc32;

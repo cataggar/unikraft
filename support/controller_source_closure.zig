@@ -61,7 +61,7 @@ pub const previous_entries = [_]Entry{
     .{ .name = "support/tools/hyperv/sha256_clear_upper.S", .content = @embedFile("tools/hyperv/sha256_clear_upper.S") },
 };
 
-pub const entries = blk: {
+pub const previous_native_entries = blk: {
     @setEvalBranchQuota(100_000);
     var all = previous_entries ++ import_validator_entries;
     @import("std").mem.sort(Entry, &all, {}, struct {
@@ -70,6 +70,23 @@ pub const entries = blk: {
         }
     }.less);
     break :blk all;
+};
+
+pub const entries = blk: {
+    @setEvalBranchQuota(100_000);
+    var all = previous_native_entries ++ private_consumer_entries;
+    @import("std").mem.sort(Entry, &all, {}, struct {
+        fn less(_: void, first: Entry, second: Entry) bool {
+            return @import("std").mem.lessThan(u8, first.name, second.name);
+        }
+    }.less);
+    break :blk all;
+};
+
+const private_consumer_entries = [_]Entry{
+    .{ .name = "support/build/wamr-native-ci/handoff/contracts.zig", .content = @embedFile("build/wamr-native-ci/handoff/contracts.zig") },
+    .{ .name = "support/build/wamr-native-ci/handoff/layout.zig", .content = @embedFile("build/wamr-native-ci/handoff/layout.zig") },
+    .{ .name = "support/build/wamr-native-ci/handoff/profile.zig", .content = @embedFile("build/wamr-native-ci/handoff/profile.zig") },
 };
 
 const import_validator_entries = [_]Entry{

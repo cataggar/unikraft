@@ -30,6 +30,34 @@ pub const PortableTools = struct {
     validator: files.RetainedFile,
     runtime: std.ArrayList(RuntimePin),
     before: source.Source,
+    producer_source: ?ProducerSource = null,
+
+    const ProducerSource = struct {
+        revision: [40]u8,
+        tree: [40]u8,
+        map: ?[]const u8,
+
+        fn verify(self: ProducerSource, allocator: std.mem.Allocator, io: std.Io, repository: []const u8, git: []const u8, signal: ?*core.process.SignalCancellation) !void {
+            var scratch = std.heap.ArenaAllocator.init(allocator);
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            const identity = accepted_run.SourceIdentity{ .revision = &self.revision, .tree = &self.tree };
+            if (self.map) |raw| {
+                var document = try contracts.Document.parse(a, raw, .{
+                    .bytes = records.max_record_bytes,
+                    .depth = 32,
+                    .items = 4096,
+                    .tokens = 65536,
+                });
+                defer document.deinit();
+                _ = try supervisor_identity.verifyGitSource(a, io, identity, repository, git, document.value(), signal);
+            } else {
+                try supervisor_identity.verifyGitIdentity(a, io, identity, repository, git, signal);
+            }
+        }
+    };
+
+    const BindingPolicy = enum { producer, legacy_reader, private_reader };
 
     pub fn bind(
         allocator: std.mem.Allocator,
@@ -42,7 +70,7 @@ pub const PortableTools = struct {
         local: LocalTools,
         signal: ?*core.process.SignalCancellation,
     ) !PortableTools {
-        return bindWithPolicy(allocator, io, context, identity, start, repository, controller_path, local, signal, false);
+        return bindWithPolicy(allocator, io, context, identity, start, repository, controller_path, local, signal, .producer);
     }
 
     fn bindLegacy(
@@ -57,7 +85,21 @@ pub const PortableTools = struct {
     ) !PortableTools {
         if (accepted.compatibility != .tiny_v1_legacy)
             return error.InvalidContext;
-        return bindWithPolicy(allocator, io, accepted.context, accepted.source, start, repository, controller_path, local, signal, true);
+        return bindWithPolicy(allocator, io, accepted.context, accepted.source, start, repository, controller_path, local, signal, .legacy_reader);
+    }
+
+    pub fn bindPrivate(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        accepted: *accepted_run.AcceptedRun,
+        start: std.json.Value,
+        repository: []const u8,
+        controller_path: []const u8,
+        local: LocalTools,
+        signal: ?*core.process.SignalCancellation,
+    ) !PortableTools {
+        if (accepted.context != .private_bundle) return error.InvalidContext;
+        return bindWithPolicy(allocator, io, accepted.context, accepted.source, start, repository, controller_path, local, signal, .private_reader);
     }
 
     fn bindWithPolicy(
@@ -70,9 +112,11 @@ pub const PortableTools = struct {
         controller_path: []const u8,
         local: LocalTools,
         signal: ?*core.process.SignalCancellation,
-        legacy: bool,
+        policy: BindingPolicy,
     ) !PortableTools {
-        if (context != .trusted_inner_zip) return error.InvalidContext;
+        if ((policy == .private_reader and context != .private_bundle) or
+            (policy != .private_reader and context != .trusted_inner_zip))
+            return error.InvalidContext;
         if (signal) |active|
             if (active.flag().load(.acquire)) return error.Cancelled;
         var git = try adapter.openPinnedTool(io, local.git, "tool:git");
@@ -97,9 +141,17 @@ pub const PortableTools = struct {
         try native.verify(io);
         try validator.verify(io);
         for (runtime.items) |*entry| try entry.file.verify(io);
-        var supervisor = if (legacy) blk: {
-            // Historical v1 predates recorded supervisor custody. Its reader
-            // uses the current native owner, never an unauthenticated old tool.
+        if (policy == .private_reader) {
+            if (start.object.contains("command_supervisor")) {
+                const source_map = try get(try get(start, "command_supervisor"), "source_map");
+                _ = try supervisor_identity.verifyGitSource(allocator, io, identity, repository, local.git, source_map, signal);
+            } else {
+                try supervisor_identity.verifyGitIdentity(allocator, io, identity, repository, local.git, signal);
+            }
+        }
+        var supervisor = if (policy != .producer) blk: {
+            // Read-only consumers bind the current owner separately from the
+            // historical producer's recorded supervisor identity.
             var retained = try files.RetainedFile.open(io, local.supervisor, .tool);
             errdefer retained.close(io);
             break :blk supervisor_identity.PinnedRuntime{
@@ -125,12 +177,27 @@ pub const PortableTools = struct {
 
         try git.verify(io);
         const before = try source.portableSource(allocator, io, repository, local.git);
+        errdefer {
+            allocator.free(before.revision);
+            allocator.free(before.tree);
+            allocator.free(before.custody.object_format);
+        }
         if (!std.mem.eql(u8, before.custody.object_format, "sha1") or
-            (!legacy and (!std.mem.eql(u8, before.revision, identity.revision) or
+            (policy == .producer and (!std.mem.eql(u8, before.revision, identity.revision) or
                 !std.mem.eql(u8, before.tree, identity.tree))))
             return error.ImportSourceChanged;
-        if (!legacy) try checkoutSource(before, start);
+        if (policy == .producer) try checkoutSource(before, start);
         try source.verifyPhysical(io, allocator, repository);
+        var producer_source: ?ProducerSource = null;
+        errdefer if (producer_source) |proof| if (proof.map) |raw| allocator.free(raw);
+        if (policy == .private_reader) {
+            const map = if (start.object.get("command_supervisor")) |record| blk: {
+                const raw = try std.json.Stringify.valueAlloc(allocator, try get(record, "source_map"), .{});
+                defer allocator.free(raw);
+                break :blk try records.canonicalAlloc(allocator, raw);
+            } else null;
+            producer_source = .{ .revision = identity.revision[0..40].*, .tree = identity.tree[0..40].*, .map = map };
+        }
         var result = PortableTools{
             .allocator = allocator,
             .git = git,
@@ -139,16 +206,31 @@ pub const PortableTools = struct {
             .validator = validator,
             .runtime = runtime,
             .before = before,
+            .producer_source = producer_source,
         };
-        try result.verify(io, repository, local.git);
+        try result.verifyWithSignal(io, repository, local.git, signal);
         return result;
     }
 
     pub fn verify(self: *PortableTools, io: std.Io, repository: []const u8, git: []const u8) !void {
+        return self.verifyWithSignal(io, repository, git, null);
+    }
+
+    pub fn verifyWithSignal(self: *PortableTools, io: std.Io, repository: []const u8, git: []const u8, signal: ?*core.process.SignalCancellation) !void {
+        if (signal) |active|
+            if (active.flag().load(.acquire)) return error.Cancelled;
         try self.verifyExecutables(io);
+        if (self.producer_source) |proof| try proof.verify(self.allocator, io, repository, git, signal);
         const after = try source.portableSource(self.allocator, io, repository, git);
+        defer {
+            self.allocator.free(after.revision);
+            self.allocator.free(after.tree);
+            self.allocator.free(after.custody.object_format);
+        }
         if (!self.before.same(after)) return error.SourceChanged;
         try self.verifyExecutables(io);
+        if (signal) |active|
+            if (active.flag().load(.acquire)) return error.Cancelled;
     }
 
     fn verifyExecutables(self: *PortableTools, io: std.Io) !void {
@@ -166,6 +248,10 @@ pub const PortableTools = struct {
         self.validator.close(io);
         for (self.runtime.items) |*entry| entry.deinit(self.allocator, io);
         self.runtime.deinit(self.allocator);
+        if (self.producer_source) |proof| if (proof.map) |raw| self.allocator.free(raw);
+        self.allocator.free(self.before.revision);
+        self.allocator.free(self.before.tree);
+        self.allocator.free(self.before.custody.object_format);
     }
 };
 
@@ -273,7 +359,7 @@ pub fn runPortable(
     defer pinned_candidate.close(io);
     if (!std.meta.eql(observed.metadata, physical.metadata(pinned_candidate.file_snapshot)))
         return error.CandidateChanged;
-    try authenticated.verify(io, repository, local.git);
+    try authenticated.verifyWithSignal(io, repository, local.git, signal);
     try accepted.revalidateWithSignal(signal);
     _ = try revalidateHandoffCommand(allocator, io, .{
         .source_root = repository,
@@ -288,10 +374,55 @@ pub fn runPortable(
         .bundle = candidate_path,
         .tools = @splat(""),
     }, private, evidence, signal);
-    try authenticated.verify(io, repository, local.git);
+    try authenticated.verifyWithSignal(io, repository, local.git, signal);
     try accepted.revalidateWithSignal(signal);
     try pinned_start.verify(io);
     try pinned_candidate.verify(io);
+}
+
+pub fn runPrivate(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    bundle: *accepted_run.PrivateBundle,
+    output: []const u8,
+    signal: ?*core.process.SignalCancellation,
+) !void {
+    if (bundle.evidence.context != .private_bundle or bundle.evidence.repository == null)
+        return error.InvalidContext;
+    try files.absoluteFilePath(output);
+    if (contained(output, bundle.evidence.root) or contained(output, bundle.evidence.repository.?) or
+        contained(bundle.evidence.root, output) or contained(bundle.evidence.repository.?, output))
+        return error.AliasedOutput;
+    try bundle.revalidate(signal);
+    const parent_path = std.fs.path.dirname(output) orelse return error.UnsafePath;
+    const name = std.fs.path.basename(output);
+    try files.basename(name);
+    const parent = try files.openDirectory(io, parent_path, .private);
+    defer parent.close(io);
+    try parent.createDir(io, name, .fromMode(0o700));
+    const work = try files.openDirectory(io, output, .private);
+    defer work.close(io);
+    for ([_][]const u8{ "private", "evidence" }) |entry|
+        try work.createDir(io, entry, .fromMode(0o700));
+    const private = try work.openDir(io, "private", .{ .iterate = true });
+    defer private.close(io);
+    const evidence = try work.openDir(io, "evidence", .{ .iterate = true });
+    defer evidence.close(io);
+    try bundle.revalidate(signal);
+    _ = try revalidateHandoffCommand(allocator, io, .{
+        .source_root = bundle.evidence.repository.?,
+        .work = output,
+        .runtime = bundle.evidence.root,
+        .zig = "",
+        .producer = "",
+        .supervisor = bundle.tools.supervisor.supervisor.path,
+        .package_tool = "",
+        .validator = "",
+        .direct_validator = bundle.tools.validator.path,
+        .bundle = try std.fs.path.join(allocator, &.{ bundle.evidence.root, "bundle.json" }),
+        .tools = @splat(""),
+    }, private, evidence, signal);
+    try bundle.revalidate(signal);
 }
 
 fn get(value: std.json.Value, key: []const u8) !std.json.Value {

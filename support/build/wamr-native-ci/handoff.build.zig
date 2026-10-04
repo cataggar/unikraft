@@ -39,6 +39,12 @@ pub fn build(b: *std.Build) void {
             .{ .name = "hyperv_core", .module = core },
             .{ .name = "wamr_log_validator", .module = validator },
             .{ .name = "controller_source_closure", .module = source_closure },
+            .{ .name = "handoff_contracts", .module = b.createModule(.{
+                .root_source_file = b.path("handoff/contracts.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "hyperv_core", .module = core }},
+            }) },
         },
     });
     const tests = b.addTest(.{

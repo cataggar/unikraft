@@ -107,10 +107,47 @@ off-runner, and historical Python-produced trusted-v2 imports retain Python supe
 revalidation with the caller-supplied validator. Native-produced v2 local
 handoff requires native acceptance before using its result-record hashes and
 source identity, and its local inspection is routed through the recorded
-runtime controller. A Python-produced local run retains the pinned Python
-source-custody path for result-record selection; it is accepted by the native
-controller only for the v2 handoff inspection route; historical v1 local
-handoff inspection is confined to the explicit legacy action. `records
+runtime controller. Operational Python-produced v2 and historical v1 local
+record selection instead uses the explicit
+`readonly-records --runtime ABS --output handoff-v1` operation. It reuses native
+selected-artifact, packaging, boot and image-chain validation, with recorded
+local input custody. Historical local-v1 admission also recaptures the complete
+recorded Git checkout before and after selected evidence validation and retains
+that physical source snapshot for later rechecks. Later historical producers
+require their original recorded input custody. The earliest pinned v1 sources
+instead require explicit `--git ABS` for records-only admission: the current
+reader Git executable is retained under its own role, not fabricated as
+producer custody. Missing original supervisor custody still refuses handoff
+inspection/export. Neither path admits a v1 producer or falls back to Python.
+Later pre-supervisor v1 source identities retain their exact historical
+21-tool inventory, including `head` and `timeout`; supervised v2 keeps the
+current exact 19-tool inventory.
+Later local-v1 constructors also close the build/boot role and fixed-path sets
+before recapturing files, runtime loaders/libraries, trees and ancestry; an
+extra recorded executable cannot be admitted merely by resealing its custody
+digest. Original dependency restore/package custody and Bison content are
+recaptured as well, and v2 supervisor source/runtime maps must match the real
+producer files and executable runtime, not just internally consistent seals.
+Read-only local cleanup proof retains its collected physical artifact snapshot;
+the production-native owner's wrapper cleanup remains export-owned custody.
+The complete local constructor fixture covers all three later v1
+source/tree pairs and a separate historical Python-v2 checkout. It uses real
+Git objects and physical Python scans, real native packaging/QCOW2/VHD
+production, and actual constructor/recheck/CLI routes. Its command/serial
+fixtures are synthetic and do not claim guest or hardware acceptance.
+Read-only Python-v2 custody checks bind the complete recorded producer checkout,
+not the newer reader's compiled source bytes, and recapture the original input
+roles and physical identities unchanged. The production local-consumer probe
+still requires its compiled producer source closure.
+The direct controller runner forwards explicit runner arguments, so seeded
+qualification uses `test-controller-direct -- --seed=0x6f59af14` (not just the
+build runner's seed). `-Dtest-filter='trusted historical inner stage'` selects
+the bounded complete-local fixture without changing the frozen declarations.
+For diagnosis only, `-Dlocal-fixture-source=REVISION` selects one of its four
+recorded producer vectors; the default qualification executes all four.
+The Python `result_records` function remains an offline scanning oracle;
+`accepted_result_records` and actual export use native acceptance. Historical
+v1 local handoff inspection remains confined to the explicit legacy action. `records
 --runtime` and `public-validator-build --runtime` remain native-produced
 local-runtime gates.
 The digest-pinned local-consumer custody probe admits both recorded v2
@@ -210,8 +247,8 @@ explicit handoff option is present, before writing
 transport or candidate records; native refusal fails the import with no Python
 fallback. Default Python-produced
 trusted-v2 imports (including the documented off-runner operator flow),
-historical revisions, unavailable recorded-tool imports, v1 imports, and
-Python-produced producer-direct/local revalidation remain Python-owned because
+historical v2 revisions, unavailable recorded-tool imports, and
+Python-produced producer-direct revalidation remain Python-owned because
 they either need
 the caller-supplied validator or do not satisfy the pristine same-revision
 trusted-stage preconditions. Native-produced production imports bind the
@@ -248,8 +285,32 @@ checkout must be clean, match the owner's embedded tracked source closure,
 and remain unchanged throughout bounded native supervision. It is not required
 to masquerade as the historical producer checkout. No v1 build, boot,
 validator-build, profile admission, or Python fallback is enabled.
-The Python-owned archive/operator plumbing remains until its separate wiring
-cutover; merely adding this operation does not retire the Python controller.
+The historical archive/operator router now selects this native read-only
+operation before writing candidate records, using the current native supervisor
+and its build-derived validator. Its independent Python publication-record
+oracle and final publication barriers remain. The standalone supervisor's
+historical identity contract remains available; this route does not execute it
+or retire the Python controller.
+
+The separate native `accepted_run.PrivateBundle` owns an actual private
+`bundle.json`, not a fabricated public-source envelope. It validates the existing
+absolute-root v1/v2 contract and all selected bytes, retains the original
+manifest descriptor, and authenticates the current native reader, Git,
+supervisor, validator and runtime closure before and after use. Historical
+v1 source/tree identities and v2 producer source maps are checked against Git
+objects independently of the current reader checkout. The owner retains those
+claims and repeats their Git proof at every recheck. Inspection diagnostics outside the selected
+evidence list are not acceptance evidence. Private views cannot serialize as
+trusted-inner-ZIP records; `import_validator_build.runPrivate` accepts the
+authenticated owner and supervises its real manifest. This is a library
+foundation only, not a private export command or a v1 production entry point.
+
+`reader-source-closure --git ABS --output sha256-v1` checks the current native
+reader's embedded source inputs against a clean, unchanged Git checkout. It
+does not physically read `run.py`. The separate `supervisor-source-closure`
+query and historical source-name/Git-blob admission sets remain unchanged for
+the standalone supervisor and archived producers. Adding the private contract
+dependency preserves both prior native source-name sets.
 
 `local-consumer-custody --runtime ABS --expected-build-start-sha256 HEX
 --expected-boot-inputs-sha256 HEX` is the production owner for a completed
@@ -782,7 +843,8 @@ artifact.
 From a checkout with Zig 0.16:
 
 ```sh
-mkdir -p .d/wamr-ci-check/{cache,global-cache/tmp,scratch,restore,out}
+umask 077
+mkdir -p .d/wamr-ci-check/{cache,global-cache/tmp,scratch,restore,out,fixtures}
 export TMPDIR="$PWD/.d/wamr-ci-check/scratch"
 export ZIG_GLOBAL_CACHE_DIR="$PWD/.d/wamr-ci-check/global-cache"
 cp support/tools/hyperv/local_boot/build.zig \

@@ -1,6 +1,19 @@
 const std = @import("std");
 const controller_target = @import("controller/target.zig");
 
+fn handoffContracts(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, core: *std.Build.Module) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("handoff/contracts.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "hyperv_core", .module = core }},
+    });
+}
+
+fn wamrAotBuild(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Dependency {
+    return b.dependency("wamr_aot_build", .{ .target = target, .optimize = optimize });
+}
+
 pub fn build(b: *std.Build) void {
     const requested_target = b.standardTargetOptionsQueryOnly(.{});
     const target = b.resolveTargetQuery(requested_target);
@@ -70,10 +83,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(supervisor_fixture);
 
     const image = b.dependency("public_image", .{ .target = target, .optimize = optimize }).module("hyperv_public_image");
-    const wamr_aot_build = b.dependency("wamr_aot_build", .{
-        .target = target,
-        .optimize = optimize,
-    });
+    const wamr_aot_build = wamrAotBuild(b, target, optimize);
     b.installArtifact(wamr_aot_build.artifact("uk-wamr-aot-build"));
     const root = b.createModule(.{
         .root_source_file = b.path("package.zig"),
@@ -119,6 +129,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "wamr_log_validator", .module = portable_validator },
             .{ .name = "controller_source_closure", .module = source_closure_module },
             .{ .name = "import_validator_identity", .module = portable_identity },
+            .{ .name = "handoff_contracts", .module = handoffContracts(b, portable_target, optimize, portable_core) },
         },
     });
     const controller_cli = b.addExecutable(.{
@@ -150,11 +161,13 @@ pub fn build(b: *std.Build) void {
         "Existing absolute owner-only runtime directory for create-only controller install",
     ) orelse "";
     const controller_options = b.addOptions();
+    controller_options.addOption([]const u8, "local_fixture_source", b.option([]const u8, "local-fixture-source", "Select one complete historical local fixture revision for diagnosis") orelse "");
     controller_options.addOption([]const u8, "repository_root", std.fs.path.resolve(b.allocator, &.{ b.graph.cache.cwd, b.build_root.path orelse ".", "../../.." }) catch
         @panic("cannot resolve source root"));
     controller_options.addOption([]const u8, "zig_executable", b.graph.zig_exe);
     controller_options.addOption([]const u8, "git_executable", b.findProgram(&.{"git"}, &.{}) catch @panic("Git required for controller custody tests"));
     controller_options.addOption([]const u8, "python_executable", b.findProgram(&.{"python3"}, &.{}) catch @panic("Python required for handoff compatibility fixtures"));
+    controller_options.addOptionPath("miz_package", b.dependency("public_image", .{ .target = target, .optimize = optimize }).builder.dependency("miz_source", .{ .target = target, .optimize = optimize }).path("."));
     controller_options.addOption([]const u8, "fixture_root", std.fs.path.resolve(b.allocator, &.{
         b.graph.cache.cwd, b.cache_root.path orelse ".",
     }) catch @panic("cannot resolve private controller test root"));
@@ -185,6 +198,30 @@ pub fn build(b: *std.Build) void {
             .{ .name = "local_boot_serial", .module = host_serial },
         },
     });
+    const host_package = b.addExecutable(.{
+        .name = "wamr-ci-package-host-local-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("package.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "public_image", .module = b.dependency("public_image", .{ .target = b.graph.host, .optimize = optimize }).module("hyperv_public_image") }},
+        }),
+    });
+    controller_options.addOptionPath("host_package_cli", host_package.getEmittedBin());
+    const host_log_cli = b.addExecutable(.{
+        .name = "uk-wamr-log-validate-host-local-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("../../apps/wamr-aot/validator/main.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wamr_log_validator", .module = host_validator },
+                .{ .name = "hyperv_core", .module = host_core },
+            },
+        }),
+    });
+    controller_options.addOptionPath("host_log_validator", host_log_cli.getEmittedBin());
+    controller_options.addOptionPath("host_aot_build", wamrAotBuild(b, b.graph.host, optimize).artifact("uk-wamr-aot-build").getEmittedBin());
     const host_controller = b.createModule(.{
         .root_source_file = b.path("controller/root.zig"),
         .target = b.graph.host,
@@ -194,6 +231,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "wamr_log_validator", .module = host_validator },
             .{ .name = "controller_source_closure", .module = host_closure },
             .{ .name = "import_validator_identity", .module = host_identity },
+            .{ .name = "handoff_contracts", .module = handoffContracts(b, b.graph.host, optimize, host_core) },
         },
     });
     const host_cli = b.addExecutable(.{
@@ -233,6 +271,7 @@ pub fn build(b: *std.Build) void {
             "install-controller requires -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=ReleaseSafe",
         ).step);
     const controller_tests = b.addTest(.{
+        .filters = b.option([]const []const u8, "test-filter", "Select bounded controller fixtures") orelse &.{},
         .root_module = b.createModule(.{
             .root_source_file = b.path("controller/tests.zig"),
             .target = b.graph.host,
@@ -271,6 +310,7 @@ pub fn build(b: *std.Build) void {
     const controller_run = b.addRunArtifact(controller_tests);
     const controller_direct = b.addSystemCommand(&.{"/usr/bin/env"});
     controller_direct.addFileArg(controller_tests.getEmittedBin());
+    if (b.args) |args| controller_direct.addArgs(args);
     b.step("test-controller-direct", "Run host controller tests with direct failure output")
         .dependOn(&controller_direct.step);
     const install_target_tests = b.addTest(.{
@@ -432,6 +472,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "hyperv_core", .module = image.import_table.get("hyperv_core").? },
             .{ .name = "wamr_log_validator", .module = proof_validator },
             .{ .name = "controller_source_closure", .module = proof_closure },
+            .{ .name = "handoff_contracts", .module = handoffContracts(b, target, optimize, image.import_table.get("hyperv_core").?) },
             .{ .name = "import_validator_identity", .module = validatorIdentity(b, identity_writer, b.dependency("direct_validator", .{
                 .target = target,
                 .optimize = .ReleaseSafe,
