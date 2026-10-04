@@ -137,6 +137,11 @@ source/tree pairs and a separate historical Python-v2 checkout. It uses real
 Git objects and physical Python scans, real native packaging/QCOW2/VHD
 production, and actual constructor/recheck/CLI routes. Its command/serial
 fixtures are synthetic and do not claim guest or hardware acceptance.
+These fixtures require the genuine historical Git objects in the reader's
+repository, so qualification from a shallow checkout must first fetch its
+complete history with `git fetch --unshallow`. The native CI checkout uses
+`fetch-depth: 0`, matching the existing integration runtime job. Missing
+historical objects refuse the fixture; no synthetic commit replaces them.
 Read-only Python-v2 custody checks bind the complete recorded producer checkout,
 not the newer reader's compiled source bytes, and recapture the original input
 roles and physical identities unchanged. The production local-consumer probe

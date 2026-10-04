@@ -3375,6 +3375,8 @@ test "trusted historical inner stage accepts complete records and refuses tamper
         .stdout_limit = .limited(256),
         .stderr_limit = .limited(2048),
     });
+    if (seeded.term != .exited or seeded.term.exited != 0)
+        std.debug.print("historical Git fixture {s}: {s}\n", .{ source.revision, seeded.stderr });
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, seeded.term);
     const self = try std.process.executablePathAlloc(io, a);
     const local_tools = controller.import_validator_build.LocalTools{
