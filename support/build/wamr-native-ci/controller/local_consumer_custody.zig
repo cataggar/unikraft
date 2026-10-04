@@ -92,8 +92,12 @@ fn addRuntime(
 fn exactRoles(allowed: *std.StringHashMap(void), map: std.json.Value) !void {
     if (map != .object or map.object.count() != allowed.count())
         return error.UnexpectedInputRole;
-    for (map.object.keys()) |name|
+    for (map.object.keys()) |name| {
         if (!allowed.contains(name)) return error.UnexpectedInputRole;
+        if (std.mem.startsWith(u8, name, "runtime:") and
+            !std.mem.eql(u8, name["runtime:".len..], try recordedPath(map, name)))
+            return error.UnexpectedInputPath;
+    }
 }
 
 fn buildRoles(

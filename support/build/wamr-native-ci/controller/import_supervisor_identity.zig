@@ -176,6 +176,7 @@ pub fn verifyGitSource(
         const listing = try source.gitOutput(a, io, repository, git, &.{
             "ls-tree", "-z", identity.tree, "--", name,
         }, 512, null);
+        defer a.free(listing);
         if (listing.len == 0 or listing[listing.len - 1] != 0 or
             std.mem.indexOfScalar(u8, listing[0 .. listing.len - 1], 0) != null)
             return error.ImportSourceChanged;
@@ -190,11 +191,13 @@ pub fn verifyGitSource(
                 return error.ImportSourceChanged;
         try notCancelled(signal);
         const size_raw = try source.gitOutput(a, io, repository, git, &.{ "cat-file", "-s", oid }, 32, null);
+        defer a.free(size_raw);
         if (size_raw.len < 2 or size_raw[size_raw.len - 1] != '\n' or
             try std.fmt.parseInt(u64, size_raw[0 .. size_raw.len - 1], 10) != size)
             return error.ImportSourceChanged;
         try notCancelled(signal);
         const blob = try source.gitOutput(a, io, repository, git, &.{ "cat-file", "blob", oid }, @intCast(size), null);
+        defer a.free(blob);
         const hash = std.fmt.bytesToHex(records.fileIdentity(blob), .lower);
         if (blob.len != size) return error.ImportSourceChanged;
         try same(&hash, digest);

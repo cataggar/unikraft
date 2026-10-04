@@ -147,6 +147,15 @@ pub fn qualify(a: std.mem.Allocator, io: std.Io, stage: []const u8) !void {
             try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, emitted.term);
             try std.testing.expectEqualStrings("", emitted.stderr);
             try compareHandoff(a, &accepted, emitted.stdout);
+            if (v2) {
+                const raw = try root.readFileAlloc(io, try std.fs.path.join(a, &.{ revision, "runtime/compute/evidence/build-start.json" }), a, .limited(controller.records.max_record_bytes));
+                const start = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{ .parse_numbers = false });
+                const source_map = start.object.get("command_supervisor").?.object.get("source_map").?;
+                _ = try controller.import_supervisor_identity.verifyGitSource(std.testing.allocator, io, accepted.source, repository, options.git_executable, source_map, null);
+                const source_records = source_map.object.get("records").?;
+                source_records.object.values()[0].object.getPtr("sha256").?.* = .{ .string = "0000000000000000000000000000000000000000000000000000000000000000" };
+                try std.testing.expectError(error.ImportIdentityChanged, controller.import_supervisor_identity.verifyGitSource(std.testing.allocator, io, accepted.source, repository, options.git_executable, source_map, null));
+            }
         }
         try std.testing.expectError(
             if (v2) error.UnsupportedLocalProducer else error.UnsupportedLocalLegacyRun,
@@ -192,6 +201,8 @@ pub fn qualify(a: std.mem.Allocator, io: std.Io, stage: []const u8) !void {
             .{ .name = "extra-tool", .expected = error.UnexpectedInputRole },
             .{ .name = "missing-tool", .expected = error.InvalidInputCustody },
             .{ .name = "boot-path", .expected = error.UnexpectedInputPath },
+            .{ .name = "runtime-path-build", .expected = error.UnexpectedInputPath },
+            .{ .name = "runtime-path-boot", .expected = error.UnexpectedInputPath },
             .{ .name = "boot-pin", .expected = error.InvalidBootPins },
             .{ .name = "serial", .expected = error.EvidenceChanged },
             .{ .name = "command-identity", .expected = error.InvalidCommandIdentity, .v2_only = true },

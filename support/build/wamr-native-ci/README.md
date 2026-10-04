@@ -125,8 +125,10 @@ current exact 19-tool inventory.
 Later local-v1 constructors also close the build/boot role and fixed-path sets
 before recapturing files, runtime loaders/libraries, trees and ancestry; an
 extra recorded executable cannot be admitted merely by resealing its custody
-digest. Original dependency restore/package custody and Bison content are
-recaptured as well, and v2 supervisor source/runtime maps must match the real
+digest. Discovered `runtime:ABS` roles bind the recorded path to that exact
+absolute library path in both build and boot custody; an identical separate
+copy is not a substitute. Original dependency restore/package custody and Bison
+content are recaptured as well, and v2 supervisor source/runtime maps must match the real
 producer files and executable runtime, not just internally consistent seals.
 Read-only local cleanup proof retains its collected physical artifact snapshot;
 the production-native owner's wrapper cleanup remains export-owned custody.
@@ -304,6 +306,8 @@ evidence list are not acceptance evidence. Private views cannot serialize as
 trusted-inner-ZIP records; `import_validator_build.runPrivate` accepts the
 authenticated owner and supervises its real manifest. This is a library
 foundation only, not a private export command or a v1 production entry point.
+Temporary Git source-proof output buffers are freed on success and refusal;
+the owner retains its source claims rather than copies of the historical blobs.
 
 `reader-source-closure --git ABS --output sha256-v1` checks the current native
 reader's embedded source inputs against a clean, unchanged Git checkout. It

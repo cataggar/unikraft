@@ -103,6 +103,7 @@ def prepare(args):
     for part in ("original", "compiler-cache", "global", "supervisor-install", "image-records"):
         (work / part).mkdir(mode=0o700)
     (work / "mutated-runtime-role").write_bytes(b"")
+    (work / "redirected-runtime").write_bytes(b"")
     app = repository / "support/apps/wamr-aot"
     for role, relative in {
         "efi": "build/wamr_hyperv-x86_64-efi",
@@ -509,7 +510,34 @@ def mutate(work, case):
         else:
             raise AssertionError("real Python runtime oracle accepted mutation")
         return
-    if case in ("source-custody", "extra-tool", "missing-tool",
+    if case in ("runtime-path-build", "runtime-path-boot"):
+        ci = load("runtime_path_oracle", Path(__file__).parents[1] / "run.py")
+        name = "build-start.json" if case == "runtime-path-build" else "boot-inputs.json"
+        record = document(name)
+        custody = record["consumer_inputs"] if case == "runtime-path-build" else record
+        libraries = [(role, Path(value["path"])) for role, value in
+                     custody["files"].items() if role.startswith("runtime:")]
+        if case == "runtime-path-build":
+            libraries = [(role, path) for role, path in libraries
+                         if str(path).startswith(str(runtime / "lib") + "/")]
+        assert libraries, "real discovered runtime library unavailable"
+        role, path = libraries[0]
+        redirected = work / "redirected-runtime"
+        copy_file(path, redirected)
+        file_paths = {key: Path(value["path"]) for key, value in custody["files"].items()}
+        file_paths[role] = redirected
+        tree_paths = {key: Path(value["path"]) for key, value in custody["trees"].items()}
+        changed = ci.record_input_paths(
+            file_paths, tree_paths, scope="consumer" if case == "runtime-path-build" else "boot")
+        assert changed["files"][role]["sha256"] == custody["files"][role]["sha256"]
+        assert set(changed["files"]) == set(custody["files"])
+        ci.require_recorded_consumer_inputs(changed, content=True)
+        if case == "runtime-path-build":
+            record["consumer_inputs"] = changed
+        else:
+            record = changed
+        put(name, record)
+    elif case in ("source-custody", "extra-tool", "missing-tool",
                 "dependency-custody", "bison-custody",
                 "supervisor-source", "supervisor-runtime"):
         start = document("build-start.json")
