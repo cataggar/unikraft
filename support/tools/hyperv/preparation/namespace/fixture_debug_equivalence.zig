@@ -2,6 +2,9 @@
 const std = @import("std");
 pub const core = @import("hyperv_core");
 const elf = @import("producer_elf");
+const Program = @typeInfo(@FieldType(elf.Image, "programs")).pointer.child;
+const Section = @typeInfo(@FieldType(elf.Image, "sections")).pointer.child;
+const SectionHeader = @FieldType(Section, "header");
 const pf = core.private_files;
 
 pub const max_file_bytes = 64 * 1024 * 1024;
@@ -57,7 +60,7 @@ pub const ProgramMappings = struct {
 };
 pub const ContentProof = struct {
     elf_class: enum { elf64 } = .elf64,
-    endian: std.builtin.Endian,
+    endian: std.lang.Endian,
     machine: std.elf.EM,
     entry: u64,
     layout_policy: LayoutPolicy,
@@ -140,7 +143,7 @@ fn compareRange(raw: []const u8, candidate: []const u8, raw_offset: u64, candida
 
 fn hashRange(sha: *core.Sha256, bytes: []const u8, offset: u64, length: u64, masks: []const Mask) !void {
     const data = try elf.range(bytes, offset, length);
-    const zeroes = [_]u8{0} ** 8;
+    const zeroes = @as([8]u8, @splat(0));
     var cursor: usize = 0;
     for (masks) |field| {
         if (!overlaps(offset, length, field.offset, field.width)) continue;
@@ -176,7 +179,7 @@ fn loadOffsetModulus(machine: std.elf.EM) u64 {
 }
 
 fn validateRelayoutLayout(image: elf.Image) !void {
-    const table_bytes = image.programs.len * @sizeOf(std.elf.Elf64_Phdr);
+    const table_bytes = image.programs.len * @sizeOf(Program);
     var phdr_seen = false;
     for (image.programs, 0..) |program, index| {
         _ = try elf.add(program.p_vaddr, program.p_filesz);
@@ -224,7 +227,7 @@ fn validateRelayoutLayout(image: elf.Image) !void {
     }
 }
 
-fn sameOverlap(raw_a: std.elf.Elf64_Phdr, raw_b: std.elf.Elf64_Phdr, candidate_a: std.elf.Elf64_Phdr, candidate_b: std.elf.Elf64_Phdr) bool {
+fn sameOverlap(raw_a: Program, raw_b: Program, candidate_a: Program, candidate_b: Program) bool {
     const before = overlaps(raw_a.p_offset, raw_a.p_filesz, raw_b.p_offset, raw_b.p_filesz);
     const after = overlaps(candidate_a.p_offset, candidate_a.p_filesz, candidate_b.p_offset, candidate_b.p_filesz);
     if (before != after) return false;
@@ -252,8 +255,8 @@ fn logicalIdentity(index: usize, header_bytes: []const u8) [64]u8 {
 
 fn validateLayout(image: elf.Image) !void {
     const header = image.header;
-    const program_bytes = image.programs.len * @sizeOf(std.elf.Elf64_Phdr);
-    const section_bytes = image.sections.len * @sizeOf(std.elf.Elf64_Shdr);
+    const program_bytes = image.programs.len * @sizeOf(Program);
+    const section_bytes = image.sections.len * @sizeOf(SectionHeader);
     if (overlaps(header.phoff, program_bytes, header.shoff, section_bytes)) return error.OverlappingElfTables;
     var executable_entry = false;
     for (image.programs) |program| {
@@ -292,7 +295,7 @@ pub fn compareWithPolicy(allocator: std.mem.Allocator, raw: []const u8, candidat
     try validateLayout(left);
     try validateLayout(right);
     if (!std.mem.eql(u8, &normalizedHeader(raw), &normalizedHeader(candidate))) return error.ElfHeaderChanged;
-    const phdr_bytes = left.programs.len * @sizeOf(std.elf.Elf64_Phdr);
+    const phdr_bytes = left.programs.len * @sizeOf(Program);
     const raw_programs = try elf.range(raw, left.header.phoff, phdr_bytes);
     const candidate_programs = try elf.range(candidate, right.header.phoff, phdr_bytes);
     if (policy == .identical_program_headers) {
@@ -304,9 +307,9 @@ pub fn compareWithPolicy(allocator: std.mem.Allocator, raw: []const u8, candidat
     var masks = Masks.init();
     var mappings: ProgramMappings = .{};
     for (left.programs, right.programs, 0..) |program, other, index| {
-        const start = index * @sizeOf(std.elf.Elf64_Phdr);
-        const before = raw_programs[start..][0..@sizeOf(std.elf.Elf64_Phdr)];
-        const after = candidate_programs[start..][0..@sizeOf(std.elf.Elf64_Phdr)];
+        const start = index * @sizeOf(Program);
+        const before = raw_programs[start..][0..@sizeOf(Program)];
+        const after = candidate_programs[start..][0..@sizeOf(Program)];
         if (!std.mem.eql(u8, before[0..8], after[0..8]) or !std.mem.eql(u8, before[16..], after[16..]))
             return error.ProgramHeadersChanged;
         const changed = program.p_offset != other.p_offset;
@@ -394,7 +397,7 @@ pub fn compareWithPolicy(allocator: std.mem.Allocator, raw: []const u8, candidat
         }
         if (overlaps(sh.sh_offset, sh.sh_size, 0, 64) or
             overlaps(sh.sh_offset, sh.sh_size, left.header.phoff, phdr_bytes) or
-            overlaps(sh.sh_offset, sh.sh_size, left.header.shoff, left.sections.len * @sizeOf(std.elf.Elf64_Shdr)))
+            overlaps(sh.sh_offset, sh.sh_size, left.header.shoff, left.sections.len * @sizeOf(SectionHeader)))
             return error.OverlappingDebugData;
         removed_sections += 1;
         removed_bytes += sh.sh_size;

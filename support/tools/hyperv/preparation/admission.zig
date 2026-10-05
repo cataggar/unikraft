@@ -133,7 +133,7 @@ pub fn requireChain(allocator: std.mem.Allocator, chain: [4]receipts.Link, input
     try inputs.validate(allocator, input, review.selection_sha256);
     for (chain, 0..) |link, i| {
         try receipts.requireLink(allocator, link);
-        if (@intFromEnum(link.receipt.phase) != i or !std.meta.eql(link.sha256, review.receipt_sha256[i]) or
+        if (@backingInt(link.receipt.phase) != i or !std.meta.eql(link.sha256, review.receipt_sha256[i]) or
             !std.meta.eql(link.receipt.reviewed_provenance_sha256, review.provenance_sha256))
             return error.ReceiptSubstitution;
         if (i != 0) try receipts.requireParent(allocator, link.receipt, chain[i - 1]);
@@ -296,7 +296,7 @@ fn verifyStoredBinding(allocator: std.mem.Allocator, io: std.Io, bytes: []const 
         try checkDeadline(deadline);
         try verifyTool(allocator, io, @field(binding, name));
     }
-    if (binding.native.len == 0 or binding.native.len > std.meta.fields(producer.Alias).len) return error.IncompleteRuntime;
+    if (binding.native.len == 0 or binding.native.len > @typeInfo(producer.Alias).@"enum".field_names.len) return error.IncompleteRuntime;
     for (binding.native, 0..) |tool, i| {
         for (binding.native[0..i]) |previous| if (previous.name == tool.name) return error.InvalidRuntime;
         try checkDeadline(deadline);

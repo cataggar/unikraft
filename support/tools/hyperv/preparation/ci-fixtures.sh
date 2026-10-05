@@ -99,7 +99,7 @@ native /usr/bin/awk -v uid="${uid}" -v gid="${gid}" '
   /^Cap(Inh|Prm|Eff|Amb):/ { if ($2 != "0000000000000000") exit 1; c++ }
   END { if (!u || !g || !s || c != 4) exit 1 }
 ' /proc/self/status
-test "$(native "${zig}" version)" = 0.16.0
+test "$(native "${zig}" version)" = 0.17.0
 if [ "${qualify_strip}" = true ]; then
   objcopy="$(readlink -f "${llvm_directory}/llvm-objcopy")"
   test -f "${objcopy}"
@@ -245,6 +245,7 @@ fi
 
 # Two physical native children: each embeds its mode's actual workspace/helper.
 for mode in Debug ReleaseSafe; do
+  if [ "${mode}" = Debug ]; then optimize=debug; else optimize=safe; fi
   mkdir -p "${root}/${mode}/namespace-work"
   strip_report=()
   if [ "${qualify_strip}" = true ]; then
@@ -254,7 +255,7 @@ for mode in Debug ReleaseSafe; do
     --cache-dir "${root}/${mode}/namespace-cache" --prefix "${root}/${mode}/fixture-out" \
     "-Dworkspace=${root}/${mode}/namespace-work" "${git_fixture[@]}" \
     "${namespace_variant[@]}" "${strip_report[@]}" \
-    "-Doptimize=${mode}" -j2 install-fixture --summary all \
+    "-Doptimize=${optimize}" -j2 install-fixture --summary all \
     > "${root}/${mode}/fixture-build.log" 2>&1
   if [ "${qualify_strip}" = true ]; then
     bash "${package}/ci-strip-proof.sh" "${root}/${mode}/fixture-strip-proof.json" \
@@ -301,7 +302,7 @@ native "${zig}" build --build-file "${package}/namespace/build.zig" \
   "-Dfixture-executable=${installation}/namespace-fixture-debug" \
   "-Dci-report=${root}/Debug/baseline.json" \
   "${namespace_variant[@]}" \
-  -Dtest-filter='namespace CI baseline crosses' -Doptimize=Debug -j2 test --summary all \
+  -Dtest-filter='namespace CI baseline crosses' -Doptimize=debug -j2 test --summary all \
   > "${root}/baseline.log" 2>&1 || baseline=$?
 finished="$(date --utc '+%Y-%m-%d %H:%M:%S.%6N UTC')"
 if [ "${baseline}" -ne 0 ]; then
@@ -347,12 +348,13 @@ if [ "${baseline}" -ne 0 ]; then
 fi
 
 for mode in Debug ReleaseSafe; do
+  if [ "${mode}" = Debug ]; then optimize=debug; else optimize=safe; fi
   variant=debug
   if [ "${mode}" = ReleaseSafe ]; then variant=release-safe; fi
   native "${zig}" build --build-file "${package}/build.zig" \
     --system "${packages}" --cache-dir "${root}/${mode}/zig-local-cache" \
     --prefix "${root}/${mode}/out" "-Dproof-fixture=${proof_workspace}" "${git_fixture[@]}" \
-    "-Doptimize=${mode}" -j2 test install --summary all \
+    "-Doptimize=${optimize}" -j2 test install --summary all \
     > "${root}/${mode}/preparation.log" 2>&1
   native "${zig}" build --build-file "${package}/namespace/build.zig" \
     --cache-dir "${root}/${mode}/namespace-cache" --prefix "${root}/${mode}/namespace-out" \
@@ -360,11 +362,11 @@ for mode in Debug ReleaseSafe; do
     "-Dfixture-executable=${installation}/namespace-fixture-${variant}" \
     "-Dci-report=${root}/${mode}/namespace-baseline.json" \
     "${namespace_variant[@]}" \
-    "-Doptimize=${mode}" -j2 test install --summary all \
+    "-Doptimize=${optimize}" -j2 test install --summary all \
     > "${root}/${mode}/namespace.log" 2>&1
   native "${zig}" build --build-file "${package}/integration/build.zig" \
     --system "${packages}" --cache-dir "${root}/${mode}/integration-cache" \
-    --prefix "${root}/${mode}/integration-out" "-Doptimize=${mode}" -j2 test install --summary all \
+    --prefix "${root}/${mode}/integration-out" "-Doptimize=${optimize}" -j2 test install --summary all \
     > "${root}/${mode}/integration.log" 2>&1
 done
 for variant in debug release-safe; do

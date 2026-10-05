@@ -92,7 +92,7 @@ fn publishImpl(a: std.mem.Allocator, io: std.Io, lock: *p.Locked, self_executabl
     const encoded = try build(a, state, source);
     const parent = try p.FileParent.open(io, target, .artifact);
     defer parent.close(io);
-    const stage_name = try std.fmt.allocPrint(a, ".{s}.native-stage", .{parent.name});
+    const stage_name = try a.print(".{s}.native-stage", .{parent.name});
     try p.basename(stage_name);
     try parent.directory.createDir(io, stage_name, .fromMode(0o700));
     var published = false;

@@ -165,7 +165,7 @@ pub fn validate(a: std.mem.Allocator, input: std.json.Value) !void {
         try @import("files.zig").same(a, try transcript(a, try nonceValue(config.nonce)), config.transcript);
 }
 pub fn marker(a: std.mem.Allocator, config: Network) ![]const u8 {
-    return std.fmt.allocPrint(a, "HYPERV_ACCEPTANCE NETWORK_APP_CONFIG PASS peer_ipv4={s} tcp_port={d} udp_port={d} nonce={s} tcp_connections=3 udp_datagrams=6", .{ config.peer_ipv4, config.tcp_port, config.udp_port, config.nonce });
+    return a.print("HYPERV_ACCEPTANCE NETWORK_APP_CONFIG PASS peer_ipv4={s} tcp_port={d} udp_port={d} nonce={s} tcp_connections=3 udp_datagrams=6", .{ config.peer_ipv4, config.tcp_port, config.udp_port, config.nonce });
 }
 pub fn serial(a: std.mem.Allocator, bytes: []const u8, config: c.boot.config.Config, acceptance: std.json.Value) !void {
     try c.boot.serial.validate(a, bytes, config);

@@ -10,7 +10,7 @@ const packaging = @import("package.zig");
 const budget = @import("budget.zig");
 const admission = @import("admission.zig");
 const private = c.core.private_files;
-const host_is_aarch64 = @import("builtin").cpu.arch == .aarch64;
+const host_is_aarch64 = @import("builtin").target.cpu.arch == .aarch64;
 
 fn cli(allocator: std.mem.Allocator, cwd: std.Io.Dir, arguments: []const []const u8) !c.core.process.Result {
     var argv: std.ArrayList([]const u8) = .empty;
@@ -249,7 +249,7 @@ test "typed native contracts reject duplicate missing unknown float noncanonical
     try std.testing.expectError(error.UnexpectedFields, c.parse(c.File, allocator, try replaceOnce(allocator, bytes, "\"mode\":384,", "")));
     try std.testing.expectError(error.UnexpectedFields, c.parse(c.File, allocator, try replaceOnce(allocator, bytes, "}\n", ",\"unknown\":false}\n")));
     for ([_][]const u8{ "7.0", "7e0", "7E+0", "-0" }) |number|
-        try std.testing.expectError(error.ExpectedInteger, c.parse(c.File, allocator, try replaceOnce(allocator, bytes, "\"size\":7", try std.fmt.allocPrint(allocator, "\"size\":{s}", .{number}))));
+        try std.testing.expectError(error.ExpectedInteger, c.parse(c.File, allocator, try replaceOnce(allocator, bytes, "\"size\":7", try allocator.print("\"size\":{s}", .{number}))));
     try std.testing.expectError(error.IntegerOverflow, c.parse(c.File, allocator, try replaceOnce(allocator, bytes, "\"size\":7", "\"size\":18446744073709551616")));
     try std.testing.expectError(error.IntegerOverflow, c.parse(c.File, allocator, try replaceOnce(allocator, bytes, "\"size\":7", "\"size\":-1")));
     try std.testing.expectError(error.ExpectedInteger, c.parse(c.File, allocator, try replaceOnce(allocator, bytes, "\"size\":7", "\"size\":\"7\"")));
@@ -393,7 +393,7 @@ test "SHAPE ONLY reviewed provenance rejects substitution of every producer comp
                 deps[0].content.tree.sha256 = c.digest("substitute dependency bytes");
                 changed.provenance.dependencies = deps;
             },
-            5 => changed.provenance.producer.origin.payload.local_build.source_revision = "3" ** 40,
+            5 => changed.provenance.producer.origin.payload.local_build.source_revision = &@as([40]u8, @splat('3')),
             6 => changed.provenance.git.origin.payload.local_build.compiler_executable_sha256 = c.digest("substitute runtime producer"),
             7 => changed.provenance.trust.origin.payload.distribution.evidence_set_sha256 = c.digest("substitute trust source"),
             else => unreachable,
@@ -487,10 +487,10 @@ fn shapePlan(allocator: std.mem.Allocator, packaged: receipts.Link) !inputs.Plan
         .placement = .staged,
     };
     for (assets[12..18], 0..) |*item, i| item.* = .{
-        .id = try std.fmt.allocPrint(allocator, "vars-copy-{d}", .{i}),
+        .id = try allocator.print("vars-copy-{d}", .{i}),
         .role = .firmware_working_copy,
         .source = assets[5].source,
-        .destination = try std.fmt.allocPrint(allocator, "firmware/vars-{d}.fd", .{i}),
+        .destination = try allocator.print("firmware/vars-{d}.fd", .{i}),
         .placement = .future_copy,
     };
     var qemu = shapeTool(.qemu, assets[2].source);
@@ -580,7 +580,7 @@ test "SHAPE ONLY generation ledger charges six firmware copies all controls evid
     defer parsed.deinit();
     try inputs.validate(std.testing.allocator, parsed.value, selected_sha);
     for ([_][]const u8{ "completed", "accepted", "configured" }) |state| {
-        const bad = try replaceOnce(allocator, bytes, "\"state\":\"prepared\"", try std.fmt.allocPrint(allocator, "\"state\":\"{s}\"", .{state}));
+        const bad = try replaceOnce(allocator, bytes, "\"state\":\"prepared\"", try allocator.print("\"state\":\"{s}\"", .{state}));
         try std.testing.expectError(error.InvalidEnum, c.parse(inputs.Input, allocator, bad));
     }
     var changed = document;
@@ -740,7 +740,7 @@ test "entry chain requires independent selection provenance receipt and executio
     try std.testing.expectEqual(@as(usize, 32), (try admission.rawHash(review.input_sha256)).len);
     const storage = try admission.storageIdentity(input.receipt.run_id);
     try std.testing.expectEqual(@as(u8, 0x11), storage.bytes[0]);
-    try std.testing.expectError(error.InvalidSha256, admission.rawHash(("G" ** 64).*));
+    try std.testing.expectError(error.InvalidSha256, admission.rawHash(@as([64]u8, @splat('G'))));
     const encoded = try c.canonical(a, input);
     const legacy = try replaceOnce(a, encoded, "hyperv_native_prepared_input_v3", "hyperv_native_prepared_input_v2");
     try std.testing.expectError(error.InvalidEnum, c.parse(inputs.PreparedInputV3, a, legacy));
@@ -850,7 +850,7 @@ test "current engine identity is physically bound without weakening producer sel
     try writeFixture(fixture.dir, "engine", bytes, info.mode & 0o7777);
     const record = try directory.record(a, io, "engine", bytes.len, .executable);
     var tool = shapeTool(.preparation, record);
-    tool.target = if (@import("builtin").cpu.arch == .aarch64) .aarch64_linux else .x86_64_linux;
+    tool.target = if (@import("builtin").target.cpu.arch == .aarch64) .aarch64_linux else .x86_64_linux;
     tool.tree = (try fs.inventory(a, io, directory, 4, 128 * 1024 * 1024)).tree;
     const bound: rt.Bound = .{ .directory = directory, .contract = tool };
     const chain = try shapeChain(a);
@@ -1014,7 +1014,7 @@ test "merged native proof root builder and CLI are physically bound without runn
         .{ .index = 0, .old = "gate.step.dependOn(&driver_check.step);", .new = "// gate.step.dependOn(&driver_check.step);" },
         .{ .index = 0, .old = "hyperv_proof_build.tool(b, b.path(\".\"))", .new = "hyperv_proof_build.tool(b, b.path(\"substituted\"))" },
         .{ .index = 0, .old = "check.addArgs(&.{ \"smp\", \"--image\" });", .new = "check.addArgs(&.{ \"drivers\", \"--image\" });" },
-        .{ .index = 1, .old = "\"support/build/hyperv-proof-tool.zig\", b.graph.host, .ReleaseSafe", .new = "\"support/build/hyperv-proof-tool.zig\", b.graph.host, .Debug" },
+        .{ .index = 1, .old = "\"support/build/hyperv-proof-tool.zig\", b.graph.host, .safe", .new = "\"support/build/hyperv-proof-tool.zig\", b.graph.host, .debug" },
         .{ .index = 1, .old = "drivers/hyperv/vmbus/vmbus_protocol.zig", .new = "drivers/hyperv/vmbus/unselected.zig" },
         .{ .index = 2, .old = "try proofs.drivers(model, required.items, diagnostic);", .new = "// try proofs.drivers(model, required.items, diagnostic);" },
     };
@@ -1105,7 +1105,7 @@ test "authoritative metadata entry rejects incomplete invented and wrong platfor
     defer arena.deinit();
     const a = arena.allocator();
     const guard = (try shapePrepared(a)).guard;
-    const solved = try std.fmt.allocPrint(a, "{s}CONFIG_ARCH_X86_64=y\nCONFIG_PLAT_HYPERV=y\n", .{try cfg.render(a, guard)});
+    const solved = try a.print("{s}CONFIG_ARCH_X86_64=y\nCONFIG_PLAT_HYPERV=y\n", .{try cfg.render(a, guard)});
     const metadata =
         "unikraft-native-config-metadata-v1\n" ++
         "symbol\tAPPHYPERVACCEPTANCE\tbool\n" ++
@@ -1127,7 +1127,7 @@ test "authoritative metadata entry rejects incomplete invented and wrong platfor
     try std.testing.expectError(error.InvalidConfig, inputs.validateAuthoritativeConfig(a, solved, "unikraft-native-config-metadata-v1\n", guard));
     const wrong = try replaceOnce(a, solved, "CONFIG_PLAT_HYPERV=y", "# CONFIG_PLAT_HYPERV is not set");
     try std.testing.expectError(error.InvalidSelection, inputs.validateAuthoritativeConfig(a, wrong, metadata, guard));
-    const unknown = try std.fmt.allocPrint(a, "{s}CONFIG_UNREVIEWED_FLAG=y\n", .{solved});
+    const unknown = try a.print("{s}CONFIG_UNREVIEWED_FLAG=y\n", .{solved});
     try std.testing.expectError(error.IncompleteMetadata, inputs.validateAuthoritativeConfig(a, unknown, metadata, guard));
     const bad_types = try replaceOnce(a, metadata, "APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS\tint", "APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS\thex");
     try std.testing.expectError(error.ConflictingMetadata, inputs.validateAuthoritativeConfig(a, solved, bad_types, guard));

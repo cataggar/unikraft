@@ -110,7 +110,7 @@ fn requireStagingDirectories(allocator: std.mem.Allocator, io: std.Io, directory
     while (try iterator.next(io)) |entry| {
         if (entry.kind != .directory) continue;
         count.* += 1;
-        const path = try std.fmt.allocPrint(allocator, "{s}{s}/", .{ prefix, entry.name });
+        const path = try allocator.print("{s}{s}/", .{ prefix, entry.name });
         defer allocator.free(path);
         var required = false;
         for (assets) |item| if (item.placement == .staged and std.mem.startsWith(u8, item.destination, path)) {
@@ -331,7 +331,7 @@ pub fn ledger(allocator: std.mem.Allocator, plan: Plan, packaged: receipts.Link)
     var entries: std.ArrayList(budget.Entry) = .empty;
     errdefer entries.deinit(allocator);
     var working: usize = 0;
-    var controls = [_]usize{0} ** 4;
+    var controls = @as([4]usize, @splat(0));
     const vars = try asset(plan.assets, .firmware_vars);
     try validateFirmwareOrigins(plan);
     for (plan.assets) |item| {

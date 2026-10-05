@@ -48,7 +48,7 @@ pub fn attempt(world: *x.World, directory: fs.Directory, phase: x.Phase, review_
     const state = try world.state(directory);
     var lock = try state.lock(world.io);
     defer lock.close(world.io);
-    _ = try world.publish(&lock, try std.fmt.allocPrint(world.allocator, "attempt-{s}.json", .{@tagName(phase)}), .{
+    _ = try world.publish(&lock, try world.allocator.print("attempt-{s}.json", .{@tagName(phase)}), .{
         .schema = "hyperv_native_integration_attempt_v1",
         .phase = phase,
         .review_sha256 = review_sha256,
@@ -60,7 +60,7 @@ pub fn attempt(world: *x.World, directory: fs.Directory, phase: x.Phase, review_
 fn producer(world: *x.World, workspace: fs.Directory, phase: x.Phase) !x.Sha {
     const state = try world.state(workspace);
     const reviews = try world.child(workspace, if (phase == .generate) "reserved-controls" else "reviews");
-    const reviewed = try world.read(x.Review, reviews, try std.fmt.allocPrint(world.allocator, "{s}.json", .{@tagName(phase)}), null);
+    const reviewed = try world.read(x.Review, reviews, try world.allocator.print("{s}.json", .{@tagName(phase)}), null);
     const review = reviewed.value;
     try review.validate(phase);
     const receipts = try world.child(workspace, "receipts");
@@ -79,7 +79,7 @@ fn producer(world: *x.World, workspace: fs.Directory, phase: x.Phase) !x.Sha {
     const bootstrap_sha = switch (phase) {
         .prepare, .package => review.material_sha256,
         .configure, .build => blk: {
-            stage = (try world.read(x.Stage, controls, try std.fmt.allocPrint(world.allocator, "{s}.json", .{@tagName(phase)}), review.material_sha256)).value;
+            stage = (try world.read(x.Stage, controls, try world.allocator.print("{s}.json", .{@tagName(phase)}), review.material_sha256)).value;
             if (!std.mem.eql(u8, @tagName(stage.?.phase), @tagName(phase)) or
                 !std.meta.eql(stage.?.parent_sha256, review.parent_sha256.?) or
                 !std.meta.eql(try p.producer.bindingDigest(world.allocator, stage.?.execution), review.execution_sha256.?) or
@@ -252,7 +252,7 @@ fn measure(world: *x.World, workspace: fs.Directory, phase: @FieldType(Command, 
                 @as(?x.Sha, null),
         }),
         .configure, .build => blk: {
-            const record = try world.read(x.Stage, try world.child(workspace, "controls"), try std.fmt.allocPrint(world.allocator, "{s}.json", .{@tagName(phase)}), null);
+            const record = try world.read(x.Stage, try world.child(workspace, "controls"), try world.allocator.print("{s}.json", .{@tagName(phase)}), null);
             break :blk try c.canonical(world.allocator, .{
                 .material_sha256 = record.sha256,
                 .provenance_sha256 = provenance_sha256,

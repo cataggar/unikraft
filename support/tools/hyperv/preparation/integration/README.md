@@ -14,12 +14,17 @@ phases. Build/Make execution is reserved for the parent integrator.
 
 ## Build
 
-Use Zig 0.16.0 and the parent's pinned local preparation/miz dependency. All
+Use Zig 0.17.0 and the parent's pinned local preparation/miz dependency. All
 outputs and caches belong below the scoped private scratch root. The executable
 and `preparation-namespace` are installed together; keep their physical files
 unchanged during the run. The importing mode uses the same physical executable
 by default. A separately selected engine copy is separately inventoried and
 charged, and must itself execute importer mode.
+
+Historical Zig 0.16 installation tables, artifact hashes and measurements in
+this document describe their original qualification only; they are not current
+0.17 prepared-image provenance. Obtain a fresh physical producer/source/compiler
+review before using newly built integration material.
 
 Choose a Git-coherence setup below before material generation. This build
 example uses the owned, clean, committed worktree. A private clone instead
@@ -40,7 +45,7 @@ export ZIG_GLOBAL_CACHE_DIR="$S/zig-global" ZIG_LOCAL_CACHE_DIR="$S/zig-local"
 /home/g/.local/bin/zig build \
   --build-file support/tools/hyperv/preparation/integration/build.zig \
   --system /d/unikraft-worktrees/fleet-ci/.d/zig-migration-preparation/restore/zig-pkg \
-  --prefix "$S/install" -Doptimize=ReleaseSafe -j2 test install --summary all
+  --prefix "$S/install" -Doptimize=safe -j2 test install --summary all
 export DRIVER="$S/install/bin/uk-hyperv-prepare-integration"
 export WORK="$S/run"
 ```
@@ -545,8 +550,8 @@ is parent-owned and is not reimplemented in this harness.
 ## Earlier bounded execution records (historical)
 
 Only the standalone driver and its non-executing fixtures were compiled/run.
-Both `-Doptimize=Debug -j2 test install --summary all` and
-`-Doptimize=ReleaseSafe -j2 test install --summary all` completed **8/8 build
+Both `-Doptimize=debug -j2 test install --summary all` and
+`-Doptimize=safe -j2 test install --summary all` completed **8/8 build
 steps and 12/12 fixtures**, with no skips. The complete commands are the Build
 command above with scratch root
 `.d/zig-migration-preparation/integration-driver-v1`, prefix

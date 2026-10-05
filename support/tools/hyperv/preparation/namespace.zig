@@ -108,7 +108,7 @@ pub fn validate(allocator: std.mem.Allocator, io: std.Io, input: Inputs, reposit
         return error.InvalidAccount;
     const selected = try std.fs.path.join(allocator, &.{ repository.path, ".d/zig-migration-preparation" });
     if (!paths.isDescendant(selected, workspace.path)) return error.UnsafePath;
-    const run_user = try std.fmt.allocPrint(allocator, "/run/user/{d}", .{account.uid});
+    const run_user = try allocator.print("/run/user/{d}", .{account.uid});
     // Match the facade: a missing final /run/user/UID selects passwd HOME.
     // If it exists, validate the entire chain rather than trusting this probe.
     const probe = std.Io.Dir.openDirAbsolute(io, run_user, .{ .follow_symlinks = false }) catch |err| switch (err) {
@@ -118,7 +118,7 @@ pub fn validate(allocator: std.mem.Allocator, io: std.Io, input: Inputs, reposit
     defer if (probe) |directory| directory.close(io);
     const runtime_root = if (probe != null) try fs.Directory.open(allocator, io, run_user) else null;
     defer if (runtime_root) |directory| directory.close(allocator, io);
-    const expected_runtime = try std.fmt.allocPrint(allocator, "{s}/unikraft-zig-facade-{d}", .{
+    const expected_runtime = try allocator.print("{s}/unikraft-zig-facade-{d}", .{
         if (runtime_root != null) run_user else account.home, account.uid,
     });
     if (!std.mem.eql(u8, expected_runtime, input.facade_runtime.path)) return error.AlternateFacadeLock;
@@ -183,13 +183,13 @@ pub const Request = struct {
 /// Eight bytes, no strings or externally supplied diagnostics. Only the outer
 /// helper holds the supervisor's descriptor; PID 1 uses a separate private pipe.
 pub const Status = struct {
-    primary: enum(u8) { unknown, exited, signaled, spawn_failed, setup_failed } = .unknown,
+    primary: enum(u3) { unknown, exited, signaled, spawn_failed, setup_failed } = .unknown,
     code: u8 = 0,
-    cleanup: enum(u8) { complete = 1, failed } = .complete,
-    recording: enum(u8) { complete = 1, missing, malformed } = .complete,
+    cleanup: enum(u2) { complete = 1, failed } = .complete,
+    recording: enum(u2) { complete = 1, missing, malformed } = .complete,
 
     pub fn encode(self: Status) [8]u8 {
-        return .{ 0x4e, 1, @intFromEnum(self.primary), self.code, @intFromEnum(self.cleanup), @intFromEnum(self.recording), 0x53, 0xff };
+        return .{ 0x4e, 1, @backingInt(self.primary), self.code, @backingInt(self.cleanup), @backingInt(self.recording), 0x53, 0xff };
     }
 
     pub fn decode(bytes: []const u8) !Status {
@@ -214,7 +214,7 @@ pub const Status = struct {
     pub fn termination(self: Status) ?std.process.Child.Term {
         return switch (self.primary) {
             .exited => .{ .exited = self.code },
-            .signaled => .{ .signal = @enumFromInt(self.code) },
+            .signaled => .{ .signal = @fromBackingInt(@intCast(self.code)) },
             else => null,
         };
     }
@@ -242,7 +242,7 @@ pub const StatusFile = struct {
     pub fn openParent(allocator: std.mem.Allocator, descriptor: []const u8) !StatusFile {
         const fd = try std.fmt.parseInt(u31, descriptor, 10);
         if (fd < 3) return error.InvalidNamespaceStatus;
-        const path = try std.fmt.allocPrintSentinel(allocator, "/proc/{d}/fd/{d}", .{ linux.getppid(), fd }, 0);
+        const path = try allocator.printSentinel("/proc/{d}/fd/{d}", .{ linux.getppid(), fd }, 0);
         const opened = linux.openat(linux.AT.FDCWD, path, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
         if (linux.errno(opened) != .SUCCESS) return error.StatusUnavailable;
         const result: StatusFile = .{ .fd = @intCast(opened) };
@@ -285,7 +285,7 @@ pub const ParentGuard = struct {
     }
 
     pub fn arm(self: ParentGuard) !void {
-        if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(linux.SIG.KILL), 0, 0, 0)) != .SUCCESS)
+        if (linux.errno(linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @backingInt(linux.SIG.KILL), 0, 0, 0)) != .SUCCESS)
             return error.ParentDeathUnavailable;
         var poll = [_]linux.pollfd{.{ .fd = self.fd, .events = linux.POLL.IN, .revents = 0 }};
         var zero: linux.timespec = .{ .sec = 0, .nsec = 0 };
@@ -433,7 +433,7 @@ pub fn enterWithCleanupFault(allocator: std.mem.Allocator, io: std.Io, sandbox: 
             try interpreterMount(allocator, io, &mounts, bound, executable);
             if (bound.contract.loader) |loader| {
                 for (bound.contract.libraries) |library| {
-                    try addFile(allocator, io, &mounts, bound.directory, library, try std.fmt.allocPrint(allocator, "/lib/{s}", .{std.fs.path.basename(library.path)}), .artifact);
+                    try addFile(allocator, io, &mounts, bound.directory, library, try allocator.print("/lib/{s}", .{std.fs.path.basename(library.path)}), .artifact);
                     try interpreterMount(allocator, io, &mounts, bound, library);
                 }
                 // libc can itself require the loader by SONAME.
@@ -441,14 +441,14 @@ pub fn enterWithCleanupFault(allocator: std.mem.Allocator, io: std.Io, sandbox: 
                 var image = try elf.Image.parse(allocator, bytes);
                 defer image.deinit();
                 const soname = try loaderSoname(image, bytes);
-                if (soname) |name| try addFile(allocator, io, &mounts, bound.directory, loader, try std.fmt.allocPrint(allocator, "/lib/{s}", .{name}), .artifact);
+                if (soname) |name| try addFile(allocator, io, &mounts, bound.directory, loader, try allocator.print("/lib/{s}", .{name}), .artifact);
             }
         }
         if (observe_fixture) observer.mark(.runtime_mount_end);
     }
     if (observe_fixture) observer.mark(.mounts_finalize_begin);
     for ([_][]const u8{ "null", "zero", "random", "urandom" }, [_]u32{ 3, 5, 8, 9 }) |name, minor| {
-        const path = try std.fmt.allocPrint(allocator, "/dev/{s}", .{name});
+        const path = try allocator.print("/dev/{s}", .{name});
         const file = try std.Io.Dir.openFileAbsolute(io, path, .{ .path_only = true, .follow_symlinks = false });
         var metadata: linux.Statx = undefined;
         if (linux.errno(linux.statx(file.handle, "", linux.AT.EMPTY_PATH, .BASIC_STATS, &metadata)) != .SUCCESS or
@@ -472,7 +472,7 @@ pub fn enterWithCleanupFault(allocator: std.mem.Allocator, io: std.Io, sandbox: 
         }
     }.less);
     const root_path = try std.fs.path.join(allocator, &.{ sandbox.scratch.path, "namespace-root" });
-    const root_z = try allocator.dupeZ(u8, root_path);
+    const root_z = try allocator.dupeSentinel(u8, root_path, 0);
     const root_before = try fs.Directory.open(allocator, io, root_path);
     defer root_before.close(allocator, io);
     try sandbox.root.require(try Identity.directory(root_before));
@@ -543,7 +543,7 @@ fn childNamespace(allocator: std.mem.Allocator, io: std.Io, sandbox: Sandbox, ar
     };
     // Recursive clones must preserve validated submount content, but must not
     // recursively copy this root back through the source's writable subtree.
-    const root_fd_path = try std.fmt.allocPrintSentinel(allocator, "/proc/self/fd/{d}", .{root.dir.handle}, 0);
+    const root_fd_path = try allocator.printSentinel("/proc/self/fd/{d}", .{root.dir.handle}, 0);
     if (linux.errno(linux.mount(null, root_fd_path, null, linux.MS.UNBINDABLE, 0)) != .SUCCESS)
         return error.MountNamespaceUnavailable;
     try bindAt(allocator, io, root, .{
@@ -551,7 +551,7 @@ fn childNamespace(allocator: std.mem.Allocator, io: std.Io, sandbox: Sandbox, ar
         .target = sandbox.repository.path,
         .directory = true,
     });
-    const hidden = try std.fmt.allocPrint(allocator, "{s}/.d", .{sandbox.repository.path});
+    const hidden = try allocator.print("{s}/.d", .{sandbox.repository.path});
     const hidden_directory = try ensureDirectory(allocator, io, root, hidden);
     try tmpfs(allocator, hidden_directory.handle);
     hidden_directory.close(io);
@@ -563,19 +563,19 @@ fn childNamespace(allocator: std.mem.Allocator, io: std.Io, sandbox: Sandbox, ar
     try symlink(allocator, root, "/bin", "usr/bin");
     try symlink(allocator, root, "/lib", "usr/lib");
     try symlink(allocator, root, "/lib64", "usr/lib64");
-    try symlink(allocator, root, ".", if (builtin.cpu.arch == .aarch64) "lib/aarch64-linux-gnu" else "lib/x86_64-linux-gnu");
+    try symlink(allocator, root, ".", if (builtin.target.cpu.arch == .aarch64) "lib/aarch64-linux-gnu" else "lib/x86_64-linux-gnu");
     for (sandbox.aliases) |alias| {
         try c.core.private_files.basename(alias.name);
         const executable = alias.bound.contract.executable orelse return error.InvalidRuntime;
-        try symlink(allocator, root, try std.fs.path.join(allocator, &.{ alias.bound.directory.path, executable.path }), try std.fmt.allocPrint(allocator, "bin/{s}", .{alias.name}));
+        try symlink(allocator, root, try std.fs.path.join(allocator, &.{ alias.bound.directory.path, executable.path }), try allocator.print("bin/{s}", .{alias.name}));
     }
     try symlink(allocator, root, "/proc/self/fd", "dev/fd");
     inline for (.{ "stdin", "stdout", "stderr" }, 0..) |name, fd|
-        try symlink(allocator, root, try std.fmt.allocPrint(allocator, "/proc/self/fd/{d}", .{fd}), "dev/" ++ name);
+        try symlink(allocator, root, try allocator.print("/proc/self/fd/{d}", .{fd}), "dev/" ++ name);
     try writeRoot(io, root, "etc/passwd", try sandbox.isolation.account.passwd(allocator));
-    try writeRoot(io, root, "etc/group", try std.fmt.allocPrint(allocator, "{s}:x:{d}:\n", .{ sandbox.isolation.account.name, sandbox.isolation.account.gid }));
+    try writeRoot(io, root, "etc/group", try allocator.print("{s}:x:{d}:\n", .{ sandbox.isolation.account.name, sandbox.isolation.account.gid }));
     try writeRoot(io, root, "etc/nsswitch.conf", "passwd: files\ngroup: files\n");
-    const proc_path = try allocator.dupeZ(u8, try std.fs.path.join(allocator, &.{ root.path, "proc" }));
+    const proc_path = try allocator.dupeSentinel(u8, try std.fs.path.join(allocator, &.{ root.path, "proc" }), 0);
     if (linux.errno(linux.mount("proc", proc_path, "proc", linux.MS.NOSUID | linux.MS.NODEV | linux.MS.NOEXEC, 0)) != .SUCCESS)
         return error.ProcNamespaceUnavailable;
     try readonlyAt(io, root, "proc");
@@ -585,14 +585,14 @@ fn childNamespace(allocator: std.mem.Allocator, io: std.Io, sandbox: Sandbox, ar
         linux.errno(linux.chdir("/")) != .SUCCESS) return error.ChrootUnavailable;
     try sandbox.isolation.facade_lock.require(try Identity.of(sandbox.isolation.facade_lock.path, try facadeInside(allocator, io, sandbox.isolation.facade_runtime.path)));
     const args = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
-    for (argv, 0..) |arg, i| args[i] = (try allocator.dupeZ(u8, arg)).ptr;
+    for (argv, 0..) |arg, i| args[i] = (try allocator.dupeSentinel(u8, arg, 0)).ptr;
     const block = try environment.createPosixBlock(allocator, .{ .zig_progress_fd = -1 });
-    const cwd = try allocator.dupeZ(u8, sandbox.repository.path);
+    const cwd = try allocator.dupeSentinel(u8, sandbox.repository.path, 0);
     if (linux.errno(linux.chdir(cwd)) != .SUCCESS) return error.ChrootUnavailable;
     try dropPrivileges();
     // Same-UID payloads must not reopen PID 1's private status/exec pipe through
     // procfs. This does not change passwd HOME, lock identity, or payload FDs.
-    if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), 0, 0, 0, 0)) != .SUCCESS)
+    if (linux.errno(linux.prctl(@backingInt(linux.PR.SET_DUMPABLE), 0, 0, 0, 0)) != .SUCCESS)
         return error.DescriptorIsolationUnavailable;
     try closeExcept(status_fd);
     _ = linux.syscall1(.umask, 0o077);
@@ -720,7 +720,7 @@ fn ensureDirectory(allocator: std.mem.Allocator, io: std.Io, root: fs.Directory,
     return current;
 }
 fn tmpfs(allocator: std.mem.Allocator, target: linux.fd_t) !void {
-    const path = try std.fmt.allocPrintSentinel(allocator, "/proc/self/fd/{d}", .{target}, 0);
+    const path = try allocator.printSentinel("/proc/self/fd/{d}", .{target}, 0);
     if (linux.errno(linux.mount("tmpfs", path, "tmpfs", linux.MS.NOSUID | linux.MS.NODEV, @intFromPtr("mode=0700,size=16m"))) != .SUCCESS)
         return error.MountNamespaceUnavailable;
 }
@@ -755,7 +755,7 @@ fn bindAt(allocator: std.mem.Allocator, io: std.Io, root: fs.Directory, mount: M
     // their kernel-provided names in the new mount tree, requiring the same
     // held object, before open_tree/move_mount (which reject foreign mounts).
     var path_buffer: [4096]u8 = undefined;
-    const source_path = path_buffer[0..try std.Io.Dir.readLinkAbsolute(io, try std.fmt.allocPrint(allocator, "/proc/self/fd/{d}", .{mount.file.handle}), &path_buffer)];
+    const source_path = path_buffer[0..try std.Io.Dir.readLinkAbsolute(io, try allocator.print("/proc/self/fd/{d}", .{mount.file.handle}), &path_buffer)];
     const current = try std.Io.Dir.openFileAbsolute(io, source_path, .{ .path_only = true, .follow_symlinks = false });
     defer current.close(io);
     try sameObject(mount.file, current);
@@ -787,7 +787,7 @@ fn readonlyAt(io: std.Io, root: fs.Directory, path: []const u8) !void {
     try attributes(directory.handle, true, false, false);
 }
 fn symlink(allocator: std.mem.Allocator, root: fs.Directory, target: []const u8, path: []const u8) !void {
-    if (linux.errno(linux.symlinkat(try allocator.dupeZ(u8, target), root.dir.handle, try allocator.dupeZ(u8, path))) != .SUCCESS)
+    if (linux.errno(linux.symlinkat(try allocator.dupeSentinel(u8, target, 0), root.dir.handle, try allocator.dupeSentinel(u8, path, 0))) != .SUCCESS)
         return error.InvalidAlias;
 }
 fn writeRoot(io: std.Io, root: fs.Directory, path: []const u8, bytes: []const u8) !void {
@@ -811,16 +811,16 @@ pub fn userNamespace(account: env.Account) !void {
     if (linux.errno(linux.unshare(linux.CLONE.NEWUSER)) != .SUCCESS) return error.UserNamespaceUnavailable;
     try writeMap("/proc/self/setgroups", "deny\n");
     var buffer: [96]u8 = undefined;
-    try writeMap("/proc/self/uid_map", try std.fmt.bufPrint(&buffer, "{d} {d} 1\n", .{ account.uid, account.uid }));
-    try writeMap("/proc/self/gid_map", try std.fmt.bufPrint(&buffer, "{d} {d} 1\n", .{ account.gid, account.gid }));
+    try writeMap("/proc/self/uid_map", try std.mem.print(&buffer, "{d} {d} 1\n", .{ account.uid, account.uid }));
+    try writeMap("/proc/self/gid_map", try std.mem.print(&buffer, "{d} {d} 1\n", .{ account.gid, account.gid }));
     if (linux.geteuid() != account.uid or linux.getegid() != account.gid) return error.UserMappingUnavailable;
 }
 fn dropPrivileges() !void {
-    if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0)) != .SUCCESS)
+    if (linux.errno(linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0)) != .SUCCESS)
         return error.PrivilegeDropUnavailable;
     var cap: usize = 0;
     while (cap < 64) : (cap += 1) {
-        const result = linux.prctl(@intFromEnum(linux.PR.CAPBSET_DROP), cap, 0, 0, 0);
+        const result = linux.prctl(@backingInt(linux.PR.CAPBSET_DROP), cap, 0, 0, 0);
         if (linux.errno(result) == .INVAL) break;
         if (linux.errno(result) != .SUCCESS) return error.PrivilegeDropUnavailable;
     }
@@ -828,7 +828,7 @@ fn dropPrivileges() !void {
     if (linux.errno(linux.prctl(47, 4, 0, 0, 0)) != .SUCCESS) return error.PrivilegeDropUnavailable;
     // Linux UAPI pid is 32-bit; Zig 0.16's cap_user_header_t uses usize.
     const header: extern struct { version: u32, pid: i32 } = .{ .version = 0x20080522, .pid = 0 };
-    const data = [_]linux.cap_user_data_t{std.mem.zeroes(linux.cap_user_data_t)} ** 2;
+    const data = @as([2]linux.cap_user_data_t, @splat(std.mem.zeroes(linux.cap_user_data_t)));
     if (linux.errno(linux.syscall2(.capset, @intFromPtr(&header), @intFromPtr(&data))) != .SUCCESS)
         return error.PrivilegeDropUnavailable;
 }
@@ -839,7 +839,7 @@ fn wait(pid: linux.pid_t) !Status {
         switch (linux.errno(result)) {
             .SUCCESS => if (result == @as(usize, @intCast(pid))) {
                 if (linux.W.IFEXITED(status)) return .{ .primary = .exited, .code = linux.W.EXITSTATUS(status) };
-                if (linux.W.IFSIGNALED(status)) return .{ .primary = .signaled, .code = @intCast(@intFromEnum(linux.W.TERMSIG(status))) };
+                if (linux.W.IFSIGNALED(status)) return .{ .primary = .signaled, .code = @intCast(@backingInt(linux.W.TERMSIG(status))) };
                 return error.NamespaceWaitFailed;
             },
             .INTR => {},

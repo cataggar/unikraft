@@ -5,7 +5,7 @@ pub const Sha = [64]u8;
 pub const Identity = [32]u8;
 pub const miz_revision = "669a27982b376311f558e820b69e9a692735b0cd";
 pub const miz_package_hash = "miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx";
-pub const compiler_version = "0.16.0";
+pub const compiler_version = "0.17.0";
 pub const guest_target = "x86_64-freestanding-none";
 pub const total_cap: u64 = 268435456;
 pub const control_cap: u64 = 8388608;
@@ -76,13 +76,9 @@ pub fn parse(comptime T: type, allocator: std.mem.Allocator, bytes: []const u8) 
 fn shape(comptime T: type, value: std.json.Value) anyerror!void {
     switch (@typeInfo(T)) {
         .@"struct" => |info| {
-            const fields = comptime fields: {
-                var result: [info.fields.len][]const u8 = undefined;
-                for (info.fields, 0..) |field, i| result[i] = field.name;
-                break :fields result;
-            };
-            const object = try c.exactFields(value, &fields);
-            inline for (info.fields) |field| try shape(field.type, object.get(field.name).?);
+            const object = try c.exactFields(value, info.field_names);
+            inline for (info.field_names, info.field_types) |name, Field|
+                try shape(Field, object.get(name).?);
         },
         .optional => |info| if (value != .null) {
             try shape(info.child, value);
@@ -112,8 +108,8 @@ fn shape(comptime T: type, value: std.json.Value) anyerror!void {
         .@"union" => |info| {
             if (info.tag_type == null) @compileError("Only tagged unions belong in preparation contracts");
             if (value != .object or value.object.count() != 1) return error.InvalidUnion;
-            inline for (info.fields) |field| {
-                if (value.object.get(field.name)) |payload| return shape(field.type, payload);
+            inline for (info.field_names, info.field_types) |name, Field| {
+                if (value.object.get(name)) |payload| return shape(Field, payload);
             }
             return error.InvalidUnion;
         },

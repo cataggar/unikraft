@@ -18,7 +18,10 @@ pub fn build(b: *std.Build) void {
     });
     const kconfig = b.createModule(.{ .root_source_file = b.path("../../../build/kconfig.zig"), .target = target, .optimize = optimize });
     const elf = b.createModule(.{ .root_source_file = b.path("../../../build/postprocess-elf.zig"), .target = target, .optimize = optimize });
-    const peer = b.build_root.handle.readFileAlloc(b.graph.io, "../../../scripts/hyperv-network-peer.py", b.allocator, .limited(4 * 1024 * 1024)) catch @panic("public peer source unavailable");
+    const peer_source = b.path("../../../scripts/hyperv-network-peer.py");
+    b.dependOnFileContents(peer_source);
+    const peer_path = b.root.joinString(b.allocator, "../../../scripts/hyperv-network-peer.py") catch @panic("cannot resolve peer source");
+    const peer = std.Io.Dir.cwd().readFileAlloc(b.graph.io, peer_path, b.allocator, .limited(4 * 1024 * 1024)) catch @panic("public peer source unavailable");
     var peer_hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(peer, &peer_hash, .{});
     const pins = b.addOptions();

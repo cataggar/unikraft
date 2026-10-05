@@ -6,7 +6,7 @@ const material = @import("material.zig");
 const selection = @import("selection.zig");
 const t = std.testing;
 const a = t.allocator;
-const hash = "1" ** 64;
+const hash = &@as([64]u8, @splat('1'));
 
 test "integration driver runtime measurement is explicit and bootstrap cannot borrow a post Bundle review" {
     const parsed = try main.arguments(&.{ "driver", "runtime-material", "/private/work" });
@@ -187,13 +187,13 @@ test "integration driver canonical exact review rejects duplicate and unknown fi
     const decoded = try x.c.parse(x.Review, a, encoded);
     defer decoded.deinit();
     try decoded.value.validate(.configure);
-    const duplicate = try std.fmt.allocPrint(a, "{{\"phase\":\"configure\",{s}", .{encoded[1..]});
+    const duplicate = try a.print("{{\"phase\":\"configure\",{s}", .{encoded[1..]});
     defer a.free(duplicate);
     if (x.c.parse(x.Review, a, duplicate)) |value| {
         value.deinit();
         return error.TestExpectedError;
     } else |_| {}
-    const unknown = try std.fmt.allocPrint(a, "{{\"arbitrary\":false,{s}", .{encoded[1..]});
+    const unknown = try a.print("{{\"arbitrary\":false,{s}", .{encoded[1..]});
     defer a.free(unknown);
     if (x.c.parse(x.Review, a, unknown)) |value| {
         value.deinit();
@@ -202,7 +202,7 @@ test "integration driver canonical exact review rejects duplicate and unknown fi
 }
 
 test "integration driver expectation preserves destination not future physical identity" {
-    const current: x.c.File = .{ .path = "run.config", .mode = 0o600, .size = 19, .sha256 = "2".* ** 64 };
+    const current: x.c.File = .{ .path = "run.config", .mode = 0o600, .size = 19, .sha256 = @as([64]u8, @splat('2')) };
     const expected: x.c.File = .{ .path = "reviewed.config", .mode = 0o600, .size = 123, .sha256 = hash.* };
     const result = try x.inspectionConfig(current, expected);
     try t.expectEqualStrings("run.config", result.path);
@@ -282,7 +282,7 @@ test "integration driver immutable attempt refuses replay without changing mater
     const directory = try world.open(try fixture.dir.realPathFileAlloc(t.io, ".", world.allocator));
     try main.attempt(&world, directory, .configure, hash.*, hash.*);
     const before = try directory.record(world.allocator, t.io, "attempt-configure.json", 4096, .private);
-    try t.expectError(error.PathAlreadyExists, main.attempt(&world, directory, .configure, "2".* ** 64, hash.*));
+    try t.expectError(error.PathAlreadyExists, main.attempt(&world, directory, .configure, @as([64]u8, @splat('2')), hash.*));
     const after = try directory.record(world.allocator, t.io, "attempt-configure.json", 4096, .private);
     try x.fs.requireFile(before, after);
 }
@@ -300,7 +300,7 @@ test "integration driver actual actor identity rejects identical physical copies
     const executable = try directory.record(world.allocator, t.io, std.fs.path.basename(path), 64 * 1024 * 1024, .executable);
     var bound: x.rt.Bound = .{ .directory = directory, .contract = .{
         .role = .preparation,
-        .target = if (@import("builtin").cpu.arch == .aarch64) .aarch64_linux else .x86_64_linux,
+        .target = if (@import("builtin").target.cpu.arch == .aarch64) .aarch64_linux else .x86_64_linux,
         .origin = x.p.origin_fixture.local(),
         .tree = .{ .files = 1, .bytes = executable.size, .sha256 = hash.* },
         .executable = executable,
@@ -348,7 +348,7 @@ test "integration driver reservation charges every post-selection file and manif
 }
 
 test "integration driver rejects historical-size geometry and non-synthetic LUN" {
-    var guard: x.p.config.Guard = .{ .run_id = "1".* ** 32, .disk_id = "2".* ** 32, .sectors = 49, .lun = 0 };
+    var guard: x.p.config.Guard = .{ .run_id = @as([32]u8, @splat('1')), .disk_id = @as([32]u8, @splat('2')), .sectors = 49, .lun = 0 };
     try x.synthetic(guard);
     guard.sectors = 4096;
     try x.synthetic(guard);
@@ -427,15 +427,15 @@ test "integration driver rejects data-only and absent compiler or engine executa
 fn configuredReceiptFixture(allocator: std.mem.Allocator) !x.p.receipts.Link {
     const source: x.c.Source = .{
         .scheme = .git_physical_native_v1,
-        .head = "1" ** 40,
-        .tree = "2" ** 40,
+        .head = &@as([40]u8, @splat('1')),
+        .tree = &@as([40]u8, @splat('2')),
         .tree_sha256 = hash.*,
         .physical = .{ .sha256 = hash.*, .files = 1, .bytes = 1 },
     };
     const executable: x.rt.Tool = .{
         .role = .preparation,
-        .target = if (@import("builtin").cpu.arch == .aarch64) .aarch64_linux else .x86_64_linux,
-        .origin = .{ .payload = .{ .local_build = .{ .source_revision = "1" ** 40, .source_physical_sha256 = hash.*, .compiler_executable_sha256 = hash.* } } },
+        .target = if (@import("builtin").target.cpu.arch == .aarch64) .aarch64_linux else .x86_64_linux,
+        .origin = .{ .payload = .{ .local_build = .{ .source_revision = &@as([40]u8, @splat('1')), .source_physical_sha256 = hash.*, .compiler_executable_sha256 = hash.* } } },
         .tree = .{ .files = 1, .bytes = 1, .sha256 = hash.* },
         .executable = .{ .path = "bin/fixture", .size = 1, .mode = 0o700, .sha256 = hash.* },
         .loader = null,
@@ -459,7 +459,7 @@ fn configuredReceiptFixture(allocator: std.mem.Allocator) !x.p.receipts.Link {
     const provenance: x.p.provenance.Record = .{
         .schema = .hyperv_native_producer_provenance_v2,
         .source = source,
-        .host_target = if (@import("builtin").cpu.arch == .aarch64) .aarch64_linux else .x86_64_linux,
+        .host_target = if (@import("builtin").target.cpu.arch == .aarch64) .aarch64_linux else .x86_64_linux,
         .guest_target = .x86_64_freestanding_none,
         .compiler_version = x.c.compiler_version,
         .producer = executable,
@@ -473,8 +473,8 @@ fn configuredReceiptFixture(allocator: std.mem.Allocator) !x.p.receipts.Link {
         .schema = .hyperv_artifact_preparation_native_v2,
         .phase = .configured,
         .purpose = .synthetic,
-        .run_id = "1".* ** 32,
-        .guard = .{ .run_id = "1".* ** 32, .disk_id = "2".* ** 32, .sectors = 49, .lun = 0 },
+        .run_id = @as([32]u8, @splat('1')),
+        .guard = .{ .run_id = @as([32]u8, @splat('1')), .disk_id = @as([32]u8, @splat('2')), .sectors = 49, .lun = 0 },
         .source_before = source,
         .source_after = source,
         .provenance = provenance,

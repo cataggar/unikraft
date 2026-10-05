@@ -19,9 +19,9 @@ pub const MakeRecord = struct {
     zig_local_cache: []const u8,
 
     pub fn validate(self: MakeRecord) !void {
-        inline for (std.meta.fields(MakeRecord)) |field| {
-            if (comptime !std.mem.eql(u8, field.name, "schema")) {
-                const path = @field(self, field.name);
+        inline for (@typeInfo(MakeRecord).@"struct".field_names) |field| {
+            if (comptime !std.mem.eql(u8, field, "schema")) {
+                const path = @field(self, field);
                 try absolute(path);
                 if (path.len > 4095) return error.UnsafePath;
                 for (path) |byte| if (!std.ascii.isAlphanumeric(byte) and
@@ -41,15 +41,15 @@ pub fn loadMake(allocator: std.mem.Allocator, io: std.Io, path: []const u8, sha2
     const parsed = try c.parse(MakeRecord, allocator, bytes);
     errdefer parsed.deinit();
     try parsed.value.validate();
-    inline for (std.meta.fields(MakeRecord)) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "schema")) {
-            const value = @field(parsed.value, field.name);
-            if (comptime std.mem.eql(u8, field.name, "shell") or std.mem.eql(u8, field.name, "m4")) {
+    inline for (@typeInfo(MakeRecord).@"struct".field_names) |field| {
+        if (comptime !std.mem.eql(u8, field, "schema")) {
+            const value = @field(parsed.value, field);
+            if (comptime std.mem.eql(u8, field, "shell") or std.mem.eql(u8, field, "m4")) {
                 const directory = try fs.Directory.open(allocator, io, std.fs.path.dirname(value).?);
                 defer directory.close(allocator, io);
                 const file = try directory.openFile(io, std.fs.path.basename(value), .executable);
                 file.close(io);
-            } else if (comptime std.mem.eql(u8, field.name, "bison_data")) {
+            } else if (comptime std.mem.eql(u8, field, "bison_data")) {
                 const directory = try fs.Directory.open(allocator, io, value);
                 directory.close(allocator, io);
             } else {
@@ -182,7 +182,7 @@ pub const Account = struct {
     }
 
     pub fn passwd(self: Account, allocator: std.mem.Allocator) ![]const u8 {
-        return std.fmt.allocPrint(allocator, "{s}:x:{d}:{d}::{s}:/bin/sh\n", .{ self.name, self.uid, self.gid, self.home });
+        return allocator.print("{s}:x:{d}:{d}::{s}:/bin/sh\n", .{ self.name, self.uid, self.gid, self.home });
     }
 };
 
@@ -213,7 +213,7 @@ test "native Make bridge wire exactly matches canonical parent contract" {
         invalid.shell = path;
         try std.testing.expectError(error.UnsafePath, invalid.validate());
     }
-    const unknown = try std.fmt.allocPrint(allocator, "{{\"HOME\":\"/other\",{s}", .{bytes[1..]});
+    const unknown = try allocator.print("{{\"HOME\":\"/other\",{s}", .{bytes[1..]});
     defer allocator.free(unknown);
     try std.testing.expectError(error.UnexpectedFields, c.parse(MakeRecord, allocator, unknown));
 }
@@ -229,16 +229,16 @@ test "native Make bridge requires private hash-bound file and canonical trusted 
     const base = try fixture.dir.realPathFileAlloc(io, ".", allocator);
     var record: MakeRecord = undefined;
     record.schema = .unikraft_native_make_environment_v1;
-    inline for (std.meta.fields(MakeRecord)) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "schema")) {
-            @field(record, field.name) = try std.fs.path.join(allocator, &.{ base, field.name });
-            if (comptime std.mem.eql(u8, field.name, "shell") or std.mem.eql(u8, field.name, "m4")) {
-                const file = try fixture.dir.createFile(io, field.name, .{ .permissions = .fromMode(0o700) });
+    inline for (@typeInfo(MakeRecord).@"struct".field_names) |field| {
+        if (comptime !std.mem.eql(u8, field, "schema")) {
+            @field(record, field) = try std.fs.path.join(allocator, &.{ base, field });
+            if (comptime std.mem.eql(u8, field, "shell") or std.mem.eql(u8, field, "m4")) {
+                const file = try fixture.dir.createFile(io, field, .{ .permissions = .fromMode(0o700) });
                 defer file.close(io);
                 try file.setPermissions(io, .fromMode(0o700));
                 try file.writePositionalAll(io, "public metadata-only fixture, never executed\n", 0);
             } else {
-                try fixture.dir.createDir(io, field.name, .fromMode(0o700));
+                try fixture.dir.createDir(io, field, .fromMode(0o700));
             }
         }
     }

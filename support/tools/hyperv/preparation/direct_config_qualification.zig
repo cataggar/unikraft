@@ -171,7 +171,7 @@ pub fn main(init: std.process.Init) !void {
         .version = @as(u8, 1),
         .scope = "local_unsolved_configuration_only",
         .authority = "not_admitted",
-        .host_arch = @tagName(@import("builtin").cpu.arch),
+        .host_arch = @tagName(@import("builtin").target.cpu.arch),
         .optimization = @tagName(@import("builtin").mode),
         .cli_sha256 = cli_sha,
         .full_size_creations = @as(u8, 1),

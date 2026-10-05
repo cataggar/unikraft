@@ -4,10 +4,10 @@ const std = @import("std");
 const c = @import("contracts.zig");
 const fs = @import("files.zig");
 const o = @import("origin.zig");
-pub const tree: c.Tree = .{ .sha256 = "1".* ** 64, .files = 1, .bytes = 128 };
+pub const tree: c.Tree = .{ .sha256 = @as([64]u8, @splat('1')), .files = 1, .bytes = 128 };
 pub fn local() o.Origin {
     return .{ .payload = .{ .local_build = .{
-        .source_revision = "1" ** 40,
+        .source_revision = &@as([40]u8, @splat('1')),
         .source_physical_sha256 = c.digest("public synthetic source SHAPE only"),
         .compiler_executable_sha256 = c.digest("public synthetic compiler SHAPE only"),
     } } };
@@ -26,7 +26,7 @@ pub fn shapePackage() o.Origin {
         .revision = .{ .git_commit = c.miz_revision },
         .declaration = .{
             .directory = .{ .path = "/synthetic/manifest", .device = 1, .inode = 1, .mode = 0o40700, .uid = 1000 },
-            .file = .{ .path = "build.zig.zon", .sha256 = "2".* ** 64, .mode = 0o644, .size = 128 },
+            .file = .{ .path = "build.zig.zon", .sha256 = @as([64]u8, @splat('2')), .mode = 0o644, .size = 128 },
             .entry = "miz_source",
         },
         .scope = .{ .whole = .{} },
@@ -40,7 +40,7 @@ pub fn write(allocator: std.mem.Allocator, io: std.Io, root: fs.Directory, path:
     return root.record(allocator, io, path, 1024 * 1024 * 1024, .artifact);
 }
 pub fn distribution(allocator: std.mem.Allocator, io: std.Io, root: fs.Directory) !struct { origin: o.Origin, evidence: []const o.Binding } {
-    const path = try std.fmt.allocPrint(allocator, "{s}-origin-evidence", .{root.path});
+    const path = try allocator.print("{s}-origin-evidence", .{root.path});
     try std.Io.Dir.cwd().createDir(io, path, .fromMode(0o700));
     const evidence = try fs.Directory.open(allocator, io, path);
     defer evidence.close(allocator, io);

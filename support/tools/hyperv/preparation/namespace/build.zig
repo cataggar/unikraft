@@ -2,8 +2,6 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    b.cache_root.path = b.cache_root.handle.realPathFileAlloc(b.graph.io, ".", b.allocator) catch
-        @panic("cannot canonicalize the selected fixture cache");
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const workspace = b.option([]const u8, "workspace", "Explicit preparation validation subtree") orelse
@@ -29,7 +27,7 @@ pub fn build(b: *std.Build) void {
         probe.root_module.addOptions("hash_cost_options", options);
         const run = b.addRunArtifact(probe);
         run.has_side_effects = true;
-        if (b.args) |args| run.addArgs(args);
+        run.addPassthruArgs();
         b.step("build-hash-cost-probe", "Compile the uninstalled actual-fixture hash probe").dependOn(&probe.step);
         b.step("diagnose-hash-cost", "Observe original file-hash APIs without namespace operations").dependOn(&run.step);
         return;
@@ -81,14 +79,14 @@ pub fn build(b: *std.Build) void {
         .{ .name = "producer_elf", .module = elf },
         .{ .name = "facade_paths", .module = paths },
     };
-    const gate_core = b.createModule(.{ .root_source_file = b.path("../../core.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
+    const gate_core = b.createModule(.{ .root_source_file = b.path("../../core.zig"), .target = b.graph.host, .optimize = .safe });
     if (b.graph.host.result.cpu.arch == .x86_64)
         gate_core.addAssemblyFile(b.path("../../sha256_clear_upper.S"));
-    const gate_elf = b.createModule(.{ .root_source_file = b.path("../../../../build/postprocess-elf.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
+    const gate_elf = b.createModule(.{ .root_source_file = b.path("../../../../build/postprocess-elf.zig"), .target = b.graph.host, .optimize = .safe });
     const equivalence = b.createModule(.{
         .root_source_file = b.path("fixture_debug_equivalence.zig"),
         .target = b.graph.host,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .imports = &.{ .{ .name = "hyperv_core", .module = gate_core }, .{ .name = "producer_elf", .module = gate_elf } },
     });
     const verifier = b.addExecutable(.{
@@ -96,7 +94,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("fixture_debug_verifier.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .imports = &.{.{ .name = "equivalence", .module = equivalence }},
         }),
     });
@@ -240,7 +238,7 @@ pub fn build(b: *std.Build) void {
     b.step("test", "Run small native namespace and typed producer fixtures").dependOn(&run.step);
 }
 
-fn observationTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, workspace: []const u8) *std.Build.Step.Run {
+fn observationTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, workspace: []const u8) *std.Build.Step.Run {
     const core = b.createModule(.{ .root_source_file = b.path("../../core.zig"), .target = target, .optimize = optimize });
     if (target.result.cpu.arch == .x86_64)
         core.addAssemblyFile(b.path("../../sha256_clear_upper.S"));
@@ -274,7 +272,7 @@ fn observationTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
     return run;
 }
 
-fn exclusionTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, workspace: []const u8) *std.Build.Step.Run {
+fn exclusionTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, workspace: []const u8) *std.Build.Step.Run {
     const core = b.createModule(.{ .root_source_file = b.path("../../core.zig"), .target = target, .optimize = optimize });
     if (target.result.cpu.arch == .x86_64)
         core.addAssemblyFile(b.path("../../sha256_clear_upper.S"));
@@ -298,7 +296,7 @@ fn exclusionTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
     return run;
 }
 
-fn internalProbe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, workspace: []const u8) *std.Build.Step.Compile {
+fn internalProbe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, workspace: []const u8) *std.Build.Step.Compile {
     const core = b.createModule(.{ .root_source_file = b.path("../../core.zig"), .target = target, .optimize = optimize });
     if (target.result.cpu.arch == .x86_64)
         core.addAssemblyFile(b.path("../../sha256_clear_upper.S"));

@@ -15,7 +15,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .single_threaded = true,
             .link_libc = false,
-            .strip = optimize != .Debug,
+            .strip = optimize != .debug,
             .imports = imports,
         }),
     });
@@ -32,6 +32,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run = b.addRunArtifact(tests);
-    run.setCwd(.{ .cwd_relative = b.cache_root.path.? });
+    run.setCwd(std.Build.LazyPath.cache_root);
     b.step("test", "Run non-executing integration argument/material fixtures").dependOn(&run.step);
 }

@@ -272,7 +272,7 @@ export ZIG_LOCAL_CACHE_DIR="$S/cache" ZIG_GLOBAL_CACHE_DIR="$S/global-cache"
   -Dimport-test-root="$S/fixtures" -Dtest-root="$S/fixtures" \
   -j2 test-import test install --summary all
 /home/g/.local/bin/zig build --build-file support/tools/hyperv/public_image/build.zig \
-  --system "$PKGS" --prefix "$S/outputs/release" -Doptimize=ReleaseSafe \
+  --system "$PKGS" --prefix "$S/outputs/release" -Doptimize=safe \
   -Dimport-test-root="$S/fixtures" -Dtest-root="$S/fixtures" \
   -j2 test-import test install --summary all
 /home/g/.local/bin/zig build --build-file support/tools/hyperv/local_boot/build.zig \
@@ -281,7 +281,7 @@ export ZIG_LOCAL_CACHE_DIR="$S/cache" ZIG_GLOBAL_CACHE_DIR="$S/global-cache"
 /home/g/.local/bin/zig build --build-file support/tools/hyperv/local_boot/build.zig \
   --system "$PKGS" --prefix "$S/outputs/local-release" \
   -Dtest-root="$S/fixtures" \
-  -Doptimize=ReleaseSafe -j2 test install
+  -Doptimize=safe -j2 test install
 ```
 
 `test-import` uses ordinary public synthetic 512-byte EFI inputs and real

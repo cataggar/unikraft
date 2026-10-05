@@ -9,7 +9,7 @@ fn integer(comptime T: type, bytes: []u8, offset: usize, value: T) void {
 }
 
 fn image(raw: bool, machine: u16) [768]u8 {
-    var bytes = [_]u8{0} ** 768;
+    var bytes = @as([768]u8, @splat(0));
     @memcpy(bytes[0..7], "\x7fELF\x02\x01\x01");
     integer(u16, &bytes, 16, 2);
     integer(u16, &bytes, 18, machine);
@@ -66,7 +66,7 @@ fn requireRejected(raw: []const u8, candidate: []const u8) !void {
 }
 
 test "debug equivalence preserves ELF64 loaded bytes and records only locator normalization" {
-    for ([_]u16{ @intFromEnum(std.elf.EM.AARCH64), @intFromEnum(std.elf.EM.X86_64) }) |machine| {
+    for ([_]u16{ @backingInt(std.elf.EM.AARCH64), @backingInt(std.elf.EM.X86_64) }) |machine| {
         const raw = image(true, machine);
         const candidate = image(false, machine);
         const proof = try gate.compare(a, &raw, candidate[0..512]);
@@ -93,8 +93,8 @@ test "debug equivalence preserves ELF64 loaded bytes and records only locator no
 }
 
 test "debug equivalence rejects loaded changes entry headers and normalization neighbors" {
-    const raw = image(true, @intFromEnum(std.elf.EM.AARCH64));
-    const good = image(false, @intFromEnum(std.elf.EM.AARCH64));
+    const raw = image(true, @backingInt(std.elf.EM.AARCH64));
+    const good = image(false, @backingInt(std.elf.EM.AARCH64));
     for ([_]usize{ 4, 5, 7, 18, 24, 32, 48, 52, 54, 56, 58, 68, 88, 140, 250 }) |offset| {
         var bad = good;
         bad[offset] ^= 1;
@@ -106,8 +106,8 @@ test "debug equivalence rejects loaded changes entry headers and normalization n
 }
 
 test "debug equivalence validates both section tables before normalization and actual removal" {
-    const raw = image(true, @intFromEnum(std.elf.EM.AARCH64));
-    const good = image(false, @intFromEnum(std.elf.EM.AARCH64));
+    const raw = image(true, @backingInt(std.elf.EM.AARCH64));
+    const good = image(false, @backingInt(std.elf.EM.AARCH64));
     var bad = good;
     integer(u64, &bad, 40, 500);
     try requireRejected(&raw, bad[0..512]);
@@ -140,8 +140,8 @@ test "debug equivalence pins identity hashes and rejects symlinks and input muta
     defer a.free(candidate_path);
     const link_path = try std.fs.path.join(a, &.{ directory, "link" });
     defer a.free(link_path);
-    const raw = image(true, @intFromEnum(std.elf.EM.AARCH64));
-    const candidate = image(false, @intFromEnum(std.elf.EM.AARCH64));
+    const raw = image(true, @backingInt(std.elf.EM.AARCH64));
+    const candidate = image(false, @backingInt(std.elf.EM.AARCH64));
     try temporary.dir.writeFile(io, .{ .sub_path = "raw", .data = &raw, .flags = .{ .exclusive = true, .permissions = .fromMode(0o700) } });
     try temporary.dir.writeFile(io, .{ .sub_path = "candidate", .data = candidate[0..512], .flags = .{ .exclusive = true, .permissions = .fromMode(0o700) } });
     const pair = try gate.Pair.open(a, io, raw_path, candidate_path);
@@ -205,7 +205,7 @@ test "debug equivalence reports are private bounded create-only and non-admittin
     try t.expectEqual(@as(u16, 0o600), before.mode & 0o777);
     const oversize = try std.fs.path.join(a, &.{ path, "oversize.json" });
     defer a.free(oversize);
-    try t.expectError(error.ReportTooLarge, gate.publish(a, io, oversize, "x" ** gate.max_report_bytes));
+    try t.expectError(error.ReportTooLarge, gate.publish(a, io, oversize, &@as([gate.max_report_bytes]u8, @splat('x'))));
     try t.expectError(error.FileNotFound, temporary.dir.openFile(io, "oversize.json", .{}));
 }
 
@@ -222,7 +222,7 @@ fn program(bytes: []u8, index: usize, kind: u32, flags: u32, offset: u64, addres
 }
 
 fn relayoutImage(raw: bool, machine: u16) [524288]u8 {
-    var bytes = [_]u8{0} ** 524288;
+    var bytes = @as([524288]u8, @splat(0));
     @memcpy(bytes[0..7], "\x7fELF\x02\x01\x01");
     integer(u16, &bytes, 16, 2);
     integer(u16, &bytes, 18, machine);
@@ -288,7 +288,7 @@ fn requireRelayoutRejected(raw: []const u8, candidate: []const u8) !void {
 }
 
 test "file relayout requires explicit policy and maps overlapping PHDR LOAD and EH records coherently" {
-    for ([_]u16{ @intFromEnum(std.elf.EM.AARCH64), @intFromEnum(std.elf.EM.X86_64) }) |machine| {
+    for ([_]u16{ @backingInt(std.elf.EM.AARCH64), @backingInt(std.elf.EM.X86_64) }) |machine| {
         const raw = relayoutImage(true, machine);
         const candidate = relayoutImage(false, machine);
         try t.expectError(error.ProgramHeadersChanged, gate.compare(a, &raw, candidate[0..0x40000]));
@@ -322,12 +322,12 @@ test "file relayout requires explicit policy and maps overlapping PHDR LOAD and 
 }
 
 test "file relayout preserves strict unchanged offsets and rejects header layout permissions code and data changes" {
-    const old_raw = image(true, @intFromEnum(std.elf.EM.AARCH64));
-    const old_candidate = image(false, @intFromEnum(std.elf.EM.AARCH64));
+    const old_raw = image(true, @backingInt(std.elf.EM.AARCH64));
+    const old_candidate = image(false, @backingInt(std.elf.EM.AARCH64));
     const unchanged = try gate.compareWithPolicy(a, &old_raw, old_candidate[0..512], .file_offset_relayout);
     try t.expect(!unchanged.program_mappings.records[0].changed);
-    const raw = relayoutImage(true, @intFromEnum(std.elf.EM.AARCH64));
-    const good = relayoutImage(false, @intFromEnum(std.elf.EM.AARCH64));
+    const raw = relayoutImage(true, @backingInt(std.elf.EM.AARCH64));
+    const good = relayoutImage(false, @backingInt(std.elf.EM.AARCH64));
     for ([_]usize{
         0,           4,               5,                7,                16,               18,               20,               24,    32,      48,      52,      54, 56, 58,
         64 + 2 * 56, 64 + 2 * 56 + 4, 64 + 2 * 56 + 16, 64 + 2 * 56 + 24, 64 + 2 * 56 + 32, 64 + 2 * 56 + 40, 64 + 2 * 56 + 48, 0x1f0, 0x10080, 0x20080, 0x30080,
@@ -344,8 +344,8 @@ test "file relayout preserves strict unchanged offsets and rejects header layout
 }
 
 test "file relayout rejects misaligned out of bounds zero byte unknown and anchored offsets" {
-    const raw = relayoutImage(true, @intFromEnum(std.elf.EM.AARCH64));
-    const good = relayoutImage(false, @intFromEnum(std.elf.EM.AARCH64));
+    const raw = relayoutImage(true, @backingInt(std.elf.EM.AARCH64));
+    const good = relayoutImage(false, @backingInt(std.elf.EM.AARCH64));
     var bad = good;
     integer(u64, &bad, 64 + 2 * 56 + 8, 0x30001);
     try t.expectError(error.InvalidLoadAlignment, gate.compareWithPolicy(a, &raw, bad[0..0x40000], .file_offset_relayout));
@@ -377,8 +377,8 @@ test "file relayout rejects misaligned out of bounds zero byte unknown and ancho
 }
 
 test "file relayout rejects ambiguous loads and changed nonload backing aliases" {
-    const raw = relayoutImage(true, @intFromEnum(std.elf.EM.AARCH64));
-    const good = relayoutImage(false, @intFromEnum(std.elf.EM.AARCH64));
+    const raw = relayoutImage(true, @backingInt(std.elf.EM.AARCH64));
+    const good = relayoutImage(false, @backingInt(std.elf.EM.AARCH64));
     var bad = good;
     integer(u64, &bad, 64 + 3 * 56 + 8, 0x20000);
     integer(u64, &bad, 0x34000 + 64 + 24, 0x20000);
@@ -397,8 +397,8 @@ test "file relayout rejects ambiguous loads and changed nonload backing aliases"
 }
 
 test "file relayout compares nonload program bytes outside every LOAD" {
-    var raw = relayoutImage(true, @intFromEnum(std.elf.EM.AARCH64));
-    var candidate = relayoutImage(false, @intFromEnum(std.elf.EM.AARCH64));
+    var raw = relayoutImage(true, @backingInt(std.elf.EM.AARCH64));
+    var candidate = relayoutImage(false, @backingInt(std.elf.EM.AARCH64));
     program(&raw, 6, std.elf.PT_NOTE, std.elf.PF_R, 0x65000, 0, 16, 16, 8);
     program(&candidate, 6, std.elf.PT_NOTE, std.elf.PF_R, 0x33000, 0, 16, 16, 8);
     @memset(raw[0x65000..][0..16], 0x36);
@@ -411,8 +411,8 @@ test "file relayout compares nonload program bytes outside every LOAD" {
 }
 
 test "file relayout preserves target page residues and validates nonload alignment and address bounds" {
-    const raw = relayoutImage(true, @intFromEnum(std.elf.EM.AARCH64));
-    const good = relayoutImage(false, @intFromEnum(std.elf.EM.AARCH64));
+    const raw = relayoutImage(true, @backingInt(std.elf.EM.AARCH64));
+    const good = relayoutImage(false, @backingInt(std.elf.EM.AARCH64));
     for ([_]u64{ 0x30100, 0x31000 }) |offset| {
         var bad = good;
         integer(u64, &bad, 64 + 2 * 56 + 8, offset);
@@ -435,23 +435,23 @@ test "file relayout preserves target page residues and validates nonload alignme
 }
 
 test "file relayout does not normalize executable or allocated program header bytes" {
-    var raw = relayoutImage(true, @intFromEnum(std.elf.EM.AARCH64));
-    var candidate = relayoutImage(false, @intFromEnum(std.elf.EM.AARCH64));
+    var raw = relayoutImage(true, @backingInt(std.elf.EM.AARCH64));
+    var candidate = relayoutImage(false, @backingInt(std.elf.EM.AARCH64));
     integer(u64, &raw, 24, 0x4000b8);
     integer(u64, &candidate, 24, 0x4000b8);
     integer(u32, &raw, 64 + 56 + 4, std.elf.PF_R | std.elf.PF_X);
     integer(u32, &candidate, 64 + 56 + 4, std.elf.PF_R | std.elf.PF_X);
     try t.expectError(error.EntryInProgramHeaders, gate.compareWithPolicy(a, &raw, candidate[0..0x40000], .file_offset_relayout));
-    raw = relayoutImage(true, @intFromEnum(std.elf.EM.AARCH64));
-    candidate = relayoutImage(false, @intFromEnum(std.elf.EM.AARCH64));
+    raw = relayoutImage(true, @backingInt(std.elf.EM.AARCH64));
+    candidate = relayoutImage(false, @backingInt(std.elf.EM.AARCH64));
     for ([_]*[524288]u8{ &raw, &candidate }, [_]usize{ 0x70000, 0x34000 }) |bytes, table| {
         integer(u64, bytes, table + 64 + 16, 0x4000b8);
         integer(u64, bytes, table + 64 + 24, 0xb8);
         integer(u64, bytes, table + 64 + 32, 8);
     }
     try t.expectError(error.AllocatedProgramHeaders, gate.compareWithPolicy(a, &raw, candidate[0..0x40000], .file_offset_relayout));
-    raw = relayoutImage(true, @intFromEnum(std.elf.EM.AARCH64));
-    candidate = relayoutImage(false, @intFromEnum(std.elf.EM.AARCH64));
+    raw = relayoutImage(true, @backingInt(std.elf.EM.AARCH64));
+    candidate = relayoutImage(false, @backingInt(std.elf.EM.AARCH64));
     integer(u32, &raw, 64 + 56 + 4, std.elf.PF_R | std.elf.PF_X);
     integer(u32, &candidate, 64 + 56 + 4, std.elf.PF_R | std.elf.PF_X);
     try t.expectError(error.ExecutableProgramHeaderNormalization, gate.compareWithPolicy(a, &raw, candidate[0..0x40000], .file_offset_relayout));
@@ -466,8 +466,8 @@ test "file relayout pins still reject mutation and mapping proof growth remains 
     defer a.free(raw_path);
     const candidate_path = try std.fs.path.join(a, &.{ directory, "candidate" });
     defer a.free(candidate_path);
-    const raw = relayoutImage(true, @intFromEnum(std.elf.EM.AARCH64));
-    const candidate = relayoutImage(false, @intFromEnum(std.elf.EM.AARCH64));
+    const raw = relayoutImage(true, @backingInt(std.elf.EM.AARCH64));
+    const candidate = relayoutImage(false, @backingInt(std.elf.EM.AARCH64));
     try temporary.dir.writeFile(io, .{ .sub_path = "raw", .data = &raw, .flags = .{ .exclusive = true, .permissions = .fromMode(0o700) } });
     try temporary.dir.writeFile(io, .{ .sub_path = "candidate", .data = candidate[0..0x40000], .flags = .{ .exclusive = true, .permissions = .fromMode(0o700) } });
     const pair = try gate.Pair.openWithPolicy(a, io, raw_path, candidate_path, .file_offset_relayout);

@@ -22,7 +22,7 @@ const Hash = union(enum) {
             else => return error.InvalidObjectId,
         };
         var buffer: [96]u8 = undefined;
-        value.update(try std.fmt.bufPrint(&buffer, "{s} {d}\x00", .{ kind, size }));
+        value.update(try std.mem.print(&buffer, "{s} {d}\x00", .{ kind, size }));
         return value;
     }
     fn update(self: *Hash, bytes: []const u8) void {
@@ -265,14 +265,14 @@ fn checkUntracked(allocator: std.mem.Allocator, io: std.Io, root: fs.Directory, 
     if (depth > 64) return error.LimitExceeded;
     var iterator = dir.iterate();
     while (try iterator.next(io)) |item| {
-        const path = if (prefix.len == 0) item.name else try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, item.name });
+        const path = if (prefix.len == 0) item.name else try allocator.print("{s}/{s}", .{ prefix, item.name });
         if (excluded(path)) continue;
         try c.relative(path);
         const named = try dir.openFile(io, item.name, .{ .path_only = true, .follow_symlinks = false });
         defer named.close(io);
         const before = try fs.metadata(named);
         const is_directory = before.mode & std.os.linux.S.IFMT == std.os.linux.S.IFDIR;
-        const wanted = if (is_directory) try std.fmt.allocPrint(allocator, "{s}/", .{path}) else path;
+        const wanted = if (is_directory) try allocator.print("{s}/", .{path}) else path;
         const position = entryPosition(entries, wanted);
         const found = position < entries.len and
             (if (is_directory) std.mem.startsWith(u8, entries[position].path, wanted) else std.mem.eql(u8, entries[position].path, path));
@@ -328,7 +328,7 @@ fn resolveLink(allocator: std.mem.Allocator, entries: []const Entry, path: []con
                 // Expand a link before interpreting later "." or "..", exactly
                 // as filesystem traversal does. Never lexically cancel a link.
                 const next = if (more)
-                    try std.fmt.allocPrint(allocator, "{s}/{s}", .{ target, pending[offset..] })
+                    try allocator.print("{s}/{s}", .{ target, pending[offset..] })
                 else
                     try allocator.dupe(u8, target);
                 allocator.free(pending);
@@ -342,7 +342,7 @@ fn resolveLink(allocator: std.mem.Allocator, entries: []const Entry, path: []con
             if (more) return error.UnreviewedInput;
             return;
         }
-        const prefix = try std.fmt.allocPrint(allocator, "{s}/", .{resolved.items});
+        const prefix = try allocator.print("{s}/", .{resolved.items});
         defer allocator.free(prefix);
         const child = entryPosition(entries, prefix);
         if (child == entries.len or !std.mem.startsWith(u8, entries[child].path, prefix)) return error.UnreviewedInput;
@@ -478,7 +478,7 @@ const Metadata = struct {
             if (count.* > 200000) return error.LimitExceeded;
             if (std.mem.eql(u8, item.name, ".d")) return error.UnsafePath;
             if (std.mem.endsWith(u8, item.name, ".promisor")) return error.AlternateHistoryForbidden;
-            const relative = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ path, item.name });
+            const relative = try self.allocator.print("{s}/{s}", .{ path, item.name });
             defer self.allocator.free(relative);
             try c.relative(relative);
             const named = try child.openFile(self.io, item.name, .{ .path_only = true, .follow_symlinks = false });
@@ -735,8 +735,8 @@ pub fn require(actual: c.Source, expected: c.Source) !void {
 fn initializeTree(fixture: *rt.TestFixture, format: []const u8) !void {
     const allocator = fixture.git.allocator;
     _ = try fixture.setup(&.{
-        "init",                                                                                   "--quiet",                                                           "--initial-branch=synthetic",
-        try std.fmt.allocPrint(allocator, "--template={s}/empty-template", .{fixture.root.path}), try std.fmt.allocPrint(allocator, "--object-format={s}", .{format}),
+        "init",                                                                     "--quiet",                                             "--initial-branch=synthetic",
+        try allocator.print("--template={s}/empty-template", .{fixture.root.path}), try allocator.print("--object-format={s}", .{format}),
     });
     try fixture.repository.dir.createDir(fixture.git.io, ".git/info", .fromMode(0o755));
     try fixture.repository.dir.createDir(fixture.git.io, "dir", .fromMode(0o755));
@@ -872,7 +872,7 @@ test "source real relocated Git verifies physical SHA1 commit tree index and com
     try fixture.repository.dir.deleteFile(io, "link");
     try fixture.repository.dir.symLink(io, "dir/file", "link", .{});
 
-    const replacement = try std.fmt.allocPrint(allocator, "refs/replace/{s}", .{expected.head});
+    const replacement = try allocator.print("refs/replace/{s}", .{expected.head});
     _ = try fixture.setup(&.{ "update-ref", replacement, expected.head });
     try std.testing.expectError(error.ReplacementsForbidden, inspect(&fixture.git, fixture.repository));
     _ = try fixture.setup(&.{ "update-ref", "-d", replacement });
@@ -888,7 +888,7 @@ test "source real relocated Git verifies physical SHA1 commit tree index and com
     try require(try inspect(&fixture.git, fixture.repository), expected);
     const original_head = try fixture.repository.read(allocator, io, ".git/HEAD", 4096, .source);
     const entries = try parseTree(allocator, try fixture.git.command(fixture.repository, .{ .tree = expected.tree }), 40);
-    try fixture.write(".git/HEAD", try std.fmt.allocPrint(allocator, "{s}\n", .{entries[0].oid}), 0o644);
+    try fixture.write(".git/HEAD", try allocator.print("{s}\n", .{entries[0].oid}), 0o644);
     try std.testing.expectError(error.CommandFailed, inspect(&fixture.git, fixture.repository));
     try fixture.write(".git/HEAD", original_head, 0o644);
     fixture.git.failures = .{};
@@ -1010,15 +1010,15 @@ test "source symlink expansion has a fixed hop and pending-path bound" {
     const allocator = arena.allocator();
     var entries: [34]Entry = undefined;
     for (entries[0..33], 0..) |*entry, i| entry.* = .{
-        .path = try std.fmt.allocPrint(allocator, "link-{d:0>2}", .{i}),
+        .path = try allocator.print("link-{d:0>2}", .{i}),
         .mode = "120000",
-        .oid = "1" ** 40,
-        .target = if (i == 32) "target" else try std.fmt.allocPrint(allocator, "link-{d:0>2}", .{i + 1}),
+        .oid = &@as([40]u8, @splat('1')),
+        .target = if (i == 32) "target" else try allocator.print("link-{d:0>2}", .{i + 1}),
     };
-    entries[33] = .{ .path = "target", .mode = "100644", .oid = "1" ** 40 };
+    entries[33] = .{ .path = "target", .mode = "100644", .oid = &@as([40]u8, @splat('1')) };
     try std.testing.expectError(error.UnsafePath, resolveLink(allocator, &entries, "link-00"));
     try resolveLink(allocator, &entries, "link-01");
-    entries[0].target = "x" ** 4096;
+    entries[0].target = &@as([4096]u8, @splat('x'));
     try std.testing.expectError(error.UnsafePath, resolveLink(allocator, &entries, "link-00/suffix"));
 }
 
@@ -1043,14 +1043,14 @@ test "source synthetic linked metadata is physically bound without following evi
     try linked.dir.symLink(io, "dir/file", "link", .{});
     try fixture.repository.dir.createDir(io, ".git/worktrees", .fromMode(0o755));
     try fixture.repository.dir.createDir(io, ".git/worktrees/synthetic", .fromMode(0o755));
-    try fixture.write(".git/worktrees/synthetic/HEAD", try std.fmt.allocPrint(allocator, "{s}\n", .{expected.head}), 0o644);
+    try fixture.write(".git/worktrees/synthetic/HEAD", try allocator.print("{s}\n", .{expected.head}), 0o644);
     try fixture.write(".git/worktrees/synthetic/commondir", "../..\n", 0o644);
-    try fixture.write(".git/worktrees/synthetic/gitdir", try std.fmt.allocPrint(allocator, "{s}/.git\n", .{linked.path}), 0o644);
+    try fixture.write(".git/worktrees/synthetic/gitdir", try allocator.print("{s}/.git\n", .{linked.path}), 0o644);
     try fixture.write(".git/worktrees/synthetic/index", try fixture.repository.read(allocator, io, ".git/index", 65536, .source), 0o644);
-    const pointer = try std.fmt.allocPrint(allocator, "gitdir: {s}/.git/worktrees/synthetic\n", .{fixture.repository.path});
+    const pointer = try allocator.print("gitdir: {s}/.git/worktrees/synthetic\n", .{fixture.repository.path});
     try writer.write(".git", pointer, 0o644);
     try require(try inspect(&fixture.git, linked), expected);
-    try writer.write(".git", try std.fmt.allocPrint(allocator, "gitdir: {s}/.d/not-opened\n", .{fixture.repository.path}), 0o644);
+    try writer.write(".git", try allocator.print("gitdir: {s}/.d/not-opened\n", .{fixture.repository.path}), 0o644);
     try std.testing.expectError(error.UnsafePath, inspect(&fixture.git, linked));
     try writer.write(".git", pointer, 0o644);
     try fixture.repository.dir.symLink(io, "../.d/not-opened", ".git/objects/not-followed", .{});

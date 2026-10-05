@@ -1,8 +1,6 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    b.cache_root.path = b.cache_root.handle.realPathFileAlloc(b.graph.io, ".", b.allocator) catch
-        @panic("cannot canonicalize the selected preparation cache");
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const miz = b.dependency("miz_source", .{ .target = target, .optimize = optimize });
@@ -32,7 +30,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("main.zig"),
             .target = target,
             .optimize = optimize,
-            .strip = optimize != .Debug,
+            .strip = optimize != .debug,
             .imports = &.{.{ .name = "preparation", .module = module }},
         }),
     });
@@ -43,7 +41,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("namespace_main.zig"),
             .target = target,
             .optimize = optimize,
-            .strip = optimize != .Debug,
+            .strip = optimize != .debug,
             .single_threaded = true,
             .link_libc = false,
             .imports = imports,
@@ -62,7 +60,7 @@ pub fn build(b: *std.Build) void {
     }) });
     const options = b.addOptions();
     options.addOption([]const u8, "proof_fixture", b.option([]const u8, "proof-fixture", "Explicit directory containing reviewed native proof source fixtures") orelse
-        (std.fs.path.resolve(b.allocator, &.{ b.build_root.path.?, "../../../.." }) catch @panic("cannot resolve proof fixture root")));
+        (std.fs.path.resolve(b.allocator, &.{ (b.root.toString(b.allocator) catch @panic("cannot resolve build root")), "../../../.." }) catch @panic("cannot resolve proof fixture root")));
     options.addOption(?[]const u8, "git_executable", b.option([]const u8, "git-executable", "Explicit public native Git fixture executable"));
     options.addOption(?[]const u8, "git_loader", b.option([]const u8, "git-loader", "Explicit public native Git fixture ELF interpreter"));
     options.addOption(?[]const []const u8, "git_libraries", b.option([]const []const u8, "git-library", "Explicit public Git fixture library; repeat for the complete closure"));
@@ -70,7 +68,7 @@ pub fn build(b: *std.Build) void {
     options.addOptionPath("preparation_cli", executable.getEmittedBin());
     tests.root_module.addOptions("test_options", options);
     const run = b.addRunArtifact(tests);
-    run.setCwd(.{ .cwd_relative = b.cache_root.path.? });
+    run.setCwd(std.Build.LazyPath.cache_root);
     const test_step = b.step("test", "Run native synthetic preparation and provenance fixtures");
     test_step.dependOn(&run.step);
 
@@ -104,7 +102,7 @@ pub fn build(b: *std.Build) void {
     }) });
     seed_tests.root_module.addOptions("test_options", options);
     const seed_run = b.addRunArtifact(seed_tests);
-    seed_run.setCwd(.{ .cwd_relative = b.cache_root.path.? });
+    seed_run.setCwd(std.Build.LazyPath.cache_root);
     const seed_step = b.step("test-original-seed", "Run bounded original-seed native fixtures (no full-size disks)");
     seed_step.dependOn(&seed_run.step);
     test_step.dependOn(seed_step);
@@ -117,7 +115,7 @@ pub fn build(b: *std.Build) void {
     }) });
     config_tests.root_module.addOptions("test_options", options);
     const config_run = b.addRunArtifact(config_tests);
-    config_run.setCwd(.{ .cwd_relative = b.cache_root.path.? });
+    config_run.setCwd(std.Build.LazyPath.cache_root);
     const config_step = b.step("test-direct-config", "Run bounded direct configuration and custody fixtures");
     config_step.dependOn(&config_run.step);
     test_step.dependOn(config_step);

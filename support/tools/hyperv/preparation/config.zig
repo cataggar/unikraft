@@ -101,7 +101,7 @@ pub fn renderDirectPersistence(allocator: std.mem.Allocator, guard: Guard) ![]u8
 }
 
 fn renderFragment(allocator: std.mem.Allocator, guard: Guard, comptime direct: bool) ![]u8 {
-    const bytes = try std.fmt.allocPrint(allocator,
+    const bytes = try allocator.print(
         \\# {s}
         \\{s}CONFIG_APPHYPERVACCEPTANCE=y
         \\CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE=y
@@ -364,7 +364,7 @@ const fixture: Guard = .{
 
 fn replaceTest(allocator: std.mem.Allocator, bytes: []const u8, old: []const u8, new: []const u8) ![]u8 {
     const start = std.mem.indexOf(u8, bytes, old) orelse return error.TestUnexpectedResult;
-    return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ bytes[0..start], new, bytes[start + old.len ..] });
+    return allocator.print("{s}{s}{s}", .{ bytes[0..start], new, bytes[start + old.len ..] });
 }
 
 test "native guarded config renders deterministically and validates before and after normalization" {
@@ -399,10 +399,10 @@ test "native document preserves unrelated typed options and requires metadata fo
         \\CONFIG_LIBSTORVSC_QUEUE_DEPTH=32
         \\
     ;
-    const input = try std.fmt.allocPrint(a, "{s}{s}", .{ base, unrelated });
+    const input = try a.print("{s}{s}", .{ base, unrelated });
     const normalized = try normalize(a, input, fixture);
     try std.testing.expect(std.mem.endsWith(u8, normalized, unrelated));
-    const ambiguous = try std.fmt.allocPrint(a, "{s}CONFIG_OTHER_NUMBER=123\n", .{input});
+    const ambiguous = try a.print("{s}CONFIG_OTHER_NUMBER=123\n", .{input});
     try std.testing.expectError(error.InvalidConfig, validate(a, ambiguous, fixture));
     var metadata = Metadata.init(a);
     defer metadata.deinit();
@@ -427,7 +427,7 @@ test "native config rejects duplicate conflicting missing and malformed required
         "CONFIG_LIBSTORVSC_MAX_LUNS=8\n",
         "CONFIG_OTHER=y\nCONFIG_OTHER=y\n",
     }) |extra| {
-        const bytes = try std.fmt.allocPrint(a, "{s}{s}", .{ base, extra });
+        const bytes = try a.print("{s}{s}", .{ base, extra });
         try std.testing.expectError(error.InvalidConfig, validate(a, bytes, fixture));
     }
     for ([_][]const u8{
@@ -444,19 +444,19 @@ test "native config rejects duplicate conflicting missing and malformed required
         prefix ++ "_IDENTITY_POLICY",
         prefix ++ "_LUN",
     }) |name| {
-        const search = try std.fmt.allocPrint(a, "CONFIG_{s}=", .{name});
+        const search = try a.print("CONFIG_{s}=", .{name});
         const start = std.mem.indexOf(u8, base, search).?;
         const end = start + std.mem.indexOfScalar(u8, base[start..], '\n').? + 1;
         const missing = try replaceTest(a, base, base[start..end], "");
         try std.testing.expectError(error.MissingRequired, validate(a, missing, fixture));
     }
     for ([_][]const u8{ "\"8\"", "y", "8oops", "9223372036854775808", "" }) |value| {
-        const replacement = try std.fmt.allocPrint(a, "CONFIG_LIBSTORVSC_MAX_LUNS={s}\n", .{value});
+        const replacement = try a.print("CONFIG_LIBSTORVSC_MAX_LUNS={s}\n", .{value});
         const bytes = try replaceTest(a, base, "CONFIG_LIBSTORVSC_MAX_LUNS=8\n", replacement);
         try std.testing.expectError(error.InvalidConfig, validate(a, bytes, fixture));
     }
     for ([_][]const u8{ "08", "+8", "-8", "0_8" }) |value| {
-        const replacement = try std.fmt.allocPrint(a, "CONFIG_LIBSTORVSC_MAX_LUNS={s}\n", .{value});
+        const replacement = try a.print("CONFIG_LIBSTORVSC_MAX_LUNS={s}\n", .{value});
         const bytes = try replaceTest(a, base, "CONFIG_LIBSTORVSC_MAX_LUNS=8\n", replacement);
         try std.testing.expectError(error.InvalidGuardValue, validate(a, bytes, fixture));
     }
@@ -468,14 +468,14 @@ test "native config rejects profile changes v1 addresses and unknown guarded ove
     const a = arena.allocator();
     const base = try render(a, fixture);
     for (enabled_symbols) |name| {
-        const old = try std.fmt.allocPrint(a, "CONFIG_{s}=y\n", .{name});
-        const new = try std.fmt.allocPrint(a, "# CONFIG_{s} is not set\n", .{name});
+        const old = try a.print("CONFIG_{s}=y\n", .{name});
+        const new = try a.print("# CONFIG_{s} is not set\n", .{name});
         try std.testing.expectError(error.InvalidGuardProfile, validate(a, try replaceTest(a, base, old, new), fixture));
     }
     const network = try replaceTest(a, base, "# CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION is not set\n", "CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION=y\n");
     try std.testing.expectError(error.InvalidGuardProfile, validate(a, network, fixture));
     for ([_][]const u8{ "PATH", "TARGET" }) |name| {
-        const bytes = try std.fmt.allocPrint(a, "{s}CONFIG_{s}_{s}=0\n", .{ base, prefix, name });
+        const bytes = try a.print("{s}CONFIG_{s}_{s}=0\n", .{ base, prefix, name });
         try std.testing.expectError(error.ForbiddenV2Address, validate(a, bytes, fixture));
     }
     for ([_][]const u8{
@@ -483,7 +483,7 @@ test "native config rejects profile changes v1 addresses and unknown guarded ove
         "CONFIG_LIBSTORVSC_GUARDED_IO_BYPASS=n\n",
         "# CONFIG_LIBSTORVSC_UNKNOWN is not set\n",
     }) |extra| {
-        const bytes = try std.fmt.allocPrint(a, "{s}{s}", .{ base, extra });
+        const bytes = try a.print("{s}{s}", .{ base, extra });
         try std.testing.expectError(error.UnknownDangerousOverride, validate(a, bytes, fixture));
     }
     var metadata = Metadata.init(a);
@@ -497,7 +497,7 @@ test "native config never replaces caller identities and rejects invalid IDs" {
     defer arena.deinit();
     const a = arena.allocator();
     const bytes = try render(a, fixture);
-    var changes = [_]Guard{fixture} ** 4;
+    var changes = @as([4]Guard, @splat(fixture));
     changes[0].run_id[0] = '1';
     changes[1].disk_id[0] = '2';
     changes[2].sectors += 1;

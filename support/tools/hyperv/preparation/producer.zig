@@ -46,7 +46,7 @@ pub const Plan = struct {
 pub fn plan(allocator: std.mem.Allocator, step: Step, command: CommandPaths) !Plan {
     inline for (.{ "repository", "config", "output", "scratch", "packages", "zig", "make" }) |field|
         try commandPath(@field(command, field));
-    inline for (std.meta.fields(LlvmPaths)) |field| try commandPath(@field(command.llvm, field.name));
+    inline for (@typeInfo(LlvmPaths).@"struct".field_names) |field| try commandPath(@field(command.llvm, field));
     var args: std.ArrayList([]const u8) = .empty;
     try args.appendSlice(allocator, &.{
         command.zig,
@@ -65,28 +65,28 @@ pub fn plan(allocator: std.mem.Allocator, step: Step, command: CommandPaths) !Pl
         try std.fs.path.join(allocator, &.{ command.scratch, "zig-global" }),
         "--prefix",
         command.output,
-        try std.fmt.allocPrint(allocator, "-Dapp={s}/support/apps/hyperv-acceptance", .{command.repository}),
-        try std.fmt.allocPrint(allocator, "-Dconfig={s}", .{command.config}),
-        try std.fmt.allocPrint(allocator, "-Doutput={s}", .{command.output}),
+        try allocator.print("-Dapp={s}/support/apps/hyperv-acceptance", .{command.repository}),
+        try allocator.print("-Dconfig={s}", .{command.config}),
+        try allocator.print("-Doutput={s}", .{command.output}),
         "-Dnative-profile=" ++ profile,
-        try std.fmt.allocPrint(allocator, "-Dmake-command={s}", .{command.make}),
-        try std.fmt.allocPrint(allocator, "-Dcompiler={s} cc -target " ++ c.guest_target, .{command.zig}),
+        try allocator.print("-Dmake-command={s}", .{command.make}),
+        try allocator.print("-Dcompiler={s} cc -target " ++ c.guest_target, .{command.zig}),
         "-Dcompiler-targeted=true",
-        try std.fmt.allocPrint(allocator, "-Dhost-cc={s} cc", .{command.zig}),
-        try std.fmt.allocPrint(allocator, "-Dhost-cxx={s} c++", .{command.zig}),
+        try allocator.print("-Dhost-cc={s} cc", .{command.zig}),
+        try allocator.print("-Dhost-cxx={s} c++", .{command.zig}),
         "-Dhost-cflags=-fno-sanitize=null",
-        try std.fmt.allocPrint(allocator, "-Dmake-arg=AR={s} ar", .{command.zig}),
-        try std.fmt.allocPrint(allocator, "-Dmake-arg=NM={s}", .{command.llvm.nm}),
-        try std.fmt.allocPrint(allocator, "-Dmake-arg=OBJCOPY={s}", .{command.llvm.objcopy}),
-        try std.fmt.allocPrint(allocator, "-Dmake-arg=OBJDUMP={s}", .{command.llvm.objdump}),
-        try std.fmt.allocPrint(allocator, "-Dmake-arg=READELF={s}", .{command.llvm.readelf}),
-        try std.fmt.allocPrint(allocator, "-Dmake-arg=STRIP={s}", .{command.llvm.strip}),
+        try allocator.print("-Dmake-arg=AR={s} ar", .{command.zig}),
+        try allocator.print("-Dmake-arg=NM={s}", .{command.llvm.nm}),
+        try allocator.print("-Dmake-arg=OBJCOPY={s}", .{command.llvm.objcopy}),
+        try allocator.print("-Dmake-arg=OBJDUMP={s}", .{command.llvm.objdump}),
+        try allocator.print("-Dmake-arg=READELF={s}", .{command.llvm.readelf}),
+        try allocator.print("-Dmake-arg=STRIP={s}", .{command.llvm.strip}),
         "-Dmake-arg=UK_CFLAGS=-std=gnu17",
         "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt",
     });
     if (command.native_make_environment) |path| {
         try commandPath(path);
-        try args.append(allocator, try std.fmt.allocPrint(allocator, "-Dnative-make-environment={s}", .{path}));
+        try args.append(allocator, try allocator.print("-Dnative-make-environment={s}", .{path}));
     }
     return .{ .step = step, .cwd = command.repository, .argv = try args.toOwnedSlice(allocator) };
 }
@@ -270,7 +270,7 @@ pub const Binding = struct {
 /// A measurement for separate review, not admission. Does not spawn children,
 /// manufacture a proof approval, or restore packages.
 pub fn describe(allocator: std.mem.Allocator, inputs: Inputs) !Binding {
-    if (inputs.tools.native.len > std.meta.fields(Alias).len) return error.LimitExceeded;
+    if (inputs.tools.native.len > @typeInfo(Alias).@"enum".field_names.len) return error.LimitExceeded;
     const native = try allocator.alloc(NativeBinding, inputs.tools.native.len);
     for (inputs.tools.native, native) |item, *binding| binding.* = .{ .name = item.name, .tool = toolBinding(item.bound) };
     return .{
@@ -432,7 +432,7 @@ pub fn validateBindingStructure(allocator: std.mem.Allocator, binding: Binding) 
 }
 
 fn validateNativeStructure(allocator: std.mem.Allocator, native_tools: []const NativeBinding, git: ToolBinding) !void {
-    if (native_tools.len == 0 or native_tools.len > std.meta.fields(Alias).len) return error.DependencyUnavailable;
+    if (native_tools.len == 0 or native_tools.len > @typeInfo(Alias).@"enum".field_names.len) return error.DependencyUnavailable;
     var seen = std.EnumSet(Alias).initEmpty();
     for (native_tools) |native| {
         if (seen.contains(native.name)) return error.InvalidRuntime;
@@ -573,7 +573,7 @@ fn validateTools(allocator: std.mem.Allocator, io: std.Io, inputs: Inputs) !void
     for ([_]runtime.Bound{ tools.git, tools.packages, tools.bison_data, tools.trust }) |bound|
         try runtime.origin.requireSeparate(bound.contract.evidence, roots.items);
     if (tools.path) |path| try requireDirectory(allocator, io, path, true);
-    if (tools.native.len == 0 or tools.native.len > std.meta.fields(Alias).len) return error.DependencyUnavailable;
+    if (tools.native.len == 0 or tools.native.len > @typeInfo(Alias).@"enum".field_names.len) return error.DependencyUnavailable;
     for (tools.native, 0..) |item, index| {
         for (tools.native[0..index]) |previous| if (item.name == previous.name) return error.InvalidRuntime;
         const expected_role = aliasRole(item.name);
@@ -646,7 +646,7 @@ pub fn rejectLegacyProofs(allocator: std.mem.Allocator, root_build: []const u8) 
 
 fn functionBody(allocator: std.mem.Allocator, bytes: []const u8, name: []const u8) ![:0]const u8 {
     if (bytes.len > 1024 * 1024) return error.LimitExceeded;
-    const text = try allocator.dupeZ(u8, bytes);
+    const text = try allocator.dupeSentinel(u8, bytes, 0);
     var tokenizer = std.zig.Tokenizer.init(text);
     var found: ?[:0]const u8 = null;
     while (true) {
@@ -669,7 +669,7 @@ fn functionBody(allocator: std.mem.Allocator, bytes: []const u8, name: []const u
                 .eof, .invalid => return error.DependencyUnavailable,
                 else => {},
             }
-            if (depth == 0) found = try allocator.dupeZ(u8, text[opening.loc.end..next.loc.start]);
+            if (depth == 0) found = try allocator.dupeSentinel(u8, text[opening.loc.end..next.loc.start], 0);
         }
     }
     return found orelse error.DependencyUnavailable;
@@ -684,7 +684,7 @@ fn nativeSourceFile(record: c.File) !void {
 
 fn requireSequences(allocator: std.mem.Allocator, source_text: []const u8, sequences: []const [:0]const u8) !void {
     if (source_text.len > 1024 * 1024) return error.LimitExceeded;
-    const text = try allocator.dupeZ(u8, source_text);
+    const text = try allocator.dupeSentinel(u8, source_text, 0);
     defer allocator.free(text);
     var tokens: std.ArrayList(std.zig.Token) = .empty;
     defer tokens.deinit(allocator);
@@ -732,7 +732,7 @@ pub fn requireNativeProof(allocator: std.mem.Allocator, root_build: []const u8, 
     if (!std.mem.eql(u8, native.builder.path, "support/build/hyperv-proof-build.zig") or
         !std.mem.eql(u8, native.tool.path, "support/build/hyperv-proof-tool.zig")) return error.DependencyUnavailable;
     for (native.modes, 0..) |mode, index|
-        if (@intFromEnum(mode) != index) return error.DependencyUnavailable;
+        if (@backingInt(mode) != index) return error.DependencyUnavailable;
     try requireSequences(allocator, root_build, &.{
         \\const hyperv_proof_build = @import("support/build/hyperv-proof-build.zig");
     });
@@ -774,7 +774,7 @@ pub fn requireNativeProofFiles(allocator: std.mem.Allocator, io: std.Io, reposit
     try requireSequences(allocator, try functionBody(allocator, builder, "tool"), &.{
         \\return b.addExecutable(.{
         \\    .name = "hyperv-image-proof",
-        \\    .root_module = module(b, root, "support/build/hyperv-proof-tool.zig", b.graph.host, .ReleaseSafe),
+        \\    .root_module = module(b, root, "support/build/hyperv-proof-tool.zig", b.graph.host, .safe),
         \\});
     });
     try requireSequences(allocator, try functionBody(allocator, builder, "module"), &.{
@@ -979,7 +979,7 @@ fn executePrepared(allocator: std.mem.Allocator, scratch: std.mem.Allocator, io:
         try executablePath(scratch, inputs.isolation.?.helper),
         try std.fs.path.join(scratch, &.{ inputs.workspace.scratch.path, "namespace-request.json" }),
         try scratch.dupe(u8, &c.digest(bytes)),
-        try std.fmt.allocPrint(scratch, "{d}", .{status_file.fd}),
+        try scratch.print("{d}", .{status_file.fd}),
     };
     var controlled = std.process.Environ.Map.init(scratch);
     defer controlled.deinit();
@@ -1199,7 +1199,7 @@ test "producer vetoes selected Python proofs before any child or claimed native 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     for (old_proofs) |name| {
-        const root = try std.fmt.allocPrint(arena.allocator(), "fn finishNativeImages() void {{ const p = \"support/build/tests/{s}\"; }}", .{name});
+        const root = try arena.allocator().print("fn finishNativeImages() void {{ const p = \"support/build/tests/{s}\"; }}", .{name});
         try std.testing.expectError(error.DependencyUnavailable, rejectLegacyProofs(arena.allocator(), root));
         // observed_source and proof must not be evaluated before the veto.
         try std.testing.expectError(error.DependencyUnavailable, requireNativeProof(arena.allocator(), root, undefined, null));

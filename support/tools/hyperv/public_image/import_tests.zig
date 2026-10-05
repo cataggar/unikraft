@@ -43,25 +43,25 @@ test "explicit expectation mismatches and canonical manifest violations refuse b
     const f = try fixture();
     defer f.deinit(a);
     var changed = f.expected;
-    changed.manifest_sha256 = "0" ** 64;
+    changed.manifest_sha256 = &@as([64]u8, @splat('0'));
     try t.expect(!image.importer.importPrepared(f.a, io, f.artifact_path, try f.destination("digest"), changed).succeeded());
     changed = f.expected;
-    changed.native_producer_sha256 = "b" ** 64;
+    changed.native_producer_sha256 = &@as([64]u8, @splat('b'));
     try t.expect(!image.importer.importPrepared(f.a, io, f.artifact_path, try f.destination("producer"), changed).succeeded());
     changed = f.expected;
     changed.source.run_attempt += 1;
     try t.expect(!image.importer.importPrepared(f.a, io, f.artifact_path, try f.destination("source"), changed).succeeded());
     for ([_][]const u8{
         "",
-        " " ** (c.max_record + 1),
-        try std.fmt.allocPrint(f.a, " {s}", .{f.bytes}),
-        try std.fmt.allocPrint(f.a, "{{\"schema\":\"duplicate\",{s}", .{f.bytes[1..]}),
-        try std.fmt.allocPrint(f.a, "{{\"authority\":true,{s}", .{f.bytes[1..]}),
+        &@as([(c.max_record + 1)]u8, @splat(' ')),
+        try f.a.print(" {s}", .{f.bytes}),
+        try f.a.print("{{\"schema\":\"duplicate\",{s}", .{f.bytes[1..]}),
+        try f.a.print("{{\"authority\":true,{s}", .{f.bytes[1..]}),
         try std.mem.replaceOwned(u8, f.a, f.bytes, "\"controller_revision\":4", "\"controller_revision\":3"),
         try std.mem.replaceOwned(u8, f.a, f.bytes, "\"run_id\":456", "\"run_id\":4.56e2"),
     }, 0..) |bytes, index| {
         const expected = try f.writeManifest(bytes);
-        const path = try f.destination(try std.fmt.allocPrint(f.a, "canonical-{d}", .{index}));
+        const path = try f.destination(try f.a.print("canonical-{d}", .{index}));
         const result = image.importer.importPrepared(f.a, io, f.artifact_path, path, expected);
         try t.expect(!result.succeeded() and result.destination == .not_committed);
         try t.expectError(error.FileNotFound, p.Directory.open(io, path));
@@ -74,7 +74,7 @@ test "native import faults retain consumption and independent publication record
         .destination_creation, .destination_sync,    .request,              .inspection,
         .receipt_before_sync,  .receipt_publication, .receipt_after_rename, .receipt_cleanup,
     }, 0..) |fault, index| {
-        const path = try f.destination(try std.fmt.allocPrint(f.a, "fault-{d}", .{index}));
+        const path = try f.destination(try f.a.print("fault-{d}", .{index}));
         const result = image.importer.importFault(f.a, io, f.artifact_path, path, f.expected, fault);
         try t.expect(!result.succeeded() and result.receipt_sha256 == null);
         if (fault == .destination_creation) {
@@ -140,7 +140,7 @@ test "publication refuses altered copied records and suppresses late durable rec
     const f = try fixture();
     defer f.deinit(a);
     for ([_]image.importer.TestFault{ .copied_manifest, .inspection_record, .request_after_receipt, .receipt_record }, 0..) |fault, index| {
-        const path = try f.destination(try std.fmt.allocPrint(f.a, "record-mutation-{d}", .{index}));
+        const path = try f.destination(try f.a.print("record-mutation-{d}", .{index}));
         const result = image.importer.importFault(f.a, io, f.artifact_path, path, f.expected, fault);
         try t.expect(!result.succeeded() and result.receipt_sha256 == null);
         try t.expectEqual(.integrity, result.failures.primary.?.category);
@@ -165,7 +165,7 @@ test "output reuse within-input paths and aliased ancestry cannot mutate the art
     const before = try image.files.record(f.a, io, try image.files.path(f.a, f.artifact_path, ic.image_name), c.vhd_bytes, false);
     for ([_][]const u8{
         f.artifact_path,                                           try image.files.path(f.a, f.artifact_path, "child"),
-        try image.files.path(f.a, f.artifact_path, ic.image_name), try std.fmt.allocPrint(f.a, "{s}/../alias", .{f.artifact_path}),
+        try image.files.path(f.a, f.artifact_path, ic.image_name), try f.a.print("{s}/../alias", .{f.artifact_path}),
     }) |target| try t.expect(!image.importer.importPrepared(f.a, io, f.artifact_path, target, f.expected).succeeded());
     try f.dir.dir.symLink(io, "artifact", "output-link", .{ .is_directory = true });
     try t.expect(!image.importer.importPrepared(f.a, io, f.artifact_path, try f.destination("output-link/child"), f.expected).succeeded());
@@ -195,7 +195,7 @@ test "coherent hashes cannot excuse corrupted footer GPT EFI or logical size" {
         if (kind == 1) checksumFooter(&malformed);
         try disk.writePositionalAll(io, &malformed, c.raw_bytes);
         const expected = try f.coherentImage(f.manifest);
-        const result = image.importer.importPrepared(f.a, io, f.artifact_path, try f.destination(try std.fmt.allocPrint(f.a, "footer-{d}", .{kind})), expected);
+        const result = image.importer.importPrepared(f.a, io, f.artifact_path, try f.destination(try f.a.print("footer-{d}", .{kind})), expected);
         try t.expect(!result.succeeded() and result.destination == .not_committed);
     }
     try disk.writePositionalAll(io, &footer, c.raw_bytes);
@@ -230,9 +230,9 @@ test "reload requires separately retained receipt digest and the original physic
     const result = try f.run("loaded");
     try t.expect(result.succeeded());
     const path = try f.destination("loaded");
-    try t.expectError(error.HashMismatch, image.importer.load(f.a, io, path, f.expected, [_]u8{0} ** 32));
+    try t.expectError(error.HashMismatch, image.importer.load(f.a, io, path, f.expected, @as([32]u8, @splat(0))));
     var wrong = f.expected;
-    wrong.native_producer_sha256 = "b" ** 64;
+    wrong.native_producer_sha256 = &@as([64]u8, @splat('b'));
     if (image.importer.load(f.a, io, path, wrong, result.receipt_sha256.?)) |_| return error.AcceptedWrongProducer else |_| {}
     const root = try p.Directory.open(io, path);
     defer root.close(io);
@@ -257,7 +257,7 @@ test "reloader rejects each later byte metadata namespace and receipt commitment
     const f = try fixture();
     defer f.deinit(a);
     for ([_][]const u8{ image.manifest.name, ic.image_name, ic.inspection_name, ic.request_name, ic.receipt_name, ".writer.lock" }, 0..) |name, index| {
-        const label = try std.fmt.allocPrint(f.a, "mutation-{d}", .{index});
+        const label = try f.a.print("mutation-{d}", .{index});
         const result = try f.run(label);
         try t.expect(result.succeeded());
         const root = try p.Directory.open(io, try f.destination(label));
@@ -268,7 +268,7 @@ test "reloader rejects each later byte metadata namespace and receipt commitment
         if (image.importer.load(f.a, io, try f.destination(label), f.expected, result.receipt_sha256.?)) |_| return error.AcceptedMutation else |_| {}
     }
     for (0..3) |kind| {
-        const label = try std.fmt.allocPrint(f.a, "namespace-{d}", .{kind});
+        const label = try f.a.print("namespace-{d}", .{kind});
         const imported = try f.run(label);
         try t.expect(imported.succeeded());
         const changed = try p.Directory.open(io, try f.destination(label));
@@ -317,12 +317,12 @@ test "coherent receipt changes cannot manufacture admitted phase producer claims
     try fixtures.rewrite(io, root, ic.receipt_name, wrong_importer);
     if (image.importer.load(f.a, io, path, f.expected, c.hash(wrong_importer))) |_| return error.AcceptedImporterSubstitution else |_| {}
     receipt = try c.read(ic.Receipt, f.a, bytes);
-    receipt.image.digest.sha256 = "b" ** 64;
+    receipt.image.digest.sha256 = &@as([64]u8, @splat('b'));
     const wrong_commitment = try c.encode(f.a, receipt);
     try fixtures.rewrite(io, root, ic.receipt_name, wrong_commitment);
     if (image.importer.load(f.a, io, path, f.expected, c.hash(wrong_commitment))) |_| return error.AcceptedPhysicalCommitment else |_| {}
     var inspection = try c.read(image.package.Inspection, f.a, try root.read(io, f.a, ic.inspection_name, c.max_record, null));
-    inspection.footer_sha256 = "b" ** 64;
+    inspection.footer_sha256 = &@as([64]u8, @splat('b'));
     const altered_inspection = try c.encode(f.a, inspection);
     try fixtures.rewrite(io, root, ic.inspection_name, altered_inspection);
     const inspected = try root.openFile(io, ic.inspection_name);
@@ -506,7 +506,7 @@ test "real full and broken stdout retain durable import evidence and output fail
     defer broken.close(io);
     (std.Io.File{ .handle = descriptors[0], .flags = .{ .nonblocking = false } }).close(io);
     for ([_]std.Io.File{ full, broken }, 0..) |sink, index| {
-        const path = try f.destination(try std.fmt.allocPrint(f.a, "failed-delivery-{d}", .{index}));
+        const path = try f.destination(try f.a.print("failed-delivery-{d}", .{index}));
         const args = try std.mem.concat(f.a, []const u8, &.{ &.{ executable, "import-prepared", "--state-dir", path, "--artifact-dir", f.artifact_path }, &expected_args });
         const report = try deliveryReport(f, try cliOutputFailure(f, args, sink, .stdout));
         try t.expect(!report.get("succeeded").?.bool);

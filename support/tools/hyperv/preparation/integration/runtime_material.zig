@@ -50,7 +50,7 @@ pub fn measure(world: *x.World, workspace: x.fs.Directory) !Material {
     const parsed = try world.read(x.Spec, requests, "bootstrap.json", null);
     const spec = parsed.value;
     try x.synthetic(spec.guard);
-    if (spec.native.len > std.meta.fields(x.p.producer.Alias).len or spec.dependencies.len > 128) return error.LimitExceeded;
+    if (spec.native.len > @typeInfo(x.p.producer.Alias).@"enum".field_names.len or spec.dependencies.len > 128) return error.LimitExceeded;
     const native = try world.allocator.alloc(std.meta.Child(@FieldType(Material, "native")), spec.native.len);
     for (spec.native, native, 0..) |item, *output, i| {
         for (spec.native[0..i]) |previous| if (previous.name == item.name) return error.InvalidRuntime;
@@ -95,7 +95,7 @@ pub fn measure(world: *x.World, workspace: x.fs.Directory) !Material {
         .repository = try o.Identity.directory(try world.open(spec.repository)),
         .actor = .{
             .role = .preparation,
-            .target = if (@import("builtin").cpu.arch == .aarch64) .aarch64_linux else if (@import("builtin").cpu.arch == .x86_64) .x86_64_linux else return error.InvalidRuntime,
+            .target = if (@import("builtin").target.cpu.arch == .aarch64) .aarch64_linux else if (@import("builtin").target.cpu.arch == .x86_64) .x86_64_linux else return error.InvalidRuntime,
             .directory = try o.Identity.directory(actor),
             .tree = (try x.fs.inventory(world.allocator, world.io, actor, 100000, 4 * 1024 * 1024 * 1024)).tree,
             .physical_sha256 = try x.fs.physicalDigest(world.allocator, world.io, actor),

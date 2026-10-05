@@ -318,7 +318,7 @@ zig build --build-file support/tools/hyperv/public_image/build.zig \
   -Dtest-root="$S/fixtures" -j2 test install --summary all
 zig build --build-file support/tools/hyperv/public_image/build.zig \
   --system "$S/restore/zig-pkg" --prefix "$S/outputs/release" \
-  -Dtest-root="$S/fixtures" -Doptimize=ReleaseSafe -j2 test install --summary all
+  -Dtest-root="$S/fixtures" -Doptimize=safe -j2 test install --summary all
 zig build --build-file support/tools/hyperv/local_boot/build.zig \
   --system "$S/restore/zig-pkg" \
   --prefix "$S/outputs/local-debug" -Dtest-root="$S/fixtures" \
@@ -326,7 +326,7 @@ zig build --build-file support/tools/hyperv/local_boot/build.zig \
 zig build --build-file support/tools/hyperv/local_boot/build.zig \
   --system "$S/restore/zig-pkg" \
   --prefix "$S/outputs/local-release" -Dtest-root="$S/fixtures" \
-  -Doptimize=ReleaseSafe -j2 test install --summary all
+  -Doptimize=safe -j2 test install --summary all
 ```
 
 The separate uninstalled native QEMU fixture checks actual argv, vpc versus
@@ -380,3 +380,19 @@ each. CPU-specific measurements are not guest benchmarks or qualification.
 The regular required integration contexts remain unchanged. A repeated
 `-Dtest-filter=...` selector is available for targeted local diagnosis; CI
 does not filter or exclude any original fixture case.
+
+### Zig 0.17 configure cache
+
+Native commands use Zig 0.17's `debug` and `safe` optimization modes.
+The configure-time peer commitment explicitly depends on the peer script's
+contents: reusing a build cache neither preserves an old hash after an edit
+nor accepts a deleted source. Run the isolated native build-schema regression
+from the repository root:
+
+```sh
+python3 support/tools/hyperv/public_image/configure_cache_tests.py \
+  /home/g/.local/bin/zig .zig17-peer-cache-test
+```
+
+It uses fresh private synthetic sources and the actual package build script,
+then removes its own directory. No guest, network or cloud resource is used.

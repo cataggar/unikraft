@@ -20,7 +20,7 @@ comptime {
 
 pub fn main(init: std.process.Init.Minimal) void {
     // Only this synthetic executable receives the hosted CI audit name.
-    if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_NAME), @intFromPtr("uk-prep-ns-test"), 0, 0, 0)) != .SUCCESS)
+    if (linux.errno(linux.prctl(@backingInt(linux.PR.SET_NAME), @intFromPtr("uk-prep-ns-test"), 0, 0, 0)) != .SUCCESS)
         fail(error.FixtureAuditNameUnavailable);
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const allocator = arena.allocator();
@@ -49,10 +49,10 @@ pub fn main(init: std.process.Init.Minimal) void {
         const status_file = ns.StatusFile.openParent(allocator, args[2]) catch |err| failCi(allocator, io, err);
         const diagnostic = ns.StatusFile.openParent(allocator, args[3]) catch |err| failCi(allocator, io, err);
         const status = fixture(allocator, io, "isolation", status_file) catch |err| {
-            diagnostic.write(.{ .primary = .exited, .code = @intFromEnum(namespaceError(err)) }) catch |write_error| failCi(allocator, io, write_error);
+            diagnostic.write(.{ .primary = .exited, .code = @backingInt(namespaceError(err)) }) catch |write_error| failCi(allocator, io, write_error);
             failCi(allocator, io, err);
         };
-        diagnostic.write(.{ .primary = .exited, .code = @intFromEnum(NamespaceError.none) }) catch |err| failCi(allocator, io, err);
+        diagnostic.write(.{ .primary = .exited, .code = @backingInt(NamespaceError.none) }) catch |err| failCi(allocator, io, err);
         status_file.write(status) catch |err| failCi(allocator, io, err);
         return;
     }
@@ -92,7 +92,7 @@ fn failCi(allocator: std.mem.Allocator, io: std.Io, err: anyerror) noreturn {
     fail(err);
 }
 fn ciErrorName(allocator: std.mem.Allocator, parent: linux.pid_t) ![]u8 {
-    return std.fmt.allocPrint(allocator, "ci-fixture-error-{d}.txt", .{parent});
+    return allocator.print("ci-fixture-error-{d}.txt", .{parent});
 }
 fn recordCiError(allocator: std.mem.Allocator, io: std.Io, err: anyerror) !void {
     // A fixed error name from this synthetic fixture only. Failed process output
@@ -155,7 +155,7 @@ fn readStages(allocator: std.mem.Allocator, io: std.Io, directory: fs.Directory,
     return result;
 }
 fn retainStageLog(allocator: std.mem.Allocator, io: std.Io, base: fs.Directory, selected: observations.Fixture, buffer: *[observations.log_bytes]u8) ![]const u8 {
-    const path = try std.fmt.allocPrint(allocator, "{s}/fixture-{s}/{s}", .{ base.path, selected.mode(), fixtureScratch(selected.mode()) });
+    const path = try allocator.print("{s}/fixture-{s}/{s}", .{ base.path, selected.mode(), fixtureScratch(selected.mode()) });
     defer allocator.free(path);
     const directory = try fs.Directory.open(allocator, io, path);
     defer directory.close(allocator, io);
@@ -166,7 +166,7 @@ fn failureStageLog(allocator: std.mem.Allocator, io: std.Io, base: fs.Directory,
     const state: enum { unavailable, cleanup_incomplete } = if (cleanup_complete) state: {
         return retainStageLog(allocator, io, base, selected, buffer) catch break :state .unavailable;
     } else .cleanup_incomplete;
-    return std.fmt.bufPrint(buffer, "{s}{{\"schema\":\"hyperv_preparation_namespace_observations_v2\",\"authority\":\"none\",\"fixture\":\"{s}\",\"state\":\"{s}\"}}\n", .{
+    return std.mem.print(buffer, "{s}{{\"schema\":\"hyperv_preparation_namespace_observations_v2\",\"authority\":\"none\",\"fixture\":\"{s}\",\"state\":\"{s}\"}}\n", .{
         selected.logPrefix(), @tagName(selected), @tagName(state),
     }) catch unreachable;
 }
@@ -181,10 +181,10 @@ fn internalFailureLog(a: std.mem.Allocator, io: std.Io, base: fs.Directory, sele
     const status = if (cleanup_complete) status: {
         return retainInternalLog(a, io, base, selected, buffer) catch break :status "unavailable";
     } else "cleanup_incomplete";
-    return std.fmt.bufPrint(buffer, "Namespace internal observations: {{\"authority\":\"none\",\"state\":\"{s}\"}}\n", .{status}) catch unreachable;
+    return std.mem.print(buffer, "Namespace internal observations: {{\"authority\":\"none\",\"state\":\"{s}\"}}\n", .{status}) catch unreachable;
 }
 fn retainInternalLog(a: std.mem.Allocator, io: std.Io, base: fs.Directory, selected: observations.Fixture, buffer: *[internal.log_bytes]u8) ![]const u8 {
-    const path = try std.fmt.allocPrint(a, "{s}/fixture-{s}/{s}", .{ base.path, selected.mode(), fixtureScratch(selected.mode()) });
+    const path = try a.print("{s}/fixture-{s}/{s}", .{ base.path, selected.mode(), fixtureScratch(selected.mode()) });
     defer a.free(path);
     const directory = try fs.Directory.open(a, io, path);
     defer directory.close(a, io);
@@ -192,7 +192,7 @@ fn retainInternalLog(a: std.mem.Allocator, io: std.Io, base: fs.Directory, selec
     return collection.log(a, buffer);
 }
 fn reportInsideError(allocator: std.mem.Allocator, io: std.Io, base: fs.Directory, mode: []const u8) !void {
-    const scratch = try std.fmt.allocPrint(allocator, "fixture-{s}/{s}", .{ mode, fixtureScratch(mode) });
+    const scratch = try allocator.print("fixture-{s}/{s}", .{ mode, fixtureScratch(mode) });
     defer allocator.free(scratch);
     const error_path = try std.fs.path.join(allocator, &.{ scratch, "inside-error.txt" });
     defer allocator.free(error_path);
@@ -250,7 +250,7 @@ fn requireOrdinaryCredentials(allocator: std.mem.Allocator, io: std.Io) !void {
     if (linux.errno(count) != .SUCCESS) return error.SupplementaryGroupsUnavailable;
     try requireFixtureGroups(groups[0..count], account.gid);
     const header: extern struct { version: u32, pid: i32 } = .{ .version = 0x20080522, .pid = 0 };
-    var data = [_]linux.cap_user_data_t{std.mem.zeroes(linux.cap_user_data_t)} ** 2;
+    var data = @as([2]linux.cap_user_data_t, @splat(std.mem.zeroes(linux.cap_user_data_t)));
     if (linux.errno(linux.syscall2(.capget, @intFromPtr(&header), @intFromPtr(&data))) != .SUCCESS or
         !std.mem.allEqual(u8, std.mem.asBytes(&data), 0)) return error.InvalidFixtureCredentials;
     for (0..64) |cap| {
@@ -265,7 +265,7 @@ fn requireFixtureGroups(groups: []const linux.gid_t, primary: linux.gid_t) !void
 }
 
 fn facadeDirectory(allocator: std.mem.Allocator, io: std.Io, account: env.Account) !fs.Directory {
-    const run_user = try std.fmt.allocPrint(allocator, "/run/user/{d}", .{account.uid});
+    const run_user = try allocator.print("/run/user/{d}", .{account.uid});
     const probe = std.Io.Dir.openDirAbsolute(io, run_user, .{ .follow_symlinks = false }) catch |err| switch (err) {
         error.FileNotFound => null,
         else => return err,
@@ -273,17 +273,17 @@ fn facadeDirectory(allocator: std.mem.Allocator, io: std.Io, account: env.Accoun
     defer if (probe) |value| value.close(io);
     const directory = if (probe != null) try fs.Directory.open(allocator, io, run_user) else null;
     defer if (directory) |value| value.close(allocator, io);
-    return fs.Directory.open(allocator, io, try std.fmt.allocPrint(allocator, "{s}/unikraft-zig-facade-{d}", .{
+    return fs.Directory.open(allocator, io, try allocator.print("{s}/unikraft-zig-facade-{d}", .{
         if (directory != null) run_user else account.home, account.uid,
     }));
 }
 const NamespaceIds = struct { user: u64, mnt: u64, pid: u64, net: u64 };
 fn namespaceIds(io: std.Io) !NamespaceIds {
     var ids: NamespaceIds = undefined;
-    inline for (std.meta.fields(NamespaceIds)) |field| {
-        const file = try std.Io.Dir.openFileAbsolute(io, "/proc/self/ns/" ++ field.name, .{});
+    inline for (@typeInfo(NamespaceIds).@"struct".field_names) |field| {
+        const file = try std.Io.Dir.openFileAbsolute(io, "/proc/self/ns/" ++ field, .{});
         defer file.close(io);
-        @field(ids, field.name) = (try fs.metadata(file)).inode;
+        @field(ids, field) = (try fs.metadata(file)).inode;
     }
     return ids;
 }
@@ -299,7 +299,7 @@ fn tool(allocator: std.mem.Allocator, io: std.Io, directory: fs.Directory, execu
     return .{ .directory = directory, .contract = .{
         .role = .preparation,
         .origin = @import("origin_fixture.zig").local(),
-        .target = if (builtin.cpu.arch == .aarch64) .aarch64_linux else .x86_64_linux,
+        .target = if (builtin.target.cpu.arch == .aarch64) .aarch64_linux else .x86_64_linux,
         .tree = (try fs.inventory(allocator, io, directory, 32, 128 * 1024 * 1024)).tree,
         .executable = try directory.record(allocator, io, executable, 64 * 1024 * 1024, .executable),
         .loader = if (dynamic) try directory.record(allocator, io, "lib/loader", 16 * 1024 * 1024, .executable) else null,
@@ -315,7 +315,7 @@ fn fixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status_fi
         !std.mem.eql(u8, mode, "cleanup-failure")) return error.InvalidFixtureMode;
     const diagnostic: ?observations.Fixture = if (std.mem.eql(u8, mode, "timeout")) .timeout else null;
     const base = try fs.Directory.open(allocator, io, options.workspace);
-    const repository = try makeDir(allocator, io, base, try std.fmt.allocPrint(allocator, "fixture-{s}", .{mode}));
+    const repository = try makeDir(allocator, io, base, try allocator.print("fixture-{s}", .{mode}));
     try put(io, repository.dir, "source.txt", "readonly synthetic source\n", 0o600);
     const historical = try makeDir(allocator, io, repository, ".d");
     try put(io, historical.dir, "hidden-marker", "synthetic historical marker\n", 0o600);
@@ -335,9 +335,9 @@ fn fixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status_fi
     _ = try makeDir(allocator, io, dynamic_directory, "lib");
     try markStage(allocator, io, scratch.dir, diagnostic, .dynamic_copy);
     try copy(allocator, io, dynamic_directory, "/usr/bin/true", "true", 0o700);
-    const system_lib = if (builtin.cpu.arch == .aarch64) "/usr/lib/aarch64-linux-gnu/" else "/usr/lib/x86_64-linux-gnu/";
+    const system_lib = if (builtin.target.cpu.arch == .aarch64) "/usr/lib/aarch64-linux-gnu/" else "/usr/lib/x86_64-linux-gnu/";
     try copy(allocator, io, dynamic_directory, system_lib ++ "libc.so.6", "lib/libc.so.6", 0o600);
-    try copy(allocator, io, dynamic_directory, system_lib ++ (if (builtin.cpu.arch == .aarch64) "ld-linux-aarch64.so.1" else "ld-linux-x86-64.so.2"), "lib/loader", 0o700);
+    try copy(allocator, io, dynamic_directory, system_lib ++ (if (builtin.target.cpu.arch == .aarch64) "ld-linux-aarch64.so.1" else "ld-linux-x86-64.so.2"), "lib/loader", 0o700);
     try markStage(allocator, io, scratch.dir, diagnostic, .dynamic_copied);
     const dynamic = try tool(allocator, io, dynamic_directory, "true", true);
     try markStage(allocator, io, scratch.dir, diagnostic, .dynamic_recorded);
@@ -395,7 +395,7 @@ fn fixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status_fi
     defer internal.stop();
     const status = try ns.enterWithCleanupFault(allocator, io, sandbox, &.{
         if (std.mem.eql(u8, mode, "exec-missing")) "/bin/missing-fixture" else "/bin/fixture",
-        try std.fmt.allocPrint(allocator, "inside-{s}", .{mode}),
+        try allocator.print("inside-{s}", .{mode}),
     }, &environment, std.mem.eql(u8, mode, "cleanup-failure"));
     try markStage(allocator, io, scratch.dir, diagnostic, .namespace_return);
     try scratch.dir.deleteDir(io, "namespace-root");
@@ -466,7 +466,7 @@ fn inside(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, inherited:
         // Only the selected facade requires these otherwise empty ancestors.
         const runtime_parent = try std.Io.Dir.openDirAbsolute(io, "/run/user", .{ .iterate = true, .follow_symlinks = false });
         defer runtime_parent.close(io);
-        const uid = try std.fmt.allocPrint(allocator, "{d}", .{account.uid});
+        const uid = try allocator.print("{d}", .{account.uid});
         try requireOnlyDirectory(io, runtime_parent, uid);
         const user_parent = try runtime_parent.openDir(io, uid, .{ .iterate = true, .follow_symlinks = false });
         defer user_parent.close(io);
@@ -493,20 +493,20 @@ fn inside(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, inherited:
     const created = try workspace.openFile(io, "scratch/created", .artifact);
     if ((try fs.metadata(created)).mode & 0o7777 != 0o600) return error.UnsafeUmask;
     created.close(io);
-    if (linux.prctl(@intFromEnum(linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0) != 1) return error.PrivilegeDropUnavailable;
+    if (linux.prctl(@backingInt(linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0) != 1) return error.PrivilegeDropUnavailable;
     var header: extern struct { version: u32, pid: i32 } = .{ .version = 0x20080522, .pid = 0 };
-    var data = [_]linux.cap_user_data_t{std.mem.zeroes(linux.cap_user_data_t)} ** 2;
+    var data = @as([2]linux.cap_user_data_t, @splat(std.mem.zeroes(linux.cap_user_data_t)));
     if (linux.errno(linux.syscall2(.capget, @intFromPtr(&header), @intFromPtr(&data))) != .SUCCESS or !std.mem.allEqual(u8, std.mem.asBytes(&data), 0))
         return error.PrivilegeDropUnavailable;
     for (0..64) |cap| {
-        const bounding = linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), cap, 0, 0, 0);
+        const bounding = linux.prctl(@backingInt(linux.PR.CAPBSET_READ), cap, 0, 0, 0);
         if (linux.errno(bounding) == .INVAL) break;
         if (bounding != 0 or linux.prctl(47, 1, cap, 0, 0) != 0) return error.PrivilegeDropUnavailable;
     }
     const host = try c.parse(NamespaceIds, allocator, try workspace.read(allocator, io, "host-namespaces.json", 4096, .private));
     const isolated = try namespaceIds(io);
-    inline for (std.meta.fields(NamespaceIds)) |field|
-        if (@field(host.value, field.name) == @field(isolated, field.name)) return error.AmbientNamespace;
+    inline for (@typeInfo(NamespaceIds).@"struct".field_names) |field|
+        if (@field(host.value, field) == @field(isolated, field)) return error.AmbientNamespace;
     try c.core.process.initialize();
     var result = try c.core.process.run(allocator, io, .{
         .argv = &.{"/bin/true"},
@@ -592,7 +592,7 @@ fn parentDeathRace(allocator: std.mem.Allocator, io: std.Io) !void {
     _ = linux.write(1, "parent-death-race-ok\n", "parent-death-race-ok\n".len);
 }
 
-const NamespaceError = enum(u8) {
+const NamespaceError = enum(u4) {
     none,
     namespace_unavailable,
     mount_namespace_unavailable,
@@ -710,7 +710,7 @@ fn stageRecord(selected: observations.Fixture, stage: FixtureStage, wall: u64, c
         .sample = .{
             .backend = .stage2_llvm,
             .arch = .aarch64,
-            .optimize = .Debug,
+            .optimize = .debug,
             .aarch64_sha2 = true,
             .x86_sha = false,
             .x86_avx2 = false,
@@ -731,7 +731,7 @@ test "namespace observations bounded canonical format and maximum log" {
             if (stage.appliesTo(selected)) {
                 var record = stageRecord(selected, stage, std.math.maxInt(u64), std.math.maxInt(u64));
                 record.self_executable_bytes = std.math.maxInt(u64);
-                record.sample.optimize = .ReleaseSafe;
+                record.sample.optimize = .safe;
                 record.sample.aarch64_sha2 = false;
                 const bytes = try record.encode(allocator);
                 try std.testing.expectEqual(@as(usize, 512), bytes.len);
@@ -757,7 +757,7 @@ test "namespace observations refuse malformed private data and authority" {
     const bytes = try record.encode(allocator);
     try std.testing.expectEqual(.partial, (try observations.decode(allocator, .git_timeout, .setup_started, bytes[0..511])).state);
     try std.testing.expectEqual(.partial, (try observations.decode(allocator, .git_timeout, .setup_started, "1\n")).state);
-    try std.testing.expectEqual(.oversized, (try observations.decode(allocator, .git_timeout, .setup_started, &([_]u8{0} ** 513))).state);
+    try std.testing.expectEqual(.oversized, (try observations.decode(allocator, .git_timeout, .setup_started, &(@as([513]u8, @splat(0))))).state);
     try std.testing.expectEqual(.invalid, (try observations.decode(allocator, .git_timeout, .runtime_ready, &bytes)).state);
     var wrong_scope = record;
     wrong_scope.clock_scope = .inner_payload;
@@ -769,9 +769,9 @@ test "namespace observations refuse malformed private data and authority" {
     const authority = std.mem.indexOf(u8, &malformed, "\"none\"").?;
     @memcpy(malformed[authority + 1 ..][0..4], "root");
     try std.testing.expectEqual(.invalid, (try observations.decode(allocator, .git_timeout, .setup_started, &malformed)).state);
-    var unknown = [_]u8{0} ** observations.record_bytes;
+    var unknown = @as([observations.record_bytes]u8, @splat(0));
     const json = std.mem.trimEnd(u8, &bytes, "\x00\n");
-    _ = try std.fmt.bufPrint(&unknown, "{s},\"argv\":\"SYNTHETIC_PRIVATE\"}}\n", .{json[0 .. json.len - 1]});
+    _ = try std.mem.print(&unknown, "{s},\"argv\":\"SYNTHETIC_PRIVATE\"}}\n", .{json[0 .. json.len - 1]});
     try std.testing.expectEqual(.invalid, (try observations.decode(allocator, .git_timeout, .setup_started, &unknown)).state);
     var bad_padding = bytes;
     bad_padding[bad_padding.len - 1] = ' ';
@@ -814,10 +814,10 @@ test "namespace observations ordering keeps CPU process local through return" {
     valid.checkOrder();
     for (valid.observations) |value|
         try std.testing.expectEqual(if (value.stage.appliesTo(.git_policy)) observations.State.observed else .not_applicable, value.state);
-    const enter = @intFromEnum(FixtureStage.namespace_enter);
-    const entry = @intFromEnum(FixtureStage.inner_payload_entry);
-    const ready = @intFromEnum(FixtureStage.inside_ready);
-    const returned = @intFromEnum(FixtureStage.namespace_return);
+    const enter = @backingInt(FixtureStage.namespace_enter);
+    const entry = @backingInt(FixtureStage.inner_payload_entry);
+    const ready = @backingInt(FixtureStage.inside_ready);
+    const returned = @backingInt(FixtureStage.namespace_return);
     try std.testing.expect(valid.observations[enter].record.?.sample.process_cpu_ns > valid.observations[entry].record.?.sample.process_cpu_ns);
     var cpu_regression = baseline;
     cpu_regression.observations[ready].record.?.sample.process_cpu_ns = 0;
@@ -854,10 +854,10 @@ test "namespace observations private files refuse incomplete and unsafe records"
     try std.testing.expectError(error.PathAlreadyExists, markStage(allocator, io, temporary.dir, .git_timeout, .setup_started));
     try std.testing.expectError(error.InvalidFixtureObservationPhase, markStage(allocator, io, temporary.dir, .git_timeout, .detached_ready));
     try put(io, temporary.dir, observations.fileName(.runtime_ready), "1\n", 0o600);
-    var invalid = [_]u8{0} ** observations.record_bytes;
+    var invalid = @as([observations.record_bytes]u8, @splat(0));
     @memcpy(invalid[0.."SYNTHETIC_SECRET".len], "SYNTHETIC_SECRET");
     try put(io, temporary.dir, observations.fileName(.namespace_enter), &invalid, 0o600);
-    try put(io, temporary.dir, observations.fileName(.inner_payload_entry), &([_]u8{0} ** 513), 0o600);
+    try put(io, temporary.dir, observations.fileName(.inner_payload_entry), &(@as([513]u8, @splat(0))), 0o600);
     try put(io, temporary.dir, observations.fileName(.inside_ready), &invalid, 0o644);
     const public = try temporary.dir.openFile(io, observations.fileName(.inside_ready), .{});
     defer public.close(io);
@@ -882,7 +882,7 @@ test "namespace observations private files refuse incomplete and unsafe records"
         .{ FixtureStage.dynamic_copy, observations.State.invalid },
         .{ FixtureStage.detached_ready, observations.State.not_applicable },
         .{ FixtureStage.timeout_ready, observations.State.missing },
-    }) |expected| try std.testing.expectEqual(expected[1], values.observations[@intFromEnum(expected[0])].state);
+    }) |expected| try std.testing.expectEqual(expected[1], values.observations[@backingInt(expected[0])].state);
     const self = try std.Io.Dir.openFileAbsolute(io, "/proc/self/exe", .{});
     defer self.close(io);
     try std.testing.expectEqual((try fs.metadata(self)).size, values.observations[0].record.?.self_executable_bytes);
@@ -898,7 +898,7 @@ test "namespace observations native sampling uses the current test process" {
     const first = try observations.Record.observe(std.testing.io, .timeout, .setup_started);
     const second = try observations.Record.observe(std.testing.io, .timeout, .payload_copy);
     try std.testing.expectEqual(builtin.zig_backend, first.sample.backend);
-    try std.testing.expectEqual(builtin.cpu.arch, first.sample.arch);
+    try std.testing.expectEqual(builtin.target.cpu.arch, first.sample.arch);
     try std.testing.expectEqual(builtin.mode, first.sample.optimize);
     try std.testing.expect(first.sample.monotonic_ns <= second.sample.monotonic_ns);
     try std.testing.expect(first.sample.process_cpu_ns <= second.sample.process_cpu_ns);
@@ -919,7 +919,7 @@ test "namespace observations failure logs survive fixture deletion without maski
     const base: fs.Directory = .{ .dir = temporary.dir, .path = path };
     const Probe = struct {
         fn fail(a_: std.mem.Allocator, io_: std.Io, base_: fs.Directory, selected: observations.Fixture, buffer: *[observations.log_bytes]u8, line: *[]const u8) !void {
-            const name = try std.fmt.allocPrint(a_, "fixture-{s}", .{selected.mode()});
+            const name = try a_.print("fixture-{s}", .{selected.mode()});
             defer base_.dir.deleteTree(io_, name) catch @panic("synthetic diagnostic cleanup failed");
             // Same ordering as the native test: preserve the diagnostic before
             // deletion, and never replace the assertion's original error.
@@ -928,14 +928,14 @@ test "namespace observations failure logs survive fixture deletion without maski
         }
     };
     for (std.enums.values(observations.Fixture)) |selected| {
-        const name = try std.fmt.allocPrint(a, "fixture-{s}", .{selected.mode()});
-        const scratch_name = try std.fmt.allocPrint(a, "{s}/{s}", .{ name, fixtureScratch(selected.mode()) });
+        const name = try a.print("fixture-{s}", .{selected.mode()});
+        const scratch_name = try a.print("{s}/{s}", .{ name, fixtureScratch(selected.mode()) });
         {
             const scratch = try makeDir(a, io, base, scratch_name);
             defer scratch.close(a, io);
             try markStage(a, io, scratch.dir, selected, .setup_started);
             try markStage(a, io, scratch.dir, selected, .payload_copy);
-            var invalid = [_]u8{0} ** observations.record_bytes;
+            var invalid = @as([observations.record_bytes]u8, @splat(0));
             @memcpy(invalid[0.."SYNTHETIC_PRIVATE".len], "SYNTHETIC_PRIVATE");
             try put(io, scratch.dir, observations.fileName(.payload_copied), &invalid, 0o600);
         }
@@ -990,7 +990,7 @@ test "namespace observations internal fixed format and maximum log exclude autho
         record.self_bytes = std.math.maxInt(u64);
         record.sample.monotonic_ns = std.math.maxInt(u64);
         record.sample.process_cpu_ns = std.math.maxInt(u64);
-        record.sample.optimize = .ReleaseSafe;
+        record.sample.optimize = .safe;
         const bytes = try record.encode(a);
         try std.testing.expectEqualDeep(record, try internal.decode(a, &bytes));
         maximum.records[index] = record;
@@ -1008,9 +1008,9 @@ test "namespace observations internal fixed format and maximum log exclude autho
     const scope = std.mem.indexOf(u8, &bytes, "outer_helper").?;
     @memcpy(bytes[scope..][0..12], "inner_helper");
     if (internal.decode(a, &bytes)) |_| return error.AcceptedForeignClockScope else |_| {}
-    var unknown = [_]u8{0} ** internal.record_bytes;
+    var unknown = @as([internal.record_bytes]u8, @splat(0));
     const json = std.mem.trimEnd(u8, &valid, "\x00\n");
-    _ = try std.fmt.bufPrint(&unknown, "{s},\"argv\":\"SYNTHETIC_PRIVATE\"}}\n", .{json[0 .. json.len - 1]});
+    _ = try std.mem.print(&unknown, "{s},\"argv\":\"SYNTHETIC_PRIVATE\"}}\n", .{json[0 .. json.len - 1]});
     if (internal.decode(a, &unknown)) |_| return error.AcceptedPrivateObservationField else |_| {}
     if (c.parse(ns.Status, a, std.mem.trimEnd(u8, &valid, "\x00"))) |status| {
         status.deinit();
@@ -1021,8 +1021,8 @@ test "namespace observations internal fixed format and maximum log exclude autho
 }
 
 fn validationPhases(order: *internal.Order, context: internal.Context) !void {
-    inline for (@typeInfo(internal.Phase).@"enum".fields[@intFromEnum(internal.Phase.inventory_begin) .. @intFromEnum(internal.Phase.validation_end) + 1]) |field|
-        try order.advance(context, @enumFromInt(field.value));
+    inline for (@typeInfo(internal.Phase).@"enum".field_values[@backingInt(internal.Phase.inventory_begin) .. @backingInt(internal.Phase.validation_end) + 1]) |field|
+        try order.advance(context, @fromBackingInt(@intCast(field)));
 }
 
 test "namespace observations internal order separates repeated runtimes and stops before namespace setup" {
@@ -1065,7 +1065,7 @@ pub const InternalProbe = enum { refusal, runtime };
 
 pub fn internalProbe(a: std.mem.Allocator, io: std.Io, directory: fs.Directory, mode: InternalProbe) !void {
     if (mode == .runtime) return internalRuntimeProbe(a, io, directory);
-    const sandbox = try @import("namespace/entry_refusal_fixture.zig").invalidAccount(a, io);
+    const sandbox = try @import("entry_refusal_fixture.zig").invalidAccount(a, io);
     var environment = std.process.Environ.Map.init(a);
     defer environment.deinit();
     const before = try openFdCount(io);
@@ -1107,10 +1107,10 @@ fn internalRuntimeProbe(a: std.mem.Allocator, io: std.Io, directory: fs.Director
     try std.testing.expect(internal.fault() == null);
     try std.testing.expectEqual(before, try openFdCount(io));
     const collection = try internal.read(a, io, directory, .timeout);
-    try std.testing.expectEqual(@as(usize, @intFromEnum(internal.Phase.isolation_end)) + 1, collection.count);
+    try std.testing.expectEqual(@as(usize, @backingInt(internal.Phase.isolation_end)) + 1, collection.count);
     try std.testing.expectEqual(internal.Tail.prefix, collection.tail);
     for (collection.records[0..collection.count], 0..) |record, index| {
-        try std.testing.expectEqual(@as(internal.Phase, @enumFromInt(index)), record.phase);
+        try std.testing.expectEqual(@as(internal.Phase, @fromBackingInt(@intCast(index))), record.phase);
         try std.testing.expectEqual(internal.Context.isolation, record.context);
         try std.testing.expectEqual(builtin.mode, record.sample.optimize);
         try std.testing.expectEqual(builtin.zig_backend, record.sample.backend);
@@ -1164,7 +1164,7 @@ test "namespace observations internal records reject unsafe files gaps clocks an
         try put(io, temporary.dir, one, &first, 0o600);
         switch (variant) {
             2 => try put(io, temporary.dir, two, second[0..100], 0o600),
-            3 => try put(io, temporary.dir, two, &([_]u8{'S'} ** 513), 0o600),
+            3 => try put(io, temporary.dir, two, &(@as([513]u8, @splat('S'))), 0o600),
             4 => try temporary.dir.symLink(io, one, two, .{}),
             5 => {
                 try put(io, temporary.dir, two, &second, 0o600);
@@ -1246,9 +1246,9 @@ test "namespace CI baseline crosses native user and mount boundaries" {
     defer status_file.close();
     const diagnostic = try ns.StatusFile.create();
     defer diagnostic.close();
-    const arg = try std.fmt.allocPrint(allocator, "{d}", .{status_file.fd});
+    const arg = try allocator.print("{d}", .{status_file.fd});
     defer allocator.free(arg);
-    const diagnostic_arg = try std.fmt.allocPrint(allocator, "{d}", .{diagnostic.fd});
+    const diagnostic_arg = try allocator.print("{d}", .{diagnostic.fd});
     defer allocator.free(diagnostic_arg);
     const status_metadata = try fs.metadata(.{ .handle = status_file.fd, .flags = .{ .nonblocking = false } });
     const diagnostic_metadata = try fs.metadata(.{ .handle = diagnostic.fd, .flags = .{ .nonblocking = false } });
@@ -1345,12 +1345,12 @@ test "namespace native dynamic isolation, nonzero status, deadline and detached 
     const base = try fs.Directory.open(allocator, io, options.workspace);
     defer base.close(allocator, io);
     for ([_][]const u8{ "isolation", "failure", "timeout", "descendant", "exit143", "signal", "exec-missing", "setup-failure", "cleanup-failure" }) |mode| {
-        const path = try std.fmt.allocPrint(allocator, "fixture-{s}", .{mode});
+        const path = try allocator.print("fixture-{s}", .{mode});
         defer allocator.free(path);
         defer base.dir.deleteTree(io, path) catch @panic("native fixture cleanup failed");
         const status_file = try ns.StatusFile.create();
         defer status_file.close();
-        const fd_arg = try std.fmt.allocPrint(allocator, "{d}", .{status_file.fd});
+        const fd_arg = try allocator.print("{d}", .{status_file.fd});
         defer allocator.free(fd_arg);
         var outcome: producer.Outcome = .{ .step = .inspect, .child = try c.core.process.run(allocator, io, .{
             .argv = &.{ @import("test_options").namespace_fixture, mode, fd_arg },
@@ -1382,7 +1382,7 @@ test "namespace native dynamic isolation, nonzero status, deadline and detached 
             try std.testing.expectEqual(.unavailable, result.failures.primary.?.category);
         } else if (std.mem.eql(u8, mode, "timeout")) {
             try std.testing.expectEqual(.timeout, result.failures.primary.?.category);
-            const ready_path = try std.fmt.allocPrint(allocator, "{s}/.d/zig-migration-preparation/resume-producer/work/scratch/timeout-ready", .{path});
+            const ready_path = try allocator.print("{s}/.d/zig-migration-preparation/resume-producer/work/scratch/timeout-ready", .{path});
             defer allocator.free(ready_path);
             const ready = try base.dir.openFile(io, ready_path, .{});
             ready.close(io);
@@ -1393,7 +1393,7 @@ test "namespace native dynamic isolation, nonzero status, deadline and detached 
             try std.testing.expectEqualStrings("namespace-isolation-ok\n", result.stdout);
         }
         if (std.mem.eql(u8, mode, "timeout") or std.mem.eql(u8, mode, "descendant")) {
-            const lock_path = try std.fmt.allocPrint(allocator, "{s}/.d/zig-migration-preparation/resume-producer/work/scratch/descendant-lock", .{path});
+            const lock_path = try allocator.print("{s}/.d/zig-migration-preparation/resume-producer/work/scratch/descendant-lock", .{path});
             defer allocator.free(lock_path);
             const lock = try base.dir.openFile(io, lock_path, .{});
             defer lock.close(io);
@@ -1413,7 +1413,7 @@ test "namespace forced parent death before PID 1 registration and bounded status
     for ([_][]const u8{ "parent-death-race", "status-missing", "status-exit143", "status-partial", "status-malformed" }) |mode| {
         const status_file = try ns.StatusFile.create();
         defer status_file.close();
-        const arg = try std.fmt.allocPrint(allocator, "{d}", .{status_file.fd});
+        const arg = try allocator.print("{d}", .{status_file.fd});
         defer allocator.free(arg);
         var outcome: producer.Outcome = .{ .step = .inspect, .child = try c.core.process.run(allocator, io, .{
             .argv = &.{ @import("test_options").namespace_fixture, mode, arg },
@@ -1557,7 +1557,7 @@ test "namespace production helper setup status and producer entry compile withou
     defer map.deinit();
     const status_file = try ns.StatusFile.create();
     defer status_file.close();
-    const arg = try std.fmt.allocPrint(allocator, "{d}", .{status_file.fd});
+    const arg = try allocator.print("{d}", .{status_file.fd});
     defer allocator.free(arg);
     const missing = try std.fs.path.join(allocator, &.{ options.workspace, "missing-request.json" });
     defer allocator.free(missing);
@@ -1680,7 +1680,7 @@ const FixtureChild = struct {
             .status = if (linux.W.IFEXITED(status))
                 .{ .primary = .exited, .code = linux.W.EXITSTATUS(status) }
             else if (linux.W.IFSIGNALED(status))
-                .{ .primary = .signaled, .code = @intCast(@intFromEnum(linux.W.TERMSIG(status))) }
+                .{ .primary = .signaled, .code = @intCast(@backingInt(linux.W.TERMSIG(status))) }
             else
                 return error.FixtureFailed,
             .stdout = stdout,
@@ -1704,7 +1704,7 @@ fn readPipe(allocator: std.mem.Allocator, fd: linux.fd_t, maximum: usize) ![]con
 
 fn spawnFixture(allocator: std.mem.Allocator, argv: []const []const u8, map: *const std.process.Environ.Map, cwd: fs.Directory, stalled: bool) !FixtureChild {
     const pointers = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
-    for (argv, 0..) |arg, i| pointers[i] = (try allocator.dupeZ(u8, arg)).ptr;
+    for (argv, 0..) |arg, i| pointers[i] = (try allocator.dupeSentinel(u8, arg, 0)).ptr;
     const block = try map.createPosixBlock(allocator, .{ .zig_progress_fd = -1 });
     var output: [2]linux.fd_t = undefined;
     var diagnostic: [2]linux.fd_t = undefined;
@@ -1712,7 +1712,7 @@ fn spawnFixture(allocator: std.mem.Allocator, argv: []const []const u8, map: *co
         linux.errno(linux.pipe2(&diagnostic, .{ .CLOEXEC = true })) != .SUCCESS) return error.FixtureFailed;
     if (stalled) {
         if (linux.fcntl(output[1], linux.F.SETPIPE_SZ, 4096) != 4096) return error.FixtureFailed;
-        const fill = [_]u8{'P'} ** 4096;
+        const fill = @as([4096]u8, @splat('P'));
         if (linux.write(output[1], &fill, fill.len) != fill.len) return error.FixtureFailed;
     }
     const pid = linux.fork();
@@ -1749,7 +1749,7 @@ fn gitFixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status
         !std.mem.eql(u8, mode, "git-modified") and !std.mem.eql(u8, mode, "git-timeout")) return error.InvalidFixtureMode;
     const diagnostic = try observations.Fixture.fromMode(mode);
     const base = try fs.Directory.open(allocator, io, options.workspace);
-    const repository = try makeDir(allocator, io, base, try std.fmt.allocPrint(allocator, "fixture-{s}", .{mode}));
+    const repository = try makeDir(allocator, io, base, try allocator.print("fixture-{s}", .{mode}));
     try put(io, repository.dir, "tracked.txt", "public synthetic Git fixture\n", 0o600);
     const workspace = try makeDir(allocator, io, repository, ".d/zig-migration-preparation/bridge-git/work");
     const scratch = try makeDir(allocator, io, workspace, "scratch");
@@ -1793,8 +1793,8 @@ fn gitFixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status
     try markStage(allocator, io, scratch.dir, diagnostic, .context_ready);
     try markStage(allocator, io, scratch.dir, diagnostic, .git_setup);
     _ = try setupGit(allocator, git, repository, &setup, &.{
-        "init",                                                                              "--quiet", "--initial-branch=main",
-        try std.fmt.allocPrint(allocator, "--template={s}/empty-template", .{scratch.path}),
+        "init",                                                                "--quiet", "--initial-branch=main",
+        try allocator.print("--template={s}/empty-template", .{scratch.path}),
     });
     if (!std.mem.eql(u8, mode, "git-unborn")) {
         _ = try setupGit(allocator, git, repository, &setup, &.{ "add", "--", "tracked.txt" });
@@ -1896,7 +1896,7 @@ fn gitFixture(allocator: std.mem.Allocator, io: std.Io, mode: []const u8, status
     try markStage(allocator, io, scratch.dir, diagnostic, .namespace_enter);
     internal.start(allocator, io, scratch.dir, diagnostic);
     defer internal.stop();
-    const status = try ns.enter(allocator, io, sandbox, &.{ "/bin/fixture", try std.fmt.allocPrint(allocator, "inside-{s}", .{mode}) }, &clean);
+    const status = try ns.enter(allocator, io, sandbox, &.{ "/bin/fixture", try allocator.print("inside-{s}", .{mode}) }, &clean);
     try markStage(allocator, io, scratch.dir, diagnostic, .namespace_return);
     try scratch.dir.deleteDir(io, "namespace-root");
     return status;
@@ -2041,7 +2041,7 @@ fn inspectBlockedGit(allocator: std.mem.Allocator, io: std.Io, record: git_entry
     const timeout = diagnostic == .git_timeout;
     const child = try spawnFixture(allocator, &.{ "/bin/git", "rev-parse", "--short", "HEAD" }, poison, scratch, true);
     try markStage(allocator, io, scratch.dir, diagnostic, .blocked_spawned);
-    const proc = try std.fmt.allocPrint(allocator, "/proc/{d}", .{child.pid});
+    const proc = try allocator.print("/proc/{d}", .{child.pid});
     const executable = try std.fs.path.join(allocator, &.{ record.runtime_directory, "lib/loader" });
     var link: [4096]u8 = undefined;
     var observed = false;
@@ -2057,7 +2057,7 @@ fn inspectBlockedGit(allocator: std.mem.Allocator, io: std.Io, record: git_entry
                     var fields = std.mem.tokenizeScalar(u8, state[0..length], ' ');
                     const number = std.fmt.parseInt(usize, fields.next() orelse "", 10) catch 0;
                     const descriptor = std.fmt.parseInt(usize, fields.next() orelse "", 0) catch 0;
-                    if (number == @intFromEnum(linux.SYS.write) and descriptor == 1) {
+                    if (number == @backingInt(linux.SYS.write) and descriptor == 1) {
                         observed = true;
                         break;
                     }
@@ -2112,7 +2112,7 @@ fn inspectBlockedGit(allocator: std.mem.Allocator, io: std.Io, record: git_entry
     }
     if (linux.errno(linux.kill(child.pid, .TERM)) != .SUCCESS) return error.FixtureFailed;
     const result = try child.collect(allocator);
-    if (result.status.primary != .signaled or result.status.code != @intFromEnum(linux.SIG.TERM) or
+    if (result.status.primary != .signaled or result.status.code != @backingInt(linux.SIG.TERM) or
         result.stderr.len != 0 or result.stdout.len != 4096) return error.GitSignalMismatch;
     try markStage(allocator, io, scratch.dir, diagnostic, .blocked_reaped);
 }
@@ -2126,12 +2126,12 @@ test "namespace Git actual static dispatch restores stripped and poisoned policy
     const base = try fs.Directory.open(allocator, io, options.workspace);
     defer base.close(allocator, io);
     for ([_][]const u8{ "git-policy", "git-unborn", "git-modified", "git-timeout" }) |mode| {
-        const path = try std.fmt.allocPrint(allocator, "fixture-{s}", .{mode});
+        const path = try allocator.print("fixture-{s}", .{mode});
         defer allocator.free(path);
         defer base.dir.deleteTree(io, path) catch @panic("Git namespace fixture cleanup failed");
         const status_file = try ns.StatusFile.create();
         defer status_file.close();
-        const arg = try std.fmt.allocPrint(allocator, "{d}", .{status_file.fd});
+        const arg = try allocator.print("{d}", .{status_file.fd});
         defer allocator.free(arg);
         var outcome: producer.Outcome = .{ .step = .inspect, .child = try c.core.process.run(allocator, io, .{
             .argv = &.{ @import("test_options").namespace_fixture, mode, arg },
@@ -2147,7 +2147,7 @@ test "namespace Git actual static dispatch restores stripped and poisoned policy
         if (std.mem.eql(u8, mode, "git-timeout")) {
             try std.testing.expectEqual(.timeout, outcome.child.failures.primary.?.category);
             try std.testing.expect(outcome.child.cleanup_complete and outcome.child.failures.cleanup == null);
-            const scratch_path = try std.fmt.allocPrint(allocator, "{s}/.d/zig-migration-preparation/bridge-git/work/scratch", .{path});
+            const scratch_path = try allocator.print("{s}/.d/zig-migration-preparation/bridge-git/work/scratch", .{path});
             defer allocator.free(scratch_path);
             const scratch = try base.dir.openDir(io, scratch_path, .{});
             defer scratch.close(io);
@@ -2162,7 +2162,7 @@ test "namespace Git actual static dispatch restores stripped and poisoned policy
             defer allocator.free(absolute_scratch);
             const stages = try readStages(allocator, io, .{ .dir = scratch, .path = absolute_scratch }, .git_timeout);
             for ([_]FixtureStage{ .setup_started, .runtime_ready, .namespace_enter, .inner_payload_entry, .inside_ready, .policy_ready, .blocked_probe, .write_observed }) |required| {
-                const stage = stages.observations[@intFromEnum(required)];
+                const stage = stages.observations[@backingInt(required)];
                 try std.testing.expectEqual(.observed, stage.state);
                 try std.testing.expectEqual(stage.stage.clockScope(), stage.record.?.clock_scope);
             }
