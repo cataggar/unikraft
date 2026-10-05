@@ -86,6 +86,9 @@ The full package build's `test-authority-contracts`, `test-controller`, and
 and removes only its fresh child below the scratch parent, preserving existing
 parent contents. `--write` intentionally regenerates checked-in goldens for
 review; it is not part of verification.
+The current v2 fixtures bind the Zig 0.17 SDK generation. Frozen v1 fixtures
+retain the original SDK revision and byte-identical archives; their generator
+selects the historical source context explicitly rather than relabelling it.
 
 ## Native package and boot chain (production caller)
 

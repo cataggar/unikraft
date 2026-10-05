@@ -87,15 +87,15 @@ def zip_empty_golden():
     ))
 
 
-def source_context(public_bundle, handoff):
+def source_context(public_bundle, handoff, version):
     return public_bundle.context({
         "repository": "cataggar/unikraft",
         "run_id": "1",
         "run_attempt": "1",
         "source_revision": REV,
         "source_tree": REV,
-        "wamr_revision": handoff.ci.REVISION,
-    })
+        "wamr_revision": public_bundle.HISTORICAL_WAMR_REVISION if version == 1 else handoff.ci.REVISION,
+    }, version=version)
 
 
 def portable_bundle(handoff, public_bundle, version, *, sizes=None, paths=None, validate=True):
@@ -119,7 +119,7 @@ def portable_bundle(handoff, public_bundle, version, *, sizes=None, paths=None, 
         "source_revision": REV,
         "source_tree": REV,
         "identity": {
-            "wamr_revision": handoff.ci.REVISION,
+            "wamr_revision": public_bundle.HISTORICAL_WAMR_REVISION if version == 1 else handoff.ci.REVISION,
             "wasm_sha256": SHA,
             "cwasm_sha256": SHA,
             "runtime_sha256": SHA,
@@ -189,7 +189,7 @@ def packed_records(handoff, public_bundle, version):
         stage.mkdir(mode=0o700)
         out = root / "out"
         out.mkdir(mode=0o700)
-        source = source_context(public_bundle, handoff)
+        source = source_context(public_bundle, handoff, version)
         handoff.ci.save(stage / "bundle.json", materialize_bundle(handoff, public_bundle, stage, version))
 
         original_publication_records = public_bundle.publication_records

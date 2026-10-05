@@ -53,7 +53,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const options = b.addOptions();
-    options.addOptionPath("fixture_root", .cache_root);
+    options.addOptionPathUntracked("fixture_root", .cache_root);
     options.addOptionPath("python_oracle", b.path("tests/test_handoff_contract_goldens.py"));
     options.addOptionPath("accepted_result_fixture", b.path("tests/fixtures/differential/accepted-v2.json"));
     tests.root_module.addOptions("test_options", options);
