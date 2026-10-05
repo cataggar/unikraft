@@ -1030,13 +1030,6 @@ class Compute(unittest.TestCase):
                 records={p.name: ci.digest(p) for p in sorted((root / "evidence").glob("*.json"))}))
             original = (root / "evidence/result.json").read_bytes()
 
-            def mocked_producer_inputs(actual_runtime, expected_consumer=None,
-                                       content=True):
-                self.assertEqual(actual_runtime, runtime)
-                self.assertEqual(expected_consumer, consumer_inputs)
-                self.assertTrue(content)
-                return producer
-
             def native_handoff_inspect(actual_runtime, output, *, legacy=False):
                 self.assertEqual(actual_runtime, runtime)
                 self.assertTrue(legacy)
@@ -1059,15 +1052,33 @@ class Compute(unittest.TestCase):
                 })
                 return output / "private/handoff-inspect-legacy.log", command
 
-            with mock.patch.object(ci, "check_build", return_value=build), \
-                    mock.patch.object(
-                        ci, "producer_inputs", autospec=True,
-                        side_effect=mocked_producer_inputs), \
+            output = handoff_parent / "handoff"
+            with mock.patch.dict(os.environ, {
+                    handoff.accepted_records.CONTROLLER_ENV: ""}), \
+                    self.assertRaisesRegex(
+                        ValueError, "native controller records refused"):
+                handoff.export(runtime, output)
+            self.assertFalse(output.exists())
+
+            # This synthetic image/copy fixture is not native admission proof.
+            # Genuine complete-local admission is exercised by the Zig suite.
+            native_view = {
+                "compatibility": "tiny-v1", "profile": None,
+                "source": source, "modes": list(ci.MODES),
+                "records": [
+                    {"name": name, "sha256": sha256}
+                    for name, sha256 in handoff.result_records(root).items()
+                ],
+            }
+            with mock.patch.object(
+                    handoff.accepted_records, "readonly_local_runtime",
+                    return_value=native_view) as reader, \
                     mock.patch.object(
                         handoff.accepted_records, "handoff_inspect",
                         side_effect=native_handoff_inspect):
-                with mock.patch.object(ci, "require_build_custody"):
-                    handoff.export(runtime, handoff_parent / "handoff")
+                handoff.export(runtime, output)
+            self.assertEqual(reader.call_args_list, [
+                mock.call(runtime), mock.call(runtime)])
         self.assertEqual((root / "evidence/result.json").read_bytes(), original)
         bundle_path = handoff_parent / "handoff/bundle.json"
         bundle = read(bundle_path)
@@ -1180,12 +1191,47 @@ class Compute(unittest.TestCase):
             ],
         }
         output = self.root / "imported"
+        revalidation_refused = self.root / "revalidation-refused-import"
         with mock.patch.object(
                 public_bundle.accepted_records, "imported_stage",
-                return_value=native_view):
+                return_value=native_view), \
+                mock.patch.object(
+                    public_bundle.accepted_records, "import_native_revalidation",
+                    side_effect=ValueError("synthetic native revalidation refused")), \
+                self.assertRaisesRegex(
+                    ValueError, "synthetic native revalidation refused"):
+            public_bundle.import_bundle(
+                handoff, archive, revalidation_refused, source, archive_sha256,
+                VALIDATOR, SUPERVISOR)
+        for name in ("candidate-bundle.json", "bundle.json"):
+            self.assertFalse((revalidation_refused / name).exists())
+
+        def native_import_revalidation(actual_stage, path, **tools):
+            self.assertEqual(actual_stage, output)
+            self.assertEqual(tools, {
+                "git": handoff.ci.tool("git"),
+                "supervisor": SUPERVISOR,
+                "validator": VALIDATOR,
+            })
+            self.assertFalse((actual_stage / "candidate-bundle.json").exists())
+            path.mkdir(mode=0o700)
+            return path
+
+        with mock.patch.object(
+                public_bundle.accepted_records, "imported_stage",
+                return_value=native_view), \
+                mock.patch.object(
+                    public_bundle.accepted_records, "import_native_revalidation",
+                    side_effect=native_import_revalidation) as revalidation:
             imported = public_bundle.import_bundle(
                 handoff, archive, output, source, archive_sha256,
                 VALIDATOR, SUPERVISOR)
+        revalidation.assert_called_once()
+        revalidated = subprocess.run(
+            [VALIDATOR, "handoff", output / "bundle.json"],
+            env={}, capture_output=True, timeout=60)
+        self.assertEqual(revalidated.returncode, 0, revalidated.stderr)
+        self.assertIn(b"authority=not_admitted", revalidated.stdout)
         self.assertEqual(imported["authority"], "not_admitted")
         self.assertEqual((output / "artifacts/vhd").read_bytes(), (stage / "artifacts/vhd").read_bytes())
         self.assertEqual(handoff.candidate_plan(output / "bundle.json", self.root / "public-plan.json")["authority"],

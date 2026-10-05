@@ -137,6 +137,15 @@ source/tree pairs and a separate historical Python-v2 checkout. It uses real
 Git objects and physical Python scans, real native packaging/QCOW2/VHD
 production, and actual constructor/recheck/CLI routes. Its command/serial
 fixtures are synthetic and do not claim guest or hardware acceptance.
+The separate direct-Azure physical image/copy fixture has mocked producer
+custody, not a complete native-accepted run. It first proves export refuses
+without a native controller, then stubs the read-only view only for downstream
+full-image, four-boot, archive and mutation checks, just as its imported-stage
+checks do. Its imported native-revalidation seam also proves refusal prevents
+candidate/public bundle publication before using a stub for those archive
+checks; the real direct validator reopens the imported image and records.
+These stubs are not native-admission qualification; the complete-local native
+constructor fixture above remains the genuine admission gate.
 These fixtures require the genuine historical Git objects in the reader's
 repository, so qualification from a shallow checkout must first fetch its
 complete history with `git fetch --unshallow`. The native CI checkout uses
