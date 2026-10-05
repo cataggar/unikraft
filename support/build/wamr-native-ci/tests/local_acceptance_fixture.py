@@ -104,7 +104,7 @@ def pin(path):
 def prepare(args):
     source, stage, work, revision, git, python, zig, fixture, miz, package_cli, log_cli, aot_cli = args
     source, stage, work, miz = map(Path, (source, stage, work, miz))
-    repository, runtime = work / "producer", work / "runtime"
+    repository, runtime = work / "producer", work / ".d/wamr-native-runtime"
     v2 = revision == "e98623f780fa23d05b5797004e4b88160404eb1b"
     package = source / "support/build/wamr-native-ci"
     ci = load("local_ci", package / "run.py")
@@ -137,7 +137,8 @@ def prepare(args):
                  "firmware", "bin/share", "bison", "llvm", "zig",
                  "host-tools", "evidence"):
         (runtime / part).mkdir(mode=0o700, parents=True, exist_ok=True)
-    for part in ("original", "compiler-cache", "global", "supervisor-install", "image-records"):
+    for part in ("original", "compiler-cache", "global", "supervisor-install",
+                 "image-records", "private-products"):
         (work / part).mkdir(mode=0o700)
     (work / "mutated-runtime-role").write_bytes(b"")
     (work / "redirected-runtime").write_bytes(b"")
@@ -452,8 +453,7 @@ def chain(ci, evidence, compute, source, package, boots, images):
                       ("unikraft.raw", "unikraft.qcow2", "unikraft-derived.vhd"))
     efi = package["image"]["efi"]
     def output(path):
-        return {"sha256": digest(path), "file_bytes": path.stat().st_size,
-                "virtual_bytes": raw.stat().st_size}
+        return ci.image_artifact(path, raw.stat().st_size)
     def emit(name, schema, **fields):
         save(evidence / name, {"schema": schema, "schema_version": 1, **fields})
     def ref(name):
@@ -476,7 +476,7 @@ def chain(ci, evidence, compute, source, package, boots, images):
              "fixed-vhd-derivation-intent.json", "fixed-vhd-derivation-gate.json", "fixed-vhd-derivation.json"]
     emit("final-inspection.json", "uk.wamr.compute-image-chain-inspection",
          profile="qcow2-derived-vhd", status="complete", source=source,
-         artifacts={"efi": {"sha256": efi["sha256"], "file_bytes": efi["size"]},
+         artifacts={"efi": ci.image_artifact(ci.APP / "build" / ci.EFI, efi["size"]),
                     "raw": output(raw), "qcow2": output(qcow), "vhd": output(vhd)},
          records={name: ref(name) for name in names}, modes=list(ci.SIX_MODES), boots=boots)
 
@@ -484,7 +484,7 @@ def chain(ci, evidence, compute, source, package, boots, images):
 def private_cli(source, work, controller, validator):
     """Exercise real product processes and the retained Python export oracle."""
     source, work = map(Path, (source, work))
-    repository, runtime = work / "producer", work / "runtime"
+    repository, runtime = work / "producer", work / ".d/wamr-native-runtime"
     os.chdir(repository)
     os.environ.update(WAMR_CI_CONTROLLER=controller,
                       GITHUB_REPOSITORY="cataggar/unikraft",
@@ -493,7 +493,9 @@ def private_cli(source, work, controller, validator):
     handoff.ci.REPO = repository
     handoff.ci.APP = repository / "support/apps/wamr-aot"
     handoff.ci.LOCAL_BOOT = repository / "support/tools/hyperv/local_boot"
-    native, oracle = work / "native-private-export", work / "python-private-export"
+    handoff.accepted_records.HERE = repository / "support/build/wamr-native-ci"
+    products = work / "private-products"
+    native, oracle = products / "native-export", products / "python-export"
     export_argv = [controller, "private-export", "--runtime", str(runtime),
                    "--output", str(native)]
     result = subprocess.run(export_argv, capture_output=True, timeout=900)
@@ -532,8 +534,14 @@ def private_cli(source, work, controller, validator):
              "--output", str(output)], cwd=source,
             capture_output=True, timeout=900, **kwargs)
 
-    output = work / "native-private-validation"
+    output = products / "native-validation"
     checked = validate(native, output)
+    if checked.returncode != 0:
+        log = output / "private/import-native-revalidation.log"
+        if log.is_file():
+            print("private validator diagnostic:",
+                  log.read_bytes()[:4096].decode(errors="replace"),
+                  file=sys.stderr)
     assert checked.returncode == 0, checked.stderr
     assert checked.stdout == b"Compute handoff revalidated; authority=not_admitted.\n"
     assert not checked.stderr
@@ -552,7 +560,7 @@ def private_cli(source, work, controller, validator):
     actual["boots"][0]["serial"].update(size=serial.stat().st_size,
                                       sha256=digest(serial))
     save(native / "bundle.json", actual)
-    refused_output = work / "rehashed-private-refusal"
+    refused_output = products / "rehashed-refusal"
     refused = validate(native, refused_output)
     assert refused.returncode == 1 and not refused.stdout, refused
     assert not refused_output.exists()
@@ -562,14 +570,14 @@ def private_cli(source, work, controller, validator):
     def io_fault():
         resource.setrlimit(resource.RLIMIT_FSIZE, (1, 1))
 
-    partial = work / "private-validation-io-fault"
+    partial = products / "validation-io-fault"
     failed = validate(native, partial, preexec_fn=io_fault)
     assert failed.returncode != 0 and not failed.stdout, failed
     assert partial.is_dir(), failed.stderr
     assert (partial / "private").is_dir()
     retry = validate(native, partial)
     assert retry.returncode == 1 and not retry.stdout, retry
-    export_partial = work / "private-export-io-fault"
+    export_partial = products / "export-io-fault"
     failed = subprocess.run(
         [controller, "private-export", "--runtime", str(runtime),
          "--output", str(export_partial)],
@@ -588,7 +596,7 @@ def private_cli(source, work, controller, validator):
 
 def mutate(work, case):
     work = Path(work)
-    repository, runtime = work / "producer", work / "runtime"
+    repository, runtime = work / "producer", work / ".d/wamr-native-runtime"
     evidence = runtime / "compute/evidence"
     for original in (work / "original").glob("*.json"):
         copy_file(original, evidence / original.name)

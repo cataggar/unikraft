@@ -125,7 +125,7 @@ pub fn qualify(a: std.mem.Allocator, io: std.Io, stage: []const u8) !void {
         try root.createDir(io, revision, .fromMode(0o700));
         const work = try std.fs.path.join(a, &.{ root_path, revision });
         const repository = try std.fs.path.join(a, &.{ work, "producer" });
-        const runtime = try std.fs.path.join(a, &.{ work, "runtime" });
+        const runtime = try std.fs.path.join(a, &.{ work, ".d/wamr-native-runtime" });
         try python(a, io, &.{
             "prepare",                options.repository_root,    stage,                  work,                    revision,
             options.git_executable,   options.python_executable,  options.zig_executable, options.command_fixture, options.miz_package,
@@ -152,7 +152,7 @@ pub fn qualify(a: std.mem.Allocator, io: std.Io, stage: []const u8) !void {
             try std.testing.expectEqualStrings("", emitted.stderr);
             try compareHandoff(a, &accepted, emitted.stdout);
             if (v2) {
-                const raw = try root.readFileAlloc(io, try std.fs.path.join(a, &.{ revision, "runtime/compute/evidence/build-start.json" }), a, .limited(controller.records.max_record_bytes));
+                const raw = try root.readFileAlloc(io, try std.fs.path.join(a, &.{ revision, ".d/wamr-native-runtime/compute/evidence/build-start.json" }), a, .limited(controller.records.max_record_bytes));
                 const start = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{ .parse_numbers = false });
                 const source_map = start.object.get("command_supervisor").?.object.get("source_map").?;
                 _ = try controller.import_supervisor_identity.verifyGitSource(std.testing.allocator, io, accepted.source, repository, options.git_executable, source_map, null);
