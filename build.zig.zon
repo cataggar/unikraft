@@ -2,7 +2,12 @@
     .name = .unikraft,
     .version = "0.21.0",
     .fingerprint = 0x77eedfefd66048ac, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .translate_c = .{
+            .url = "git+https://github.com/cataggar/translate-c.git#62d06a5d3e93c82727544e8113e4762a315ca0ed",
+            .hash = "translate_c-2.0.0-Q_BUWlpOBwBWvgGBM20tJq-GXgPio3v3UD39rXEn70KN",
+        },
+    },
     .paths = .{""},
 }

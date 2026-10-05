@@ -2,11 +2,11 @@
     .name = .unikraft_hyperv_local_boot,
     .version = "0.1.0",
     .fingerprint = 0xaec47cd93c6c45e2,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .miz_source = .{
-            .url = "git+https://github.com/cataggar/miz.git#669a27982b376311f558e820b69e9a692735b0cd",
-            .hash = "miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx",
+            .url = "git+https://github.com/cataggar/miz.git#66ea6701cf0e1b6d31e5f30fade00b7a546d4b44",
+            .hash = "miz-0.2.0-Z3lHlLgL2wDiGxutMJMDy9Qy4CLNCwOptwgQLp1ZDSiv",
         },
     },
     .paths = .{""},
