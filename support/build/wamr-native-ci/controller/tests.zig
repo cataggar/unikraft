@@ -3756,9 +3756,12 @@ fn qualifyLegacyLocalReadOnly(a: std.mem.Allocator, io: std.Io, stage: []const u
     }
     if (!mutated_runtime) std.debug.print("legacy local fixture has no owned discovered Git runtime\n", .{});
     try std.testing.expect(mutated_runtime);
-    const changed_git = try bin.openFile(io, "reader-git", .{ .mode = .read_write, .follow_symlinks = false });
+    // An executable pin may deny in-place writes; replace the physical tool.
+    try copyFixtureExecutable(io, a, git, bin, "changed-reader-git");
+    const changed_git = try bin.openFile(io, "changed-reader-git", .{ .mode = .read_write, .follow_symlinks = false });
     defer changed_git.close(io);
     try changed_git.writePositionalAll(io, "!", (try changed_git.stat(io)).size - 1);
+    try bin.rename("changed-reader-git", bin, "reader-git", io);
     try std.testing.expectError(error.FileChanged, accepted.revalidate());
 }
 
