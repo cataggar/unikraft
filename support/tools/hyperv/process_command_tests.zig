@@ -284,25 +284,28 @@ test "command pre-spawn results have one exact not-required shape" {
         .{ .primary = .local_io, .fault = .snapshot_local_io },
         .{ .primary = .local_io, .fault = .spawn_local_io },
     };
-    for (cases) |case| {
-        var cancellation = std.atomic.Value(bool).init(case.cancelled);
-        var command = try request(
-            executable,
-            &.{ path, "bytes", "0", "0", "0" },
-            &environment,
-            fixture.directory.dir,
-        );
-        if (case.expired) command.primary_deadline = .{ .expires_ns = 1 };
-        command.cancel = if (case.cancelled) &cancellation else null;
-        var result = try process.runCommandTest(
-            allocator,
-            io,
-            command,
-            .{ .pre_spawn = case.fault },
-        );
-        defer result.deinit(allocator);
-        try expectExactPreSpawn(result, case.primary);
-        try support.noChildren();
+    for ([_]process.CommandCapture{ .separate, .{ .merged = 32 } }) |capture| {
+        for (cases) |case| {
+            var cancellation = std.atomic.Value(bool).init(case.cancelled);
+            var command = try request(
+                executable,
+                &.{ path, "bytes", "0", "0", "0" },
+                &environment,
+                fixture.directory.dir,
+            );
+            command.capture = capture;
+            if (case.expired) command.primary_deadline = .{ .expires_ns = 1 };
+            command.cancel = if (case.cancelled) &cancellation else null;
+            var result = try process.runCommandTest(
+                allocator,
+                io,
+                command,
+                .{ .pre_spawn = case.fault },
+            );
+            defer result.deinit(allocator);
+            try expectExactPreSpawn(result, case.primary);
+            try support.noChildren();
+        }
     }
 }
 
@@ -331,6 +334,222 @@ test "command contract captures successful bounded stdout and stderr" {
     try testing.expect(std.mem.allEqual(u8, result.stderr, 'e'));
     try testing.expect(result.executable_stable);
     try testing.expectEqual(@as(u16, 0), result.descendants.observed);
+    try support.noChildren();
+}
+
+test "command merged capture preserves ordered binary writes and separate defaults" {
+    var fixture = try support.Fixture.init();
+    defer fixture.deinit();
+    var executable = try openExecutable();
+    defer executable.close(io);
+    const path = try support.executable();
+    defer allocator.free(path);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    const expected = "out-1\x00err-1\nout-2\nerr-2\xff";
+    for ([_]bool{ false, true }) |merged| {
+        var command = try request(executable, &.{ path, "interleaved" }, &environment, fixture.directory.dir);
+        if (merged) {
+            command.capture = .{ .merged = expected.len };
+            command.limits.stdout_bytes = 1;
+            command.limits.stderr_bytes = 1;
+        }
+        const descriptor = try nextDescriptor();
+        var result = try process.runCommand(allocator, io, command);
+        defer result.deinit(allocator);
+        try testing.expect(result.succeeded());
+        try testing.expectEqual(.complete, result.stdout_status);
+        try testing.expectEqual(.complete, result.stderr_status);
+        try testing.expectEqualStrings(if (merged) expected else "out-1\x00out-2\n", result.stdout);
+        try testing.expectEqualStrings(if (merged) "" else "err-1\nerr-2\xff", result.stderr);
+        try testing.expectEqual(descriptor, try nextDescriptor());
+        try support.noChildren();
+    }
+}
+
+test "command merged aggregate accepts one MiB and refuses the first excess" {
+    var fixture = try support.Fixture.init();
+    defer fixture.deinit();
+    var executable = try openExecutable();
+    defer executable.close(io);
+    const path = try support.executable();
+    defer allocator.free(path);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    const cap = 1024 * 1024;
+    for ([_]bool{ false, true }) |excess| {
+        var command = try request(
+            executable,
+            &.{ path, "bytes", "524288", if (excess) "524289" else "524288", "0" },
+            &environment,
+            fixture.directory.dir,
+        );
+        command.capture = .{ .merged = cap };
+        var result = try process.runCommand(allocator, io, command);
+        defer result.deinit(allocator);
+        try testing.expectEqual(!excess, result.succeeded());
+        if (excess) try testing.expectEqual(.output_overflow, result.primary);
+        try testing.expectEqual(@as(usize, cap), result.stdout.len);
+        try testing.expect(std.mem.allEqual(u8, result.stdout[0 .. cap / 2], 'o'));
+        try testing.expect(std.mem.allEqual(u8, result.stdout[cap / 2 ..], 'e'));
+        try testing.expectEqual(@as(usize, 0), result.stderr.len);
+        try testing.expectEqual(@as(process.CommandStreamStatus, if (excess) .overflow else .complete), result.stdout_status);
+        try testing.expectEqual(.complete, result.stderr_status);
+        try testing.expectEqual(.complete, result.cleanup);
+        try testing.expect(result.cleanup_complete);
+        try support.noChildren();
+    }
+}
+
+test "command merged first excess stops a long lived TERM resistant descendant tree" {
+    var fixture = try support.Fixture.init();
+    defer fixture.deinit();
+    var executable = try openExecutable();
+    defer executable.close(io);
+    const path = try support.executable();
+    defer allocator.free(path);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var command = try request(
+        executable,
+        &.{ path, "mixed-overflow-tree", "1048576" },
+        &environment,
+        fixture.directory.dir,
+    );
+    command.capture = .{ .merged = 1024 * 1024 };
+    command.primary_deadline = try process.Deadline.afterMilliseconds(30_000);
+    command.limits.term_grace_ms = 50;
+    const descriptor = try nextDescriptor();
+    var result = try process.runCommand(allocator, io, command);
+    defer result.deinit(allocator);
+    const prefix_end = (std.mem.indexOfScalar(u8, result.stdout, '\n') orelse return error.MissingFixturePid) + 1;
+    try expectPidsGone(result.stdout[0..prefix_end], 1);
+    try testing.expectEqual(.output_overflow, result.primary);
+    try testing.expectEqual(.overflow, result.stdout_status);
+    try testing.expectEqual(.complete, result.stderr_status);
+    try testing.expectEqual(@as(usize, 1024 * 1024), result.stdout.len);
+    try testing.expect(std.mem.allEqual(u8, result.stdout[prefix_end .. 512 * 1024], 'o'));
+    try testing.expect(std.mem.allEqual(u8, result.stdout[512 * 1024 ..], 'e'));
+    try testing.expectEqual(@as(usize, 0), result.stderr.len);
+    try testing.expect(result.primary_completed_ns - result.started_ns < 2000 * std.time.ns_per_ms);
+    try testing.expect(result.completed_ns - result.started_ns < 3000 * std.time.ns_per_ms);
+    try testing.expect(!result.primary_deadline_reached);
+    try testing.expectEqual(.KILL, result.termination.?.signal);
+    try testing.expectEqual(.complete, result.cleanup);
+    try testing.expect(result.cleanup_complete);
+    try testing.expectEqual(@as(u16, 1), result.descendants.observed);
+    try testing.expectEqual(@as(u16, 1), result.descendants.identity_validated);
+    try testing.expectEqual(@as(u16, 3), result.reap_events);
+    try testing.expectEqual(descriptor, try nextDescriptor());
+    try support.noChildren();
+}
+
+test "command merged timeout cancellation and stopped leaders retain partial bytes" {
+    var fixture = try support.Fixture.init();
+    defer fixture.deinit();
+    var executable = try openExecutable();
+    defer executable.close(io);
+    const path = try support.executable();
+    defer allocator.free(path);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    for ([_][]const u8{ "partial", "stopped-partial", "term-output" }) |mode| {
+        for ([_]bool{ false, true }) |use_cancel| {
+            var cancel = std.atomic.Value(bool).init(false);
+            const thread = try std.Thread.spawn(.{}, support.cancelAfter, .{ &cancel, @as(u32, 300) });
+            defer thread.join();
+            var command = try request(executable, &.{ path, mode }, &environment, fixture.directory.dir);
+            command.capture = .{ .merged = 1024 * 1024 };
+            command.primary_deadline = try process.Deadline.afterMilliseconds(if (use_cancel) 3000 else 300);
+            command.cleanup_deadline = try process.Deadline.afterMilliseconds(2000);
+            command.cancel = if (use_cancel) &cancel else null;
+            command.limits.term_grace_ms = 50;
+            var result = try process.runCommand(allocator, io, command);
+            defer result.deinit(allocator);
+            try testing.expectEqual(@as(process.CommandPrimary, if (use_cancel) .cancelled else .timeout), result.primary);
+            try testing.expectEqual(use_cancel, result.cancellation_observed);
+            try testing.expectEqual(!use_cancel, result.primary_deadline_reached);
+            const expected = if (std.mem.eql(u8, mode, "partial"))
+                "private-stdout?sig=synthetic-secret\nprivate-stderr?sig=synthetic-secret\n"
+            else if (std.mem.eql(u8, mode, "stopped-partial"))
+                "stopped-out\nstopped-err\n"
+            else
+                "before-term\nprivate-after-term\n";
+            try testing.expectEqualStrings(expected, result.stdout);
+            try testing.expectEqualStrings("", result.stderr);
+            try testing.expectEqual(.complete, result.stdout_status);
+            try testing.expectEqual(.complete, result.stderr_status);
+            try testing.expectEqual(.complete, result.cleanup);
+            try testing.expect(result.cleanup_complete);
+            try testing.expect(!result.succeeded());
+            if (std.mem.eql(u8, mode, "stopped-partial"))
+                try testing.expectEqual(.KILL, result.termination.?.signal);
+            try support.noChildren();
+        }
+    }
+}
+
+test "command merged inherited pipe is drained only after descendant KILL and reap" {
+    var fixture = try support.Fixture.init();
+    defer fixture.deinit();
+    var executable = try openExecutable();
+    defer executable.close(io);
+    const path = try support.executable();
+    defer allocator.free(path);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var command = try request(executable, &.{ path, "orphan-pipes" }, &environment, fixture.directory.dir);
+    command.capture = .{ .merged = 64 * 1024 };
+    command.limits.term_grace_ms = 50;
+    var result = try process.runCommand(allocator, io, command);
+    defer result.deinit(allocator);
+    try testing.expect(result.succeeded());
+    try testing.expectEqual(.complete, result.stdout_status);
+    try testing.expectEqual(.complete, result.stderr_status);
+    try testing.expectEqual(@as(u16, 1), result.descendants.observed);
+    try testing.expectEqual(@as(u16, 3), result.reap_events);
+    try expectPidsGone(result.stdout, 1);
+    try support.noChildren();
+}
+
+test "command merged invalid caps and stdout sinks refuse before execution" {
+    var fixture = try support.Fixture.init();
+    defer fixture.deinit();
+    var executable = try openExecutable();
+    defer executable.close(io);
+    const path = try support.executable();
+    defer allocator.free(path);
+    var environment = std.process.Environ.Map.init(allocator);
+    defer environment.deinit();
+    var command = try request(executable, &.{ path, "gate-marker", "must-not-run" }, &environment, fixture.directory.dir);
+    for ([_]usize{ 0, 8 * 1024 * 1024 + 1, std.math.maxInt(usize) }) |cap| {
+        command.capture = .{ .merged = cap };
+        try testing.expectError(error.InvalidOptions, process.runCommand(allocator, io, command));
+    }
+    const sink = try fixture.directory.dir.createFile(io, "sink", .{
+        .exclusive = true,
+        .permissions = .fromMode(0o600),
+    });
+    defer sink.close(io);
+    command.capture = .{ .merged = 32 };
+    command.stdout_file = sink;
+    try testing.expectError(error.InvalidOptions, process.runCommand(allocator, io, command));
+    try testing.expectEqual(@as(u64, 0), (try sink.stat(io)).size);
+    try testing.expectEqual(.SUCCESS, linux.errno(linux.fcntl(sink.handle, linux.F.GETFD, 0)));
+    const marker = linux.openat(fixture.directory.dir.handle, "must-not-run", .{
+        .ACCMODE = .RDONLY,
+        .CLOEXEC = true,
+        .NOFOLLOW = true,
+    }, 0);
+    try testing.expectEqual(.NOENT, linux.errno(marker));
+    command.capture = .separate;
+    command.argv = &.{ path, "bytes", "17", "23", "0" };
+    var result = try process.runCommand(allocator, io, command);
+    defer result.deinit(allocator);
+    try testing.expect(result.succeeded());
+    try testing.expectEqual(@as(usize, 0), result.stdout.len);
+    try testing.expectEqual(@as(usize, 23), result.stderr.len);
+    try testing.expectEqual(@as(u64, 17), (try sink.stat(io)).size);
     try support.noChildren();
 }
 

@@ -370,7 +370,7 @@ GUARDED_PRODUCER_FILES = {
         "ee1e038f6538beecac8a09d4d52a6c601a9ca1f503fd70a3753bd8d2e3ac904b"
     ),
     "support/tools/hyperv/process.zig": (
-        "453bcc06e36f43a906f98f4c28e8e2f802245ebdbc47b5bea4d23a11ef448dac"
+        "18d6e8121bbd4462f55e6b0bbe0f1e2b90cdfa47d36d89ebf748726ffe27f678"
     ),
     "support/tools/hyperv/sensitive.zig": (
         "e5845b7623116f3ef6e6e062463f39c2f3840bec5d36c75ccf413643dfae1eca"

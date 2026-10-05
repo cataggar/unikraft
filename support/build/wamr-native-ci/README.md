@@ -445,7 +445,41 @@ tracked entries/2 GiB (256 MiB per file), 131,072 ignored entries/8 GiB
 512 Bison entries/8 MiB, and 128 dependency roots/16,384 entries/256 MiB.
 Custody checks bind content hashes and stable physical metadata before and
 after use; only the four fixed output roles may be ignored. Bounded diagnostics
-and refusal never grant acceptance. The build path now supervises a closed
+and refusal never grant acceptance.
+
+`input_custody.executableRuntimePathsWithOptions(allocator, io, executable,
+RuntimeInventoryOptions)` adds an optional borrowed atomic cancellation flag
+to the existing closed native ELF inventory. The original three-argument
+`executableRuntimePaths` retains its default behavior and sorted canonical
+loader/library paths. Both entrypoints use the same retained native loader,
+`loader --list executable`, root cwd, and closed `LC_ALL=C` environment,
+30-second primary/10-second later cleanup deadlines, 1-MiB stdout/4096-byte
+stderr bounds, 256-path limit and physical identity checks. No tool allowlist,
+reader source-name policy, controller CLI or caller is changed.
+
+Cancellation is checked around ELF reads, loader/path resolution, identity
+work and final sorting, and passed directly to the shared native process
+owner during inventory. `error.Cancelled` never carries a partial closure.
+For a spawned cancellation it requires proven complete native tree cleanup;
+an unproved cleanup remains `error.RuntimeInventoryRefused` and preserves the
+process owner's irreversible poison. Subsequent supervised work still refuses
+with `error.UnresolvedCleanup`. Other native failures retain their existing
+refusal classification rather than becoming cancellation because the flag
+was set later.
+
+An optional initially empty `RuntimeInventoryEvidence` receives the owned
+private `CommandResult` on success or refusal, including partial output,
+executable identity, cancellation, stream/descendant/cleanup/reap observations
+and timestamps. Cancellation before spawning leaves `command=null`.
+Post-inventory cancellation can retain a successful native command but still
+refuses the closure. Call `evidence.deinit(allocator)` before reuse; evidence
+is not a public record and does not authorize publication. The focused
+`test-controller-direct -Dtest-filter="native ELF runtime"` cases use genuine
+ELFs and loaders, kernel FIFO-open synchronization (no timed sleeps), native
+cleanup-proof fault injection, and real executable/loader replacement,
+hardlink and byte mutations.
+
+The build path now supervises a closed
 adapter/local-boot/fixtures/prepare/config/native-image sequence directly
 through the shared Hyper-V process supervisor. It freezes installed native
 producer/validator/fixture identities in `build-start.json`, checks the pinned

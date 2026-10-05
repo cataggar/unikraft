@@ -520,6 +520,37 @@ byte executable path. `reap_events` must be at least `descendants + 3`: one
 event each for the leader, every requested descendant, the retained first
 excess sentinel, and the terminal `ECHILD` observation.
 
+Capture remains separate by default, including the existing per-stream limits
+and retained stdout-file sink. Trusted callers may explicitly set
+`CommandRequest.capture = .{ .merged = aggregate_bytes }` to connect child
+stdout and stderr to the **same pipe before exec**. Kernel pipe order is
+retained, including binary bytes; this is not concatenation or polling-order
+reconstruction of independent streams. The merged cap accepts exactly that
+many bytes and stops primary execution on the first excess byte, entering the
+same bounded TERM/KILL, descendant-discovery and reap protocol immediately
+rather than waiting for the primary deadline. Its cap must be nonzero and at
+most 8 MiB; existing `CommandLimits` validation remains unchanged. In this
+opt-in mode only, the merged cap replaces the two separate capture budgets:
+`CommandResult.stdout` and `stdout_status` hold the merged bytes/status, while
+`stderr` is empty and `stderr_status` is complete. No result fields or persisted
+command records are added. A merged request with `stdout_file` is refused with
+`error.InvalidOptions` before spawn; the supervisor never redirects a merged
+stream into a caller's sink implicitly.
+
+Merged timeout/cancellation and failures retain their bounded partial byte
+prefix, executable identity and independent cleanup evidence just like command
+mode's separate capture. An inherited merged pipe is drained after proven
+descendant cleanup; incomplete cleanup still poisons the entire supervisor.
+Neither `run` nor `runPrivate` offers this opt-in or changes its behavior.
+The shared fixtures (ordered descriptor writes, aggregate boundaries, live and
+stopped leaders, inherited pipes, KILL/reap and irreversible cleanup poison)
+can be run with `zig build --build-file support/tools/hyperv/direct/build.zig
+test-command -Dtest-root=/absolute/private/fixtures`, using the normal external
+SDK/cache options for this repository. `test-runtime` includes those cases
+alongside the unchanged private-process and direct-runtime regressions.
+Guarded producer/runner hashes are deliberately not updated by this API change;
+outer guarded gates require separate approval of the exact new source bytes.
+
 `CommandResult` owns zeroized bounded stdout/stderr storage and reports the
 leader's primary outcome, termination, deadline/cancellation observations,
 per-stream completion/overflow/I/O status, executable stability, descendant
