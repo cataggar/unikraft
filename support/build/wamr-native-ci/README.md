@@ -89,6 +89,9 @@ review; it is not part of verification.
 The current v2 fixtures bind the Zig 0.17 SDK generation. Frozen v1 fixtures
 retain the original SDK revision and byte-identical archives; their generator
 selects the historical source context explicitly rather than relabelling it.
+The controller test runner retains its selected optimization mode but is
+stripped because it serves as its own retained handoff-controller executable.
+This keeps debug information outside the unchanged 64 MiB executable bound.
 
 ## Native package and boot chain (production caller)
 

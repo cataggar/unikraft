@@ -237,6 +237,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("controller/tests.zig"),
             .target = b.graph.host,
             .optimize = optimize,
+            .strip = true,
             .imports = &.{
                 .{ .name = "wamr_controller", .module = host_controller },
                 .{ .name = "hyperv_core", .module = host_core },

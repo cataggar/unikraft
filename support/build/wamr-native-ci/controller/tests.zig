@@ -520,7 +520,7 @@ fn handoffInspectFixtures() !void {
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), validator_plan.output_limit);
     try std.testing.expectEqualStrings(
         try std.fs.path.join(a, &.{ output, "public-source/tools" }),
-        try plan.path(a, validator_plan.argv[9], roots),
+        try plan.path(a, validator_plan.argv[7], roots),
     );
     const env = try plan.environment(a, .@"public-validator-build");
     defer plan.freeEnvironment(a, env);
