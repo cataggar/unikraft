@@ -38,7 +38,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: cataggar/wamr
-          ref: a53205d77be3b880eb8f8b96679512ba58e2331a
+          ref: 661ac49584c4d0ac57adb78eba62f3ff3e9795df
           path: .d/wamr-source
           persist-credentials: false
 
@@ -826,7 +826,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: cataggar/wamr
-          ref: a53205d77be3b880eb8f8b96679512ba58e2331a
+          ref: 661ac49584c4d0ac57adb78eba62f3ff3e9795df
           path: .d/wamr-source
           persist-credentials: false
 
