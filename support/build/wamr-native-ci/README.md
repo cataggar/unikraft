@@ -142,6 +142,13 @@ repository, so qualification from a shallow checkout must first fetch its
 complete history with `git fetch --unshallow`. The native CI checkout uses
 `fetch-depth: 0`, matching the existing integration runtime job. Missing
 historical objects refuse the fixture; no synthetic commit replaces them.
+The historical fixture also needs the complete pinned dependency graph, not
+only the lazy subset fetched by a native package build. Native CI restores the
+unchanged local-boot manifests with `zig build --fetch=all` in a private root
+and supplies its genuine `zig-pkg` forest through `--system`, matching the
+existing integration runtime job. Every copied package still undergoes the
+original content-hash and custody checks; missing packages are not synthesized
+or ignored. Offline qualification must provide that same complete graph.
 Reader fixtures stage a single-link private copy of real Git and its real ELF
 interpreter, relocating only `PT_INTERP` while preserving Git's loaded code and
 bundled-library search paths. This gives both system and bundled Git an actual

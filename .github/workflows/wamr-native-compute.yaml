@@ -114,11 +114,19 @@ jobs:
           mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-controller-pipeline-root"
           mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-controller-python-private"
           export TMPDIR="${RUNNER_TEMP}/wamr-controller-python-private"
+          restore_root="${RUNNER_TEMP}/wamr-controller-dependency-restore"
+          mkdir -m 0700 -- "${restore_root}"
+          cp "${source_root}/support/tools/hyperv/local_boot/build.zig" \
+            "${source_root}/support/tools/hyperv/local_boot/build.zig.zon" "${restore_root}/"
+          ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
+            zig build --build-file "${restore_root}/build.zig" --fetch=all -j2
           if ! ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
             zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
+            --system "${restore_root}/zig-pkg" \
             -Doptimize=ReleaseSafe -j2 test-controller; then
             if ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
               zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
+              --system "${restore_root}/zig-pkg" \
               -Doptimize=ReleaseSafe -j1 test-controller-direct; then
               echo "Direct controller diagnostic passed after the gate failed" >&2
             else
@@ -128,6 +136,7 @@ jobs:
           fi
           ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
             zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
+            --system "${restore_root}/zig-pkg" \
             -Doptimize=ReleaseSafe -Dtest-root="${RUNNER_TEMP}/wamr-controller-pipeline-root" \
             -j2 test-pipeline
           (
