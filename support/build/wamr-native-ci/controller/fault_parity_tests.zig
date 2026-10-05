@@ -623,7 +623,7 @@ fn expectGone(bytes: []const u8, allow_partial: bool, minimum: usize) !void {
         count += 1;
     }
     try std.testing.expect(count >= minimum);
-    var status: u32 = 0;
+    var status: i32 = 0;
     try std.testing.expectEqual(linux.E.CHILD, linux.errno(linux.waitpid(-1, &status, linux.W.NOHANG)));
 }
 

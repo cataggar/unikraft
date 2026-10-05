@@ -788,18 +788,18 @@ fn fifoSubstitutionBounded(fault: retained_copy.TestFault) !void {
     var reaped = false;
     defer if (!reaped) {
         _ = linux.kill(pid, .KILL);
-        var status: u32 = 0;
+        var status: i32 = 0;
         while (linux.errno(linux.waitpid(pid, &status, 0)) == .INTR) {}
     };
     const deadline = try core.process.Deadline.afterMilliseconds(5000);
     while (true) {
-        var status: u32 = 0;
+        var status: i32 = 0;
         const result = linux.waitpid(pid, &status, linux.W.NOHANG);
         switch (linux.errno(result)) {
             .SUCCESS => if (result != 0) {
                 reaped = true;
-                try std.testing.expect(linux.W.IFEXITED(status));
-                try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+                try std.testing.expect(linux.W.IFEXITED(@bitCast(status)));
+                try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(@bitCast(status)));
                 break;
             },
             .INTR => continue,
