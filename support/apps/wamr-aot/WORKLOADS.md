@@ -38,7 +38,7 @@ Request fields are never echoed into independent observations.
 ### Supported SDK and explicit development selection
 
 All variants select the exact-generation Zig 0.17 WAMR compatibility revision
-`661ac49584c4d0ac57adb78eba62f3ff3e9795df`, including the AOT producer and the
+`bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20`, including the AOT producer and the
 PIC, final-link-owned compiler-runtime sampler APIs. This supported source pin
 is not qualified image or deployment lineage.
 

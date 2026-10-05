@@ -29,12 +29,15 @@ revision and package hash. Changing only an imported algorithm name cannot
 authenticate a package from the other generation.
 
 New SDK producers select exact-generation compatibility revision
-`661ac49584c4d0ac57adb78eba62f3ff3e9795df`. Frozen Zig 0.16 imports retain
+`bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20`, published by protected
+[WAMR PR #1081](https://github.com/cataggar/wamr/pull/1081).
+Frozen Zig 0.16 imports retain
 `a53205d77be3b880eb8f8b96679512ba58e2331a`; changing only the runtime compiler
 version or SDK revision cannot authenticate the other generation. SDK source
 custody covers the complete selected Git archive, including
 `build/environment.zig`, `include/wamr_aot.h`, and
-`tests/unikraft-jit/fixture.zig`, without changing its metadata
+`tests/unikraft-jit/fixture.zig`, `src/main.zig`, and `src/wasi/net_io.zig`,
+without changing its metadata
 schema or evidence bounds.
 
 The exact-generation WAMR/Miz dependency qualification is a separate

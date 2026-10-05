@@ -49,7 +49,7 @@ closure alone restores Translator/Aro, not those additional SDK dependencies;
 the qualified SDK closure must be restored into the bound depot too.
 
 `uk-wamr-aot-build prepare` exports exactly WAMR
-`661ac49584c4d0ac57adb78eba62f3ff3e9795df` from the local Git object
+`bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20` from the local Git object
 database into this application's ignored `build/wamr-source/`. It never
 builds in, changes, or inherits uncommitted files from the source checkout.
 It builds that revision's host `wamrc`, its freestanding library audit,
@@ -76,10 +76,13 @@ The same merged SDK supplies the single-root CoreMark bridge and optional
 workloads in [WORKLOADS.md](WORKLOADS.md). This source pin does not establish
 native boot, hardware or measurement qualification.
 Its independently fetched package hash is
-`wamr-0.1.0-_KKF6aMOqwDgUgUg0WrLZ1mTLPsNhQs7Yvx7AwUUwmeM`.
-The final compatibility follow-up only adds
-`tests/unikraft-jit/fixture.zig` to the upstream package's selected paths;
-the raw archive custody includes that generated JIT workload source as well.
+`wamr-0.1.0-_KKF6RgUqwCKfMFTu8Jh5YiEDdwxBEkIpHavOCNMh1uV`.
+This exact-generation compiler port was published by protected
+[WAMR PR #1081](https://github.com/cataggar/wamr/pull/1081). It retains the
+original native APIs and byte-identical C header, with the existing JIT fixture
+included in the package's selected paths. Source custody covers the complete
+selected archive, including the compiler-compatible CLI and WASI sources;
+the publication checks do not substitute for this application's qualification.
 
 Generated workload manifests pin the standalone `cataggar/translate-c`
 `62d06a5d3e93c82727544e8113e4762a315ca0ed` translator. The target-aware
