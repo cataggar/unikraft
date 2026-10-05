@@ -35,7 +35,7 @@ trap cleanup EXIT
 mkdir -p "${root}/baseline/fixtures"
 zig build --build-file "${package}/build.zig" \
   --cache-dir "${root}/fixture-cache" --prefix "${root}/fixture-out" \
-  -Dfixture-optimize=ReleaseSafe -j2 install-fixture --summary all
+  -Dfixture-optimize=safe -j2 install-fixture --summary all
 
 # Never profile a writable cache path, compiler, shell, or arbitrary test runner.
 for directory in / /var /var/lib; do
@@ -55,7 +55,7 @@ zig build --build-file "${package}/build.zig" \
   --cache-dir "${root}/baseline/cache" --prefix "${root}/baseline/out" \
   -Dtest-root="${root}/baseline/fixtures" \
   "-Dfixture-executable=${executable}" \
-  -Dtest-filter='kernel guard completes' -Doptimize=Debug -j2 test --summary all \
+  -Dtest-filter='kernel guard completes' -Doptimize=debug -j2 test --summary all \
   > "${root}/baseline.log" 2>&1 || baseline=$?
 
 if [ "${baseline}" -ne 0 ]; then
@@ -81,7 +81,7 @@ if [ "${baseline}" -ne 0 ]; then
   test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = 1
 fi
 
-for mode in Debug ReleaseSafe; do
+for mode in debug safe; do
   mkdir -p "${root}/${mode}/fixtures"
   zig build --build-file "${package}/build.zig" \
     --cache-dir "${root}/${mode}/zig-local-cache" \
@@ -107,7 +107,7 @@ for target in x86_64-linux-musl aarch64-linux-musl; do
   zig build --build-file "${package}/build.zig" \
     --cache-dir "${root}/${target}/zig-local-cache" \
     --prefix "${root}/${target}/out" \
-    -Dtarget="${target}" -Doptimize=ReleaseSafe \
+    -Dtarget="${target}" -Doptimize=safe \
     -j2 compile-guard --summary all
   binary_bytes="$(stat -c %s "${root}/${target}/out/bin/operator-guard-target-fixture")"
   test "$((binary_bytes + 233504))" -le 8388608

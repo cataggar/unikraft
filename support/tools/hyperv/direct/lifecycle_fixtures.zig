@@ -196,8 +196,8 @@ fn setup(c: f.Context, name: []const u8) !void {
         .location = "fixture",
         .prefix = f.prefix,
         .vm_size = "Standard_D2s_v5",
-        .run_id = "1" ** 32,
-        .disk_id = "2" ** 32,
+        .run_id = &@as([32:0]u8, @splat('1')),
+        .disk_id = &@as([32:0]u8, @splat('2')),
         .controller = .SCSI,
         .lun = 7,
         .sectors = if (eq(name, "wrong-geometry")) 4096 else 8388608,
@@ -226,9 +226,9 @@ fn setup(c: f.Context, name: []const u8) !void {
         if (one(name, &.{ "azure-interior-nul", "azure-interior-nul-removed" })) first = try std.mem.concat(c.a, u8, &.{ "provider\x00banner \t\x1b[0m\n", first });
         try c.write("boot1-body.log", first);
         const body = first;
-        first = try std.mem.concat(c.a, u8, &.{ first, "\x00" ** 464 });
+        first = try std.mem.concat(c.a, u8, &.{ first, &@as([464:0]u8, @splat('\x00')) });
         const changes = .{
-            .{ "azure-wrong-identity", "4" ** 32, "5" ** 32 },
+            .{ "azure-wrong-identity", &@as([32:0]u8, @splat('4')), &@as([32:0]u8, @splat('5')) },
             .{ "azure-writes", ":0:0:receipt-verified", ":1:0:receipt-verified" },
             .{ "azure-flushes", ":0:0:receipt-verified", ":0:1:receipt-verified" },
             .{ "azure-failure", "FINAL PASS rc=0", "FINAL FAIL rc=1" },
@@ -283,7 +283,7 @@ fn execute(c: f.Context, cfg: Config, attempt: []const u8, label: []const u8) !u
     }
     const status = switch (try child.wait(c.io)) {
         .exited => |code| code,
-        .signal => |signal| @as(u8, @intCast(128 + @intFromEnum(signal))),
+        .signal => |signal| @as(u8, @intCast(128 + @backingInt(signal))),
         else => return error.ControllerTermination,
     };
     try stdout.sync(c.io);
@@ -390,7 +390,7 @@ fn common(c: f.Context, case: Case, result: u8, outcome: std.json.Value) !void {
     if (state.object.get("boot2_reads")) |reads| try expect(try f.number(reads) <= 60);
     if (!one(case.name, &.{ "bad-input", "preexisting-group" })) {
         try expect(try c.exists("ledger/attempt-" ++ f.owner));
-        try sameFile(c, "scope.json", "ledger/" ++ "1" ** 32 ++ "-" ++ "2" ** 32 ++ "/consumed.json");
+        try sameFile(c, "scope.json", "ledger/" ++ &@as([32:0]u8, @splat('1')) ++ "-" ++ &@as([32:0]u8, @splat('2')) ++ "/consumed.json");
         try expect(try c.exists("ledger/sha256-" ++ f.image_sha));
     }
 }
@@ -498,9 +498,9 @@ fn custody(c: f.Context) !void {
         const poll = try f.num(record, "poll");
         try expect(poll > 0 and poll <= 60);
         try checkHash(c, record, "serial_sha256", "attempt/boot" ++ pair[1] ++ ".log");
-        try checkHash(c, record, "cli_wrapper_sha256", try std.fmt.allocPrint(c.a, "attempt/boot{s}-serial-{d}.json", .{ pair[1], poll }));
+        try checkHash(c, record, "cli_wrapper_sha256", try c.a.print("attempt/boot{s}-serial-{d}.json", .{ pair[1], poll }));
         try checkHash(c, record, "vm_observation_sha256", "attempt/boot" ++ pair[1] ++ "-vm.json");
-        try decodedEquals(c, try std.fmt.allocPrint(c.a, "attempt/boot{s}-serial-{d}.json", .{ pair[1], poll }), "attempt/boot" ++ pair[1] ++ ".log");
+        try decodedEquals(c, try c.a.print("attempt/boot{s}-serial-{d}.json", .{ pair[1], poll }), "attempt/boot" ++ pair[1] ++ ".log");
     }
     try expect(eq(try f.str(first, "boot2_admission_sha256"), ""));
     try checkHash(c, second, "boot2_admission_sha256", "attempt/boot2-admission.json");
@@ -542,10 +542,10 @@ fn accepted(c: f.Context, name: []const u8, outcome: std.json.Value) !void {
         const retained = one(phase, &.{ "retained", "final" });
         const stopped = (eq(phase, "boot1") and one(name, &.{ "stopped-boot1", "stopped-both" })) or (eq(phase, "boot2") and one(name, &.{ "stopped-boot2", "stopped-both" }));
         inline for (.{ "os", "data" }) |role| {
-            const disk = try c.document(try std.fmt.allocPrint(c.a, "attempt/{s}-{s}.json", .{ phase, role }));
+            const disk = try c.document(try c.a.print("attempt/{s}-{s}.json", .{ phase, role }));
             try expect(eq(try f.str(disk, "diskState"), if (retained) "Reserved" else "Attached") and eq(try f.str(disk, "managedBy"), f.vm_id));
         }
-        const power = try c.document(try std.fmt.allocPrint(c.a, "attempt/{s}-power.json", .{phase}));
+        const power = try c.document(try c.a.print("attempt/{s}-power.json", .{phase}));
         const statuses = try f.field(try f.field(power, "instanceView"), "statuses");
         var found: usize = 0;
         for (statuses.array.items) |status| {
@@ -585,7 +585,7 @@ fn refused(c: f.Context, name: []const u8, result: u8, outcome: std.json.Value) 
         try absent(c, &.{ "attempt/boot1.log", "attempt/boot2-admission.json" });
         try noDiagnostics(outcome);
         const pid = try std.fmt.parseInt(std.os.linux.pid_t, std.mem.trimEnd(u8, try c.read("process.pid"), "\n"), 10);
-        try expect(pid > 1 and std.os.linux.errno(std.os.linux.kill(pid, @enumFromInt(0))) == .SRCH);
+        try expect(pid > 1 and std.os.linux.errno(std.os.linux.kill(pid, @fromBackingInt(@intCast(0)))) == .SRCH);
         if (eq(name, "process-signal-term")) try expect(result == 143 and primary == 143);
         if (eq(name, "process-output-overflow")) {
             try overflowTermination(c, primary);
@@ -666,10 +666,10 @@ fn refused(c: f.Context, name: []const u8, result: u8, outcome: std.json.Value) 
     if (one(name, &.{ "retained-stopped", "final-stopped" })) {
         const phase = if (eq(name, "retained-stopped")) "retained" else "final";
         inline for (.{ "os", "data" }) |role| {
-            const disk = try c.document(try std.fmt.allocPrint(c.a, "attempt/{s}-{s}.json", .{ phase, role }));
+            const disk = try c.document(try c.a.print("attempt/{s}-{s}.json", .{ phase, role }));
             try expect(eq(try f.str(disk, "diskState"), "Reserved"));
         }
-        try diagnostic(c, "attempt/driver.stderr", try std.fmt.allocPrint(c.a, "direct observation failed: {s}-power.json", .{phase}));
+        try diagnostic(c, "attempt/driver.stderr", try c.a.print("direct observation failed: {s}-power.json", .{phase}));
     }
     if (eq(name, "diagnostics-power-failure")) try sameFile(c, "boot1.log", "attempt/failure-boot-diagnostics.log");
     const reads = try f.num(try f.field(outcome, "boot2_freshness"), "cached_reads");
@@ -757,7 +757,7 @@ fn evidencePresence(c: f.Context, name: []const u8) !inventory.Evidence {
         if (eq(case.name, name)) break case.evidence;
     } else return error.UnknownFixtureCase;
     for (evidence_files) |file| {
-        const expected = @intFromEnum(required) >= @intFromEnum(file.first_required);
+        const expected = @backingInt(required) >= @backingInt(file.first_required);
         if (try c.exists(file.path) != expected)
             return if (expected) error.MissingEvidenceRecord else error.UnexpectedEvidenceRecord;
     }
@@ -766,7 +766,7 @@ fn evidencePresence(c: f.Context, name: []const u8) !inventory.Evidence {
 
 fn processGone(pid: std.os.linux.pid_t) !bool {
     try expect(pid > 1);
-    return switch (std.os.linux.errno(std.os.linux.kill(pid, @enumFromInt(0)))) {
+    return switch (std.os.linux.errno(std.os.linux.kill(pid, @fromBackingInt(@intCast(0))))) {
         .SRCH => true,
         .SUCCESS => false,
         else => error.ProcessObservationFailed,
@@ -844,7 +844,7 @@ fn malformedRecordRegressions(c: f.Context) !usize {
         const original = try c.read(path);
         const drift = if (comptime eq(path, "attempt/boot2-capture.json")) blk: {
             var changed = try f.parse(c.a, original);
-            try changed.object.put(c.a, "scope_sha256", .{ .string = "0" ** 64 });
+            try changed.object.put(c.a, "scope_sha256", .{ .string = &@as([64:0]u8, @splat('0')) });
             break :blk try f.json(c.a, changed);
         } else try std.mem.concat(c.a, u8, &.{ original, " \n" });
         inline for (.{ false, true }) |malformed| {
@@ -890,7 +890,7 @@ fn recordRemovalRegressions(c: f.Context, case: Case) !usize {
     var all: u5 = 0;
     var count: usize = 0;
     for (evidence_files, 0..) |file, index| {
-        if (@intFromEnum(case.evidence) < @intFromEnum(file.first_required)) continue;
+        if (@backingInt(case.evidence) < @backingInt(file.first_required)) continue;
         const bit = @as(u5, 1) << @as(u3, @intCast(index));
         all |= bit;
         try missingRecordsRegression(c, case.name, bit);
@@ -1015,8 +1015,8 @@ fn refusedCustody(c: f.Context, name: []const u8) !void {
     try checkHash(c, first, "vm_observation_sha256", "attempt/boot1-vm.json");
     const poll = try f.num(first, "poll");
     try expect(poll > 0 and poll <= 60);
-    try checkHash(c, first, "cli_wrapper_sha256", try std.fmt.allocPrint(c.a, "attempt/boot1-serial-{d}.json", .{poll}));
-    try decodedEquals(c, try std.fmt.allocPrint(c.a, "attempt/boot1-serial-{d}.json", .{poll}), try originalFile(c, "attempt/boot1.log"));
+    try checkHash(c, first, "cli_wrapper_sha256", try c.a.print("attempt/boot1-serial-{d}.json", .{poll}));
+    try decodedEquals(c, try c.a.print("attempt/boot1-serial-{d}.json", .{poll}), try originalFile(c, "attempt/boot1.log"));
     try sameFile(c, "boot1.log", try originalFile(c, "attempt/boot1.log"));
     inline for (.{ .{ "vm_id", f.vm_id }, .{ "os_id", f.os_id }, .{ "data_id", f.data_id }, .{ "vm_uuid", "original-vm" }, .{ "os_uuid", "original-os" }, .{ "data_uuid", "original-data" } }) |binding|
         try expect(eq(try f.str(first, binding[0]), binding[1]));

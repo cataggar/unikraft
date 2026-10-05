@@ -37,7 +37,7 @@ pub const Action = enum {
     dispose_credentials,
 
     pub fn cleanup(self: Action) bool {
-        return @intFromEnum(self) >= @intFromEnum(Action.deallocate);
+        return @backingInt(self) >= @backingInt(Action.deallocate);
     }
     pub fn mutation(self: Action) bool {
         return switch (self) {
@@ -53,7 +53,7 @@ pub const Action = enum {
         };
     }
 };
-pub const action_count = @typeInfo(Action).@"enum".fields.len;
+pub const action_count = @typeInfo(Action).@"enum".field_names.len;
 pub const worker_output_reservation = 2 * (action_count + 4) * (max_operation_result + 1024);
 
 pub const Debit = struct {
@@ -171,8 +171,8 @@ pub const Input = struct {
             now >= approved.expires_at or approved.expires_at - approved.not_before > 3600 or
             approved.cleanup_expires_at <= approved.expires_at or approved.cleanup_expires_at - approved.expires_at > 1200)
             return error.AuthorityUnavailable;
-        inline for (std.meta.fields(Approvals)) |field| try nonzero(@field(approved.proofs, field.name));
-        inline for (std.meta.fields(NativeBinding)) |field| try nonzero(@field(self.preparation.binding, field.name));
+        inline for (@typeInfo(Approvals).@"struct".field_names) |field| try nonzero(@field(approved.proofs, field));
+        inline for (@typeInfo(NativeBinding).@"struct".field_names) |field| try nonzero(@field(self.preparation.binding, field));
         try nonzero(self.preparation.input_manifest_sha256);
         try core.private_files.absoluteFilePath(self.preparation.input_root);
         if (self.preparation.files.len < 6 or self.preparation.files.len > 131) return error.InvalidPreparation;
@@ -240,8 +240,8 @@ pub fn parse(comptime T: type, allocator: std.mem.Allocator, bytes: []const u8) 
     if (@typeInfo(T) == .@"struct") {
         const value = document.value();
         if (value != .object) return error.ExpectedObject;
-        inline for (std.meta.fields(T)) |field| {
-            if (!value.object.contains(field.name)) return error.MissingField;
+        inline for (@typeInfo(T).@"struct".field_names) |field| {
+            if (!value.object.contains(field)) return error.MissingField;
         }
     }
     return std.json.parseFromSlice(T, allocator, bytes, .{ .allocate = .alloc_always, .ignore_unknown_fields = false, .duplicate_field_behavior = .@"error" });

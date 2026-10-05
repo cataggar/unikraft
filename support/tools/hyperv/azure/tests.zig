@@ -36,7 +36,7 @@ const vm_url = s.arm_host ++ vm_path ++ "?api-version=2025-11-01";
 const disk_path = group_path ++ "/providers/Microsoft.Compute/disks/synthetic-disk";
 const disk_url = s.arm_host ++ disk_path ++ "?api-version=2025-01-02";
 const disk_operation_path = "/subscriptions/" ++ sub ++ "/providers/Microsoft.Compute/locations/northeurope/DiskOperations/" ++ operation_uuid;
-const disk_operation_context = "SYNTHETIC_PRIVATE%2b%2F%3d" ++ "a" ** (2956 - "SYNTHETIC_PRIVATE%2b%2F%3d".len);
+const disk_operation_context = "SYNTHETIC_PRIVATE%2b%2F%3d" ++ &@as([(2956 - "SYNTHETIC_PRIVATE%2b%2F%3d".len):0]u8, @splat('a'));
 const disk_operation_query = "?p=SYNTHETIC_PRIVATE%2bstate%2Fvalue%3d&api-version=2025-01-02&t=638000000000000000&c=" ++ disk_operation_context ++ "&s=SYNTHETIC_PRIVATE+state/==&h=SYNTHETIC_PRIVATE%2Bsignature%2f%3D";
 const disk_status_url = s.arm_host ++ disk_operation_path ++ disk_operation_query;
 const disk_location_url = disk_status_url ++ "&monitor=true";
@@ -66,7 +66,7 @@ test "persistence fixed network uses pinned create readback and rejects altered 
             .vnet => "\"addressSpace\":{\"addressPrefixes\":[\"10.79.0.0/29\"]},\"subnets\":[{\"name\":\"default\",\"id\":\"" ++ group_path ++ "/providers/Microsoft.Network/virtualNetworks/synthetic-vnet/subnets/default\",\"properties\":{\"addressPrefix\":\"10.79.0.0/29\",\"defaultOutboundAccess\":false,\"networkSecurityGroup\":{\"id\":\"" ++ group_path ++ "/providers/Microsoft.Network/networkSecurityGroups/synthetic-nsg\"}}}]",
             .nic => "\"enableIPForwarding\":false,\"enableAcceleratedNetworking\":false,\"ipConfigurations\":[{\"name\":\"primary\",\"properties\":{\"privateIPAllocationMethod\":\"Dynamic\",\"privateIPAddress\":\"10.79.0.4\",\"subnet\":{\"id\":\"" ++ group_path ++ "/providers/Microsoft.Network/virtualNetworks/synthetic-vnet/subnets/default\"}}}]",
         };
-        const body = try std.fmt.allocPrint(alloc, "{{\"id\":\"{s}\",\"name\":\"synthetic-{s}\",\"location\":\"northeurope\",\"tags\":{{\"uk-hyperv-run\":\"{s}\"}},\"properties\":{{\"provisioningState\":\"Succeeded\",{s}}}}}", .{ plan.path, @tagName(kind), run, properties });
+        const body = try alloc.print("{{\"id\":\"{s}\",\"name\":\"synthetic-{s}\",\"location\":\"northeurope\",\"tags\":{{\"uk-hyperv-run\":\"{s}\"}},\"properties\":{{\"provisioningState\":\"Succeeded\",{s}}}}}", .{ plan.path, @tagName(kind), run, properties });
         try models.requirePersistenceNetwork(alloc, authority, definition, try json.parse(alloc, body));
         const failed = try std.mem.replaceOwned(u8, alloc, body, "\"provisioningState\":\"Succeeded\"", "\"provisioningState\":\"Failed\"");
         try t.expectError(error.InvalidNetwork, models.requirePersistenceNetwork(alloc, authority, definition, try json.parse(alloc, failed)));
@@ -124,7 +124,7 @@ test "persistence NIC readiness and cleanup reject foreign association arrays an
         .{ .field = "loadBalancerInboundNatRules", .target = foreign ++ "loadBalancers/foreign-lb/inboundNatRules/rule" },
         .{ .field = "applicationGatewayBackendAddressPools", .target = foreign ++ "applicationGateways/foreign-gateway/backendAddressPools/pool" },
     }) |association| {
-        const nonempty = try std.fmt.allocPrint(alloc, "[{{\"id\":\"{s}\"}}]", .{association.target});
+        const nonempty = try alloc.print("[{{\"id\":\"{s}\"}}]", .{association.target});
         for ([_][]const u8{ "[]", nonempty, "[{}]", "[null]", "[\"unknown\"]", "null", "{}", "{\"id\":\"unknown\"}", "\"unknown\"", "false", "0" }) |raw| {
             try config.object.put(alloc, association.field, try json.parse(alloc, raw));
             for ([_][]const u8{ "Succeeded", "Failed" }) |state| {
@@ -218,7 +218,7 @@ test "persistence guest VHD upload geometry is MiB aligned with locally checked 
     const no_role = try std.mem.replaceOwned(u8, alloc, smaller, "4294967808", "69206528");
     const body = try std.mem.replaceOwned(u8, alloc, no_role, "\"diskSizeGB\":1", "\"diskSizeGB\":1,\"diskSizeBytes\":69206016,\"osType\":\"Linux\",\"hyperVGeneration\":\"V2\"");
     for ([_][]const u8{ "1073741824", "69206528", "69206015", "0" }) |wrong_bytes| {
-        const wrong = try std.mem.replaceOwned(u8, alloc, body, "\"diskSizeBytes\":69206016", try std.fmt.allocPrint(alloc, "\"diskSizeBytes\":{s}", .{wrong_bytes}));
+        const wrong = try std.mem.replaceOwned(u8, alloc, body, "\"diskSizeBytes\":69206016", try alloc.print("\"diskSizeBytes\":{s}", .{wrong_bytes}));
         try t.expectError(error.InvalidGeometry, models.parse(alloc, authority, plan.operation, try json.parse(alloc, wrong)));
     }
     const wrong_ceiling = try std.mem.replaceOwned(u8, alloc, body, "\"diskSizeGB\":1", "\"diskSizeGB\":2");
@@ -668,8 +668,8 @@ test "TLS requires explicit pinned nonempty trust material and no ambient fallba
     var h = try Harness.init(&.{});
     defer h.deinit();
     const clock = h.channel().budget.clock;
-    try t.expectError(error.InvalidTrust, wire.NativeRuntime.init(a, t.io, &.{}, [_]u8{0} ** 32, clock));
-    try t.expectError(error.TrustMismatch, wire.NativeRuntime.init(a, t.io, &.{"invalid-der"}, [_]u8{0} ** 32, clock));
+    try t.expectError(error.InvalidTrust, wire.NativeRuntime.init(a, t.io, &.{}, @as([32]u8, @splat(0)), clock));
+    try t.expectError(error.TrustMismatch, wire.NativeRuntime.init(a, t.io, &.{"invalid-der"}, @as([32]u8, @splat(0)), clock));
 }
 
 test "missing Standard metadata bool-as-geometry and CLI disk aliases are refused" {
@@ -767,7 +767,7 @@ test "pagination rejects sibling scope invalid version duplicate fields and cycl
         s.arm_host ++ group_path ++ "/resources?api-version=2025-11-01",
         s.arm_host ++ group_path ++ "/resources?api-version=2021-04-01&api-version=2021-04-01",
     }) |next| {
-        const body = try std.fmt.allocPrint(a, "{{\"value\":[],\"nextLink\":\"{s}\"}}", .{next});
+        const body = try a.print("{{\"value\":[],\"nextLink\":\"{s}\"}}", .{next});
         defer a.free(body);
         var h = try Harness.init(&.{.{ .url = first, .response = body }});
         defer h.deinit();
@@ -906,12 +906,12 @@ test "owned account keys remain private typed data across list and regeneration"
     var first: [88]u8 = undefined;
     var second: [88]u8 = undefined;
     var third: [88]u8 = undefined;
-    _ = std.base64.standard.Encoder.encode(&first, &([_]u8{0x11} ** 64));
-    _ = std.base64.standard.Encoder.encode(&second, &([_]u8{0x22} ** 64));
-    _ = std.base64.standard.Encoder.encode(&third, &([_]u8{0x33} ** 64));
-    const body = try std.fmt.allocPrint(a, "{{\"keys\":[{{\"keyName\":\"key1\",\"value\":\"{s}\",\"permissions\":\"FULL\"}},{{\"keyName\":\"key2\",\"value\":\"{s}\",\"permissions\":\"FULL\"}}]}}", .{ first, second });
+    _ = std.base64.standard.Encoder.encode(&first, &(@as([64]u8, @splat(0x11))));
+    _ = std.base64.standard.Encoder.encode(&second, &(@as([64]u8, @splat(0x22))));
+    _ = std.base64.standard.Encoder.encode(&third, &(@as([64]u8, @splat(0x33))));
+    const body = try a.print("{{\"keys\":[{{\"keyName\":\"key1\",\"value\":\"{s}\",\"permissions\":\"FULL\"}},{{\"keyName\":\"key2\",\"value\":\"{s}\",\"permissions\":\"FULL\"}}]}}", .{ first, second });
     defer a.free(body);
-    const changed_body = try std.fmt.allocPrint(a, "{{\"keys\":[{{\"keyName\":\"key1\",\"value\":\"{s}\",\"permissions\":\"FULL\"}},{{\"keyName\":\"key2\",\"value\":\"{s}\",\"permissions\":\"FULL\"}}]}}", .{ third, second });
+    const changed_body = try a.print("{{\"keys\":[{{\"keyName\":\"key1\",\"value\":\"{s}\",\"permissions\":\"FULL\"}},{{\"keyName\":\"key2\",\"value\":\"{s}\",\"permissions\":\"FULL\"}}]}}", .{ third, second });
     defer a.free(changed_body);
     var h = try Harness.init(&.{
         .{ .url = group_url, .response = group_json },
@@ -1278,12 +1278,12 @@ test "schedule deletion cannot treat authorization failure as absence" {
 test "key regeneration rejects unchanged selected key or changed other key" {
     var first: [88]u8 = undefined;
     var second: [88]u8 = undefined;
-    _ = std.base64.standard.Encoder.encode(&first, &([_]u8{0x11} ** 64));
-    _ = std.base64.standard.Encoder.encode(&second, &([_]u8{0x22} ** 64));
+    _ = std.base64.standard.Encoder.encode(&first, &(@as([64]u8, @splat(0x11))));
+    _ = std.base64.standard.Encoder.encode(&second, &(@as([64]u8, @splat(0x22))));
     const before: models.Keys = .{ .key1 = &first, .key2 = &second };
-    const body = try std.fmt.allocPrint(a, "{{\"keys\":[{{\"keyName\":\"key1\",\"value\":\"{s}\",\"permissions\":\"FULL\"}},{{\"keyName\":\"key2\",\"value\":\"{s}\",\"permissions\":\"FULL\"}}]}}", .{ first, second });
+    const body = try a.print("{{\"keys\":[{{\"keyName\":\"key1\",\"value\":\"{s}\",\"permissions\":\"FULL\"}},{{\"keyName\":\"key2\",\"value\":\"{s}\",\"permissions\":\"FULL\"}}]}}", .{ first, second });
     defer a.free(body);
-    const wrong_other = try std.fmt.allocPrint(a, "{{\"keys\":[{{\"keyName\":\"key1\",\"value\":\"{s}\",\"permissions\":\"FULL\"}},{{\"keyName\":\"key2\",\"value\":\"{s}\",\"permissions\":\"FULL\"}}]}}", .{ second, first });
+    const wrong_other = try a.print("{{\"keys\":[{{\"keyName\":\"key1\",\"value\":\"{s}\",\"permissions\":\"FULL\"}},{{\"keyName\":\"key2\",\"value\":\"{s}\",\"permissions\":\"FULL\"}}]}}", .{ second, first });
     defer a.free(wrong_other);
     for ([_][]const u8{ body, wrong_other }) |response| {
         var h = try Harness.init(&.{
@@ -1313,7 +1313,7 @@ test "admission refuses unavailable provider versions without further requests" 
         .require_nested_metadata = true,
         .image = .{ .kind = .image, .name = "synthetic-image" },
         .image_group = authority.group,
-        .image_response_sha256 = [_]u8{0} ** 32,
+        .image_response_sha256 = @as([32]u8, @splat(0)),
     }), .unavailable, .not_applicable, null);
 }
 
@@ -1343,7 +1343,7 @@ test "admission refuses quota exhaustion and unreviewed image bytes" {
             .require_nested_metadata = true,
             .image = .{ .kind = .image, .name = "synthetic-image" },
             .image_group = authority.group,
-            .image_response_sha256 = [_]u8{0} ** 32,
+            .image_response_sha256 = @as([32]u8, @splat(0)),
         }), .unavailable, .not_applicable, null);
     }
 }
@@ -1610,7 +1610,7 @@ test "signed DiskOperations create and revoke complete with scoped resource read
 
 test "signed DiskOperations duplicate and unknown keys fail without forwarding" {
     for ([_][]const u8{ "p", "api-version", "t", "c", "s", "h", "%68", "extra" }) |key| {
-        const bad = try std.fmt.allocPrint(a, "{s}&{s}=SYNTHETIC_PRIVATE", .{ disk_status_url, key });
+        const bad = try a.print("{s}&{s}=SYNTHETIC_PRIVATE", .{ disk_status_url, key });
         defer a.free(bad);
         var h = try Harness.init(&.{
             .{ .url = group_url, .response = group_json },
@@ -1660,7 +1660,7 @@ test "signed DiskOperations requires complete bounded opaque values and exact mo
         "?p=x&api-version=2025-01-02&t=x&c=x&s=x&h=%",
         "?p=x&api-version=2025-01-02&t=x&c=x&s=x&h=%GG",
     }) |query| {
-        const bad = try std.fmt.allocPrint(a, "{s}{s}", .{ disk_operation_path, query });
+        const bad = try a.print("{s}{s}", .{ disk_operation_path, query });
         defer a.free(bad);
         try t.expectError(error.UnsafeUrl, s.diskOperationQuery(bad, "2025-01-02", .status));
     }
@@ -1678,9 +1678,9 @@ test "signed DiskOperations opaque values remain bounded by the complete URL" {
         const value = try a.alloc(u8, 4096 - prefix.len - case.suffix.len + 1);
         defer a.free(value);
         @memset(value, 'a');
-        const exact = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ prefix, value[0 .. value.len - 1], case.suffix });
+        const exact = try a.print("{s}{s}{s}", .{ prefix, value[0 .. value.len - 1], case.suffix });
         defer a.free(exact);
-        const over = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ prefix, value, case.suffix });
+        const over = try a.print("{s}{s}{s}", .{ prefix, value, case.suffix });
         defer a.free(over);
         try t.expectEqual(@as(usize, 4096), exact.len);
         try t.expectEqual(@as(usize, 4097), over.len);
@@ -1718,7 +1718,7 @@ test "boot diagnostics initial query has exact ten-minute lifetime and no JSON b
         "?api-version=2025-11-01&sasUriExpirationTimeInMinutes=10&sasUriExpirationTimeInMinutes=10",
         "?api-version=2025-11-01&sasUriExpirationTimeInMinutes=10&extra=true",
     }) |query| {
-        plan.url = try std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ s.arm_host, plan.path, query });
+        plan.url = try alloc.print("{s}{s}{s}", .{ s.arm_host, plan.path, query });
         try t.expectError(error.UnsafeUrl, plan.validateInitialUrl(alloc));
     }
     var ordinary = try ops.Plan.create(alloc, authority, .{ .get = vm_ref });

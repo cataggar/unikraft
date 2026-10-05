@@ -38,16 +38,16 @@ const RoleWire = struct {
         const scratch = arena.allocator();
         const authority = input.approved.authority;
         const account = try input.approved.resources.storage.path(scratch, authority);
-        const scope = try std.fmt.allocPrint(scratch, "{s}/blobServices/default/containers/preflight", .{account});
+        const scope = try scratch.print("{s}/blobServices/default/containers/preflight", .{account});
         var paths: [2][]const u8 = undefined;
         var urls: [2][]const u8 = undefined;
         for (&paths, &urls, [_]c.Uuid{ input.approved.resources.input_role, input.approved.resources.evidence_role }) |*path, *url, id| {
-            path.* = try std.fmt.allocPrint(scratch, "{s}/providers/Microsoft.Authorization/roleAssignments/{s}", .{ scope, id });
-            url.* = try std.fmt.allocPrint(scratch, "{s}{s}?api-version=2022-04-01", .{ pf.azure.scope.arm_host, path.* });
+            path.* = try scratch.print("{s}/providers/Microsoft.Authorization/roleAssignments/{s}", .{ scope, id });
+            url.* = try scratch.print("{s}{s}?api-version=2022-04-01", .{ pf.azure.scope.arm_host, path.* });
         }
         const group_ref: pf.azure.scope.Ref = .{ .kind = .group, .name = authority.group };
         const group_path = try group_ref.path(scratch, authority);
-        const group_url = try std.fmt.allocPrint(scratch, "{s}{s}?api-version={s}", .{ pf.azure.scope.arm_host, group_path, group_ref.kind.version() });
+        const group_url = try scratch.print("{s}{s}?api-version={s}", .{ pf.azure.scope.arm_host, group_path, group_ref.kind.version() });
         const group = try c.canonical(scratch, .{ .id = group_path, .name = authority.group, .location = authority.location, .tags = .{ .@"uk-hyperv-run" = @as([]const u8, &authority.owner_run) }, .properties = .{ .provisioningState = "Succeeded" } });
         const token: pf.azure.auth.Token = .{ .value = try pf.azure.secret.Bytes.copy(a, "synthetic-token"), .expires_on = f.now + 86400, .tenant = authority.tenant, .subscription = authority.subscription, .principal = authority.principal, .client = authority.client };
         return .{ .arena = arena, .token = token, .paths = paths, .urls = urls, .scope = scope, .group = group, .group_url = group_url };
@@ -376,14 +376,14 @@ test "review accepted and uncertain worker transfers survive subsequent credenti
         try t.expectEqual(@as(usize, if (uncertain) 1 else 4), blob.calls);
         const recovered = try pf.journal.Store.openRecovery(a, io, &lock, &fixture.input);
         try t.expectEqual(c.Phase.cleaning, recovered.state.phase);
-        const entry = recovered.state.actions[@intFromEnum(c.Action.stage_public)];
+        const entry = recovered.state.actions[@backingInt(c.Action.stage_public)];
         try t.expectEqual(pf.journal.Status.unknown, entry.status);
         try t.expectEqual(if (uncertain) pf.azure.transport.Effect.unknown else .accepted, entry.effect);
         try t.expectEqual(entry.effect, native.last.effect);
         try t.expect(recovered.state.failures.primary != null and recovered.state.failures.cleanup != null);
         if (!deletion) try t.expect(recovered.state.failures.recording != null);
         if (uncertain) try t.expectEqual(pf.core.diagnostics.Category.transport, recovered.state.failures.primary.?.category);
-        try t.expectEqual(entry.effect, (try pf.journal.Store.open(a, io, &lock, &fixture.input)).state.actions[@intFromEnum(c.Action.stage_public)].effect);
+        try t.expectEqual(entry.effect, (try pf.journal.Store.open(a, io, &lock, &fixture.input)).state.actions[@backingInt(c.Action.stage_public)].effect);
     };
 }
 

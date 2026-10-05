@@ -40,7 +40,7 @@ pub const Adapter = struct {
         defer collection.deinit();
         const r = self.input.approved.resources;
         const expected = [_]az.scope.Ref{ r.vm, r.disk, r.nic, r.nsg, r.vnet, r.storage, r.schedule };
-        var seen = [_]bool{false} ** expected.len;
+        var seen = @as([expected.len]bool, @splat(false));
         if ((!partial and collection.items.len != expected.len) or collection.items.len > expected.len) return error.InventoryMismatch;
         var hash = core.Sha256.init(.{});
         for (collection.items) |item| {
@@ -200,11 +200,11 @@ pub const Adapter = struct {
         defer arena.destroy();
         const a = arena.allocator();
         try self.client.token.require(self.input.approved.authority, self.client.channel.budget.clock.unixSecondsFn(self.client.channel.budget.clock.context), 1);
-        const url = try std.fmt.allocPrint(a, "{s}{s}?api-version={s}", .{ az.scope.arm_host, path, version });
+        const url = try a.print("{s}{s}?api-version={s}", .{ az.scope.arm_host, path, version });
         var request = sdk.http.Request.init(a, method, url);
         defer request.deinit();
         request.body = body;
-        try request.setHeader("Authorization", try std.fmt.allocPrint(a, "Bearer {s}", .{self.client.token.value.bytes}));
+        try request.setHeader("Authorization", try a.print("Bearer {s}", .{self.client.token.value.bytes}));
         try request.setHeader("Accept", "application/json");
         if (body != null) try request.setHeader("Content-Type", "application/json");
         if (method == .PUT) try request.setHeader("If-None-Match", "*");
@@ -270,13 +270,13 @@ fn rolePath(a: std.mem.Allocator, input: *const c.Input, admitted_at: u64, evide
     // Admission has already checked this container through the host contract.
     var admission = try input.validate(a, admitted_at);
     defer admission.deinit();
-    return std.fmt.allocPrint(a, "{s}/blobServices/default/containers/{s}/providers/Microsoft.Authorization/roleAssignments/{s}", .{ account, admission.container, if (evidence_role) input.approved.resources.evidence_role else input.approved.resources.input_role });
+    return a.print("{s}/blobServices/default/containers/{s}/providers/Microsoft.Authorization/roleAssignments/{s}", .{ account, admission.container, if (evidence_role) input.approved.resources.evidence_role else input.approved.resources.input_role });
 }
 fn roleProperties(a: std.mem.Allocator, input: *const c.Input, principal: c.Uuid, evidence_role: bool) ![]u8 {
     const role = if (evidence_role) "ba92f5b4-2d11-453d-a403-e96b0029c9fe" else "2a2b9908-6ea1-4ae2-8e65-a410df84e7d1";
-    const definition = try std.fmt.allocPrint(a, "/subscriptions/{s}/providers/Microsoft.Authorization/roleDefinitions/{s}", .{ input.approved.authority.subscription, role });
+    const definition = try a.print("/subscriptions/{s}/providers/Microsoft.Authorization/roleDefinitions/{s}", .{ input.approved.authority.subscription, role });
     defer a.free(definition);
-    const condition = if (evidence_role) try std.fmt.allocPrint(a, "(@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringLike 'runs/{s}/evidence/*')", .{input.approved.authority.owner_run}) else null;
+    const condition = if (evidence_role) try a.print("(@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringLike 'runs/{s}/evidence/*')", .{input.approved.authority.owner_run}) else null;
     defer if (condition) |value| a.free(value);
     return c.canonical(a, .{ .properties = .{
         .roleDefinitionId = definition,
@@ -347,11 +347,11 @@ pub fn validateNetwork(a: std.mem.Allocator, input: *const c.Input, kind: az.sco
                 for (observed) |item| if (std.mem.eql(u8, try az.models.string(item, "name"), wanted.name)) {
                     count += 1;
                     const actual = try az.models.field(item, "properties");
-                    inline for (std.meta.fields(@TypeOf(wanted.properties))) |field| {
-                        const raw = try az.models.field(actual, field.name);
-                        if (field.type == u16) {
-                            if (try core.contracts.integer(u16, raw) != @field(wanted.properties, field.name)) return error.RouteMismatch;
-                        } else if (!std.mem.eql(u8, try core.contracts.string(raw), @field(wanted.properties, field.name))) return error.RouteMismatch;
+                    inline for (@typeInfo(@TypeOf(wanted.properties)).@"struct".field_names) |field| {
+                        const raw = try az.models.field(actual, field);
+                        if (@TypeOf(@field(wanted.properties, field)) == u16) {
+                            if (try core.contracts.integer(u16, raw) != @field(wanted.properties, field)) return error.RouteMismatch;
+                        } else if (!std.mem.eql(u8, try core.contracts.string(raw), @field(wanted.properties, field))) return error.RouteMismatch;
                     }
                 };
                 if (count != 1) return error.RouteMismatch;
@@ -455,7 +455,7 @@ pub fn deploymentBody(a: std.mem.Allocator, input: *const c.Input) ![]u8 {
     try out.writer.writeByte(',');
     const shutdown = std.time.epoch.EpochSeconds{ .secs = input.approved.expires_at };
     var time: [4]u8 = undefined;
-    _ = try std.fmt.bufPrint(&time, "{d:0>2}{d:0>2}", .{ shutdown.getDaySeconds().getHoursIntoDay(), shutdown.getDaySeconds().getMinutesIntoHour() });
+    _ = try std.mem.print(&time, "{d:0>2}{d:0>2}", .{ shutdown.getDaySeconds().getHoursIntoDay(), shutdown.getDaySeconds().getMinutesIntoHour() });
     try std.json.Stringify.value(.{
         .type = "Microsoft.DevTestLab/schedules",
         .apiVersion = r.schedule.kind.version(),

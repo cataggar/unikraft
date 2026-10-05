@@ -87,7 +87,7 @@ pub fn hex(bytes: anytype) [bytes.len * 2]u8 {
 pub fn uuidText(bytes: Uuid) [36]u8 {
     const h = hex(bytes);
     var result: [36]u8 = undefined;
-    _ = std.fmt.bufPrint(&result, "{s}-{s}-{s}-{s}-{s}", .{ h[0..8], h[8..12], h[12..16], h[16..20], h[20..32] }) catch unreachable;
+    _ = std.mem.print(&result, "{s}-{s}-{s}-{s}-{s}", .{ h[0..8], h[8..12], h[12..16], h[16..20], h[20..32] }) catch unreachable;
     return result;
 }
 
@@ -298,7 +298,7 @@ pub const Command = struct {
         if (records != .array or records.array.items.len > 129) return error.InvalidArtifact;
         const artifacts = try allocator.alloc(Artifact, records.array.items.len);
         errdefer allocator.free(artifacts);
-        var roles = [_]usize{0} ** @typeInfo(Role).@"enum".fields.len;
+        var roles = @as([@typeInfo(Role).@"enum".field_names.len]usize, @splat(0));
         var infrastructure = @import("hyperv_core").Sha256.init(.{});
         infrastructure.update("uk-hyperv-host-infrastructure-v1\n");
         var total: u64 = 0;
@@ -316,12 +316,12 @@ pub const Command = struct {
             total += size;
             for (artifacts[0..index]) |prior| if (std.mem.eql(u8, prior.name, name) or std.mem.eql(u8, prior.blob, blob)) return error.DuplicateArtifact;
             artifacts[index] = .{ .role = role, .name = name, .blob = blob, .sha256 = try sha(try field(record, "sha256")), .size = size };
-            roles[@intFromEnum(role)] += 1;
+            roles[@backingInt(role)] += 1;
             if (role == .qemu or role == .ovmf_code or role == .ovmf_vars or role == .support) {
                 // Blob phase differs, but immutable local infrastructure must not.
                 var name_length: [8]u8 = undefined;
                 std.mem.writeInt(u64, &name_length, name.len, .big);
-                infrastructure.update(&.{@intFromEnum(role)});
+                infrastructure.update(&.{@backingInt(role)});
                 infrastructure.update(&name_length);
                 infrastructure.update(@tagName(role));
                 infrastructure.update(name);
@@ -331,11 +331,11 @@ pub const Command = struct {
                 infrastructure.update(&number);
             }
         }
-        inline for (.{ Role.qemu, Role.ovmf_code, Role.ovmf_vars }) |role| if (roles[@intFromEnum(role)] != 1) return error.InvalidArtifact;
-        if (roles[@intFromEnum(Role.support)] > 124) return error.InvalidArtifact;
+        inline for (.{ Role.qemu, Role.ovmf_code, Role.ovmf_vars }) |role| if (roles[@backingInt(role)] != 1) return error.InvalidArtifact;
+        if (roles[@backingInt(Role.support)] > 124) return error.InvalidArtifact;
         if (phase == .public) {
-            if (roles[@intFromEnum(Role.capability_raw)] != 1 or roles[@intFromEnum(Role.raw)] != 0 or roles[@intFromEnum(Role.vhd)] != 0) return error.InvalidArtifact;
-        } else if (roles[@intFromEnum(Role.capability_raw)] != 0 or roles[@intFromEnum(Role.raw)] != 1 or roles[@intFromEnum(Role.vhd)] != 1) return error.InvalidArtifact;
+            if (roles[@backingInt(Role.capability_raw)] != 1 or roles[@backingInt(Role.raw)] != 0 or roles[@backingInt(Role.vhd)] != 0) return error.InvalidArtifact;
+        } else if (roles[@backingInt(Role.capability_raw)] != 0 or roles[@backingInt(Role.raw)] != 1 or roles[@backingInt(Role.vhd)] != 1) return error.InvalidArtifact;
         const image_hash = try sha(try field(body, "image_sha256"));
         for (artifacts) |record| {
             if (record.role == .raw or record.role == .capability_raw) {
@@ -427,5 +427,5 @@ pub fn validName(role: Role, name: []const u8) !void {
 }
 
 pub fn artifactBlob(allocator: std.mem.Allocator, run: Uuid, phase: Phase, name: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "runs/{s}/{s}/artifacts/{s}", .{ uuidText(run), @tagName(phase), name });
+    return allocator.print("runs/{s}/{s}/artifacts/{s}", .{ uuidText(run), @tagName(phase), name });
 }

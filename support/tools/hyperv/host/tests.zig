@@ -15,7 +15,7 @@ test "scope and native Ed25519 reject untrusted configuration" {
     const run = try host.core.contracts.parseUuid("01234567-89ab-4cde-8fab-0123456789ab");
     try (p.Scope{ .account = "fixture", .container = "private", .run_id = run }).validate();
     try std.testing.expectError(error.InvalidEndpoint, (p.Scope{ .account = "fixture.evil", .container = "private", .run_id = run }).validate());
-    try std.testing.expectError(error.InvalidSignature, p.verify(std.testing.allocator, "{\"body\":{},\"signature\":\"00\"}", [_]u8{0} ** 32, "uk-hyperv-host-command-v1"));
+    try std.testing.expectError(error.InvalidSignature, p.verify(std.testing.allocator, "{\"body\":{},\"signature\":\"00\"}", @as([32]u8, @splat(0)), "uk-hyperv-host-command-v1"));
 }
 
 test "image authority requires correct signature runner envelope and control allowance" {
@@ -23,7 +23,7 @@ test "image authority requires correct signature runner envelope and control all
     defer std.testing.allocator.free(bytes);
     var admitted = try f.admission();
     defer admitted.deinit();
-    try std.testing.expectError(error.InvalidSignature, p.Admission.parse(std.testing.allocator, bytes, [_]u8{1} ** 32, f.now, f.runner_hash, 256));
+    try std.testing.expectError(error.InvalidSignature, p.Admission.parse(std.testing.allocator, bytes, @as([32]u8, @splat(1)), f.now, f.runner_hash, 256));
     try std.testing.expectError(error.RunnerMismatch, p.Admission.parse(std.testing.allocator, bytes, f.key(), f.now, p.hash("wrong"), 256));
     try std.testing.expectError(error.ControlAllowanceExceeded, p.Admission.parse(std.testing.allocator, bytes, f.key(), f.now, f.runner_hash, p.max_control + 1));
     try std.testing.expectError(error.StaleCommand, p.Admission.parse(std.testing.allocator, bytes, f.key(), 2000, f.runner_hash, 256));

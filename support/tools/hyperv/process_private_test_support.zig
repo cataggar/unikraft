@@ -12,7 +12,7 @@ pub const Fixture = struct {
 
     pub fn init() !Fixture {
         try process.initialize();
-        var root = try core.private_files.Directory.open(io, options.test_root.?);
+        var root = try core.private_files.Directory.open(io, options.test_root orelse return error.TestRootRequired);
         errdefer root.close(io);
         var random: [16]u8 = undefined;
         io.random(&random);

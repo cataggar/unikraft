@@ -61,7 +61,7 @@ pub const Engine = struct {
         try store.begin(action, reservation.bytes, reservation.control);
         const outcome = self.perform(action) catch |err| {
             const failure = self.backend.failureFn(self.backend.context);
-            const entry = &store.state.actions[@intFromEnum(action)];
+            const entry = &store.state.actions[@backingInt(action)];
             entry.status = if (failure.effect == .rejected) .rejected else .unknown;
             entry.effect = if (action.mutation()) failure.effect else .not_applicable;
             const diagnostic = if (failure.diagnostic.category == .internal) local(err, action) else failure.diagnostic;
@@ -83,7 +83,7 @@ pub const Engine = struct {
             if (store.state.key_snapshot != null) return error.AttemptConsumed;
             store.state.key_snapshot = keys;
         }
-        store.state.actions[@intFromEnum(action)] = .{ .status = .complete, .proof = outcome.digest, .effect = outcome.effect };
+        store.state.actions[@backingInt(action)] = .{ .status = .complete, .proof = outcome.digest, .effect = outcome.effect };
         store.state.observed_at = self.now;
         if (action == .read_private) store.state.phase = .cleaning;
         try store.save();
@@ -117,7 +117,7 @@ pub const Engine = struct {
         store.fail(.primary, .{ .stage = .process_run, .category = .ambiguous });
         for (&store.state.actions, 0..) |*observation, i| if (observation.status == .intent) {
             observation.status = .unknown;
-            observation.effect = if ((@as(c.Action, @enumFromInt(i))).mutation()) .unknown else .not_applicable;
+            observation.effect = if ((@as(c.Action, @fromBackingInt(@intCast(i)))).mutation()) .unknown else .not_applicable;
         };
         try store.save();
     }
@@ -188,7 +188,7 @@ pub const Engine = struct {
         defer command.deinit();
         if (action == .accept_public) {
             const public = store.state.public orelse return error.MissingPublicEvidence;
-            if (store.state.actions[@intFromEnum(c.Action.read_public)].status != .complete) return error.MissingPublicEvidence;
+            if (store.state.actions[@backingInt(c.Action.read_public)].status != .complete) return error.MissingPublicEvidence;
             const acceptance = try self.signer.acceptance(store.allocator, store.input, &command, public.receipt_sha256, public.host_boot_id, self.now);
             defer store.allocator.free(acceptance);
             try store.immutable("acceptance.json", acceptance, true);
@@ -205,7 +205,7 @@ pub const Engine = struct {
         const summary = try ev.verify(store.allocator, store.input, &admission, &command, bundle, if (phase == .private) store.state.public else null);
         try j.durable(try store.lock.createImmutable(store.io, receiptName(phase), bundle.receipt));
         for (bundle.logs, 0..) |log, i| {
-            const name = try std.fmt.allocPrint(store.allocator, "boot-{d}.log", .{i + @as(usize, if (phase == .public) 0 else 2)});
+            const name = try store.allocator.print("boot-{d}.log", .{i + @as(usize, if (phase == .public) 0 else 2)});
             defer store.allocator.free(name);
             // Both the transport output and retained evidence copy are reserved.
             try j.durable(try store.lock.createImmutable(store.io, name, log));
@@ -224,7 +224,7 @@ pub const Engine = struct {
         const store = self.store;
         if (store.state.phase != .cleaning) return error.InvalidState;
         var clean = true;
-        for (store.state.actions[@intFromEnum(c.Action.deallocate)..]) |observation| {
+        for (store.state.actions[@backingInt(c.Action.deallocate)..]) |observation| {
             if (observation.status != .complete or observation.proof == null) clean = false;
         }
         if (!clean or store.state.failures.cleanup != null or store.state.failures.recording != null) {
@@ -244,7 +244,7 @@ pub const Engine = struct {
                 .admitted_at = store.state.admitted_at,
                 .public = store.state.public.?,
                 .private = store.state.private.?,
-                .group_absence = store.state.actions[@intFromEnum(c.Action.prove_group_absent)].proof.?,
+                .group_absence = store.state.actions[@backingInt(c.Action.prove_group_absent)].proof.?,
                 .scope = "platform-only",
                 .storage = "UNAVAILABLE",
             };
@@ -259,9 +259,9 @@ pub const Engine = struct {
 };
 
 pub fn next(state: j.State) ?c.Action {
-    const start: usize = if (state.phase == .cleaning) @intFromEnum(c.Action.deallocate) else 0;
-    const end: usize = if (state.phase == .cleaning) c.action_count else @intFromEnum(c.Action.deallocate);
-    for (state.actions[start..end], start..) |observation, i| if (observation.status == .fresh) return @enumFromInt(i);
+    const start: usize = if (state.phase == .cleaning) @backingInt(c.Action.deallocate) else 0;
+    const end: usize = if (state.phase == .cleaning) c.action_count else @backingInt(c.Action.deallocate);
+    for (state.actions[start..end], start..) |observation, i| if (observation.status == .fresh) return @fromBackingInt(@intCast(i));
     return null;
 }
 pub fn terminal(phase: c.Phase) bool {
@@ -270,8 +270,8 @@ pub fn terminal(phase: c.Phase) bool {
 pub fn requirePublic(state: j.State) !void {
     const public = state.public orelse return error.PrematurePrivateTransfer;
     if (public.count != 2 or public.phase != .public or public.kind != state.kind or state.acceptance_sha256 == null or
-        state.actions[@intFromEnum(c.Action.accept_public)].status != .complete or
-        state.actions[@intFromEnum(c.Action.read_public)].status != .complete) return error.PrematurePrivateTransfer;
+        state.actions[@backingInt(c.Action.accept_public)].status != .complete or
+        state.actions[@backingInt(c.Action.read_public)].status != .complete) return error.PrematurePrivateTransfer;
 }
 pub fn commandName(phase: p.Phase) []const u8 {
     return if (phase == .public) "public-command.json" else "private-command.json";

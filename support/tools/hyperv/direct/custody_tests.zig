@@ -49,11 +49,11 @@ fn sampleScope(mode: custody.SerialMode) custody.Scope {
         .cleanup_seconds = 60,
         .operation_seconds = 10,
         .poll_seconds = 1,
-        .os_vhd = .{ .path = "/synthetic/os.vhd", .size = 1049088, .sha256 = "a" ** 64 },
-        .seed_raw = .{ .path = "/synthetic/seed.raw", .size = 4294967296, .sha256 = "b" ** 64 },
-        .seed_vhd = .{ .path = "/synthetic/seed.vhd", .size = 4294967808, .sha256 = "c" ** 64 },
-        .manifest = .{ .path = "/synthetic/manifest.json", .size = 16, .sha256 = "d" ** 64 },
-        .config = .{ .path = "/synthetic/config", .size = 16, .sha256 = "e" ** 64 },
+        .os_vhd = .{ .path = "/synthetic/os.vhd", .size = 1049088, .sha256 = &@as([64:0]u8, @splat('a')) },
+        .seed_raw = .{ .path = "/synthetic/seed.raw", .size = 4294967296, .sha256 = &@as([64:0]u8, @splat('b')) },
+        .seed_vhd = .{ .path = "/synthetic/seed.vhd", .size = 4294967808, .sha256 = &@as([64:0]u8, @splat('c')) },
+        .manifest = .{ .path = "/synthetic/manifest.json", .size = 16, .sha256 = &@as([64:0]u8, @splat('d')) },
+        .config = .{ .path = "/synthetic/config", .size = 16, .sha256 = &@as([64:0]u8, @splat('e')) },
     };
 }
 
@@ -71,7 +71,7 @@ const Fixture = struct {
         io.random(&random);
         const name = std.fmt.bytesToHex(random, .lower);
         try root.dir.createDir(io, &name, .fromMode(0o700));
-        const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ root_path, name });
+        const path = try a.print("{s}/{s}", .{ root_path, name });
         errdefer a.free(path);
         const directory = try files.Directory.open(io, path);
         errdefer directory.close(io);
@@ -87,13 +87,13 @@ const Fixture = struct {
     }
 
     fn join(self: Fixture, name: []const u8) ![]u8 {
-        return std.fmt.allocPrint(a, "{s}/{s}", .{ self.path, name });
+        return a.print("{s}/{s}", .{ self.path, name });
     }
 
     fn store(self: Fixture, name: []const u8, scope: custody.Scope) !custody.Store {
         const bytes = try custody.encode(a, scope);
         defer a.free(bytes);
-        const original = try std.fmt.allocPrint(a, " \n{s} \n", .{bytes});
+        const original = try a.print(" \n{s} \n", .{bytes});
         defer a.free(original);
         try write(self.directory, "source.json", original);
         return self.fromSource(name);
@@ -151,7 +151,7 @@ const first_raw = "UK_HYPERV_PLATFORM_READY\n" ++
     "UK_HYPERV_PERSISTENCE_IO:1:1:11111111111111111111111111111111:5:3:receipt-verified\n" ++
     "UK_HYPERV_PERSISTENCE_BOOT1_COMPLETE:11111111111111111111111111111111\n" ++
     "HYPERV_PERSISTENCE FINAL PASS rc=0\nmain returned 0\n";
-const padded_raw = first_raw ++ "\x00" ** 464;
+const padded_raw = first_raw ++ &@as([464:0]u8, @splat('\x00'));
 const second_raw = "UK_HYPERV_PLATFORM_READY\n" ++
     "HYPERV_PERSISTENCE START PASS run=11111111111111111111111111111111 address=0:0:7 sectors=8388608 sector_size=512\n" ++
     "HYPERV_PERSISTENCE SELECT PASS id=1 controller=1 state=2\n" ++
@@ -241,7 +241,7 @@ test "fresh scope is copied byte for byte and the exact three ledger claims are 
     try store.requireConsumed();
     try expectDirectory(fixture, "ledger/attempt-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
     try expectDirectory(fixture, "ledger/11111111111111111111111111111111-22222222222222222222222222222222");
-    try expectDirectory(fixture, "ledger/sha256-" ++ "c" ** 64);
+    try expectDirectory(fixture, "ledger/sha256-" ++ &@as([64:0]u8, @splat('c')));
     const consumed_path = try fixture.join("ledger/11111111111111111111111111111111-22222222222222222222222222222222");
     defer a.free(consumed_path);
     const consumed_dir = try files.Directory.open(io, consumed_path);
@@ -259,7 +259,7 @@ test "immutable collisions at each ledger identity never roll back earlier reser
         const names = [_][]const u8{
             "attempt-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             "11111111111111111111111111111111-22222222222222222222222222222222",
-            "sha256-" ++ "c" ** 64,
+            "sha256-" ++ &@as([64:0]u8, @splat('c')),
         };
         const ledger_path = try fixture.join("ledger");
         defer a.free(ledger_path);
@@ -271,7 +271,7 @@ test "immutable collisions at each ledger identity never roll back earlier reser
         try t.expectError(error.PathAlreadyExists, store.consume());
         try t.expect(!store.consumed and !store.healthy);
         for (names[0 .. collision + 1]) |name| {
-            const path = try std.fmt.allocPrint(a, "ledger/{s}", .{name});
+            const path = try a.print("ledger/{s}", .{name});
             defer a.free(path);
             try expectDirectory(fixture, path);
         }
@@ -321,7 +321,7 @@ test "immutable commit outcomes require durable status and all independent failu
         };
         try t.expectError(expected, store.consume());
         try t.expectError(error.CustodyPoisoned, store.requireConsumed());
-        try expectDirectory(fixture, "ledger/sha256-" ++ "c" ** 64);
+        try expectDirectory(fixture, "ledger/sha256-" ++ &@as([64:0]u8, @splat('c')));
         const path = try fixture.join("ledger/11111111111111111111111111111111-22222222222222222222222222222222");
         defer a.free(path);
         const directory = try files.Directory.open(io, path);
@@ -344,11 +344,11 @@ test "append-only events preserve hyphenated phase and reserved boots and refuse
     try t.expectError(error.FileChanged, store.event(.@"boot1-evidence-complete"));
     try t.expectEqual(.@"boot1-evidence-complete", store.phase);
     try t.expect(!store.healthy);
-    inline for (std.meta.fields(custody.Phase)) |field| {
-        const bytes = try custody.encode(a, custody.Event{ .phase = @enumFromInt(field.value), .reserved_boots = 2 });
+    inline for (@typeInfo(custody.Phase).@"enum".field_names) |field| {
+        const bytes = try custody.encode(a, custody.Event{ .phase = @field(custody.Phase, field), .reserved_boots = 2 });
         defer a.free(bytes);
-        try t.expect(std.mem.indexOf(u8, bytes, field.name) != null);
-        try t.expect(std.mem.indexOfScalar(u8, field.name, '_') == null);
+        try t.expect(std.mem.indexOf(u8, bytes, field) != null);
+        try t.expect(std.mem.indexOfScalar(u8, field, '_') == null);
     }
 }
 
@@ -403,7 +403,7 @@ test "all serial modes retain the complete Boot1 raw bytes and exact capture sch
         try t.expectEqualStrings(&store.scope_pin.hex(), capture.scope_sha256);
         try t.expectEqualStrings(capture.serial_sha256, capture.original_boot1_sha256);
         try t.expectEqualStrings("", capture.boot2_admission_sha256);
-        inline for (std.meta.fields(custody.Identities)) |field| try t.expectEqualStrings(@field(ids, field.name), @field(capture, field.name));
+        inline for (@typeInfo(custody.Identities).@"struct".field_names) |field| try t.expectEqualStrings(@field(ids, field), @field(capture, field));
     }
 }
 
@@ -435,7 +435,7 @@ test "Boot2 admission and capture bind all retained observations and original ca
     try t.expectEqualStrings(&hex("{\"os\":\"retained\"}"), admission.retained_os_sha256);
     try t.expectEqualStrings(&hex("{\"data\":\"retained\"}"), admission.retained_data_sha256);
     try t.expectEqualStrings(&hex("{\"power\":\"deallocated\"}"), admission.deallocated_power_sha256);
-    inline for (std.meta.fields(custody.Identities)) |field| try t.expectEqualStrings(@field(ids, field.name), @field(admission, field.name));
+    inline for (@typeInfo(custody.Identities).@"struct".field_names) |field| try t.expectEqualStrings(@field(ids, field), @field(admission, field));
     var capture_bytes = try store.directory.readSensitive(io, a, "boot2-capture.json", 65536, null);
     defer capture_bytes.deinit();
     const capture = try direct.parse(custody.CaptureRecord, a, capture_bytes.bytes());
@@ -659,7 +659,7 @@ test "input and tool references retain the artifact versus private policy distin
     defer file.close(io);
     try file.setPermissions(io, .fromMode(0o755));
     try t.expectEqual(.SUCCESS, linux.errno(linux.linkat(fixture.directory.dir.handle, "artifact", fixture.directory.dir.handle, "artifact-hard", 0)));
-    const item: custody.Artifact = .{ .path = path, .size = 7, .sha256 = "a" ** 64 };
+    const item: custody.Artifact = .{ .path = path, .size = 7, .sha256 = &@as([64:0]u8, @splat('a')) };
     const artifact = try custody.Reference.artifact(io, item, .artifact);
     try t.expectError(error.UnsafeFile, custody.Reference.tool(io, path));
     try write(fixture.directory, "tool", "fixture");
@@ -923,7 +923,7 @@ test "full input references and execution tools detect size metadata and permiss
     defer a.free(tool_path);
     var scope = sampleScope(.per_boot);
     inline for (.{ "os_vhd", "seed_raw", "seed_vhd", "manifest", "config" }) |field|
-        @field(scope, field) = .{ .path = input_path, .size = 7, .sha256 = "a" ** 64 };
+        @field(scope, field) = .{ .path = input_path, .size = 7, .sha256 = &@as([64:0]u8, @splat('a')) };
     const references = try custody.References.capture(io, scope, tool_path, tool_path, tool_path);
     try references.verify(io);
     try write(fixture.directory, "small-input", "changed-size");
@@ -998,7 +998,7 @@ test "primary raw capture admission scope and hash refusals preserve independent
                     const name = if (which == 1) "boot1-capture.json" else "boot2-admission.json";
                     var original = try store.directory.readSensitive(io, a, name, 65536, null);
                     defer original.deinit();
-                    const changed = try std.fmt.allocPrint(a, "{s} \n", .{original.bytes()});
+                    const changed = try a.print("{s} \n", .{original.bytes()});
                     defer a.free(changed);
                     try write(store.directory, name, changed);
                 },
@@ -1021,8 +1021,8 @@ test "primary raw capture admission scope and hash refusals preserve independent
             try store.event(.@"cleanup-intent");
             try store.event(.@"cleanup-delete-intent");
             // A cleanup append is not a reset or authorization for any primary phase.
-            inline for (std.meta.fields(custody.Phase)) |field| {
-                const phase: custody.Phase = @enumFromInt(field.value);
+            inline for (@typeInfo(custody.Phase).@"enum".field_names) |field| {
+                const phase = @field(custody.Phase, field);
                 if (phase != .@"cleanup-intent" and phase != .@"cleanup-delete-intent")
                     try t.expectError(error.CustodyPoisoned, store.event(phase));
             }
@@ -1033,8 +1033,8 @@ test "primary raw capture admission scope and hash refusals preserve independent
             try t.expectEqual(@as(u8, 2), store.reserved_boots);
             try t.expectEqualStrings("fixture", store.scope.value.prefix);
             try t.expectEqualStrings(sampleScope(mode).attempt_id, store.scope.value.attempt_id);
-            inline for (std.meta.fields(custody.Identities)) |field|
-                try t.expectEqualStrings(@field(ids, field.name), @field(store.identities.?, field.name));
+            inline for (@typeInfo(custody.Identities).@"struct".field_names) |field|
+                try t.expectEqualStrings(@field(ids, field), @field(store.identities.?, field));
             const primary: u8 = if (which >= 4) 17 else 1;
             const result = store.finish(failedCompletion(prior_phase, primary));
             try expectIndependentCleanup(result, primary);

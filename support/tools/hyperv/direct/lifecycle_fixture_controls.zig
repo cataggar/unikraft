@@ -280,7 +280,7 @@ fn templateControls(base: f.Context, fake: []const u8) !Counts {
     try linked.write(f.private_template, bytes);
     const linked_dir = try f.files.Directory.open(base.io, try linked.path("attempt"));
     defer linked_dir.close(base.io);
-    const template_name = try base.a.dupeZ(u8, std.fs.path.basename(f.private_template));
+    const template_name = try base.a.dupeSentinel(u8, std.fs.path.basename(f.private_template), 0);
     try f.expect(linux.errno(linux.linkat(linked_dir.dir.handle, template_name, linked_dir.dir.handle, "extra-link.json", 0)) == .SUCCESS);
     try deployment(linked, fake, try linked.path(f.private_template), false);
     try remove(linked, "attempt/extra-link.json");

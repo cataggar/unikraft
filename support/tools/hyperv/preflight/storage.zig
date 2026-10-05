@@ -34,7 +34,7 @@ pub const Adapter = struct {
             .schema = transfer.request.schema,
             .schema_version = 1,
             .action = "upload",
-            .account_url = try std.fmt.allocPrint(scratch, "https://{s}.blob.core.windows.net", .{admission.account}),
+            .account_url = try scratch.print("https://{s}.blob.core.windows.net", .{admission.account}),
             .container = admission.container,
             .files = records.items,
             .create_container = false,
@@ -175,11 +175,11 @@ pub const Adapter = struct {
         const name = @import("engine.zig").commandName(phase);
         const path = try std.fs.path.join(a, &.{ self.root, name });
         defer a.free(path);
-        const account = try std.fmt.allocPrint(a, "https://{s}.blob.core.windows.net", .{store.input.approved.resources.storage.name});
+        const account = try a.print("https://{s}.blob.core.windows.net", .{store.input.approved.resources.storage.name});
         defer a.free(account);
         var admission = try store.admission();
         defer admission.deinit();
-        const blob = try std.fmt.allocPrint(a, "runs/{s}/commands/{s}.json", .{ store.state.run_id, @tagName(phase) });
+        const blob = try a.print("runs/{s}/commands/{s}.json", .{ store.state.run_id, @tagName(phase) });
         defer a.free(blob);
         var client: transfer.Client = .{ .allocator = a, .io = store.io, .runtime = self.runtime, .budget = self.budget };
         const outcome = client.uploadBlock(.{ .account_url = account, .container = admission.container, .name = blob, .sas = sas.bytes() }, .{ .path = path, .size = bytes.len, .sha256 = p.hash(bytes) });
@@ -189,7 +189,7 @@ pub const Adapter = struct {
     pub fn fetch(self: *Adapter, phase: p.Phase, nonce: c.Uuid) !ev.Bundle {
         const store = self.store;
         const a = store.allocator;
-        const prefix = try std.fmt.allocPrint(a, "runs/{s}/evidence/{s}/{s}/", .{ store.state.run_id, @tagName(phase), nonce });
+        const prefix = try a.print("runs/{s}/evidence/{s}/{s}/", .{ store.state.run_id, @tagName(phase), nonce });
         defer a.free(prefix);
         const name = if (phase == .public) "download-public-receipt" else "download-private-receipt";
         const receipt = try self.download(prefix, "receipt.json", name, p.max_command, true);
@@ -208,9 +208,9 @@ pub const Adapter = struct {
             a.free(logs);
         }
         for (logs, 0..) |*log, i| {
-            const file = try std.fmt.allocPrint(a, "boot-{d}.log", .{i + @as(usize, if (phase == .public) 0 else 2)});
+            const file = try a.print("boot-{d}.log", .{i + @as(usize, if (phase == .public) 0 else 2)});
             defer a.free(file);
-            const local = try std.fmt.allocPrint(a, "download-{s}", .{file});
+            const local = try a.print("download-{s}", .{file});
             defer a.free(local);
             log.* = try self.download(prefix, file, local, p.max_serial, false);
             loaded += 1;
@@ -222,7 +222,7 @@ pub const Adapter = struct {
         const a = store.allocator;
         const blob = try std.mem.concat(a, u8, &.{ prefix, name });
         defer a.free(blob);
-        const account = try std.fmt.allocPrint(a, "https://{s}.blob.core.windows.net", .{store.input.approved.resources.storage.name});
+        const account = try a.print("https://{s}.blob.core.windows.net", .{store.input.approved.resources.storage.name});
         defer a.free(account);
         const path = try std.fs.path.join(a, &.{ self.root, local });
         defer a.free(path);
@@ -281,7 +281,7 @@ fn transferEffect(certainty: transfer.diagnostic.Certainty) az.transport.Effect 
 /// This signs native bytes, not an Azure CLI account-SAS operation.
 pub fn signSas(allocator: std.mem.Allocator, account: []const u8, base64_key: []const u8, expires_at: u64) !az.secret.Bytes {
     if (expires_at < 946684800 or expires_at > 4102444800) return error.InvalidExpiry;
-    const account_url = try std.fmt.allocPrint(allocator, "https://{s}.blob.core.windows.net", .{account});
+    const account_url = try allocator.print("https://{s}.blob.core.windows.net", .{account});
     defer allocator.free(account_url);
     if (!transfer.request.validAccount(account_url)) return error.InvalidAccount;
     var decoded: [64]u8 = undefined;
@@ -293,8 +293,8 @@ pub fn signSas(allocator: std.mem.Allocator, account: []const u8, base64_key: []
     const month = year.calculateMonthDay();
     const day = epoch.getDaySeconds();
     var expiry_buffer: [20]u8 = undefined;
-    const expiry = try std.fmt.bufPrint(&expiry_buffer, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{ year.year, @intFromEnum(month.month), @as(u8, month.day_index) + 1, day.getHoursIntoDay(), day.getMinutesIntoHour(), day.getSecondsIntoMinute() });
-    const message = try std.fmt.allocPrint(allocator, "{s}\nrcw\nb\nsco\n\n{s}\n\nhttps\n2024-11-04\n\n", .{ account, expiry });
+    const expiry = try std.mem.print(&expiry_buffer, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{ year.year, @backingInt(month.month), @as(u8, month.day_index) + 1, day.getHoursIntoDay(), day.getMinutesIntoHour(), day.getSecondsIntoMinute() });
+    const message = try allocator.print("{s}\nrcw\nb\nsco\n\n{s}\n\nhttps\n2024-11-04\n\n", .{ account, expiry });
     defer allocator.free(message);
     var signature: [32]u8 = undefined;
     defer std.crypto.secureZero(u8, &signature);

@@ -60,7 +60,7 @@ test "native SDK wire has one identity Accept-Encoding for ARM and credential ch
             var serving = try t.io.concurrent(Capture.run, .{&capture});
             defer serving.cancel(t.io);
 
-            const url = try std.fmt.allocPrint(t.allocator, "http://127.0.0.1:{d}" ++ request_target, .{server.socket.address.getPort()});
+            const url = try t.allocator.print("http://127.0.0.1:{d}" ++ request_target, .{server.socket.address.getPort()});
             defer t.allocator.free(url);
             var native = sdk.http.StdHttpTransport.init(t.allocator, t.io);
             defer native.deinit();

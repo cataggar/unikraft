@@ -180,7 +180,7 @@ test "inventory allowlist folds only types and IDs, not resource names or tags" 
         .{ "Microsoft.Network/networkSecurityGroups", "nsg" },
         .{ "Microsoft.Network/virtualNetworks", "vnet" },
     }) |row| {
-        const source = try std.fmt.allocPrint(a, "[{{\"id\":\"{s}/providers/{s}/fixture-direct-{s}\",\"name\":\"fixture-direct-{s}\",\"type\":\"{s}\",{s}}}]", .{ f.group_id, row[0], row[1], row[1], row[0], f.tags });
+        const source = try a.print("[{{\"id\":\"{s}/providers/{s}/fixture-direct-{s}\",\"name\":\"fixture-direct-{s}\",\"type\":\"{s}\",{s}}}]", .{ f.group_id, row[0], row[1], row[1], row[0], f.tags });
         defer a.free(source);
         try check(.inventory, source);
         try changed(.inventory, source, "Microsoft.", "mICROSOFT.", null);
@@ -365,7 +365,7 @@ test "grant uppercase lowercase alternate domain ports and exact private shape" 
         "{\"accessSAS\":\"secret\",\"accessSas\":\"secret\"}", "{\"accessSAS\":\"secret\",\"unexpected\":true}", "{\"accesssas\":\"secret\"}", "{\"AccessSAS\":\"secret\"}",
     }) |source| try t.expectError(error.InvalidGrantShape, o.Grant.parse(a, .{ .complete = source }));
     for ([_][]const u8{ "null", "1", "true", "[]", "{}" }) |value| {
-        const source = try std.fmt.allocPrint(a, "{{\"accessSAS\":{s}}}", .{value});
+        const source = try a.print("{{\"accessSAS\":{s}}}", .{value});
         defer a.free(source);
         try t.expectError(error.InvalidGrantValue, o.Grant.parse(a, .{ .complete = source }));
     }
@@ -433,7 +433,7 @@ test "grant URL narrow hosts, domain boundary, optional ports and nonempty path 
 
 test "grant retains native private-JSON 4096-byte string and 65536-byte document boundaries" {
     const prefix = "https://fixture.blob.core.windows.net/p?q=";
-    const url = prefix ++ "x" ** (4096 - prefix.len);
+    const url = prefix ++ &@as([(4096 - prefix.len):0]u8, @splat('x'));
     const source = try grantJson(a, url);
     defer a.free(source);
     const grant = try o.Grant.parse(a, .{ .complete = source });
@@ -508,10 +508,13 @@ test "ARM parsing keeps arbitrary extra numeric fields but rejects duplicate or 
     defer a.free(oversized);
     @memset(oversized, ' ');
     try t.expectError(error.InputTooLarge, parse(oversized));
-    const depth = "[" ** 33 ++ "0" ++ "]" ** 33;
+    const depth = &@as([33:0]u8, @splat('[')) ++ "0" ++ &@as([33:0]u8, @splat(']'));
     try t.expectError(error.TooDeep, parse(depth));
-    try t.expectError(error.TooManyItems, parse("[0" ++ ",0" ** 4096 ++ "]"));
-    try t.expectError(error.TooManyTokens, parse("[" ++ ("[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]," ** 4095) ++ "[]]"));
+    const items: [4096][2]u8 = @splat(",0".*);
+    try t.expectError(error.TooManyItems, parse("[0" ++ @as(*const [8192]u8, @ptrCast(&items)).* ++ "]"));
+    const item = "[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],";
+    const nested: [4095][item.len]u8 = @splat(item.*);
+    try t.expectError(error.TooManyTokens, parse("[" ++ @as(*const [4095 * item.len]u8, @ptrCast(&nested)).* ++ "[]]"));
     const boundary = try a.alloc(u8, o.maximum_capture_bytes);
     defer a.free(boundary);
     @memset(boundary, 'x');
@@ -520,7 +523,7 @@ test "ARM parsing keeps arbitrary extra numeric fields but rejects duplicate or 
     const maximum = try o.Diagnostics.decode(a, .{ .complete = boundary }, .primary);
     defer maximum.deinit();
     try t.expectEqual(o.maximum_capture_bytes - 2, (try maximum.evidenceBytes()).len);
-    const large_grant = try grantJson(a, "https://fixture.blob.core.windows.net/p?q=" ++ "x" ** 4096);
+    const large_grant = try grantJson(a, "https://fixture.blob.core.windows.net/p?q=" ++ &@as([4096:0]u8, @splat('x')));
     defer a.free(large_grant);
     try t.expectError(error.ValueTooLong, o.Grant.parse(a, .{ .complete = large_grant }));
 }
@@ -619,7 +622,7 @@ const PrivateFixture = struct {
         var random: [16]u8 = undefined;
         io.random(&random);
         const name = std.fmt.bytesToHex(random, .lower);
-        const relative = try std.fmt.allocPrint(a, ".d/observations-{s}", .{name});
+        const relative = try a.print(".d/observations-{s}", .{name});
         errdefer a.free(relative);
         try std.Io.Dir.cwd().createDir(io, relative, .fromMode(0o700));
         errdefer std.Io.Dir.cwd().deleteDir(io, relative) catch {};

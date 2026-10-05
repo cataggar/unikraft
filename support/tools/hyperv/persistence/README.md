@@ -9,7 +9,7 @@ and unchanged. `evidence.EvidenceInput` / `evidence.parseWorkload` expose only
 the pure serial identity/geometry parser for the direct lane; they carry no authority
 and cannot turn a synthetic or nested receipt into accepted persistence.
 
-This standalone Zig 0.16 package implements the #89 two-boot execution and
+This standalone Zig 0.17.0 package implements the #89 two-boot execution and
 cleanup state machine. It does **not** constitute real boot, upload, or
 persistence acceptance. No production preparation/COMPLETED-preflight loader
 or approved credential/route selection is provided by this package.
@@ -271,16 +271,28 @@ TMPDIR and Zig/XDG caches beneath `.d/zig-migration-persistence`. With an
 existing owner-only absolute fixture directory:
 
 ```text
-zig build --build-file support/tools/hyperv/persistence/build.zig \
+ZIG_GLOBAL_CACHE_DIR=SCRATCH/global-cache zig build --build-file support/tools/hyperv/persistence/build.zig \
   --system SCRATCH/restore/zig-pkg \
-  --cache-dir SCRATCH/cache --global-cache-dir SCRATCH/global-cache \
+  --cache-dir SCRATCH/cache \
   --prefix SCRATCH/outputs/debug -Dtest-root=SCRATCH/fixtures \
   -j2 test test-arm install
 ```
 
-Repeat with `-Doptimize=ReleaseSafe` and a distinct output prefix. No new SDK
+Repeat with `-Doptimize=safe` and a distinct output prefix. No new SDK
 surface, dependency, tool installation, root build, CI, producer-pin or
 legacy-controller change is required by this package.
+
+Zig 0.17 separates build configuration from the maker process. The configured
+build record keeps its exact v1 fields, but maker-global test seed, compiler-rt
+optimization and debug-incremental settings are not exposed to the configurer
+and are recorded as `null`, never as an observed false/default. Build-ID and
+incremental fields describe explicit `Compile` settings only; maker-global
+defaults are not claimed. The existing null semantics, observed parent builtin
+record, full source envelopes and ELF/proof revalidation remain unchanged.
+Strip-equivalence, strip-proof and build-evidence test steps require an explicit
+private `-Dtest-root`; none defaults to the source tree or build cache. Generated
+0.17 artifact option paths are resolved against the observed build cwd before
+private fixture execution, retaining absolute-path and no-follow checks.
 
 ### Default-off exact parent build evidence
 
@@ -542,13 +554,14 @@ mkdir -p "${TRIAL_ROOT:?}"/{home,tmp,global}
 chmod 700 "$TRIAL_ROOT"
 export HOME="$TRIAL_ROOT/home" TMPDIR="$TRIAL_ROOT/tmp"
 export XDG_CACHE_HOME="$TRIAL_ROOT/global"
+export ZIG_GLOBAL_CACHE_DIR="$TRIAL_ROOT/global"
 filters=(
   'real native leaf workers deliver bound private results and exact serial model'
   'partial native page checkpoint survives killed delivery without claiming full upload'
   'cleanup recovery requires bound parent reaping proof and never replays mutations'
   'failed native creation delivery retains UUID and refuses cleanup replacement'
 )
-for mode in Debug ReleaseSafe; do
+for mode in debug safe; do
   for timing in false true; do
     index=0
     for filter in "${filters[@]}"; do
@@ -558,7 +571,7 @@ for mode in Debug ReleaseSafe; do
       status=0
       "$ZIG" build --build-file support/tools/hyperv/persistence/build.zig \
         --system "${PERSISTENCE_PACKAGES:?}" \
-        --cache-dir "$run/cache" --global-cache-dir "$TRIAL_ROOT/global" \
+        --cache-dir "$run/cache" \
         --prefix "$run/out" -Dtest-root="$run/fixtures" \
         -Dtest-filter="$filter" -Doptimize="$mode" \
         -Dpersistence-timing="$timing" -j2 test --summary all \
@@ -678,10 +691,11 @@ remains the same 34 cases.
 
 ```bash
 umask 077
+export ZIG_GLOBAL_CACHE_DIR="$SCRATCH/global"
 "$ZIG" build --build-file support/tools/hyperv/persistence/build.zig \
   --system "$PERSISTENCE_PACKAGES" --cache-dir "$SCRATCH/cache" \
-  --global-cache-dir "$SCRATCH/global" --prefix "$SCRATCH/out" \
-  -Dtest-root="$SCRATCH/fixtures" -Doptimize=Debug \
+  --prefix "$SCRATCH/out" \
+  -Dtest-root="$SCRATCH/fixtures" -Doptimize=debug \
   -Dstrip-fixture-debug=true -Dfixture-objcopy="$LLVM_OBJCOPY" \
   -j2 test-strip-equivalence test-strip-proof --summary all
 bash support/tools/hyperv/persistence/fixture-strip-build-tests.sh \
@@ -700,7 +714,7 @@ run remains independent of the rejected candidate.
 
 #### Parent-owned native x64 qualification recipe
 
-After independent review, use the already-approved native Zig 0.16, exact
+After independent review, use the already-approved native Zig 0.17.0, exact
 persistence SDKs and pinned LLVM 22.1.8. Set the absolute variables below and a
 new private `QUALIFICATION_ROOT`; the parent separately owns VM/readiness,
 source/tool provenance and disk bindings. Choose `LAYOUT_POLICY` **before**
@@ -714,8 +728,9 @@ root="${QUALIFICATION_ROOT:?}"
 mkdir -m 700 -- "$root"
 mkdir -- "$root/home" "$root/tmp" "$root/global"
 export HOME="$root/home" TMPDIR="$root/tmp" XDG_CACHE_HOME="$root/global"
+export ZIG_GLOBAL_CACHE_DIR="$root/global"
 "${ZIG:?}" version > "$root/zig.version"
-test "$(tr -d '\n' < "$root/zig.version")" = 0.16.0
+test "$(tr -d '\n' < "$root/zig.version")" = 0.17.0
 "${LLVM_OBJCOPY:?}" --version > "$root/objcopy.version"
 awk -f support/tools/hyperv/preparation/ci-objcopy-version.awk "$root/objcopy.version"
 sha256sum -- "$LLVM_OBJCOPY" > "$root/objcopy.sha256"
@@ -732,7 +747,7 @@ filters=(
   'cleanup recovery requires bound parent reaping proof and never replays mutations'
   'failed native creation delivery retains UUID and refuses cleanup replacement'
 )
-for mode in Debug ReleaseSafe; do
+for mode in debug safe; do
   for variant in raw qualified; do
     index=0
     for filter in "${filters[@]}"; do
@@ -746,7 +761,7 @@ for mode in Debug ReleaseSafe; do
       status=0
       "$ZIG" build --build-file support/tools/hyperv/persistence/build.zig \
         --system "${PERSISTENCE_PACKAGES:?}" --cache-dir "$run/cache" \
-        --global-cache-dir "$root/global" --prefix "$run/out" \
+        --prefix "$run/out" \
         -Dtest-root="$run/fixtures" -Dtest-filter="$filter" \
         -Doptimize="$mode" -Dpersistence-timing=true "${selection[@]}" \
         -j2 test --summary all > "$run/engine.log" 2>&1 || status=$?

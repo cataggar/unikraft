@@ -1,10 +1,15 @@
 const std = @import("std");
 pub fn build(b: *std.Build) void {
-    b.cache_root.path = b.cache_root.handle.realPathFileAlloc(b.graph.io, ".", b.allocator) catch
-        @panic("cannot canonicalize the selected fixture cache");
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const test_root = b.option([]const u8, "test-root", "Existing private absolute fixture directory");
+    const build_cwd = std.Io.Dir.cwd().realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", b.allocator) catch
+        @panic("Cannot resolve the build cwd for fixture artifact paths");
+    const fixture_paths = b.createModule(.{
+        .root_source_file = b.path("../test_artifact_path.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
     const timing = b.option(bool, "persistence-timing", "Synthetic timing only (inside unchanged deadlines; never installed)") orelse false;
     const filter = b.option([]const u8, "test-filter", "Run only matching native fixture names");
     const strip_debug = b.option(bool, "strip-fixture-debug", "QUALIFICATION ONLY: verify a debug-stripped synthetic persistence worker copy") orelse false;
@@ -100,24 +105,24 @@ pub fn build(b: *std.Build) void {
     const selected_worker = if (strip_debug) stripped: {
         const strip = b.addSystemCommand(&.{ objcopy.?, "--strip-debug" });
         strip.addFileInput(.{ .cwd_relative = objcopy.? });
-        strip.addFileArg(raw_worker);
+        strip.addFileArg2(raw_worker, .{ .make_absolute = true });
         break :stripped strip.addOutputFileArg("hyperv-persistence-worker-fixture");
     } else raw_worker;
     test_options.addOptionPath("worker", selected_worker);
-    const gate_core = b.createModule(.{ .root_source_file = b.path("../core.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
+    const gate_core = b.createModule(.{ .root_source_file = b.path("../core.zig"), .target = b.graph.host, .optimize = .safe });
     if (b.graph.host.result.cpu.arch == .x86_64)
         gate_core.addAssemblyFile(b.path("../sha256_clear_upper.S"));
-    const gate_elf = b.createModule(.{ .root_source_file = b.path("../../../build/postprocess-elf.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
+    const gate_elf = b.createModule(.{ .root_source_file = b.path("../../../build/postprocess-elf.zig"), .target = b.graph.host, .optimize = .safe });
     const equivalence = b.createModule(.{
         .root_source_file = b.path("../preparation/namespace/fixture_debug_equivalence.zig"),
         .target = b.graph.host,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .imports = &.{ .{ .name = "hyperv_core", .module = gate_core }, .{ .name = "producer_elf", .module = gate_elf } },
     });
     const qualification = b.createModule(.{
         .root_source_file = b.path("fixture_strip.zig"),
         .target = b.graph.host,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .imports = &.{.{ .name = "equivalence", .module = equivalence }},
     });
     const verifier = b.addExecutable(.{
@@ -125,7 +130,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("fixture_strip_verifier.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .imports = &.{.{ .name = "qualification", .module = qualification }},
         }),
     });
@@ -133,8 +138,8 @@ pub fn build(b: *std.Build) void {
         const verify = b.addRunArtifact(verifier);
         // Cached candidates and an omitted report still require fresh reads.
         verify.has_side_effects = true;
-        verify.addFileArg(raw_worker);
-        verify.addFileArg(selected_worker);
+        verify.addFileArg2(raw_worker, .{ .make_absolute = true });
+        verify.addFileArg2(selected_worker, .{ .make_absolute = true });
         verify.addArgs(&.{ "--layout-policy", layout_policy });
         if (strip_report) |path| verify.addArgs(&.{ "--report", path });
         verify.expectExitCode(0);
@@ -149,10 +154,11 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "equivalence", .module = equivalence }},
     }) });
     const run_gate_tests = b.addRunArtifact(gate_tests);
-    run_gate_tests.setCwd(.{ .cwd_relative = test_root orelse b.cache_root.path.? });
+    if (test_root) |path| run_gate_tests.setCwd(.{ .cwd_relative = path }) else run_gate_tests.step.dependOn(&b.addFail("test-strip-equivalence requires -Dtest-root=PRIVATE_ABSOLUTE_DIRECTORY").step);
     const gate_test_step = b.step("test-strip-equivalence", "Run the existing 13 shared ELF and private-file qualification cases");
     gate_test_step.dependOn(&run_gate_tests.step);
     const proof_options = b.addOptions();
+    proof_options.addOption([]const u8, "build_cwd", build_cwd);
     proof_options.addOptionPath("raw", raw_worker);
     proof_options.addOptionPath("candidate", selected_worker);
     proof_options.addOption(bool, "qualified", strip_debug);
@@ -161,11 +167,14 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("fixture_strip_tests.zig"),
         .target = b.graph.host,
         .optimize = optimize,
-        .imports = &.{.{ .name = "qualification", .module = qualification }},
+        .imports = &.{
+            .{ .name = "qualification", .module = qualification },
+            .{ .name = "test_artifact_paths", .module = fixture_paths },
+        },
     }) });
     proof_tests.root_module.addOptions("strip_options", proof_options);
     const run_proof_tests = b.addRunArtifact(proof_tests);
-    run_proof_tests.setCwd(.{ .cwd_relative = test_root orelse b.cache_root.path.? });
+    if (test_root) |path| run_proof_tests.setCwd(.{ .cwd_relative = path }) else run_proof_tests.step.dependOn(&b.addFail("test-strip-proof requires -Dtest-root=PRIVATE_ABSOLUTE_DIRECTORY").step);
     const proof_test_step = b.step("test-strip-proof", "Test the single persistence-worker proof and explicit verifier options");
     proof_test_step.dependOn(&run_proof_tests.step);
     const tests = b.addTest(.{ .filters = if (filter) |value| &.{value} else &.{}, .root_module = b.createModule(.{
@@ -213,9 +222,10 @@ pub fn build(b: *std.Build) void {
             step.dependOn(&verify.step);
     }
     const library = b.addLibrary(.{ .name = "hyperv-persistence", .root_module = module, .linkage = .static });
-    const evidence_steps = addEvidenceTests(b, gate_core, gate_elf, qualification, optimize);
+    const evidence_steps = addEvidenceTests(b, gate_core, gate_elf, qualification, optimize, test_root);
     if (evidence_root == null) {
         const exclusion_options = b.addOptions();
+        exclusion_options.addOption([]const u8, "build_cwd", build_cwd);
         exclusion_options.addOptionPath("default_parent", tests.getEmittedBin());
         exclusion_options.addOptionPath("production_cli", cli.getEmittedBin());
         exclusion_options.addOptionPath("production_library", library.getEmittedBin());
@@ -224,11 +234,14 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("fixture_build_exclusion_tests.zig"),
             .target = b.graph.host,
             .optimize = optimize,
-            .imports = &.{.{ .name = "producer_elf", .module = gate_elf }},
+            .imports = &.{
+                .{ .name = "producer_elf", .module = gate_elf },
+                .{ .name = "test_artifact_paths", .module = fixture_paths },
+            },
         }) });
         exclusion.root_module.addOptions("exclusion_options", exclusion_options);
         const exclude = b.addRunArtifact(exclusion);
-        exclude.setCwd(.{ .cwd_relative = b.cache_root.path.? });
+        exclude.setCwd(std.Build.LazyPath.cache_root);
         b.step("test-build-evidence-exclusion", "Check actual default parent and production binaries exclude build evidence without executing fixtures").dependOn(&exclude.step);
     }
     if (evidence_root) |root| {
@@ -341,9 +354,9 @@ const QueryVersion = struct {
 fn configuredJson(b: *std.Build, compile: *std.Build.Step.Compile, graph: []const CapturedModule) []const u8 {
     const metadata = @import("fixture_parent_metadata.zig");
     const m = compile.root_module;
-    const build_id = compile.build_id orelse b.build_id;
+    const build_id = compile.build_id;
     const build_id_hex = if (build_id) |value| switch (value) {
-        .hexstring => |hex| std.fmt.allocPrint(b.allocator, "{x}", .{hex.toSlice()}) catch @panic("cannot serialize build ID"),
+        .hexstring => |hex| b.allocator.print("{x}", .{hex.toSlice()}) catch @panic("cannot serialize build ID"),
         else => @as(?[]const u8, null),
     } else null;
     const resolved = m.resolved_target.?;
@@ -367,7 +380,7 @@ fn configuredJson(b: *std.Build, compile: *std.Build.Step.Compile, graph: []cons
         .source_identity = "user_supplied_not_authenticated",
         .test_selection = "all_unfiltered_35_main_cases",
         .test_filters = compile.filters,
-        .test_run_seed = b.graph.random_seed,
+        .test_run_seed = @as(?u32, null),
         .parent_compilation_bookend = "metadata_only_baseline_and_prepare",
         .worker_compiler_bookend = "not_claimed_workers_precede_baseline",
         .module_scope = "configured_reachable_package_envelopes_not_compiler_resolved_import_embed_closure",
@@ -391,9 +404,9 @@ fn configuredJson(b: *std.Build, compile: *std.Build.Step.Compile, graph: []cons
         .resolved_target = metadata.Target{ .value = resolved.result },
         .compile = .{
             .kind = compile.kind,
-            .debug_compiler_runtime_libs = b.graph.debug_compiler_runtime_libs,
-            .incremental = b.graph.incremental,
-            .debug_incremental = b.debug_incremental,
+            .debug_compiler_runtime_libs = @as(?std.lang.Optimize, null),
+            .incremental = compile.incremental,
+            .debug_incremental = @as(?bool, null),
             .build_id_kind = if (build_id) |value| @tagName(value) else null,
             .build_id_hex = build_id_hex,
             .build_id_override = compile.build_id != null,
@@ -459,38 +472,27 @@ fn addCaptureArgs(
     graph: []const CapturedModule,
 ) void {
     run.addArgs(&.{ mode, root, commit, tree, configured });
-    if (parent) |path| run.addFileArg(path) else run.addArg("");
-    run.addFileArg(raw);
-    run.addFileArg(selected);
-    run.addFileArg(.{ .cwd_relative = b.graph.zig_exe });
-    run.addDirectoryArg(absoluteLazy(b, compile.zig_lib_dir orelse .{ .cwd_relative = b.graph.zig_lib_directory.path.? }));
-    run.addFileArg(main_options.getOutput());
-    run.addFileArg(absoluteLazy(b, compile.root_module.root_source_file.?));
-    run.addDirectoryArg(absoluteLazy(b, b.path("..")));
-    run.addDirectoryArg(absoluteLazy(b, b.path("../../../build")));
+    if (parent) |path| run.addFileArg2(path, .{ .make_absolute = true }) else run.addArg("");
+    run.addFileArg2(raw, .{ .make_absolute = true });
+    run.addFileArg2(selected, .{ .make_absolute = true });
+    run.addFileArg2(std.Build.LazyPath.zig_exe, .{ .make_absolute = true });
+    run.addDirectoryArg2(compile.zig_lib_dir orelse std.Build.LazyPath.zig_lib, .{ .make_absolute = true });
+    run.addFileArg2(main_options.getOutput(), .{ .make_absolute = true });
+    run.addFileArg2(compile.root_module.root_source_file.?, .{ .make_absolute = true });
+    run.addDirectoryArg2(b.path(".."), .{ .make_absolute = true });
+    run.addDirectoryArg2(b.path("../../../build"), .{ .make_absolute = true });
     const mode_root = std.fs.path.dirname(test_root) orelse @panic("invalid test root");
     run.addArgs(&.{ proof, b.pathJoin(&.{ mode_root, "fixtures.log" }), b.pathJoin(&.{ mode_root, "fixture-build-exit.txt" }) });
     for (graph) |item| {
         const source = item.module.root_source_file orelse @panic("evidence module requires a root source");
         run.addArg(item.name);
-        run.addFileArg(absoluteLazy(b, source));
+        run.addFileArg2(source, .{ .make_absolute = true });
         const scope = switch (source) {
             .generated => source.dirname(),
             else => if (item.module.owner == b) b.path("..") else item.module.owner.path("."),
         };
-        run.addDirectoryArg(absoluteLazy(b, scope));
+        run.addDirectoryArg2(scope, .{ .make_absolute = true });
     }
-}
-
-fn absoluteLazy(b: *std.Build, path: std.Build.LazyPath) std.Build.LazyPath {
-    // Only the private helper argv is normalized; compiler paths stay intact.
-    const absolute = switch (path) {
-        .generated => return path,
-        .src_path => |source| b.pathResolve(&.{ b.graph.cache.cwd, source.owner.build_root.path orelse ".", source.sub_path }),
-        .dependency => |source| b.pathResolve(&.{ b.graph.cache.cwd, source.dependency.builder.build_root.path orelse ".", source.sub_path }),
-        .cwd_relative => |source| b.pathResolve(&.{ b.graph.cache.cwd, source }),
-    };
-    return .{ .cwd_relative = absolute };
 }
 
 fn addEvidenceTests(
@@ -498,17 +500,18 @@ fn addEvidenceTests(
     core: *std.Build.Module,
     elf: *std.Build.Module,
     qualification: *std.Build.Module,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
+    test_root: ?[]const u8,
 ) struct { collector: *std.Build.Step.Compile, tests: [2]*std.Build.Step.Run } {
     const paths = b.createModule(.{
         .root_source_file = b.path("../../../build/zig-facade-paths.zig"),
         .target = b.graph.host,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     });
     const files = b.createModule(.{
         .root_source_file = b.path("../preparation/files.zig"),
         .target = b.graph.host,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .imports = &.{ .{ .name = "hyperv_core", .module = core }, .{ .name = "facade_paths", .module = paths } },
     });
     const imports: []const std.Build.Module.Import = &.{
@@ -522,7 +525,7 @@ fn addEvidenceTests(
         .root_module = b.createModule(.{
             .root_source_file = b.path("fixture_build_capture.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .imports = imports,
         }),
     });
@@ -536,7 +539,7 @@ fn addEvidenceTests(
             .imports = imports,
         }) });
         const run = b.addRunArtifact(tests);
-        run.setCwd(.{ .cwd_relative = b.cache_root.path.? });
+        if (test_root) |path| run.setCwd(.{ .cwd_relative = path }) else run.step.dependOn(&b.addFail("test-build-evidence requires -Dtest-root=PRIVATE_ABSOLUTE_DIRECTORY").step);
         test_run.* = run;
         evidence_test_step.dependOn(&run.step);
     }

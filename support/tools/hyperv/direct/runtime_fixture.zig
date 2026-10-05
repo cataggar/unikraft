@@ -88,7 +88,7 @@ fn spawnImmediateChild() !linux.pid_t {
 
 fn emitPid(pid: linux.pid_t) !void {
     var text: [32]u8 = undefined;
-    try emit(1, try std.fmt.bufPrint(&text, "{d}\n", .{pid}));
+    try emit(1, try std.mem.print(&text, "{d}\n", .{pid}));
 }
 
 fn createMarker(io: std.Io, name: []const u8) !void {
@@ -190,7 +190,7 @@ pub fn main(init: std.process.Init) !void {
             break;
         }
         var status: u32 = 0;
-        while (linux.errno(linux.waitpid(@intCast(intermediate), &status, 0)) == .INTR) {}
+        while (linux.errno(linux.waitpid(@intCast(intermediate), @ptrCast(&status), 0)) == .INTR) {}
         if (!linux.W.IFEXITED(status) or linux.W.EXITSTATUS(status) != 0) return error.FixtureHandshake;
         try emitPid(pid);
     } else if (std.mem.eql(u8, mode, "many-children") or
@@ -305,7 +305,7 @@ pub fn main(init: std.process.Init) !void {
             break;
         }
         var text: [32]u8 = undefined;
-        try emit(1, try std.fmt.bufPrint(&text, "{d}\n", .{child}));
+        try emit(1, try std.mem.print(&text, "{d}\n", .{child}));
     } else if (std.mem.eql(u8, mode, "escaped") or std.mem.eql(u8, mode, "tree")) {
         const child = linux.fork();
         if (linux.errno(child) != .SUCCESS) return error.ForkFailed;
@@ -317,7 +317,7 @@ pub fn main(init: std.process.Init) !void {
             }
         }
         var text: [32]u8 = undefined;
-        try emit(1, try std.fmt.bufPrint(&text, "{d}\n", .{child}));
+        try emit(1, try std.mem.print(&text, "{d}\n", .{child}));
         if (std.mem.eql(u8, mode, "escaped")) {
             // Wait until the child's group change is observable before exit.
             while (linux.getpgid(@intCast(child)) != child) sleep(10);

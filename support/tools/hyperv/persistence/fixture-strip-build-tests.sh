@@ -22,15 +22,16 @@ root="$(cd -- "$root" && pwd -P)/build-gating"
 mkdir -m 700 -- "$root"
 mkdir -- "$root/home" "$root/tmp" "$root/global" "$root/fixtures" "$root/retained"
 export HOME="$root/home" TMPDIR="$root/tmp" XDG_CACHE_HOME="$root/global"
-test "$("$zig" version)" = 0.16.0
+export ZIG_GLOBAL_CACHE_DIR="$root/global"
+test "$("$zig" version)" = 0.17.0
 "$objcopy" --version > "$root/objcopy-version.txt"
 test "$(stat -c '%s' "$root/objcopy-version.txt")" -le 4096
 awk -f "$package/../preparation/ci-objcopy-version.awk" "$root/objcopy-version.txt"
 sha256sum -- "$objcopy" > "$root/objcopy.sha256"
 common=(
   "$zig" build --build-file "$package/build.zig" --system "$packages"
-  --cache-dir "$root/cache" --global-cache-dir "$root/global" --prefix "$root/out"
-  "-Dtest-root=$root/fixtures" -Doptimize=Debug -j2 --summary all
+  --cache-dir "$root/cache" --prefix "$root/out"
+  "-Dtest-root=$root/fixtures" -Doptimize=debug -j2 --summary all
 )
 qualified=(-Dstrip-fixture-debug=true "-Dfixture-objcopy=$objcopy")
 filter="-Dtest-filter=persistence timing native malformed delivery"

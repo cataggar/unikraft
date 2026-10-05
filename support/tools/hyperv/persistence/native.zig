@@ -408,7 +408,7 @@ pub const Context = struct {
         };
         defer inventory.deinit();
         if (inventory.items.len > 7) return error.UnownedResources;
-        var seen: [7]bool = [_]bool{false} ** 7;
+        var seen: [7]bool = @as([7]bool, @splat(false));
         for (inventory.items) |item| {
             if (item != .summary) return error.InvalidInventory;
             const candidate = item.summary.id;
@@ -556,7 +556,7 @@ pub fn operationFor(a: std.mem.Allocator, job: m.Job) !aops.Operation {
     };
 }
 fn ref(a: std.mem.Allocator, input: c.Contract, kind: azure.scope.Kind, suffix: []const u8) !azure.scope.Ref {
-    return .{ .kind = kind, .name = try std.fmt.allocPrint(a, "{s}-{s}", .{ input.prefix, suffix }) };
+    return .{ .kind = kind, .name = try a.print("{s}-{s}", .{ input.prefix, suffix }) };
 }
 fn diskIdentity(a: std.mem.Allocator, job: m.Job, os: bool) !aops.DiskIdentity {
     return .{

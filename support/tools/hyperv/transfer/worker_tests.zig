@@ -25,7 +25,7 @@ const Fixture = struct {
         errdefer root.dir.deleteTree(io, &name) catch {};
         const dir = try root.dir.openDir(io, &name, .{ .follow_symlinks = false, .iterate = true });
         errdefer dir.close(io);
-        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root_path, name });
+        const path = try allocator.print("{s}/{s}", .{ root_path, name });
         errdefer allocator.free(path);
         const fixture: Fixture = .{ .root = root, .directory = .{ .dir = dir }, .name = name, .path = path };
         try fixture.put("fixture-mode", mode);
@@ -36,14 +36,14 @@ const Fixture = struct {
         try fixture.put("source", bytes);
         const digest = std.fmt.bytesToHex(core.transfer.job.hash(bytes), .lower);
         const request = if (kind == .pages)
-            try std.fmt.allocPrint(allocator, "{{\"schema\":\"unikraft.hyperv.managed-disk-page-worker\",\"schema_version\":1,\"endpoint\":\"https://fixture.blob.storage.azure.net/upload/vhd\",\"path\":\"{s}/source\",\"size\":{d},\"sha256\":\"{s}\"}}", .{ path, size, digest })
+            try allocator.print("{{\"schema\":\"unikraft.hyperv.managed-disk-page-worker\",\"schema_version\":1,\"endpoint\":\"https://fixture.blob.storage.azure.net/upload/vhd\",\"path\":\"{s}/source\",\"size\":{d},\"sha256\":\"{s}\"}}", .{ path, size, digest })
         else if (download)
-            try std.fmt.allocPrint(allocator, "{{\"schema\":\"unikraft.hyperv.private-preflight-blob-worker\",\"schema_version\":1,\"action\":\"download\",\"account_url\":\"https://fixture.blob.core.windows.net\",\"container\":\"fixture\",\"files\":[{{\"blob\":\"input\",\"path\":\"{s}/download\",\"maximum\":128}}],\"create_container\":false}}", .{path})
+            try allocator.print("{{\"schema\":\"unikraft.hyperv.private-preflight-blob-worker\",\"schema_version\":1,\"action\":\"download\",\"account_url\":\"https://fixture.blob.core.windows.net\",\"container\":\"fixture\",\"files\":[{{\"blob\":\"input\",\"path\":\"{s}/download\",\"maximum\":128}}],\"create_container\":false}}", .{path})
         else
-            try std.fmt.allocPrint(allocator, "{{\"schema\":\"unikraft.hyperv.private-preflight-blob-worker\",\"schema_version\":1,\"action\":\"upload\",\"account_url\":\"https://fixture.blob.core.windows.net\",\"container\":\"fixture\",\"files\":[{{\"blob\":\"input\",\"path\":\"{s}/source\",\"size\":{d},\"sha256\":\"{s}\"}}],\"create_container\":false}}", .{ path, size, digest });
+            try allocator.print("{{\"schema\":\"unikraft.hyperv.private-preflight-blob-worker\",\"schema_version\":1,\"action\":\"upload\",\"account_url\":\"https://fixture.blob.core.windows.net\",\"container\":\"fixture\",\"files\":[{{\"blob\":\"input\",\"path\":\"{s}/source\",\"size\":{d},\"sha256\":\"{s}\"}}],\"create_container\":false}}", .{ path, size, digest });
         defer allocator.free(request);
         try fixture.put("request.json", request);
-        const job = try std.fmt.allocPrint(allocator, "{{\"contract\":\"uk.hyperv.transfer-job\",\"schema_version\":1,\"kind\":\"{s}\",\"request\":\"request.json\",\"sas\":\"sas\",\"timeout_ms\":{d},\"cleanup_ms\":1000}}", .{ @tagName(kind), timeout_ms });
+        const job = try allocator.print("{{\"contract\":\"uk.hyperv.transfer-job\",\"schema_version\":1,\"kind\":\"{s}\",\"request\":\"request.json\",\"sas\":\"sas\",\"timeout_ms\":{d},\"cleanup_ms\":1000}}", .{ @tagName(kind), timeout_ms });
         defer allocator.free(job);
         try fixture.put("job.json", job);
         return fixture;
@@ -75,7 +75,7 @@ const Fixture = struct {
     }
 
     fn useDownload(self: Fixture) !void {
-        const request = try std.fmt.allocPrint(allocator, "{{\"schema\":\"unikraft.hyperv.private-preflight-blob-worker\",\"schema_version\":1,\"action\":\"download\",\"account_url\":\"https://fixture.blob.core.windows.net\",\"container\":\"fixture\",\"files\":[{{\"blob\":\"input\",\"path\":\"{s}/download\",\"maximum\":128}}],\"create_container\":false}}", .{self.path});
+        const request = try allocator.print("{{\"schema\":\"unikraft.hyperv.private-preflight-blob-worker\",\"schema_version\":1,\"action\":\"download\",\"account_url\":\"https://fixture.blob.core.windows.net\",\"container\":\"fixture\",\"files\":[{{\"blob\":\"input\",\"path\":\"{s}/download\",\"maximum\":128}}],\"create_container\":false}}", .{self.path});
         defer allocator.free(request);
         try self.put("request.json", request);
     }
@@ -95,7 +95,7 @@ fn mutateOne(raw: []const u8, before: []const u8, after: []const u8) ![]u8 {
 
 fn noChildren() !void {
     var status: u32 = 0;
-    try testing.expectEqual(linux.E.CHILD, linux.errno(linux.waitpid(-1, &status, linux.W.NOHANG)));
+    try testing.expectEqual(linux.E.CHILD, linux.errno(linux.waitpid(-1, @ptrCast(&status), linux.W.NOHANG)));
 }
 
 fn safeReport(report: worker.Report) !void {
@@ -115,8 +115,8 @@ fn reportContext(report: protocol.Report) protocol.Intent {
         .job_sha256 = report.job_sha256.?,
         .kind = report.kind.?,
         .plan = report.admitted_plan.?,
-        .request_sha256 = [_]u8{0} ** 32,
-        .sas_sha256 = [_]u8{0} ** 32,
+        .request_sha256 = @as([32]u8, @splat(0)),
+        .sas_sha256 = @as([32]u8, @splat(0)),
         .parent_pid = 1,
         .deadline_ns = 0,
     };
@@ -160,8 +160,8 @@ fn capturedContext(value: std.json.Value, plan: core.transfer.job.Plan) !protoco
         .job_sha256 = try core.contracts.parseSha256(try core.contracts.string(fields.get("job_sha256").?)),
         .kind = try core.contracts.enumeration(core.transfer.job.Kind, fields.get("kind").?),
         .plan = plan,
-        .request_sha256 = [_]u8{0} ** 32,
-        .sas_sha256 = [_]u8{0} ** 32,
+        .request_sha256 = @as([32]u8, @splat(0)),
+        .sas_sha256 = @as([32]u8, @splat(0)),
         .parent_pid = 1,
         .deadline_ns = 0,
     };
@@ -299,12 +299,12 @@ test "real native worker uploads downloads and reads page footer through supervi
 
 test "unavailable read-only progress remains unknown through validation and recovery" {
     const intent: protocol.Intent = .{
-        .attempt_id = [_]u8{1} ** 32,
-        .job_sha256 = [_]u8{2} ** 32,
+        .attempt_id = @as([32]u8, @splat(1)),
+        .job_sha256 = @as([32]u8, @splat(2)),
         .kind = .blob,
         .plan = .{ .bytes = 0, .download_bytes = 128, .mutations = 0, .requests = 1 },
-        .request_sha256 = [_]u8{3} ** 32,
-        .sas_sha256 = [_]u8{4} ** 32,
+        .request_sha256 = @as([32]u8, @splat(3)),
+        .sas_sha256 = @as([32]u8, @splat(4)),
         .parent_pid = 1,
         .deadline_ns = 0,
     };
@@ -448,7 +448,7 @@ test "handled uploader signals cancel and reap an admitted native worker" {
         }.send, .{ fixture.directory.dir, linux.getpid(), signal });
         defer thread.join();
         const result = fixture.run(cancellation.flag());
-        try testing.expectEqual(@as(?u8, @intCast(@intFromEnum(signal))), cancellation.signal());
+        try testing.expectEqual(@as(?u8, @intCast(@backingInt(signal))), cancellation.signal());
         try testing.expectEqual(.cancelled, result.failures.primary.?.category);
         try testing.expectEqual(@as(?bool, true), result.process_cleanup_complete);
         try testing.expectEqual(.unknown, result.side_effect);
@@ -729,7 +729,7 @@ test "sealed production CLI reexecutes its worker without a pathname or network 
     for ([_]core.transfer.job.Kind{ .blob, .pages }) |kind| {
         const fixture = try Fixture.init("pass", kind, 512, false, 5000);
         defer fixture.deinit();
-        try fixture.put("source", &([_]u8{0} ** 512));
+        try fixture.put("source", &(@as([512]u8, @splat(0))));
         try fixture.directory.dir.createDir(io, "capture", .fromMode(0o700));
         const capture_dir: core.private_files.Directory = .{
             .dir = try fixture.directory.dir.openDir(io, "capture", .{
@@ -920,10 +920,10 @@ fn rejectSingleFields(report: protocol.Report, intent: protocol.Intent, changes:
 
 test "journal phase matrix validates serial transitions rollback heads and zero-byte prefixes" {
     const intent: protocol.Intent = .{
-        .attempt_id = [_]u8{1} ** 32,
-        .job_sha256 = [_]u8{2} ** 32,
-        .request_sha256 = [_]u8{3} ** 32,
-        .sas_sha256 = [_]u8{4} ** 32,
+        .attempt_id = @as([32]u8, @splat(1)),
+        .job_sha256 = @as([32]u8, @splat(2)),
+        .request_sha256 = @as([32]u8, @splat(3)),
+        .sas_sha256 = @as([32]u8, @splat(4)),
         .deadline_ns = 1000,
         .parent_pid = 1,
         .kind = .blob,
@@ -1063,10 +1063,10 @@ test "write-ahead recording refusal rolls back unentered zero-byte and payload m
         var lock = try fixture.directory.lock(io);
         defer lock.close(io);
         const intent: protocol.Intent = .{
-            .attempt_id = [_]u8{1} ** 32,
-            .job_sha256 = [_]u8{2} ** 32,
-            .request_sha256 = [_]u8{3} ** 32,
-            .sas_sha256 = [_]u8{4} ** 32,
+            .attempt_id = @as([32]u8, @splat(1)),
+            .job_sha256 = @as([32]u8, @splat(2)),
+            .request_sha256 = @as([32]u8, @splat(3)),
+            .sas_sha256 = @as([32]u8, @splat(4)),
             .deadline_ns = 1000,
             .parent_pid = 1,
             .kind = .blob,

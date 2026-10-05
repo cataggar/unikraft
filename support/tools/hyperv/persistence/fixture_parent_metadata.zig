@@ -140,7 +140,7 @@ pub const transport align(schema.note_alignment) linksection(schema.section_name
     },
     name: [schema.note_name.len]u8 = schema.note_name.*,
     description: [std.mem.alignForward(usize, payload.len, schema.note_alignment)]u8 =
-        payload ++ [_]u8{0} ** ((schema.note_alignment - payload.len % schema.note_alignment) % schema.note_alignment),
+        payload ++ @as([((schema.note_alignment - payload.len % schema.note_alignment) % schema.note_alignment)]u8, @splat(0)),
 }{};
 
 pub fn exportSection() void {

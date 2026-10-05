@@ -138,8 +138,8 @@ pub const CandidateScope = struct {
         try hex(self.source_revision, 40);
         try hex(self.source_tree, 40);
         if (!eq(self.identity.wamr_revision, sdk)) return error.WrongSdk;
-        inline for (std.meta.fields(Identity)) |member| {
-            if (comptime !eq(member.name, "wamr_revision")) _ = try c.parseSha256(@field(self.identity, member.name));
+        inline for (@typeInfo(Identity).@"struct".field_names) |member| {
+            if (comptime !eq(member, "wamr_revision")) _ = try c.parseSha256(@field(self.identity, member));
         }
         try artifact(self.os_vhd);
         try artifact(self.bundle);
@@ -825,8 +825,8 @@ pub fn inspect(a: std.mem.Allocator, io: std.Io, scope: CandidateScope) !void {
     if (!eq(bundle.schema, "uk.wamr.local-image-handoff") or bundle.version != 1 or
         !eq(bundle.source_revision, scope.source_revision) or !eq(bundle.source_tree, scope.source_tree))
         return error.WrongSource;
-    inline for (std.meta.fields(Identity)) |member|
-        if (!eq(@field(bundle.identity, member.name), @field(scope.identity, member.name))) return error.WrongComputeIdentity;
+    inline for (@typeInfo(Identity).@"struct".field_names) |member|
+        if (!eq(@field(bundle.identity, member), @field(scope.identity, member))) return error.WrongComputeIdentity;
     if (!same(bundle.get("vhd"), scope.os_vhd)) return error.WrongImage;
     inline for (.{ .{ "runtime", "runtime_sha256" }, .{ "compiler", "compiler_sha256" }, .{ "wasm", "wasm_sha256" }, .{ "cwasm", "cwasm_sha256" }, .{ "config", "config_sha256" } }) |pair|
         if (!eq(bundle.get(pair[0]).sha256, @field(scope.identity, pair[1]))) return error.WrongComputeIdentity;
@@ -882,8 +882,8 @@ fn inspectV2(a: std.mem.Allocator, io: std.Io, scope: CandidateScope) !void {
         !sameLineage(bundle.lineage, admission.lineage) or
         !sameRun(bundle.run, admission.run))
         return error.WrongImage;
-    inline for (std.meta.fields(Identity)) |member|
-        if (!eq(@field(bundle.identity, member.name), @field(scope.identity, member.name)))
+    inline for (@typeInfo(Identity).@"struct".field_names) |member|
+        if (!eq(@field(bundle.identity, member), @field(scope.identity, member)))
             return error.WrongComputeIdentity;
 
     const transport_bytes = try read(a, io, admission.transport, 65536);
@@ -924,7 +924,7 @@ const LedgerEntry = struct {
     path: []const u8,
     kind: enum { directory, file },
     metadata: files.Snapshot,
-    sha256: [32]u8 = [_]u8{0} ** 32,
+    sha256: [32]u8 = @as([32]u8, @splat(0)),
 };
 
 fn validateLedgerDirectorySnapshot(value: files.Snapshot) !void {
@@ -978,7 +978,7 @@ fn collectLedgerState(
         const path = if (prefix_path.len == 0)
             try a.dupe(u8, entry.name)
         else
-            try std.fmt.allocPrint(a, "{s}/{s}", .{ prefix_path, entry.name });
+            try a.print("{s}/{s}", .{ prefix_path, entry.name });
         const path_file = try directory.openFile(io, entry.name, .{
             .path_only = true,
             .follow_symlinks = false,
@@ -1095,8 +1095,7 @@ pub fn ledgerMarkerBytes(
     try uuid(campaign_id);
     try uuid(ledger_id);
     _ = try c.parseSha256(initial_state_sha256);
-    return std.fmt.allocPrint(
-        a,
+    return a.print(
         "{{\"campaign_id\":\"{s}\",\"initial_state_sha256\":\"{s}\",\"ledger_id\":\"{s}\",\"migration\":\"authorized_legacy_state\",\"purpose\":\"qcow2-derived-vhd-two-boot\",\"schema\":\"uk.wamr.azure-campaign-ledger-identity\",\"state\":\"initialized\",\"version\":1}}\n",
         .{ campaign_id, initial_state_sha256, ledger_id },
     );
@@ -1206,8 +1205,7 @@ pub fn ledgerProposal(
 
 pub fn ledgerBindingBytes(a: std.mem.Allocator, binding: LedgerBinding) ![]u8 {
     try binding.validate(binding.campaign_id);
-    return std.fmt.allocPrint(
-        a,
+    return a.print(
         "{{\"campaign_id\":\"{s}\",\"directory\":{{\"device_major\":{d},\"device_minor\":{d},\"inode\":{d},\"mode\":{d},\"uid\":{d}}},\"initial_state_sha256\":\"{s}\",\"initialization_required\":{s},\"ledger_id\":\"{s}\",\"marker_sha256\":\"{s}\",\"purpose\":\"qcow2-derived-vhd-two-boot\",\"schema\":\"uk.wamr.azure-campaign-ledger-binding\",\"version\":1}}\n",
         .{
             binding.campaign_id,
@@ -1524,7 +1522,7 @@ fn verifyPlanBindings(
         return error.WrongAzureRuntime;
     try azure_runtime.verify(a, io, plan.azure_runtime);
 
-    inline for (std.meta.fields(Tools)) |member| try inspectTool(io, @field(plan.tools, member.name));
+    inline for (@typeInfo(Tools).@"struct".field_names) |member| try inspectTool(io, @field(plan.tools, member));
 }
 
 fn inspectTool(io: std.Io, item: Artifact) !void {
@@ -1578,7 +1576,7 @@ pub fn verifyBundle(a: std.mem.Allocator, io: std.Io, bundle: Bundle) !void {
     try evidenceRecords(a, io, bundle, true);
     try rawVhd(io, bundle.get("raw"), bundle.get("vhd"));
     for (bundle.boots, 0..) |boot, i| {
-        if (@intFromEnum(boot.mode) != i) return error.WrongLocalMode;
+        if (@backingInt(boot.mode) != i) return error.WrongLocalMode;
         inline for (.{ "request", "report", "compute" }) |name| try inspectArtifact(io, @field(boot, name));
         const raw = try read(a, io, boot.serial, 4 * 1024 * 1024);
         defer a.free(raw);
@@ -1619,7 +1617,7 @@ pub fn verifyBundleV2(a: std.mem.Allocator, io: std.Io, bundle: BundleV2) !void 
     try evidenceRecords(a, io, bundle, false);
     try rawVhd(io, bundle.get("raw"), bundle.get("vhd"));
     for (bundle.boots, 0..) |boot, i| {
-        if (@intFromEnum(boot.mode) != i) return error.WrongLocalMode;
+        if (@backingInt(boot.mode) != i) return error.WrongLocalMode;
         if (!eq(std.fs.path.basename(boot.serial.path), "serial"))
             return error.WrongLocalReport;
         inline for (.{ "request", "report", "compute" }) |name| {
@@ -1684,7 +1682,7 @@ fn evidenceRecords(a: std.mem.Allocator, io: std.Io, bundle: anytype, package_vh
         if (!eq(try c.string(records.object.get(filename) orelse return error.MissingField), bundle.get(name).sha256)) return error.HashMismatch;
     }
     for (bundle.boots) |boot| {
-        const filename = try std.fmt.allocPrint(a, "{s}-compute.json", .{@tagName(boot.mode)});
+        const filename = try a.print("{s}-compute.json", .{@tagName(boot.mode)});
         defer a.free(filename);
         if (!eq(try c.string(records.object.get(filename) orelse return error.MissingField), boot.compute.sha256)) return error.HashMismatch;
     }
@@ -1698,7 +1696,7 @@ fn evidenceRecords(a: std.mem.Allocator, io: std.Io, bundle: anytype, package_vh
     const runtime = try field(build_doc.value(), "runtime");
     if (!eq(try string(runtime, "wamr_revision"), sdk) or
         !eq(try string(runtime, "compiler_profile"), "unikraft-x86_64") or
-        !eq(try string(runtime, "zig_version"), "0.16.0")) return error.WrongSdk;
+        !eq(try string(runtime, "zig_version"), "0.17.0")) return error.WrongSdk;
     const wasi = try field(runtime, "minimal_wasi");
     if (wasi != .bool or wasi.bool) return error.WrongSdk;
     const runtime_files = try field(runtime, "files");
@@ -1764,7 +1762,7 @@ fn localReport(
     const request_version = try c.integer(u8, try field(request.value(), "schema_version"));
     const config = try field(request.value(), "config");
     const source = try field(config, "source");
-    const mode = @intFromEnum(boot.mode);
+    const mode = @backingInt(boot.mode);
     const mode_name = @tagName(boot.mode);
     const expected_kind = if (std.mem.startsWith(u8, mode_name, "raw-"))
         "raw_disk"
@@ -1834,10 +1832,10 @@ fn localReport(
     defer a.free(encoded);
     const checked = try parse(Result, a, encoded);
     defer checked.deinit();
-    inline for (std.meta.fields(Result)) |member| {
-        const actual = @field(checked.value, member.name);
-        const expected = @field(result, member.name);
-        if (comptime member.type == []const u8) {
+    inline for (@typeInfo(Result).@"struct".field_names) |member| {
+        const actual = @field(checked.value, member);
+        const expected = @field(result, member);
+        if (comptime @TypeOf(actual) == []const u8) {
             if (!eq(actual, expected)) return error.WrongLocalReport;
         } else if (actual != expected) return error.WrongLocalReport;
     }
@@ -2391,8 +2389,8 @@ fn same(a: Artifact, b: Artifact) bool {
     return a.size == b.size and eq(a.sha256, b.sha256) and eq(a.path, b.path);
 }
 fn sameIdentity(a: Identity, b: Identity) bool {
-    inline for (std.meta.fields(Identity)) |member|
-        if (!eq(@field(a, member.name), @field(b, member.name))) return false;
+    inline for (@typeInfo(Identity).@"struct".field_names) |member|
+        if (!eq(@field(a, member), @field(b, member))) return false;
     return true;
 }
 fn sameRun(a: RunIdentity, b: RunIdentity) bool {
@@ -2400,8 +2398,8 @@ fn sameRun(a: RunIdentity, b: RunIdentity) bool {
         eq(a.run_id, b.run_id) and eq(a.run_attempt, b.run_attempt);
 }
 fn sameLineage(a: Lineage, b: Lineage) bool {
-    inline for (std.meta.fields(Lineage)) |member|
-        if (!eq(@field(a, member.name), @field(b, member.name))) return false;
+    inline for (@typeInfo(Lineage).@"struct".field_names) |member|
+        if (!eq(@field(a, member), @field(b, member))) return false;
     return true;
 }
 
@@ -2421,8 +2419,8 @@ fn sameLedgerProposal(actual: LedgerBinding, planned: LedgerBinding) bool {
 }
 
 fn sameTools(a: Tools, b: Tools) bool {
-    inline for (std.meta.fields(Tools)) |member|
-        if (!same(@field(a, member.name), @field(b, member.name))) return false;
+    inline for (@typeInfo(Tools).@"struct".field_names) |member|
+        if (!same(@field(a, member), @field(b, member))) return false;
     return true;
 }
 fn sameAzureArtifact(a: Artifact, b: azure_runtime.Artifact) bool {
@@ -2582,13 +2580,13 @@ fn commonPlan(
     try decimal(run.run_id);
     try decimal(run.run_attempt);
     if (!eq(identity.wamr_revision, sdk)) return error.WrongSdk;
-    inline for (std.meta.fields(Identity)) |member| {
-        if (comptime !eq(member.name, "wamr_revision")) {
-            _ = try c.parseSha256(@field(identity, member.name));
+    inline for (@typeInfo(Identity).@"struct".field_names) |member| {
+        if (comptime !eq(member, "wamr_revision")) {
+            _ = try c.parseSha256(@field(identity, member));
         }
     }
-    inline for (std.meta.fields(Lineage)) |member| {
-        _ = try c.parseSha256(@field(lineage, member.name));
+    inline for (@typeInfo(Lineage).@"struct".field_names) |member| {
+        _ = try c.parseSha256(@field(lineage, member));
     }
     inline for (.{ candidate, bundle, public_bundle, transport, qcow2, os_vhd }) |item| {
         try artifact(item);
@@ -2621,8 +2619,8 @@ fn commonPlan(
         cost.repository_policy_maximum != repository_maximum_cost_microusd or
         cost.maximum_authorized > cost.repository_policy_maximum)
         return error.InvalidCostAuthorization;
-    inline for (std.meta.fields(Tools)) |member| {
-        const item = @field(tools, member.name);
+    inline for (@typeInfo(Tools).@"struct".field_names) |member| {
+        const item = @field(tools, member);
         try artifact(item);
         if (item.size == 0 or item.size > 64 * 1024 * 1024)
             return error.InvalidTool;

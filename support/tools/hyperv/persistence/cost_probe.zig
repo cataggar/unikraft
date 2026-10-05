@@ -18,7 +18,7 @@ fn mark(io: std.Io, phase: Phase, bytes: u64, checks: usize) !void {
         .phase = phase,
         .worker_bytes = bytes,
         .guard_checks = checks,
-        .cpu_model = builtin.cpu.model.name,
+        .cpu_model = builtin.target.cpu.model.name,
         .self_bytes = try measurement.selfExecutableBytes(io),
         .sample = try measurement.capture(),
     }, .{}, &writer);
@@ -58,7 +58,7 @@ pub fn main(init: std.process.Init) !void {
     const selected = try core.contracts.parseSha256(&local.hash(bytes));
     try mark(io, .selection_end, before.size, 0);
     try mark(io, .dirty_selection_begin, before.size, 0);
-    if (comptime builtin.cpu.arch == .x86_64 and builtin.cpu.hasAll(.x86, &.{ .sha, .avx2 }))
+    if (comptime builtin.target.cpu.arch == .x86_64 and builtin.target.cpu.hasAll(.x86, &.{ .sha, .avx2 }))
         asm volatile ("vpcmpeqd %%ymm0, %%ymm0, %%ymm0" ::: .{ .ymm0 = true });
     const dirty_selected = try core.contracts.parseSha256(&local.hash(bytes));
     try mark(io, .dirty_selection_end, before.size, 0);

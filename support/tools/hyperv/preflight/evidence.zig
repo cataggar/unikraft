@@ -57,7 +57,7 @@ pub fn verify(allocator: std.mem.Allocator, input: *const c.Input, admission: *c
         .phase_nonce = p.uuidText(command.phase_nonce),
         .vm_id = p.uuidText(command.vm_id),
         .host_boot_id = try uuid(value, "host_boot_id"),
-        .launches = [_]c.Uuid{[_]u8{0} ** 36} ** 4,
+        .launches = @as([4]c.Uuid, @splat(@as([36]u8, @splat(0)))),
         .count = @intCast(count),
         .host_staged = try core.contracts.integer(u64, try p.field(value, "staging_bytes_reserved_before_receipt")),
         .host_control = try core.contracts.integer(u64, try p.field(value, "control_bytes_reserved_before_receipt")),

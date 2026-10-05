@@ -64,14 +64,14 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run native read-only direct validation fixtures (no cloud or disks)");
     test_step.dependOn(&b.addRunArtifact(fixtures).step);
     const log_cli_tests = b.addSystemCommand(&.{ "python3", "-B" });
-    log_cli_tests.addFileArg(b.path("../../../apps/wamr-aot/validator/cli_test.py"));
-    log_cli_tests.addFileArg(log_cli.getEmittedBin());
+    log_cli_tests.addFileArg2(b.path("../../../apps/wamr-aot/validator/cli_test.py"), .{ .make_absolute = true });
+    log_cli_tests.addFileArg2(log_cli.getEmittedBin(), .{ .make_absolute = true });
     test_step.dependOn(&log_cli_tests.step);
 
     const fixture_tools = b.step("fixture-tools", "Install isolated native lifecycle fixture tools (no controller)");
     const fake = b.addExecutable(.{
         .name = "hyperv-direct-fixture-cli",
-        .root_module = b.createModule(.{ .root_source_file = b.path("fixture_cli.zig"), .target = target, .optimize = optimize, .imports = &imports }),
+        .root_module = b.createModule(.{ .root_source_file = b.path("fixture_cli.zig"), .target = target, .optimize = optimize, .strip = true, .imports = &imports }),
     });
     const lifecycle = b.addExecutable(.{
         .name = "hyperv-direct-lifecycle-fixtures",
@@ -103,6 +103,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("runtime_fixture.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = true,
             .imports = &.{.{ .name = "hyperv_core", .module = core }},
         }),
     });
@@ -176,7 +177,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("compute_main.zig"),
             .target = target,
             .optimize = optimize,
-            .strip = optimize != .Debug,
+            .strip = optimize != .debug,
             .imports = &imports,
         }),
     });
@@ -203,6 +204,17 @@ pub fn build(b: *std.Build) void {
         .name = "hyperv-direct-controller-fixture",
         .root_module = controllerModule(b, "controller_fixture_main.zig", target, optimize, &controller_imports),
     });
+    controller_fixture.root_module.strip = true;
+    const lifecycle_validator = b.addExecutable(.{
+        .name = "uk-hyperv-direct-validate",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = true,
+            .imports = &imports,
+        }),
+    });
     const controller_tests = b.addTest(.{
         .root_module = controllerModule(b, "controller_tests.zig", target, optimize, &runtime_imports),
     });
@@ -219,7 +231,10 @@ pub fn build(b: *std.Build) void {
             const run = b.addRunArtifact(lifecycle);
             run.has_side_effects = true;
             run.addArgs(&.{ "--root", root });
-            NativeLifecycleArgs.add(b, run, .{ controller_fixture, fake, validator });
+            for ([_]*std.Build.Step.Compile{ controller_fixture, fake, lifecycle_validator }, [_][]const u8{ "--controller", "--fake", "--validator" }) |program, flag| {
+                run.addArg(flag);
+                run.addFileArg2(program.getEmittedBin(), .{ .make_absolute = true });
+            }
             if (lifecycle_cases) |cases| run.addArgs(&.{ "--case", cases });
             native_lifecycle.dependOn(&run.step);
         }
@@ -228,43 +243,11 @@ pub fn build(b: *std.Build) void {
     }
 }
 
-const NativeLifecycleArgs = struct {
-    step: std.Build.Step,
-    run: *std.Build.Step.Run,
-    programs: [3]*std.Build.Step.Compile,
-
-    fn add(b: *std.Build, run: *std.Build.Step.Run, programs: [3]*std.Build.Step.Compile) void {
-        const args = b.allocator.create(NativeLifecycleArgs) catch @panic("OOM");
-        args.* = .{
-            .step = std.Build.Step.init(.{
-                .id = .custom,
-                .name = "Resolve absolute native fixture program paths",
-                .owner = b,
-                .makeFn = make,
-            }),
-            .run = run,
-            .programs = programs,
-        };
-        for (programs) |program| program.getEmittedBin().addStepDependencies(&args.step);
-        run.step.dependOn(&args.step);
-    }
-
-    fn make(step: *std.Build.Step, _: std.Build.Step.MakeOptions) !void {
-        const args: *NativeLifecycleArgs = @fieldParentPtr("step", step);
-        const b = step.owner;
-        // Run.addFileArg intentionally relativizes paths; the fixture CLI requires absolute inputs.
-        for (args.programs, [_][]const u8{ "--controller", "--fake", "--validator" }) |program, flag| {
-            const path = try program.getEmittedBin().getPath4(b, step);
-            args.run.addArgs(&.{ flag, b.pathResolve(&.{ b.graph.cache.cwd, path.root_dir.path orelse ".", path.sub_path }) });
-        }
-    }
-};
-
 fn controllerModule(
     b: *std.Build,
     source: []const u8,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     imports: []const std.Build.Module.Import,
 ) *std.Build.Module {
     const module = b.createModule(.{

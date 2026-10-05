@@ -16,7 +16,7 @@ pub const Directory = struct {
         defer root.close(io);
         var nonce: [8]u8 = undefined;
         io.random(&nonce);
-        const basename = try std.fmt.allocPrint(a, "{s}-{s}", .{ name, p.hex(nonce) });
+        const basename = try a.print("{s}-{s}", .{ name, p.hex(nonce) });
         defer a.free(basename);
         try root.dir.createDir(io, basename, .fromMode(0o700));
         const path = try std.fs.path.join(a, &.{ root_path, basename });
@@ -41,7 +41,7 @@ fn run(fixture: *f.Context) !pf.worker.Report {
 }
 
 pub fn until(fixture: *f.Context, action: c.Action) !void {
-    for (0..@intFromEnum(action) + 1) |_| {
+    for (0..@backingInt(action) + 1) |_| {
         const result = try pf.worker.execute(.synthetic, a, io, .step, fixture.directory, try fixture.resolved(), null);
         try t.expect(result.failures.primary == null and result.failures.cleanup == null and result.failures.recording == null);
     }
@@ -61,7 +61,7 @@ test "strict preparation boundary budget partitions and all proof bindings" {
     const total = try (try fixture.input.approved.budget.floor()).add(fixture.input.approved.budget.host_runtime);
     try t.expect(total.control < p.max_control and total.staged < p.max_staging);
     const before = fixture.input.approved.proofs.native_provider;
-    fixture.input.approved.proofs.native_provider = [_]u8{0} ** 32;
+    fixture.input.approved.proofs.native_provider = @as([32]u8, @splat(0));
     try t.expectError(error.MissingBinding, fixture.input.validate(a, f.now));
     fixture.input.approved.proofs.native_provider = before;
     fixture.input.approved.budget.controller.staged += 1;
@@ -81,7 +81,7 @@ test "synthetic lifecycle signs exact public acceptance then private phases and 
     try t.expectEqual(c.Phase.synthetic_completed, result.phase);
     try t.expectEqual(@as(usize, 1), fixture.private_transfers);
     for (fixture.calls, 0..) |count, index| {
-        if (index != @intFromEnum(c.Action.accept_public)) try t.expectEqual(@as(u8, 1), count);
+        if (index != @backingInt(c.Action.accept_public)) try t.expectEqual(@as(u8, 1), count);
     }
     try t.expectError(error.SyntheticEvidence, pf.completed.load(a, io, directory.value, &fixture.input));
     fixture.input.kind = .production;
@@ -109,8 +109,8 @@ test "public evidence failure and publication ambiguity prevent every private tr
         try t.expectEqual(c.Phase.cleaned, result.phase);
         try t.expect(result.failures.primary != null);
         try t.expectEqual(@as(usize, 0), fixture.private_transfers);
-        try t.expectEqual(@as(u8, 0), fixture.calls[@intFromEnum(c.Action.publish_private)]);
-        try t.expectEqual(@as(u8, 1), fixture.calls[@intFromEnum(c.Action.prove_group_absent)]);
+        try t.expectEqual(@as(u8, 0), fixture.calls[@backingInt(c.Action.publish_private)]);
+        try t.expectEqual(@as(u8, 1), fixture.calls[@backingInt(c.Action.prove_group_absent)]);
     }
 }
 
@@ -132,11 +132,11 @@ test "consumed mutation intent survives restart without replay or rearming" {
         defer lock.close(io);
         var store = try pf.journal.Store.open(a, io, &lock, &fixture.input);
         try t.expectEqual(c.Phase.cleaning, store.state.phase);
-        try t.expectEqual(pf.journal.Status.unknown, store.state.actions[@intFromEnum(c.Action.create_group)].status);
+        try t.expectEqual(pf.journal.Status.unknown, store.state.actions[@backingInt(c.Action.create_group)].status);
         try t.expectError(error.AttemptConsumed, store.begin(.create_group, 4096, true));
         try t.expectError(error.PrematurePrivateTransfer, pf.engine.requirePublic(store.state));
     }
-    try t.expectEqual(@as(u8, 0), fixture.calls[@intFromEnum(c.Action.create_group)]);
+    try t.expectEqual(@as(u8, 0), fixture.calls[@backingInt(c.Action.create_group)]);
 }
 
 test "primary cleanup and recording outcomes remain separate" {
@@ -229,7 +229,7 @@ test "hard deadline terminates operation before cleanup writer takes ownership" 
     var lock = try directory.value.lock(io);
     defer lock.close(io);
     const store = try pf.journal.Store.open(a, io, &lock, &fixture.input);
-    try t.expectEqual(pf.journal.Status.unknown, store.state.actions[@intFromEnum(c.Action.create_group)].status);
+    try t.expectEqual(pf.journal.Status.unknown, store.state.actions[@backingInt(c.Action.create_group)].status);
     try t.expect(store.state.private == null);
 }
 
@@ -322,7 +322,7 @@ test "cleanup planning preserves expired and restart wall ceilings before effect
     resolved.now = f.now + 6;
     const expired = try pf.worker.execute(.synthetic, a, io, .plan_cleanup, directory.value, resolved, null);
     try t.expectEqual(resolved.monotonic_ns, expired.deadline_ns.?);
-    try t.expectEqual(@as(u8, 0), fixture.calls[@intFromEnum(c.Action.deallocate)]);
+    try t.expectEqual(@as(u8, 0), fixture.calls[@backingInt(c.Action.deallocate)]);
 }
 
 test "independent native supervisor handles recording poison descendants and output overflow" {
@@ -361,7 +361,7 @@ test "independent native supervisor handles recording poison descendants and out
         defer lock.close(io);
         const recovered = try pf.journal.Store.openRecovery(a, io, &lock, &fixture.input);
         try t.expect(recovered.state.private == null and recovered.state.phase != .completed);
-        try t.expect(recovered.state.actions[@intFromEnum(c.Action.prove_group_absent)].status == .complete);
+        try t.expect(recovered.state.actions[@backingInt(c.Action.prove_group_absent)].status == .complete);
     }
 }
 
@@ -424,7 +424,7 @@ test "production worker rejects synthetic kind and unadmitted self binary before
         return error.SyntheticBinaryAdmitted;
     } else |err| try t.expect(err == error.NativeControlNotAdmitted or err == error.NativeBindingMismatch);
     try t.expectError(error.FileNotFound, directory.value.openFile(io, "attempt-consumed.json"));
-    try t.expectError(error.SigningAuthorityMismatch, pf.commands.Signer.fromSeed([_]u8{0x11} ** 32, fixture.input.approved.public_key));
+    try t.expectError(error.SigningAuthorityMismatch, pf.commands.Signer.fromSeed(@as([32]u8, @splat(0x11)), fixture.input.approved.public_key));
 }
 
 test "prepared context freezes complete artifacts not just caller supplied manifest hash" {

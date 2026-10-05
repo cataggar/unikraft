@@ -1,6 +1,6 @@
 # Native public local boot driver
 
-Standalone Zig 0.16 replacement for `support/build/tests/hyperv-efi-boot-test.py`
+Standalone Zig 0.17.0 replacement for `support/build/tests/hyperv-efi-boot-test.py`
 and its focused Python fixtures. No Python interpreter, SDK, cloud client,
 shell, preparation engine, or host admission is used. QCOW2 inspection uses
 the exact pinned Miz host library and its native zstd dependency.
@@ -208,13 +208,13 @@ or trailing-garbage returns, malformed serial, crash markers anywhere
 ## Offline build and fixtures
 
 The build restores reviewed Miz revision
-`669a27982b376311f558e820b69e9a692735b0cd` with package hash
-`miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx` from
+`66ea6701cf0e1b6d31e5f30fade00b7a546d4b44` with package hash
+`miz-0.2.0-Z3lHlLgL2wDiGxutMJMDy9Qy4CLNCwOptwgQLp1ZDSiv` from
 `build.zig.zon`; Miz's exported `dependency.module("miz")` supplies its native
 zstd wiring. After that pinned restore is available, builds run offline through `--system`.
 This Zig distribution creates `zig-pkg` beside the selected build file, so
 restore copied manifests under owned scratch before source custody is
-established. Never fetch beside the tracked build file. Use Zig 0.16, `-j2`,
+established. Never fetch beside the tracked build file. Use Zig 0.17.0, `-j2`,
 and explicit owned scratch for HOME, TMPDIR, XDG/Zig caches and outputs:
 
 ```sh
@@ -230,16 +230,16 @@ cp support/tools/hyperv/local_boot/build.zig \
   support/tools/hyperv/local_boot/build.zig.zon "$SCRATCH/restore/"
 zig build --build-file "$SCRATCH/restore/build.zig" --fetch=all \
   --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
-  --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" -j2
+  -j2
 zig build --build-file support/tools/hyperv/local_boot/build.zig \
   --system "$SCRATCH/restore/zig-pkg" \
   --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
-  --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
+  \
   --prefix "$SCRATCH/outputs/debug" -Dtest-root="$SCRATCH/fixtures" \
   -j2 test install --summary all
 ```
 
-Repeat with `-Doptimize=ReleaseSafe` and a separate output prefix. A missing
+Repeat with `-Doptimize=safe` and a separate output prefix. A missing
 or incomplete `--system` package tree is an explicit build error; builds do
 not fall back to fetching into tracked source.
 CI additionally selects the explicit test-only path:

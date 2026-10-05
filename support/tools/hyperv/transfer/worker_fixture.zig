@@ -54,7 +54,7 @@ fn run(init: std.process.Init) !void {
     var count_buffer: [32]u8 = undefined;
     try directory.dir.writeFile(init.io, .{
         .sub_path = "invocations",
-        .data = try std.fmt.bufPrint(&count_buffer, "{d}", .{invocations + 1}),
+        .data = try std.mem.print(&count_buffer, "{d}", .{invocations + 1}),
         .flags = .{ .permissions = .fromMode(0o600) },
     });
     if (mode == .changed_request) {
@@ -85,7 +85,7 @@ fn run(init: std.process.Init) !void {
     } else if (mode == .flood) {
         while (true) try stdout.interface.writeAll("SYNTHETIC_SECRET?sig=PRIVATE\n");
     } else {
-        if (mode == .stale) report.attempt_id = [_]u8{0} ** 32;
+        if (mode == .stale) report.attempt_id = @as([32]u8, @splat(0));
         if (mode == .stderr_secret) {
             var stderr = std.Io.File.stderr().writer(init.io, &.{});
             try stderr.interface.writeAll("SYNTHETIC_SECRET?sig=PRIVATE\n");
@@ -245,7 +245,7 @@ const Operation = struct {
     allocator: std.mem.Allocator,
     interface: sdk.http.HttpOperation,
     reader: std.Io.Reader,
-    footer: [512]u8 = [_]u8{0x5a} ** 512,
+    footer: [512]u8 = @as([512]u8, @splat(0x5a)),
 
     fn finish(_: *sdk.http.HttpOperation) !void {
         return error.UnboundedFinishForbidden;

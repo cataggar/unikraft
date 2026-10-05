@@ -231,9 +231,9 @@ pub fn blobUri(allocator: std.mem.Allocator, account: []const u8, container: []c
     if (!validAccount(account) or !validContainer(container) or !validSas(sas)) return error.InvalidContract;
     if (blob) |name| if (!validBlob(name)) return error.InvalidContract;
     const raw = if (blob) |name|
-        try std.fmt.allocPrint(allocator, "{s}/{s}/{s}?{s}", .{ account, container, name, sas })
+        try allocator.print("{s}/{s}/{s}?{s}", .{ account, container, name, sas })
     else
-        try std.fmt.allocPrint(allocator, "{s}/{s}?{s}", .{ account, container, sas });
+        try allocator.print("{s}/{s}?{s}", .{ account, container, sas });
     defer {
         std.crypto.secureZero(u8, raw);
         allocator.free(raw);
@@ -264,7 +264,7 @@ pub fn validDiskEndpoint(endpoint: []const u8) bool {
 
 pub fn diskUri(allocator: std.mem.Allocator, endpoint: []const u8, sas: []const u8) !common.sas.CompleteSasUri {
     if (!validDiskEndpoint(endpoint) or !validSas(sas)) return error.InvalidContract;
-    const raw = try std.fmt.allocPrint(allocator, "{s}?{s}", .{ endpoint, sas });
+    const raw = try allocator.print("{s}?{s}", .{ endpoint, sas });
     defer {
         std.crypto.secureZero(u8, raw);
         allocator.free(raw);

@@ -94,7 +94,7 @@ pub const Native = struct {
                 defer firewall.deinit();
                 var admission = try store.admission();
                 defer admission.deinit();
-                const account = try std.fmt.allocPrint(store.allocator, "https://{s}.blob.core.windows.net", .{r.storage.name});
+                const account = try store.allocator.print("https://{s}.blob.core.windows.net", .{r.storage.name});
                 defer store.allocator.free(account);
                 var client: transfer.Client = .{ .allocator = store.allocator, .io = store.io, .runtime = self.storage_adapter.runtime, .budget = self.storage_adapter.budget };
                 const created = client.createContainer(account, admission.container, sas.bytes);
@@ -122,13 +122,13 @@ pub const Native = struct {
             },
             .revoke_roles => {
                 if (try api.groupAbsent()) return self.absentProof(action);
-                if (state.actions[@intFromEnum(c.Action.grant_access)].status == .fresh)
+                if (state.actions[@backingInt(c.Action.grant_access)].status == .fresh)
                     return .{ .digest = p.hash("role-grant-not-started"), .effect = .not_started };
                 return .{ .digest = try api.roles(state, true), .effect = .accepted };
             },
             .revoke_sas => {
                 if (try api.groupAbsent()) return self.absentProof(action);
-                if (state.actions[@intFromEnum(c.Action.grant_access)].status == .fresh)
+                if (state.actions[@backingInt(c.Action.grant_access)].status == .fresh)
                     return .{ .digest = p.hash("capability-not-issued"), .effect = .not_started };
                 const snapshot = try self.loadSnapshot();
                 var result = try api.execute(.{ .regenerate_key = .{ .account = r.storage, .key = .key1, .previous = snapshot } });
@@ -141,7 +141,7 @@ pub const Native = struct {
                 // Group absence is recorded distinctly. It is not a successful
                 // key rotation or a signed data-plane rejection.
                 if (try api.groupAbsent()) return self.absentProof(action);
-                if (state.actions[@intFromEnum(c.Action.grant_access)].status == .fresh)
+                if (state.actions[@backingInt(c.Action.grant_access)].status == .fresh)
                     return .{ .digest = p.hash("capability-not-issued"), .effect = .not_applicable };
                 try self.proveRevoked();
                 return .{ .digest = p.hash("independent-old-capability-authentication-rejected"), .effect = .not_applicable };
@@ -254,9 +254,9 @@ pub const Native = struct {
         defer sas.deinit();
         var admission = try store.admission();
         defer admission.deinit();
-        const account = try std.fmt.allocPrint(a, "https://{s}.blob.core.windows.net", .{admission.account});
+        const account = try a.print("https://{s}.blob.core.windows.net", .{admission.account});
         defer a.free(account);
-        const blob = try std.fmt.allocPrint(a, "runs/{s}/commands/public.json", .{store.state.run_id});
+        const blob = try a.print("runs/{s}/commands/public.json", .{store.state.run_id});
         defer a.free(blob);
         const output = try std.fs.path.join(a, &.{ self.storage_adapter.root, "revocation-probe" });
         defer a.free(output);

@@ -3,10 +3,27 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 
+// Synthetic v1 records retain their wire spelling independently of compiler API names.
+pub const Optimize = enum {
+    Debug,
+    ReleaseSafe,
+    ReleaseFast,
+    ReleaseSmall,
+
+    fn fromCompiler(mode: std.lang.Optimize) Optimize {
+        return switch (mode) {
+            .debug => .Debug,
+            .safe => .ReleaseSafe,
+            .fast => .ReleaseFast,
+            .small => .ReleaseSmall,
+        };
+    }
+};
+
 pub const Sample = struct {
     backend: std.builtin.CompilerBackend,
     arch: std.Target.Cpu.Arch,
-    optimize: std.lang.Optimize,
+    optimize: Optimize,
     aarch64_sha2: bool,
     x86_sha: bool,
     x86_avx2: bool,
@@ -18,7 +35,7 @@ pub fn capture() !Sample {
     return .{
         .backend = builtin.zig_backend,
         .arch = builtin.target.cpu.arch,
-        .optimize = builtin.mode,
+        .optimize = Optimize.fromCompiler(builtin.mode),
         .aarch64_sha2 = builtin.target.cpu.arch == .aarch64 and builtin.target.cpu.has(.aarch64, .sha2),
         .x86_sha = builtin.target.cpu.arch == .x86_64 and builtin.target.cpu.has(.x86, .sha),
         .x86_avx2 = builtin.target.cpu.arch == .x86_64 and builtin.target.cpu.has(.x86, .avx2),

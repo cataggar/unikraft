@@ -269,7 +269,7 @@ copies, and a failed run may have only a prefix of the fixed labels.
 The later image-target compile remains default-off. These records are diagnostic-only,
 `authority=none`, not production acceptance or cleanup proof.
 
-Zig 0.16.0 is required. Run from the owned worktree. Restore only the pinned
+Zig 0.17.0 is required. Run from the owned worktree. Restore only the pinned
 package manifests, into scratch; this distribution otherwise creates `zig-pkg`
 beside the build file. All subsequent builds use `--system` to disable fetching.
 
@@ -283,12 +283,12 @@ cp support/tools/hyperv/host/build.zig support/tools/hyperv/host/build.zig.zon "
 /home/g/.local/bin/zig build --build-file "$out/packages/restore/build.zig" --fetch=all -j2
 /home/g/.local/bin/zig build --build-file support/tools/hyperv/host/build.zig test \
   --system "$out/packages/restore/zig-pkg" --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
-  --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" --prefix "$out/out" \
+  --prefix "$out/out" \
   -Dtest-root="$out/out/fixtures" -j2 --summary all
 ```
 
-Use `-Doptimize=ReleaseSafe` for checked optimized fixtures. A cross-build uses
-`-Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe` and an explicitly synthetic
+Use `-Doptimize=safe` for checked optimized fixtures. A cross-build uses
+`-Dtarget=x86_64-linux-musl -Doptimize=safe` and an explicitly synthetic
 image public key; it is not cloud admission. `-Dtest-filter=TEXT` narrows native
 fixture names. Fixture directories retain private local evidence under scratch.
 `test install` also compiles the CLI and therefore requires an explicit synthetic

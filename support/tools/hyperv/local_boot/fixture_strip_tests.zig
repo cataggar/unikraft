@@ -1,20 +1,26 @@
 const std = @import("std");
 const gate = @import("equivalence");
 const options = @import("strip_options");
+const paths = @import("test_artifact_paths");
+const raw_plain = paths.resolve(options.build_cwd, options.raw_plain);
+const plain_path = paths.resolve(options.build_cwd, options.plain);
+const raw_diagnostic = paths.resolve(options.build_cwd, options.raw_diagnostic);
+const diagnostic_path = paths.resolve(options.build_cwd, options.diagnostic);
+const verifier = paths.resolve(options.build_cwd, options.verifier);
 const t = std.testing;
 const a = t.allocator;
 const io = t.io;
 
 test "synthetic QEMU selection preserves both raw pairs and labels only test artifacts" {
     if (!options.stripped) {
-        try t.expectEqualStrings(options.raw_plain, options.plain);
-        try t.expectEqualStrings(options.raw_diagnostic, options.diagnostic);
+        try t.expectEqualStrings(raw_plain, plain_path);
+        try t.expectEqualStrings(raw_diagnostic, diagnostic_path);
         try t.expect(options.report == null);
         return;
     }
-    const plain = try gate.Pair.openWithPolicy(a, io, options.raw_plain, options.plain, .file_offset_relayout);
+    const plain = try gate.Pair.openWithPolicy(a, io, raw_plain, plain_path, .file_offset_relayout);
     defer plain.close(a, io);
-    const diagnostic = try gate.Pair.openWithPolicy(a, io, options.raw_diagnostic, options.diagnostic, .file_offset_relayout);
+    const diagnostic = try gate.Pair.openWithPolicy(a, io, raw_diagnostic, diagnostic_path, .file_offset_relayout);
     defer diagnostic.close(a, io);
     for ([_]gate.Pair{ plain, diagnostic }) |pair| {
         try t.expect(pair.content.size_reduction > 0);
@@ -47,8 +53,8 @@ fn refused(args: []const []const u8) !void {
 }
 
 test "synthetic QEMU verifier refuses alias substitution and unknown policy" {
-    try refused(&.{ options.verifier, "pair", options.raw_plain, options.raw_plain, "--layout-policy", "file_offset_relayout" });
-    try refused(&.{ options.verifier, "pair", options.raw_plain, options.diagnostic, "--layout-policy", "file_offset_relayout" });
-    try refused(&.{ options.verifier, "pair", options.raw_plain, options.plain, "--layout-policy", "unchecked" });
-    try refused(&.{ options.verifier, "pair", options.raw_plain, options.plain, "--external", options.plain });
+    try refused(&.{ verifier, "pair", raw_plain, raw_plain, "--layout-policy", "file_offset_relayout" });
+    try refused(&.{ verifier, "pair", raw_plain, diagnostic_path, "--layout-policy", "file_offset_relayout" });
+    try refused(&.{ verifier, "pair", raw_plain, plain_path, "--layout-policy", "unchecked" });
+    try refused(&.{ verifier, "pair", raw_plain, plain_path, "--external", plain_path });
 }

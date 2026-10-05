@@ -1,11 +1,16 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    b.cache_root.path = b.cache_root.handle.realPathFileAlloc(b.graph.io, ".", b.allocator) catch
-        @panic("cannot canonicalize the selected fixture cache");
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const test_root = b.option([]const u8, "test-root", "Existing absolute 0700 native fixture directory");
+    const build_cwd = std.Io.Dir.cwd().realPathFileAlloc(std.Io.Threaded.global_single_threaded.io(), ".", b.allocator) catch
+        @panic("Cannot resolve the build cwd for fixture artifact paths");
+    const fixture_paths = b.createModule(.{
+        .root_source_file = b.path("../test_artifact_path.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
     const miz = b.dependency("miz_source", .{ .target = target, .optimize = optimize }).module("miz");
     const strip_debug = b.option(bool, "strip-fixture-debug", "TESTS ONLY: gate debug-stripped copies of the two uninstalled synthetic QEMU fixtures") orelse false;
     const objcopy = b.option([]const u8, "fixture-objcopy", "Explicit absolute pinned native llvm-objcopy for TESTS ONLY");
@@ -61,7 +66,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("main.zig"),
             .target = target,
             .optimize = optimize,
-            .strip = optimize != .Debug,
+            .strip = optimize != .debug,
             .imports = &.{.{ .name = "local_boot", .module = module }},
         }),
     });
@@ -100,14 +105,14 @@ pub fn build(b: *std.Build) void {
     const raw_diagnostic = diagnostic_fixture.getEmittedBin();
     const selected_plain = if (strip_debug) strippedCopy(b, objcopy.?, raw_plain, "local-boot-qemu-fixture") else raw_plain;
     const selected_diagnostic = if (strip_debug) strippedCopy(b, objcopy.?, raw_diagnostic, "local-boot-qemu-diagnostic-fixture") else raw_diagnostic;
-    const gate_core = b.createModule(.{ .root_source_file = b.path("../core.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
+    const gate_core = b.createModule(.{ .root_source_file = b.path("../core.zig"), .target = b.graph.host, .optimize = .safe });
     if (b.graph.host.result.cpu.arch == .x86_64)
         gate_core.addAssemblyFile(b.path("../sha256_clear_upper.S"));
-    const gate_elf = b.createModule(.{ .root_source_file = b.path("../../../build/postprocess-elf.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
+    const gate_elf = b.createModule(.{ .root_source_file = b.path("../../../build/postprocess-elf.zig"), .target = b.graph.host, .optimize = .safe });
     const equivalence = b.createModule(.{
         .root_source_file = b.path("../preparation/namespace/fixture_debug_equivalence.zig"),
         .target = b.graph.host,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .imports = &.{ .{ .name = "hyperv_core", .module = gate_core }, .{ .name = "producer_elf", .module = gate_elf } },
     });
     const verifier = b.addExecutable(.{
@@ -115,7 +120,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("../preparation/namespace/fixture_debug_verifier.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .imports = &.{.{ .name = "equivalence", .module = equivalence }},
         }),
     });
@@ -126,8 +131,8 @@ pub fn build(b: *std.Build) void {
             // Never let a cached candidate substitute for reading this pair.
             check.has_side_effects = true;
             check.addArg("pair");
-            check.addFileArg(raw);
-            check.addFileArg(candidate);
+            check.addFileArg2(raw, .{ .make_absolute = true });
+            check.addFileArg2(candidate, .{ .make_absolute = true });
             check.addArgs(&.{ "--layout-policy", "file_offset_relayout" });
             check.expectExitCode(0);
             gate.dependOn(&check.step);
@@ -140,9 +145,10 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "equivalence", .module = equivalence }},
     }) });
     const run_gate_tests = b.addRunArtifact(gate_tests);
-    run_gate_tests.setCwd(.{ .cwd_relative = test_root orelse b.cache_root.path.? });
+    if (test_root) |path| run_gate_tests.setCwd(.{ .cwd_relative = path }) else run_gate_tests.step.dependOn(&b.addFail("test-strip-equivalence requires -Dtest-root=PRIVATE_ABSOLUTE_DIRECTORY").step);
     b.step("test-strip-equivalence", "Reuse native ELF, relayout and private-file refusal fixtures").dependOn(&run_gate_tests.step);
     const proof_options = b.addOptions();
+    proof_options.addOption([]const u8, "build_cwd", build_cwd);
     proof_options.addOption(bool, "stripped", strip_debug);
     proof_options.addOptionPath("raw_plain", raw_plain);
     proof_options.addOptionPath("plain", selected_plain);
@@ -154,12 +160,15 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("fixture_strip_tests.zig"),
         .target = b.graph.host,
         .optimize = optimize,
-        .imports = &.{.{ .name = "equivalence", .module = equivalence }},
+        .imports = &.{
+            .{ .name = "equivalence", .module = equivalence },
+            .{ .name = "test_artifact_paths", .module = fixture_paths },
+        },
     }) });
     proof_tests.root_module.addOptions("strip_options", proof_options);
     const run_proof_tests = b.addRunArtifact(proof_tests);
     run_proof_tests.has_side_effects = true;
-    run_proof_tests.setCwd(.{ .cwd_relative = test_root orelse b.cache_root.path.? });
+    if (test_root) |path| run_proof_tests.setCwd(.{ .cwd_relative = path }) else run_proof_tests.step.dependOn(&b.addFail("test-strip-proof requires -Dtest-root=PRIVATE_ABSOLUTE_DIRECTORY").step);
     if (strip_debug) run_proof_tests.step.dependOn(gate);
     b.step("test-strip-proof", "Verify selected synthetic pairs, preserved raw files and verifier refusals").dependOn(&run_proof_tests.step);
     const options = b.addOptions();
@@ -200,6 +209,6 @@ pub fn build(b: *std.Build) void {
 fn strippedCopy(b: *std.Build, objcopy: []const u8, raw: std.Build.LazyPath, basename: []const u8) std.Build.LazyPath {
     const strip = b.addSystemCommand(&.{ objcopy, "--strip-debug" });
     strip.addFileInput(.{ .cwd_relative = objcopy });
-    strip.addFileArg(raw);
+    strip.addFileArg2(raw, .{ .make_absolute = true });
     return strip.addOutputFileArg(basename);
 }

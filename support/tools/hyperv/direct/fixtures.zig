@@ -39,7 +39,7 @@ fn serialError(expected: anyerror, mode: validation.SerialMode, first: []const u
 fn serialFixtures(a: std.mem.Allocator) !void {
     const first = comptime serialLog(1);
     const second = comptime serialLog(2);
-    const padding = "\x00" ** 464;
+    const padding = &@as([464:0]u8, @splat('\x00'));
     const padded = first ++ padding;
     const platform = "UK_HYPERV_PLATFORM_READY\n";
     inline for (.{ validation.SerialMode.per_boot, .cumulative, .azure_cumulative }) |mode| {
@@ -135,7 +135,7 @@ pub fn main() !void {
     if (validation.seedChunk(&prefix, 0, parameters)) |_| return error.AcceptedWrongSeed else |err| try expect(err == error.InvalidSeedMagic);
     const a = std.heap.page_allocator;
     try serialFixtures(a);
-    const manifest = try std.fmt.allocPrint(a,
+    const manifest = try a.print(
         \\{{"version":2,"run_id":"{s}","disk_id":"{s}","sectors":8388608,"sector_size":512,
         \\"identity_policy":"seed-enrollment-v2","identity_policy_version":2,"path":null,"target":null,
         \\"lun":7,"seed_lbas":[8,9],"intent_lba":16,"receipt_lba":17,"extent_lba":32,"extent_sectors":16,"manifest_crc32":{d}}}

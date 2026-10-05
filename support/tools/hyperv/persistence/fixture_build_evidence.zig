@@ -156,8 +156,8 @@ fn pathHash(hash: *Hash, path: []const u8) void {
 }
 
 fn metadataHash(hash: *Hash, value: files.Metadata) void {
-    inline for (std.meta.fields(files.Metadata)) |field|
-        number(hash, field.type, @field(value, field.name));
+    inline for (@typeInfo(files.Metadata).@"struct".field_names) |field|
+        number(hash, @TypeOf(@field(value, field)), @field(value, field));
 }
 
 fn walk(
@@ -182,7 +182,7 @@ fn walk(
         const relative = if (prefix.len == 0)
             try a.dupe(u8, entry.name)
         else
-            try std.fmt.allocPrint(a, "{s}/{s}", .{ prefix, entry.name });
+            try a.print("{s}/{s}", .{ prefix, entry.name });
         if (relative.len > 4095) return error.UnsafePath;
         const held = try directory.openFile(io, entry.name, .{ .path_only = true, .follow_symlinks = false });
         defer held.close(io);
@@ -318,8 +318,8 @@ const Inputs = struct {
         try result.addTree(a, io, "repository_hyperv", request.repository_hyperv);
         try result.addTree(a, io, "repository_build", request.repository_build);
         for (request.modules) |module| {
-            try result.addFile(a, io, try std.fmt.allocPrint(a, "module_{s}_root", .{module.name}), module.root, schema.max_lib_file_bytes);
-            try result.addTree(a, io, try std.fmt.allocPrint(a, "module_{s}_envelope", .{module.name}), module.scope);
+            try result.addFile(a, io, try a.print("module_{s}_root", .{module.name}), module.root, schema.max_lib_file_bytes);
+            try result.addTree(a, io, try a.print("module_{s}_envelope", .{module.name}), module.scope);
         }
         try result.recheck(a, io);
         return result;
@@ -442,7 +442,7 @@ fn canonical(a: std.mem.Allocator, value: anytype, maximum: usize) ![]const u8 {
     const json = try std.json.Stringify.valueAlloc(a, value, .{});
     defer a.free(json);
     if (json.len >= maximum) return error.FileTooLarge;
-    return std.fmt.allocPrint(a, "{s}\n", .{json});
+    return a.print("{s}\n", .{json});
 }
 
 fn publish(a: std.mem.Allocator, io: std.Io, lock: *pf.Locked, name: []const u8, value: anytype, maximum: usize) !void {
@@ -871,29 +871,29 @@ pub fn parentMetadata(a: std.mem.Allocator, bytes: []const u8, request: schema.R
     defer image.deinit();
     const section = try image.section(schema.section_name);
     const sh = section.header;
-    if ((sh.sh_type != std.elf.SHT_NOTE and sh.sh_type != std.elf.SHT_PROGBITS) or
-        sh.sh_size < schema.note_prefix_bytes or sh.sh_size > schema.max_note_bytes or
-        sh.sh_addralign != schema.note_alignment or sh.sh_addr % schema.note_alignment != 0 or
-        sh.sh_offset % schema.note_alignment != 0 or
-        sh.sh_flags & ~@as(u64, std.elf.SHF_ALLOC | std.elf.SHF_WRITE) != 0 or
-        (sh.sh_type == std.elf.SHT_NOTE and sh.sh_flags & std.elf.SHF_WRITE != 0))
+    if ((sh.type != .NOTE and sh.type != .PROGBITS) or
+        sh.size < schema.note_prefix_bytes or sh.size > schema.max_note_bytes or
+        sh.addralign != schema.note_alignment or sh.addr % schema.note_alignment != 0 or
+        sh.offset % schema.note_alignment != 0 or
+        @as(u64, @bitCast(sh.flags)) & ~@as(u64, @as(u32, @bitCast(std.elf.SHF{ .ALLOC = true, .WRITE = true }))) != 0 or
+        (sh.type == .NOTE and sh.flags.shf.WRITE))
         return error.InvalidBuildMetadata;
     try image.requireLoadedSection(section);
     for (image.programs) |program| {
-        if (program.p_type == std.elf.PT_LOAD and program.p_flags & std.elf.PF_X != 0 and
-            sh.sh_addr < program.p_vaddr + program.p_memsz and program.p_vaddr < sh.sh_addr + sh.sh_size)
+        if (program.type == .LOAD and program.flags.X and
+            sh.addr < program.vaddr + program.memsz and program.vaddr < sh.addr + sh.size)
             return error.InvalidBuildMetadata;
     }
-    if (try image.symbol(schema.symbol_name) != sh.sh_addr) return error.InvalidBuildMetadata;
+    if (try image.symbol(schema.symbol_name) != sh.addr) return error.InvalidBuildMetadata;
     for (image.symbols) |symbol| {
         if (!std.mem.eql(u8, symbol.name, schema.symbol_name)) continue;
         const sym = symbol.header;
-        const binding = sym.st_info >> 4;
+        const binding = sym.info.bind;
         // The self-hosted linker localizes this export in its final executable.
-        if (sym.st_info & 15 != std.elf.STT_OBJECT or
-            (binding != std.elf.STB_GLOBAL and !(sh.sh_type == std.elf.SHT_PROGBITS and binding == std.elf.STB_LOCAL)) or sym.st_other != 0 or
-            sym.st_size != sh.sh_size or sym.st_shndx >= image.sections.len or
-            !std.mem.eql(u8, image.sections[sym.st_shndx].name, schema.section_name))
+        if (sym.info.type != .OBJECT or
+            (binding != .GLOBAL and !(sh.type == .PROGBITS and binding == .LOCAL)) or @as(u8, @bitCast(sym.other)) != 0 or
+            sym.size != sh.size or @backingInt(sym.shndx) >= image.sections.len or
+            !std.mem.eql(u8, image.sections[@backingInt(sym.shndx)].name, schema.section_name))
             return error.InvalidBuildMetadata;
     }
     const data = try image.sectionData(section);
@@ -912,10 +912,10 @@ pub fn parentMetadata(a: std.mem.Allocator, bytes: []const u8, request: schema.R
     try literal(value.object.get("origin").?, "actual_tests_zig_compile_builtin");
     const observed = value.object.get("observed").?;
     if (observed != .object) return error.InvalidBuildMetadata;
-    if (sh.sh_type == std.elf.SHT_PROGBITS) {
+    if (sh.type == .PROGBITS) {
         if (image.header.machine != .X86_64) return error.InvalidBuildMetadata;
         try literal(observed.object.get("zig_backend") orelse return error.InvalidBuildMetadata, "stage2_x86_64");
-        try literal(observed.object.get("mode") orelse return error.InvalidBuildMetadata, "Debug");
+        try literal(observed.object.get("mode") orelse return error.InvalidBuildMetadata, "debug");
     }
     var iterator = observed.object.iterator();
     while (iterator.next()) |entry| {

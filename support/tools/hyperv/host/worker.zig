@@ -103,7 +103,7 @@ pub const Engine = struct {
         for (outcomes) |outcome| {
             if (outcome.serial_bytes == 0) continue;
             var name_buffer: [16]u8 = undefined;
-            const local = try std.fmt.bufPrint(&name_buffer, "boot-{d}", .{outcome.index});
+            const local = try std.mem.print(&name_buffer, "boot-{d}", .{outcome.index});
             const path = try std.fs.path.join(self.allocator, &.{ self.runner.work_root, local });
             defer self.allocator.free(path);
             const directory = try core.private_files.Directory.open(self.io, path);
@@ -115,7 +115,7 @@ pub const Engine = struct {
             }
             try self.store.reserve(bytes.len, false, true);
             var blob_buffer: [16]u8 = undefined;
-            const name = try std.fmt.bufPrint(&blob_buffer, "boot-{d}.log", .{outcome.index});
+            const name = try std.mem.print(&blob_buffer, "boot-{d}.log", .{outcome.index});
             const result = self.remote.publishFn(self.remote.context, command, name, bytes);
             publication = result.publication;
             if (publication != .complete) {

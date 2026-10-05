@@ -277,7 +277,7 @@ pub const Client = struct {
             defer request.deinit();
             self.headers(&request, page_api_version, length) catch return failAfter(outcome, .page_put, .allocation);
             var range: [64]u8 = undefined;
-            const value = std.fmt.bufPrint(&range, "bytes={d}-{d}", .{ offset, offset + length - 1 }) catch unreachable;
+            const value = std.mem.print(&range, "bytes={d}-{d}", .{ offset, offset + length - 1 }) catch unreachable;
             request.setHeader("x-ms-range", value) catch return failAfter(outcome, .page_put, .allocation);
             request.setHeader("x-ms-page-write", "update") catch return failAfter(outcome, .page_put, .allocation);
             var md5: [16]u8 = undefined;
@@ -321,7 +321,7 @@ pub const Client = struct {
             return;
         };
         var range: [64]u8 = undefined;
-        const value = std.fmt.bufPrint(&range, "bytes={d}-{d}", .{ size - 512, size - 1 }) catch unreachable;
+        const value = std.mem.print(&range, "bytes={d}-{d}", .{ size - 512, size - 1 }) catch unreachable;
         request.setHeader("x-ms-range", value) catch {
             outcome.* = failAfter(outcome.*, .footer_readback, .allocation);
             return;
@@ -343,7 +343,7 @@ pub const Client = struct {
             return;
         }
         var expected_range: [80]u8 = undefined;
-        const content_range = std.fmt.bufPrint(&expected_range, "bytes {d}-{d}/{d}", .{ size - 512, size - 1, size }) catch unreachable;
+        const content_range = std.mem.print(&expected_range, "bytes {d}-{d}/{d}", .{ size - 512, size - 1, size }) catch unreachable;
         const observed_range = uniqueHeader(operation, "Content-Range") catch null;
         if (!validEncoding(operation) or !validLength(operation, 512, 512) or observed_range == null or !std.mem.eql(u8, content_range, observed_range.?)) {
             outcome.diagnostic.category = .malformed_response;
@@ -455,7 +455,7 @@ pub const Client = struct {
         try request.setHeader("Content-Type", "application/octet-stream");
         if (length) |size| {
             var buffer: [24]u8 = undefined;
-            try request.setHeader("Content-Length", try std.fmt.bufPrint(&buffer, "{d}", .{size}));
+            try request.setHeader("Content-Length", try std.mem.print(&buffer, "{d}", .{size}));
         }
     }
 

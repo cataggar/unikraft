@@ -217,7 +217,7 @@ fn publish(lock: *r.core.private_files.Locked, io: std.Io, name: []const u8, byt
 
 pub fn namespaceInit(comptime kind: r.Kind, a: std.mem.Allocator, io: std.Io) !void {
     if (linux.getpid() != 1 or linux.getppid() != 0) return error.NotNamespaceInit;
-    _ = try k.checked(linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(linux.SIG.KILL), 0, 0, 0));
+    _ = try k.checked(linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @backingInt(linux.SIG.KILL), 0, 0, 0));
     if (try k.readable(7) or try k.readable(5)) return error.OwnerUnavailable;
     if (try k.readable(10)) return error.Cancelled;
     const configuration = try readDispatch(Dispatch, a, io);
@@ -303,7 +303,7 @@ pub fn namespaceInit(comptime kind: r.Kind, a: std.mem.Allocator, io: std.Io) !v
         }
         k.pause();
     }
-    const event: Event = .{ .cause = @intFromEnum(cause), .worker_status = worker_status };
+    const event: Event = .{ .cause = @backingInt(cause), .worker_status = worker_status };
     const report: std.Io.File = .{ .handle = 8, .flags = .{ .nonblocking = true } };
     try report.writeStreamingAll(io, std.mem.asBytes(&event));
     // Exiting PID1 is the containment primitive, including setsid/double-fork

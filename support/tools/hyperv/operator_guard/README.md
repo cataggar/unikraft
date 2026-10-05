@@ -1,6 +1,6 @@
 # Native operator process custody
 
-This dependency-free Zig 0.16 module supplies local process custody for a
+This dependency-free Zig 0.17.0 module supplies local process custody for a
 future parent-integrated preflight/persistence controller. It does not grant
 cloud authority, admit preparation/image evidence, resume a consumed attempt,
 or replace either engine's state loader. The installed production entry
@@ -279,18 +279,18 @@ From the worktree root, using existing private fixture directories:
 root="$PWD/.d/zig-migration-operator-guard"
 export TMPDIR="$root/tmp" XDG_CACHE_HOME="$root/cache"
 export ZIG_GLOBAL_CACHE_DIR="$root/global-cache"
-for mode in Debug ReleaseSafe; do
+for mode in debug safe; do
     export ZIG_LOCAL_CACHE_DIR="$root/$mode/cache"
     /home/g/.local/bin/zig build --build-file support/tools/hyperv/operator_guard/build.zig test install \
-        -Dtest-root="$root/$mode/fixtures" -Doptimize="$mode" -Dfixture-optimize=ReleaseSafe -j2 \
-        --cache-dir "$ZIG_LOCAL_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
+        -Dtest-root="$root/$mode/fixtures" -Doptimize="$mode" -Dfixture-optimize=safe -j2 \
+        --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
         --prefix "$root/$mode/install" --summary all
 done
 for target in x86_64-linux-musl aarch64-linux-musl; do
     export ZIG_LOCAL_CACHE_DIR="$root/targets-release-safe/$target/cache"
     /home/g/.local/bin/zig build --build-file support/tools/hyperv/operator_guard/build.zig compile-guard \
-        -Dtarget="$target" -Doptimize=ReleaseSafe -j2 \
-        --cache-dir "$ZIG_LOCAL_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
+        -Dtarget="$target" -Doptimize=safe -j2 \
+        --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
         --prefix "$root/targets-release-safe/$target/install" --summary all
 done
 ```

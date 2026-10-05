@@ -259,7 +259,7 @@ def build(root, package_tool):
             "wamr_revision": SDK,
             "minimal_wasi": False,
             "compiler_profile": "unikraft-x86_64",
-            "zig_version": "0.16.0",
+            "zig_version": "0.17.0",
             "files": {
                 "tiny.wasm": identity["wasm_sha256"],
                 "tiny.cwasm": identity["cwasm_sha256"],

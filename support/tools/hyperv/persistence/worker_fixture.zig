@@ -45,8 +45,8 @@ const Context = struct {
             const intent: transfer.worker.protocol.Intent = .{
                 .attempt_id = try core.contracts.parseSha256(&job.nonce),
                 .job_sha256 = try core.contracts.parseSha256(&initial.job_sha256),
-                .request_sha256 = [_]u8{1} ** 32,
-                .sas_sha256 = [_]u8{2} ** 32,
+                .request_sha256 = @as([32]u8, @splat(1)),
+                .sas_sha256 = @as([32]u8, @splat(2)),
                 .kind = .pages,
                 .plan = .{ .bytes = job.input.data.size, .download_bytes = 512, .mutations = count, .requests = count + 1 },
                 .deadline_ns = job.deadline_ns,

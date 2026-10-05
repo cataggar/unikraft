@@ -305,7 +305,7 @@ test "streaming artifact verifies exact bytes length digest and scope" {
 test "artifact truncation excess digest mismatch cancellation and deadline fail closed" {
     const fixture = try f.Directory.create("wire-negative");
     defer fixture.deinit();
-    const body = [_]u8{0x5a} ** 1024;
+    const body = @as([1024]u8, @splat(0x5a));
     const name = "runs/" ++ f.run_text ++ "/public/artifacts/capability.raw";
     const url = "https://fixture.blob.core.windows.net/private/" ++ name;
     const steps = [_]Step{
@@ -321,7 +321,7 @@ test "artifact truncation excess digest mismatch cancellation and deadline fail 
         var client = try mock.authenticated();
         defer client.deinit();
         var filename: [16]u8 = undefined;
-        const file = try fixture.directory.dir.createFile(io, try std.fmt.bufPrint(&filename, "file-{d}", .{index}), .{ .exclusive = true, .permissions = .fromMode(0o600) });
+        const file = try fixture.directory.dir.createFile(io, try std.mem.print(&filename, "file-{d}", .{index}), .{ .exclusive = true, .permissions = .fromMode(0o600) });
         defer file.close(io);
         const record: p.Artifact = .{ .role = .capability_raw, .name = "capability.raw", .blob = name, .sha256 = if (index == 1) p.hash("wrong") else p.hash(&body), .size = body.len };
         if (client.download(record, .public, file, f.now)) |_| return error.AcceptedBadArtifact else |_| {}

@@ -81,7 +81,7 @@ pub fn boolean(value: std.json.Value) !bool {
 pub fn state(value: std.json.Value) !State {
     const raw = try c.string(value);
     const names = .{ "Succeeded", "Creating", "Updating", "Deleting", "Running", "Accepted", "Failed", "Canceled", "InProgress" };
-    inline for (names, 0..) |name, i| if (std.mem.eql(u8, raw, name)) return @enumFromInt(i);
+    inline for (names, 0..) |name, i| if (std.mem.eql(u8, raw, name)) return @fromBackingInt(@intCast(i));
     return error.InvalidProvisioningState;
 }
 
@@ -288,7 +288,7 @@ fn parseDisk(id: s.Ref, root: std.json.Value, properties: std.json.Value) !Model
     const raw_access = try string(properties, "diskState");
     const access: DiskAccess = access: {
         inline for (.{ "Unattached", "Attached", "Reserved", "Frozen", "ActiveSAS", "ReadyToUpload", "ActiveUpload" }, 0..) |name, i|
-            if (std.mem.eql(u8, raw_access, name)) break :access @enumFromInt(i);
+            if (std.mem.eql(u8, raw_access, name)) break :access @fromBackingInt(@intCast(i));
         return error.InvalidDiskState;
     };
     const creation = try field(properties, "creationData");
@@ -445,7 +445,7 @@ fn persistenceNetwork(a: std.mem.Allocator, authority: s.Authority, definition: 
             const subnet = try field(subnets[0], "properties");
             if (!std.mem.eql(u8, try string(subnet, "addressPrefix"), "10.79.0.0/29") or
                 try boolean(try field(subnet, "defaultOutboundAccess"))) return error.InvalidNetwork;
-            const nsg: s.Ref = .{ .kind = .nsg, .name = try std.fmt.allocPrint(a, "{s}-nsg", .{definition.prefix}) };
+            const nsg: s.Ref = .{ .kind = .nsg, .name = try a.print("{s}-nsg", .{definition.prefix}) };
             try nsg.requireId(a, authority, try string(try field(subnet, "networkSecurityGroup"), "id"));
             if (subnet.object.get("natGateway")) |nat| if (nat != .null) return error.InvalidNetwork;
             if (subnet.object.get("routeTable")) |route| if (route != .null) return error.InvalidNetwork;
@@ -461,7 +461,7 @@ fn persistenceNetwork(a: std.mem.Allocator, authority: s.Authority, definition: 
                 if (configuration.object.get(relationship)) |associations|
                     if ((try array(associations)).len != 0) return error.InvalidNetwork;
             }
-            const subnet: s.Ref = .{ .kind = .subnet, .name = "default", .parent = try std.fmt.allocPrint(a, "{s}-vnet", .{definition.prefix}) };
+            const subnet: s.Ref = .{ .kind = .subnet, .name = "default", .parent = try a.print("{s}-vnet", .{definition.prefix}) };
             try subnet.requireId(a, authority, try string(try field(configuration, "subnet"), "id"));
         },
     }

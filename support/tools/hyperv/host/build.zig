@@ -1,6 +1,6 @@
 const std = @import("std");
 
-fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Module {
     const sdk = b.dependency("azure_sdk_core", .{ .target = target, .optimize = optimize });
     const core = b.createModule(.{
         .root_source_file = b.path("../core.zig"),
@@ -29,7 +29,7 @@ fn configureHost(b: *std.Build, host: *std.Build.Module, timing: ?*std.Build.Mod
     if (timing) |observer| host.addImport("host_timing", observer);
 }
 
-fn child(b: *std.Build, optimize: std.builtin.OptimizeMode, native: *std.Build.Module, timing: ?*std.Build.Module, success: bool) *std.Build.Step.Compile {
+fn child(b: *std.Build, optimize: std.lang.Optimize, native: *std.Build.Module, timing: ?*std.Build.Module, success: bool) *std.Build.Step.Compile {
     const fixture = b.addExecutable(.{
         .name = if (success) "host-wire-success-fixture" else "host-child-fixture",
         .root_module = b.createModule(.{
@@ -60,7 +60,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("main.zig"),
             .target = target,
             .optimize = optimize,
-            .strip = optimize != .Debug,
+            .strip = optimize != .debug,
             .imports = &.{.{ .name = "host", .module = host }},
         }),
     });

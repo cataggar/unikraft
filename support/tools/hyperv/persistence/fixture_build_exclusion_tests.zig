@@ -1,11 +1,15 @@
 const std = @import("std");
 const elf = @import("producer_elf");
 const options = @import("exclusion_options");
+const paths = @import("test_artifact_paths");
 const schema = @import("fixture_build_schema.zig");
 const t = std.testing;
 
 test "actual default parent and production CLI contain no evidence section or symbol" {
-    for ([_][]const u8{ options.default_parent, options.production_cli }) |path| {
+    for ([_][]const u8{
+        paths.resolve(options.build_cwd, options.default_parent),
+        paths.resolve(options.build_cwd, options.production_cli),
+    }) |path| {
         const bytes = try std.Io.Dir.cwd().readFileAlloc(t.io, path, t.allocator, .limited(schema.max_parent_bytes));
         defer t.allocator.free(bytes);
         var image = try elf.Image.parse(t.allocator, bytes);
@@ -18,7 +22,10 @@ test "actual default parent and production CLI contain no evidence section or sy
 }
 
 test "actual default production archive and generated options exclude evidence material" {
-    for ([_][]const u8{ options.production_library, options.default_options }) |path| {
+    for ([_][]const u8{
+        paths.resolve(options.build_cwd, options.production_library),
+        paths.resolve(options.build_cwd, options.default_options),
+    }) |path| {
         const bytes = try std.Io.Dir.cwd().readFileAlloc(t.io, path, t.allocator, .limited(schema.max_parent_bytes));
         defer t.allocator.free(bytes);
         try absentMaterial(bytes);

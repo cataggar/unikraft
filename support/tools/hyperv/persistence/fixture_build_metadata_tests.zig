@@ -86,10 +86,10 @@ test "default production roots and original test cases do not acquire evidence e
 
 test "source identity and module labels use strict fixed public alphabets" {
     try schema.validateIdentity("0123456789abcdef0123456789abcdef01234567");
-    for ([_][]const u8{ "", "0" ** 39, "0" ** 41, "A" ** 40, "/" ** 40 }) |value|
+    for ([_][]const u8{ "", &@as([39:0]u8, @splat('0')), &@as([41:0]u8, @splat('0')), &@as([40:0]u8, @splat('A')), &@as([40:0]u8, @splat('/')) }) |value|
         try t.expectError(error.InvalidSourceIdentity, schema.validateIdentity(value));
     try schema.validateModuleName("azure_sdk_core");
-    for ([_][]const u8{ "", "../main", "/main", "name-token", "x" ** 65 }) |value|
+    for ([_][]const u8{ "", "../main", "/main", "name-token", &@as([65:0]u8, @splat('x')) }) |value|
         try t.expectError(error.InvalidModuleName, schema.validateModuleName(value));
 }
 
@@ -129,12 +129,12 @@ test "private capture protocol refuses unsafe paths identities ordering and argu
     args[6] = "/private/unexpected_parent";
     try t.expectError(error.InvalidArguments, capture.parse(t.allocator, &args));
     args = captureArgs();
-    args[3] = "A" ** 40;
+    args[3] = &@as([40:0]u8, @splat('A'));
     try t.expectError(error.InvalidSourceIdentity, capture.parse(t.allocator, &args));
     args = captureArgs();
     args[5] = "[]";
     try t.expectError(error.InvalidArguments, capture.parse(t.allocator, &args));
-    args[5] = "x" ** (schema.max_metadata_bytes + 1);
+    args[5] = &@as([(schema.max_metadata_bytes + 1):0]u8, @splat('x'));
     try t.expectError(error.InvalidArguments, capture.parse(t.allocator, &args));
     args = captureArgs();
     try t.expectError(error.InvalidArguments, capture.parse(t.allocator, args[0..20]));
@@ -144,13 +144,13 @@ test "private capture protocol refuses unsafe paths identities ordering and argu
 
 fn captureArgs() [21][]const u8 {
     return .{
-        "/private/collector", "baseline",              "/private/root",
-        "0" ** 40,            "1" ** 40,               "{}",
-        "",                   "/private/raw",          "/private/selected",
-        "/private/zig",       "/private/zig_lib",      "/private/options.zig",
-        "/private/tests.zig", "/private/hyperv",       "/private/build",
-        "/private/proof",     "/private/fixtures.log", "/private/fixture-build-exit.txt",
-        "main",               "/private/tests.zig",    "/private/hyperv",
+        "/private/collector",        "baseline",                  "/private/root",
+        &@as([40:0]u8, @splat('0')), &@as([40:0]u8, @splat('1')), "{}",
+        "",                          "/private/raw",              "/private/selected",
+        "/private/zig",              "/private/zig_lib",          "/private/options.zig",
+        "/private/tests.zig",        "/private/hyperv",           "/private/build",
+        "/private/proof",            "/private/fixtures.log",     "/private/fixture-build-exit.txt",
+        "main",                      "/private/tests.zig",        "/private/hyperv",
     };
 }
 

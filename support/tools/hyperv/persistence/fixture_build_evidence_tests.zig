@@ -17,7 +17,7 @@ const Case = struct {
 
     fn init() !Case {
         serial += 1;
-        const name = try std.fmt.allocPrint(a, "collector-unit-{d}-{d}", .{ std.os.linux.getpid(), serial });
+        const name = try a.print("collector-unit-{d}-{d}", .{ std.os.linux.getpid(), serial });
         errdefer a.free(name);
         try std.Io.Dir.cwd().createDir(io, name, .fromMode(0o700));
         errdefer std.Io.Dir.cwd().deleteTree(io, name) catch @panic("collector test setup cleanup failed");
@@ -72,8 +72,8 @@ const Case = struct {
         const modules = try self.allocator().alloc(schema.Module, 1);
         modules[0] = .{ .name = "main", .root = root, .scope = scope };
         return .{
-            .source_commit = "1" ** 40,
-            .source_tree = "2" ** 40,
+            .source_commit = &@as([40:0]u8, @splat('1')),
+            .source_tree = &@as([40:0]u8, @splat('2')),
             .configured_json = try syntheticConfigured(self.allocator()),
             .parent = "",
             .raw_worker = try self.absolute("raw"),
@@ -110,7 +110,7 @@ test "request rejects unsafe paths ambiguous modules identities and parent phase
     try t.expectError(error.InvalidParentPhase, evidence.validateRequest(bad, false));
     try t.expectError(error.UnsafePath, evidence.validateRequest(request, true));
     bad = request;
-    bad.source_commit = "X" ** 40;
+    bad.source_commit = &@as([40:0]u8, @splat('X'));
     try t.expectError(error.InvalidSourceIdentity, evidence.validateRequest(bad, false));
     bad = request;
     bad.compiler = "/a/../compiler";
@@ -171,7 +171,7 @@ test "tree metadata refuses symbolic links hard links specials and bounds" {
     try link_source.hardLink(io, fixture.dir, "tree/hard", .{});
     try t.expectError(error.UnsafeFile, evidence.observeTree(a, io, path, .{}, false));
     try fixture.dir.deleteFile(io, "tree/hard");
-    const special = try std.fmt.allocPrintSentinel(fixture.allocator(), "{s}/tree/fifo", .{fixture.path}, 0);
+    const special = try fixture.allocator().printSentinel("{s}/tree/fifo", .{fixture.path}, 0);
     const rc = std.os.linux.mknodat(std.os.linux.AT.FDCWD, special, std.os.linux.S.IFIFO | 0o600, 0);
     try t.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(rc));
     try t.expectError(error.UnsafeFile, evidence.observeTree(a, io, path, .{}, false));
@@ -248,7 +248,7 @@ test "stream copy reads full EOF refuses existing outputs and preserves primary 
     try fixture.dir.symLink(io, "input", "alias", .{});
     try t.expectError(error.PathAlreadyExists, evidence.testing.copy(a, io, path, fixture.dir, "alias", 64));
     try t.expectError(error.UnsafeFile, evidence.testing.copy(a, io, try fixture.absolute("alias"), fixture.dir, "bad", 64));
-    const large = "a" ** (64 * 1024 + 1);
+    const large = &@as([(64 * 1024 + 1):0]u8, @splat('a'));
     try fixture.write("large", large);
     try t.expectError(error.InjectedPrimaryFailure, evidence.testing.partialCopy(a, io, try fixture.absolute("large"), fixture.dir, "interrupted"));
     const interrupted = try fixture.dir.openFile(io, "interrupted", .{});
@@ -324,10 +324,10 @@ fn put(comptime T: type, bytes: []u8, offset: usize, value: T) void {
 }
 
 fn workerImage(raw: bool) [768]u8 {
-    var bytes = [_]u8{0} ** 768;
+    var bytes = @as([768]u8, @splat(0));
     @memcpy(bytes[0..7], "\x7fELF\x02\x01\x01");
     put(u16, &bytes, 16, 2);
-    put(u16, &bytes, 18, @intFromEnum(std.elf.EM.AARCH64));
+    put(u16, &bytes, 18, @backingInt(std.elf.EM.AARCH64));
     put(u32, &bytes, 20, 1);
     put(u64, &bytes, 24, 0x400080);
     put(u64, &bytes, 32, 64);
@@ -340,8 +340,8 @@ fn workerImage(raw: bool) [768]u8 {
     put(u16, &bytes, 58, 64);
     put(u16, &bytes, 60, if (raw) 4 else 3);
     put(u16, &bytes, 62, if (raw) 3 else 2);
-    put(u32, &bytes, 64, std.elf.PT_LOAD);
-    put(u32, &bytes, 68, std.elf.PF_R | std.elf.PF_X);
+    put(u32, &bytes, 64, @backingInt(std.elf.PT.LOAD));
+    put(u32, &bytes, 68, @as(u32, @bitCast(std.elf.PF{ .R = true, .X = true })));
     put(u64, &bytes, 80, 0x400000);
     put(u64, &bytes, 88, 0x400000);
     put(u64, &bytes, 96, 256);
@@ -352,8 +352,8 @@ fn workerImage(raw: bool) [768]u8 {
     @memcpy(bytes[strings..][0..names.len], names);
     const text = table + 64;
     put(u32, &bytes, text, 1);
-    put(u32, &bytes, text + 4, std.elf.SHT_PROGBITS);
-    put(u64, &bytes, text + 8, std.elf.SHF_ALLOC | std.elf.SHF_EXECINSTR);
+    put(u32, &bytes, text + 4, @backingInt(std.elf.SHT.PROGBITS));
+    put(u64, &bytes, text + 8, @as(u32, @bitCast(std.elf.SHF{ .ALLOC = true, .EXECINSTR = true })));
     put(u64, &bytes, text + 16, 0x400080);
     put(u64, &bytes, text + 24, 128);
     put(u64, &bytes, text + 32, 16);
@@ -362,14 +362,14 @@ fn workerImage(raw: bool) [768]u8 {
         @memset(bytes[256..320], 0xd7);
         const debug = table + 128;
         put(u32, &bytes, debug, 7);
-        put(u32, &bytes, debug + 4, std.elf.SHT_PROGBITS);
+        put(u32, &bytes, debug + 4, @backingInt(std.elf.SHT.PROGBITS));
         put(u64, &bytes, debug + 24, 256);
         put(u64, &bytes, debug + 32, 64);
         put(u64, &bytes, debug + 48, 1);
     }
     const names_section = table + (if (raw) @as(usize, 192) else 128);
     put(u32, &bytes, names_section, 19);
-    put(u32, &bytes, names_section + 4, std.elf.SHT_STRTAB);
+    put(u32, &bytes, names_section + 4, @backingInt(std.elf.SHT.STRTAB));
     put(u64, &bytes, names_section + 24, strings);
     put(u64, &bytes, names_section + 32, names.len);
     put(u64, &bytes, names_section + 48, 1);
@@ -420,8 +420,8 @@ fn parentImage(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
     @memcpy(bytes[0..7], "\x7fELF\x02\x01\x01");
     put(u16, bytes, 16, 2);
     put(u16, bytes, 18, switch (@import("builtin").cpu.arch) {
-        .aarch64 => @intFromEnum(std.elf.EM.AARCH64),
-        .x86_64 => @intFromEnum(std.elf.EM.X86_64),
+        .aarch64 => @backingInt(std.elf.EM.AARCH64),
+        .x86_64 => @backingInt(std.elf.EM.X86_64),
         else => unreachable,
     });
     put(u32, bytes, 20, 1);
@@ -433,26 +433,26 @@ fn parentImage(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
     put(u16, bytes, 58, 64);
     put(u16, bytes, 60, 5);
     put(u16, bytes, 62, 1);
-    put(u32, bytes, 64, std.elf.PT_LOAD);
-    put(u32, bytes, 68, std.elf.PF_R);
+    put(u32, bytes, 64, @backingInt(std.elf.PT.LOAD));
+    put(u32, bytes, 68, @as(u32, @bitCast(std.elf.PF{ .R = true })));
     put(u64, bytes, 80, parent_address);
     put(u64, bytes, 96, bytes.len);
     put(u64, bytes, 104, bytes.len);
     put(u64, bytes, 112, 4096);
     put(u32, bytes, 192, 1);
-    put(u32, bytes, 196, std.elf.SHT_STRTAB);
+    put(u32, bytes, 196, @backingInt(std.elf.SHT.STRTAB));
     put(u64, bytes, 216, parent_names_offset);
     put(u64, bytes, 224, parent_names.len);
     put(u64, bytes, 240, 1);
     put(u32, bytes, parent_note_section, 11);
-    put(u32, bytes, parent_note_section + 4, std.elf.SHT_NOTE);
-    put(u64, bytes, parent_note_section + 8, std.elf.SHF_ALLOC);
+    put(u32, bytes, parent_note_section + 4, @backingInt(std.elf.SHT.NOTE));
+    put(u64, bytes, parent_note_section + 8, @as(u32, @bitCast(std.elf.SHF{ .ALLOC = true })));
     put(u64, bytes, parent_note_section + 16, parent_address + parent_note_offset);
     put(u64, bytes, parent_note_section + 24, parent_note_offset);
     put(u64, bytes, parent_note_section + 32, note_size);
     put(u64, bytes, parent_note_section + 48, schema.note_alignment);
     put(u32, bytes, 320, 12 + schema.section_name.len);
-    put(u32, bytes, 324, std.elf.SHT_SYMTAB);
+    put(u32, bytes, 324, @backingInt(std.elf.SHT.SYMTAB));
     put(u64, bytes, 344, parent_symbols_offset);
     put(u64, bytes, 352, 48);
     put(u32, bytes, 360, 4);
@@ -460,7 +460,7 @@ fn parentImage(allocator: std.mem.Allocator, payload: []const u8) ![]u8 {
     put(u64, bytes, 368, 8);
     put(u64, bytes, 376, 24);
     put(u32, bytes, 384, 20 + schema.section_name.len);
-    put(u32, bytes, 388, std.elf.SHT_STRTAB);
+    put(u32, bytes, 388, @backingInt(std.elf.SHT.STRTAB));
     put(u64, bytes, 408, parent_symbol_names_offset);
     put(u64, bytes, 416, parent_symbol_names.len);
     put(u64, bytes, 432, 1);
@@ -593,13 +593,13 @@ test "synthetic note transport rejects missing duplicate unloaded executable and
     const original = try parentImage(fixture.allocator(), payload);
     const mutations = [_]struct { offset: usize, width: enum { byte, word, wide }, value: u64 }{
         .{ .offset = parent_note_section, .width = .word, .value = 1 },
-        .{ .offset = parent_note_section + 4, .width = .word, .value = std.elf.SHT_NOBITS },
+        .{ .offset = parent_note_section + 4, .width = .word, .value = @backingInt(std.elf.SHT.NOBITS) },
         .{ .offset = parent_note_section + 8, .width = .wide, .value = 0 },
-        .{ .offset = parent_note_section + 8, .width = .wide, .value = std.elf.SHF_ALLOC | std.elf.SHF_EXECINSTR },
-        .{ .offset = parent_note_section + 8, .width = .wide, .value = std.elf.SHF_ALLOC | std.elf.SHF_WRITE },
+        .{ .offset = parent_note_section + 8, .width = .wide, .value = @as(u32, @bitCast(std.elf.SHF{ .ALLOC = true, .EXECINSTR = true })) },
+        .{ .offset = parent_note_section + 8, .width = .wide, .value = @as(u32, @bitCast(std.elf.SHF{ .ALLOC = true, .WRITE = true })) },
         .{ .offset = parent_note_section + 16, .width = .wide, .value = parent_address + parent_note_offset + 4 },
         .{ .offset = parent_note_section + 48, .width = .wide, .value = 8 },
-        .{ .offset = 68, .width = .word, .value = std.elf.PF_R | std.elf.PF_X },
+        .{ .offset = 68, .width = .word, .value = @as(u32, @bitCast(std.elf.PF{ .R = true, .X = true })) },
         .{ .offset = 96, .width = .wide, .value = parent_note_offset },
         .{ .offset = parent_note_offset, .width = .word, .value = schema.note_name.len - 1 },
         .{ .offset = parent_note_offset + 4, .width = .word, .value = 0 },
@@ -631,7 +631,7 @@ test "synthetic note transport rejects missing duplicate unloaded executable and
     const duplicate_symbol = try fixture.allocator().dupe(u8, original);
     @memcpy(duplicate_symbol[parent_symbols_offset..][0..24], original[parent_symbols_offset + 24 ..][0..24]);
     try t.expectError(error.DuplicateSymbol, evidence.parentMetadata(fixture.allocator(), duplicate_symbol, request));
-    const padded_payload = try std.mem.concat(fixture.allocator(), u8, &.{ payload, " " ** (4 - payload.len % 4), " " });
+    const padded_payload = try std.mem.concat(fixture.allocator(), u8, &.{ payload, &@as([(4 - payload.len % 4):0]u8, @splat(' ')), " " });
     const padding = try parentImage(fixture.allocator(), padded_payload);
     _ = try evidence.parentMetadata(fixture.allocator(), padding, request);
     padding[padding.len - 1] = 1;
@@ -646,11 +646,11 @@ test "synthetic PROGBITS transport is limited to the self hosted x86 Debug repre
     defer fixture.close();
     const request = try fixture.request();
     const bytes = try parentImage(fixture.allocator(), &@import("fixture_parent_metadata.zig").payload);
-    put(u32, bytes, parent_note_section + 4, std.elf.SHT_PROGBITS);
-    put(u64, bytes, parent_note_section + 8, std.elf.SHF_ALLOC | std.elf.SHF_WRITE);
+    put(u32, bytes, parent_note_section + 4, @backingInt(std.elf.SHT.PROGBITS));
+    put(u64, bytes, parent_note_section + 8, @as(u32, @bitCast(std.elf.SHF{ .ALLOC = true, .WRITE = true })));
     bytes[parent_symbols_offset + 28] = std.elf.STT_OBJECT;
     const builtin = @import("builtin");
-    if (builtin.zig_backend == .stage2_x86_64 and builtin.mode == .Debug) {
+    if (builtin.zig_backend == .stage2_x86_64 and builtin.mode == .debug) {
         _ = try evidence.parentMetadata(fixture.allocator(), bytes, request);
     } else try t.expectError(error.InvalidBuildMetadata, evidence.parentMetadata(fixture.allocator(), bytes, request));
 }
@@ -690,7 +690,7 @@ test "synthetic collection retains exact bytes full envelopes and failed origina
     try t.expect(std.mem.indexOf(u8, report_bytes, "\"passed\"") == null);
     const files_expected = [_][]const u8{ parent_bytes, &raw_bytes, selected_bytes[0..512] };
     for ([_][]const u8{ "parent-test", "worker-raw", "worker-selected" }, files_expected) |name, expected| {
-        const relative = try std.fmt.allocPrint(fixture.allocator(), "capture/evidence/{s}", .{name});
+        const relative = try fixture.allocator().print("capture/evidence/{s}", .{name});
         const actual = try fixture.dir.readFileAlloc(io, relative, a, .limited(schema.max_parent_bytes));
         defer a.free(actual);
         try t.expectEqualSlices(u8, expected, actual);

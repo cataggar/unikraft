@@ -52,27 +52,27 @@ pub const Identities = struct {
     data_uuid: if (profile.compute) ?[]const u8 else []const u8,
 
     fn validate(self: Identities) !void {
-        inline for (std.meta.fields(Identities)) |field| {
-            const value = @field(self, field.name);
-            if (comptime @typeInfo(field.type) == .optional) {
+        inline for (@typeInfo(Identities).@"struct".field_names) |field| {
+            const value = @field(self, field);
+            if (comptime @typeInfo(@TypeOf(value)) == .optional) {
                 if (value != null) return error.UnexpectedDataDisk;
             } else if (value.len == 0) return error.MissingIdentity;
         }
     }
 
     fn equal(a: Identities, b: Identities) bool {
-        inline for (std.meta.fields(Identities)) |field| {
-            if (comptime @typeInfo(field.type) == .optional) {
-                if (@field(a, field.name) != null or @field(b, field.name) != null) return false;
-            } else if (!std.mem.eql(u8, @field(a, field.name), @field(b, field.name))) return false;
+        inline for (@typeInfo(Identities).@"struct".field_names) |field| {
+            if (comptime @typeInfo(@TypeOf(@field(a, field))) == .optional) {
+                if (@field(a, field) != null or @field(b, field) != null) return false;
+            } else if (!std.mem.eql(u8, @field(a, field), @field(b, field))) return false;
         }
         return true;
     }
 
     fn clone(self: Identities, allocator: std.mem.Allocator) !Identities {
         var result: Identities = undefined;
-        inline for (std.meta.fields(Identities)) |field|
-            @field(result, field.name) = if (comptime @typeInfo(field.type) == .optional) null else try allocator.dupe(u8, @field(self, field.name));
+        inline for (@typeInfo(Identities).@"struct".field_names) |field|
+            @field(result, field) = if (comptime @typeInfo(@TypeOf(@field(self, field))) == .optional) null else try allocator.dupe(u8, @field(self, field));
         return result;
     }
 };
@@ -490,14 +490,14 @@ pub fn checkEligibility(
 
 fn checkClaims(io: std.Io, directory: std.Io.Dir, scope: Scope) !void {
     var buffer: [128]u8 = undefined;
-    const attempt_name = try std.fmt.bufPrint(&buffer, "attempt-{s}", .{scope.attempt_id});
+    const attempt_name = try std.mem.print(&buffer, "attempt-{s}", .{scope.attempt_id});
     try requireAbsentDirectory(io, directory, attempt_name);
     const identity_name = if (profile.compute)
-        try std.fmt.bufPrint(&buffer, "compute-{s}", .{scope.source_tree})
+        try std.mem.print(&buffer, "compute-{s}", .{scope.source_tree})
     else
-        try std.fmt.bufPrint(&buffer, "{s}-{s}", .{ scope.run_id, scope.disk_id });
+        try std.mem.print(&buffer, "{s}-{s}", .{ scope.run_id, scope.disk_id });
     try requireAbsentDirectory(io, directory, identity_name);
-    const digest_name = try std.fmt.bufPrint(&buffer, "sha256-{s}", .{if (profile.compute) scope.os_vhd.sha256 else scope.seed_vhd.sha256});
+    const digest_name = try std.mem.print(&buffer, "sha256-{s}", .{if (profile.compute) scope.os_vhd.sha256 else scope.seed_vhd.sha256});
     try requireAbsentDirectory(io, directory, digest_name);
 }
 
@@ -790,7 +790,13 @@ pub const Store = struct {
     /// identities; revalidating this writer never reloads scope or clears refusal.
     fn writerReady(self: *Store) !void {
         if (self.finished) return error.AlreadyFinished;
-        errdefer |err| self.recordingFailed(err);
+        self.validateWriter() catch |err| {
+            self.recordingFailed(err);
+            return err;
+        };
+    }
+
+    fn validateWriter(self: *Store) !void {
         try validatePrivateDirectory(self.directory.dir);
         const held = self.writer.file orelse return error.LockNotHeld;
         try validatePrivate(held, false);
@@ -840,18 +846,18 @@ pub const Store = struct {
         defer ledger_writer.close(self.io);
         const s = self.scope.value;
         var buffer: [128]u8 = undefined;
-        const attempt_name = try std.fmt.bufPrint(&buffer, "attempt-{s}", .{s.attempt_id});
+        const attempt_name = try std.mem.print(&buffer, "attempt-{s}", .{s.attempt_id});
         const attempt = try createDirectory(self.io, ledger_directory.dir, attempt_name, self.take(.directory_sync));
         attempt.close(self.io);
         if (self.take(.after_first_reservation)) return error.Injected;
         const identity_name = if (profile.compute)
-            try std.fmt.bufPrint(&buffer, "compute-{s}", .{s.source_tree})
+            try std.mem.print(&buffer, "compute-{s}", .{s.source_tree})
         else
-            try std.fmt.bufPrint(&buffer, "{s}-{s}", .{ s.run_id, s.disk_id });
+            try std.mem.print(&buffer, "{s}-{s}", .{ s.run_id, s.disk_id });
         const identity = try createDirectory(self.io, ledger_directory.dir, identity_name, false);
         defer identity.close(self.io);
         if (self.take(.after_identity_reservation)) return error.Injected;
-        const digest_name = try std.fmt.bufPrint(&buffer, "sha256-{s}", .{if (profile.compute) s.os_vhd.sha256 else s.seed_vhd.sha256});
+        const digest_name = try std.mem.print(&buffer, "sha256-{s}", .{if (profile.compute) s.os_vhd.sha256 else s.seed_vhd.sha256});
         const digest = try createDirectory(self.io, ledger_directory.dir, digest_name, false);
         digest.close(self.io);
         var identity_writer = try identity.lock(self.io);
@@ -885,7 +891,13 @@ pub const Store = struct {
         }
         // The failing phase is observable even if its event append fails.
         self.phase = phase;
-        errdefer |err| self.recordingFailed(err);
+        self.appendEvent(phase) catch |err| {
+            self.recordingFailed(err);
+            return err;
+        };
+    }
+
+    fn appendEvent(self: *Store, phase: Phase) !void {
         const bytes = try encode(self.allocator, Event{ .phase = phase, .reserved_boots = self.reserved_boots });
         defer self.allocator.free(bytes);
         var expected_hash = self.event_hash;
@@ -920,9 +932,9 @@ pub const Store = struct {
     pub fn captureSources(self: *Store, boot: u8, poll: u8) !CaptureSources {
         try validateCaptureIndex(boot, poll);
         var name: [80]u8 = undefined;
-        const serial = try self.pinFile(try std.fmt.bufPrint(&name, "boot{d}-candidate.log", .{boot}), cli_limit);
-        const wrapper = try self.pinFile(try std.fmt.bufPrint(&name, "boot{d}-serial-{d}.json", .{ boot, poll }), cli_limit);
-        const vm = try self.pinFile(try std.fmt.bufPrint(&name, "boot{d}-vm.json", .{boot}), cli_limit);
+        const serial = try self.pinFile(try std.mem.print(&name, "boot{d}-candidate.log", .{boot}), cli_limit);
+        const wrapper = try self.pinFile(try std.mem.print(&name, "boot{d}-serial-{d}.json", .{ boot, poll }), cli_limit);
+        const vm = try self.pinFile(try std.mem.print(&name, "boot{d}-vm.json", .{boot}), cli_limit);
         return .{ .serial = serial, .cli_wrapper = wrapper, .vm_observation = vm };
     }
 
@@ -942,19 +954,19 @@ pub const Store = struct {
             if (self.boot2_capture != null) return error.PathAlreadyExists;
         }
         var name: [80]u8 = undefined;
-        try self.verifyFile(try std.fmt.bufPrint(&name, "boot{d}-serial-{d}.json", .{ boot, poll }), sources.cli_wrapper, cli_limit);
-        try self.verifyFile(try std.fmt.bufPrint(&name, "boot{d}-vm.json", .{boot}), sources.vm_observation, cli_limit);
+        try self.verifyFile(try std.mem.print(&name, "boot{d}-serial-{d}.json", .{ boot, poll }), sources.cli_wrapper, cli_limit);
+        try self.verifyFile(try std.mem.print(&name, "boot{d}-vm.json", .{boot}), sources.vm_observation, cli_limit);
         var candidate_name: [80]u8 = undefined;
-        const candidate = try std.fmt.bufPrint(&candidate_name, "boot{d}-candidate.log", .{boot});
+        const candidate = try std.mem.print(&candidate_name, "boot{d}-candidate.log", .{boot});
         var log_name: [80]u8 = undefined;
-        const log = try std.fmt.bufPrint(&log_name, "boot{d}.log", .{boot});
+        const log = try std.mem.print(&log_name, "boot{d}.log", .{boot});
         const raw = try self.publishRaw(candidate, log, sources.serial);
         const serial_sha = raw.hex();
         const wrapper_sha = sources.cli_wrapper.hex();
         const scope_sha = self.scope_pin.hex();
         const vm_sha = sources.vm_observation.hex();
         const first_sha = if (boot == 1) raw.hex() else self.boot1.?.serial.hex();
-        const admission_sha = if (self.boot2) |admission| admission.admission.hex() else [_]u8{0} ** 64;
+        const admission_sha = if (self.boot2) |admission| admission.admission.hex() else @as([64]u8, @splat(0));
         var capture_record: CaptureRecord = .{
             .boot = boot,
             .poll = poll,
@@ -979,7 +991,7 @@ pub const Store = struct {
             var first = try self.directory.readSensitive(self.io, self.allocator, "boot1.log", cli_limit, if (boot == 1) raw.sha256 else self.boot1.?.serial.sha256);
             defer first.deinit();
             const result = try direct.checkSerial(self.allocator, if (boot == 1) current.bytes() else try direct.secondBytes(current.bytes(), first.bytes(), self.scope.value.serial_mode), self.scope.value.identity);
-            const result_pin = try self.record(try std.fmt.bufPrint(&name, "boot{d}-compute.json", .{boot}), .{
+            const result_pin = try self.record(try std.mem.print(&name, "boot{d}-compute.json", .{boot}), .{
                 .schema = "uk.wamr.direct-boot-result",
                 .version = @as(u8, 1),
                 .attempt_id = self.scope.value.attempt_id,
@@ -998,7 +1010,7 @@ pub const Store = struct {
             capture_record.compute_result_sha256 = &compute_sha;
             capture_record.serial_bytes = raw.metadata.size;
         }
-        const record_name = try std.fmt.bufPrint(&name, "boot{d}-capture.json", .{boot});
+        const record_name = try std.mem.print(&name, "boot{d}-capture.json", .{boot});
         const pin = try self.record(record_name, capture_record);
         if (boot == 1) {
             self.identities = try ids.clone(self.scope.arena.allocator());
@@ -1065,11 +1077,11 @@ pub const Store = struct {
 
     fn verifyComputeResult(self: *Store, boot: u8) !void {
         var name: [80]u8 = undefined;
-        var bytes = try self.directory.readSensitive(self.io, self.allocator, try std.fmt.bufPrint(&name, "boot{d}-capture.json", .{boot}), record_limit, null);
+        var bytes = try self.directory.readSensitive(self.io, self.allocator, try std.mem.print(&name, "boot{d}-capture.json", .{boot}), record_limit, null);
         defer bytes.deinit();
         const capture_record = try direct.parse(CaptureRecord, self.allocator, bytes.bytes());
         defer capture_record.deinit();
-        const pin = try self.pinFile(try std.fmt.bufPrint(&name, "boot{d}-compute.json", .{boot}), record_limit);
+        const pin = try self.pinFile(try std.mem.print(&name, "boot{d}-compute.json", .{boot}), record_limit);
         if (!std.mem.eql(u8, &pin.sha256, &try core.contracts.parseSha256(capture_record.value.compute_result_sha256)))
             return error.HashMismatch;
     }
@@ -1114,7 +1126,13 @@ pub const Store = struct {
     }
 
     fn record(self: *Store, name: []const u8, value: anytype) !FileSnapshot {
-        errdefer |err| self.recordingFailed(err);
+        return self.recordImpl(name, value) catch |err| {
+            self.recordingFailed(err);
+            return err;
+        };
+    }
+
+    fn recordImpl(self: *Store, name: []const u8, value: anytype) !FileSnapshot {
         const bytes = try encode(self.allocator, value);
         defer self.allocator.free(bytes);
         try requireDurable(try self.immutable(&self.writer, name, bytes));
@@ -1124,8 +1142,10 @@ pub const Store = struct {
     }
 
     fn immutable(self: *Store, writer: *files.Locked, name: []const u8, bytes: []const u8) !files.CommitResult {
-        errdefer |err| self.recordingFailed(err);
-        const result = try self.immutableResult(writer, name, bytes);
+        const result = self.immutableResult(writer, name, bytes) catch |err| {
+            self.recordingFailed(err);
+            return err;
+        };
         requireDurable(result) catch |err| self.recordingFailed(err);
         return result;
     }
@@ -1248,7 +1268,13 @@ pub const Store = struct {
     }
 
     fn commitRaw(self: *Store, atomic: *std.Io.File.Atomic, destination: []const u8, expected: Digest) !FileSnapshot {
-        errdefer |err| self.recordingFailed(err);
+        return self.commitRawImpl(atomic, destination, expected) catch |err| {
+            self.recordingFailed(err);
+            return err;
+        };
+    }
+
+    fn commitRawImpl(self: *Store, atomic: *std.Io.File.Atomic, destination: []const u8, expected: Digest) !FileSnapshot {
         if (self.take(.raw_file_sync)) return error.NotCommitted;
         try atomic.file.sync(self.io);
         if (self.take(.raw_publication)) return error.PublicationUnknown;

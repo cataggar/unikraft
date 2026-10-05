@@ -21,20 +21,12 @@ pub fn selectInterpreter(
             const runtime_sealed = sealed orelse
                 return error.AzureRuntimeNotPinned;
             var home_buffer: [64]u8 = undefined;
-            const home = try std.fmt.bufPrint(
-                &home_buffer,
-                "/proc/self/fd/{d}",
-                .{runtime_sealed.root.handle},
-            );
+            const home = try std.mem.print(&home_buffer, "/proc/self/fd/{d}", .{runtime_sealed.root.handle});
             try environment.azure.put("PYTHONHOME", home);
             var extensions_buffer: [80]u8 = undefined;
             try environment.azure.put(
                 "AZURE_EXTENSION_DIR",
-                try std.fmt.bufPrint(
-                    &extensions_buffer,
-                    "{s}/extensions",
-                    .{home},
-                ),
+                try std.mem.print(&extensions_buffer, "{s}/extensions", .{home}),
             );
             try environment.azure.put(
                 "AZURE_EXTENSION_USE_DYNAMIC_INSTALL",
@@ -121,24 +113,10 @@ pub fn check(adapter: runtime.Runtime, writer: *core.private_files.Locked, azure
     status.child = result;
     // Preserve primary, cleanup and recording failures independently before
     // interpreting output. Child bytes never appear in the public diagnostic.
-    {
-        errdefer |err| status.recording_error = err;
-        const record = try custody.encode(adapter.allocator, .{
-            .schema = "uk.hyperv.local-cli-startup",
-            .version = @as(u8, 1),
-            .authority = "not_admitted",
-            .capture = result.capture,
-            .stdout_bytes = result.stdout_bytes,
-            .stderr_bytes = result.stderr_bytes,
-            .cleanup_complete = result.execution.cleanup_complete,
-            .failures = result.execution.failures,
-            .termination = result.execution.termination,
-            .azure = azure,
-            .interpreter = adapter.interpreter,
-        });
-        defer adapter.allocator.free(record);
-        try custody.requireDurable(try writer.createImmutable(adapter.io, "cli-version.process.json", record));
-    }
+    recordStartup(adapter, writer, azure, result) catch |err| {
+        status.recording_error = err;
+        return err;
+    };
     if (!result.execution.cleanup_complete or result.execution.unreaped_group != null) return error.CliStartupCleanupFailed;
     if (!result.succeeded()) return error.CliStartupFailed;
     if (result.stderr_bytes != 0) return error.CliStartupStderr;
@@ -147,6 +125,24 @@ pub fn check(adapter: runtime.Runtime, writer: *core.private_files.Locked, azure
     var bytes = try writer.directory.readSensitive(adapter.io, adapter.allocator, "cli-version.stdout", 4096, null);
     defer bytes.deinit();
     try validateVersion(adapter.allocator, bytes.bytes());
+}
+
+fn recordStartup(adapter: runtime.Runtime, writer: *core.private_files.Locked, azure: custody.Reference, result: core.process.PrivateResult) !void {
+    const record = try custody.encode(adapter.allocator, .{
+        .schema = "uk.hyperv.local-cli-startup",
+        .version = @as(u8, 1),
+        .authority = "not_admitted",
+        .capture = result.capture,
+        .stdout_bytes = result.stdout_bytes,
+        .stderr_bytes = result.stderr_bytes,
+        .cleanup_complete = result.execution.cleanup_complete,
+        .failures = result.execution.failures,
+        .termination = result.execution.termination,
+        .azure = azure,
+        .interpreter = adapter.interpreter,
+    });
+    defer adapter.allocator.free(record);
+    try custody.requireDurable(try writer.createImmutable(adapter.io, "cli-version.process.json", record));
 }
 
 pub fn standalone(init: std.process.Init, args: []const []const u8) !u8 {

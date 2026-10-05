@@ -51,7 +51,7 @@ pub const PersistenceNetwork = struct {
             .nsg => .nsg,
             .vnet => .vnet,
             .nic => .nic,
-        }, .name = try std.fmt.allocPrint(a, "{s}-{s}", .{ self.prefix, @tagName(self.kind) }) };
+        }, .name = try a.print("{s}-{s}", .{ self.prefix, @tagName(self.kind) }) };
     }
 };
 pub const Storage = struct { name: []const u8 };
@@ -136,32 +136,32 @@ pub const Plan = struct {
         const group = try authority.groupPath(a);
         switch (operation) {
             .subscription => {
-                plan.path = try std.fmt.allocPrint(a, "/subscriptions/{s}", .{authority.subscription});
+                plan.path = try a.print("/subscriptions/{s}", .{authority.subscription});
                 plan.version = "2022-12-01";
             },
-            .providers => plan.path = try std.fmt.allocPrint(a, "/subscriptions/{s}/providers", .{authority.subscription}),
-            .provider => |provider| plan.path = try std.fmt.allocPrint(a, "/subscriptions/{s}/providers/{s}", .{ authority.subscription, provider.wire() }),
+            .providers => plan.path = try a.print("/subscriptions/{s}/providers", .{authority.subscription}),
+            .provider => |provider| plan.path = try a.print("/subscriptions/{s}/providers/{s}", .{ authority.subscription, provider.wire() }),
             .skus => {
-                plan.path = try std.fmt.allocPrint(a, "/subscriptions/{s}/providers/Microsoft.Compute/skus", .{authority.subscription});
+                plan.path = try a.print("/subscriptions/{s}/providers/Microsoft.Compute/skus", .{authority.subscription});
                 plan.version = "2021-07-01";
                 plan.provider = "Microsoft.Compute";
-                plan.filter = try std.fmt.allocPrint(a, "location eq '{s}'", .{authority.location});
+                plan.filter = try a.print("location eq '{s}'", .{authority.location});
             },
             .usage => {
-                plan.path = try std.fmt.allocPrint(a, "/subscriptions/{s}/providers/Microsoft.Compute/locations/{s}/usages", .{ authority.subscription, authority.location });
+                plan.path = try a.print("/subscriptions/{s}/providers/Microsoft.Compute/locations/{s}/usages", .{ authority.subscription, authority.location });
                 plan.version = "2025-11-01";
                 plan.provider = "Microsoft.Compute";
             },
             .quota => |quota| {
                 try s.name(quota);
-                plan.path = try std.fmt.allocPrint(a, "/subscriptions/{s}/providers/Microsoft.Compute/locations/{s}/providers/Microsoft.Quota/quotas/{s}", .{ authority.subscription, authority.location, quota });
+                plan.path = try a.print("/subscriptions/{s}/providers/Microsoft.Compute/locations/{s}/providers/Microsoft.Quota/quotas/{s}", .{ authority.subscription, authority.location, quota });
                 plan.version = "2023-02-01";
                 plan.provider = "Microsoft.Quota";
             },
-            .inventory => plan.path = try std.fmt.allocPrint(a, "{s}/resources", .{group}),
+            .inventory => plan.path = try a.print("{s}/resources", .{group}),
             .list => |kind| {
                 if (kind == .group or kind == .subnet or kind == .gallery_image or kind == .gallery_version) return error.InvalidOperation;
-                plan.path = try std.fmt.allocPrint(a, "{s}/providers/{s}/{s}", .{ group, kind.provider(), kind.resourceType() });
+                plan.path = try a.print("{s}/providers/{s}/{s}", .{ group, kind.provider(), kind.resourceType() });
                 plan.version = kind.version();
                 plan.provider = kind.provider();
             },
@@ -298,9 +298,9 @@ pub const Plan = struct {
                 plan.method = .DELETE;
             },
         }
-        plan.url = try std.fmt.allocPrint(a, "{s}{s}?api-version={s}", .{ s.arm_host, plan.path, plan.version });
-        if (operation == .skus) plan.url = try std.fmt.allocPrint(a, "{s}&$filter=location%20eq%20%27{s}%27", .{ plan.url, authority.location });
-        if (operation == .boot_diagnostics) plan.url = try std.fmt.allocPrint(a, "{s}&sasUriExpirationTimeInMinutes=10", .{plan.url});
+        plan.url = try a.print("{s}{s}?api-version={s}", .{ s.arm_host, plan.path, plan.version });
+        if (operation == .skus) plan.url = try a.print("{s}&$filter=location%20eq%20%27{s}%27", .{ plan.url, authority.location });
+        if (operation == .boot_diagnostics) plan.url = try a.print("{s}&sasUriExpirationTimeInMinutes=10", .{plan.url});
         if (plan.body) |body| if (body.len > 256 * 1024) return error.InvalidBody;
         try plan.validateInitialUrl(a);
         return plan;
@@ -314,7 +314,7 @@ pub const Plan = struct {
     }
 
     fn resource(self: *Plan, a: std.mem.Allocator, authority: s.Authority, target: s.Ref, suffix: []const u8) !void {
-        self.path = try std.fmt.allocPrint(a, "{s}{s}", .{ try target.path(a, authority), suffix });
+        self.path = try a.print("{s}{s}", .{ try target.path(a, authority), suffix });
         self.version = target.kind.version();
         self.provider = target.kind.provider();
         self.target = target;
@@ -418,8 +418,8 @@ pub fn uploadGeometry(size_gib: u32, bytes: u64) !void {
 }
 
 fn persistenceNetworkBody(a: std.mem.Allocator, authority: s.Authority, network: PersistenceNetwork) ![]u8 {
-    const nsg: s.Ref = .{ .kind = .nsg, .name = try std.fmt.allocPrint(a, "{s}-nsg", .{network.prefix}) };
-    const subnet: s.Ref = .{ .kind = .subnet, .parent = try std.fmt.allocPrint(a, "{s}-vnet", .{network.prefix}), .name = "default" };
+    const nsg: s.Ref = .{ .kind = .nsg, .name = try a.print("{s}-nsg", .{network.prefix}) };
+    const subnet: s.Ref = .{ .kind = .subnet, .parent = try a.print("{s}-vnet", .{network.prefix}), .name = "default" };
     return switch (network.kind) {
         .nsg => encode(a, .{ .location = authority.location, .tags = ownerTags(authority), .properties = .{ .securityRules = &[_]struct {}{} } }),
         .vnet => encode(a, .{ .location = authority.location, .tags = ownerTags(authority), .properties = .{

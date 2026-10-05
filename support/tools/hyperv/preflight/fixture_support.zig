@@ -8,7 +8,7 @@ pub const vm: c.Uuid = "10234567-89ab-4cde-8fab-0123456789ab".*;
 pub const disk: c.Uuid = "20234567-89ab-4cde-8fab-0123456789ab".*;
 pub const principal: c.Uuid = "30234567-89ab-4cde-8fab-0123456789ab".*;
 pub const boot: c.Uuid = "40234567-89ab-4cde-8fab-0123456789ab".*;
-pub const seed = [_]u8{0x47} ** 32;
+pub const seed = @as([32]u8, @splat(0x47));
 
 pub const Context = struct {
     arena: std.heap.ArenaAllocator,
@@ -25,7 +25,7 @@ pub const Context = struct {
     orphan_action: ?c.Action = null,
     flood_action: ?c.Action = null,
     private_transfers: usize = 0,
-    calls: [c.action_count]u8 = [_]u8{0} ** c.action_count,
+    calls: [c.action_count]u8 = @as([c.action_count]u8, @splat(0)),
 
     pub fn init(a: std.mem.Allocator, io: std.Io, directory: pf.core.private_files.Directory, root: []const u8) !Context {
         var arena = std.heap.ArenaAllocator.init(a);
@@ -162,7 +162,7 @@ pub const Context = struct {
         return .{ .input = &self.input, .signer = &self.signer, .backend_context = self, .backendFn = backend, .now = now, .monotonic_ns = try pf.core.process.monotonicNanoseconds(), .operator_boot_id = boot };
     }
     fn before(self: *Context, action: c.Action) !void {
-        self.calls[@intFromEnum(action)] += 1;
+        self.calls[@backingInt(action)] += 1;
         self.last = .{ .effect = .not_started, .diagnostic = .{ .stage = .admission, .category = .internal } };
         if (self.orphan_action == action) {
             const child = std.os.linux.fork();
@@ -171,7 +171,7 @@ pub const Context = struct {
                 const duration: std.os.linux.timespec = .{ .sec = 1, .nsec = 0 };
                 _ = std.os.linux.nanosleep(&duration, null);
             };
-            const pid = try std.fmt.allocPrint(self.arena.allocator(), "{d}", .{child});
+            const pid = try self.arena.allocator().print("{d}", .{child});
             try self.directory.dir.writeFile(self.io, .{ .sub_path = "synthetic-descendant.pid", .data = pid, .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) } });
             try self.io.sleep(.fromSeconds(60), .awake);
         }

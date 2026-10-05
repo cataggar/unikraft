@@ -124,7 +124,7 @@ pub const Client = struct {
 
     pub fn command(self: *Client, phase: p.Phase, now: u64) ![]u8 {
         try self.authorized(now);
-        const name = try std.fmt.allocPrint(self.allocator, "runs/{s}/commands/{s}.json", .{ p.uuidText(self.scope.run_id), @tagName(phase) });
+        const name = try self.allocator.print("runs/{s}/commands/{s}.json", .{ p.uuidText(self.scope.run_id), @tagName(phase) });
         defer self.allocator.free(name);
         const url = try self.blobUrl(name);
         defer self.allocator.free(url);
@@ -177,7 +177,7 @@ pub const Client = struct {
             if (name.len != 10 or !std.mem.startsWith(u8, name, "boot-") or !std.mem.endsWith(u8, name, ".log") or name[5] < '0' or name[5] > '5') return error.InvalidEvidenceRole;
             if ((phase == .public and name[5] > '1') or (phase == .private and name[5] < '2')) return error.InvalidEvidenceRole;
         }
-        const path = try std.fmt.allocPrint(self.allocator, "runs/{s}/evidence/{s}/{s}/{s}", .{ p.uuidText(self.scope.run_id), @tagName(phase), p.uuidText(nonce), name });
+        const path = try self.allocator.print("runs/{s}/evidence/{s}/{s}/{s}", .{ p.uuidText(self.scope.run_id), @tagName(phase), p.uuidText(nonce), name });
         defer self.allocator.free(path);
         const url = try self.blobUrl(path);
         defer self.allocator.free(url);
@@ -187,7 +187,7 @@ pub const Client = struct {
         try request.setHeader("If-None-Match", "*");
         try request.setHeader("x-ms-blob-type", "BlockBlob");
         var length: [24]u8 = undefined;
-        try request.setHeader("Content-Length", try std.fmt.bufPrint(&length, "{d}", .{bytes.len}));
+        try request.setHeader("Content-Length", try std.mem.print(&length, "{d}", .{bytes.len}));
         var md5: [16]u8 = undefined;
         std.crypto.hash.Md5.hash(bytes, &md5, .{});
         var encoded: [24]u8 = undefined;
@@ -223,7 +223,7 @@ pub const Client = struct {
 
     fn blobUrl(self: *Client, name: []const u8) ![]u8 {
         try self.scope.validate();
-        return std.fmt.allocPrint(self.allocator, "https://{s}.blob.core.windows.net/{s}/{s}", .{ self.scope.account, self.scope.container, name });
+        return self.allocator.print("https://{s}.blob.core.windows.net/{s}/{s}", .{ self.scope.account, self.scope.container, name });
     }
 
     fn headers(self: *Client, request: *sdk.http.Request, metadata: bool) !void {

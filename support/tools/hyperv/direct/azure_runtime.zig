@@ -197,7 +197,7 @@ pub fn ensureNamespace(init: std.process.Init) !void {
         null,
     );
     for (arguments, 0..) |argument, index|
-        argv[index] = (try allocator.dupeZ(u8, argument)).ptr;
+        argv[index] = (try allocator.dupeSentinel(u8, argument, 0)).ptr;
 
     var environment = std.process.Environ.Map.init(allocator);
     var entries = init.environ_map.iterator();
@@ -214,38 +214,26 @@ pub fn ensureNamespace(init: std.process.Init) !void {
     var uid_value_buffer: [32]u8 = undefined;
     try environment.put(
         files.namespace_uid,
-        try std.fmt.bufPrint(&uid_value_buffer, "{d}", .{uid}),
+        try std.mem.print(&uid_value_buffer, "{d}", .{uid}),
     );
     var gid_value_buffer: [32]u8 = undefined;
     try environment.put(
         files.namespace_gid,
-        try std.fmt.bufPrint(&gid_value_buffer, "{d}", .{gid}),
+        try std.mem.print(&gid_value_buffer, "{d}", .{gid}),
     );
     var parent_value_buffer: [32]u8 = undefined;
     try environment.put(
         files.namespace_parent,
-        try std.fmt.bufPrint(
-            &parent_value_buffer,
-            "{d}",
-            .{linux.getpid()},
-        ),
+        try std.mem.print(&parent_value_buffer, "{d}", .{linux.getpid()}),
     );
     const block = try environment.createPosixBlock(
         allocator,
         .{ .zig_progress_fd = -1 },
     );
     var uid_buffer: [64]u8 = undefined;
-    const uid_map = try std.fmt.bufPrint(
-        &uid_buffer,
-        "{d} {d} 1\n",
-        .{ 0, uid },
-    );
+    const uid_map = try std.mem.print(&uid_buffer, "{d} {d} 1\n", .{ 0, uid });
     var gid_buffer: [64]u8 = undefined;
-    const gid_map = try std.fmt.bufPrint(
-        &gid_buffer,
-        "{d} {d} 1\n",
-        .{ 0, gid },
-    );
+    const gid_map = try std.mem.print(&gid_buffer, "{d} {d} 1\n", .{ 0, gid });
 
     var report: [2]linux.fd_t = undefined;
     if (linux.errno(linux.pipe2(&report, .{ .CLOEXEC = true })) != .SUCCESS)
@@ -322,8 +310,8 @@ pub const NamespaceStage = enum(u8) {
     }
 
     pub fn fromCode(code: u8) ?NamespaceStage {
-        inline for (@typeInfo(NamespaceStage).@"enum".fields) |field|
-            if (field.value == code) return @field(NamespaceStage, field.name);
+        inline for (@typeInfo(NamespaceStage).@"enum".field_names, @typeInfo(NamespaceStage).@"enum".field_values) |name, value|
+            if (value == code) return @field(NamespaceStage, name);
         return null;
     }
 };
@@ -366,7 +354,7 @@ pub fn readNamespaceReport(descriptor: linux.fd_t) NamespaceReport {
 }
 
 fn childRefusal(descriptor: linux.fd_t, stage: NamespaceStage) noreturn {
-    const marker = [_]u8{@intFromEnum(stage)};
+    const marker = [_]u8{@backingInt(stage)};
     _ = linux.write(descriptor, &marker, marker.len);
     linux.exit_group(126);
 }
@@ -374,13 +362,13 @@ fn childRefusal(descriptor: linux.fd_t, stage: NamespaceStage) noreturn {
 fn waitNamespaceChild(pid: linux.pid_t) !u8 {
     while (true) {
         var status: u32 = 0;
-        const waited = linux.waitpid(pid, &status, 0);
+        const waited = linux.waitpid(pid, @ptrCast(&status), 0);
         switch (linux.errno(waited)) {
             .SUCCESS => {
                 if (linux.W.IFEXITED(status)) return linux.W.EXITSTATUS(status);
                 if (linux.W.IFSIGNALED(status)) return @intCast(@min(
                     255,
-                    128 + @intFromEnum(linux.W.TERMSIG(status)),
+                    128 + @backingInt(linux.W.TERMSIG(status)),
                 ));
                 return 1;
             },
@@ -592,7 +580,7 @@ pub fn seal(
     errdefer for (parents[0..parent_count]) |parent|
         parent.directory.close(io);
 
-    const root_path = try allocator.dupeZ(u8, contract.root);
+    const root_path = try allocator.dupeSentinel(u8, contract.root, 0);
     defer allocator.free(root_path);
     var options_buffer: [160]u8 = undefined;
     const mount_bytes = try std.math.add(
@@ -605,11 +593,7 @@ pub fn seal(
         @as(u64, contract.observed.files) + contract.observed.directories,
         1024,
     );
-    const options = try std.fmt.bufPrintZ(
-        &options_buffer,
-        "mode=0700,size={d},nr_inodes={d}",
-        .{ mount_bytes, inode_count },
-    );
+    const options = try std.mem.printSentinel(&options_buffer, "mode=0700,size={d},nr_inodes={d}", .{ mount_bytes, inode_count }, 0);
     if (linux.errno(linux.mount(
         "tmpfs",
         root_path,
@@ -893,7 +877,7 @@ pub const Test = struct {
 
 fn dropNamespaceAuthority() !void {
     if (linux.errno(linux.prctl(
-        @intFromEnum(linux.PR.SET_NO_NEW_PRIVS),
+        @backingInt(linux.PR.SET_NO_NEW_PRIVS),
         1,
         0,
         0,
@@ -903,16 +887,14 @@ fn dropNamespaceAuthority() !void {
         return error.AzureRuntimeIsolationUnavailable;
     const Header = extern struct { version: u32, pid: i32 };
     var header: Header = .{ .version = 0x20080522, .pid = 0 };
-    const data = [_]linux.cap_user_data_t{
-        std.mem.zeroes(linux.cap_user_data_t),
-    } ** 2;
+    const data = @as([2]linux.cap_user_data_t, @splat(std.mem.zeroes(linux.cap_user_data_t)));
     if (linux.errno(linux.syscall2(
         .capset,
         @intFromPtr(&header),
         @intFromPtr(&data),
     )) != .SUCCESS or
         linux.errno(linux.prctl(
-            @intFromEnum(linux.PR.SET_DUMPABLE),
+            @backingInt(linux.PR.SET_DUMPABLE),
             0,
             0,
             0,
@@ -1068,7 +1050,7 @@ fn walk(
         const relative = if (prefix.len == 0)
             try allocator.dupe(u8, item.name)
         else
-            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, item.name });
+            try allocator.print("{s}/{s}", .{ prefix, item.name });
         errdefer allocator.free(relative);
         if (relative.len > 4095) return error.AzureRuntimeLimit;
         const path_file = try directory.openFile(io, item.name, .{
@@ -1162,16 +1144,8 @@ fn hashContent(hash: *core.Sha256, entry: Entry) void {
     const kind: u8 = if (entry.sha256 == null) 'D' else 'F';
     const line = if (entry.sha256) |value| line: {
         const digest = std.fmt.bytesToHex(value, .lower);
-        break :line std.fmt.bufPrint(
-            &buffer,
-            "C\t{c}\t{s}\t{d}\t{s}\n",
-            .{ kind, entry.path, entry.snapshot.size, &digest },
-        ) catch unreachable;
-    } else std.fmt.bufPrint(
-        &buffer,
-        "C\t{c}\t{s}\t{d}\t-\n",
-        .{ kind, entry.path, 0 },
-    ) catch unreachable;
+        break :line std.mem.print(&buffer, "C\t{c}\t{s}\t{d}\t{s}\n", .{ kind, entry.path, entry.snapshot.size, &digest }) catch unreachable;
+    } else std.mem.print(&buffer, "C\t{c}\t{s}\t{d}\t-\n", .{ kind, entry.path, 0 }) catch unreachable;
     hash.update(line);
 }
 
@@ -1184,11 +1158,7 @@ fn hashExternalContent(
 ) void {
     var buffer: [8192]u8 = undefined;
     const encoded = std.fmt.bytesToHex(digest, .lower);
-    const line = std.fmt.bufPrint(
-        &buffer,
-        "C\t" ++ kind ++ "\t{s}\t{d}\t{s}\n",
-        .{ path, size, &encoded },
-    ) catch unreachable;
+    const line = std.mem.print(&buffer, "C\t" ++ kind ++ "\t{s}\t{d}\t{s}\n", .{ path, size, &encoded }) catch unreachable;
     hash.update(line);
 }
 
@@ -1199,25 +1169,21 @@ fn hashMetadata(
     value: files.Snapshot,
 ) void {
     var buffer: [8192]u8 = undefined;
-    const line = std.fmt.bufPrint(
-        &buffer,
-        tag ++ "\t{s}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\n",
-        .{
-            path,
-            value.dev_major,
-            value.dev_minor,
-            value.ino,
-            value.mode,
-            files.hostUid(value.uid),
-            files.hostGid(value.gid),
-            value.nlink,
-            value.size,
-            value.mtime.sec,
-            value.mtime.nsec,
-            value.ctime.sec,
-            value.ctime.nsec,
-        },
-    ) catch unreachable;
+    const line = std.mem.print(&buffer, tag ++ "\t{s}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\n", .{
+        path,
+        value.dev_major,
+        value.dev_minor,
+        value.ino,
+        value.mode,
+        files.hostUid(value.uid),
+        files.hostGid(value.gid),
+        value.nlink,
+        value.size,
+        value.mtime.sec,
+        value.mtime.nsec,
+        value.ctime.sec,
+        value.ctime.nsec,
+    }) catch unreachable;
     hash.update(line);
 }
 
@@ -1315,19 +1281,15 @@ fn hashParent(
         files.isNamespaceOverflowUid(value.uid)) 0 else files.hostUid(value.uid);
     const gid = if (std.mem.eql(u8, path, "/") or
         files.isNamespaceOverflowGid(value.gid)) 0 else files.hostGid(value.gid);
-    const line = std.fmt.bufPrint(
-        &buffer,
-        "P\t{s}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\n",
-        .{
-            path,
-            value.dev_major,
-            value.dev_minor,
-            value.ino,
-            value.mode,
-            uid,
-            gid,
-        },
-    ) catch unreachable;
+    const line = std.mem.print(&buffer, "P\t{s}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\n", .{
+        path,
+        value.dev_major,
+        value.dev_minor,
+        value.ino,
+        value.mode,
+        uid,
+        gid,
+    }) catch unreachable;
     hash.update(line);
 }
 

@@ -927,7 +927,7 @@ class Compute(unittest.TestCase):
             write(path, ("synthetic " + name).encode())
             files[name] = ci.digest(path)
         runtime_identity = dict(wamr_revision=SDK, minimal_wasi=False,
-                                compiler_profile="unikraft-x86_64", zig_version="0.16.0",
+                                compiler_profile="unikraft-x86_64", zig_version="0.17.0",
                                 files=files)
         write(app / "build/artifacts/identity.json", runtime_identity)
         source = dict(

@@ -31,8 +31,8 @@ pub const Execution = struct {
 pub fn arguments(allocator: std.mem.Allocator, artifact_root: []const u8, raw_size: u64, legacy_apic: bool) ![]const []const u8 {
     const qemu = try std.fs.path.join(allocator, &.{ artifact_root, "qemu/bin/qemu-system-x86_64" });
     const share = try std.fs.path.join(allocator, &.{ artifact_root, "qemu/share" });
-    const code = try std.fmt.allocPrint(allocator, "if=pflash,format=raw,readonly=on,file={s}/OVMF_CODE.fd", .{artifact_root});
-    const block = try std.fmt.allocPrint(allocator, "{{\"driver\":\"raw\",\"node-name\":\"hyperv-disk\",\"offset\":0,\"size\":{d},\"read-only\":true,\"file\":{{\"driver\":\"file\",\"filename\":\"disk.img\",\"read-only\":true}}}}", .{raw_size});
+    const code = try allocator.print("if=pflash,format=raw,readonly=on,file={s}/OVMF_CODE.fd", .{artifact_root});
+    const block = try allocator.print("{{\"driver\":\"raw\",\"node-name\":\"hyperv-disk\",\"offset\":0,\"size\":{d},\"read-only\":true,\"file\":{{\"driver\":\"file\",\"filename\":\"disk.img\",\"read-only\":true}}}}", .{raw_size});
     return allocator.dupe([]const u8, &.{
         qemu,                  "-machine", "q35,accel=kvm", "-cpu",                             if (legacy_apic) cpu_features ++ ",x2apic=off" else cpu_features,
         "-L",                  share,      "-smp",          "1",                                "-m",
@@ -68,7 +68,7 @@ pub const Runner = struct {
         const root = try files.durableDirectory(self.io, self.work_root);
         defer root.close(self.io);
         var name_buffer: [16]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buffer, "boot-{d}", .{index});
+        const name = try std.mem.print(&name_buffer, "boot-{d}", .{index});
         try root.dir.createDir(self.io, name, .fromMode(0o700));
         try files.syncDirectory(self.io, root.dir);
         const path = try std.fs.path.join(self.allocator, &.{ self.work_root, name });
@@ -81,7 +81,7 @@ pub const Runner = struct {
         defer original.close(self.io);
         const source_parent = try files.parent(self.allocator, self.io, self.artifact_root, image.name, false);
         defer source_parent.close(self.io);
-        const source_name = try self.allocator.dupeZ(u8, source_parent.name);
+        const source_name = try self.allocator.dupeSentinel(u8, source_parent.name, 0);
         defer self.allocator.free(source_name);
         if (linux.errno(linux.linkat(source_parent.directory.dir.handle, source_name, work.dir.handle, "disk.img", 0)) != .SUCCESS) return error.LinkFailed;
         var linked = true;
@@ -226,7 +226,7 @@ pub fn execChild(init: std.process.Init) !void {
     defer environment.deinit();
     try environment.put("LD_LIBRARY_PATH", execution.library_path);
     const argv = try init.gpa.allocSentinel(?[*:0]const u8, execution.argv.len, null);
-    for (execution.argv, 0..) |arg, i| argv[i] = (try init.gpa.dupeZ(u8, arg)).ptr;
+    for (execution.argv, 0..) |arg, i| argv[i] = (try init.gpa.dupeSentinel(u8, arg, 0)).ptr;
     const env = try environment.createPosixBlock(init.gpa, .{ .zig_progress_fd = -1 });
     _ = linux.execveat(qemu.handle, "", argv.ptr, env.slice.ptr, .{ .EMPTY_PATH = true, .SYMLINK_NOFOLLOW = true });
     return error.ExecFailed;

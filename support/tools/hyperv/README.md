@@ -73,8 +73,17 @@ zero byte for native argv and proc paths. Linux wait status storage retains its
 unsigned raw bits, with the signed `waitpid` pointer adapted only at the syscall
 boundary; termination, cancellation and cleanup diagnostics keep their existing
 schemas. Use `-Doptimize=debug` or `-Doptimize=safe` for checked qualification.
+The synthetic v1 sampling records keep their existing `Debug`/`ReleaseSafe`
+wire enum spellings; lowercase compiler mode names do not alter that contract.
 `zig build` reads the private global cache from `ZIG_GLOBAL_CACHE_DIR` rather
 than accepting the old `--global-cache-dir` build option.
+The direct native process and lifecycle child fixtures strip debug metadata in both checked modes;
+its safety checks and synthetic runtime modes remain enabled. This keeps exact executable
+snapshotting within the existing 120–200 ms fixture deadlines despite the
+larger compiler-generated debug sections. Test drivers retain their selected
+optimization mode, and production executable selection and deadlines are not
+changed. Native lifecycle validation uses a separate uninstalled validator
+fixture; the installed production validator retains its existing build policy.
 
 ## Local inspection CLI
 

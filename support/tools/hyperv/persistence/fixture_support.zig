@@ -26,17 +26,17 @@ pub fn input() p.contract.Contract {
         .authority = authority,
         .cleanup_authority = authority,
         .prefix = "synthetic",
-        .guest = .{ .path = "/synthetic-public-fixture/guest.vhd", .size = 66 * 1024 * 1024 + 512, .sha256 = [_]u8{'1'} ** 64, .footer_sha256 = [_]u8{'2'} ** 64 },
-        .data = .{ .path = "/synthetic-public-fixture/data.vhd", .size = p.contract.data_bytes + 512, .sha256 = [_]u8{'3'} ** 64, .footer_sha256 = [_]u8{'4'} ** 64 },
+        .guest = .{ .path = "/synthetic-public-fixture/guest.vhd", .size = 66 * 1024 * 1024 + 512, .sha256 = @as([64]u8, @splat('1')), .footer_sha256 = @as([64]u8, @splat('2')) },
+        .data = .{ .path = "/synthetic-public-fixture/data.vhd", .size = p.contract.data_bytes + 512, .sha256 = @as([64]u8, @splat('3')), .footer_sha256 = @as([64]u8, @splat('4')) },
         .bindings = .{
-            .source = [_]u8{'1'} ** 64,
-            .producer = [_]u8{'2'} ** 64,
-            .preparation = [_]u8{'3'} ** 64,
-            .preflight = [_]u8{'4'} ** 64,
-            .image = [_]u8{'5'} ** 64,
-            .authority = [_]u8{'6'} ** 64,
-            .route = [_]u8{'7'} ** 64,
-            .trust = [_]u8{'8'} ** 64,
+            .source = @as([64]u8, @splat('1')),
+            .producer = @as([64]u8, @splat('2')),
+            .preparation = @as([64]u8, @splat('3')),
+            .preflight = @as([64]u8, @splat('4')),
+            .image = @as([64]u8, @splat('5')),
+            .authority = @as([64]u8, @splat('6')),
+            .route = @as([64]u8, @splat('7')),
+            .trust = @as([64]u8, @splat('8')),
         },
         .runtime_seconds = 60,
         .cleanup_seconds = 60,
@@ -49,7 +49,7 @@ pub fn input() p.contract.Contract {
 pub const terminal = "[    0.123456] Info: [libukboot] <boot.c @  544> main returned 0";
 pub fn segment(a: std.mem.Allocator, boot: u8, writes: u8) ![]u8 {
     const spec = input();
-    return std.fmt.allocPrint(a, "synthetic protocol fixture, not boot evidence\n" ++
+    return a.print("synthetic protocol fixture, not boot evidence\n" ++
         "HYPERV_PERSISTENCE START PASS run={s} address=0:0:7 sectors=8388608 sector_size=512\n" ++
         "HYPERV_PERSISTENCE SELECT PASS id=1 controller=2 state={d}\n" ++
         "UK_HYPERV_PERSISTENCE_IDENTITY:1:2:{s}:{s}:77777777777747778777777777777777:0:3:7:8388608:512:4:1:3:0:11223344\n" ++
@@ -72,7 +72,7 @@ pub const Model = struct {
     allocator: std.mem.Allocator,
     mode: Mode = .good,
     fail_at: ?p.model.Step = null,
-    calls: [p.model.step_count]u8 = [_]u8{0} ** p.model.step_count,
+    calls: [p.model.step_count]u8 = @as([p.model.step_count]u8, @splat(0)),
     denied_execution: bool = false,
     denied_cleanup: bool = false,
     pub fn options(self: *Model) p.engine.Options {
@@ -84,7 +84,7 @@ pub const Model = struct {
     }
     fn execute(context: *anyopaque, job: p.model.Job) !p.engine.Reply {
         const self: *Model = @ptrCast(@alignCast(context));
-        self.calls[@intFromEnum(job.step)] += 1;
+        self.calls[@backingInt(job.step)] += 1;
         return .{ .value = try self.result(job) };
     }
     pub fn result(self: *Model, job: p.model.Job) !p.model.Result {
@@ -175,7 +175,7 @@ pub const Model = struct {
 pub fn makeJob(a: std.mem.Allocator, step: p.model.Step, deadline: u64) !p.model.Job {
     const bytes = try p.local.encode(a, input());
     defer a.free(bytes);
-    return .{ .input = input(), .input_sha256 = p.local.hash(bytes), .nonce = [_]u8{'8'} ** 64, .step = step, .originals = ids, .parent_pid = @intCast(std.os.linux.getpid()), .deadline_ns = deadline, .authority_lane = if (step.cleanup()) .cleanup else .execution, .boot1 = null, .creation_intent = .{ true, true, true }, .network_intent = .{ true, true, true }, .group_intent = true };
+    return .{ .input = input(), .input_sha256 = p.local.hash(bytes), .nonce = @as([64]u8, @splat('8')), .step = step, .originals = ids, .parent_pid = @intCast(std.os.linux.getpid()), .deadline_ns = deadline, .authority_lane = if (step.cleanup()) .cleanup else .execution, .boot1 = null, .creation_intent = .{ true, true, true }, .network_intent = .{ true, true, true }, .group_intent = true };
 }
 
 pub const Fixture = struct {
