@@ -924,6 +924,9 @@ to retain the existing fixture size bound; the test runners retain their selecte
 `debug` or `safe` mode. Executable admission, retained-descriptor and cancellation
 policies are unchanged. Keep the test executable and fixture artifacts under the
 canonical, owner-only private qualification root.
+Build options track the compiler library and repository directories as directory
+inputs. Scratch fixture roots are untracked output paths, not input files or
+directory-content dependencies.
 The neutral v1/v2 fixture constructors in `tests/controller_record_fixtures.py`
 remain available to #187/#189. `test_differential_parity.DeterministicContracts`
 is only a compatibility import of their neutral byte tests, not a controller

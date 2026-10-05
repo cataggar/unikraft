@@ -150,11 +150,11 @@ pub fn build(b: *std.Build) void {
         "Existing absolute owner-only runtime directory for create-only controller install",
     ) orelse "";
     const controller_options = b.addOptions();
-    controller_options.addOptionPath("repository_root", b.path("../../.."));
+    controller_options.addOptionPathDirectory("repository_root", b.path("../../.."));
     controller_options.addOption([]const u8, "zig_executable", b.graph.zig_exe);
     controller_options.addOptionPath("git_executable", b.findProgramLazy(.{ .names = &.{"git"} }));
     controller_options.addOptionPath("python_executable", b.findProgramLazy(.{ .names = &.{"python3"} }));
-    controller_options.addOptionPath("fixture_root", .cache_root);
+    controller_options.addOptionPathUntracked("fixture_root", .cache_root);
     const host_core = b.createModule(.{
         .root_source_file = b.path("../../tools/hyperv/core.zig"),
         .target = b.graph.host,
@@ -356,7 +356,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const handoff_options = b.addOptions();
-    handoff_options.addOptionPath("fixture_root", .cache_root);
+    handoff_options.addOptionPathUntracked("fixture_root", .cache_root);
     handoff_options.addOptionPath("python_oracle", b.path("tests/test_handoff_contract_goldens.py"));
     handoff_options.addOptionPath("accepted_result_fixture", b.path("tests/fixtures/differential/accepted-v2.json"));
     handoff_contracts.root_module.addOptions("test_options", handoff_options);

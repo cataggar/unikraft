@@ -84,9 +84,9 @@ pub fn build(b: *std.Build) void {
     options.addOptionPath("process_fixture", process_fixture.getEmittedBin());
     options.addOptionPath("prepare_fixture", prepare_fixture.getEmittedBin());
     options.addOptionPath("image_fixture", image_fixture.getEmittedBin());
-    options.addOptionPath("zig_lib_dir", .zig_lib);
+    options.addOptionPathDirectory("zig_lib_dir", .zig_lib);
     options.addOptionPath("git_executable", b.findProgramLazy(.{ .names = &.{"git"} }));
-    options.addOptionPath("repository_root", b.path("../../.."));
+    options.addOptionPathDirectory("repository_root", b.path("../../.."));
 
     const unit_tests = b.addTest(.{
         .filters = b.option(
