@@ -360,7 +360,10 @@ The protected x86 job exercises `test-controller-limits` and then
 cache outside the production source checkout; this reports fixture failures
 without exposing private supervised-command output. On failure it runs the
 host test binary directly for diagnostic errors while keeping the original
-gate failed. The Python
+gate failed. The host controller fixture omits debug symbols in both modes
+and uses LLVM/LLD in `debug` to stay within the unchanged 16 MiB supervisor
+identity limit. `debug` still enables its normal safety checks and assertions;
+production compiler and linker selection is unchanged. The Python
 `tests/source_custody_production_limits.py` remains paired with the native
 limit fixture while production `build` uses the installed native controller.
 

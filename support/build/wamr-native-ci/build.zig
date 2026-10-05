@@ -195,10 +195,13 @@ pub fn build(b: *std.Build) void {
     });
     const host_cli = b.addExecutable(.{
         .name = "uk-wamr-native-ci-host-fixture",
+        .use_llvm = if (optimize == .debug) true else null,
+        .use_lld = if (optimize == .debug) true else null,
         .root_module = b.createModule(.{
             .root_source_file = b.path("controller/main.zig"),
             .target = b.graph.host,
             .optimize = optimize,
+            .strip = true,
             .imports = &.{.{ .name = "wamr_controller", .module = host_controller }},
         }),
     });
