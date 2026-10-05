@@ -24,11 +24,12 @@ revision and package hash. Changing only an imported algorithm name cannot
 authenticate a package from the other generation.
 
 New SDK producers select exact-generation compatibility revision
-`41cc890a60bb3ce6b997a92748d042e9aa1e7e9a`. Frozen Zig 0.16 imports retain
+`661ac49584c4d0ac57adb78eba62f3ff3e9795df`. Frozen Zig 0.16 imports retain
 `a53205d77be3b880eb8f8b96679512ba58e2331a`; changing only the runtime compiler
 version or SDK revision cannot authenticate the other generation. SDK source
 custody covers the complete selected Git archive, including
-`build/environment.zig` and `include/wamr_aot.h`, without changing its metadata
+`build/environment.zig`, `include/wamr_aot.h`, and
+`tests/unikraft-jit/fixture.zig`, without changing its metadata
 schema or evidence bounds.
 
 The exact-generation WAMR/Miz dependency qualification is a separate
@@ -416,7 +417,7 @@ unchanged. This does not complete #88's guarded Azure authority or image handoff
 
 The job builds the distinct `hyperv-x86_64-efi-wamr` target using the
 adapter-installed app-owned `uk-wamr-aot-build` executable, pinned WAMR
-`41cc890a60bb3ce6b997a92748d042e9aa1e7e9a`, Zig 0.17.0, the existing LLVM
+`661ac49584c4d0ac57adb78eba62f3ff3e9795df`, Zig 0.17.0, the existing LLVM
 distribution and the native final-image graph. Its constructor/returning-IRQ,
 SMP, relocation and EFI checks are not replaced, mocked or disabled.
 There is no guest compiler or hosted-runtime substitute. Only the tiny

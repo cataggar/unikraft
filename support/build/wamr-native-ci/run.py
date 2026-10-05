@@ -27,7 +27,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 APP = REPO / "support/apps/wamr-aot"
 LOCAL_BOOT = REPO / "support/tools/hyperv/local_boot"
-REVISION = "41cc890a60bb3ce6b997a92748d042e9aa1e7e9a"
+REVISION = "661ac49584c4d0ac57adb78eba62f3ff3e9795df"
 HISTORICAL_WAMR_REVISION = "a53205d77be3b880eb8f8b96679512ba58e2331a"
 MARKER = "WAMR_NATIVE_AOT_OK answer=42 teardown=0"
 LEGACY = "Using legacy xAPIC MMIO"

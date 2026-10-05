@@ -35,7 +35,7 @@ tool="$tool_root/bin/uk-wamr-aot-build"
 ```
 
 `uk-wamr-aot-build prepare` exports exactly WAMR
-`41cc890a60bb3ce6b997a92748d042e9aa1e7e9a` from the local Git object
+`661ac49584c4d0ac57adb78eba62f3ff3e9795df` from the local Git object
 database into this application's ignored `build/wamr-source/`. It never
 builds in, changes, or inherits uncommitted files from the source checkout.
 It builds that revision's host `wamrc`, its freestanding library audit,
@@ -61,6 +61,11 @@ of `--source`; it is incompatible with `--development-revision`.
 The same merged SDK supplies the single-root CoreMark bridge and optional
 workloads in [WORKLOADS.md](WORKLOADS.md). This source pin does not establish
 native boot, hardware or measurement qualification.
+Its independently fetched package hash is
+`wamr-0.1.0-_KKF6aMOqwDgUgUg0WrLZ1mTLPsNhQs7Yvx7AwUUwmeM`.
+The final compatibility follow-up only adds
+`tests/unikraft-jit/fixture.zig` to the upstream package's selected paths;
+the raw archive custody includes that generated JIT workload source as well.
 
 Generated workload manifests pin the standalone `cataggar/translate-c`
 `62d06a5d3e93c82727544e8113e4762a315ca0ed` translator. The target-aware
