@@ -21,6 +21,8 @@ _records_spec.loader.exec_module(accepted_records)
 MAX_TOTAL = 512 * 1024 * 1024
 MAX_MEMBERS = 96
 MAX_JSON = 65536
+WAMR_REVISION = "4d393552cf1797e1d4a65328ddb444f96ee5b816"
+HISTORICAL_WAMR_REVISION = "a53205d77be3b880eb8f8b96679512ba58e2331a"
 V1_ZIP_MEMBERS = 55
 V2_ZIP_MEMBERS = 85
 PYTHON_SUPERVISOR_RELATIVE = Path("compute/supervisor/bin/wamr-ci-supervisor")
@@ -610,11 +612,14 @@ def decode(raw):
     return value
 
 
-def context(value):
+def context(value, *, version=None):
     require(set(value) == {"repository", "run_id", "run_attempt", "source_revision",
                            "source_tree", "wamr_revision"})
     require(value["repository"] == "cataggar/unikraft"
-            and value["wamr_revision"] == "a53205d77be3b880eb8f8b96679512ba58e2331a")
+            and value["wamr_revision"] in (
+                WAMR_REVISION, HISTORICAL_WAMR_REVISION))
+    if version == 1:
+        require(value["wamr_revision"] == HISTORICAL_WAMR_REVISION)
     for key in ("run_id", "run_attempt"):
         require(type(value[key]) is str and re.fullmatch(r"[1-9][0-9]{0,19}", value[key]))
     for key in ("source_revision", "source_tree"):
@@ -1528,6 +1533,7 @@ def pack(handoff, stage, archive, source, validator, supervisor, *, producer="py
     handoff.private(stage)
     handoff.private(archive.parent)
     bundle = handoff.ci.document(stage / "bundle.json")
+    context(source, version=bundle["version"])
     require(bundle["source_revision"] == source["source_revision"]
             and bundle["source_tree"] == source["source_tree"]
             and bundle["identity"]["wamr_revision"] == source["wamr_revision"])
@@ -1653,7 +1659,7 @@ def verify_archive_descriptor(handoff, handle, expected,
                 and type(manifest["version"]) is int
                 and manifest["version"] == bundle["version"]
                 and manifest["authority"] == "not_admitted"
-                and context(manifest["source"]) == expected
+                and context(manifest["source"], version=manifest["version"]) == expected
                 and bundle["source_revision"] == expected["source_revision"]
                 and bundle["source_tree"] == expected["source_tree"]
                 and bundle["identity"]["wamr_revision"] == expected["wamr_revision"]

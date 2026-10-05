@@ -343,7 +343,7 @@ fn restoreDependencies(context: *Context) !void {
     for (listing.packages, 0..) |package, index| {
         const name = try a.print("dependency-hash-{d:0>3}", .{index});
         const raw = try runBootstrap(context, name, &.{
-            context.roots.zig,                             "fetch",                                         "--global-cache-dir",
+            context.roots.zig,                             "fetch",                                         "--pkg-dir",
             try subpath(context, "dependency-hash-cache"), try join(context, &.{ packages, package.name }),
         }, hash_work, 300, 511);
         if (!std.mem.eql(u8, raw, try a.print("{s}\n", .{package.name})))

@@ -3073,6 +3073,25 @@ class Evidence(unittest.TestCase):
             })
         self.assertEqual(owner.FAILURE_STAGE, "public-context-binding")
 
+    def test_public_context_retains_frozen_sdk_without_accepting_unknown_revision(self):
+        source = {
+            "repository": "cataggar/unikraft",
+            "run_id": "123", "run_attempt": "1",
+            "source_revision": "1" * 40, "source_tree": "2" * 40,
+            "wamr_revision": ci.REVISION,
+        }
+        self.assertEqual(public_bundle.context(source), source)
+        self.assertEqual(public_bundle.context(source, version=2), source)
+        with self.assertRaises(ValueError):
+            public_bundle.context(source, version=1)
+        source["wamr_revision"] = ci.HISTORICAL_WAMR_REVISION
+        self.assertEqual(public_bundle.context(source), source)
+        self.assertEqual(public_bundle.context(source, version=1), source)
+        self.assertEqual(public_bundle.context(source, version=2), source)
+        source["wamr_revision"] = "f" * 40
+        with self.assertRaises(ValueError):
+            public_bundle.context(source)
+
     def test_precreated_parity_slots_preserve_recorded_runtime_ancestor(self):
         parent = self.root / "paired-parent"
         runtime = parent / "runtime"
@@ -4357,6 +4376,8 @@ class Evidence(unittest.TestCase):
 
         def wrong(*args, **kwargs):
             work = root / "dependency-hash-work"
+            self.assertEqual(args[2][1:4], [
+                "fetch", "--pkg-dir", root / "dependency-hash-cache"])
             self.assertEqual(kwargs["cwd"], work)
             self.assertEqual((work / "build.zig").read_bytes(),
                              (root / "dependencies/build.zig").read_bytes())

@@ -126,6 +126,16 @@ test "closed external handoff, manifest, transport, candidate and admission cont
         var manifest_doc = try c.Document.parse(a, manifest, contracts.json_limits);
         defer manifest_doc.deinit();
         try std.testing.expectEqual(compatibility, try contracts.validatePublicSourceManifest(manifest_doc.value()));
+        const manifest_revision = manifest_doc.value().object.get("source").?.object.getPtr("wamr_revision").?;
+        manifest_revision.* = .{ .string = profile.historical_wamr_revision };
+        try std.testing.expectEqual(compatibility, try contracts.validatePublicSourceManifest(manifest_doc.value()));
+        manifest_revision.* = .{ .string = profile.wamr_revision };
+        if (compatibility == .frozen_tiny_v1)
+            try std.testing.expectError(error.InvalidLiteral, contracts.validatePublicSourceManifest(manifest_doc.value()))
+        else
+            try std.testing.expectEqual(compatibility, try contracts.validatePublicSourceManifest(manifest_doc.value()));
+        manifest_revision.* = .{ .string = "ffffffffffffffffffffffffffffffffffffffff" };
+        try std.testing.expectError(error.InvalidLiteral, contracts.validatePublicSourceManifest(manifest_doc.value()));
 
         const candidate = try sampleCandidate(a, compatibility);
         defer a.free(candidate);
@@ -1216,7 +1226,7 @@ fn sampleBundleWithRoot(a: std.mem.Allocator, compatibility: profile.Compatibili
     if (compatibility == .tiny_qcow2_derived_vhd_v2) try w.writeAll("\"profile\":\"qcow2-derived-vhd\",");
     try w.print("\"authority\":\"not_admitted\",\"source_revision\":\"{s}\",\"source_tree\":\"{s}\",", .{ rev, rev });
     if (compatibility == .tiny_qcow2_derived_vhd_v2) try writeRun(w);
-    try writeIdentityField(w);
+    try writeIdentityField(w, compatibility);
     if (compatibility == .tiny_qcow2_derived_vhd_v2) try writeLineage(w);
     try w.writeAll("\"artifacts\":[");
     for (layout.artifactNames(compatibility), 0..) |name, i| {
@@ -1252,7 +1262,7 @@ fn sampleManifest(a: std.mem.Allocator, compatibility: profile.Compatibility) ![
     try w.print("{{\"schema\":\"uk.wamr.public-source-bundle\",\"version\":{},", .{compatibility.version()});
     if (compatibility == .tiny_qcow2_derived_vhd_v2) try w.writeAll("\"profile\":\"qcow2-derived-vhd\",");
     try w.writeAll("\"authority\":\"not_admitted\",\"source\":{");
-    try w.print("\"repository\":\"cataggar/unikraft\",\"run_id\":\"1\",\"run_attempt\":\"1\",\"source_revision\":\"{s}\",\"source_tree\":\"{s}\",\"wamr_revision\":\"{s}\"}},\"members\":{{", .{ rev, rev, profile.wamr_revision });
+    try w.print("\"repository\":\"cataggar/unikraft\",\"run_id\":\"1\",\"run_attempt\":\"1\",\"source_revision\":\"{s}\",\"source_tree\":\"{s}\",\"wamr_revision\":\"{s}\"}},\"members\":{{", .{ rev, rev, if (compatibility == .frozen_tiny_v1) profile.historical_wamr_revision else profile.wamr_revision });
     const members = try generatedPublicMembers(a, compatibility);
     defer freeMembers(a, members);
     for (members[0 .. members.len - 2], 0..) |name, i| {
@@ -1276,7 +1286,7 @@ fn sampleCandidate(a: std.mem.Allocator, compatibility: profile.Compatibility) !
         rev,
         rev,
     });
-    try writeIdentityField(w);
+    try writeIdentityField(w, compatibility);
     try w.writeAll("\"os_vhd\":");
     try writeArtifact(w, "artifacts/vhd", 1);
     try w.writeAll(",\"bundle\":");
@@ -1304,8 +1314,8 @@ fn writeRun(w: *std.Io.Writer) !void {
     try w.writeAll("\"run\":{\"repository\":\"cataggar/unikraft\",\"run_id\":\"1\",\"run_attempt\":\"1\"},");
 }
 
-fn writeIdentityField(w: *std.Io.Writer) !void {
-    try w.print("\"identity\":{{\"wamr_revision\":\"{s}\",\"wasm_sha256\":\"{s}\",\"cwasm_sha256\":\"{s}\",\"runtime_sha256\":\"{s}\",\"compiler_sha256\":\"{s}\",\"config_sha256\":\"{s}\"}},", .{ profile.wamr_revision, sha, sha, sha, sha, sha });
+fn writeIdentityField(w: *std.Io.Writer, compatibility: profile.Compatibility) !void {
+    try w.print("\"identity\":{{\"wamr_revision\":\"{s}\",\"wasm_sha256\":\"{s}\",\"cwasm_sha256\":\"{s}\",\"runtime_sha256\":\"{s}\",\"compiler_sha256\":\"{s}\",\"config_sha256\":\"{s}\"}},", .{ if (compatibility == .frozen_tiny_v1) profile.historical_wamr_revision else profile.wamr_revision, sha, sha, sha, sha, sha });
 }
 
 fn writeLineage(w: *std.Io.Writer) !void {

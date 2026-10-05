@@ -27,7 +27,8 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 APP = REPO / "support/apps/wamr-aot"
 LOCAL_BOOT = REPO / "support/tools/hyperv/local_boot"
-REVISION = "a53205d77be3b880eb8f8b96679512ba58e2331a"
+REVISION = "4d393552cf1797e1d4a65328ddb444f96ee5b816"
+HISTORICAL_WAMR_REVISION = "a53205d77be3b880eb8f8b96679512ba58e2331a"
 MARKER = "WAMR_NATIVE_AOT_OK answer=42 teardown=0"
 LEGACY = "Using legacy xAPIC MMIO"
 MODES = ("raw-x2apic", "raw-legacy-apic", "vpc-x2apic", "vpc-legacy-apic")
@@ -4466,7 +4467,7 @@ def verify_package_hashes(runtime, root, packages, expected_inputs):
             require_consumer_inputs(runtime, expected_inputs)
             output, _ = execute(
                 root, f"dependency-hash-{index:03d}",
-                [tool("zig"), "fetch", "--global-cache-dir", cache, packages / name],
+                [tool("zig"), "fetch", "--pkg-dir", cache, packages / name],
                 300, 511, cwd=work, evidence=False,
                 input_records=consumer_file_records(expected_inputs),
                 allow_bootstrap=True)

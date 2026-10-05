@@ -1247,7 +1247,8 @@ def candidate_plan(bundle_path, output, *, attempt_id=None,
     ci.require(bundle["schema"] == "uk.wamr.local-image-handoff"
                and bundle["version"] in (1, 2)
                and bundle["authority"] == "not_admitted"
-               and bundle["identity"]["wamr_revision"] == ci.REVISION,
+               and bundle["identity"]["wamr_revision"] in (
+                   ci.REVISION, ci.HISTORICAL_WAMR_REVISION),
                "not a compute handoff")
     version = bundle["version"]
     names = NAMES if version == 1 else V2_NAMES

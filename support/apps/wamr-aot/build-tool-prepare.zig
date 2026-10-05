@@ -909,9 +909,18 @@ fn buildWorkload(
     }
     const object = try std.fs.path.join(
         a,
-        &.{ archive_members_path, "libwamr-aot_zcu.o" },
+        &.{ archive_members_path, "wamr-aot_zcu.o" },
     );
     _ = try digestAbsolute(io, object, maximum_artifact_bytes);
+    try copyAbsoluteFile(
+        allocator,
+        io,
+        object,
+        archive_members,
+        "libwamr-aot_zcu.o",
+        0o600,
+    );
+    try archive_members.deleteFile(io, "wamr-aot_zcu.o");
     const canonical = try std.fs.path.join(
         a,
         &.{ archive_members_path, "libwamr-aot.a" },
@@ -948,7 +957,7 @@ fn requireRuntimeArchiveMember(
         "{s}/native-environment/zig_local_cache/o/",
         .{build_path},
     );
-    const suffix = "/libwamr-aot_zcu.o\n";
+    const suffix = "/wamr-aot_zcu.o\n";
     if (output.len != prefix.len + 32 + suffix.len or
         !std.mem.startsWith(u8, output, prefix) or
         !std.mem.endsWith(u8, output, suffix))

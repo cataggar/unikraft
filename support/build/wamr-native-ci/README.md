@@ -4,8 +4,10 @@
 
 New producers require official Zig 0.17.0 and use `-Doptimize=safe`.
 `zig build` receives its global cache through the bound
-`ZIG_GLOBAL_CACHE_DIR` environment variable, not `--global-cache-dir`;
-historical imported build commands retain their original flag bindings.
+`ZIG_GLOBAL_CACHE_DIR` environment variable, not `--global-cache-dir`.
+Current `zig fetch` rehashes use a separately bound `--pkg-dir` because its
+removed global-cache CLI flag is also rejected by Zig 0.17.
+Historical imported build commands retain their original flag bindings.
 Dependency-custody schema version 1 now records the producer-specific
 `zig-0.17.0-fetch-path` algorithm. Read-only imports explicitly retain
 `zig-0.16.0-fetch-path`, its original Miz revision/package hash, historical
@@ -20,6 +22,14 @@ New dependency restoration binds the qualified exact-generation Miz
 algorithm still selects its original `669a27982b376311f558e820b69e9a692735b0cd`
 revision and package hash. Changing only an imported algorithm name cannot
 authenticate a package from the other generation.
+
+New SDK producers select exact-generation compatibility revision
+`4d393552cf1797e1d4a65328ddb444f96ee5b816`. Frozen Zig 0.16 imports retain
+`a53205d77be3b880eb8f8b96679512ba58e2331a`; changing only the runtime compiler
+version or SDK revision cannot authenticate the other generation. SDK source
+custody covers the complete selected Git archive, including
+`build/environment.zig` and `include/wamr_aot.h`, without changing its metadata
+schema or evidence bounds.
 
 The exact-generation WAMR/Miz dependency qualification is a separate
 prerequisite to an integrated build. Validator or controller fixture success
@@ -398,7 +408,7 @@ unchanged. This does not complete #88's guarded Azure authority or image handoff
 
 The job builds the distinct `hyperv-x86_64-efi-wamr` target using the
 adapter-installed app-owned `uk-wamr-aot-build` executable, pinned WAMR
-`a53205d77be3b880eb8f8b96679512ba58e2331a`, Zig 0.17.0, the existing LLVM
+`4d393552cf1797e1d4a65328ddb444f96ee5b816`, Zig 0.17.0, the existing LLVM
 distribution and the native final-image graph. Its constructor/returning-IRQ,
 SMP, relocation and EFI checks are not replaced, mocked or disabled.
 There is no guest compiler or hosted-runtime substitute. Only the tiny

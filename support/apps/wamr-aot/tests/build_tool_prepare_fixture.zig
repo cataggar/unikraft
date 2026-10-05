@@ -25,7 +25,7 @@ fn run(init: std.process.Init) !void {
                 try stdout.interface.writeAll("unexpected.o\n")
             else
                 try stdout.interface.print(
-                    "{s}/o/0123456789abcdef0123456789abcdef/libwamr-aot_zcu.o\n",
+                    "{s}/o/0123456789abcdef0123456789abcdef/wamr-aot_zcu.o\n",
                     .{cache},
                 );
             return;
@@ -45,7 +45,7 @@ fn run(init: std.process.Init) !void {
             else
                 bytes;
             const output = try std.fs.path.join(allocator, &.{
-                arguments[3]["--output=".len..], "libwamr-aot_zcu.o",
+                arguments[3]["--output=".len..], "wamr-aot_zcu.o",
             });
             try writeFile(init.io, output, member, 0o600);
             return;

@@ -1230,6 +1230,8 @@ fn revalidateImported(self: *AcceptedRun) !void {
     try equal(try text(try get(source, "source_revision")), self.source.revision);
     try equal(try text(try get(source, "source_tree")), self.source.tree);
     const wamr_revision = try text(try get(source, "wamr_revision"));
+    if (version == 1)
+        try equal(wamr_revision, limits.historical_wamr_revision);
     if (!std.mem.eql(u8, wamr_revision, limits.wamr_revision) and
         !std.mem.eql(u8, wamr_revision, limits.historical_wamr_revision))
         return error.InvalidImportedBundle;

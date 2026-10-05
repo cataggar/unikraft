@@ -777,7 +777,7 @@ pub fn verifyZigPackageHashes(
         const deadline = try process.Deadline.afterMilliseconds(300_000);
         var result = try process.runCommand(allocator, io, .{
             .executable = executable,
-            .argv = &.{ zig, "fetch", "--global-cache-dir", cache_path, package_path },
+            .argv = &.{ zig, "fetch", "--pkg-dir", cache_path, package_path },
             .environment = &env,
             .cwd = work,
             .primary_deadline = deadline,

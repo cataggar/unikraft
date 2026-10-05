@@ -35,13 +35,15 @@ tool="$tool_root/bin/uk-wamr-aot-build"
 ```
 
 `uk-wamr-aot-build prepare` exports exactly WAMR
-`a53205d77be3b880eb8f8b96679512ba58e2331a` from the local Git object
+`4d393552cf1797e1d4a65328ddb444f96ee5b816` from the local Git object
 database into this application's ignored `build/wamr-source/`. It never
 builds in, changes, or inherits uncommitted files from the source checkout.
 It builds that revision's host `wamrc`, its freestanding library audit,
 then the integration archive. `prepare` requires `llvm-objcopy` to remove
 checkout-dependent debug sections, then checks the single Zig object member
-and uses pinned `zig ar` to repack it with a stable basename. The original
+and uses pinned `zig ar` to repack it with a stable basename. The Zig 0.17
+input member is exactly `wamr-aot_zcu.o` under the bound cache; the canonical
+archive retains `libwamr-aot_zcu.o`. The original
 archive's long-name table otherwise records an absolute, checkout-dependent
 cache path. These supervised commands retain linkable symbols and are included
 in the verified producer plan. The tiny wasm is genuinely generated from

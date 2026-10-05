@@ -1052,8 +1052,12 @@ test "native tiny build identity refuses development optional JIT and altered fi
         const native = if (controller.build_pipeline.admitPreparedIdentity(value)) |_| true else |_| false;
         try std.testing.expectEqual(index == 0, native);
         if (std.mem.eql(u8, change.key, "zig_version")) {
+            try std.testing.expectError(error.InvalidProducer, controller.build_pipeline.admitImportedIdentity(value));
             try value.object.put(local, "wamr_revision", .{ .string = controller.custody_limits.historical_wamr_revision });
             try controller.build_pipeline.admitImportedIdentity(value);
+            try std.testing.expectError(error.InvalidProducer, controller.build_pipeline.admitPreparedIdentity(value));
+            try value.object.put(local, "zig_version", .{ .string = "0.17.0" });
+            try std.testing.expectError(error.InvalidProducer, controller.build_pipeline.admitImportedIdentity(value));
             try value.object.put(local, "zig_version", .{ .string = "0.15.2" });
             try std.testing.expectError(error.InvalidProducer, controller.build_pipeline.admitImportedIdentity(value));
         }
@@ -3663,7 +3667,7 @@ test "frozen custody limits, component-bound roles and first excess" {
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024 * 1024), l.ignored_bytes);
     try std.testing.expectEqual(@as(usize, 512), l.bison_entries);
     try std.testing.expectEqual(@as(usize, 128), l.dependency_roots);
-    try std.testing.expectEqualStrings("a53205d77be3b880eb8f8b96679512ba58e2331a", l.wamr_revision);
+    try std.testing.expectEqualStrings("4d393552cf1797e1d4a65328ddb444f96ee5b816", l.wamr_revision);
     for (l.roles, 0..) |role, index|
         try std.testing.expectEqual(index, try l.outputRole(role));
     try std.testing.expectEqual(@as(usize, 0), try l.outputRole(".d/private/file"));

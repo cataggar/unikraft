@@ -4,7 +4,8 @@ const std = @import("std");
 pub const repository = "cataggar/unikraft";
 pub const workload = "tiny";
 pub const current_profile = "qcow2-derived-vhd";
-pub const wamr_revision = "a53205d77be3b880eb8f8b96679512ba58e2331a";
+pub const wamr_revision = "4d393552cf1797e1d4a65328ddb444f96ee5b816";
+pub const historical_wamr_revision = "a53205d77be3b880eb8f8b96679512ba58e2331a";
 pub const authority = "not_admitted";
 pub const canonicalization = "utf8-byte-sorted-keys-compact-lf-v1";
 

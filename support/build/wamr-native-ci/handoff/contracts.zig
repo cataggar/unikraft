@@ -65,7 +65,7 @@ pub fn validatePublicSourceManifest(value: std.json.Value) !profile.Compatibilit
     _ = try c.exactFields(value, if (compatibility == .tiny_qcow2_derived_vhd_v2) &schema_fields.public_source_manifest_v2 else &schema_fields.public_source_manifest_v1);
     try literal(initial, "schema", "uk.wamr.public-source-bundle");
     try literal(initial, "authority", profile.authority);
-    try validatePublicContext(initial.get("source") orelse return error.MissingField);
+    try validatePublicContext(initial.get("source") orelse return error.MissingField, compatibility);
     try validateMemberMap(initial.get("members") orelse return error.MissingField, compatibility);
     return compatibility;
 }
@@ -248,13 +248,16 @@ fn validateLineage(value: std.json.Value, artifacts: ?std.json.Value) !void {
     }
 }
 
-fn validatePublicContext(value: std.json.Value) !void {
+fn validatePublicContext(value: std.json.Value, compatibility: profile.Compatibility) !void {
     const fields = try c.exactFields(value, &schema_fields.public_context);
     try literal(fields, "repository", profile.repository);
     try decimalString(try string(fields, "run_id"));
     try decimalString(try string(fields, "run_attempt"));
     try hex(try string(fields, "source_revision"), 40);
     try hex(try string(fields, "source_tree"), 40);
+    const revision = try string(fields, "wamr_revision");
+    if (std.mem.eql(u8, revision, profile.historical_wamr_revision)) return;
+    if (compatibility == .frozen_tiny_v1) return error.InvalidLiteral;
     try literal(fields, "wamr_revision", profile.wamr_revision);
 }
 
