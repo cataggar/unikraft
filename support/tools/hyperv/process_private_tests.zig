@@ -81,7 +81,7 @@ test "exited leaders cannot abandon either open-pipe or closed-pipe descendants"
             try testing.expect(elapsed < 1500 * std.time.ns_per_ms);
         }
         try result.requireSuccess();
-        try testing.expectEqual(.SRCH, linux.errno(linux.kill(descendant, @enumFromInt(0))));
+        try testing.expectEqual(.SRCH, linux.errno(linux.kill(descendant, @fromBackingInt(@intCast(0)))));
         try support.noChildren();
     }
 }
@@ -376,10 +376,10 @@ test "private supervision refuses unrelated child ownership and shares the legac
         defer {
             _ = linux.kill(@intCast(child), .KILL);
             var status: u32 = 0;
-            _ = linux.waitpid(@intCast(child), &status, 0);
+            _ = linux.waitpid(@intCast(child), @ptrCast(&status), 0);
         }
         try testing.expectError(error.UnownedChildren, process.runPrivate(allocator, io, &lock, "out", "err", .{ .process = options }));
-        try testing.expectEqual(.SUCCESS, linux.errno(linux.kill(@intCast(child), @enumFromInt(0))));
+        try testing.expectEqual(.SUCCESS, linux.errno(linux.kill(@intCast(child), @fromBackingInt(@intCast(0)))));
         try testing.expectError(error.FileNotFound, fixture.directory.openFile(io, "out"));
     }
     var saw_busy = std.atomic.Value(bool).init(false);
@@ -416,7 +416,7 @@ test "capture names are exclusive private no-symlink and do not leak writer desc
     var environment = std.process.Environ.Map.init(allocator);
     defer environment.deinit();
     const options: process.PrivateOptions = .{ .process = .{
-        .argv = &.{ executable, "fd-closed", try std.fmt.bufPrint(&fd, "{d}", .{lock.file.?.handle}) },
+        .argv = &.{ executable, "fd-closed", try std.mem.print(&fd, "{d}", .{lock.file.?.handle}) },
         .environment = &environment,
         .cwd = fixture.directory.dir,
         .deadline = try process.Deadline.afterMilliseconds(5000),

@@ -204,7 +204,7 @@ test "private atomic state is durable owner-only bounded and hash-bound" {
     var checked = try files.readSensitiveAbsolute(io, allocator, absolute, 4096, expected);
     defer checked.deinit();
     try testing.expectEqualStrings(binding, checked.bytes());
-    expected = [_]u8{0} ** 32;
+    expected = @as([32]u8, @splat(0));
     try testing.expectError(error.HashMismatch, fixture.directory.readSensitive(io, allocator, "state.json", 4096, expected));
     expected = null;
     var optional_unbound = try fixture.directory.readSensitive(io, allocator, "state.json", 4096, expected);
@@ -213,7 +213,7 @@ test "private atomic state is durable owner-only bounded and hash-bound" {
     defer literal_unbound.deinit();
     try testing.expectEqualStrings(binding, optional_unbound.bytes());
     try testing.expectEqualStrings(binding, literal_unbound.bytes());
-    try testing.expectError(error.HashMismatch, fixture.directory.read(io, allocator, "state.json", 4096, [_]u8{0} ** 32));
+    try testing.expectError(error.HashMismatch, fixture.directory.read(io, allocator, "state.json", 4096, @as([32]u8, @splat(0))));
     try testing.expectError(error.FileTooLarge, fixture.directory.read(io, allocator, "state.json", 1, null));
     try testing.expectError(error.UnsafePath, fixture.directory.openFile(io, "../state.json"));
     try testing.expectError(error.InvalidState, lock.commit(io, ".writer.lock", "bad"));
@@ -250,16 +250,16 @@ test "immutable input creation is exclusive and never overwrites earlier content
 test "private directory traversal rejects symlink components noncanonical paths and unsafe modes" {
     var fixture = try Fixture.init();
     defer fixture.deinit();
-    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ options.test_root.?, fixture.name });
+    const path = try allocator.print("{s}/{s}", .{ options.test_root.?, fixture.name });
     defer allocator.free(path);
-    const alias = try std.fmt.allocPrint(allocator, "{s}/alias", .{path});
+    const alias = try allocator.print("{s}/alias", .{path});
     defer allocator.free(alias);
     try testing.expectEqual(.SUCCESS, linux.errno(linux.symlinkat(".", fixture.directory.dir.handle, "alias")));
     if (files.Directory.open(io, alias)) |directory| {
         directory.close(io);
         return error.SymlinkAccepted;
     } else |_| {}
-    const traversal = try std.fmt.allocPrint(allocator, "{s}/../{s}", .{ path, fixture.name });
+    const traversal = try allocator.print("{s}/../{s}", .{ path, fixture.name });
     defer allocator.free(traversal);
     try testing.expectError(error.UnsafePath, files.Directory.open(io, traversal));
     try fixture.directory.dir.setPermissions(io, .fromMode(0o750));
@@ -338,7 +338,7 @@ fn child(mode: []const u8, milliseconds: u64, output_limit: usize) !process.Resu
 
 fn noChildren() !void {
     var status: u32 = 0;
-    try testing.expectEqual(.CHILD, linux.errno(linux.waitpid(-1, &status, linux.W.NOHANG)));
+    try testing.expectEqual(.CHILD, linux.errno(linux.waitpid(-1, @ptrCast(&status), linux.W.NOHANG)));
 }
 
 test "native process captures bounded stdout and redacts failed stderr" {
@@ -385,7 +385,7 @@ test "private locks do not leak through exec and environment inheritance is abse
     defer fixture.deinit();
     var lock = try fixture.directory.lock(io);
     defer lock.close(io);
-    const fd = try std.fmt.allocPrint(allocator, "{d}", .{lock.file.?.handle});
+    const fd = try allocator.print("{d}", .{lock.file.?.handle});
     defer allocator.free(fd);
     const executable = try std.Io.Dir.cwd().realPathFileAlloc(io, options.process_fixture, allocator);
     defer allocator.free(executable);
@@ -443,7 +443,7 @@ test "successful parent exit cannot strand a grandchild holding output pipes" {
     try testing.expect(result.failures.primary == null);
     try testing.expect(result.cleanup_complete);
     const pid = try std.fmt.parseInt(linux.pid_t, std.mem.trim(u8, result.stdout, "\n"), 10);
-    try testing.expectEqual(.SRCH, linux.errno(linux.kill(pid, @enumFromInt(0))));
+    try testing.expectEqual(.SRCH, linux.errno(linux.kill(pid, @fromBackingInt(@intCast(0)))));
     try noChildren();
 }
 
@@ -475,7 +475,7 @@ test "expired cancelled and missing executables never report success" {
     try testing.expect(std.mem.allEqual(u8, cancelled.storage, 0));
     var fixture = try Fixture.init();
     defer fixture.deinit();
-    const missing = try std.fmt.allocPrint(allocator, "{s}/nonexistent-native-fixture", .{options.test_root.?});
+    const missing = try allocator.print("{s}/nonexistent-native-fixture", .{options.test_root.?});
     defer allocator.free(missing);
     var absent = try process.run(allocator, io, .{
         .argv = &.{missing},
@@ -497,7 +497,7 @@ test "exec permission and format failures are bounded reaped and have no shell f
     var lock = try fixture.directory.lock(io);
     defer lock.close(io);
     _ = try lock.commit(io, "not-executable", "synthetic-nonnative-content\n");
-    const executable = try std.fmt.allocPrint(allocator, "{s}/{s}/not-executable", .{ options.test_root.?, fixture.name });
+    const executable = try allocator.print("{s}/{s}/not-executable", .{ options.test_root.?, fixture.name });
     defer allocator.free(executable);
     var environment = std.process.Environ.Map.init(allocator);
     defer environment.deinit();
@@ -566,7 +566,7 @@ test "sensitive reader wipes successful and hash-rejected buffers before release
     var secret = try fixture.directory.readSensitive(io, observer.asAllocator(), "sas", 64, null);
     try testing.expectEqualStrings("sig=SYNTHETIC_SECRET", secret.bytes());
     secret.deinit();
-    try testing.expectError(error.HashMismatch, fixture.directory.readSensitive(io, observer.asAllocator(), "sas", 64, [_]u8{0} ** 32));
+    try testing.expectError(error.HashMismatch, fixture.directory.readSensitive(io, observer.asAllocator(), "sas", 64, @as([32]u8, @splat(0))));
     try observer.verify();
 }
 

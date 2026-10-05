@@ -1,6 +1,6 @@
 # Native Hyper-V host tool and supervised transfers
 
-This standalone Zig 0.16.0 package does not import the repository's root build,
+This standalone Zig 0.17.0 package does not import the repository's root build,
 run any legacy controller, use Azure CLI, or acquire ambient credentials.
 The dependency-free `hyperv_core` foundation is combined with the pinned SDK
 transfer module in the `hyperv` facade. Its only installed executable is
@@ -10,7 +10,7 @@ results do not authorize execution or establish preflight/persistence acceptance
 
 ## Build and test
 
-From the repository root, using the already installed Zig 0.16.0 compiler:
+From the repository root, using the already installed Zig 0.17.0 compiler:
 
 ```sh
 CORE_WORK="$PWD/.d/zig-migration-transfer-core"
@@ -25,11 +25,10 @@ export ZIG_LOCAL_CACHE_DIR="$CORE_WORK/zig-local"
 # in scratch, then disable fetching for every source-tree build.
 cp support/tools/hyperv/build.zig support/tools/hyperv/build.zig.zon "$CORE_WORK/restore/"
 zig build --build-file "$CORE_WORK/restore/build.zig" \
-  --fetch=all --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
-  --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" -j2
+  --fetch=all --cache-dir "$ZIG_LOCAL_CACHE_DIR" -j2
 zig build --build-file support/tools/hyperv/build.zig \
   --system "$CORE_WORK/restore/zig-pkg" \
-  --cache-dir "$ZIG_LOCAL_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
+  --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
   --prefix "$CORE_WORK/out" -Dtest-root="$CORE_WORK/fixtures" \
   -j2 test-core test-transfer test-worker install --summary all
 ```
@@ -67,6 +66,15 @@ snapshot, EOF/identity check and deadline. `test-sha256`, also included in
 `test-core` and persistence `test`, retains runtime and compile-time known-vector, streaming, `peek`
 and continuation equivalence. The producer and runner source guards
 independently pin the shared implementation, assembly and test dependency.
+
+Zig 0.17 reads CPU features from `builtin.target.cpu`; the SHA/AVX2 gate and
+C ABI fence are unchanged. Allocator sentinel methods retain the terminating
+zero byte for native argv and proc paths. Linux wait status storage retains its
+unsigned raw bits, with the signed `waitpid` pointer adapted only at the syscall
+boundary; termination, cancellation and cleanup diagnostics keep their existing
+schemas. Use `-Doptimize=debug` or `-Doptimize=safe` for checked qualification.
+`zig build` reads the private global cache from `ZIG_GLOBAL_CACHE_DIR` rather
+than accepting the old `--global-cache-dir` build option.
 
 ## Local inspection CLI
 

@@ -10,7 +10,7 @@ const executable_snapshot_seals = 1 | 2 | 4 | 8;
 const mfd_exec = 0x10;
 
 comptime {
-    if (builtin.os.tag != .linux) @compileError("Hyper-V process supervision currently requires Linux");
+    if (builtin.target.os.tag != .linux) @compileError("Hyper-V process supervision currently requires Linux");
 }
 
 pub const Deadline = struct {
@@ -181,7 +181,7 @@ fn validateElfExecutable(descriptor: linux.fd_t, size: u64) !bool {
 
     const executable_type = readLittle16(header[16..18]);
     if (executable_type != 2 and executable_type != 3) return error.UnsupportedExecutableFormat;
-    const expected_machine: u16 = switch (builtin.cpu.arch) {
+    const expected_machine: u16 = switch (builtin.target.cpu.arch) {
         .x86_64 => 62,
         .aarch64 => 183,
         else => return error.UnsupportedExecutableFormat,
@@ -877,7 +877,7 @@ var retained_writer: ?linux.fd_t = null;
 /// application with unrelated waitpid users. Legacy run/runPrivate require group
 /// containment; runCommand opts into bounded pidfd/procfs descendant discovery.
 pub fn initialize() !void {
-    if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0)) != .SUCCESS)
+    if (linux.errno(linux.prctl(@backingInt(linux.PR.SET_CHILD_SUBREAPER), 1, 0, 0, 0)) != .SUCCESS)
         return error.SubreaperUnavailable;
 }
 
@@ -1550,7 +1550,7 @@ fn enter() !void {
     errdefer busy.store(false, .release);
     if (poisoned.load(.acquire)) return error.UnresolvedCleanup;
     var subreaper: c_int = 0;
-    if (linux.errno(linux.prctl(@intFromEnum(linux.PR.GET_CHILD_SUBREAPER), @intFromPtr(&subreaper), 0, 0, 0)) != .SUCCESS or subreaper != 1)
+    if (linux.errno(linux.prctl(@backingInt(linux.PR.GET_CHILD_SUBREAPER), @intFromPtr(&subreaper), 0, 0, 0)) != .SUCCESS or subreaper != 1)
         return error.SubreaperRequired;
 }
 
@@ -2002,7 +2002,7 @@ fn cleanup(pid: linux.pid_t, milliseconds: u32, result: *Execution, policy: Clea
     final_signal_sent = true;
     while (true) {
         var status: u32 = 0;
-        const child = linux.waitpid(if (result.termination == null) pid else if (policy.all_children) -1 else -pid, &status, linux.W.NOHANG);
+        const child = linux.waitpid(if (result.termination == null) pid else if (policy.all_children) -1 else -pid, @ptrCast(&status), linux.W.NOHANG);
         switch (linux.errno(child)) {
             .SUCCESS => {
                 if (child != 0) {
@@ -2566,7 +2566,7 @@ fn reapCommand(request: CommandRequest, tracker: *OwnedTracker, result: *Command
     var remaining = tracker.len;
     while (true) {
         var status: u32 = 0;
-        const child = linux.waitpid(-1, &status, linux.W.NOHANG);
+        const child = linux.waitpid(-1, @ptrCast(&status), linux.W.NOHANG);
         switch (linux.errno(child)) {
             .SUCCESS => {
                 if (child == 0) {
@@ -2657,7 +2657,7 @@ fn commandPidfd(pid: linux.pid_t) !linux.fd_t {
 
 fn readProcStat(proc: linux.fd_t, pid: linux.pid_t) !ProcStat {
     var path: [64:0]u8 = undefined;
-    const name = std.fmt.bufPrintZ(&path, "{d}/stat", .{pid}) catch return error.ProcUnavailable;
+    const name = std.mem.printSentinel(&path, "{d}/stat", .{pid}, 0) catch return error.ProcUnavailable;
     const opened = linux.openat(proc, name, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, 0);
     switch (linux.errno(opened)) {
         .SUCCESS => {},
@@ -2738,7 +2738,7 @@ fn openCommandProc() !linux.fd_t {
 fn requirePidfds() !void {
     const descriptor = try commandPidfd(linux.getpid());
     defer _ = linux.close(descriptor);
-    const signal: linux.SIG = @enumFromInt(0);
+    const signal: linux.SIG = @fromBackingInt(@intCast(0));
     if (linux.errno(linux.pidfd_send_signal(descriptor, signal, null, 0)) != .SUCCESS)
         return error.PidfdUnavailable;
 }
@@ -2758,7 +2758,7 @@ fn poisonCommand(
     var attempts: u16 = 0;
     while (attempts < request.limits.reap_events) : (attempts += 1) {
         var status: u32 = 0;
-        const child = linux.waitpid(-1, &status, linux.W.NOHANG);
+        const child = linux.waitpid(-1, @ptrCast(&status), linux.W.NOHANG);
         if (linux.errno(child) == .CHILD or child == 0) break;
         if (linux.errno(child) != .SUCCESS and linux.errno(child) != .INTR) break;
         if (linux.errno(child) == .SUCCESS and @as(linux.pid_t, @intCast(child)) == tracker.items[0].pid)
@@ -2880,7 +2880,7 @@ fn recoverGatedChild(
     while (true) {
         try takeCleanupEvent(request, result);
         var status: u32 = 0;
-        const waited = linux.waitpid(pid, &status, linux.W.NOHANG);
+        const waited = linux.waitpid(pid, @ptrCast(&status), linux.W.NOHANG);
         switch (linux.errno(waited)) {
             .SUCCESS => {
                 if (waited == 0) {
@@ -2928,7 +2928,7 @@ fn poisonGatedChild(
     var attempts: u16 = 0;
     while (attempts < request.limits.reap_events) : (attempts += 1) {
         var status: u32 = 0;
-        const waited = linux.waitpid(pid, &status, linux.W.NOHANG);
+        const waited = linux.waitpid(pid, @ptrCast(&status), linux.W.NOHANG);
         switch (linux.errno(waited)) {
             .SUCCESS => {
                 if (waited == 0) {
@@ -2958,7 +2958,7 @@ fn poisonUnpinnedGatedChild(
     var attempts: u16 = 0;
     while (attempts < request.limits.reap_events) : (attempts += 1) {
         var status: u32 = 0;
-        const waited = linux.waitpid(pid, &status, linux.W.NOHANG);
+        const waited = linux.waitpid(pid, @ptrCast(&status), linux.W.NOHANG);
         switch (linux.errno(waited)) {
             .SUCCESS => {
                 if (waited == 0) {
@@ -3059,7 +3059,7 @@ fn spawnOwned(
     defer arena.deinit();
     const scratch = arena.allocator();
     const argv = try scratch.allocSentinel(?[*:0]const u8, options.argv.len, null);
-    for (options.argv, 0..) |arg, i| argv[i] = (try scratch.dupeZ(u8, arg)).ptr;
+    for (options.argv, 0..) |arg, i| argv[i] = (try scratch.dupeSentinel(u8, arg, 0)).ptr;
     const environment = try options.environment.createPosixBlock(scratch, .{ .zig_progress_fd = -1 });
     defer for (environment.slice) |entry| std.crypto.secureZero(u8, @constCast(std.mem.span(entry.?)));
 
@@ -3085,7 +3085,7 @@ fn spawnOwned(
         _ = linux.close(stderr[0]);
         _ = linux.close(control[0]);
         if (gate) |pair| _ = linux.close(pair[0]);
-        if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(linux.SIG.KILL), 0, 0, 0)) != .SUCCESS or
+        if (linux.errno(linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @backingInt(linux.SIG.KILL), 0, 0, 0)) != .SUCCESS or
             linux.getppid() != parent_pid) childFailure(control[1], 1);
         if (fault == .pre_exec_stall) {
             while (true) {
@@ -3419,7 +3419,7 @@ pub const SignalCancellation = struct {
     }
 
     fn handle(number: linux.SIG) callconv(.c) void {
-        _ = received_signal.cmpxchgStrong(0, @intCast(@intFromEnum(number)), .acq_rel, .acquire);
+        _ = received_signal.cmpxchgStrong(0, @intCast(@backingInt(number)), .acq_rel, .acquire);
         signal_cancelled.store(true, .release);
     }
 };

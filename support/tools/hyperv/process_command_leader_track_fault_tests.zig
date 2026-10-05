@@ -100,7 +100,7 @@ test "addLeader failure samples one inclusive deadline timestamp and reaps the l
         }
         const pid: linux.pid_t = @intCast(forked);
         var status: u32 = 0;
-        while (true) switch (linux.errno(linux.waitpid(pid, &status, 0))) {
+        while (true) switch (linux.errno(linux.waitpid(pid, @ptrCast(&status), 0))) {
             .SUCCESS => break,
             .INTR => continue,
             else => return error.FixtureReap,

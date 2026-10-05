@@ -40,7 +40,7 @@ pub fn executable() ![:0]u8 {
 
 pub fn noChildren() !void {
     var status: u32 = 0;
-    try std.testing.expectEqual(.CHILD, std.os.linux.errno(std.os.linux.waitpid(-1, &status, std.os.linux.W.NOHANG)));
+    try std.testing.expectEqual(.CHILD, std.os.linux.errno(std.os.linux.waitpid(-1, @ptrCast(&status), std.os.linux.W.NOHANG)));
 }
 
 /// Failing cleanup regressions must not strand their synthetic descendants.
@@ -56,7 +56,7 @@ pub fn reapFixtureChildIfOwned(pid: std.os.linux.pid_t) void {
     };
     _ = linux.kill(pid, .KILL);
     var status: u32 = 0;
-    while (linux.errno(linux.waitpid(pid, &status, 0)) == .INTR) {}
+    while (linux.errno(linux.waitpid(pid, @ptrCast(&status), 0)) == .INTR) {}
 }
 
 pub fn cancelAfter(flag: *std.atomic.Value(bool), milliseconds: u32) void {

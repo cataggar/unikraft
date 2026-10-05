@@ -218,7 +218,7 @@ fn expectPidsGone(bytes: []const u8, expected: usize) !void {
     var count: usize = 0;
     while (lines.next()) |line| {
         const pid = try std.fmt.parseInt(linux.pid_t, line, 10);
-        try testing.expectEqual(.SRCH, linux.errno(linux.kill(pid, @enumFromInt(0))));
+        try testing.expectEqual(.SRCH, linux.errno(linux.kill(pid, @fromBackingInt(@intCast(0)))));
         count += 1;
     }
     try testing.expectEqual(expected, count);
@@ -476,7 +476,7 @@ test "executable contract rejects scripts text and malformed ELF before spawn" {
         .{ .name = "shebang", .bytes = "#!/bin/sh\nexit 0\n" },
         .{ .name = "text", .bytes = "echo executable text\n" },
         .{ .name = "truncated", .bytes = "\x7fELF" },
-        .{ .name = "magic-only", .bytes = "\x7fELF\x02\x01\x01" ++ "\x00" ** 57 },
+        .{ .name = "magic-only", .bytes = "\x7fELF\x02\x01\x01" ++ &@as([57:0]u8, @splat('\x00')) },
     };
     for (cases) |case| {
         const path = try createExecutableFile(&fixture, case.name, case.bytes);
@@ -506,7 +506,7 @@ test "ELF program alignment rejects malformed values and accepts valid forms" {
 
     for ([_]u64{ 0, 1, 2 }) |alignment| {
         var name_buffer: [32:0]u8 = undefined;
-        const name = try std.fmt.bufPrintZ(&name_buffer, "valid-align-{d}", .{alignment});
+        const name = try std.mem.printSentinel(&name_buffer, "valid-align-{d}", .{alignment}, 0);
         const path = try copyExecutableFile(&fixture, name, source);
         defer allocator.free(path);
         const descriptor = try openReadWrite(path);
@@ -696,7 +696,7 @@ test "pidfd liveness and proc start identity agree across exit and reap" {
     defer if (!reaped) {
         _ = linux.pidfd_send_signal(descriptor, .KILL, null, 0);
         var status: u32 = 0;
-        while (linux.errno(linux.waitpid(pid, &status, 0)) == .INTR) {}
+        while (linux.errno(linux.waitpid(pid, @ptrCast(&status), 0)) == .INTR) {}
     };
 
     const start_ticks = try process.CommandIdentityTest.startTicks(pid);
@@ -708,7 +708,7 @@ test "pidfd liveness and proc start identity agree across exit and reap" {
     }
     try testing.expect(try process.CommandIdentityTest.identityOwned(pid, start_ticks, descriptor));
     var status: u32 = 0;
-    while (true) switch (linux.errno(linux.waitpid(pid, &status, 0))) {
+    while (true) switch (linux.errno(linux.waitpid(pid, @ptrCast(&status), 0))) {
         .SUCCESS => {
             reaped = true;
             break;
@@ -731,7 +731,7 @@ test "proc stat read recognizes disappearance after open and exact child reap" {
     defer if (!reaped) support.reapFixtureChildIfOwned(pid);
 
     var path: [64:0]u8 = undefined;
-    const name = try std.fmt.bufPrintZ(&path, "/proc/{d}/stat", .{pid});
+    const name = try std.mem.printSentinel(&path, "/proc/{d}/stat", .{pid}, 0);
     const opened = linux.openat(linux.AT.FDCWD, name, .{
         .ACCMODE = .RDONLY,
         .CLOEXEC = true,
@@ -742,7 +742,7 @@ test "proc stat read recognizes disappearance after open and exact child reap" {
     defer _ = linux.close(descriptor);
 
     var status: u32 = 0;
-    while (true) switch (linux.errno(linux.waitpid(pid, &status, 0))) {
+    while (true) switch (linux.errno(linux.waitpid(pid, @ptrCast(&status), 0))) {
         .SUCCESS => {
             reaped = true;
             break;
@@ -1108,7 +1108,7 @@ test "immediate-exit descendants count exactly through first excess and minimum 
         var fixture = try support.Fixture.init();
         defer fixture.deinit();
         var count_buffer: [8]u8 = undefined;
-        const count = try std.fmt.bufPrint(&count_buffer, "{d}", .{case.count});
+        const count = try std.mem.print(&count_buffer, "{d}", .{case.count});
         var command = try request(
             executable,
             &.{ path, "many-immediate", count },
