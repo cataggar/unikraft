@@ -105,22 +105,23 @@ Each successful fixture run records its case count in its generated
 Pinned local invocation (Linux, Zig 0.17.0, existing LLVM 22.1.8):
 
 ```sh
+umask 077
 cd /d/unikraft-worktrees/fleet-network
-work="$PWD/.d/zig-migration-object-proofs"
+work="$HOME/unikraft-zig17-object-proofs"
 export HOME="$work/home" TMPDIR="$work/tmp"
 export ZIG_LOCAL_CACHE_DIR="$work/cache"
 export ZIG_GLOBAL_CACHE_DIR="$work/global-cache"
 export PATH="/home/g/.local/bin:/d/unikraft-worktrees/fleet-ci/.d/tools/llvm-tools-22.1.8-aarch64-linux/bin:$PATH"
 mkdir -p "$HOME" "$TMPDIR" "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
 /home/g/.local/bin/zig build hyperv-object-proofs test-hyperv-object-proofs \
-  -Doptimize=Debug -j2 --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
-  --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" --prefix "$work/outputs/debug"
+  -Doptimize=debug -j2 --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
+  --prefix "$work/outputs/debug"
 /home/g/.local/bin/zig build hyperv-object-proofs test-hyperv-object-proofs \
   -Doptimize=safe -j2 --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
-  --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" --prefix "$work/outputs/release-safe"
+  --prefix "$work/outputs/safe"
 ```
 
-The existing protocol/C suites retain their existing Debug mode and the
+The existing protocol/C suites retain their existing debug mode and the
 freestanding producers retain fast; the new verifier, parser tests,
 CLI fixture driver and fake tool use the selected optimization mode.
 `-Dhyperv-object-nm=PATH`, `-Dhyperv-object-readelf=PATH` and
