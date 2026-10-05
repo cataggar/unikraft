@@ -4124,7 +4124,7 @@ test "dependency custody parses pinned native ZON, tracked manifests and bounded
     var manifest_data = try core.private_files.readSensitiveFile(io, allocator, manifest_file.file, 1024 * 1024, .artifact);
     defer manifest_data.deinit();
     try dependency.pinnedManifest(allocator, manifest_data.bytes());
-    const mutated = try std.mem.replaceOwned(u8, allocator, manifest_data.bytes(), "miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx", "miz-0.2.0-invalid");
+    const mutated = try std.mem.replaceOwned(u8, allocator, manifest_data.bytes(), controller.custody_limits.miz_package_hash, "miz-0.2.0-invalid");
     defer allocator.free(mutated);
     try std.testing.expectError(error.UnpinnedDependency, dependency.pinnedManifest(allocator, mutated));
     const sources = try dependency.sourceManifests(allocator, io, options.repository_root, options.git_executable);

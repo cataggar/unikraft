@@ -4181,8 +4181,8 @@ class Evidence(unittest.TestCase):
                 "support/tools/hyperv/local_boot/build.zig", repository)
         self.assertTrue(raced)
 
-    def dependency_fixture(self):
-        root = self.root / "dependency-fixture"
+    def dependency_fixture(self, name="dependency-fixture"):
+        root = self.root / name
         root.mkdir(mode=0o700)
         private = root / "private"
         private.mkdir(mode=0o700)
@@ -4226,7 +4226,20 @@ class Evidence(unittest.TestCase):
         root, _, tracked = self.dependency_fixture()
         with tracked:
             current = ci.dependency_custody(root)
-        historical = copy.deepcopy(current)
+        current_sources = {
+            name: item["source"]
+            for name, item in current["source_manifests"].items()
+        }
+        with mock.patch.object(
+                public_bundle, "trusted_source_manifests", return_value=current_sources):
+            public_bundle.dependency_record(ci, current, {})
+        with (mock.patch.object(ci, "MIZ_REVISION", ci.HISTORICAL_MIZ_REVISION),
+              mock.patch.object(ci, "MIZ_PACKAGE_HASH", ci.HISTORICAL_MIZ_PACKAGE_HASH),
+              mock.patch.object(ci, "MIZ_URL", ci.HISTORICAL_MIZ_URL)):
+            historical_root, _, historical_tracked = self.dependency_fixture(
+                "historical-dependency-fixture")
+            with historical_tracked:
+                historical = ci.dependency_custody(historical_root)
         historical["packages"]["hash_verification"]["algorithm"] = (
             "zig-0.16.0-fetch-path")
         sources = {
@@ -4245,6 +4258,11 @@ class Evidence(unittest.TestCase):
             altered["request"]["package_hash"] = ci.MIZ_PACKAGE_HASH
             with self.assertRaises(ValueError):
                 public_bundle.dependency_record(ci, altered, {})
+            relabeled = copy.deepcopy(current)
+            relabeled["packages"]["hash_verification"]["algorithm"] = (
+                "zig-0.16.0-fetch-path")
+            with self.assertRaises(ValueError):
+                public_bundle.dependency_record(ci, relabeled, {})
             for algorithm in ("zig-0.15.2-fetch-path", [], {"unexpected": True}):
                 altered = copy.deepcopy(historical)
                 altered["packages"]["hash_verification"]["algorithm"] = algorithm

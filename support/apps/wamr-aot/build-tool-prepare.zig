@@ -687,7 +687,9 @@ fn buildWorkload(
         ".{ .name = .wamr_workload_image, .version = \"0.0.0\", " ++
             ".fingerprint = 0xcb36ebabb0542062, " ++
             ".minimum_zig_version = \"0.17.0\", " ++
-            ".dependencies = .{ .wamr = .{ .path = \"../wamr-source\" } }, " ++
+            ".dependencies = .{ .wamr = .{ .path = \"../wamr-source\" }, " ++
+            ".translate_c = .{ .url = \"" ++ contract.translate_c_url ++
+            "\", .hash = \"" ++ contract.translate_c_hash ++ "\" } }, " ++
             ".paths = .{ \".\" } }\n",
     );
 

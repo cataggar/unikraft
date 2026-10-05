@@ -40,7 +40,14 @@ Request fields are never echoed into independent observations.
 All variants use merged WAMR
 `a53205d77be3b880eb8f8b96679512ba58e2331a`, including the AOT producer and the
 PIC, final-link-owned compiler-runtime sampler APIs. This supported source pin
-is not qualified image or deployment lineage:
+is not qualified image or deployment lineage.
+
+The generated consumer also pins `cataggar/translate-c`
+`62d06a5d3e93c82727544e8113e4762a315ca0ed`. Its target-aware
+`Translator.init` translates the actual `workloads.h`, `platform.h`, and
+generated `wamr_aot.h` into the `workloads_c` module, including the package's
+required helper imports. Translation keeps the freestanding target, generated
+include paths, shared SDK module roots, PIC, and final-link-owned compiler runtime.
 
 ```sh
 umask 077

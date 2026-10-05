@@ -15,6 +15,12 @@ The historical source, canonical records, physical custody, dependency graph,
 and actual native output revalidation remain required; schema versions and
 resource bounds are unchanged.
 
+New dependency restoration binds the qualified exact-generation Miz
+`66ea6701cf0e1b6d31e5f30fade00b7a546d4b44` package; the Zig 0.16 import
+algorithm still selects its original `669a27982b376311f558e820b69e9a692735b0cd`
+revision and package hash. Changing only an imported algorithm name cannot
+authenticate a package from the other generation.
+
 The exact-generation WAMR/Miz dependency qualification is a separate
 prerequisite to an integrated build. Validator or controller fixture success
 alone does not qualify the SDK, hardware, deployment, or cloud lineage.

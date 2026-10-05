@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 const std = @import("std");
+const Translator = @import("translate_c").Translator;
 
 fn pic(module: *std.Build.Module) void {
     module.pic = true;
@@ -33,15 +34,25 @@ pub fn build(b: *std.Build) void {
     root.addIncludePath(b.path("."));
     root.addIncludePath(b.path("../artifacts"));
     if (variant != .tiny or coremark) {
-        const translated = b.addTranslateC(.{
-            .root_source_file = b.path("workloads.h"),
+        const translated = Translator.init(b.dependency("translate_c", .{
+            .target = b.graph.host,
+            .optimize = std.lang.Optimize.safe,
+        }), .{
+            .name = "workloads_c",
+            .c_source_file = b.path("workloads.h"),
             .target = target,
             .optimize = .safe,
             .link_libc = false,
         });
         translated.addIncludePath(b.path("."));
         translated.addIncludePath(b.path("../artifacts"));
-        root.addImport("workloads_c", translated.createModule());
+        translated.mod.single_threaded = true;
+        translated.mod.red_zone = false;
+        translated.mod.stack_check = false;
+        translated.mod.stack_protector = false;
+        translated.mod.unwind_tables = .none;
+        translated.mod.error_tracing = false;
+        root.addImport("workloads_c", translated.mod);
     }
     if (variant != .tiny) root.addAnonymousImport("workload-artifacts", .{
         .root_source_file = b.path("artifacts.zig"),

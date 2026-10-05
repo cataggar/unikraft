@@ -115,6 +115,41 @@ test "native prepare and verify cover every variant with create-only output" {
             try testing.expect(fields.get("jit_mode").? == .null);
         try testing.expectEqual(case.coremark, fields.get("minimal_wasi").?.bool);
         const files = fields.get("files").?.object;
+        const manifest_path = try std.fs.path.join(allocator, &.{
+            repository, "support/apps/wamr-aot/build/workload-consumer/build.zig.zon",
+        });
+        defer allocator.free(manifest_path);
+        const manifest_bytes = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            manifest_path,
+            allocator,
+            .limited(4096),
+        );
+        defer allocator.free(manifest_bytes);
+        const manifest_source = try allocator.dupeSentinel(u8, manifest_bytes, 0);
+        defer allocator.free(manifest_source);
+        var manifest_arena = std.heap.ArenaAllocator.init(allocator);
+        defer manifest_arena.deinit();
+        var manifest_diagnostics: std.zon.parse.Diagnostics = undefined;
+        const manifest = try std.zon.parse.fromSlice(struct {
+            name: enum { wamr_workload_image },
+            version: []const u8,
+            fingerprint: u64,
+            minimum_zig_version: []const u8,
+            dependencies: struct {
+                wamr: struct { path: []const u8 },
+                translate_c: struct { url: []const u8, hash: []const u8 },
+            },
+            paths: [][]const u8,
+        }, .{
+            .gpa = allocator,
+            .arena = manifest_arena.allocator(),
+            .source = manifest_source,
+            .diagnostics = &manifest_diagnostics,
+        });
+        try testing.expectEqualStrings("../wamr-source", manifest.dependencies.wamr.path);
+        try testing.expectEqualStrings(build_tool.translate_c_url, manifest.dependencies.translate_c.url);
+        try testing.expectEqualStrings(build_tool.translate_c_hash, manifest.dependencies.translate_c.hash);
         try testing.expectEqualStrings(
             "5e43618eda26c083b511b9570d347123affd2b1a14bfc22be766e95c1c8153f8",
             files.get("tiny.wasm").?.string,

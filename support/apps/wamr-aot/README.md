@@ -60,6 +60,11 @@ The same merged SDK supplies the single-root CoreMark bridge and optional
 workloads in [WORKLOADS.md](WORKLOADS.md). This source pin does not establish
 native boot, hardware or measurement qualification.
 
+Generated workload manifests pin the standalone `cataggar/translate-c`
+`62d06a5d3e93c82727544e8113e4762a315ca0ed` translator. The target-aware
+generated `workloads_c` module uses the actual workload/platform/SDK headers;
+it is not a handwritten C ABI substitute.
+
 The integration archive explicitly uses x86_64 SysV, PIC, no red zone,
 stack protector, stack checking, unwind tables, libc, or error tracing, and
 single-threaded Zig support. Safe-mode checks remain enabled. The wrapper

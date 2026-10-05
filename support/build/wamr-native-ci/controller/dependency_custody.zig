@@ -148,6 +148,22 @@ pub fn packageDependencies(allocator: std.mem.Allocator, bytes: []const u8) ![][
     return result;
 }
 
+test "current restore manifest refuses historical and mismatched pin generations" {
+    const allocator = std.testing.allocator;
+    const current = ".{ .dependencies = .{ .miz_source = .{ .url = \"" ++
+        limits.miz_url ++ "\", .hash = \"" ++ limits.miz_package_hash ++ "\" } } }";
+    try pinnedManifest(allocator, current);
+    const historical = ".{ .dependencies = .{ .miz_source = .{ .url = \"" ++
+        limits.historical_miz_url ++ "\", .hash = \"" ++ limits.historical_miz_package_hash ++ "\" } } }";
+    try std.testing.expectError(error.UnpinnedDependency, pinnedManifest(allocator, historical));
+    const mismatched = ".{ .dependencies = .{ .miz_source = .{ .url = \"" ++
+        limits.miz_url ++ "\", .hash = \"" ++ limits.historical_miz_package_hash ++ "\" } } }";
+    try std.testing.expectError(error.UnpinnedDependency, pinnedManifest(allocator, mismatched));
+    const alias = ".{ .dependencies = .{ .alias = .{ .url = \"" ++
+        limits.miz_url ++ "\", .hash = \"" ++ limits.miz_package_hash ++ "\" } } }";
+    try std.testing.expectError(error.UnpinnedDependency, pinnedManifest(allocator, alias));
+}
+
 test "arena ZON extraction retains independent pins and rolls back invalid later entries" {
     const allocator = std.testing.allocator;
     const pins = try packageDependencies(allocator,
