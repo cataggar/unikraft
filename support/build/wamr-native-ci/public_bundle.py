@@ -1720,11 +1720,9 @@ def import_bundle(
                 )
     for item in members(handoff, bundle).values():
         item["path"] = str(output / item["path"])
-    identity_parent = None
-    if bundle["version"] == 2:
-        identity_parent = output.with_name(output.name + "-native-identity")
-        identity_parent.mkdir(mode=0o700)
-        handoff.private(identity_parent)
+    identity_parent = output.with_name(output.name + "-native-identity")
+    identity_parent.mkdir(mode=0o700)
+    handoff.private(identity_parent)
     handoff.FAILURE_STAGE = "public-import-native-records"
     accepted = accepted_records.imported_stage(output)
     require(
@@ -1791,6 +1789,11 @@ def import_bundle(
     else:
         require(artifact_id is None and container_digest is None
                 and not native_import_revalidation)
+        handoff.FAILURE_STAGE = "public-import-native-revalidation"
+        native_revalidation = accepted_records.import_native_revalidation(
+            output, identity_parent / "revalidation",
+            git=handoff.ci.tool("git"), supervisor=supervisor,
+            validator=validator)
     handoff.ci.save(output / "candidate-bundle.json", bundle)
     handoff.FAILURE_STAGE = "public-import-records"
     publication_records(
@@ -1798,7 +1801,7 @@ def import_bundle(
         "candidate-bundle.json",
         native_accepted=accepted if bundle["version"] == 2 else None)
     handoff.FAILURE_STAGE = "public-import-revalidation"
-    if bundle["version"] == 2 and (
+    if bundle["version"] == 1 or (
             native_import_revalidation or producer == "native"):
         require(native_revalidation is not None)
         handoff.private(native_revalidation)
@@ -1818,7 +1821,7 @@ def publish_ci(handoff):
     handoff.FAILURE_STAGE = "public-context-runtime"
     runtime = ci_runtime(handoff.ci)
     handoff.FAILURE_STAGE = "public-result-records"
-    handoff.result_records(runtime / "compute")
+    handoff.accepted_result_records(runtime / "compute")
     build_start = accepted_public_build_start(handoff, runtime)
     start = build_start.start
     producer = recorded_producer(runtime, start["consumer_inputs"])

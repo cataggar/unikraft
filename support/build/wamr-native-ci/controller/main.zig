@@ -26,24 +26,53 @@ pub fn main(init: std.process.Init) void {
         stdout.interface.writeAll(encoded) catch refused(init.io);
         return;
     }
-    if (command.action == .@"supervisor-source-closure") {
+    if (command.action == .@"supervisor-source-closure" or command.action == .@"reader-source-closure") {
         const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
-        const closure = controller.import_supervisor_identity.supervisorSourceContentClosure(
-            allocator,
-            init.io,
-            repository,
-            command.git.?,
-        ) catch |err| failed(init.io, @tagName(command.action), "", err);
+        const closure = (if (command.action == .@"reader-source-closure")
+            controller.import_supervisor_identity.currentReaderSourceContentClosure(
+                allocator,
+                init.io,
+                repository,
+                command.git.?,
+            )
+        else
+            controller.import_supervisor_identity.supervisorSourceContentClosure(
+                allocator,
+                init.io,
+                repository,
+                command.git.?,
+            )) catch |err| failed(init.io, @tagName(command.action), "", err);
         var stdout = std.Io.File.stdout().writerStreaming(init.io, &.{});
         stdout.interface.print("{s}\n", .{closure[0..]}) catch refused(init.io);
         return;
     }
-    if (command.action == .records) {
+    if (command.action == .records or command.action == .@"readonly-records") {
         const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
         const root = command.runtime orelse command.stage_root.?;
         const directory = controller.layout.runtime(init.io, root) catch refused(init.io);
         defer directory.close(init.io);
-        var accepted = if (command.runtime != null)
+        var accepted = if (command.action == .@"readonly-records" and command.git != null)
+            controller.accepted_run.openAndValidateReadOnlyWithGit(
+                allocator,
+                init.io,
+                init.minimal.environ,
+                &directory,
+                root,
+                repository,
+                command.git.?,
+                null,
+            ) catch |err| failed(init.io, "readonly-records", "", err)
+        else if (command.action == .@"readonly-records")
+            controller.accepted_run.openAndValidateReadOnlyWithSignal(
+                allocator,
+                init.io,
+                init.minimal.environ,
+                &directory,
+                root,
+                repository,
+                null,
+            ) catch |err| failed(init.io, "readonly-records", "", err)
+        else if (command.runtime != null)
             controller.accepted_run.openAndValidate(
                 allocator,
                 init.io,
@@ -155,7 +184,7 @@ pub fn main(init: std.process.Init) void {
         var signal = controller.build_pipeline.installCancellation() catch refused(init.io);
         defer signal.deinit();
         var accepted = if (command.action == .@"handoff-inspect" or command.action == .@"handoff-inspect-legacy")
-            controller.accepted_run.openAndValidateForHandoffInspectWithSignal(
+            controller.accepted_run.openAndValidateReadOnlyWithSignal(
                 allocator,
                 init.io,
                 init.minimal.environ,
@@ -251,7 +280,9 @@ pub fn main(init: std.process.Init) void {
         },
         .describe => unreachable,
         .@"supervisor-source-closure" => unreachable,
+        .@"reader-source-closure" => unreachable,
         .records => unreachable,
+        .@"readonly-records" => unreachable,
         .@"local-consumer-custody" => unreachable,
         .@"handoff-inspect" => unreachable,
         .@"handoff-inspect-legacy" => unreachable,
@@ -271,6 +302,8 @@ fn usage(io: std.Io) noreturn {
             "       uk-wamr-native-ci boot|diagnostics --runtime ABS\n" ++
             "       uk-wamr-native-ci describe --output json-v1\n" ++
             "       uk-wamr-native-ci supervisor-source-closure --git /usr/bin/git --output sha256-v1\n" ++
+            "       uk-wamr-native-ci reader-source-closure --git /usr/bin/git --output sha256-v1\n" ++
+            "       uk-wamr-native-ci readonly-records --runtime /private/runtime --output handoff-v1\n" ++
             "       uk-wamr-native-ci records --runtime ABS --output handoff-v1\n" ++
             "       uk-wamr-native-ci records --stage-root ABS --transport trusted-inner-zip --output handoff-v1\n" ++
             "       uk-wamr-native-ci import-handoff-revalidation --stage-root ABS --git ABS --supervisor ABS --validator ABS --output ABS\n" ++

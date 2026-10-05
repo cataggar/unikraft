@@ -4,7 +4,7 @@ const builtin = @import("builtin");
 const core = @import("hyperv_core");
 const files = core.private_files;
 const Sha256 = core.Sha256;
-const layout = @import("layout.zig");
+const layout = @import("wamr_controller").handoff_contracts.layout;
 const linux = std.os.linux;
 
 pub const aggregate_budget = layout.max_total_bytes - 2 * layout.max_json_bytes;

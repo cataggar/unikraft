@@ -493,6 +493,24 @@ def local_runtime(runtime):
     return value
 
 
+def readonly_local_runtime(runtime, *, git=None):
+    """Accept historical/Python runs only through the explicit native reader."""
+    runtime = _absolute(runtime)
+    arguments = ("readonly-records", "--runtime", str(runtime),
+                 "--output", "handoff-v1")
+    if git is not None:
+        arguments += ("--git", str(_absolute(git)))
+    raw, stderr_seen = _controller_command(
+        arguments,
+        "native controller read-only records refused")
+    if stderr_seen:
+        _refuse("native controller read-only records refused")
+    value = _decode(raw, "local-runtime")
+    if not value["runtime_inputs"]:
+        _refuse("native controller read-only records refused")
+    return value
+
+
 def public_validator_build(runtime, output):
     """Build the public validator for a native-produced run without fallback."""
     return _runtime_output(

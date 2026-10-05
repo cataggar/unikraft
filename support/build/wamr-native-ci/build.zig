@@ -1,6 +1,19 @@
 const std = @import("std");
 const controller_target = @import("controller/target.zig");
 
+fn handoffContracts(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, core: *std.Build.Module) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("handoff/contracts.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "hyperv_core", .module = core }},
+    });
+}
+
+fn wamrAotBuild(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Dependency {
+    return b.dependency("wamr_aot_build", .{ .target = target, .optimize = optimize });
+}
+
 pub fn build(b: *std.Build) void {
     const requested_target = b.standardTargetOptionsQueryOnly(.{});
     const target = b.resolveTargetQuery(requested_target);
@@ -70,10 +83,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(supervisor_fixture);
 
     const image = b.dependency("public_image", .{ .target = target, .optimize = optimize }).module("hyperv_public_image");
-    const wamr_aot_build = b.dependency("wamr_aot_build", .{
-        .target = target,
-        .optimize = optimize,
-    });
+    const wamr_aot_build = wamrAotBuild(b, target, optimize);
     b.installArtifact(wamr_aot_build.artifact("uk-wamr-aot-build"));
     const root = b.createModule(.{
         .root_source_file = b.path("package.zig"),
@@ -119,6 +129,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "wamr_log_validator", .module = portable_validator },
             .{ .name = "controller_source_closure", .module = source_closure_module },
             .{ .name = "import_validator_identity", .module = portable_identity },
+            .{ .name = "handoff_contracts", .module = handoffContracts(b, portable_target, optimize, portable_core) },
         },
     });
     const controller_cli = b.addExecutable(.{
@@ -150,11 +161,13 @@ pub fn build(b: *std.Build) void {
         "Existing absolute owner-only runtime directory for create-only controller install",
     ) orelse "";
     const controller_options = b.addOptions();
+    controller_options.addOption([]const u8, "local_fixture_source", b.option([]const u8, "local-fixture-source", "Select one complete historical local fixture revision for diagnosis") orelse "");
     controller_options.addOption([]const u8, "repository_root", std.fs.path.resolve(b.allocator, &.{ b.graph.cache.cwd, b.build_root.path orelse ".", "../../.." }) catch
         @panic("cannot resolve source root"));
     controller_options.addOption([]const u8, "zig_executable", b.graph.zig_exe);
     controller_options.addOption([]const u8, "git_executable", b.findProgram(&.{"git"}, &.{}) catch @panic("Git required for controller custody tests"));
     controller_options.addOption([]const u8, "python_executable", b.findProgram(&.{"python3"}, &.{}) catch @panic("Python required for handoff compatibility fixtures"));
+    controller_options.addOptionPath("miz_package", b.dependency("public_image", .{ .target = target, .optimize = optimize }).builder.dependency("miz_source", .{ .target = target, .optimize = optimize }).path("."));
     controller_options.addOption([]const u8, "fixture_root", std.fs.path.resolve(b.allocator, &.{
         b.graph.cache.cwd, b.cache_root.path orelse ".",
     }) catch @panic("cannot resolve private controller test root"));
@@ -185,6 +198,30 @@ pub fn build(b: *std.Build) void {
             .{ .name = "local_boot_serial", .module = host_serial },
         },
     });
+    const host_package = b.addExecutable(.{
+        .name = "wamr-ci-package-host-local-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("package.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "public_image", .module = b.dependency("public_image", .{ .target = b.graph.host, .optimize = optimize }).module("hyperv_public_image") }},
+        }),
+    });
+    controller_options.addOptionPath("host_package_cli", host_package.getEmittedBin());
+    const host_log_cli = b.addExecutable(.{
+        .name = "uk-wamr-log-validate-host-local-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("../../apps/wamr-aot/validator/main.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wamr_log_validator", .module = host_validator },
+                .{ .name = "hyperv_core", .module = host_core },
+            },
+        }),
+    });
+    controller_options.addOptionPath("host_log_validator", host_log_cli.getEmittedBin());
+    controller_options.addOptionPath("host_aot_build", wamrAotBuild(b, b.graph.host, optimize).artifact("uk-wamr-aot-build").getEmittedBin());
     const host_controller = b.createModule(.{
         .root_source_file = b.path("controller/root.zig"),
         .target = b.graph.host,
@@ -194,10 +231,12 @@ pub fn build(b: *std.Build) void {
             .{ .name = "wamr_log_validator", .module = host_validator },
             .{ .name = "controller_source_closure", .module = host_closure },
             .{ .name = "import_validator_identity", .module = host_identity },
+            .{ .name = "handoff_contracts", .module = handoffContracts(b, b.graph.host, optimize, host_core) },
         },
     });
     const host_cli = b.addExecutable(.{
         .name = "uk-wamr-native-ci-host-fixture",
+        .use_llvm = if (optimize == .ReleaseSafe) true else null,
         .root_module = b.createModule(.{
             .root_source_file = b.path("controller/main.zig"),
             .target = b.graph.host,
@@ -205,6 +244,57 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "wamr_controller", .module = host_controller }},
         }),
     });
+    // Producer import requires an installable ReleaseSafe supervisor.
+    // Keep the selected profile for the other CLI fixtures and test modules.
+    const host_import_cli = if (optimize == .ReleaseSafe) host_cli else blk: {
+        const import_core = b.createModule(.{
+            .root_source_file = b.path("../../tools/hyperv/core.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        });
+        if (b.graph.host.result.cpu.arch == .x86_64)
+            import_core.addAssemblyFile(b.path("../../tools/hyperv/sha256_clear_upper.S"));
+        const import_serial = b.createModule(.{
+            .root_source_file = b.path("../../tools/hyperv/local_boot/serial.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "hyperv_core", .module = import_core }},
+        });
+        const import_validator = b.createModule(.{
+            .root_source_file = b.path("../../apps/wamr-aot/validator/root.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "hyperv_core", .module = import_core },
+                .{ .name = "local_boot_serial", .module = import_serial },
+            },
+        });
+        const import_controller = b.createModule(.{
+            .root_source_file = b.path("controller/root.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "hyperv_core", .module = import_core },
+                .{ .name = "wamr_log_validator", .module = import_validator },
+                .{ .name = "controller_source_closure", .module = b.createModule(.{
+                    .root_source_file = b.path("../../controller_source_closure.zig"),
+                    .target = b.graph.host,
+                    .optimize = .ReleaseSafe,
+                }) },
+                .{ .name = "import_validator_identity", .module = host_identity },
+                .{ .name = "handoff_contracts", .module = handoffContracts(b, b.graph.host, .ReleaseSafe, import_core) },
+            },
+        });
+        break :blk b.addExecutable(.{
+            .name = "uk-wamr-native-ci-host-import-fixture",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("controller/main.zig"),
+                .target = b.graph.host,
+                .optimize = .ReleaseSafe,
+                .imports = &.{.{ .name = "wamr_controller", .module = import_controller }},
+            }),
+        });
+    };
     const host_cli_run = b.addRunArtifact(host_cli);
     if (b.args) |args| host_cli_run.addArgs(args);
     b.step("run-controller-fixture", "Run host controller CLI for bounded CLI fixtures")
@@ -233,10 +323,14 @@ pub fn build(b: *std.Build) void {
             "install-controller requires -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=ReleaseSafe",
         ).step);
     const controller_tests = b.addTest(.{
+        .filters = b.option([]const []const u8, "test-filter", "Select bounded controller fixtures") orelse &.{},
+        .use_llvm = if (optimize == .ReleaseSafe) true else null,
         .root_module = b.createModule(.{
             .root_source_file = b.path("controller/tests.zig"),
             .target = b.graph.host,
             .optimize = optimize,
+            // This runner is itself a pinned supervisor, bounded to 64 MiB.
+            .strip = true,
             .imports = &.{
                 .{ .name = "wamr_controller", .module = host_controller },
                 .{ .name = "hyperv_core", .module = host_core },
@@ -245,6 +339,7 @@ pub fn build(b: *std.Build) void {
     });
     controller_tests.root_module.addOptions("test_options", controller_options);
     controller_options.addOptionPath("host_controller_cli", host_cli.getEmittedBin());
+    controller_options.addOptionPath("host_import_controller_cli", host_import_cli.getEmittedBin());
     controller_options.addOptionPath("import_validator", host_direct.getEmittedBin());
     const fixture_host = b.addExecutable(.{
         .name = "wamr-native-ci-fixtures-host-test",
@@ -271,6 +366,7 @@ pub fn build(b: *std.Build) void {
     const controller_run = b.addRunArtifact(controller_tests);
     const controller_direct = b.addSystemCommand(&.{"/usr/bin/env"});
     controller_direct.addFileArg(controller_tests.getEmittedBin());
+    if (b.args) |args| controller_direct.addArgs(args);
     b.step("test-controller-direct", "Run host controller tests with direct failure output")
         .dependOn(&controller_direct.step);
     const install_target_tests = b.addTest(.{
@@ -300,6 +396,7 @@ pub fn build(b: *std.Build) void {
     const source_limits_run = b.addRunArtifact(source_limits_tests);
     b.step("test-controller-limits", "Run native source-custody production boundary fixtures")
         .dependOn(&source_limits_run.step);
+    controller_run.step.dependOn(&source_limits_run.step);
     controller_step.dependOn(&source_limits_run.step);
     const fault_parity_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -387,11 +484,24 @@ pub fn build(b: *std.Build) void {
     authority_step.dependOn(&authority_python_goldens.step);
     controller_step.dependOn(&authority_contracts_run.step);
     controller_step.dependOn(&authority_python_goldens.step);
+    // Parallel goldens must not create ancestors of recorded controller tools.
+    const contract_fixture_dirs = b.addSystemCommand(&.{ "mkdir", "-p", "-m", "0700", "--" });
+    contract_fixture_dirs.has_side_effects = true;
+    for ([_][]const u8{ "tmp", "handoff-export-tests", "handoff-python-goldens", "authority-contract-work" }) |name|
+        contract_fixture_dirs.addArg(b.pathJoin(&.{ handoff_fixture_root, name }));
+    for ([_]*std.Build.Step{
+        &controller_run.step,
+        &controller_direct.step,
+        &source_limits_run.step,
+        &handoff_contracts_run.step,
+        &handoff_python_goldens.step,
+        &authority_contracts_run.step,
+        &authority_python_goldens.step,
+    }) |step| step.dependOn(&contract_fixture_dirs.step);
     const tests = b.addTest(.{ .root_module = root });
     const unit_tests = b.addRunArtifact(tests);
     const unit_step = b.step("test-unit", "Test the compute packaging adapter command boundary");
     unit_step.dependOn(&unit_tests.step);
-    unit_step.dependOn(&controller_run.step);
     const cli_tests = b.addSystemCommand(&.{ "python3", "-B" });
     cli_tests.addFileArg(b.path("../../apps/wamr-aot/validator/cli_test.py"));
     cli_tests.addFileArg(log_cli.getEmittedBin());
@@ -432,6 +542,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "hyperv_core", .module = image.import_table.get("hyperv_core").? },
             .{ .name = "wamr_log_validator", .module = proof_validator },
             .{ .name = "controller_source_closure", .module = proof_closure },
+            .{ .name = "handoff_contracts", .module = handoffContracts(b, target, optimize, image.import_table.get("hyperv_core").?) },
             .{ .name = "import_validator_identity", .module = validatorIdentity(b, identity_writer, b.dependency("direct_validator", .{
                 .target = target,
                 .optimize = .ReleaseSafe,
@@ -451,6 +562,17 @@ pub fn build(b: *std.Build) void {
     const pipeline_run = b.addRunArtifact(pipeline_tests);
     const pipeline_step = b.step("test-pipeline", "Run the real private raw-to-QCOW2-to-VHD pipeline fixtures");
     pipeline_step.dependOn(&pipeline_run.step);
+    const fixture_build = b.step("build-controller-fixtures", "Compile controller and package-boot fixture binaries without running them");
+    for ([_]*std.Build.Step.Compile{
+        controller_tests,
+        source_limits_tests,
+        fault_parity_tests,
+        install_target_tests,
+        record_goldens,
+        handoff_contracts,
+        authority_contracts,
+        pipeline_tests,
+    }) |artifact| fixture_build.dependOn(&artifact.step);
     const test_step = b.step("test", "Run unit and required private compute pipeline fixtures");
     test_step.dependOn(&unit_tests.step);
     test_step.dependOn(&pipeline_run.step);

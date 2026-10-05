@@ -48,6 +48,24 @@ pub fn nativeSourceContentClosure(allocator: std.mem.Allocator) ![64]u8 {
     return physical.hex(&hash);
 }
 
+pub fn currentReaderSourceContentClosure(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repository: []const u8,
+    git: []const u8,
+) ![64]u8 {
+    var retained = try adapter.openPinnedTool(io, git, "tool:git");
+    defer retained.close(io);
+    try source.verifyPhysical(io, allocator, repository);
+    const before = try source.portableSource(allocator, io, repository, git);
+    const result = try nativeSourceContentClosure(allocator);
+    try source.verifyPhysical(io, allocator, repository);
+    const after = try source.portableSource(allocator, io, repository, git);
+    if (!before.same(after)) return error.SourceChanged;
+    try retained.verify(io);
+    return result;
+}
+
 pub fn identityBytes(allocator: std.mem.Allocator, source_sha256: []const u8) ![]const u8 {
     const raw = try std.json.Stringify.valueAlloc(allocator, .{
         .protocol = "uk.wamr.command-supervisor/1 process-command/1",
@@ -94,10 +112,46 @@ pub fn validateSourceNames(records_map: std.json.Value) !void {
     } else if (records_map.object.count() == source.closure.len) {
         for (source.closure) |entry|
             _ = try get(records_map, entry.name);
+    } else if (records_map.object.count() == source.previous_native_closure.len) {
+        for (source.previous_native_closure) |entry|
+            _ = try get(records_map, entry.name);
     } else if (records_map.object.count() == source.previous_closure.len) {
         for (source.previous_closure) |entry|
             _ = try get(records_map, entry.name);
     } else return error.UnsupportedSupervisorSource;
+}
+
+pub fn verifyGitIdentity(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    identity: accepted_run.SourceIdentity,
+    repository: []const u8,
+    git: []const u8,
+    signal: ?*core.process.SignalCancellation,
+) !void {
+    const a = allocator;
+    for ([_][]const u8{ identity.revision, identity.tree }) |digest| {
+        if (digest.len != 40) return error.InvalidImportIdentity;
+        for (digest) |byte|
+            if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f'))
+                return error.InvalidImportIdentity;
+    }
+    const revision_ref = try std.mem.concat(a, u8, &.{ identity.revision, "^{commit}" });
+    defer a.free(revision_ref);
+    const tree_ref = try std.mem.concat(a, u8, &.{ identity.revision, "^{tree}" });
+    defer a.free(tree_ref);
+    try notCancelled(signal);
+    const commit = try source.gitOutput(a, io, repository, git, &.{ "rev-parse", "--verify", revision_ref }, 65, null);
+    defer a.free(commit);
+    const expected_commit = try std.fmt.allocPrint(a, "{s}\n", .{identity.revision});
+    defer a.free(expected_commit);
+    try same(commit, expected_commit);
+    try notCancelled(signal);
+    const tree = try source.gitOutput(a, io, repository, git, &.{ "rev-parse", tree_ref }, 65, null);
+    defer a.free(tree);
+    const expected_tree = try std.fmt.allocPrint(a, "{s}\n", .{identity.tree});
+    defer a.free(expected_tree);
+    try same(tree, expected_tree);
 }
 
 pub fn verifyGitSource(
@@ -112,14 +166,7 @@ pub fn verifyGitSource(
     const a = allocator;
     const records_map = try get(source_map, "records");
     try validateSourceNames(records_map);
-    const revision_ref = try std.mem.concat(a, u8, &.{ identity.revision, "^{commit}" });
-    const tree_ref = try std.mem.concat(a, u8, &.{ identity.revision, "^{tree}" });
-    try notCancelled(signal);
-    const commit = try source.gitOutput(a, io, repository, git, &.{ "rev-parse", "--verify", revision_ref }, 65, null);
-    try same(commit, try std.fmt.allocPrint(a, "{s}\n", .{identity.revision}));
-    try notCancelled(signal);
-    const tree = try source.gitOutput(a, io, repository, git, &.{ "rev-parse", tree_ref }, 65, null);
-    try same(tree, try std.fmt.allocPrint(a, "{s}\n", .{identity.tree}));
+    try verifyGitIdentity(a, io, identity, repository, git, signal);
     for (records_map.object.keys(), records_map.object.values()) |name, value| {
         try notCancelled(signal);
         try @import("custody_limits.zig").relative(name, 256, 8);
@@ -129,6 +176,7 @@ pub fn verifyGitSource(
         const listing = try source.gitOutput(a, io, repository, git, &.{
             "ls-tree", "-z", identity.tree, "--", name,
         }, 512, null);
+        defer a.free(listing);
         if (listing.len == 0 or listing[listing.len - 1] != 0 or
             std.mem.indexOfScalar(u8, listing[0 .. listing.len - 1], 0) != null)
             return error.ImportSourceChanged;
@@ -143,11 +191,13 @@ pub fn verifyGitSource(
                 return error.ImportSourceChanged;
         try notCancelled(signal);
         const size_raw = try source.gitOutput(a, io, repository, git, &.{ "cat-file", "-s", oid }, 32, null);
+        defer a.free(size_raw);
         if (size_raw.len < 2 or size_raw[size_raw.len - 1] != '\n' or
             try std.fmt.parseInt(u64, size_raw[0 .. size_raw.len - 1], 10) != size)
             return error.ImportSourceChanged;
         try notCancelled(signal);
         const blob = try source.gitOutput(a, io, repository, git, &.{ "cat-file", "blob", oid }, @intCast(size), null);
+        defer a.free(blob);
         const hash = std.fmt.bytesToHex(records.fileIdentity(blob), .lower);
         if (blob.len != size) return error.ImportSourceChanged;
         try same(&hash, digest);

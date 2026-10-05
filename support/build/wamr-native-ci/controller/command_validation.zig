@@ -8,7 +8,7 @@ const records = @import("records.zig");
 
 const handoff_controller_role = "native:handoff-inspect-controller";
 
-pub const EvidenceContext = enum { local_runtime, trusted_inner_zip };
+pub const EvidenceContext = enum { local_runtime, trusted_inner_zip, private_bundle };
 pub const ValidatedCommand = struct {
     stage: plan.Stage,
     output_bytes: u64,

@@ -14,6 +14,7 @@ pub const Entry = inputs.Entry;
 // independently checkable. Git revision/clean-tree admission is owned by PR 02.
 pub const closure = inputs.entries;
 pub const previous_closure = inputs.previous_entries;
+pub const previous_native_closure = inputs.previous_native_entries;
 
 pub fn contentClosure() [Sha256.digest_length]u8 {
     var hash = Sha256.init(.{});

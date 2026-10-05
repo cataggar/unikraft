@@ -2,8 +2,8 @@
 const std = @import("std");
 const core = @import("hyperv_core");
 const c = core.contracts;
-const layout = @import("layout.zig");
-const profile = @import("profile.zig");
+pub const layout = @import("layout.zig");
+pub const profile = @import("profile.zig");
 
 pub const json_limits = c.Limits{
     .bytes = @intCast(layout.max_json_bytes),

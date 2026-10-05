@@ -6,9 +6,9 @@ const files = core.private_files;
 const controller = @import("wamr_controller");
 const accepted_run = controller.accepted_run;
 const copy = @import("retained_copy.zig");
-const contracts = @import("contracts.zig");
-const layout = @import("layout.zig");
-const profile = @import("profile.zig");
+const contracts = controller.handoff_contracts;
+const layout = contracts.layout;
+const profile = contracts.profile;
 
 pub const Phase = enum {
     invocation,

@@ -21,7 +21,9 @@ pub const Stage = plan.Stage;
 pub const SourceIdentity = struct { revision: []const u8, tree: []const u8 };
 pub const LocalProducer = enum { native, python };
 pub const handoff_controller_role = "native:handoff-inspect-controller";
-const LocalOpenPolicy = enum { native_only, handoff_inspect };
+pub const readonly_git_role = "native:readonly-reader-git";
+const readonly_runtime_prefix = "native:readonly-reader-runtime:";
+const LocalOpenPolicy = enum { native_only, handoff_inspect, read_only };
 pub const ResultRecord = struct {
     relative_path: []const u8,
     bytes: u64,
@@ -120,8 +122,13 @@ const artifact_specs = [_]ArtifactSpec{
 };
 const max_handoff_bytes = 2 * 1024 * 1024;
 const max_artifact_bytes = 256 * 1024 * 1024 + 512;
+const legacy_host_tools = inputs.host_tools ++ [_][]const u8{ "head", "timeout" };
 
 pub const Fixture = if (@import("builtin").is_test) struct {
+    pub fn importedTools(tools: std.json.Value, supervised: bool) !void {
+        return verifyImportedTools(tools, supervised);
+    }
+
     pub const PinHooks = struct {
         context: *anyopaque,
         before_read: *const fn (*anyopaque, *const files.RetainedFile) anyerror!void,
@@ -172,10 +179,14 @@ pub const AcceptedRun = struct {
     repository: ?[]const u8,
     environ: ?std.process.Environ,
     local_producer: LocalProducer = .native,
+    local_read_only: bool = false,
+    local_legacy_source: ?@import("source_custody.zig").Source = null,
+    readonly_git: ?files.RetainedFile = null,
     record_snapshots: []const RecordSnapshot = &.{},
     cleanup_snapshot: ?physical.File = null,
 
     pub fn deinit(self: *AcceptedRun) void {
+        if (self.readonly_git) |*git| git.close(self.io);
         self.arena.deinit();
         self.* = undefined;
     }
@@ -202,10 +213,12 @@ pub const AcceptedRun = struct {
     fn artifactPath(self: *AcceptedRun, role: ArtifactRole) ![]const u8 {
         for (artifact_specs) |spec| {
             if (spec.role != role) continue;
-            if (self.context == .trusted_inner_zip) {
+            if (self.context != .local_runtime) {
                 if (role == .build_record) return join(self.allocator(), &.{ self.root, "artifacts/build" });
                 return join(self.allocator(), &.{ self.root, "artifacts", stageRole(role) });
             }
+            if (role == .vhd and self.compatibility == .tiny_v1_legacy)
+                return join(self.allocator(), &.{ self.root, "compute/package/unikraft.vhd" });
             return join(self.allocator(), &.{
                 if (spec.source) self.repository orelse return error.InvalidContext else self.root,
                 spec.relative,
@@ -215,8 +228,8 @@ pub const AcceptedRun = struct {
     }
 
     pub fn pinArtifact(self: *AcceptedRun, role: ArtifactRole) !files.RetainedFile {
-        if (role == .cleanup and self.context == .local_runtime) {
-            const expected = self.cleanup_snapshot orelse return error.UnknownArtifactRole;
+        if (role == .cleanup and self.context == .local_runtime and self.cleanup_snapshot != null) {
+            const expected = self.cleanup_snapshot.?;
             const path = try self.artifactPath(role);
             var retained = try files.RetainedFile.open(self.io, path, .private);
             errdefer retained.close(self.io);
@@ -331,14 +344,27 @@ pub const AcceptedRun = struct {
 
     pub fn revalidateWithSignal(self: *AcceptedRun, signal: ?*core.process.SignalCancellation) !void {
         if (self.context == .local_runtime) {
+            const legacy_source = if (self.local_read_only and self.compatibility == .tiny_v1_legacy)
+                try localLegacySource(self, signal)
+            else
+                null;
             if (self.compatibility == .tiny_v1_legacy)
-                try revalidateLocalLegacy(self)
+                try revalidateLocalLegacy(self, signal)
             else if (self.local_producer == .python)
                 try revalidateLocalPython(self, signal)
             else
                 try revalidateLocal(self, signal);
-        } else {
+            if (self.local_read_only)
+                try verifyImportedEvidence(self, null);
+            if (legacy_source) |before| {
+                const after = try localLegacySource(self, signal);
+                if (!before.same(after)) return error.SourceChanged;
+                self.local_legacy_source = before;
+            }
+        } else if (self.context == .trusted_inner_zip) {
             try revalidateImported(self);
+        } else {
+            try revalidatePrivate(self);
         }
         for (self.artifacts) |item| {
             if (std.mem.startsWith(u8, item.role, "boot:")) {
@@ -365,6 +391,9 @@ pub const AcceptedRun = struct {
     }
 
     pub fn handoffV1(self: *AcceptedRun) ![]const u8 {
+        if (self.context == .private_bundle) return error.InvalidContext;
+        if (self.context == .local_runtime and self.local_producer == .python and !self.local_read_only)
+            return error.InvalidContext;
         const a = self.allocator();
         const modes = profile.modes(self.compatibility);
         var names: std.ArrayList([]const u8) = .empty;
@@ -389,6 +418,90 @@ pub const AcceptedRun = struct {
     }
 };
 
+pub const PrivateBundle = struct {
+    evidence: AcceptedRun,
+    manifest: files.RetainedFile,
+    tools: @import("import_validator_build.zig").PortableTools,
+
+    pub fn open(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        directory: *const files.Directory,
+        root: []const u8,
+        repository: []const u8,
+        tools: @import("import_validator_build.zig").LocalTools,
+        signal: ?*core.process.SignalCancellation,
+    ) !PrivateBundle {
+        try files.absoluteFilePath(root);
+        try files.absoluteFilePath(repository);
+        var evidence = AcceptedRun{
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .io = io,
+            .context = .private_bundle,
+            .compatibility = undefined,
+            .production_profile = null,
+            .source = undefined,
+            .result = undefined,
+            .records = &.{},
+            .artifacts = &.{},
+            .runtime_inputs = &.{},
+            .root = root,
+            .repository = repository,
+            .environ = null,
+        };
+        errdefer evidence.deinit();
+        const a = evidence.allocator();
+        evidence.root = try a.dupe(u8, root);
+        evidence.repository = try a.dupe(u8, repository);
+        const expected = try files.snapshot(.{ .handle = directory.dir.handle, .flags = .{ .nonblocking = false } });
+        if (!files.sameSnapshot(expected, try physical.directory(io, root, true)))
+            return error.StageChanged;
+        var manifest = try files.RetainedFile.open(io, try join(a, &.{ root, "bundle.json" }), .private);
+        errdefer manifest.close(io);
+        try loadResult(&evidence);
+        try revalidatePrivate(&evidence);
+        try collectArtifacts(&evidence);
+        const start = try canonicalFile(&evidence, try recordPath(&evidence, "build-start.json"), records.max_record_bytes);
+        var authenticated = try @import("import_validator_build.zig").PortableTools.bindPrivate(
+            allocator,
+            io,
+            &evidence,
+            start,
+            repository,
+            try std.process.executablePathAlloc(io, a),
+            .{
+                .git = try a.dupe(u8, tools.git),
+                .supervisor = try a.dupe(u8, tools.supervisor),
+                .validator = try a.dupe(u8, tools.validator),
+            },
+            signal,
+        );
+        errdefer authenticated.deinit(io);
+        try authenticated.verifyWithSignal(io, repository, tools.git, signal);
+        try manifest.verify(io);
+        try evidence.revalidateWithSignal(signal);
+        try authenticated.verifyWithSignal(io, repository, tools.git, signal);
+        try manifest.verify(io);
+        return .{ .evidence = evidence, .manifest = manifest, .tools = authenticated };
+    }
+
+    pub fn revalidate(self: *PrivateBundle, signal: ?*core.process.SignalCancellation) !void {
+        if (self.evidence.context != .private_bundle or self.evidence.repository == null) return error.InvalidContext;
+        try self.tools.verifyWithSignal(self.evidence.io, self.evidence.repository.?, self.tools.git.path, signal);
+        try self.manifest.verify(self.evidence.io);
+        try self.evidence.revalidateWithSignal(signal);
+        try self.tools.verifyWithSignal(self.evidence.io, self.evidence.repository.?, self.tools.git.path, signal);
+        try self.manifest.verify(self.evidence.io);
+    }
+
+    pub fn deinit(self: *PrivateBundle) void {
+        self.tools.deinit(self.evidence.io);
+        self.manifest.close(self.evidence.io);
+        self.evidence.deinit();
+        self.* = undefined;
+    }
+};
+
 pub fn openAndValidate(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -397,7 +510,7 @@ pub fn openAndValidate(
     root: []const u8,
     repository: []const u8,
 ) !AcceptedRun {
-    return openAndValidateWithPolicy(allocator, io, environ, runtime, root, repository, null, .native_only);
+    return openAndValidateWithPolicy(allocator, io, environ, runtime, root, repository, null, .native_only, null);
 }
 
 pub fn openAndValidateWithSignal(
@@ -409,7 +522,7 @@ pub fn openAndValidateWithSignal(
     repository: []const u8,
     signal: ?*core.process.SignalCancellation,
 ) !AcceptedRun {
-    return openAndValidateWithPolicy(allocator, io, environ, runtime, root, repository, signal, .native_only);
+    return openAndValidateWithPolicy(allocator, io, environ, runtime, root, repository, signal, .native_only, null);
 }
 
 pub fn openAndValidateForHandoffInspectWithSignal(
@@ -421,7 +534,32 @@ pub fn openAndValidateForHandoffInspectWithSignal(
     repository: []const u8,
     signal: ?*core.process.SignalCancellation,
 ) !AcceptedRun {
-    return openAndValidateWithPolicy(allocator, io, environ, runtime, root, repository, signal, .handoff_inspect);
+    return openAndValidateWithPolicy(allocator, io, environ, runtime, root, repository, signal, .handoff_inspect, null);
+}
+
+pub fn openAndValidateReadOnlyWithSignal(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: std.process.Environ,
+    runtime: *const files.Directory,
+    root: []const u8,
+    repository: []const u8,
+    signal: ?*core.process.SignalCancellation,
+) !AcceptedRun {
+    return openAndValidateWithPolicy(allocator, io, environ, runtime, root, repository, signal, .read_only, null);
+}
+
+pub fn openAndValidateReadOnlyWithGit(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: std.process.Environ,
+    runtime: *const files.Directory,
+    root: []const u8,
+    repository: []const u8,
+    git: []const u8,
+    signal: ?*core.process.SignalCancellation,
+) !AcceptedRun {
+    return openAndValidateWithPolicy(allocator, io, environ, runtime, root, repository, signal, .read_only, git);
 }
 
 fn openAndValidateWithPolicy(
@@ -433,6 +571,7 @@ fn openAndValidateWithPolicy(
     repository: []const u8,
     signal: ?*core.process.SignalCancellation,
     policy: LocalOpenPolicy,
+    readonly_git: ?[]const u8,
 ) !AcceptedRun {
     try files.absoluteFilePath(root);
     try files.absoluteFilePath(repository);
@@ -458,10 +597,24 @@ fn openAndValidateWithPolicy(
     accepted.root = try accepted.allocator().dupe(u8, root);
     accepted.repository = try accepted.allocator().dupe(u8, repository);
     try loadResult(&accepted);
-    if (accepted.compatibility != .tiny_v2_qcow2_derived_vhd and policy != .handoff_inspect)
+    if (readonly_git) |git| {
+        if (policy != .read_only or accepted.compatibility != .tiny_v1_legacy or !oldLegacySource(accepted.source))
+            return error.InvalidContext;
+        accepted.readonly_git = try @import("command_adapter.zig").openPinnedTool(
+            io,
+            try accepted.allocator().dupe(u8, git),
+            readonly_git_role,
+        );
+        try appendCurrentToolInput(&accepted, readonly_git_role, accepted.readonly_git.?.path);
+        const paths = try inputs.executableRuntimePaths(accepted.allocator(), io, accepted.readonly_git.?.path);
+        for (paths) |path|
+            try appendCurrentInput(&accepted, try std.fmt.allocPrint(accepted.allocator(), "{s}{s}", .{ readonly_runtime_prefix, path }), path, false);
+    }
+    if (accepted.compatibility != .tiny_v2_qcow2_derived_vhd and policy == .native_only)
         return error.UnsupportedLocalLegacyRun;
     accepted.local_producer = if (accepted.compatibility == .tiny_v1_legacy) .python else try localProducer(&accepted);
-    if (accepted.local_producer == .python and policy != .handoff_inspect)
+    accepted.local_read_only = policy == .read_only;
+    if (accepted.local_producer == .python and policy == .native_only)
         return error.UnsupportedLocalProducer;
     try accepted.revalidateWithSignal(signal);
     if (accepted.local_producer == .python)
@@ -544,10 +697,19 @@ fn canonicalFile(self: *AcceptedRun, path: []const u8, limit: usize) !std.json.V
 }
 
 fn documentFile(self: *AcceptedRun, path: []const u8, limit: usize, canonical: bool) !std.json.Value {
+    return documentFileWithPolicy(self, path, limit, canonical, .private);
+}
+
+fn documentArtifact(self: *AcceptedRun, role: ArtifactRole, limit: usize) !std.json.Value {
+    return documentFileWithPolicy(self, try self.artifactPath(role), limit, false, if (self.context == .local_runtime and isSource(role)) .artifact else .private);
+}
+
+fn documentFileWithPolicy(self: *AcceptedRun, path: []const u8, limit: usize, canonical: bool, policy: files.FilePolicy) !std.json.Value {
     const a = self.allocator();
-    var retained = try files.RetainedFile.open(self.io, path, .private);
+    var retained = try files.RetainedFile.open(self.io, path, policy);
     defer retained.close(self.io);
-    var buffer = try files.readSensitiveFile(self.io, a, retained.file, limit, .private);
+    _ = try physical.readRetained(self.io, &retained, limit);
+    var buffer = try files.readSensitiveFile(self.io, a, retained.file, limit, policy);
     defer buffer.deinit();
     var document = try contracts.Document.parse(a, buffer.bytes(), .{
         .bytes = limit,
@@ -589,7 +751,7 @@ fn loadResult(self: *AcceptedRun) !void {
     defer buffer.deinit();
     const parsed = try records.parseCanonicalResult(a, buffer.bytes());
     const value = parsed.value;
-    if (self.context == .trusted_inner_zip and value.set == .tiny_v1_legacy and
+    if (self.context != .local_runtime and value.set == .tiny_v1_legacy and
         value.records.count() != 20)
         return error.InvalidRecords;
     self.compatibility = value.set;
@@ -610,7 +772,8 @@ fn loadResult(self: *AcceptedRun) !void {
     var iterator = directory.iterate();
     var count: usize = 0;
     var local_validator_record = false;
-    while (try iterator.next(self.io)) |entry| {
+    while (self.context != .private_bundle) {
+        const entry = (try iterator.next(self.io)) orelse break;
         if (count > 64 or (self.context == .trusted_inner_zip and
             std.mem.eql(u8, entry.name, "result.json")))
             return error.UnexpectedEvidence;
@@ -626,7 +789,7 @@ fn loadResult(self: *AcceptedRun) !void {
             return error.UnexpectedEvidence;
         count += 1;
     }
-    if (count != value.records.count() + @intFromBool(self.context == .local_runtime) +
+    if (self.context != .private_bundle and count != value.records.count() + @intFromBool(self.context == .local_runtime) +
         @intFromBool(local_validator_record))
         return error.MissingEvidence;
     var pinned: std.ArrayList(PinnedRecord) = .empty;
@@ -742,7 +905,8 @@ fn revalidateLocalPythonWithSignal(self: *AcceptedRun, signal: *core.process.Sig
     const result = try records.readResult(raw);
     if (result.set != self.compatibility or result.set != .tiny_v2_qcow2_derived_vhd)
         return error.InvalidResult;
-    try local_consumer.run(
+    const recheck_custody: *const @TypeOf(local_consumer.run) = if (self.local_read_only) local_consumer.runReadOnly else local_consumer.run;
+    try recheck_custody(
         a,
         self.io,
         self.repository orelse return error.InvalidContext,
@@ -764,13 +928,23 @@ fn revalidateLocalPythonWithSignal(self: *AcceptedRun, signal: *core.process.Sig
         try collectRecordedRuntimeInputs(self);
 }
 
-fn revalidateLocalLegacy(self: *AcceptedRun) !void {
+fn revalidateLocalLegacy(self: *AcceptedRun, signal: ?*core.process.SignalCancellation) !void {
     const raw = try canonicalFile(self, try resultPath(self), records.max_record_bytes);
     const result = try records.readResult(raw);
     if (result.set != self.compatibility or result.set != .tiny_v1_legacy)
         return error.InvalidResult;
     if (!preSupervisorSource(self.source))
         return error.UnsupportedLegacySource;
+    if (self.local_read_only and !oldLegacySource(self.source))
+        try local_consumer.runLegacyReadOnly(
+            self.allocator(),
+            self.io,
+            self.repository orelse return error.InvalidContext,
+            self.root,
+            try contracts.parseSha256(try text(result.records.get("build-start.json") orelse return error.MissingRecord)),
+            try contracts.parseSha256(try text(result.records.get("boot-inputs.json") orelse return error.MissingRecord)),
+            signal,
+        );
     const evidence_path = try join(self.allocator(), &.{ self.root, "compute/evidence" });
     const evidence = try files.openDirectory(self.io, evidence_path, .private);
     defer evidence.close(self.io);
@@ -795,16 +969,53 @@ fn revalidateLocalLegacy(self: *AcceptedRun) !void {
     if (!std.meta.eql(current.sha256, self.result.sha256) or current.bytes != self.result.bytes)
         return error.ResultChanged;
     const qcow2 = try join(self.allocator(), &.{ self.root, "compute/package/unikraft.qcow2" });
-    if (exists(self.io, qcow2)) return error.UnsupportedLegacySource;
+    if (try exists(self.io, qcow2)) return error.UnsupportedLegacySource;
     const cleanup = try join(self.allocator(), &.{ self.root, "evidence/runtime-cleanup.txt" });
-    if (exists(self.io, cleanup)) return error.UnsupportedLegacySource;
+    if (try exists(self.io, cleanup)) return error.UnsupportedLegacySource;
     try validateCommands(self, true, false);
     if (self.runtime_inputs.len == 0)
         try collectRecordedRuntimeInputs(self);
 }
 
-fn exists(io: std.Io, path: []const u8) bool {
-    var file = std.Io.Dir.openFileAbsolute(io, path, .{ .follow_symlinks = false }) catch return false;
+fn localLegacySource(self: *AcceptedRun, signal: ?*core.process.SignalCancellation) !@import("source_custody.zig").Source {
+    const source = @import("source_custody.zig");
+    if (signal) |active|
+        if (active.flag().load(.acquire)) return error.Cancelled;
+    var scratch = std.heap.ArenaAllocator.init(self.arena.child_allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const start = try canonicalFile(self, try recordPath(self, "build-start.json"), records.max_record_bytes);
+    const git_path = if (self.readonly_git) |*git| blk: {
+        try git.verify(self.io);
+        for (self.runtime_inputs) |input| {
+            if (!std.mem.startsWith(u8, input.role, readonly_runtime_prefix)) continue;
+            var retained = try self.pinInput(input.role);
+            retained.close(self.io);
+        }
+        break :blk git.path;
+    } else try text(try get(try get(try get(try get(start, "consumer_inputs"), "files"), "tool:git"), "path"));
+    var retained = try @import("command_adapter.zig").openPinnedTool(self.io, git_path, "tool:git");
+    defer retained.close(self.io);
+    var current = try source.portableSource(a, self.io, self.repository orelse return error.InvalidContext, retained.path);
+    try equal(current.revision, self.source.revision);
+    try equal(current.tree, self.source.tree);
+    try equal(current.custody.object_format, "sha1");
+    if (start.object.get("source_custody")) |custody|
+        try sameJson(a, custody, try valueOf(a, current.custody));
+    try retained.verify(self.io);
+    current.revision = self.source.revision;
+    current.tree = self.source.tree;
+    current.custody.object_format = "sha1";
+    if (self.local_legacy_source) |before|
+        if (!before.same(current)) return error.SourceChanged;
+    return current;
+}
+
+fn exists(io: std.Io, path: []const u8) !bool {
+    var file = std.Io.Dir.openFileAbsolute(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
     file.close(io);
     return true;
 }
@@ -822,17 +1033,26 @@ fn collectRecordedRuntimeInputs(self: *AcceptedRun) !void {
 
 fn appendHandoffControllerInput(self: *AcceptedRun) !void {
     const a = self.allocator();
-    for (self.runtime_inputs) |input|
-        if (std.mem.eql(u8, input.role, handoff_controller_role))
-            return error.DuplicateInputRole;
     const path = try std.Io.Dir.realPathFileAbsoluteAlloc(self.io, "/proc/self/exe", a);
+    try appendCurrentToolInput(self, handoff_controller_role, path);
+}
+
+fn appendCurrentToolInput(self: *AcceptedRun, role: []const u8, path: []const u8) !void {
+    return appendCurrentInput(self, role, path, true);
+}
+
+fn appendCurrentInput(self: *AcceptedRun, role: []const u8, path: []const u8, executable: bool) !void {
+    const a = self.allocator();
+    for (self.runtime_inputs) |input|
+        if (std.mem.eql(u8, input.role, role))
+            return error.DuplicateInputRole;
     const observed = try physical.readFile(self.io, path, limits.input_file, false);
-    if (@as(u64, @intCast(observed.metadata[2])) & 0o111 == 0)
+    if (executable and @as(u64, @intCast(observed.metadata[2])) & 0o111 == 0)
         return error.UnsafeFile;
     const updated = try a.alloc(PinnedInput, self.runtime_inputs.len + 1);
     @memcpy(updated[0..self.runtime_inputs.len], self.runtime_inputs);
     updated[self.runtime_inputs.len] = .{
-        .role = handoff_controller_role,
+        .role = role,
         .path = path,
         .snapshot = .{
             .bytes = observed.bytes,
@@ -1138,17 +1358,17 @@ fn collectArtifacts(self: *AcceptedRun) !void {
     const a = self.allocator();
     var result: std.ArrayList(PinnedArtifact) = .empty;
     for (artifact_specs) |spec| {
-        if (self.context == .local_runtime and spec.role == .cleanup) continue;
+        if (self.context == .local_runtime and spec.role == .cleanup and !self.local_read_only) continue;
         if (self.compatibility == .tiny_v1_legacy and
             (spec.role == .qcow2 or spec.role == .cleanup or
                 @intFromEnum(spec.role) >= @intFromEnum(ArtifactRole.qcow2_finalization_intent)))
             continue;
         const path_name = try self.artifactPath(spec.role);
-        const observed = try physical.readFile(self.io, path_name, max_artifact_bytes, self.context == .trusted_inner_zip or !spec.source);
+        const observed = try physical.readFile(self.io, path_name, max_artifact_bytes, self.context != .local_runtime or !spec.source);
         try result.append(a, .{
             .role = stageRole(spec.role),
             .relative_path = if (self.context == .local_runtime)
-                try join(a, &.{ if (spec.source) "source" else "runtime", spec.relative })
+                try join(a, &.{ if (spec.source) "source" else "runtime", if (spec.role == .vhd and self.compatibility == .tiny_v1_legacy) "compute/package/unikraft.vhd" else spec.relative })
             else
                 try join(a, &.{ "artifacts", stageRole(spec.role) }),
             .bytes = observed.bytes,
@@ -1182,7 +1402,7 @@ fn collectArtifacts(self: *AcceptedRun) !void {
 
 fn bootPath(self: *AcceptedRun, mode: profile.Mode, part: BootRole) ![]const u8 {
     const a = self.allocator();
-    if (self.context == .trusted_inner_zip)
+    if (self.context != .local_runtime)
         return join(a, &.{ self.root, "boots", @tagName(mode), @tagName(part) });
     if (part == .compute)
         return recordPath(self, try std.fmt.allocPrint(a, "{s}-compute.json", .{@tagName(mode)}));
@@ -1198,20 +1418,7 @@ fn revalidateImported(self: *AcceptedRun) !void {
     const a = self.allocator();
     const version: u8 = if (self.compatibility == .tiny_v1_legacy) 1 else 2;
     const portable = try canonicalFile(self, try join(a, &.{ self.root, "portable-bundle.json" }), 64 * 1024);
-    _ = try contracts.exactFields(portable, if (version == 1)
-        &.{ "schema", "version", "authority", "source_revision", "source_tree", "identity", "artifacts", "boots", "evidence" }
-    else
-        &.{ "schema", "version", "profile", "authority", "source_revision", "source_tree", "run", "identity", "lineage", "artifacts", "boots", "evidence" });
-    try equal(try text(try get(portable, "schema")), "uk.wamr.local-image-handoff");
-    try equal(try text(try get(portable, "authority")), "not_admitted");
-    if (try number(u8, try get(portable, "version")) != version)
-        return error.InvalidImportedBundle;
-    try equal(try text(try get(portable, "source_revision")), self.source.revision);
-    try equal(try text(try get(portable, "source_tree")), self.source.tree);
-    if (version == 2)
-        try equal(try text(try get(portable, "profile")), "qcow2-derived-vhd");
-    const legacy = version == 1 and preSupervisorSource(self.source);
-    if (version == 1 and !legacy) return error.UnsupportedLegacySource;
+    try validateBundleHeader(self, portable);
     const manifest = try canonicalFile(self, try join(a, &.{ self.root, "public-source.json" }), 64 * 1024);
     _ = try contracts.exactFields(manifest, if (version == 1)
         &.{ "schema", "version", "authority", "source", "members" }
@@ -1246,15 +1453,6 @@ fn revalidateImported(self: *AcceptedRun) !void {
     }
     const members = try get(manifest, "members");
     if (members != .object) return error.InvalidImportedBundle;
-    const artifact_items = try get(portable, "artifacts");
-    const boot_items = try get(portable, "boots");
-    const evidence_items = try get(portable, "evidence");
-    const expected_artifacts: usize = if (version == 1) 17 else artifact_specs.len;
-    if (artifact_items != .array or artifact_items.array.items.len != expected_artifacts or
-        boot_items != .array or boot_items.array.items.len != profile.modes(self.compatibility).len or
-        evidence_items != .array or evidence_items.array.items.len != self.records.len or
-        members.object.count() != expected_artifacts + self.records.len + 4 * boot_items.array.items.len)
-        return error.InvalidImportedBundle;
     var total: u64 = 0;
     for (members.object.keys(), members.object.values()) |path, item| {
         try limits.relative(path, 128, 3);
@@ -1264,6 +1462,54 @@ fn revalidateImported(self: *AcceptedRun) !void {
             return error.InvalidImportedBundle;
         total += size;
         _ = try contracts.parseSha256(try text(try get(item, "sha256")));
+    }
+    try validateSelectedBundle(self, portable, members);
+    var found: usize = 0;
+    try inspectImportedTree(self, self.root, "", members, &found, 0);
+    if (found != members.object.count() + 2) return error.InvalidImportedBundle;
+}
+
+fn revalidatePrivate(self: *AcceptedRun) !void {
+    if (self.context != .private_bundle) return error.InvalidContext;
+    const bundle = try canonicalFile(self, try join(self.allocator(), &.{ self.root, "bundle.json" }), 64 * 1024);
+    _ = try @import("handoff_contracts").validateLocalImageHandoffWithRoot(bundle, self.root);
+    try validateBundleHeader(self, bundle);
+    try validateSelectedBundle(self, bundle, null);
+}
+
+fn validateBundleHeader(self: *AcceptedRun, portable: std.json.Value) !void {
+    const version: u8 = if (self.compatibility == .tiny_v1_legacy) 1 else 2;
+    _ = try contracts.exactFields(portable, if (version == 1)
+        &.{ "schema", "version", "authority", "source_revision", "source_tree", "identity", "artifacts", "boots", "evidence" }
+    else
+        &.{ "schema", "version", "profile", "authority", "source_revision", "source_tree", "run", "identity", "lineage", "artifacts", "boots", "evidence" });
+    try equal(try text(try get(portable, "schema")), "uk.wamr.local-image-handoff");
+    try equal(try text(try get(portable, "authority")), "not_admitted");
+    if (try number(u8, try get(portable, "version")) != version)
+        return error.InvalidImportedBundle;
+    try equal(try text(try get(portable, "source_revision")), self.source.revision);
+    try equal(try text(try get(portable, "source_tree")), self.source.tree);
+    if (version == 2)
+        try equal(try text(try get(portable, "profile")), "qcow2-derived-vhd");
+    const legacy = version == 1 and preSupervisorSource(self.source);
+    if (version == 1 and !legacy) return error.UnsupportedLegacySource;
+}
+
+fn validateSelectedBundle(self: *AcceptedRun, portable: std.json.Value, members: ?std.json.Value) !void {
+    const a = self.allocator();
+    const version: u8 = if (self.compatibility == .tiny_v1_legacy) 1 else 2;
+    const legacy = version == 1 and preSupervisorSource(self.source);
+    const artifact_items = try get(portable, "artifacts");
+    const boot_items = try get(portable, "boots");
+    const evidence_items = try get(portable, "evidence");
+    const expected_artifacts: usize = if (version == 1) 17 else artifact_specs.len;
+    if (artifact_items != .array or artifact_items.array.items.len != expected_artifacts or
+        boot_items != .array or boot_items.array.items.len != profile.modes(self.compatibility).len or
+        evidence_items != .array or evidence_items.array.items.len != self.records.len)
+        return error.InvalidImportedBundle;
+    if (members) |manifest| {
+        if (manifest.object.count() != expected_artifacts + self.records.len + 4 * boot_items.array.items.len)
+            return error.InvalidImportedBundle;
     }
     var cursor: usize = 0;
     for (artifact_specs) |spec| {
@@ -1286,9 +1532,6 @@ fn revalidateImported(self: *AcceptedRun) !void {
     for (self.records, evidence_items.array.items) |entry, item| {
         try verifyBundleItem(self, item, members, entry.relative_path, try recordPath(self, entry.name), records.max_record_bytes);
     }
-    var found: usize = 0;
-    try inspectImportedTree(self, self.root, "", members, &found, 0);
-    if (found != members.object.count() + 2) return error.InvalidImportedBundle;
     const copied_result = try canonicalFile(self, try resultPath(self), records.max_record_bytes);
     const accepted = try records.readResult(copied_result);
     if (accepted.set != self.compatibility or accepted.records.count() != self.records.len)
@@ -1354,21 +1597,23 @@ fn inspectImportedTree(
 fn verifyBundleItem(
     self: *AcceptedRun,
     item: std.json.Value,
-    members: std.json.Value,
+    members: ?std.json.Value,
     relative: []const u8,
     path: []const u8,
     limit: u64,
 ) !void {
     _ = try contracts.exactFields(item, &.{ "path", "sha256", "size" });
-    try equal(try text(try get(item, "path")), relative);
+    try equal(try text(try get(item, "path")), if (self.context == .private_bundle) path else relative);
     const observed = try physical.readFile(self.io, path, limit, true);
     if (observed.bytes == 0 or observed.bytes != try number(u64, try get(item, "size")))
         return error.ArtifactChanged;
     try equal(&observed.sha256, try text(try get(item, "sha256")));
-    const member = try get(members, relative);
-    _ = try contracts.exactFields(member, &.{ "size", "sha256" });
-    if (try number(u64, try get(member, "size")) != observed.bytes) return error.ArtifactChanged;
-    try equal(&observed.sha256, try text(try get(member, "sha256")));
+    if (members) |manifest| {
+        const member = try get(manifest, relative);
+        _ = try contracts.exactFields(member, &.{ "size", "sha256" });
+        if (try number(u64, try get(member, "size")) != observed.bytes) return error.ArtifactChanged;
+        try equal(&observed.sha256, try text(try get(member, "sha256")));
+    }
 }
 
 fn preSupervisorSource(source: SourceIdentity) bool {
@@ -1393,7 +1638,7 @@ fn oldLegacySource(source: SourceIdentity) bool {
             std.mem.eql(u8, source.revision, "b5a8fdbee033349f7145fbc76aebfee29b2fa04f"));
 }
 
-fn verifyImportedEvidence(self: *AcceptedRun, portable: std.json.Value) !void {
+fn verifyImportedEvidence(self: *AcceptedRun, portable: ?std.json.Value) !void {
     const a = self.allocator();
     const start = try canonicalFile(self, try recordPath(self, "build-start.json"), records.max_record_bytes);
     const built = try canonicalFile(self, try recordPath(self, "build.json"), records.max_record_bytes);
@@ -1421,10 +1666,10 @@ fn verifyImportedEvidence(self: *AcceptedRun, portable: std.json.Value) !void {
     try compareCopy(self, "boot-inputs.json", .boot_inputs);
     try compareCopy(self, "package.json", .package);
     // Producer identity artifacts are not canonical JSON; archive member hashes pin their exact bytes.
-    const identity = try documentFile(self, try self.artifactPath(.runtime_identity), 64 * 1024, false);
+    const identity = try documentArtifact(self, .runtime_identity, 64 * 1024);
     if (v2) try build.admitPreparedIdentity(identity);
     try sameJson(a, try get(built, "runtime"), identity);
-    const image = try documentFile(self, try self.artifactPath(.image_identity), 1024 * 1024, false);
+    const image = try documentArtifact(self, .image_identity, 1024 * 1024);
     try sameJson(a, try get(built, "image"), image);
     for ([_]struct { name: []const u8, role: ArtifactRole }{
         .{ .name = "wamr_hyperv-x86_64-efi", .role = .efi },
@@ -1454,7 +1699,8 @@ fn verifyImportedEvidence(self: *AcceptedRun, portable: std.json.Value) !void {
         try verifyCustodyDocument(a, consumer);
         try verifyCustodyDocument(a, boot_inputs);
         const consumer_files = try get(consumer, "files");
-        for (inputs.host_tools) |name| {
+        const host_tools: []const []const u8 = if (v2) &inputs.host_tools else &legacy_host_tools;
+        for (host_tools) |name| {
             const tool = try get(consumer_files, try std.fmt.allocPrint(a, "tool:{s}", .{name}));
             try equal(try text(try get(try get(start, "tools"), name)), try text(try get(tool, "sha256")));
         }
@@ -1586,20 +1832,22 @@ fn verifyImportedEvidence(self: *AcceptedRun, portable: std.json.Value) !void {
             .@"virtual-size" = 66 * limits.mib,
         }));
     }
-    const hashes = try get(portable, "identity");
-    _ = try contracts.exactFields(hashes, &.{
-        "wamr_revision",  "wasm_sha256",     "cwasm_sha256",
-        "runtime_sha256", "compiler_sha256", "config_sha256",
-    });
-    try equal(try text(try get(hashes, "wamr_revision")), @import("custody_limits.zig").wamr_revision);
-    for ([_]struct { name: []const u8, role: ArtifactRole }{
-        .{ .name = "wasm_sha256", .role = .wasm },
-        .{ .name = "cwasm_sha256", .role = .cwasm },
-        .{ .name = "runtime_sha256", .role = .runtime },
-        .{ .name = "compiler_sha256", .role = .compiler },
-        .{ .name = "config_sha256", .role = .config },
-    }) |entry|
-        try equal(try text(try get(hashes, entry.name)), &(try stagedArtifact(self, entry.role)).sha256);
+    if (portable) |manifest| {
+        const hashes = try get(manifest, "identity");
+        _ = try contracts.exactFields(hashes, &.{
+            "wamr_revision",  "wasm_sha256",     "cwasm_sha256",
+            "runtime_sha256", "compiler_sha256", "config_sha256",
+        });
+        try equal(try text(try get(hashes, "wamr_revision")), @import("custody_limits.zig").wamr_revision);
+        for ([_]struct { name: []const u8, role: ArtifactRole }{
+            .{ .name = "wasm_sha256", .role = .wasm },
+            .{ .name = "cwasm_sha256", .role = .cwasm },
+            .{ .name = "runtime_sha256", .role = .runtime },
+            .{ .name = "compiler_sha256", .role = .compiler },
+            .{ .name = "config_sha256", .role = .config },
+        }) |entry|
+            try equal(try text(try get(hashes, entry.name)), &(try stagedArtifact(self, entry.role)).sha256);
+    }
 
     var boots = std.json.Value{ .object = .empty };
     for (profile.modes(self.compatibility)) |mode| {
@@ -1614,6 +1862,14 @@ fn verifyImportedEvidence(self: *AcceptedRun, portable: std.json.Value) !void {
         return error.InvalidResult;
     for (modes.array.items, profile.modes(self.compatibility)) |item, mode|
         try equal(try text(item), @tagName(mode));
+}
+
+fn verifyImportedTools(tools: std.json.Value, supervised: bool) !void {
+    const expected: []const []const u8 = if (supervised) &inputs.host_tools else &legacy_host_tools;
+    if (tools != .object or tools.object.count() != expected.len)
+        return error.InvalidInputCustody;
+    for (expected) |tool|
+        _ = try contracts.parseSha256(try text(try get(tools, tool)));
 }
 
 fn verifyImportedStart(a: std.mem.Allocator, start: std.json.Value, supervised: bool) !void {
@@ -1638,11 +1894,7 @@ fn verifyImportedStart(a: std.mem.Allocator, start: std.json.Value, supervised: 
         return error.InvalidSourceCustody;
     for (roles.array.items, limits.roles) |role, expected|
         try equal(try text(role), expected);
-    const tools = try get(start, "tools");
-    if (tools != .object or tools.object.count() != inputs.host_tools.len)
-        return error.InvalidInputCustody;
-    for (inputs.host_tools) |tool|
-        _ = try contracts.parseSha256(try text(try get(tools, tool)));
+    try verifyImportedTools(try get(start, "tools"), supervised);
     const dependencies = try get(start, "dependencies");
     _ = try contracts.exactFields(dependencies, &.{
         "schema",            "version", "request",  "source_manifests",
@@ -1936,7 +2188,7 @@ fn guardedMap(a: std.mem.Allocator, value: std.json.Value, domain: []const u8) !
 }
 
 fn stagedArtifact(self: *AcceptedRun, role: ArtifactRole) !physical.File {
-    return physical.readFile(self.io, try self.artifactPath(role), if (role == .cleanup) 128 else max_artifact_bytes, true);
+    return physical.readFile(self.io, try self.artifactPath(role), if (role == .cleanup) 128 else max_artifact_bytes, self.context != .local_runtime or !isSource(role));
 }
 
 fn compareCopy(self: *AcceptedRun, filename: []const u8, role: ArtifactRole) !void {
@@ -2038,7 +2290,9 @@ fn verifyImportedBoot(self: *AcceptedRun, mode: profile.Mode, boot_inputs: std.j
     if (!std.mem.endsWith(u8, work_dir, mode_suffix))
         return error.InvalidBootRequest;
     const runtime = work_dir[0 .. work_dir.len - mode_suffix.len];
-    if (!std.mem.eql(u8, runtime, "/d/wamr-ci/wamr-native-runtime") and
+    if (self.context == .local_runtime) {
+        try equal(runtime, self.root);
+    } else if (!std.mem.eql(u8, runtime, "/d/wamr-ci/wamr-native-runtime") and
         !std.mem.endsWith(u8, runtime, "/.d/wamr-native-runtime"))
         return error.InvalidBootRequest;
     const compute_root = try join(a, &.{ runtime, "compute" });
@@ -2185,7 +2439,7 @@ fn compareBootCopy(self: *AcceptedRun, mode: profile.Mode, name: []const u8) !vo
 
 fn verifyImportedChain(
     self: *AcceptedRun,
-    portable: std.json.Value,
+    portable: ?std.json.Value,
     package: std.json.Value,
     boot_inputs: std.json.Value,
     boots: std.json.Value,
@@ -2371,22 +2625,24 @@ fn verifyImportedChain(
     if (map != .object or map.object.count() != names.len) return error.InvalidImageChain;
     for (names) |name|
         try equal(try text(try get(map, name)), try evidenceHash(self, name));
-    const lineage = try get(portable, "lineage");
-    _ = try contracts.exactFields(lineage, &.{
-        "raw_sha256",                  "accepted_qcow2_sha256",   "derived_vhd_sha256",
-        "qcow2_finalization_sha256",   "qcow2_acceptance_sha256", "fixed_vhd_derivation_gate_sha256",
-        "fixed_vhd_derivation_sha256", "final_inspection_sha256",
-    });
-    for ([_]struct { key: []const u8, hash: []const u8 }{
-        .{ .key = "raw_sha256", .hash = &raw.sha256 },
-        .{ .key = "accepted_qcow2_sha256", .hash = &qcow2.sha256 },
-        .{ .key = "derived_vhd_sha256", .hash = &vhd.sha256 },
-        .{ .key = "qcow2_finalization_sha256", .hash = try evidenceHash(self, "qcow2-finalization.json") },
-        .{ .key = "qcow2_acceptance_sha256", .hash = try evidenceHash(self, "qcow2-acceptance.json") },
-        .{ .key = "fixed_vhd_derivation_gate_sha256", .hash = try evidenceHash(self, "fixed-vhd-derivation-gate.json") },
-        .{ .key = "fixed_vhd_derivation_sha256", .hash = try evidenceHash(self, "fixed-vhd-derivation.json") },
-        .{ .key = "final_inspection_sha256", .hash = try evidenceHash(self, "final-inspection.json") },
-    }) |entry| try equal(try text(try get(lineage, entry.key)), entry.hash);
+    if (portable) |manifest| {
+        const lineage = try get(manifest, "lineage");
+        _ = try contracts.exactFields(lineage, &.{
+            "raw_sha256",                  "accepted_qcow2_sha256",   "derived_vhd_sha256",
+            "qcow2_finalization_sha256",   "qcow2_acceptance_sha256", "fixed_vhd_derivation_gate_sha256",
+            "fixed_vhd_derivation_sha256", "final_inspection_sha256",
+        });
+        for ([_]struct { key: []const u8, hash: []const u8 }{
+            .{ .key = "raw_sha256", .hash = &raw.sha256 },
+            .{ .key = "accepted_qcow2_sha256", .hash = &qcow2.sha256 },
+            .{ .key = "derived_vhd_sha256", .hash = &vhd.sha256 },
+            .{ .key = "qcow2_finalization_sha256", .hash = try evidenceHash(self, "qcow2-finalization.json") },
+            .{ .key = "qcow2_acceptance_sha256", .hash = try evidenceHash(self, "qcow2-acceptance.json") },
+            .{ .key = "fixed_vhd_derivation_gate_sha256", .hash = try evidenceHash(self, "fixed-vhd-derivation-gate.json") },
+            .{ .key = "fixed_vhd_derivation_sha256", .hash = try evidenceHash(self, "fixed-vhd-derivation.json") },
+            .{ .key = "final_inspection_sha256", .hash = try evidenceHash(self, "final-inspection.json") },
+        }) |entry| try equal(try text(try get(lineage, entry.key)), entry.hash);
+    }
     _ = boot_inputs;
 }
 

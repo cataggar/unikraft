@@ -497,6 +497,25 @@ class NativeRecordBridge(unittest.TestCase):
                 bridge.local_runtime(runtime)
         self.assertEqual(json.loads(arguments.read_text()), [
             "records", "--runtime", str(runtime), "--output", "handoff-v1"])
+        with mock.patch.dict(os.environ, {
+                bridge.CONTROLLER_ENV: str(controller),
+                "WAMR_CI_TEST_ARGS": str(arguments)}):
+            with self.assertRaisesRegex(
+                    ValueError, "native controller read-only records refused"):
+                bridge.readonly_local_runtime(runtime)
+        self.assertEqual(json.loads(arguments.read_text()), [
+            "readonly-records", "--runtime", str(runtime),
+            "--output", "handoff-v1"])
+        git = controller
+        with mock.patch.dict(os.environ, {
+                bridge.CONTROLLER_ENV: str(controller),
+                "WAMR_CI_TEST_ARGS": str(arguments)}):
+            with self.assertRaisesRegex(
+                    ValueError, "native controller read-only records refused"):
+                bridge.readonly_local_runtime(runtime, git=git)
+        self.assertEqual(json.loads(arguments.read_text()), [
+            "readonly-records", "--runtime", str(runtime),
+            "--output", "handoff-v1", "--git", str(git)])
 
     def test_local_consumer_custody_uses_native_command_without_fallback(self):
         bridge = public_bundle.accepted_records
@@ -835,7 +854,7 @@ class NativeRecordBridge(unittest.TestCase):
         phases = []
         output = root / "handoff"
 
-        def check_boot_binding(*unused_args, **unused_kwargs):
+        def check_native_binding(*unused_args, **unused_kwargs):
             self.assertEqual(
                 handoff.ci.COMMAND_SUPERVISOR_PATH, str(supervisor))
             self.assertEqual(handoff.ci.COMMAND_TOOL_PATHS, expected_tools)
@@ -845,20 +864,24 @@ class NativeRecordBridge(unittest.TestCase):
             self.assertEqual(
                 handoff.ci.COMMAND_ENVIRONMENT["WAMR_CI_TOOL_GIT"],
                 expected_tools["git"])
-            return {}
+            raise ValueError("native controller handoff inspect refused")
 
         with mock.patch.object(
                 handoff, "_selected_records",
-                return_value=(None, {"build-start.json": "0" * 64})), \
+                return_value=({
+                    "source": source, "modes": list(handoff.ci.SIX_MODES),
+                }, {"build-start.json": "0" * 64})), \
                 mock.patch.object(
-                    handoff.ci, "producer_inputs", return_value=start), \
+                    handoff.ci, "producer_inputs",
+                    side_effect=AssertionError("Python custody replayed")), \
                 mock.patch.object(
-                    handoff.ci, "check_build", return_value=build), \
+                    handoff.ci, "check_build",
+                    side_effect=AssertionError("Python build replayed")), \
                 mock.patch.object(
                     handoff.ci, "boot_input_state"), \
                 mock.patch.object(
                     handoff.ci, "check_boot",
-                    side_effect=check_boot_binding), \
+                    side_effect=AssertionError("Python boot replayed")), \
                 mock.patch.object(
                     handoff.ci, "require_build_custody"), \
                 mock.patch.object(
@@ -872,8 +895,7 @@ class NativeRecordBridge(unittest.TestCase):
                     handoff.ci, "execute") as execute, \
                 mock.patch.object(
                     handoff.accepted_records, "handoff_inspect",
-                    side_effect=ValueError(
-                        "native controller handoff inspect refused")) as native:
+                    side_effect=check_native_binding) as native:
             with self.assertRaisesRegex(
                     ValueError, "native controller handoff inspect refused"):
                 handoff.export(runtime, output, on_phase=phases.append)
@@ -927,23 +949,35 @@ class NativeRecordBridge(unittest.TestCase):
         phases = []
         output = root / "handoff"
 
-        def check_boot_binding(*unused_args, **unused_kwargs):
+        def check_native_binding(*unused_args, **unused_kwargs):
             self.assertEqual(
                 handoff.ci.COMMAND_SUPERVISOR_PATH, str(supervisor))
             self.assertEqual(handoff.ci.COMMAND_TOOL_PATHS, {})
             self.assertEqual(handoff.ci.COMMAND_ENVIRONMENT, {
                 "WAMR_CI_SUPERVISOR": str(supervisor),
             })
-            return {}
+            raise ValueError("native controller handoff inspect refused")
 
         with mock.patch.object(
-                handoff.ci, "producer_inputs", return_value=start), \
+                handoff.accepted_records, "readonly_local_runtime",
+                return_value={
+                    "compatibility": "tiny-v1", "profile": None,
+                    "source": source, "modes": list(handoff.ci.MODES),
+                    "records": [
+                        {"name": name, "sha256": digest}
+                        for name, digest in hashes.items()
+                    ],
+                }) as reader, \
                 mock.patch.object(
-                    handoff.ci, "check_build", return_value=build), \
+                    handoff.ci, "producer_inputs",
+                    side_effect=AssertionError("Python custody replayed")), \
+                mock.patch.object(
+                    handoff.ci, "check_build",
+                    side_effect=AssertionError("Python build replayed")), \
                 mock.patch.object(handoff.ci, "boot_input_state"), \
                 mock.patch.object(
                     handoff.ci, "check_boot",
-                    side_effect=check_boot_binding), \
+                    side_effect=AssertionError("Python boot replayed")), \
                 mock.patch.object(handoff.ci, "require_build_custody"), \
                 mock.patch.object(
                     handoff.ci, "consumer_file_records", return_value={}), \
@@ -955,12 +989,12 @@ class NativeRecordBridge(unittest.TestCase):
                 mock.patch.object(handoff.ci, "execute") as execute, \
                 mock.patch.object(
                     handoff.accepted_records, "handoff_inspect",
-                    side_effect=ValueError(
-                        "native controller handoff inspect refused")) as native:
+                    side_effect=check_native_binding) as native:
             with self.assertRaisesRegex(
                     ValueError, "native controller handoff inspect refused"):
                 handoff.export(runtime, output, on_phase=phases.append)
         self.assertIn("inspect", phases)
+        reader.assert_called_once_with(runtime)
         native.assert_called_once_with(runtime, output, legacy=True)
         execute.assert_not_called()
         self.assertFalse(output.exists())
@@ -984,7 +1018,8 @@ class NativeRecordBridge(unittest.TestCase):
         handoff.ci.save(evidence / "build-start.json", start)
         phases = []
         with mock.patch.object(
-                handoff, "_selected_records", return_value=(None, {})), \
+                handoff, "_selected_records",
+                return_value=({"modes": list(handoff.ci.SIX_MODES)}, {})), \
                 mock.patch.object(handoff.ci, "producer_inputs") as custody, \
                 mock.patch.object(
                     handoff.accepted_records, "handoff_inspect") as native, \
@@ -1065,7 +1100,7 @@ class NativeRecordBridge(unittest.TestCase):
             self.assertEqual(
                 handoff.ci.COMMAND_SUPERVISOR_PATH,
                 str(runtime / "controller/bin/uk-wamr-native-ci"))
-        native.assert_called_once_with(runtime, root / "handoff")
+        native.assert_called_once_with(runtime, root / "handoff", legacy=False)
         custody.assert_not_called()
         build.assert_not_called()
         boot.assert_not_called()
@@ -1086,7 +1121,8 @@ class NativeRecordBridge(unittest.TestCase):
         handoff.ci.save(evidence / "build-start.json", start)
         phases = []
         with mock.patch.object(
-                handoff, "_selected_records", return_value=(None, {})), \
+                handoff, "_selected_records",
+                return_value=({"modes": list(handoff.ci.MODES)}, {})), \
                 mock.patch.object(
                     handoff.ci, "producer_inputs") as custody, \
                 mock.patch.object(handoff.ci, "COMMAND_SUPERVISOR_PATH", None), \
@@ -1770,6 +1806,116 @@ class NativeRecordBridge(unittest.TestCase):
                     container_digest="0" * 64, native_import_revalidation=True)
         identity.assert_not_called()
 
+        legacy_source = {
+            **source,
+            "source_revision": "993e4d0d394c08202c0d0c57ea97450a19a4f394",
+            "source_tree": "54f8e118146c78c24e7c802657c6ec62b268a5de",
+        }
+        handoff.NAMES = self.handoff_module().NAMES
+        legacy_artifacts = [
+            item("artifacts/" + name) for name in handoff.NAMES]
+        legacy_evidence = [
+            item("evidence/" + name)
+            for name in sorted(public_bundle.EVIDENCE)]
+        legacy_bundle = {
+            "schema": bundle["schema"], "version": 1,
+            "authority": "not_admitted",
+            "source_revision": legacy_source["source_revision"],
+            "source_tree": legacy_source["source_tree"],
+            "identity": bundle["identity"],
+            "artifacts": legacy_artifacts,
+            "evidence": legacy_evidence,
+            "boots": [{
+                "mode": mode,
+                **{
+                    key: item(f"boots/{mode}/{key}")
+                    for key in public_bundle.BOOT_KEYS
+                },
+            } for mode in ci.MODES],
+        }
+        legacy_members = public_bundle.members(handoff, legacy_bundle)
+        legacy_manifest = {
+            "schema": "uk.wamr.public-source-bundle", "version": 1,
+            "authority": "not_admitted", "source": legacy_source,
+            "members": {
+                name: {key: value[key] for key in ("size", "sha256")}
+                for name, value in legacy_members.items()
+            },
+        }
+        legacy_archive = root / "historical.zip"
+        with zipfile.ZipFile(
+                legacy_archive, "w", compression=zipfile.ZIP_STORED,
+                allowZip64=False) as zipped:
+            for name in sorted(legacy_members):
+                info = zipfile.ZipInfo(name)
+                info.create_system = 3
+                info.external_attr = (stat.S_IFREG | 0o600) << 16
+                zipped.writestr(info, b"x")
+            for name, value in (
+                    ("bundle.json", legacy_bundle),
+                    ("public-source.json", legacy_manifest)):
+                info = zipfile.ZipInfo(name)
+                info.create_system = 3
+                info.external_attr = (stat.S_IFREG | 0o600) << 16
+                zipped.writestr(info, public_bundle.encoded(value))
+        legacy_archive.chmod(0o600)
+        legacy_accepted = {
+            "compatibility": "tiny-v1",
+            "source": {
+                "revision": legacy_source["source_revision"],
+                "tree": legacy_source["source_tree"],
+            },
+            "result": {"sha256": sha256},
+            "records": [
+                {"name": Path(value["path"]).name,
+                 "sha256": value["sha256"]}
+                for value in legacy_evidence
+            ],
+        }
+        for refused in (False, True):
+            output = root / ("historical-refused" if refused else "historical")
+
+            def historical_revalidation(stage, path, **tools):
+                self.assertEqual(stage, output)
+                self.assertFalse((stage / "candidate-bundle.json").exists())
+                self.assertFalse((stage / "transport.json").exists())
+                self.assertEqual(tools, {
+                    "git": ci.tool("git"),
+                    "supervisor": root / "current-native-supervisor",
+                    "validator": root / "native-validator",
+                })
+                if refused:
+                    raise ValueError("historical native revalidation refused")
+                return Path(path)
+
+            with self.subTest(historical_refusal=refused), \
+                    mock.patch.object(
+                        public_bundle.accepted_records, "imported_stage",
+                        return_value=legacy_accepted), \
+                    mock.patch.object(
+                        public_bundle.accepted_records, "import_native_revalidation",
+                        side_effect=historical_revalidation) as native, \
+                    mock.patch.object(public_bundle, "publication_records") as records, \
+                    mock.patch.object(
+                        public_bundle, "native",
+                        side_effect=AssertionError("historical Python fallback")) as python:
+                args = (
+                    handoff, legacy_archive, output, legacy_source,
+                    ci.digest(legacy_archive), root / "native-validator",
+                    root / "current-native-supervisor",
+                )
+                if refused:
+                    with self.assertRaisesRegex(
+                            ValueError, "historical native revalidation refused"):
+                        public_bundle.import_bundle(*args)
+                else:
+                    public_bundle.import_bundle(*args)
+            native.assert_called_once()
+            python.assert_not_called()
+            self.assertEqual(records.call_count, int(not refused))
+            self.assertEqual((output / "candidate-bundle.json").exists(), not refused)
+            self.assertEqual((output / "bundle.json").exists(), not refused)
+
     def test_real_archive_requires_native_acceptance_before_publication(self):
         bridge = public_bundle.accepted_records
         stage = os.environ.get("WAMR_CI_NATIVE_IMPORT_FIXTURE")
@@ -1778,6 +1924,8 @@ class NativeRecordBridge(unittest.TestCase):
             self.skipTest("native controller and real imported archive not configured")
         from_fixture = Path(stage)
         source = json.loads((from_fixture / "public-source.json").read_bytes())["source"]
+        producer, producer_runtime = public_bundle.recorded_producer_info(
+            ci.document(from_fixture / "evidence/build-start.json")["consumer_inputs"])
         archive = Path(archive)
         root = Path(tempfile.mkdtemp(
             prefix="native-import-", dir=HERE.parents[2] / ".d"))
@@ -1805,6 +1953,17 @@ class NativeRecordBridge(unittest.TestCase):
             accepted_result["value"] = kwargs["native_accepted"]
             raise RuntimeError("after native acceptance")
 
+        def native_revalidation(actual_stage, actual_output, **tools):
+            self.assertEqual(producer, "native")
+            self.assertEqual(actual_stage, output)
+            self.assertEqual(actual_output, root / "import-native-identity/revalidation")
+            self.assertEqual(tools, {
+                "git": ci.tool("git"),
+                "supervisor": Path("/unused/supervisor"),
+                "validator": Path("/unused/validator"),
+            })
+            return actual_output
+
         with mock.patch.object(
                 public_bundle, "publication_records",
                 side_effect=after_native_acceptance), \
@@ -1814,8 +1973,7 @@ class NativeRecordBridge(unittest.TestCase):
                         unused_git, output: Path(output)) as identity, \
                 mock.patch.object(
                     bridge, "import_native_revalidation",
-                    side_effect=AssertionError(
-                        "default import selected native revalidation")
+                    side_effect=native_revalidation
                 ) as revalidation:
             with self.assertRaisesRegex(RuntimeError, "after native acceptance"):
                 public_bundle.import_bundle(
@@ -1824,7 +1982,10 @@ class NativeRecordBridge(unittest.TestCase):
                     artifact_id="123", container_digest="0" * 64)
         self.assertEqual(handoff.FAILURE_STAGE, "public-import-records")
         identity.assert_called_once()
-        revalidation.assert_not_called()
+        if producer == "native":
+            revalidation.assert_called_once()
+        else:
+            revalidation.assert_not_called()
         self.assertTrue((root / "import-native-identity").is_dir())
         self.assertTrue((output / "candidate-bundle.json").exists())
         self.assertFalse((output / "bundle.json").exists())
@@ -1883,8 +2044,12 @@ class NativeRecordBridge(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "revalidation refused"):
                 public_bundle.import_bundle(
                     handoff, archive, revalidation_refused, source,
-                    ci.digest(archive), Path("/unused/validator"),
-                    Path("/unused/supervisor"), artifact_id="123",
+                    ci.digest(archive),
+                    (producer_runtime / public_bundle.NATIVE_PUBLIC_VALIDATOR_RELATIVE
+                     if producer == "native" else Path("/unused/validator")),
+                    (producer_runtime / public_bundle.NATIVE_CONTROLLER_RELATIVE
+                     if producer == "native" else Path("/unused/supervisor")),
+                    artifact_id="123",
                     container_digest="0" * 64,
                     native_import_revalidation=True)
         python_native.assert_not_called()
@@ -4953,7 +5118,7 @@ source/generated/
         runtime = self.root / "runtime"
         (self.root / ".d").mkdir(mode=0o700)
         handoff = types.SimpleNamespace(
-            ci=ci, result_records=mock.Mock(), private=mock.Mock())
+            ci=ci, accepted_result_records=mock.Mock(), private=mock.Mock())
         build_start = public_bundle.VerifiedPublicBuildStart(
             {"consumer_inputs": {"files": {
                 "command-supervisor": {"path": str(

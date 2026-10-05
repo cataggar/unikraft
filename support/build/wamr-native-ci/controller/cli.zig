@@ -4,7 +4,7 @@ const core = @import("hyperv_core");
 const files = core.private_files;
 const contracts = core.contracts;
 
-pub const Action = enum { build, boot, diagnostics, describe, @"--identity", @"supervisor-source-closure", records, @"local-consumer-custody", @"handoff-inspect", @"handoff-inspect-legacy", @"public-validator-build", @"local-handoff-revalidation", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation", @"import-handoff-revalidation" };
+pub const Action = enum { build, boot, diagnostics, describe, @"--identity", @"supervisor-source-closure", @"reader-source-closure", records, @"readonly-records", @"local-consumer-custody", @"handoff-inspect", @"handoff-inspect-legacy", @"public-validator-build", @"local-handoff-revalidation", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation", @"import-handoff-revalidation" };
 pub const Command = struct {
     action: Action,
     runtime: ?[]const u8 = null,
@@ -31,7 +31,7 @@ pub fn parse(args: []const []const u8) !Command {
             return error.InvalidUsage;
         return .{ .action = action };
     }
-    if (action == .@"supervisor-source-closure") {
+    if (action == .@"supervisor-source-closure" or action == .@"reader-source-closure") {
         if (args.len != 6) return error.InvalidUsage;
         var result = Command{ .action = action };
         var output = false;
@@ -76,7 +76,7 @@ pub fn parse(args: []const []const u8) !Command {
             return error.InvalidUsage;
         return result;
     }
-    if (action == .records) {
+    if (action == .records or action == .@"readonly-records") {
         if (args.len != 6 and args.len != 8) return error.InvalidUsage;
         var result = Command{ .action = action };
         var output = false;
@@ -91,6 +91,9 @@ pub fn parse(args: []const []const u8) !Command {
             } else if (std.mem.eql(u8, flag, "--stage-root") and result.stage_root == null) {
                 files.absoluteFilePath(value) catch return error.InvalidUsage;
                 result.stage_root = value;
+            } else if (action == .@"readonly-records" and std.mem.eql(u8, flag, "--git") and result.git == null) {
+                files.absoluteFilePath(value) catch return error.InvalidUsage;
+                result.git = value;
             } else if (std.mem.eql(u8, flag, "--transport") and !transport and
                 std.mem.eql(u8, value, "trusted-inner-zip"))
             {
@@ -102,7 +105,8 @@ pub fn parse(args: []const []const u8) !Command {
             } else return error.InvalidUsage;
         }
         if (!output or (result.runtime != null) == (result.stage_root != null) or
-            transport != (result.stage_root != null))
+            transport != (result.stage_root != null) or
+            (action == .@"readonly-records" and result.stage_root != null))
             return error.InvalidUsage;
         return result;
     }
