@@ -396,5 +396,8 @@ python3 support/tools/hyperv/public_image/configure_cache_tests.py \
 
 It uses fresh private synthetic sources and the actual package build script,
 then removes its own directory. No guest, network or cloud resource is used.
+An optional third argument selects a fresh private cache directory on another
+filesystem; that directory is also removed. The actual build uses
+`ZIG_GLOBAL_CACHE_DIR`, not the removed Zig 0.17 build CLI flag.
 Filesystem-custody fixture runs are deliberately uncached: a previous successful
 run is not a substitute for current no-follow, metadata and source validation.

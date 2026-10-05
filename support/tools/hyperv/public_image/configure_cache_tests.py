@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the public-image configure graph against a private synthetic tree."""
 import hashlib
+import os
 import pathlib
 import shutil
 import subprocess
@@ -8,16 +9,26 @@ import sys
 
 
 def main():
-    if len(sys.argv) != 3:
-        raise SystemExit("usage: configure_cache_tests.py ZIG FRESH_PROJECT_DIRECTORY")
+    if len(sys.argv) not in (3, 4):
+        raise SystemExit("usage: configure_cache_tests.py ZIG FRESH_PROJECT_DIRECTORY [FRESH_CACHE_DIRECTORY]")
     zig = pathlib.Path(sys.argv[1]).resolve(strict=True)
     root = pathlib.Path(sys.argv[2]).absolute()
     if root.exists():
         raise SystemExit("fixture directory must not exist")
     if pathlib.Path.cwd().resolve() not in root.parents:
         raise SystemExit("fixture directory must be inside the current project")
+    cache = pathlib.Path(sys.argv[3]).absolute() if len(sys.argv) == 4 else root / ".cache"
+    if cache == root or cache in root.parents:
+        raise SystemExit("cache directory must not contain the fixture directory")
+    if cache.exists():
+        raise SystemExit("cache directory must not exist")
+    cache_owned = False
     root.mkdir(mode=0o700, parents=True)
     try:
+        cache.mkdir(mode=0o700, parents=True)
+        cache_owned = True
+        environment = os.environ.copy()
+        environment["ZIG_GLOBAL_CACHE_DIR"] = str(cache / "global")
         package = root / "support/tools/hyperv/public_image"
         package.mkdir(parents=True)
         shutil.copyfile(pathlib.Path(__file__).with_name("build.zig"), package / "build.zig")
@@ -58,24 +69,28 @@ def main():
         peer.parent.mkdir(parents=True)
         command = [
             str(zig), "build", "--build-file", str(package / "build.zig"),
-            "--cache-dir", str(root / ".cache"), "--prefix", str(root / "out"),
+            "--cache-dir", str(cache / "local"), "--prefix", str(root / "out"),
             "-j2", "install", "--summary", "failures",
         ]
         for mode in ("debug", "safe"):
             selected = command + ["-Doptimize=" + mode]
             for payload in (b"# reviewed peer A\n", b"# reviewed peer B\n"):
                 peer.write_bytes(payload)
-                subprocess.run(selected, check=True)
+                subprocess.run(selected, check=True, env=environment)
                 pin = subprocess.check_output([root / "out/bin/uk-hyperv-public-image"]).strip()
                 if pin != hashlib.sha256(payload).hexdigest().encode():
                     raise SystemExit("stale configure-time peer commitment")
             peer.unlink()
-            refused = subprocess.run(selected, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            refused = subprocess.run(selected, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=environment)
             if refused.returncode == 0 or b"public peer source unavailable" not in refused.stdout:
                 raise SystemExit("deleted peer source was not refused on a warm configure cache")
+        if not (cache / "global").is_dir():
+            raise SystemExit("build did not use the explicit private global-cache environment")
         print("public-image debug/safe warm configure caches update peer bytes and refuse deletion")
     finally:
         shutil.rmtree(root)
+        if cache_owned and cache.exists():
+            shutil.rmtree(cache)
 
 
 if __name__ == "__main__":

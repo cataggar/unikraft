@@ -61,8 +61,6 @@ pub fn plan(allocator: std.mem.Allocator, step: Step, command: CommandPaths) !Pl
         command.packages,
         "--cache-dir",
         try std.fs.path.join(allocator, &.{ command.scratch, "zig-local" }),
-        "--global-cache-dir",
-        try std.fs.path.join(allocator, &.{ command.scratch, "zig-global" }),
         "--prefix",
         command.output,
         try allocator.print("-Dapp={s}/support/apps/hyperv-acceptance", .{command.repository}),
@@ -1152,11 +1150,11 @@ test "producer exact native argv fixes targets flags packages and existing Make 
     for ([_]Step{ .configure, .inspect, .build }, [_][]const u8{ "olddefconfig", "config-inspect", "native-images" }) |step, goal| {
         const command = try plan(arena.allocator(), step, fixture_paths);
         const expected = [_][]const u8{
-            "/reviewed/native/bin/zig",                                  "build",                                                goal,                                                   "-j2",                                              "--system",                                  "/reviewed/packages",
-            "--cache-dir",                                               "/private/work/scratch/zig-local",                      "--global-cache-dir",                                   "/private/work/scratch/zig-global",                 "--prefix",                                  "/private/work/build",
-            "-Dapp=/reviewed/repository/support/apps/hyperv-acceptance", "-Dconfig=/private/work/input.config",                  "-Doutput=/private/work/build",                         "-Dnative-profile=hyperv-x86_64-efi-netvsc",        "-Dmake-command=/reviewed/native/bin/make",  "-Dcompiler=/reviewed/native/bin/zig cc -target x86_64-freestanding-none",
-            "-Dcompiler-targeted=true",                                  "-Dhost-cc=/reviewed/native/bin/zig cc",                "-Dhost-cxx=/reviewed/native/bin/zig c++",              "-Dhost-cflags=-fno-sanitize=null",                 "-Dmake-arg=AR=/reviewed/native/bin/zig ar", "-Dmake-arg=NM=/reviewed/native/bin/llvm-nm",
-            "-Dmake-arg=OBJCOPY=/reviewed/native/bin/llvm-objcopy",      "-Dmake-arg=OBJDUMP=/reviewed/native/bin/llvm-objdump", "-Dmake-arg=READELF=/reviewed/native/bin/llvm-readelf", "-Dmake-arg=STRIP=/reviewed/native/bin/llvm-strip", "-Dmake-arg=UK_CFLAGS=-std=gnu17",           "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt",
+            "/reviewed/native/bin/zig",                             "build",                                            goal,                                        "-j2",                                                                     "--system",                                                  "/reviewed/packages",
+            "--cache-dir",                                          "/private/work/scratch/zig-local",                  "--prefix",                                  "/private/work/build",                                                     "-Dapp=/reviewed/repository/support/apps/hyperv-acceptance", "-Dconfig=/private/work/input.config",
+            "-Doutput=/private/work/build",                         "-Dnative-profile=hyperv-x86_64-efi-netvsc",        "-Dmake-command=/reviewed/native/bin/make",  "-Dcompiler=/reviewed/native/bin/zig cc -target x86_64-freestanding-none", "-Dcompiler-targeted=true",                                  "-Dhost-cc=/reviewed/native/bin/zig cc",
+            "-Dhost-cxx=/reviewed/native/bin/zig c++",              "-Dhost-cflags=-fno-sanitize=null",                 "-Dmake-arg=AR=/reviewed/native/bin/zig ar", "-Dmake-arg=NM=/reviewed/native/bin/llvm-nm",                              "-Dmake-arg=OBJCOPY=/reviewed/native/bin/llvm-objcopy",      "-Dmake-arg=OBJDUMP=/reviewed/native/bin/llvm-objdump",
+            "-Dmake-arg=READELF=/reviewed/native/bin/llvm-readelf", "-Dmake-arg=STRIP=/reviewed/native/bin/llvm-strip", "-Dmake-arg=UK_CFLAGS=-std=gnu17",           "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt",
         };
         try std.testing.expectEqual(step, command.step);
         try std.testing.expectEqualStrings(fixture_paths.repository, command.cwd);

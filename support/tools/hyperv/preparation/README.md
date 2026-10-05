@@ -123,13 +123,13 @@ explicit existing-build target separately on each actual host architecture:
 ```sh
 # scratch is an already-created private directory outside the checkout.
 # packages is the pinned package directory from a copied-manifest restore.
-zig build --build-file support/tools/hyperv/preparation/build.zig \
+ZIG_GLOBAL_CACHE_DIR="$scratch/global" zig build --build-file support/tools/hyperv/preparation/build.zig \
   --system "$packages" --cache-dir "$scratch/cache" \
-  --global-cache-dir "$scratch/global" --prefix "$scratch/installed" \
+  --prefix "$scratch/installed" \
   -Doptimize=safe -j2 test-original-seed install --summary all
-zig build --build-file support/tools/hyperv/preparation/build.zig \
+ZIG_GLOBAL_CACHE_DIR="$scratch/global" zig build --build-file support/tools/hyperv/preparation/build.zig \
   --system "$packages" --cache-dir "$scratch/cache" \
-  --global-cache-dir "$scratch/global" --prefix "$scratch/installed" \
+  --prefix "$scratch/installed" \
   -Doptimize=safe -Doriginal-seed-root="$scratch/fresh-full-size" \
   -j2 qualify-original-seed --summary all
 ```
@@ -247,8 +247,8 @@ outside the checkout and `-j2`.
 An explicit, noninstalled native driver exercises the actual CLI pipeline:
 
 ```text
-zig build --build-file support/tools/hyperv/preparation/build.zig \
-  --system PACKAGES --cache-dir SCRATCH/cache --global-cache-dir SCRATCH/global \
+ZIG_GLOBAL_CACHE_DIR=SCRATCH/global zig build --build-file support/tools/hyperv/preparation/build.zig \
+  --system PACKAGES --cache-dir SCRATCH/cache \
   --prefix SCRATCH/installed -Doptimize=safe -j2 \
   -Ddirect-config-root=FRESH_ABSOLUTE_PRIVATE_PATH qualify-direct-config --summary all
 ```
@@ -395,10 +395,9 @@ checkout or fresh execution/admission evidence.
 The separate existing-runner namespace fixture build uses:
 
 ```sh
-/home/g/.local/bin/zig build \
+ZIG_GLOBAL_CACHE_DIR="$scratch/ns-global" /home/g/.local/bin/zig build \
   --build-file /d/unikraft-worktrees/fleet-origin/support/tools/hyperv/preparation/namespace/build.zig \
   --cache-dir "$scratch/ns-local" \
-  --global-cache-dir "$scratch/ns-global" \
   --system /d/unikraft-worktrees/fleet-ci/.d/zig-migration-preparation/restore/zig-pkg \
   --prefix "$scratch/outputs/namespace-debug" \
   -Dworkspace="$scratch/ns-debug-work" "${git_fixture[@]}" \
@@ -463,9 +462,9 @@ umask 077
 scratch="$PWD/.d/namespace-observations-debug"
 test ! -e "$scratch"
 mkdir -p "$scratch"/{work,cache,global,compiler-scratch}
-TMPDIR="$scratch/compiler-scratch" zig build \
+TMPDIR="$scratch/compiler-scratch" ZIG_GLOBAL_CACHE_DIR="$scratch/global" zig build \
   --build-file support/tools/hyperv/preparation/namespace/build.zig \
-  --cache-dir "$scratch/cache" --global-cache-dir "$scratch/global" \
+  --cache-dir "$scratch/cache" \
   -Dworkspace="$scratch/work" -Dobservations-only=true -Doptimize=debug \
   -j2 test-observations --summary all
 ```
@@ -861,6 +860,10 @@ after AST/ZOIR and source cleanup until declaration comparison completes.
 Filesystem-custody test runs remain live on every build invocation rather than
 reusing an earlier test result for changed source, fixture or private-file
 metadata; compilation and generated-artifact caching remain available.
+The Zig build CLI receives its global cache through the validated namespace
+environment's `ZIG_GLOBAL_CACHE_DIR`, bound to the selected private scratch
+directory. No ambient cache is inherited; Zig 0.17 build no longer accepts a
+`--global-cache-dir` argument.
 
 Canonical JSON has sorted keys, exact fields/types and one final LF, included
 in document hashes. Duplicate/unknown/missing fields, noncanonical encodings,
