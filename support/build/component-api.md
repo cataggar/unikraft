@@ -27,7 +27,13 @@ An optional `c_translation` declares C header names and the Zig import name
 generated C wrapper before compilation; the same global/object include roots,
 macros, target and generated-file bindings apply to translation. Generated
 headers are tracked inputs of the translator, not configure-time files or
-hand-copied Zig declarations. The target-object fixture checks translated
+hand-copied Zig declarations. Initialization follows the typed Hearth pattern,
+`const translated: Translator = .init(b.dependency("translate_c", .{}), options)`;
+the dependency uses its hosted defaults, while the actual guest target and
+object optimization belong to `options`. Every consumer imports
+`translated.mod`, including its helper modules, rather than rebuilding a module
+from `output_file`. Hosted production verifiers retain their safe mode.
+The target-object fixture checks translated
 macro values and a real C/Zig struct-by-value ABI, including a stripped object.
 Root invocations require the explicitly restored translator/Aro depot described
 in the root README; use `--system "$ZIG_LOCAL_PKG_DIR"` to prohibit fetching.

@@ -146,11 +146,7 @@ pub fn execute(
             target_module.addCMacro(macro.name, macro.value);
         }
         if (planned.object.c_translation) |translation| {
-            const translate_c = @import("translate_c");
-            const dependency = b.dependency("translate_c", .{
-                .target = b.graph.host,
-                .optimize = .safe,
-            });
+            const Translator = @import("translate_c").Translator;
             var source: std.Io.Writer.Allocating = .init(b.allocator);
             for (translation.headers) |header| {
                 source.writer.print("#include <{s}>\n", .{header}) catch
@@ -160,7 +156,7 @@ pub fn execute(
                 b.fmt("{s}-{s}-translate.h", .{ planned.component_name, planned.object.name }),
                 source.written(),
             );
-            const translated = translate_c.Translator.init(dependency, .{
+            const translated: Translator = .init(b.dependency("translate_c", .{}), .{
                 .name = b.fmt("{s}-{s}-config", .{ planned.component_name, planned.object.name }),
                 .c_source_file = header,
                 .target = target,

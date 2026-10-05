@@ -1803,10 +1803,7 @@ pub fn build(b: *std.Build) void {
     target_config_cache_test.addDirectoryArg(
         b.graph.path(.local_cache, "target-config-cache"),
     );
-    const translator_dependency = b.dependency("translate_c", .{
-        .target = b.graph.host,
-        .optimize = .safe,
-    });
+    const translator_dependency = b.dependency("translate_c", .{});
     const translator_root = std.fs.path.resolve(b.allocator, &.{
         cwd,
         translator_dependency.builder.root.toString(b.allocator) catch @panic("OOM"),
