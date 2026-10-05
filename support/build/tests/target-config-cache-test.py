@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import argparse
+import json
 import os
 import pathlib
 import shutil
@@ -18,32 +19,132 @@ def write_config(path, name):
     )
 
 
-def run_build(zig, base, work, config):
+def build_environment(work):
     env = os.environ.copy()
     env["ZIG_GLOBAL_CACHE_DIR"] = str(work / "global-cache")
     env["ZIG_LOCAL_CACHE_DIR"] = str(work / "local-cache")
     env["TMPDIR"] = str(work / "tmp")
     env["XDG_CACHE_HOME"] = str(work / "tool-cache")
-    subprocess.run(
+    return env
+
+
+def build(zig, base, work, arguments):
+    return subprocess.run(
+        [zig, "build", *arguments, "--summary", "failures"],
+        cwd=base,
+        env=build_environment(work),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+
+def expect_build(zig, base, work, arguments, diagnostic=None):
+    result = build(zig, base, work, arguments)
+    if diagnostic is None:
+        if result.returncode:
+            raise SystemExit(result.stdout)
+    elif result.returncode == 0 or diagnostic not in result.stdout:
+        raise SystemExit(f"expected refusal {diagnostic!r}:\n{result.stdout}")
+    return result.stdout
+
+
+def run_build(zig, base, work, config):
+    expect_build(
+        zig, base, work,
         [
-            zig,
-            "build",
             "target-config-header",
             f"-Dapp={work}",
             f"-Doutput={work / 'output'}",
             f"-Dconfig={config}",
             "--prefix",
             str(work / "install"),
-            "--summary",
-            "failures",
         ],
-        cwd=base,
-        env=env,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
     )
+
+
+def tracked_config(zig, base, work):
+    fixture = work / "configure-fixture"
+    fixture.mkdir()
+    for source, destination in (
+        ("tests/configure-cache/build.zig", "build.zig"),
+        ("native-config-input.zig", "native-config-input.zig"),
+    ):
+        shutil.copyfile(base / "support/build" / source, fixture / destination)
+    config = fixture / "same-path.config"
+    installed = work / "install/config-source"
+    arguments = [f"-Dconfig={config}", "--prefix", str(work / "install")]
+    config.write_text("first\n", encoding="utf-8")
+    expect_build(zig, fixture, work, arguments)
+    expect_build(zig, fixture, work, arguments)
+    original = config.stat()
+    replacement = fixture / "replacement.config"
+    replacement.write_text("other\n", encoding="utf-8")
+    os.utime(replacement, ns=(original.st_atime_ns, original.st_mtime_ns))
+    replacement.replace(config)
+    expect_build(zig, fixture, work, arguments)
+    if installed.read_text(encoding="utf-8") != "other\n":
+        raise SystemExit("warm configuration cache reused replaced .config contents")
+    config.unlink()
+    expect_build(zig, fixture, work, arguments, "configuration failed")
+
+
+def live_trust(zig, base, work):
+    app = work / "application"
+    app.mkdir()
+    recorded = work / "make-argv"
+    source = work / "record-make.c"
+    make = work / "record-make"
+    source.write_text(
+        "#include <stdio.h>\n"
+        "int main(int argc, char **argv) {\n"
+        f"FILE *output = fopen({json.dumps(str(recorded))}, \"w\");\n"
+        "if (!output) return 1;\n"
+        "for (int i = 1; i < argc; ++i) fprintf(output, \"%s\\n\", argv[i]);\n"
+        "return fclose(output) != 0;\n}\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [zig, "cc", "-static", "-O2", str(source), "-o", str(make)],
+        cwd=base, env=build_environment(work), check=True,
+    )
+    make.chmod(0o700)
+    tool = work / "wamr-tool"
+    tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    tool.chmod(0o700)
+    arguments = [
+        "objs", f"-Dapp={app}", f"-Doutput={work / 'output'}",
+        f"-Dmake-command={make}", f"-Dwamr-aot-tool={tool}",
+        "-Dmake-arg=AR=zig ar",
+    ]
+    expect_build(zig, base, work, arguments)
+    expect_build(zig, base, work, arguments)
+    argv = recorded.read_text(encoding="utf-8").splitlines()
+    if "AR=zig ar" not in argv or "objs" not in argv:
+        raise SystemExit("warm-cache Make passthrough lost argument boundaries")
+    recorded.unlink()
+    original = tool.stat()
+    tool.chmod(0o600)
+    os.utime(tool, ns=(original.st_atime_ns, original.st_mtime_ns))
+    expect_build(zig, base, work, arguments, "executable regular file")
+    if recorded.exists():
+        raise SystemExit("Make executed after a live executable-trust refusal")
+    tool.chmod(0o700)
+    expect_build(zig, base, work, arguments)
+    recorded.unlink()
+    original_tool = work / "original-wamr-tool"
+    tool.rename(original_tool)
+    tool.symlink_to(original_tool)
+    expect_build(zig, base, work, arguments, "existing canonical executable")
+    if recorded.exists():
+        raise SystemExit("Make executed after executable path replacement")
+    tool.unlink()
+    original_tool.rename(tool)
+    app.rename(work / "original-application")
+    app.write_text("not a directory\n", encoding="utf-8")
+    expect_build(zig, base, work, arguments, "NotDirectory")
+    if recorded.exists():
+        raise SystemExit("Make executed after application directory replacement")
 
 
 def main():
@@ -54,8 +155,8 @@ def main():
     args = parser.parse_args()
 
     os.umask(0o077)
-    base = pathlib.Path(args.base)
-    work = pathlib.Path(args.work_dir)
+    base = pathlib.Path(args.base).resolve()
+    work = pathlib.Path(args.work_dir).resolve()
     if work.exists():
         shutil.rmtree(work)
     work.mkdir(parents=True, mode=0o700)
@@ -81,6 +182,8 @@ def main():
         raise SystemExit("target header was stale after same-path config update")
     if first == second:
         raise SystemExit("same-path config update did not invalidate the target header")
+    tracked_config(args.zig, base, work)
+    live_trust(args.zig, base, work)
 
 
 if __name__ == "__main__":

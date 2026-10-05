@@ -79,7 +79,7 @@ pub fn versionAlloc(a: std.mem.Allocator, source: []const u8, raw_suffix: []cons
     if (major.len == 0 or minor.len == 0) return error.MissingVersion;
     const extra = values.get("UK_EXTRAVERSION") orelse "";
     return .{
-        .full = try std.fmt.allocPrint(a, "{s}.{s}{s}{s}{s}", .{
+        .full = try a.print("{s}.{s}{s}{s}{s}", .{
             major, minor, if (extra.len != 0) "." else "", extra, suffix,
         }),
         .codename = values.get("UK_CODENAME") orelse "",
@@ -143,7 +143,7 @@ fn imageName(override: ?[]const u8, configured: ?[]const u8, app: []const u8) []
 }
 
 fn setEnv(a: std.mem.Allocator, name: [:0]const u8, value: []const u8) !void {
-    if (setenv(name, try a.dupeZ(u8, value), 1) != 0) return error.SetEnvironmentFailed;
+    if (setenv(name, try a.dupeSentinel(u8, value, 0), 1) != 0) return error.SetEnvironmentFailed;
 }
 
 fn read(io: std.Io, a: std.mem.Allocator, path: []const u8) ![]const u8 {
@@ -216,7 +216,11 @@ fn canonical(a: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
 }
 
 fn canonicalAllowMissing(a: std.mem.Allocator, io: std.Io, path: []const u8) ![]const u8 {
-    return (try facade_paths.canonicalizeNearestExisting(a, io, try std.fs.path.resolve(a, &.{path}))).path;
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", a);
+    defer a.free(cwd);
+    const absolute = try std.fs.path.resolve(a, &.{ cwd, path });
+    defer a.free(absolute);
+    return (try facade_paths.canonicalizeNearestExisting(a, io, absolute)).path;
 }
 
 fn platformMetadata(a: std.mem.Allocator, io: std.Io, opts: Options, metadata: *kconfig.Metadata) !void {
@@ -333,11 +337,11 @@ fn run(init: std.process.Init, args: []const []const u8) !void {
         .{ "UK_NAME", image_name },
     };
     inline for (environment) |pair| try setEnv(a, pair[0], pair[1]);
-    if (chdir(try a.dupeZ(u8, opts.base)) != 0) return error.ChangeDirectoryFailed;
+    if (chdir(try a.dupeSentinel(u8, opts.base, 0)) != 0) return error.ChangeDirectoryFailed;
     var metadata = kconfig.Metadata.init(a);
     defer metadata.deinit();
     model = &metadata;
-    uk_kconfig_metadata(try a.dupeZ(u8, try join(a, opts.base, "Config.uk")), emitSymbol);
+    uk_kconfig_metadata(try a.dupeSentinel(u8, try join(a, opts.base, "Config.uk"), 0), emitSymbol);
     if (model_error) |err| return err;
     try platformMetadata(a, io, opts, &metadata);
     const contents = try render(a, &metadata);

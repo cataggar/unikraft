@@ -46,7 +46,7 @@ pub fn main(init: std.process.Init) !void {
     var relocated = try readImage(allocator, io, paths[2]);
     defer relocated.deinit();
     try std.testing.expectEqualSlices(u8, expected_relocations, try relocated.sectionData(try relocated.section(".uk_reloc")));
-    const update_reloc = try std.fmt.allocPrint(allocator, "--update-section=.uk_reloc={s}", .{paths[1]});
+    const update_reloc = try allocator.print("--update-section=.uk_reloc={s}", .{paths[1]});
     try runner.write(io, paths[7], &original);
     try tool(io, allocator, objcopy, &.{ update_reloc, paths[7] });
     try equalFile(allocator, io, paths[7], relocated.bytes);
@@ -82,7 +82,7 @@ pub fn main(init: std.process.Init) !void {
     var boot = try readImage(allocator, io, paths[5]);
     defer boot.deinit();
     try std.testing.expectEqualSlices(u8, expected_bootinfo, try boot.sectionData(try boot.section(".uk_bootinfo")));
-    const update_boot = try std.fmt.allocPrint(allocator, "--update-section=.uk_bootinfo={s}", .{paths[4]});
+    const update_boot = try allocator.print("--update-section=.uk_bootinfo={s}", .{paths[4]});
     try tool(io, allocator, objcopy, &.{ paths[3], update_boot, paths[7] });
     try equalFile(allocator, io, paths[7], boot.bytes);
     const expected_efi = try transform.efi(allocator, boot, relocated);
@@ -118,7 +118,7 @@ pub fn main(init: std.process.Init) !void {
     var bad = try std.process.spawn(io, .{ .argv = &.{ native, "strip", "--tool", strip, paths[10], paths[11] }, .stderr = .ignore });
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, try bad.wait(io));
     try std.testing.expectError(error.FileNotFound, runner.read(allocator, io, paths[11]));
-    const failing_strip = try std.fmt.allocPrint(allocator, "{s} --deliberately-invalid-native-fixture-option", .{strip});
+    const failing_strip = try allocator.print("{s} --deliberately-invalid-native-fixture-option", .{strip});
     var failed_tool = try std.process.spawn(io, .{
         .argv = &.{ native, "strip", "--tool", failing_strip, paths[0], paths[11] },
         .stderr = .ignore,

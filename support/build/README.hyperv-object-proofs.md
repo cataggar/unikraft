@@ -102,7 +102,7 @@ Fixture-only native fake tools are never selected by production code.
 Each successful fixture run records its case count in its generated
 `hyperv-object-fixtures/result.txt`.
 
-Pinned local invocation (Linux, Zig 0.16.0, existing LLVM 22.1.8):
+Pinned local invocation (Linux, Zig 0.17.0, existing LLVM 22.1.8):
 
 ```sh
 cd /d/unikraft-worktrees/fleet-network
@@ -116,12 +116,12 @@ mkdir -p "$HOME" "$TMPDIR" "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
   -Doptimize=Debug -j2 --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
   --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" --prefix "$work/outputs/debug"
 /home/g/.local/bin/zig build hyperv-object-proofs test-hyperv-object-proofs \
-  -Doptimize=ReleaseSafe -j2 --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
+  -Doptimize=safe -j2 --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
   --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" --prefix "$work/outputs/release-safe"
 ```
 
 The existing protocol/C suites retain their existing Debug mode and the
-freestanding producers retain ReleaseFast; the new verifier, parser tests,
+freestanding producers retain fast; the new verifier, parser tests,
 CLI fixture driver and fake tool use the selected optimization mode.
 `-Dhyperv-object-nm=PATH`, `-Dhyperv-object-readelf=PATH` and
 `-Dhyperv-object-objcopy=PATH` select explicit native tool executables.
@@ -132,7 +132,7 @@ Producer-closure additions for parent integration: the six
 the shared `support/tools/hyperv/process.zig` / `diagnostics.zig` modules and
 their transitive `contracts.zig` / `sensitive.zig` dependencies.
 There are no new package dependencies or package restores. Required CI runs the
-focused selector in Debug and ReleaseSafe. Both guarded producer maps bind the
+focused selector in debug and safe. Both guarded producer maps bind the
 complete guarded build closure outside the separate `wamr-native-ci` controller
 subtree and the shared core dependencies.
 

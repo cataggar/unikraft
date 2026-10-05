@@ -236,7 +236,7 @@ pub fn irq(model: Model, diagnostic: *Diagnostic) !IrqReport {
     defer visited.deinit();
     var functions = std.AutoHashMap(u64, void).init(model.image.allocator);
     defer functions.deinit();
-    var counts = [_]usize{0} ** 3;
+    var counts = @as([3]usize, @splat(0));
     var fatal_logs: usize = 0;
     try pending.append(model.image.allocator, try model.address(indirect_callers[0]));
     const printk = try model.maybeSymbol("_uk_printk");
@@ -306,9 +306,9 @@ pub fn drivers(model: Model, required: []const Driver, diagnostic: *Diagnostic) 
         const name = @tagName(driver);
         diagnostic.subject = name;
         const allocator = model.image.allocator;
-        const constructor = try std.fmt.allocPrint(allocator, "lib{s}_vmbus_register_driver", .{name});
+        const constructor = try allocator.print("lib{s}_vmbus_register_driver", .{name});
         defer allocator.free(constructor);
-        const entry = try std.fmt.allocPrint(allocator, "__uk_ctortab1_{s}", .{constructor});
+        const entry = try allocator.print("__uk_ctortab1_{s}", .{constructor});
         defer allocator.free(entry);
         const ctor = try model.namedKind(constructor, "Tt");
         const record = try model.namedKind(entry, "Dd");
@@ -317,9 +317,9 @@ pub fn drivers(model: Model, required: []const Driver, diagnostic: *Diagnostic) 
             return error.ConstructorEntryOutsideTable;
         if (try model.pointer(offset) != ctor.header.st_value) return error.ConstructorPointerMismatch;
         if (try model.directCall(constructor, "_vmbus_register_driver", true) == null) return error.MissingDriverRegistrationCall;
-        const descriptor_name = try std.fmt.allocPrint(allocator, "{s}_driver", .{name});
+        const descriptor_name = try allocator.print("{s}_driver", .{name});
         defer allocator.free(descriptor_name);
-        const ids_name = try std.fmt.allocPrint(allocator, "{s}_device_ids", .{name});
+        const ids_name = try allocator.print("{s}_device_ids", .{name});
         defer allocator.free(ids_name);
         const descriptor = try model.symbol(descriptor_name);
         const ids = try model.symbol(ids_name);
@@ -330,12 +330,12 @@ pub fn drivers(model: Model, required: []const Driver, diagnostic: *Diagnostic) 
         const id_bytes = try model.dataAt(ids.header.st_value, 32);
         if (!std.mem.eql(u8, id_bytes[0..16], &guid) or !std.mem.allEqual(u8, id_bytes[16..32], 0))
             return error.DriverIdMismatch;
-        const driver_name = try std.fmt.allocPrint(allocator, "hyperv-{s}\x00", .{name});
+        const driver_name = try allocator.print("hyperv-{s}\x00", .{name});
         defer allocator.free(driver_name);
         if (!std.mem.eql(u8, try model.dataAt(try model.pointer(address), driver_name.len), driver_name))
             return error.DriverNameMismatch;
         for ([_][]const u8{ "add_device", "remove_device" }, 0..) |suffix, index| {
-            const callback = try std.fmt.allocPrint(allocator, "{s}_{s}", .{ name, suffix });
+            const callback = try allocator.print("{s}_{s}", .{ name, suffix });
             defer allocator.free(callback);
             const pointer = try model.pointer(address + 16 + index * 8);
             if (pointer != try model.address(callback)) return error.DriverCallbackMismatch;

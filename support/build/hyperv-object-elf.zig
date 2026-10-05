@@ -45,17 +45,17 @@ pub const Object = struct {
                 continue;
             }
             if (sh.sh_addralign != 0 and !std.math.isPowerOfTwo(sh.sh_addralign)) return error.InvalidAlignment;
-            if (sh.sh_type != @intFromEnum(elf.SHT.NOBITS))
+            if (sh.sh_type != @backingInt(elf.SHT.NOBITS))
                 _ = try region(bytes, sh.sh_offset, sh.sh_size);
-            if (sh.sh_type == @intFromEnum(elf.SHT.SYMTAB)) {
+            if (sh.sh_type == @backingInt(elf.SHT.SYMTAB)) {
                 if (symtab != null) return error.DuplicateSymbolTable;
                 symtab = index;
             }
-            if (sh.sh_type == @intFromEnum(elf.SHT.DYNSYM) or sh.sh_type == @intFromEnum(elf.SHT.SYMTAB_SHNDX))
+            if (sh.sh_type == @backingInt(elf.SHT.DYNSYM) or sh.sh_type == @backingInt(elf.SHT.SYMTAB_SHNDX))
                 return error.UnsupportedSymbolTable;
         }
         const names_header = sections[header.shstrndx].header;
-        if (names_header.sh_type != @intFromEnum(elf.SHT.STRTAB)) return error.InvalidStringTable;
+        if (names_header.sh_type != @backingInt(elf.SHT.STRTAB)) return error.InvalidStringTable;
         const names = try region(bytes, names_header.sh_offset, names_header.sh_size);
         for (sections) |*section_entry| section_entry.name = try string(names, section_entry.header.sh_name);
         const symbol_section = symtab orelse return error.MissingSymbolTable;
@@ -64,7 +64,7 @@ pub const Object = struct {
             sh.sh_size / sh.sh_entsize > maximum_symbols or sh.sh_link >= sections.len or sh.sh_info > sh.sh_size / sh.sh_entsize)
             return error.InvalidSymbolTable;
         const strings = sections[sh.sh_link].header;
-        if (strings.sh_type != @intFromEnum(elf.SHT.STRTAB)) return error.InvalidStringTable;
+        if (strings.sh_type != @backingInt(elf.SHT.STRTAB)) return error.InvalidStringTable;
         const table = try region(bytes, strings.sh_offset, strings.sh_size);
         const symbols = try allocator.alloc(Symbol, @intCast(sh.sh_size / sh.sh_entsize));
         errdefer allocator.free(symbols);
@@ -120,7 +120,7 @@ pub const Object = struct {
         const sh = self.sections[entry.st_shndx].header;
         if (entry.st_size == 0 or entry.st_value > sh.sh_size or entry.st_size > sh.sh_size - entry.st_value)
             return error.InvalidExport;
-        if (!object and (sh.sh_type != @intFromEnum(elf.SHT.PROGBITS) or
+        if (!object and (sh.sh_type != @backingInt(elf.SHT.PROGBITS) or
             sh.sh_flags & (elf.SHF_ALLOC | elf.SHF_EXECINSTR | elf.SHF_WRITE) != elf.SHF_ALLOC | elf.SHF_EXECINSTR))
             return error.InvalidExport;
         return found;
@@ -138,9 +138,9 @@ pub const Object = struct {
             found.entry.st_other != 0) return error.InvalidMappingReference;
         for (self.sections) |section_| {
             const sh = section_.header;
-            if (sh.sh_type != @intFromEnum(elf.SHT.RELA)) continue;
+            if (sh.sh_type != @backingInt(elf.SHT.RELA)) continue;
             const target = self.sections[sh.sh_info].header;
-            if (target.sh_type != @intFromEnum(elf.SHT.PROGBITS) or
+            if (target.sh_type != @backingInt(elf.SHT.PROGBITS) or
                 target.sh_flags & (elf.SHF_ALLOC | elf.SHF_EXECINSTR | elf.SHF_WRITE) != elf.SHF_ALLOC | elf.SHF_EXECINSTR) continue;
             var reader = std.Io.Reader.fixed(try region(self.bytes, sh.sh_offset, sh.sh_size));
             while (reader.seek < reader.end) {
@@ -155,8 +155,8 @@ pub const Object = struct {
         var total: u64 = 0;
         for (self.sections) |section_| {
             const sh = section_.header;
-            if (sh.sh_type == @intFromEnum(elf.SHT.REL)) return error.UnsupportedRelocation;
-            if (sh.sh_type != @intFromEnum(elf.SHT.RELA)) continue;
+            if (sh.sh_type == @backingInt(elf.SHT.REL)) return error.UnsupportedRelocation;
+            if (sh.sh_type != @backingInt(elf.SHT.RELA)) continue;
             if (sh.sh_link != self.symbol_section or sh.sh_info == 0 or sh.sh_info >= self.sections.len or
                 sh.sh_entsize != @sizeOf(elf.Elf64_Rela) or sh.sh_size % sh.sh_entsize != 0)
                 return error.InvalidRelocation;

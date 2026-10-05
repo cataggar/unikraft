@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-//! Standalone, Python-free validation (Zig 0.16.0):
+//! Standalone, Python-free validation (Zig 0.17.0):
 //! zig build --build-file support/build/native-postprocess-tests.build.zig test -j2
 //! Use `integration -j2` for real LLVM strip/objcopy fixtures. Tool commands
 //! can be supplied with -Dobjcopy=... and -Dstrip=...; -Dfixture-arch=arm64
@@ -24,7 +24,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("native-postprocess-runner.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
         }),
     });
     b.installArtifact(runner);
@@ -45,7 +45,7 @@ pub fn build(b: *std.Build) void {
     const architecture = b.option([]const u8, "fixture-arch", "Fixture architecture: x86_64 or arm64") orelse "x86_64";
     run.addArg(objcopy);
     run.addArg(strip);
-    _ = run.addOutputDirectoryArg("fixtures");
+    _ = run.addOutputDirectoryArg2("fixtures", .{ .make_absolute = true });
     run.addArg(architecture);
     integration.dependOn(&run.step);
     graphFixture(b, integration, runner, fixture, architecture, objcopy, strip);
@@ -108,7 +108,7 @@ fn graphFixture(
                 .input = output("efi", "image"),
                 .effects = &.{.{ .create = .{
                     .name = "database",
-                    .path = b.pathFromRoot("compile_commands.json"),
+                    .path = b.root.joinString(b.allocator, "compile_commands.json") catch @panic("OOM"),
                     .role = .auxiliary,
                 } }},
             },

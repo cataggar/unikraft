@@ -132,11 +132,11 @@ pub const Model = struct {
     pub fn dataAt(self: Model, address_value: u64, size: u64) ![]const u8 {
         var result: ?[]const u8 = null;
         for (self.image.programs) |header| {
-            if (header.p_type != std.elf.PT_LOAD or address_value < header.p_vaddr) continue;
-            const delta = address_value - header.p_vaddr;
-            if (delta > header.p_filesz or size > header.p_filesz - delta) continue;
+            if (header.type != .LOAD or address_value < header.vaddr) continue;
+            const delta = address_value - header.vaddr;
+            if (delta > header.filesz or size > header.filesz - delta) continue;
             if (result != null) return error.AmbiguousLoadAddress;
-            result = try elf.range(self.image.bytes, try elf.add(header.p_offset, delta), size);
+            result = try elf.range(self.image.bytes, try elf.add(header.offset, delta), size);
         }
         return result orelse error.AddressOutsideLoadedImage;
     }
@@ -150,9 +150,9 @@ pub const Model = struct {
             if (delta <= header.sh_size and size <= header.sh_size - delta) {
                 try self.image.requireLoadedSection(section);
                 for (self.image.programs) |program| {
-                    if (program.p_type != std.elf.PT_LOAD or program.p_flags & std.elf.PF_X == 0 or address_value < program.p_vaddr) continue;
-                    const offset = address_value - program.p_vaddr;
-                    if (offset <= program.p_filesz and size <= program.p_filesz - offset)
+                    if (program.type != .LOAD or @as(u32, @bitCast(program.flags)) & std.elf.PF_X == 0 or address_value < program.vaddr) continue;
+                    const offset = address_value - program.vaddr;
+                    if (offset <= program.filesz and size <= program.filesz - offset)
                         return self.dataAt(address_value, size);
                 }
                 return error.AddressOutsideExecutableSegment;

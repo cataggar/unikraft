@@ -260,7 +260,7 @@ pub const Executor = struct {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("support/build/linker-script.zig"),
                 .target = b.graph.host,
-                .optimize = .ReleaseSafe,
+                .optimize = .safe,
             }),
         });
         return .{

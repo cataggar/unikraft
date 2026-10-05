@@ -4,12 +4,12 @@ const std = @import("std");
 pub const Setup = struct {
     tool: *std.Build.Step.Compile,
     process: *std.Build.Module,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     nm: []const u8,
     readelf: []const u8,
     objcopy: []const u8,
 
-    pub fn create(b: *std.Build, optimize: std.builtin.OptimizeMode) Setup {
+    pub fn create(b: *std.Build, optimize: std.lang.Optimize) Setup {
         const process = b.createModule(.{
             .root_source_file = b.path("support/tools/hyperv/process.zig"),
             .target = b.graph.host,
@@ -47,7 +47,7 @@ pub const Setup = struct {
         };
         const unit = b.addTest(.{ .root_module = b.createModule(module_options) });
         const run_unit = b.addRunArtifact(unit);
-        run_unit.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+        run_unit.setCwd(.cache_root);
         step.dependOn(&run_unit.step);
         const fixture = b.addExecutable(.{
             .name = "hyperv-object-fixtures",
@@ -65,7 +65,7 @@ pub const Setup = struct {
             .name = "hyperv-object-undefined",
             .root_module = b.createModule(.{
                 .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .freestanding, .abi = .none }),
-                .optimize = .ReleaseFast,
+                .optimize = .fast,
                 .link_libc = false,
                 .stack_protector = false,
             }),
@@ -78,11 +78,11 @@ pub const Setup = struct {
         run.addArtifactArg(self.tool);
         run.addArtifactArg(fake);
         run.addArgs(&.{ self.nm, self.readelf, self.objcopy, b.graph.zig_exe });
-        _ = run.addOutputDirectoryArg("hyperv-object-fixtures");
+        _ = run.addOutputDirectoryArg2("hyperv-object-fixtures", .{ .make_absolute = true });
         for (objects) |object| run.addFileArg(object);
         for (mappings) |mapping| run.addFileArg(mapping);
         run.addFileArg(undefined_object.getEmittedBin());
-        run.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+        run.setCwd(.cache_root);
         step.dependOn(&run.step);
     }
 };

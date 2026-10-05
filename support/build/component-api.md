@@ -1,6 +1,6 @@
 # Typed component metadata API
 
-`component-api.zig` is the internal, experimental Zig 0.16 metadata API for
+`component-api.zig` is the internal, experimental Zig 0.17 metadata API for
 describing Unikraft components and platform image pipelines. It models the
 current `Makefile.uk` contract without compiling or linking anything. The API
 may change until the external component contract is defined.
@@ -17,10 +17,21 @@ ordered partial-link command, provenance of local versus `EACHOLIB` inputs,
 the relocatable intermediate, symbol-localizing objcopy transformation, and
 the final typed library object. `TargetZigObject` separately models Zig source
 compiled for the target, including its logical object output, optimization
-mode, C include roots/macros, generated-file dependencies, PIC setting, and
+mode (`debug`, `safe`, `fast`, or `small`), C include roots/macros,
+generated-file dependencies, PIC setting, and
 frame-pointer policy. `native-target-object.zig` materializes those entries as
 `LazyPath` objects with libc disabled, no red zone, no stack checks or
 unwinding, single-threaded runtime assumptions, and trap-on-panic behavior.
+An optional `c_translation` declares C header names and the Zig import name
+(default `config`). The pinned `translate-c` build dependency translates a
+generated C wrapper before compilation; the same global/object include roots,
+macros, target and generated-file bindings apply to translation. Generated
+headers are tracked inputs of the translator, not configure-time files or
+hand-copied Zig declarations. The target-object fixture checks translated
+macro values and a real C/Zig struct-by-value ABI, including a stripped object.
+Run it with `zig build test-native-target-object`. The focused
+`zig build test-target-config-cache` selector checks same-path configuration
+updates and live executable/application replacements on warm caches.
 `LinkStage.sequence` interleaves artifacts,
 literal or driver/raw-translated flags, archive-group markers, and system
 library arguments without regrouping them. Ordered post-processing

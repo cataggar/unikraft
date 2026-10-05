@@ -19,7 +19,7 @@ pub const PathBinding = struct {
 pub const ObjectPlan = struct {
     component_name: []const u8,
     object: component.TargetZigObject,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 };
 
 pub const Plan = struct {
@@ -34,7 +34,7 @@ pub const Plan = struct {
 pub fn plan(
     allocator: std.mem.Allocator,
     graph: component.FinalizedGraph,
-    default_optimize: std.builtin.OptimizeMode,
+    default_optimize: std.lang.Optimize,
 ) Error!Plan {
     var objects = std.array_list.Managed(ObjectPlan).init(allocator);
     errdefer objects.deinit();
@@ -61,7 +61,7 @@ pub fn plan(
 }
 
 pub const Options = struct {
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     path_bindings: []const PathBinding = &.{},
     strip: bool = false,
 };
@@ -107,9 +107,9 @@ pub fn targetQuery(isr: bool) std.Target.Query {
 
 test "ISR Zig target excludes unsaved x86 registers" {
     const target = try std.zig.system.resolveTargetQuery(std.testing.io, targetQuery(true));
-    try std.testing.expect(target.cpu.features.isEnabled(@intFromEnum(std.Target.x86.Feature.soft_float)));
+    try std.testing.expect(target.cpu.features.isEnabled(@backingInt(std.Target.x86.Feature.soft_float)));
     inline for (.{ .x87, .mmx, .sse, .sse2, .avx, .avx2 }) |feature| {
-        try std.testing.expect(!target.cpu.features.isEnabled(@intFromEnum(@field(std.Target.x86.Feature, @tagName(feature)))));
+        try std.testing.expect(!target.cpu.features.isEnabled(@backingInt(@field(std.Target.x86.Feature, @tagName(feature)))));
     }
 }
 
@@ -126,7 +126,7 @@ pub fn execute(
     for (object_plan.objects, outputs) |planned, *output| {
         const target = b.resolveTargetQuery(targetQuery(planned.object.isr));
         const target_module = b.createModule(.{
-            .root_source_file = .{ .cwd_relative = planned.object.root_source_file },
+            .root_source_file = b.graph.cwdRelativePath(planned.object.root_source_file),
             .target = target,
             .optimize = planned.optimize,
             .link_libc = false,
@@ -144,6 +144,49 @@ pub fn execute(
         try addIncludes(target_module, planned.object.includes, options.path_bindings);
         for (planned.object.c_macros) |macro| {
             target_module.addCMacro(macro.name, macro.value);
+        }
+        if (planned.object.c_translation) |translation| {
+            const translate_c = @import("translate-c");
+            const dependency = b.dependency("translate-c", .{
+                .target = b.graph.host,
+                .optimize = .safe,
+            });
+            var source: std.Io.Writer.Allocating = .init(b.allocator);
+            for (translation.headers) |header| {
+                source.writer.print("#include <{s}>\n", .{header}) catch
+                    return error.OutOfMemory;
+            }
+            const header = b.addWriteFiles().add(
+                b.fmt("{s}-{s}-translate.h", .{ planned.component_name, planned.object.name }),
+                source.written(),
+            );
+            const translated = translate_c.Translator.init(dependency, .{
+                .name = b.fmt("{s}-{s}-config", .{ planned.component_name, planned.object.name }),
+                .c_source_file = header,
+                .target = target,
+                .optimize = planned.optimize,
+                .link_libc = false,
+            });
+            translated.mod.single_threaded = true;
+            translated.mod.unwind_tables = .none;
+            translated.mod.stack_protector = false;
+            translated.mod.stack_check = false;
+            translated.mod.red_zone = false;
+            translated.mod.pic = planned.object.pic;
+            translated.mod.omit_frame_pointer = planned.object.omit_frame_pointer;
+            translated.mod.error_tracing = false;
+            translated.mod.strip = if (options.strip) true else null;
+            addTranslationIncludes(&translated, graph.global_includes, options.path_bindings);
+            addTranslationIncludes(&translated, planned.object.includes, options.path_bindings);
+            for (planned.object.c_macros) |macro| {
+                translated.defineCMacro(macro.name, macro.value);
+            }
+            for (planned.object.dependencies) |dependency_path| {
+                const binding = findBinding(options.path_bindings, dependency_path) orelse
+                    return error.MissingDependencyBinding;
+                translated.run.addFileInput(binding);
+            }
+            target_module.addImport(translation.import_name, translated.mod);
         }
 
         const wrapper_source = b.addWriteFiles().add(b.fmt("{s}-{s}.zig", .{ planned.component_name, planned.object.name }),
@@ -193,17 +236,19 @@ pub fn addFixtureValidation(b: *std.Build) Error!*std.Build.Step {
     const generated = b.addWriteFiles();
     const config_header = generated.add(
         "include/uk/bits/config.h",
-        "#define CONFIG_ISSUE34_VALUE 34\n",
+        "#define CONFIG_ISSUE34_VALUE 34\n#define CONFIG_OPTIMIZE_PIE 1\n",
     );
-    const fixture_source = b.pathFromRoot(
+    const fixture_source = b.root.joinString(
+        b.allocator,
         "support/build/tests/target-zig-object/fixture.zig",
-    );
-    const fixture_include = b.pathFromRoot(
+    ) catch @panic("OOM");
+    const fixture_include = b.root.joinString(
+        b.allocator,
         "support/build/tests/target-zig-object/include",
-    );
+    ) catch @panic("OOM");
     const logical_header = "/fixture/generated/include/uk/bits/config.h";
     const logical_include = "/fixture/generated/include";
-    const fixture_objects = [_]component.TargetZigObject{.{
+    const fixture_objects = [_]component.TargetZigObject{ .{
         .name = "fixture",
         .root_source_file = fixture_source,
         .output = "/fixture/fixture.o",
@@ -212,17 +257,29 @@ pub fn addFixtureValidation(b: *std.Build) Error!*std.Build.Step {
             .{ .path = fixture_include, .languages = &.{.zig} },
         },
         .dependencies = &.{logical_header},
-    }};
-    const graph = testGraph(&fixture_objects);
+        .c_translation = .{
+            .headers = &.{ "uk/bits/config.h", "issue34-fixture.h" },
+        },
+        .c_macros = &.{.{ .name = "ISSUE34_OBJECT_VALUE", .value = "5" }},
+    }, .{
+        .name = "native-profile",
+        .root_source_file = b.root.joinString(b.allocator, "support/build/target/native-profile.zig") catch @panic("OOM"),
+        .output = "/fixture/native-profile.o",
+        .includes = &.{.{ .path = logical_include, .languages = &.{.zig} }},
+        .dependencies = &.{logical_header},
+        .c_translation = .{ .headers = &.{"uk/bits/config.h"} },
+    } };
+    const library = b.allocator.create([1]component.Library) catch return error.OutOfMemory;
+    const graph = testGraph(&fixture_objects, library);
     const compiled = try execute(b, graph, .{
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .path_bindings = &.{.{
             .logical_path = logical_header,
             .lazy_path = config_header,
         }},
     });
-    const stripped = try execute(b, testGraph(&fixture_objects), .{
-        .optimize = .ReleaseSafe,
+    const stripped = try execute(b, graph, .{
+        .optimize = .safe,
         .path_bindings = &.{.{
             .logical_path = logical_header,
             .lazy_path = config_header,
@@ -261,7 +318,43 @@ pub fn addFixtureValidation(b: *std.Build) Error!*std.Build.Step {
     });
     verify_stripped.addFileArg(stripped.outputs[0].lazy_path);
     verify.step.dependOn(&verify_stripped.step);
+    if (b.graph.host.result.cpu.arch == .x86_64 and b.graph.host.result.os.tag == .linux) {
+        const abi = b.addExecutable(.{
+            .name = "issue34-target-zig-abi",
+            .root_module = b.createModule(.{
+                .target = b.graph.host,
+                .optimize = .safe,
+                .link_libc = true,
+            }),
+        });
+        abi.root_module.addCSourceFile(.{
+            .file = b.path("support/build/tests/target-zig-object/abi.c"),
+            .flags = &.{"-std=c11"},
+        });
+        abi.root_module.addIncludePath(config_header.dirname().dirname().dirname());
+        abi.root_module.addIncludePath(b.path("support/build/tests/target-zig-object/include"));
+        abi.root_module.addCMacro("ISSUE34_OBJECT_VALUE", "5");
+        abi.root_module.addObject(compiled.outputs[0].object);
+        abi.root_module.addObject(compiled.outputs[1].object);
+        verify.step.dependOn(&b.addRunArtifact(abi).step);
+    }
     return &verify.step;
+}
+
+fn addTranslationIncludes(
+    translated: anytype,
+    includes: []const component.Include,
+    bindings: []const PathBinding,
+) void {
+    for (includes) |include| {
+        if (!includeApplies(include)) continue;
+        const path = boundDirectory(include.path, bindings) orelse
+            translated.mod.owner.graph.cwdRelativePath(include.path);
+        switch (include.kind) {
+            .normal => translated.addIncludePath(path),
+            .system, .quote => translated.addSystemIncludePath(path),
+        }
+    }
 }
 
 fn addIncludes(
@@ -272,7 +365,7 @@ fn addIncludes(
     for (includes) |include| {
         if (!includeApplies(include)) continue;
         const path = boundDirectory(include.path, bindings) orelse
-            std.Build.LazyPath{ .cwd_relative = include.path };
+            module.owner.graph.cwdRelativePath(include.path);
         switch (include.kind) {
             .normal => module.addIncludePath(path),
             .system => module.addSystemIncludePath(path),
@@ -325,7 +418,16 @@ fn noValue(_: ?*const anyopaque, _: []const u8) ?[]const u8 {
     return null;
 }
 
-fn testGraph(objects: []const component.TargetZigObject) component.FinalizedGraph {
+fn testGraph(
+    objects: []const component.TargetZigObject,
+    libraries: *[1]component.Library,
+) component.FinalizedGraph {
+    libraries.* = .{.{
+        .name = "libfixture",
+        .origin = .{ .internal = .library },
+        .layout = .{ .ordinary = .{ .build_subdir = "libfixture" } },
+        .target_zig_objects = objects,
+    }};
     return .{
         .roots = .{
             .base = "/src/unikraft",
@@ -346,12 +448,7 @@ fn testGraph(objects: []const component.TargetZigObject) component.FinalizedGrap
             .is_enabled_fn = alwaysDisabled,
             .value_fn = noValue,
         },
-        .libraries = &.{.{
-            .name = "libfixture",
-            .origin = .{ .internal = .library },
-            .layout = .{ .ordinary = .{ .build_subdir = "libfixture" } },
-            .target_zig_objects = objects,
-        }},
+        .libraries = libraries,
         .active_libraries = &.{true},
         .platforms = &.{.{
             .name = "fixture",
@@ -364,37 +461,44 @@ fn testGraph(objects: []const component.TargetZigObject) component.FinalizedGrap
 }
 
 test "planner retains target object optimization and generated dependencies" {
+    var libraries: [1]component.Library = undefined;
     const graph = testGraph(&.{.{
         .name = "probe",
         .root_source_file = "/src/probe.zig",
         .output = "/build/probe.o",
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .includes = &.{.{
             .path = "/build/include",
             .languages = &.{.zig},
         }},
         .dependencies = &.{"/build/include/uk/bits/config.h"},
-    }});
-    const object_plan = try plan(std.testing.allocator, graph, .Debug);
+        .c_translation = .{ .headers = &.{"uk/bits/config.h"} },
+    }}, &libraries);
+    const object_plan = try plan(std.testing.allocator, graph, .debug);
     defer object_plan.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), object_plan.objects.len);
-    try std.testing.expectEqual(std.builtin.OptimizeMode.ReleaseSafe, object_plan.objects[0].optimize);
+    try std.testing.expectEqual(std.lang.Optimize.safe, object_plan.objects[0].optimize);
     try std.testing.expectEqualStrings(
         "/build/include/uk/bits/config.h",
         object_plan.objects[0].object.dependencies[0],
     );
+    try std.testing.expectEqualStrings(
+        "uk/bits/config.h",
+        object_plan.objects[0].object.c_translation.?.headers[0],
+    );
 }
 
 test "planner rejects non-x86_64 freestanding target" {
+    var libraries: [1]component.Library = undefined;
     var graph = testGraph(&.{.{
         .name = "probe",
         .root_source_file = "/src/probe.zig",
         .output = "/build/probe.o",
-    }});
+    }}, &libraries);
     graph.target.triple = "aarch64-freestanding-none";
     try std.testing.expectError(
         error.UnsupportedTarget,
-        plan(std.testing.allocator, graph, .Debug),
+        plan(std.testing.allocator, graph, .debug),
     );
 }

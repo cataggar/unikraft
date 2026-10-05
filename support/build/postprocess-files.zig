@@ -60,7 +60,7 @@ const Output = struct {
         while (true) {
             var random: [16]u8 = undefined;
             try io.randomSecure(&random);
-            const name = try std.fmt.allocPrint(allocator, ".native-postprocess-{x}", .{random});
+            const name = try allocator.print(".native-postprocess-{x}", .{random});
             self.parent.createDir(io, name, .fromMode(0o700)) catch |err| {
                 allocator.free(name);
                 if (err == error.PathAlreadyExists) continue;

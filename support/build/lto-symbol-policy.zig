@@ -179,20 +179,20 @@ pub fn validate(a: std.mem.Allocator, libraries: []const LibrarySymbols) !Policy
             const private = library.isPrivate(symbol);
             has_private = has_private or private;
             if (private_owner == null) private_owner = library.name;
-            try providers.append(a, try std.fmt.allocPrint(a, "{s}({s})", .{
+            try providers.append(a, try a.print("{s}({s})", .{
                 library.name, if (private) "private" else "global",
             }));
         }
         if (providers.items.len > 1 and has_private) {
             std.mem.sort([]const u8, providers.items, {}, lessString);
-            try errors.append(a, try std.fmt.allocPrint(a, "symbol '{s}' has conflicting definitions that flat linking cannot represent: {s}", .{ symbol, try std.mem.join(a, ", ", providers.items) }));
+            try errors.append(a, try a.print("symbol '{s}' has conflicting definitions that flat linking cannot represent: {s}", .{ symbol, try std.mem.join(a, ", ", providers.items) }));
         }
         if (!globals.contains(symbol)) {
             for (libraries) |library| {
                 if (library.undefined.contains(symbol) and !library.defined.contains(symbol) and
                     !std.mem.eql(u8, library.name, private_owner.?))
                 {
-                    try errors.append(a, try std.fmt.allocPrint(a, "library '{s}' references private symbol '{s}' defined only in '{s}'", .{ library.name, symbol, private_owner.? }));
+                    try errors.append(a, try a.print("library '{s}' references private symbol '{s}' defined only in '{s}'", .{ library.name, symbol, private_owner.? }));
                 }
             }
         }
@@ -238,7 +238,7 @@ pub fn forceKeep(a: std.mem.Allocator, exports: Set) ![]const u8 {
     const symbols = try sortedKeys(a, exports);
     defer a.free(symbols);
     for (symbols) |symbol| {
-        const argument = try std.fmt.allocPrint(a, "-Wl,-u,{s}", .{symbol});
+        const argument = try a.print("-Wl,-u,{s}", .{symbol});
         defer a.free(argument);
         try quote(&out.writer, argument);
         try out.writer.writeByte('\n');

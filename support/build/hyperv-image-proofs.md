@@ -1,6 +1,6 @@
 # Native Hyper-V linked-image proofs
 
-The Zig 0.16 `hyperv-image-proof` executable replaces the three Python proof
+The Zig 0.17 `hyperv-image-proof` executable replaces the three Python proof
 subprocesses in `finishNativeImages`. It checks the **final unstripped ELF**,
 before relocations, stripping, bootinfo, and EFI wrapping. It never runs the
 image, contacts a host/cloud endpoint, or treats link evidence as boot, live
@@ -44,7 +44,7 @@ bytes are inspected; relocatable objects are refused as final-image proofs.
 The allocator fixture also includes the actual `uk/alloc.h` and native ECTX
 header, checks their pointer offsets/size/alignment, and uses a real bounded
 bump allocator. Native unit tests and the complete linked-fixture matrix run
-against both Debug and ReleaseSafe proof executables. No Python generator,
+against both debug and safe proof executables. No Python generator,
 oracle, proof executor, or install hook is involved.
 
 | Legacy assertion / added byte evidence | Native coverage |

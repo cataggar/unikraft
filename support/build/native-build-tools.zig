@@ -13,7 +13,7 @@ pub fn metadataTool(
         .root_module = b.createModule(.{
             .root_source_file = root.path(b, "support/build/native-config-metadata.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .link_libc = true,
         }),
     });
@@ -36,7 +36,7 @@ pub fn legacyConfigFixture(
         .name = "unikraft-legacy-kconfig-fixture",
         .root_module = b.createModule(.{
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .link_libc = true,
         }),
     });

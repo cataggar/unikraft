@@ -131,7 +131,7 @@ There are two ways to get started with Unikraft:
 
 ### Zig build facade and experimental Zig C compiler support
 
-Zig 0.16.0 provides a compatibility facade for the existing GNU Make build.
+Exactly Zig 0.17.0 provides a compatibility facade for the existing GNU Make build.
 GNU Make remains the backend; this facade only maps Zig build steps and options
 to Make targets and assignments. It does not yet model Unikraft's components
 as a native Zig build graph.
@@ -176,6 +176,13 @@ immediately before execution. The facade rejects repository/application
 ancestors, existing source directories, filesystem roots, and unmarked existing
 directories. New output directories receive a small marker so subsequent
 builds can distinguish them from source trees.
+
+Zig 0.17 separates configuration from build execution. Configuration-time
+`.config` reads declare content dependencies, while canonical-path, file-kind,
+permission and marker trust checks deliberately poison the configuration cache:
+these checks must run on every invocation, including warm caches. Individual
+compilation and generated-header steps remain content-cached. Do not override
+configuration cache poisoning for trusted build execution.
 
 The default step delegates to Make's `all` target. Named steps include
 `images`, `libs`, `objs`, `preprocess`, `prepare`, `fetch`, configuration
@@ -245,7 +252,7 @@ ancestors must be root- or current-user-owned and not group/other-writable. A
 root-owned `01777` sticky boundary is accepted only when its protected child
 entry is trusted and not group/other-writable. Linux retains the opened
 executable descriptor and uses `fexecve`, so replacing the final directory
-entry cannot change the executed backend. Zig 0.16's macOS and OpenBSD libc
+entry cannot change the executed backend. Zig 0.17's macOS and OpenBSD libc
 targets do not export `fexecve`, so descriptor execution is conservatively
 gated to Linux. Other supported hosts retain the original descriptor, re-open
 the fully trusted chain at the last possible point, require matching
@@ -526,7 +533,7 @@ addresses rather than consulting a GOT that has not yet been relocated.
 
 #### Experimental LTO (QEMU/x86_64 native pipeline only)
 
-The Zig 0.16 `native-images` pipeline supports a whole-program flat LTO path
+The Zig 0.17 `native-images` pipeline supports a whole-program flat LTO path
 for the `qemu-x86_64` profile. Selecting `CONFIG_OPTIMIZE_LTO=y` with the
 `qemu-arm64`, `hyperv-x86_64-efi`, or `hyperv-x86_64-efi-netvsc` native
 profiles is detected at build time and rejected with an explicit error.

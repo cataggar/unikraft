@@ -227,7 +227,7 @@ test "own stack slice tests cannot prune branches or conditionally manufacture a
     for ([_][]const u8{ "%eax", "%ax", "%al", "%ah" }, [_][]const u8{ "testl", "testw", "testb", "testb" }) |reg, op| {
         var initial = flow.State.entry(1);
         initial.regs[0] = initial.regs[4].plus(16);
-        const operands = try std.fmt.allocPrint(std.testing.allocator, "{s}, {s}", .{ reg, reg });
+        const operands = try std.testing.allocator.print("{s}, {s}", .{ reg, reg });
         defer std.testing.allocator.free(operands);
         var result = try trace(&.{
             instruction(op, operands), instruction("je", "4 <zero>"),
@@ -373,7 +373,7 @@ test "high byte aliases read their own slice without inventing unknown bits" {
 
 test "high byte writes preserve low and upper slices without claiming full knowledge" {
     for ([_][]const u8{ "%ah", "%ch", "%dh", "%bh" }, 0..) |high, reg| {
-        const move = try std.fmt.allocPrint(std.testing.allocator, "$0xaa, {s}", .{high});
+        const move = try std.testing.allocator.print("$0xaa, {s}", .{high});
         defer std.testing.allocator.free(move);
         var state = flow.State.entry(1);
         state.regs[reg] = .{ .kind = .integer, .id = 0x1122334455667788 };
@@ -394,7 +394,7 @@ test "high byte TEST CMP MOVZX and conditional writes use the correct flags and 
     for ([_][]const u8{ "%ah", "%ch", "%dh", "%bh" }, 0..) |high, reg| {
         for ([_]u64{ 0x100, 1 }) |value| {
             for ([_][]const u8{ "testb", "cmpb" }) |op| {
-                const operands = try std.fmt.allocPrint(std.testing.allocator, "{s}, {s}", .{ if (std.mem.eql(u8, op, "testb")) high else "$0", high });
+                const operands = try std.testing.allocator.print("{s}, {s}", .{ if (std.mem.eql(u8, op, "testb")) high else "$0", high });
                 defer std.testing.allocator.free(operands);
                 var initial = flow.State.entry(1);
                 initial.regs[reg] = .{ .kind = .integer, .id = value };
@@ -406,7 +406,7 @@ test "high byte TEST CMP MOVZX and conditional writes use the correct flags and 
                 try std.testing.expectEqual(value == 1, result.analysis.seen[3]);
                 try std.testing.expectEqual(value == 0x100, result.analysis.seen[2]);
             }
-            const operands = try std.fmt.allocPrint(std.testing.allocator, "{s}, %esi", .{high});
+            const operands = try std.testing.allocator.print("{s}, %esi", .{high});
             defer std.testing.allocator.free(operands);
             var initial = flow.State.entry(1);
             initial.regs[reg] = .{ .kind = .integer, .id = value };
@@ -415,7 +415,7 @@ test "high byte TEST CMP MOVZX and conditional writes use the correct flags and 
             try std.testing.expectEqual(value >> 8, result.analysis.after[0].regs[6].id);
             try std.testing.expectEqual(64, result.analysis.after[0].regs[6].bits);
         }
-        const sign_operands = try std.fmt.allocPrint(std.testing.allocator, "{s}, {s}", .{ high, high });
+        const sign_operands = try std.testing.allocator.print("{s}, {s}", .{ high, high });
         defer std.testing.allocator.free(sign_operands);
         var initial = flow.State.entry(1);
         initial.regs[reg] = .{ .kind = .integer, .id = 0x8000 };
@@ -446,7 +446,7 @@ test "high byte TEST CMP MOVZX and conditional writes use the correct flags and 
     try std.testing.expectEqual(0x112, results[0].regs[0].id);
     for ([_][]const u8{ "%ah", "%ch", "%dh", "%bh" }) |high| {
         var ap = controls();
-        const operands = try std.fmt.allocPrint(std.testing.allocator, "$0x20, {s}", .{high});
+        const operands = try std.testing.allocator.print("$0x20, {s}", .{high});
         defer std.testing.allocator.free(operands);
         ap[0] = instruction("movb", operands);
         try std.testing.expectError(error.MissingCr4Pae, proofs.pagingControls(&ap));
@@ -462,7 +462,7 @@ test "masked stores invalidate every possible written byte without manufacturing
             try state.store(slot, .{ .kind = .address, .id = 0x1234 }, 8, .none);
             try state.store(other, .{ .kind = .integer, .id = 91 }, 8, .none);
             state.vector_zero[0] = 64;
-            const operands = try std.fmt.allocPrint(std.testing.allocator, "{s}, {d}(%rsp) {{%k1}}", .{ reg, offset });
+            const operands = try std.testing.allocator.print("{s}, {d}(%rsp) {{%k1}}", .{ reg, offset });
             defer std.testing.allocator.free(operands);
             try flow.step(&state, instruction("vmovdqu64", operands), .{});
             const overlaps = offset < 24 and offset + width > 16;
@@ -488,7 +488,7 @@ test "unsupported memory syntax and implicit footprints refuse instead of preser
     }) |destination| {
         var state = flow.State.entry(1);
         try state.store(state.regs[4].plus(16), .{ .kind = .address, .id = 0x1234 }, 8, .none);
-        const operands = try std.fmt.allocPrint(std.testing.allocator, "%zmm0, {s}", .{destination});
+        const operands = try std.testing.allocator.print("%zmm0, {s}", .{destination});
         defer std.testing.allocator.free(operands);
         try std.testing.expectError(error.UnsupportedProvenanceInstruction, flow.step(&state, instruction("vmovdqu64", operands), .{}));
     }
@@ -619,7 +619,7 @@ test "memory TEST masks use width limited bitwise zero and sign flags" {
             for ([_]u64{ 0, 1, 2, sign, mask, ~mask }) |right| {
                 var state = flow.State.entry(1);
                 try state.store(state.regs[4].plus(16), .{ .kind = .integer, .id = left }, 8, .none);
-                const operands = try std.fmt.allocPrint(std.testing.allocator, "${d}, 16(%rsp)", .{right});
+                const operands = try std.testing.allocator.print("${d}, 16(%rsp)", .{right});
                 defer std.testing.allocator.free(operands);
                 try flow.step(&state, instruction(op, operands), .{});
                 const result = left & right & mask;
@@ -682,7 +682,7 @@ test "memory CMP zero keeps comparison semantics distinct from TEST and register
         var state = flow.State.entry(1);
         state.regs[reg] = .{ .kind = .integer, .id = 0x100 };
         try state.store(state.regs[4].plus(16), .{ .kind = .integer, .id = 1 }, 8, .none);
-        const operands = try std.fmt.allocPrint(std.testing.allocator, "{s}, 16(%rsp)", .{high});
+        const operands = try std.testing.allocator.print("{s}, 16(%rsp)", .{high});
         defer std.testing.allocator.free(operands);
         try flow.step(&state, instruction("testb", operands), .{});
         try std.testing.expectEqual(1, (state.zero_test orelse return error.MissingTestFlags).id);
@@ -702,7 +702,7 @@ test "memory TEST unspecified widths and unknown register masks remain conservat
     state.regs[0] = .{ .kind = .integer, .id = 0x101 };
     try state.store(slot, .{ .kind = .integer, .id = 0x100 }, 8, .none);
     for ([_][]const u8{ "%al", "%ax", "%eax", "%rax" }, [_]u64{ 0, 0x100, 0x100, 0x100 }) |reg, expected| {
-        const operands = try std.fmt.allocPrint(std.testing.allocator, "{s}, 16(%rsp)", .{reg});
+        const operands = try std.testing.allocator.print("{s}, 16(%rsp)", .{reg});
         defer std.testing.allocator.free(operands);
         try flow.step(&state, instruction("test", operands), .{});
         try std.testing.expectEqual(expected, (state.zero_test orelse return error.MissingTestFlags).id);
@@ -908,7 +908,7 @@ test "vector memory writes use full XMM YMM ZMM and scalar widths" {
     const store = instruction("movq", "%rdi, 0x10(%rbx)");
     for ([_][]const u8{ "%xmm0", "%ymm0", "%zmm0" }, [_]i64{ 16, 32, 64 }) |reg, width| {
         for ([_]i64{ 16 - width, 17 - width, 16, 23, 24 }) |offset| {
-            const operand = try std.fmt.allocPrint(std.testing.allocator, "{s}, {d}(%rbx)", .{ reg, offset });
+            const operand = try std.testing.allocator.print("{s}, {d}(%rbx)", .{ reg, offset });
             defer std.testing.allocator.free(operand);
             const op = if (width == 64) "vmovdqu64" else "vmovdqu";
             const overlap = offset < 24 and offset + width > 16;

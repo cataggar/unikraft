@@ -38,11 +38,11 @@ fn readLinux(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !std.js
     defer contents.deinit();
     var parsed = try parse(allocator, contents.bytes());
     errdefer parsed.deinit();
-    inline for (std.meta.fields(Contract)) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "schema")) {
-            const value = @field(parsed.value, field.name);
-            const tool_field = comptime std.mem.eql(u8, field.name, "shell") or
-                std.mem.eql(u8, field.name, "m4");
+    inline for (@typeInfo(Contract).@"struct".field_names) |name| {
+        if (comptime !std.mem.eql(u8, name, "schema")) {
+            const value = @field(parsed.value, name);
+            const tool_field = comptime std.mem.eql(u8, name, "shell") or
+                std.mem.eql(u8, name, "m4");
             const retained = tool_field and retainedDescriptorPath(value);
             if (!retained) {
                 const canonical = try paths.canonicalizeNearestExisting(allocator, io, value);
@@ -60,7 +60,7 @@ fn readLinux(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !std.js
                 if (metadata.mode & 0o7022 != 0 or metadata.mode & 0o111 == 0 or
                     (metadata.uid != 0 and metadata.uid != std.os.linux.geteuid()))
                     return error.UnsafeNativeMakeTool;
-            } else if (comptime std.mem.eql(u8, field.name, "bison_data")) {
+            } else if (comptime std.mem.eql(u8, name, "bison_data")) {
                 const directory = try private.openDirectory(io, value, .artifact);
                 defer directory.close(io);
             } else {
@@ -121,7 +121,7 @@ test "native Make environment requires strict canonical complete versioned JSON"
     const allocator = std.testing.allocator;
     const json = try std.json.Stringify.valueAlloc(allocator, fixture, .{});
     defer allocator.free(json);
-    const canonical = try std.fmt.allocPrint(allocator, "{s}\n", .{json});
+    const canonical = try allocator.print("{s}\n", .{json});
     defer allocator.free(canonical);
     var parsed = try parse(allocator, canonical);
     defer parsed.deinit();
@@ -134,7 +134,7 @@ test "native Make environment requires strict canonical complete versioned JSON"
         "\"umask\":\"0022\",",
         "\"shell\":\"/duplicate\",",
     }) |extra| {
-        const invalid = try std.fmt.allocPrint(allocator, "{{{s}{s}\n", .{ extra, json[1..] });
+        const invalid = try allocator.print("{{{s}{s}\n", .{ extra, json[1..] });
         defer allocator.free(invalid);
         if (std.mem.startsWith(u8, extra, "\"shell\""))
             try std.testing.expectError(error.DuplicateField, parse(allocator, invalid))
@@ -166,18 +166,18 @@ test "native Make environment reads only private state and validated explicit pa
     try temporary.dir.setPermissions(io, .fromMode(0o700));
     const base = try temporary.dir.realPathFileAlloc(io, ".", allocator);
     var contract = fixture;
-    inline for (std.meta.fields(Contract)) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "schema")) {
-            @field(contract, field.name) = try std.fs.path.join(allocator, &.{ base, field.name });
-            if (comptime std.mem.eql(u8, field.name, "shell") or std.mem.eql(u8, field.name, "m4")) {
-                const file = try temporary.dir.createFile(io, field.name, .{ .permissions = .fromMode(0o700), .exclusive = true });
+    inline for (@typeInfo(Contract).@"struct".field_names) |name| {
+        if (comptime !std.mem.eql(u8, name, "schema")) {
+            @field(contract, name) = try std.fs.path.join(allocator, &.{ base, name });
+            if (comptime std.mem.eql(u8, name, "shell") or std.mem.eql(u8, name, "m4")) {
+                const file = try temporary.dir.createFile(io, name, .{ .permissions = .fromMode(0o700), .exclusive = true });
                 defer file.close(io);
                 try file.writePositionalAll(io, "metadata-only fixture, never executed\n", 0);
-            } else try temporary.dir.createDir(io, field.name, .fromMode(0o700));
+            } else try temporary.dir.createDir(io, name, .fromMode(0o700));
         }
     }
     const json = try std.json.Stringify.valueAlloc(allocator, contract, .{});
-    const bytes = try std.fmt.allocPrint(allocator, "{s}\n", .{json});
+    const bytes = try allocator.print("{s}\n", .{json});
     const path = try std.fs.path.join(allocator, &.{ base, "environment.json" });
     const file = try temporary.dir.createFile(io, "environment.json", .{ .permissions = .fromMode(0o600), .exclusive = true });
     defer file.close(io);
@@ -188,13 +188,12 @@ test "native Make environment reads only private state and validated explicit pa
     const retained_shell = try temporary.dir.openFile(io, "shell", .{ .mode = .read_only });
     defer retained_shell.close(io);
     var retained_contract = contract;
-    retained_contract.shell = try std.fmt.allocPrint(
-        allocator,
+    retained_contract.shell = try allocator.print(
         "/proc/{d}/fd/{d}",
         .{ std.os.linux.getpid(), retained_shell.handle },
     );
     const retained_json = try std.json.Stringify.valueAlloc(allocator, retained_contract, .{});
-    const retained_bytes = try std.fmt.allocPrint(allocator, "{s}\n", .{retained_json});
+    const retained_bytes = try allocator.print("{s}\n", .{retained_json});
     const retained_environment = try temporary.dir.createFile(io, "retained-environment.json", .{
         .permissions = .fromMode(0o600),
         .exclusive = true,

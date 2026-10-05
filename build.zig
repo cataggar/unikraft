@@ -11,18 +11,20 @@ const native_image_graph = @import("support/build/native-image-graph.zig");
 const native_target_object = @import("support/build/native-target-object.zig");
 const native_build_tools = @import("support/build/native-build-tools.zig");
 const native_make_environment = @import("support/build/native-make-environment.zig");
+const native_config_input = @import("support/build/native-config-input.zig");
 const object_proofs = @import("support/build/hyperv-object-proofs.build.zig");
 const hyperv_proof_build = @import("support/build/hyperv-proof-build.zig");
 
-const supported_zig = std.SemanticVersion{ .major = 0, .minor = 16, .patch = 0 };
+const supported_zig = std.SemanticVersion{ .major = 0, .minor = 17, .patch = 0 };
 
 comptime {
     if (builtin.zig_version.order(supported_zig) != .eq) {
-        @compileError("the Unikraft build facade requires Zig 0.16.0");
+        @compileError("the Unikraft build facade requires Zig 0.17.0");
     }
 }
 
 fn validateWamrAotTool(b: *std.Build, value: []const u8) ?[]const u8 {
+    b.graph.poisonCache();
     if (!std.fs.path.isAbsolute(value)) {
         return "-Dwamr-aot-tool must be an absolute canonical executable path";
     }
@@ -59,6 +61,7 @@ fn validateWamrAotTool(b: *std.Build, value: []const u8) ?[]const u8 {
             .{value},
         );
     }
+    b.dependOnFileMetadata(b.graph.cwdRelativePath(value));
     return null;
 }
 
@@ -125,8 +128,18 @@ const targets = [_]Target{
 };
 
 pub fn build(b: *std.Build) void {
+    // realpath, file kind, executable permissions, and marker trust must be
+    // checked live: configuration dependencies do not track all of these.
+    b.graph.poisonCache();
     const optimize = b.standardOptimizeOption(.{});
-    const root_lexical = b.pathFromRoot(".");
+    const cwd = std.Io.Dir.cwd().realPathFileAlloc(b.graph.io, ".", b.allocator) catch |err| {
+        addFailedTargets(b, b.fmt("unable to canonicalize the build working directory: {s}", .{@errorName(err)}));
+        return;
+    };
+    const root_lexical = std.fs.path.resolve(b.allocator, &.{
+        cwd,
+        b.root.toString(b.allocator) catch @panic("OOM"),
+    }) catch @panic("OOM");
     const root_result = facade_paths.canonicalizeNearestExisting(
         b.allocator,
         b.graph.io,
@@ -205,13 +218,17 @@ pub fn build(b: *std.Build) void {
         .exclusions = exclusion_options,
         .image_name = image_name_option,
     }, null) catch |err| {
-        addFailedTargets(b, b.fmt("unable to create canonical Unikraft build context: {s}", .{
+        const message = b.fmt("unable to create canonical Unikraft build context: {s}", .{
             @errorName(err),
-        }));
+        });
+        std.debug.print("error: {s}\n", .{message});
+        addFailedTargets(b, message);
         return;
     };
     const app = context.application;
     const output = context.output;
+    b.dependOnDirectoryMetadata(b.graph.cwdRelativePath(root));
+    b.dependOnDirectoryMetadata(b.graph.cwdRelativePath(app));
     const output_result = facade_paths.CanonicalPath{
         .path = context.output,
         .exists = context.output_exists,
@@ -227,6 +244,7 @@ pub fn build(b: *std.Build) void {
             addFailedTargets(b, message);
             return;
         };
+        b.dependOnFileContents(b.graph.cwdRelativePath(path));
     }
     const options = MakeOptions{
         .command = b.option([]const u8, "make-command", "GNU Make executable (default: make)") orelse "make",
@@ -291,7 +309,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("support/build/zig-facade-runner.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .link_libc = true,
         }),
     });
@@ -300,7 +318,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("support/build/native-config-tool.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
         }),
     });
     const config_input = std.Build.LazyPath{ .cwd_relative = context.config };
@@ -441,11 +459,11 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("build.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     const run_facade_tests = b.addRunArtifact(facade_tests);
-    run_facade_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    run_facade_tests.setCwd(.cache_root);
     const native_environment_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("build.zig"),
@@ -455,108 +473,108 @@ pub fn build(b: *std.Build) void {
         .filters = &.{ "native Make environment", "Make assignments remain single arguments" },
     });
     const run_native_environment_tests = b.addRunArtifact(native_environment_tests);
-    run_native_environment_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    run_native_environment_tests.setCwd(.cache_root);
     b.step("test-native-make-environment", "Test explicit private Make environment and unchanged default forwarding").dependOn(&run_native_environment_tests.step);
     const runner_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("support/build/zig-facade-runner.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .link_libc = true,
         }),
     });
     const run_runner_tests = b.addRunArtifact(runner_tests);
-    run_runner_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    run_runner_tests.setCwd(.cache_root);
     const native_config_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("support/build/native-config-tests.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     const run_native_config_tests = b.addRunArtifact(native_config_tests);
-    run_native_config_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    run_native_config_tests.setCwd(.cache_root);
     const context_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("support/build/build-context.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     const run_context_tests = b.addRunArtifact(context_tests);
-    run_context_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    run_context_tests.setCwd(.cache_root);
     const native_library_link_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("support/build/native-library-link.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     const run_native_library_link_tests = b.addRunArtifact(native_library_link_tests);
-    run_native_library_link_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    run_native_library_link_tests.setCwd(.cache_root);
     const elf_common_validator_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("support/build/elf-common-validator.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     const run_elf_common_validator_tests = b.addRunArtifact(elf_common_validator_tests);
-    run_elf_common_validator_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    run_elf_common_validator_tests.setCwd(.cache_root);
     const linker_script_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("support/build/linker-script.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     const run_linker_script_tests = b.addRunArtifact(linker_script_tests);
-    run_linker_script_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    run_linker_script_tests.setCwd(.cache_root);
     const final_link_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("support/build/final-link.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     const run_final_link_tests = b.addRunArtifact(final_link_tests);
-    run_final_link_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    run_final_link_tests.setCwd(.cache_root);
     const native_image_graph_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("support/build/native-image-graph.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     const run_native_image_graph_tests = b.addRunArtifact(native_image_graph_tests);
-    run_native_image_graph_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    run_native_image_graph_tests.setCwd(.cache_root);
     const native_postprocess_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("support/build/native-postprocess.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     const run_native_postprocess_tests = b.addRunArtifact(native_postprocess_tests);
-    run_native_postprocess_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    run_native_postprocess_tests.setCwd(.cache_root);
     const native_target_object_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("support/build/native-target-object.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     const run_native_target_object_tests = b.addRunArtifact(native_target_object_tests);
-    run_native_target_object_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    run_native_target_object_tests.setCwd(.cache_root);
     const native_lto_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("support/build/native-lto.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     const run_native_lto_tests = b.addRunArtifact(native_lto_tests);
-    run_native_lto_tests.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    run_native_lto_tests.setCwd(.cache_root);
     const test_step = b.step(
         "test",
         "Test facade, native configuration, native linking, QEMU graphs, and post-processing",
@@ -573,7 +591,7 @@ pub fn build(b: *std.Build) void {
         "test",
     });
     compiler_option_run.addFileInput(b.path("support/build/Makefile.rules"));
-    compiler_option_run.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+    compiler_option_run.setCwd(.cache_root);
     compiler_option_run.has_side_effects = true;
     compiler_option_tests.dependOn(&compiler_option_run.step);
     test_step.dependOn(compiler_option_tests);
@@ -588,15 +606,22 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_final_link_tests.step);
     test_step.dependOn(&run_native_postprocess_tests.step);
     test_step.dependOn(&run_native_target_object_tests.step);
-    test_step.dependOn(native_target_object.addFixtureValidation(b) catch |err| {
+    const target_object_validation = native_target_object.addFixtureValidation(b) catch |err| {
         @panic(@errorName(err));
-    });
+    };
+    test_step.dependOn(target_object_validation);
+    const target_object_tests = b.step(
+        "test-native-target-object",
+        "Test ordered C translation, target Zig objects, stripped output and the C/Zig ABI",
+    );
+    target_object_tests.dependOn(&run_native_target_object_tests.step);
+    target_object_tests.dependOn(target_object_validation);
     test_step.dependOn(&run_native_lto_tests.step);
     const hyperv_runtime_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("plat/hyperv/hyperv_runtime.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
         // Match the production backend for the Microsoft-ABI hypercall thunk.
         .use_llvm = true,
@@ -608,7 +633,7 @@ pub fn build(b: *std.Build) void {
                 "drivers/hyperv/vmbus/vmbus_protocol.zig",
             ),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     test_step.dependOn(&b.addRunArtifact(vmbus_protocol_tests).step);
@@ -618,7 +643,7 @@ pub fn build(b: *std.Build) void {
                 "drivers/hyperv/vmbus/vmbus_channel.zig",
             ),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     test_step.dependOn(&b.addRunArtifact(vmbus_channel_tests).step);
@@ -628,7 +653,7 @@ pub fn build(b: *std.Build) void {
                 "drivers/hyperv/storvsc/storvsc_core.zig",
             ),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     const run_storvsc_core_tests = b.addRunArtifact(storvsc_core_tests);
@@ -639,7 +664,7 @@ pub fn build(b: *std.Build) void {
                 "drivers/hyperv/netvsc/netvsc_protocol.zig",
             ),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     const run_netvsc_protocol_tests = b.addRunArtifact(netvsc_protocol_tests);
@@ -656,7 +681,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("plat/hyperv/hyperv_runtime.zig"),
             .target = hyperv_isr_target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .link_libc = false,
             .single_threaded = true,
             .unwind_tables = .none,
@@ -698,7 +723,7 @@ pub fn build(b: *std.Build) void {
                 "drivers/hyperv/vmbus/vmbus_protocol.zig",
             ),
             .target = hyperv_isr_target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .link_libc = false,
             .single_threaded = true,
             .unwind_tables = .none,
@@ -735,7 +760,7 @@ pub fn build(b: *std.Build) void {
                 "drivers/hyperv/vmbus/vmbus_channel.zig",
             ),
             .target = hyperv_target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .link_libc = false,
             .single_threaded = true,
             .unwind_tables = .none,
@@ -772,7 +797,7 @@ pub fn build(b: *std.Build) void {
                 "drivers/hyperv/storvsc/storvsc_core.zig",
             ),
             .target = hyperv_target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .link_libc = false,
             .single_threaded = true,
             .unwind_tables = .none,
@@ -806,7 +831,7 @@ pub fn build(b: *std.Build) void {
             .name = if (cxx) "storvsc-mapping-cxx-abi" else "storvsc-mapping-c-abi",
             .root_module = b.createModule(.{
                 .target = hyperv_target,
-                .optimize = .ReleaseFast,
+                .optimize = .fast,
                 .link_libc = false,
                 .stack_protector = false,
                 .stack_check = false,
@@ -844,7 +869,7 @@ pub fn build(b: *std.Build) void {
                 "drivers/hyperv/netvsc/netvsc_protocol.zig",
             ),
             .target = hyperv_target,
-            .optimize = .ReleaseFast,
+            .optimize = .fast,
             .link_libc = false,
             .single_threaded = true,
             .unwind_tables = .none,
@@ -878,7 +903,7 @@ pub fn build(b: *std.Build) void {
         .name = "netvsc-protocol-abi-test",
         .root_module = b.createModule(.{
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .link_libc = true,
         }),
     });
@@ -900,7 +925,7 @@ pub fn build(b: *std.Build) void {
         .name = "vmbus-abi-test",
         .root_module = b.createModule(.{
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .link_libc = true,
         }),
     });
@@ -940,7 +965,7 @@ pub fn build(b: *std.Build) void {
         .name = "vmbus-control-test",
         .root_module = b.createModule(.{
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .link_libc = true,
         }),
     });
@@ -967,14 +992,14 @@ pub fn build(b: *std.Build) void {
                 "drivers/hyperv/vmbus/vmbus_protocol.zig",
             ),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
         }),
     });
     const vmbus_production_tests = b.addExecutable(.{
         .name = "vmbus-channel-production-test",
         .root_module = b.createModule(.{
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .link_libc = true,
         }),
     });
@@ -1011,7 +1036,7 @@ pub fn build(b: *std.Build) void {
         .name = "vmbus-disconnect-production-test",
         .root_module = b.createModule(.{
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .link_libc = true,
         }),
     });
@@ -1059,14 +1084,14 @@ pub fn build(b: *std.Build) void {
                 "drivers/hyperv/storvsc/storvsc_core.zig",
             ),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
         }),
     });
     const storvsc_vmbus_epoch_object = b.addObject(.{
         .name = "storvsc-vmbus-epoch-host",
         .root_module = b.createModule(.{
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .link_libc = true,
         }),
     });
@@ -1134,7 +1159,7 @@ pub fn build(b: *std.Build) void {
         .name = "storvsc-production-test",
         .root_module = b.createModule(.{
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .link_libc = true,
         }),
     });
@@ -1168,7 +1193,7 @@ pub fn build(b: *std.Build) void {
         .name = "hyperv-persistence-workload-test",
         .root_module = b.createModule(.{
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .link_libc = true,
         }),
     });
@@ -1202,21 +1227,21 @@ pub fn build(b: *std.Build) void {
     const persistence_evidence_core = b.createModule(.{
         .root_source_file = b.path("support/tools/hyperv/core.zig"),
         .target = b.graph.host,
-        .optimize = .Debug,
+        .optimize = .debug,
     });
     if (b.graph.host.result.cpu.arch == .x86_64)
         persistence_evidence_core.addAssemblyFile(b.path("support/tools/hyperv/sha256_clear_upper.S"));
     const persistence_evidence = b.createModule(.{
         .root_source_file = b.path("support/tools/hyperv/persistence/evidence.zig"),
         .target = b.graph.host,
-        .optimize = .Debug,
+        .optimize = .debug,
         .imports = &.{.{ .name = "hyperv_core", .module = persistence_evidence_core }},
     });
     const persistence_evidence_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("support/apps/hyperv-acceptance/tests/persistence-evidence-test.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .imports = &.{.{ .name = "evidence", .module = persistence_evidence }},
         }),
     });
@@ -1233,7 +1258,7 @@ pub fn build(b: *std.Build) void {
             .name = b.fmt("storvsc-storage-binding-{d}-test", .{controllers}),
             .root_module = b.createModule(.{
                 .target = b.graph.host,
-                .optimize = .Debug,
+                .optimize = .debug,
                 .link_libc = true,
             }),
         });
@@ -1245,7 +1270,7 @@ pub fn build(b: *std.Build) void {
             }),
             .flags = &(storvsc_host_flags ++ [_][]const u8{
                 "-include",
-                b.path("drivers/hyperv/storvsc/tests/storage-binding-config.h").getPath(b),
+                b.root.joinString(b.allocator, "drivers/hyperv/storvsc/tests/storage-binding-config.h") catch @panic("OOM"),
                 b.fmt("-DSTORAGE_BINDING_CONTROLLERS={d}", .{controllers}),
                 "-ffunction-sections",
                 "-fdata-sections",
@@ -1269,7 +1294,7 @@ pub fn build(b: *std.Build) void {
         .name = "hyperv-storage-binding-main-test",
         .root_module = b.createModule(.{
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .link_libc = true,
         }),
     });
@@ -1301,14 +1326,14 @@ pub fn build(b: *std.Build) void {
                 "drivers/hyperv/netvsc/netvsc_protocol.zig",
             ),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     const netvsc_production_tests = b.addExecutable(.{
         .name = "netvsc-driver-production-test",
         .root_module = b.createModule(.{
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .link_libc = true,
         }),
     });
@@ -1342,7 +1367,7 @@ pub fn build(b: *std.Build) void {
         .name = "hyperv-acceptance-protocol-test",
         .root_module = b.createModule(.{
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .link_libc = true,
         }),
     });
@@ -1367,7 +1392,7 @@ pub fn build(b: *std.Build) void {
         .use_llvm = true,
         .root_module = b.createModule(.{
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .link_libc = true,
         }),
     });
@@ -1399,7 +1424,7 @@ pub fn build(b: *std.Build) void {
         .name = "platform-runtime-correctness-test",
         .root_module = b.createModule(.{
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .link_libc = true,
         }),
     });
@@ -1429,7 +1454,7 @@ pub fn build(b: *std.Build) void {
         .name = "hyperv-smp-production-test",
         .root_module = b.createModule(.{
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .link_libc = true,
         }),
     });
@@ -1461,7 +1486,7 @@ pub fn build(b: *std.Build) void {
         .name = "hyperv-fixed-smp-production-test",
         .root_module = b.createModule(.{
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .link_libc = true,
         }),
     });
@@ -1495,7 +1520,7 @@ pub fn build(b: *std.Build) void {
         .name = "ukschedcoop-smp-production-test",
         .root_module = b.createModule(.{
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .link_libc = true,
         }),
     });
@@ -1526,7 +1551,7 @@ pub fn build(b: *std.Build) void {
         .name = "uksched-wake-production-test",
         .root_module = b.createModule(.{
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .link_libc = true,
         }),
     });
@@ -1551,7 +1576,7 @@ pub fn build(b: *std.Build) void {
         .name = "ukboot-smp-production-test",
         .root_module = b.createModule(.{
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
             .link_libc = true,
         }),
     });
@@ -1612,7 +1637,7 @@ pub fn build(b: *std.Build) void {
             .name = if (legacy_apic) "xpic-runtime-correctness-test" else "xpic-x2apic-only-test",
             .root_module = b.createModule(.{
                 .target = b.graph.host,
-                .optimize = .Debug,
+                .optimize = .debug,
                 .link_libc = true,
             }),
         });
@@ -1725,11 +1750,11 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path(b.fmt("support/build/{s}", .{source})),
                 .target = b.graph.host,
-                .optimize = .Debug,
+                .optimize = .debug,
             }),
         });
         const run = b.addRunArtifact(tests);
-        run.setCwd(.{ .cwd_relative = b.cache_root.path orelse ".zig-cache" });
+        run.setCwd(.cache_root);
         build_tools_tests.dependOn(&run.step);
     }
     build_tools_tests.dependOn(&run_native_config_tests.step);
@@ -1741,7 +1766,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("support/build/lto-symbol-policy.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
         }),
     });
     const build_tools_integration = b.addExecutable(.{
@@ -1749,7 +1774,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("support/build/build-tools-integration.zig"),
             .target = b.graph.host,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     const run_build_tools_integration = b.addRunArtifact(build_tools_integration);
@@ -1766,47 +1791,36 @@ pub fn build(b: *std.Build) void {
     run_build_tools_integration.addArtifactArg(native_build_tools.legacyConfigFixture(b, b.path("."), bison_command, flex_command));
     build_tools_tests.dependOn(&run_build_tools_integration.step);
     test_step.dependOn(build_tools_tests);
-    const integration_output = resolvePath(
-        b.allocator,
-        root,
-        b.cache_root.path orelse ".zig-cache",
-    );
-    const target_config_cache_work = std.fs.path.join(
-        b.allocator,
-        &.{ integration_output, "target-config-cache" },
-    ) catch @panic("out of memory");
     const target_config_cache_test = b.addSystemCommand(&.{
         "python3",
         "support/build/tests/target-config-cache-test.py",
         "--base",
         root,
         "--work-dir",
-        target_config_cache_work,
-        "--zig",
-        b.graph.zig_exe,
     });
+    target_config_cache_test.addDirectoryArg(
+        b.graph.path(.local_cache, "target-config-cache"),
+    );
+    target_config_cache_test.addArgs(&.{ "--zig", b.graph.zig_exe });
     target_config_cache_test.setCwd(.{ .cwd_relative = root });
     target_config_cache_test.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
     test_step.dependOn(&target_config_cache_test.step);
+    b.step(
+        "test-target-config-cache",
+        "Test warm configuration/header caches and live path/executable trust refusals",
+    ).dependOn(&target_config_cache_test.step);
     const native_postprocess_integration = b.addSystemCommand(&.{
         "python3",
         "support/build/tests/native-postprocess-test.py",
         "--work-dir",
-        integration_output,
-        "--base",
-        root,
     });
+    native_postprocess_integration.addDirectoryArg(.cache_root);
+    native_postprocess_integration.addArgs(&.{ "--base", root });
     native_postprocess_integration.setCwd(.{ .cwd_relative = root });
     native_postprocess_integration.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
     test_step.dependOn(&native_postprocess_integration.step);
-    const acme_integration_output = std.fs.path.join(
-        b.allocator,
-        &.{ integration_output, "native-config-acme" },
-    ) catch @panic("out of memory");
-    const integration_metadata = std.fs.path.join(
-        b.allocator,
-        &.{ acme_integration_output, "metadata.tsv" },
-    ) catch @panic("out of memory");
+    const acme_integration_output = b.graph.path(.local_cache, "native-config-acme");
+    const integration_metadata = acme_integration_output.path(b, "metadata.tsv");
     const acme_config = resolvePath(
         b.allocator,
         root,
@@ -1824,22 +1838,21 @@ pub fn build(b: *std.Build) void {
         "--app",
         root,
         "--output",
-        acme_integration_output,
-        "--config",
-        acme_config,
-        "--metadata",
-        integration_metadata,
-        "--external-platform",
-        acme_platform,
     });
+    export_integration_metadata.addDirectoryArg(acme_integration_output);
+    export_integration_metadata.addArgs(&.{ "--config", acme_config, "--metadata" });
+    export_integration_metadata.addDirectoryArg(integration_metadata);
+    export_integration_metadata.addArgs(&.{ "--external-platform", acme_platform });
     export_integration_metadata.setCwd(.{ .cwd_relative = root });
     const inspect_acme_config = b.addRunArtifact(native_config_tool);
-    inspect_acme_config.addArgs(&.{ "inspect", acme_config, integration_metadata });
+    inspect_acme_config.addArgs(&.{ "inspect", acme_config });
+    inspect_acme_config.addFileArg(integration_metadata);
     inspect_acme_config.setCwd(.{ .cwd_relative = root });
     inspect_acme_config.step.dependOn(&export_integration_metadata.step);
     test_step.dependOn(&inspect_acme_config.step);
     const validate_acme_config = b.addRunArtifact(native_config_tool);
-    validate_acme_config.addArgs(&.{ "validate", acme_config, integration_metadata });
+    validate_acme_config.addArgs(&.{ "validate", acme_config });
+    validate_acme_config.addFileArg(integration_metadata);
     validate_acme_config.setCwd(.{ .cwd_relative = root });
     validate_acme_config.step.dependOn(&export_integration_metadata.step);
     test_step.dependOn(&validate_acme_config.step);
@@ -1863,18 +1876,9 @@ pub fn build(b: *std.Build) void {
         root,
         "support/build/tests/native-config/x86_64-kvm.h",
     );
-    const x86_integration_output = std.fs.path.join(
-        b.allocator,
-        &.{ integration_output, "native-config-x86" },
-    ) catch @panic("out of memory");
-    const x86_metadata = std.fs.path.join(
-        b.allocator,
-        &.{ x86_integration_output, "metadata.tsv" },
-    ) catch @panic("out of memory");
-    const x86_generated_header = std.fs.path.join(
-        b.allocator,
-        &.{ x86_integration_output, "config.h" },
-    ) catch @panic("out of memory");
+    const x86_integration_output = b.graph.path(.local_cache, "native-config-x86");
+    const x86_metadata = x86_integration_output.path(b, "metadata.tsv");
+    const x86_generated_header = x86_integration_output.path(b, "config.h");
     const export_x86_metadata = b.addRunArtifact(metadata_tool);
     export_x86_metadata.addArgs(&.{
         "--base",
@@ -1882,44 +1886,34 @@ pub fn build(b: *std.Build) void {
         "--app",
         fixture_app,
         "--output",
-        x86_integration_output,
-        "--config",
-        x86_config,
-        "--metadata",
-        x86_metadata,
-        "--external-library",
-        fixture_library,
     });
+    export_x86_metadata.addDirectoryArg(x86_integration_output);
+    export_x86_metadata.addArgs(&.{ "--config", x86_config, "--metadata" });
+    export_x86_metadata.addDirectoryArg(x86_metadata);
+    export_x86_metadata.addArgs(&.{ "--external-library", fixture_library });
     export_x86_metadata.setCwd(.{ .cwd_relative = root });
     const generate_x86_header = b.addRunArtifact(native_config_tool);
-    generate_x86_header.addArgs(&.{ "header", x86_config, x86_metadata, x86_generated_header });
+    generate_x86_header.addArgs(&.{ "header", x86_config });
+    generate_x86_header.addFileArg(x86_metadata);
+    generate_x86_header.addDirectoryArg(x86_generated_header);
     generate_x86_header.setCwd(.{ .cwd_relative = root });
     generate_x86_header.step.dependOn(&export_x86_metadata.step);
-    const compare_x86_header = b.addSystemCommand(&.{
-        "cmp",
-        x86_expected_header,
-        x86_generated_header,
-    });
+    const compare_x86_header = b.addSystemCommand(&.{ "cmp", x86_expected_header });
+    compare_x86_header.addFileArg(x86_generated_header);
     compare_x86_header.step.dependOn(&generate_x86_header.step);
     test_step.dependOn(&compare_x86_header.step);
-    const version_integration_output = std.fs.path.join(
-        b.allocator,
-        &.{ integration_output, "native-config-version-test" },
-    ) catch @panic("out of memory");
-    const version_work_dir = std.fs.path.join(
-        b.allocator,
-        &.{ version_integration_output, "cases" },
-    ) catch @panic("out of memory");
+    const version_integration_output = b.graph.path(.local_cache, "native-config-version-test");
+    const version_work_dir = version_integration_output.path(b, "cases");
     const prepare_version_fragment = b.addSystemCommand(&.{
         "python3",
         "support/build/tests/native-config/version-metadata-test.py",
         "--base",
         root,
         "--work-dir",
-        version_work_dir,
-        "--prepare-output",
-        version_integration_output,
     });
+    prepare_version_fragment.addDirectoryArg(version_work_dir);
+    prepare_version_fragment.addArg("--prepare-output");
+    prepare_version_fragment.addDirectoryArg(version_integration_output);
     prepare_version_fragment.setCwd(.{ .cwd_relative = root });
     prepare_version_fragment.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
     const version_config = resolvePath(
@@ -1937,14 +1931,8 @@ pub fn build(b: *std.Build) void {
         root,
         "support/build/tests/native-config/version-metadata.h",
     );
-    const version_metadata = std.fs.path.join(
-        b.allocator,
-        &.{ version_integration_output, "metadata.tsv" },
-    ) catch @panic("out of memory");
-    const version_generated_header = std.fs.path.join(
-        b.allocator,
-        &.{ version_integration_output, "config.h" },
-    ) catch @panic("out of memory");
+    const version_metadata = version_integration_output.path(b, "metadata.tsv");
+    const version_generated_header = version_integration_output.path(b, "config.h");
     const export_version_metadata = b.addRunArtifact(metadata_tool);
     export_version_metadata.addArgs(&.{
         "--base",
@@ -1952,30 +1940,21 @@ pub fn build(b: *std.Build) void {
         "--app",
         root,
         "--output",
-        version_integration_output,
-        "--config",
-        version_config,
-        "--metadata",
-        version_metadata,
-        "--external-library",
-        version_library,
     });
+    export_version_metadata.addDirectoryArg(version_integration_output);
+    export_version_metadata.addArgs(&.{ "--config", version_config, "--metadata" });
+    export_version_metadata.addDirectoryArg(version_metadata);
+    export_version_metadata.addArgs(&.{ "--external-library", version_library });
     export_version_metadata.setCwd(.{ .cwd_relative = root });
     export_version_metadata.step.dependOn(&prepare_version_fragment.step);
     const generate_version_header = b.addRunArtifact(native_config_tool);
-    generate_version_header.addArgs(&.{
-        "header",
-        version_config,
-        version_metadata,
-        version_generated_header,
-    });
+    generate_version_header.addArgs(&.{ "header", version_config });
+    generate_version_header.addFileArg(version_metadata);
+    generate_version_header.addDirectoryArg(version_generated_header);
     generate_version_header.setCwd(.{ .cwd_relative = root });
     generate_version_header.step.dependOn(&export_version_metadata.step);
-    const compare_version_header = b.addSystemCommand(&.{
-        "cmp",
-        version_expected_header,
-        version_generated_header,
-    });
+    const compare_version_header = b.addSystemCommand(&.{ "cmp", version_expected_header });
+    compare_version_header.addFileArg(version_generated_header);
     compare_version_header.step.dependOn(&generate_version_header.step);
     test_step.dependOn(&compare_version_header.step);
     const runner_link_targets = [_]struct {
@@ -2001,7 +1980,7 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("support/build/zig-facade-runner.zig"),
                 .target = b.resolveTargetQuery(link_target.query),
-                .optimize = .ReleaseSafe,
+                .optimize = .safe,
                 .link_libc = true,
             }),
         });
@@ -2041,7 +2020,16 @@ fn registerNativeGraph(
         return null;
     };
 
-    const config = loadNativeConfig(b, context.config) catch null;
+    const config = loadNativeConfig(b, context.config) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => {
+            step.dependOn(&b.addFail(b.fmt(
+                "unable to load native graph configuration '{s}': {s}",
+                .{ context.config, @errorName(err) },
+            )).step);
+            return null;
+        },
+    };
     const enable_storvsc = if (config) |loaded|
         nativeConfigEnabled(loaded, "CONFIG_LIBSTORVSC")
     else
@@ -2146,7 +2134,7 @@ fn registerNativePipeline(
     root: []const u8,
     context: build_context.Context,
     options: MakeOptions,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     make_runner: *std.Build.Step.Compile,
     validate_config: *std.Build.Step.Run,
     target_config_header: std.Build.LazyPath,
@@ -2339,7 +2327,7 @@ fn finishNativeImages(
             else
                 "llvm-objdump",
         });
-        check.setCwd(.{ .cwd_relative = b.build_root.path.? });
+        check.setCwd(.{ .cwd_relative = (b.root.toString(b.allocator) catch @panic("OOM")) });
         const irq_check = b.addRunArtifact(proof_tool);
         irq_check.addArgs(&.{ "irq", "--image" });
         irq_check.addFileArg(link_output);
@@ -2352,7 +2340,7 @@ fn finishNativeImages(
             else
                 "llvm-objdump",
         });
-        irq_check.setCwd(.{ .cwd_relative = b.build_root.path.? });
+        irq_check.setCwd(.{ .cwd_relative = (b.root.toString(b.allocator) catch @panic("OOM")) });
         const gate = b.addSystemCommand(&.{copy_command});
         gate.step.dependOn(&check.step);
         gate.step.dependOn(&irq_check.step);
@@ -2375,7 +2363,7 @@ fn finishNativeImages(
                 driver_check.addArgs(&.{ "--require-driver", "storvsc" });
             if (nativeConfigEnabled(config, "CONFIG_LIBNETVSC"))
                 driver_check.addArgs(&.{ "--require-driver", "netvsc" });
-            driver_check.setCwd(.{ .cwd_relative = b.build_root.path.? });
+            driver_check.setCwd(.{ .cwd_relative = (b.root.toString(b.allocator) catch @panic("OOM")) });
             gate.step.dependOn(&driver_check.step);
         }
         gate.addFileArg(link_output);
@@ -2429,7 +2417,7 @@ fn finishNativeImages(
                     .root_module = b.createModule(.{
                         .root_source_file = b.path("support/build/native-postprocess-runner.zig"),
                         .target = b.graph.host,
-                        .optimize = .ReleaseSafe,
+                        .optimize = .safe,
                     }),
                 })
             else
@@ -2483,12 +2471,7 @@ const NativeConfig = struct {
 };
 
 fn loadNativeConfig(b: *std.Build, path: []const u8) !*NativeConfig {
-    const source = try std.Io.Dir.cwd().readFileAlloc(
-        b.graph.io,
-        path,
-        b.allocator,
-        .limited(64 * 1024 * 1024),
-    );
+    const source = try native_config_input.read(b, path);
     const config = try b.allocator.create(NativeConfig);
     config.* = .{ .source = source };
     return config;
@@ -3078,9 +3061,9 @@ fn distcleanConfigIsSafe(
     const config_basename = std.fs.path.basename(config);
     const deletion_targets = [_][]const u8{
         config,
-        try std.fmt.allocPrint(allocator, "{s}.old", .{config}),
-        try std.fmt.allocPrint(allocator, "{s}{s}.{s}.tmp", .{ config_dir, std.fs.path.sep_str, config_basename }),
-        try std.fmt.allocPrint(allocator, "{s}{s}.auto.deps", .{ config_dir, std.fs.path.sep_str }),
+        try allocator.print("{s}.old", .{config}),
+        try allocator.print("{s}{s}.{s}.tmp", .{ config_dir, std.fs.path.sep_str, config_basename }),
+        try allocator.print("{s}{s}.auto.deps", .{ config_dir, std.fs.path.sep_str }),
     };
     defer {
         for (deletion_targets[1..]) |target| allocator.free(target);
@@ -3183,7 +3166,7 @@ fn appendAssignment(
     name: []const u8,
     value: []const u8,
 ) void {
-    argv.append(std.fmt.allocPrint(allocator, "{s}={s}", .{ name, value }) catch @panic("out of memory")) catch
+    argv.append(allocator.print("{s}={s}", .{ name, value }) catch @panic("out of memory")) catch
         @panic("out of memory");
 }
 

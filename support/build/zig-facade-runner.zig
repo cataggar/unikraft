@@ -526,7 +526,7 @@ fn replaceBackend(
             null,
         );
         for (argv, 0..) |argument, index| {
-            argv_buffer[index] = (try allocator.dupeZ(u8, argument)).ptr;
+            argv_buffer[index] = (try allocator.dupeSentinel(u8, argument, 0)).ptr;
         }
         const environment_block = try environment.createPosixBlock(
             allocator,
@@ -695,7 +695,7 @@ fn runtimeDirectoryName(
     allocator: std.mem.Allocator,
     uid: std.posix.uid_t,
 ) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "{s}{d}", .{ runtime_prefix, uid });
+    return allocator.print("{s}{d}", .{ runtime_prefix, uid });
 }
 
 fn canonicalPasswdHome(
@@ -747,7 +747,7 @@ fn prepareSelectedRuntimeDirectory(
     }
 
     if (comptime builtin.os.tag == .linux) {
-        const run_user = try std.fmt.allocPrint(allocator, "/run/user/{d}", .{uid});
+        const run_user = try allocator.print("/run/user/{d}", .{uid});
         validateTrustedDirectoryChain(io, run_user, uid, true) catch |err| switch (err) {
             error.FileNotFound => return prepareRuntimeDirectory(
                 allocator,
@@ -1426,8 +1426,7 @@ test "runner output argument and Make O assignment have one identity" {
         &.{ root_buffer[0..root_length], "output" },
     );
     defer std.testing.allocator.free(output);
-    const assignment = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const assignment = try std.testing.allocator.print(
         "O={s}",
         .{output},
     );
@@ -1472,8 +1471,7 @@ test "canonical Make path validation detects intermediate replacement" {
         &.{ root_buffer[0..root_length], "base/app" },
     );
     defer std.testing.allocator.free(app);
-    const assignment = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const assignment = try std.testing.allocator.print(
         "A={s}",
         .{app},
     );

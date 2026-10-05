@@ -259,9 +259,9 @@ export fn netvsc_nvs_build_init(
     version: u32,
 ) callconv(.c) c_int {
     if (netvsc_nvs_ndis_version(version) == 0)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     const out = buildNvsBase(output, capacity, nvs_type_init) orelse
-        return @intFromEnum(Result.output_small);
+        return @backingInt(Result.output_small);
     put32(out, 4, version);
     put32(out, 8, version);
     return nvs_request_size;
@@ -273,9 +273,9 @@ export fn netvsc_nvs_build_ndis_config(
     frame_size: u32,
 ) callconv(.c) c_int {
     if (frame_size < 14)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     const out = buildNvsBase(output, capacity, nvs_type_ndis_config) orelse
-        return @intFromEnum(Result.output_small);
+        return @backingInt(Result.output_small);
     put32(out, 4, frame_size);
     put64(out, 12, 0);
     return nvs_request_size;
@@ -287,9 +287,9 @@ export fn netvsc_nvs_build_ndis_version(
     ndis_version: u32,
 ) callconv(.c) c_int {
     if (ndis_version != ndis_version_61 and ndis_version != ndis_version_630)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     const out = buildNvsBase(output, capacity, nvs_type_ndis_version) orelse
-        return @intFromEnum(Result.output_small);
+        return @backingInt(Result.output_small);
     put32(out, 4, ndis_version >> 16);
     put32(out, 8, ndis_version & 0xffff);
     return nvs_request_size;
@@ -303,9 +303,9 @@ fn buildBufferMessage(
     buffer_id: u16,
 ) c_int {
     if (gpadl_id == 0)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     const out = buildNvsBase(output, capacity, message_type) orelse
-        return @intFromEnum(Result.output_small);
+        return @backingInt(Result.output_small);
     put32(out, 4, gpadl_id);
     put16(out, 8, buffer_id);
     return nvs_request_size;
@@ -318,7 +318,7 @@ fn buildRevokeMessage(
     buffer_id: u16,
 ) c_int {
     const out = buildNvsBase(output, capacity, message_type) orelse
-        return @intFromEnum(Result.output_small);
+        return @backingInt(Result.output_small);
     put16(out, 4, buffer_id);
     return nvs_request_size;
 }
@@ -363,9 +363,9 @@ export fn netvsc_nvs_build_rndis(
     if ((channel_type != nvs_rndis_data and channel_type != nvs_rndis_control) or
         (section_index == send_section_invalid and section_size != 0) or
         (section_index != send_section_invalid and section_size == 0))
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     const out = buildNvsBase(output, capacity, nvs_type_send_rndis) orelse
-        return @intFromEnum(Result.output_small);
+        return @backingInt(Result.output_small);
     put32(out, 4, channel_type);
     put32(out, 8, section_index);
     put32(out, 12, section_size);
@@ -378,9 +378,9 @@ export fn netvsc_nvs_build_rndis_ack(
     status: u32,
 ) callconv(.c) c_int {
     if (status != nvs_status_ok and status != nvs_status_failed)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     const out = buildNvsBase(output, capacity, nvs_type_send_rndis_complete) orelse
-        return @intFromEnum(Result.output_small);
+        return @backingInt(Result.output_small);
     put32(out, 4, status);
     return nvs_request_size;
 }
@@ -393,20 +393,20 @@ export fn netvsc_nvs_parse_init_complete(
 ) callconv(.c) c_int {
     zeroObject(result);
     if (length < 16 or get32(input[0..length], 0) != nvs_type_init_complete)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     if (netvsc_nvs_ndis_version(requested_version) == 0)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     result.version = requested_version;
     result.max_mdl_chain = get32(input[0..length], 8);
     result.status = get32(input[0..length], 12);
     return switch (result.status) {
-        nvs_status_ok => @intFromEnum(Result.ok),
+        nvs_status_ok => @backingInt(Result.ok),
         nvs_status_failed,
         nvs_status_protocol_too_new,
         nvs_status_protocol_too_old,
         nvs_status_protocol_unsupported,
-        => @intFromEnum(Result.version_unsupported),
-        else => @intFromEnum(Result.remote_failure),
+        => @backingInt(Result.version_unsupported),
+        else => @backingInt(Result.remote_failure),
     };
 }
 
@@ -420,21 +420,21 @@ export fn netvsc_nvs_parse_receive_buffer_complete(
 ) callconv(.c) c_int {
     section_count.* = 0;
     if (length < 12 or buffer_size == 0 or section_capacity == 0)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     const bytes = input[0..length];
     if (get32(bytes, 0) != nvs_type_receive_buffer_complete)
-        return @intFromEnum(Result.unexpected);
+        return @backingInt(Result.unexpected);
     if (get32(bytes, 4) != nvs_status_ok)
-        return @intFromEnum(Result.remote_failure);
+        return @backingInt(Result.remote_failure);
     const count = get32(bytes, 8);
     if (count == 0 or count > max_sections or count > section_capacity)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     const table_size = mulUsize(@intCast(count), 16) orelse
-        return @intFromEnum(Result.overflow);
+        return @backingInt(Result.overflow);
     const required = addUsize(12, table_size) orelse
-        return @intFromEnum(Result.overflow);
+        return @backingInt(Result.overflow);
     if (required > length)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
 
     var index: usize = 0;
     while (index < count) : (index += 1) {
@@ -445,13 +445,13 @@ export fn netvsc_nvs_parse_receive_buffer_complete(
         // EndOffset is informational; the computed span bounds every access.
         if (slot_size == 0 or (slot_size & 3) != 0 or slot_count == 0 or
             start >= buffer_size or (start & 3) != 0)
-            return @intFromEnum(Result.invalid);
+            return @backingInt(Result.invalid);
         const span = std.math.mul(u32, slot_size, slot_count) catch
-            return @intFromEnum(Result.overflow);
+            return @backingInt(Result.overflow);
         const end = std.math.add(u32, start, span) catch
-            return @intFromEnum(Result.overflow);
+            return @backingInt(Result.overflow);
         if (end > buffer_size)
-            return @intFromEnum(Result.invalid);
+            return @backingInt(Result.invalid);
         sections[index] = .{
             .start = start,
             .slot_size = slot_size,
@@ -470,11 +470,11 @@ export fn netvsc_nvs_parse_receive_buffer_complete(
                 sections[other].start,
                 sections[other].end - sections[other].start,
             ))
-                return @intFromEnum(Result.invalid);
+                return @backingInt(Result.invalid);
         }
     }
     section_count.* = count;
-    return @intFromEnum(Result.ok);
+    return @backingInt(Result.ok);
 }
 
 export fn netvsc_nvs_parse_send_buffer_complete(
@@ -485,20 +485,20 @@ export fn netvsc_nvs_parse_send_buffer_complete(
 ) callconv(.c) c_int {
     zeroObject(result);
     if (length < 12 or buffer_size == 0)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     const bytes = input[0..length];
     if (get32(bytes, 0) != nvs_type_send_buffer_complete)
-        return @intFromEnum(Result.unexpected);
+        return @backingInt(Result.unexpected);
     if (get32(bytes, 4) != nvs_status_ok)
-        return @intFromEnum(Result.remote_failure);
+        return @backingInt(Result.remote_failure);
     const size = get32(bytes, 8);
     if (size == 0 or (size & 3) != 0 or size > buffer_size)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     result.section_size = size;
     result.section_count = buffer_size / size;
     if (result.section_count == 0)
-        return @intFromEnum(Result.invalid);
-    return @intFromEnum(Result.ok);
+        return @backingInt(Result.invalid);
+    return @backingInt(Result.ok);
 }
 
 export fn netvsc_nvs_parse_rndis_completion(
@@ -506,14 +506,14 @@ export fn netvsc_nvs_parse_rndis_completion(
     length: usize,
 ) callconv(.c) c_int {
     if (length < 8)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     const bytes = input[0..length];
     if (get32(bytes, 0) != nvs_type_send_rndis_complete)
-        return @intFromEnum(Result.unexpected);
+        return @backingInt(Result.unexpected);
     return if (get32(bytes, 4) == nvs_status_ok)
-        @intFromEnum(Result.ok)
+        @backingInt(Result.ok)
     else
-        @intFromEnum(Result.remote_failure);
+        @backingInt(Result.remote_failure);
 }
 
 export fn netvsc_nvs_message_type(
@@ -523,9 +523,9 @@ export fn netvsc_nvs_message_type(
 ) callconv(.c) c_int {
     message_type.* = 0;
     if (length < 4)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     message_type.* = get32(input[0..length], 0);
-    return @intFromEnum(Result.ok);
+    return @backingInt(Result.ok);
 }
 
 export fn netvsc_nvs_parse_rndis(
@@ -535,13 +535,13 @@ export fn netvsc_nvs_parse_rndis(
 ) callconv(.c) c_int {
     channel_type.* = 0;
     if (length < 8)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     const bytes = input[0..length];
     if (get32(bytes, 0) != nvs_type_send_rndis)
-        return @intFromEnum(Result.unexpected);
+        return @backingInt(Result.unexpected);
     const kind = get32(bytes, 4);
     channel_type.* = kind;
-    return @intFromEnum(Result.ok);
+    return @backingInt(Result.ok);
 }
 
 export fn netvsc_nvs_transfer_range_count(
@@ -551,22 +551,22 @@ export fn netvsc_nvs_transfer_range_count(
 ) callconv(.c) c_int {
     range_count.* = 0;
     if (descriptor_length < 8)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     const bytes = descriptor[0..descriptor_length];
     if (get16(bytes, 0) != rx_buffer_id or bytes[2] > 1 or bytes[3] != 0)
-        return @intFromEnum(Result.unexpected);
+        return @backingInt(Result.unexpected);
     const count = get32(bytes, 4);
     if (count == 0 or count > max_transfer_ranges)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     const range_bytes = mulUsize(@intCast(count), 8) orelse
-        return @intFromEnum(Result.overflow);
+        return @backingInt(Result.overflow);
     const required = addUsize(8, range_bytes) orelse
-        return @intFromEnum(Result.overflow);
+        return @backingInt(Result.overflow);
     if (required > descriptor_length or
         (descriptor_length - required) % 4 != 0)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     range_count.* = count;
-    return @intFromEnum(Result.ok);
+    return @backingInt(Result.ok);
 }
 
 export fn netvsc_nvs_parse_transfer_range(
@@ -580,40 +580,40 @@ export fn netvsc_nvs_parse_transfer_range(
 ) callconv(.c) c_int {
     zeroObject(result);
     if (section_count == 0 or section_count > max_sections)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     var count: u32 = 0;
     const count_rc = netvsc_nvs_transfer_range_count(
         descriptor,
         descriptor_length,
         &count,
     );
-    if (count_rc != @intFromEnum(Result.ok))
+    if (count_rc != @backingInt(Result.ok))
         return count_rc;
     if (range_index >= count)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     const bytes = descriptor[0..descriptor_length];
     const offset = 8 + @as(usize, range_index) * 8;
     const range_length = get32(bytes, offset);
     const range_offset = get32(bytes, offset + 4);
     const range_end = regionEnd(range_offset, range_length) orelse
-        return @intFromEnum(Result.overflow);
+        return @backingInt(Result.overflow);
     if (range_length == 0 or range_end > buffer_size)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
 
     var index: u32 = 0;
     while (index < section_count) : (index += 1) {
         const section = sections[index];
         if (section.slot_size == 0 or section.slot_count == 0 or
             section.end <= section.start or section.end > buffer_size)
-            return @intFromEnum(Result.invalid);
+            return @backingInt(Result.invalid);
         if (range_offset < section.start or range_end > section.end)
             continue;
         result.offset = range_offset;
         result.length = range_length;
         result.section_index = @intCast(index);
-        return @intFromEnum(Result.ok);
+        return @backingInt(Result.ok);
     }
-    return @intFromEnum(Result.invalid);
+    return @backingInt(Result.invalid);
 }
 
 fn buildRndis(output: [*]u8, capacity: usize, length: usize, message_type: u32, request_id: u32) ?[]u8 {
@@ -634,9 +634,9 @@ export fn netvsc_rndis_build_initialize(
     max_transfer_size: u32,
 ) callconv(.c) c_int {
     if (max_transfer_size < 512)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     const out = buildRndis(output, capacity, 24, rndis_initialize, request_id) orelse
-        return @intFromEnum(Result.output_small);
+        return @backingInt(Result.output_small);
     put32(out, 12, rndis_version_major);
     put32(out, 16, rndis_version_minor);
     put32(out, 20, max_transfer_size);
@@ -652,11 +652,11 @@ export fn netvsc_rndis_build_query(
     info_length: usize,
 ) callconv(.c) c_int {
     const length = addUsize(28, info_length) orelse
-        return @intFromEnum(Result.overflow);
+        return @backingInt(Result.overflow);
     const out = buildRndis(output, capacity, length, rndis_query, request_id) orelse
-        return @intFromEnum(Result.output_small);
+        return @backingInt(Result.output_small);
     if (oid == 0 or info_length > std.math.maxInt(u32))
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     put32(out, 12, oid);
     put32(out, 16, @intCast(info_length));
     // Hyper-V requires the canonical post-RequestId offset even for an empty
@@ -678,11 +678,11 @@ export fn netvsc_rndis_build_set(
     info_length: usize,
 ) callconv(.c) c_int {
     const length = addUsize(28, info_length) orelse
-        return @intFromEnum(Result.overflow);
+        return @backingInt(Result.overflow);
     const out = buildRndis(output, capacity, length, rndis_set, request_id) orelse
-        return @intFromEnum(Result.output_small);
+        return @backingInt(Result.output_small);
     if (oid == 0 or info_length == 0 or info_length > std.math.maxInt(u32))
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     put32(out, 12, oid);
     put32(out, 16, @intCast(info_length));
     put32(out, 20, 20);
@@ -697,7 +697,7 @@ export fn netvsc_rndis_build_keepalive(
     request_id: u32,
 ) callconv(.c) c_int {
     _ = buildRndis(output, capacity, 12, rndis_keepalive, request_id) orelse
-        return @intFromEnum(Result.output_small);
+        return @backingInt(Result.output_small);
     return 12;
 }
 
@@ -707,7 +707,7 @@ export fn netvsc_rndis_build_halt(
     request_id: u32,
 ) callconv(.c) c_int {
     _ = buildRndis(output, capacity, 12, rndis_halt, request_id) orelse
-        return @intFromEnum(Result.output_small);
+        return @backingInt(Result.output_small);
     return 12;
 }
 
@@ -717,11 +717,11 @@ export fn netvsc_rndis_build_packet_header(
     frame_length: u32,
 ) callconv(.c) c_int {
     if (frame_length == 0)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     const message_length = std.math.add(u32, @intCast(rndis_packet_header_size), frame_length) catch
-        return @intFromEnum(Result.overflow);
+        return @backingInt(Result.overflow);
     if (capacity < rndis_packet_header_size)
-        return @intFromEnum(Result.output_small);
+        return @backingInt(Result.output_small);
     const out = output[0..rndis_packet_header_size];
     zeroBytes(out);
     put32(out, 0, rndis_packet);
@@ -740,14 +740,14 @@ export fn netvsc_rndis_message_type(
     message_type.* = 0;
     message_length.* = 0;
     if (length < 8)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     const bytes = input[0..length];
     const declared = get32(bytes, 4);
     if (declared < 8 or declared > length)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     message_type.* = get32(bytes, 0);
     message_length.* = declared;
-    return @intFromEnum(Result.ok);
+    return @backingInt(Result.ok);
 }
 
 export fn netvsc_rndis_parse_completion(
@@ -759,69 +759,69 @@ export fn netvsc_rndis_parse_completion(
 ) callconv(.c) c_int {
     zeroObject(result);
     if (length < 16 or expected_request_id == 0)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     const bytes = input[0..length];
     const message_type = get32(bytes, 0);
     const message_length = get32(bytes, 4);
     const request_id = get32(bytes, 8);
     if (message_length < 16 or message_length > length)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     if (message_type != expected_type or request_id != expected_request_id)
-        return @intFromEnum(Result.unexpected);
+        return @backingInt(Result.unexpected);
     result.message_type = message_type;
     result.message_length = message_length;
     result.request_id = request_id;
     result.status = get32(bytes, 12);
     if (result.status != rndis_status_success)
-        return @intFromEnum(Result.remote_failure);
+        return @backingInt(Result.remote_failure);
 
     switch (expected_type) {
         rndis_initialize_complete => {
             if (message_length < 48)
-                return @intFromEnum(Result.invalid);
+                return @backingInt(Result.invalid);
             if (get32(bytes, 16) != rndis_version_major or
                 get32(bytes, 20) != rndis_version_minor or
                 (get32(bytes, 24) & rndis_device_connectionless) == 0 or
                 get32(bytes, 28) != rndis_medium_802_3)
-                return @intFromEnum(Result.unexpected);
+                return @backingInt(Result.unexpected);
             result.max_packets = get32(bytes, 32);
             result.max_transfer_size = get32(bytes, 36);
             const alignment_exponent = get32(bytes, 40);
             if (result.max_packets == 0 or result.max_transfer_size < rndis_packet_header_size or
                 alignment_exponent > 31)
-                return @intFromEnum(Result.invalid);
+                return @backingInt(Result.invalid);
             result.alignment = @as(u32, 1) << @intCast(alignment_exponent);
             if (result.alignment < 4)
                 result.alignment = 4;
         },
         rndis_query_complete => {
             if (message_length < 24)
-                return @intFromEnum(Result.invalid);
+                return @backingInt(Result.invalid);
             result.info_length = get32(bytes, 16);
             const relative = get32(bytes, 20);
             if (result.info_length == 0) {
                 if (relative != 0)
-                    return @intFromEnum(Result.invalid);
+                    return @backingInt(Result.invalid);
             } else {
                 if (relative == 0)
-                    return @intFromEnum(Result.invalid);
+                    return @backingInt(Result.invalid);
                 result.info_offset = std.math.add(u32, relative, rndis_relative_base) catch
-                    return @intFromEnum(Result.overflow);
+                    return @backingInt(Result.overflow);
                 if (result.info_offset < 24)
-                    return @intFromEnum(Result.invalid);
+                    return @backingInt(Result.invalid);
                 const end = regionEnd(result.info_offset, result.info_length) orelse
-                    return @intFromEnum(Result.overflow);
+                    return @backingInt(Result.overflow);
                 if (end > message_length)
-                    return @intFromEnum(Result.invalid);
+                    return @backingInt(Result.invalid);
             }
         },
         rndis_set_complete, rndis_keepalive_complete => {
             if (message_length < 16)
-                return @intFromEnum(Result.invalid);
+                return @backingInt(Result.invalid);
         },
-        else => return @intFromEnum(Result.invalid),
+        else => return @backingInt(Result.invalid),
     }
-    return @intFromEnum(Result.ok);
+    return @backingInt(Result.ok);
 }
 
 fn validatePacketInfo(bytes: []const u8, offset: u32, length: u32) bool {
@@ -853,13 +853,13 @@ export fn netvsc_rndis_parse_packet(
 ) callconv(.c) c_int {
     zeroObject(result);
     if (length < rndis_packet_header_size)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     const bytes = input[0..length];
     if (get32(bytes, 0) != rndis_packet)
-        return @intFromEnum(Result.unexpected);
+        return @backingInt(Result.unexpected);
     const message_length = get32(bytes, 4);
     if (message_length < rndis_packet_header_size or message_length > length)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     const data_relative = get32(bytes, 8);
     const data_length = get32(bytes, 12);
     const oob_relative = get32(bytes, 16);
@@ -868,44 +868,44 @@ export fn netvsc_rndis_parse_packet(
     const info_relative = get32(bytes, 28);
     const info_length = get32(bytes, 32);
     if (data_length == 0 or data_relative < rndis_packet_offset_min)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     const data_offset = std.math.add(u32, data_relative, rndis_relative_base) catch
-        return @intFromEnum(Result.overflow);
+        return @backingInt(Result.overflow);
     const data_end = regionEnd(data_offset, data_length) orelse
-        return @intFromEnum(Result.overflow);
+        return @backingInt(Result.overflow);
     if (data_offset < rndis_packet_header_size or data_end > message_length)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
 
     var oob_offset: u32 = 0;
     if (oob_length == 0) {
         if (oob_relative != 0 or oob_elements != 0)
-            return @intFromEnum(Result.invalid);
+            return @backingInt(Result.invalid);
     } else {
         if (oob_relative < rndis_packet_offset_min or (oob_relative & 3) != 0 or
             oob_elements == 0)
-            return @intFromEnum(Result.invalid);
+            return @backingInt(Result.invalid);
         oob_offset = std.math.add(u32, oob_relative, rndis_relative_base) catch
-            return @intFromEnum(Result.overflow);
+            return @backingInt(Result.overflow);
         const oob_end = regionEnd(oob_offset, oob_length) orelse
-            return @intFromEnum(Result.overflow);
+            return @backingInt(Result.overflow);
         if (oob_offset < rndis_packet_header_size or oob_end > message_length or
             regionsOverlap(oob_offset, oob_length, data_offset, data_length))
-            return @intFromEnum(Result.invalid);
+            return @backingInt(Result.invalid);
     }
 
     var info_offset: u32 = 0;
     if (info_length == 0) {
         if (info_relative != 0)
-            return @intFromEnum(Result.invalid);
+            return @backingInt(Result.invalid);
     } else {
         if (info_relative < rndis_packet_offset_min or (info_relative & 3) != 0)
-            return @intFromEnum(Result.invalid);
+            return @backingInt(Result.invalid);
         info_offset = std.math.add(u32, info_relative, rndis_relative_base) catch
-            return @intFromEnum(Result.overflow);
+            return @backingInt(Result.overflow);
         if (!validatePacketInfo(bytes[0..message_length], info_offset, info_length) or
             regionsOverlap(info_offset, info_length, data_offset, data_length) or
             regionsOverlap(info_offset, info_length, oob_offset, oob_length))
-            return @intFromEnum(Result.invalid);
+            return @backingInt(Result.invalid);
     }
 
     result.message_length = message_length;
@@ -913,7 +913,7 @@ export fn netvsc_rndis_parse_packet(
     result.data_length = data_length;
     result.packet_info_offset = info_offset;
     result.packet_info_length = info_length;
-    return @intFromEnum(Result.ok);
+    return @backingInt(Result.ok);
 }
 
 export fn netvsc_rndis_parse_status(
@@ -924,35 +924,35 @@ export fn netvsc_rndis_parse_status(
     zeroObject(result);
     result.link_state = -1;
     if (length < 20)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     const bytes = input[0..length];
     if (get32(bytes, 0) != rndis_indicate_status)
-        return @intFromEnum(Result.unexpected);
+        return @backingInt(Result.unexpected);
     const message_length = get32(bytes, 4);
     if (message_length < 20 or message_length > length)
-        return @intFromEnum(Result.invalid);
+        return @backingInt(Result.invalid);
     result.status = get32(bytes, 8);
     result.buffer_length = get32(bytes, 12);
     const relative = get32(bytes, 16);
     if (result.buffer_length == 0) {
         if (relative != 0)
-            return @intFromEnum(Result.invalid);
+            return @backingInt(Result.invalid);
     } else {
         if (relative == 0)
-            return @intFromEnum(Result.invalid);
+            return @backingInt(Result.invalid);
         result.buffer_offset = std.math.add(u32, relative, 8) catch
-            return @intFromEnum(Result.overflow);
+            return @backingInt(Result.overflow);
         const end = regionEnd(result.buffer_offset, result.buffer_length) orelse
-            return @intFromEnum(Result.overflow);
+            return @backingInt(Result.overflow);
         if (result.buffer_offset < 20 or end > message_length)
-            return @intFromEnum(Result.invalid);
+            return @backingInt(Result.invalid);
     }
     result.link_state = switch (result.status) {
         rndis_status_media_connect => 1,
         rndis_status_media_disconnect => 0,
         else => -1,
     };
-    return @intFromEnum(Result.ok);
+    return @backingInt(Result.ok);
 }
 
 test "NVS versions fall back safely and select NDIS" {
@@ -1003,24 +1003,24 @@ test "all fixed NVS requests have exact zeroed layouts" {
 }
 
 test "NVS init completion accepts padding and classifies rejection" {
-    var response = [_]u8{0} ** 40;
+    var response = @as([40]u8, @splat(0));
     put32(&response, 0, nvs_type_init_complete);
     put32(&response, 4, nvs_version_6);
     put32(&response, 8, 4);
     put32(&response, 12, nvs_status_ok);
     var result: NvsInitComplete = undefined;
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_parse_init_complete(&response, 16, nvs_version_61, &result));
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_nvs_parse_init_complete(&response, 16, nvs_version_61, &result));
     try std.testing.expectEqual(nvs_version_61, result.version);
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_parse_init_complete(&response, response.len, nvs_version_6, &result));
-    try std.testing.expectEqual(@intFromEnum(Result.invalid), netvsc_nvs_parse_init_complete(&response, 15, nvs_version_6, &result));
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_nvs_parse_init_complete(&response, response.len, nvs_version_6, &result));
+    try std.testing.expectEqual(@backingInt(Result.invalid), netvsc_nvs_parse_init_complete(&response, 15, nvs_version_6, &result));
     put32(&response, 12, nvs_status_failed);
-    try std.testing.expectEqual(@intFromEnum(Result.version_unsupported), netvsc_nvs_parse_init_complete(&response, response.len, nvs_version_6, &result));
+    try std.testing.expectEqual(@backingInt(Result.version_unsupported), netvsc_nvs_parse_init_complete(&response, response.len, nvs_version_6, &result));
     put32(&response, 12, 6);
-    try std.testing.expectEqual(@intFromEnum(Result.remote_failure), netvsc_nvs_parse_init_complete(&response, response.len, nvs_version_6, &result));
+    try std.testing.expectEqual(@backingInt(Result.remote_failure), netvsc_nvs_parse_init_complete(&response, response.len, nvs_version_6, &result));
 }
 
 test "receive section table and transfer ranges are bounded" {
-    var response = [_]u8{0} ** (12 + 32);
+    var response = @as([(12 + 32)]u8, @splat(0));
     put32(&response, 0, nvs_type_receive_buffer_complete);
     put32(&response, 4, nvs_status_ok);
     put32(&response, 8, 2);
@@ -1034,7 +1034,7 @@ test "receive section table and transfer ranges are bounded" {
     put32(&response, 40, 16384);
     var sections: [max_sections]NvsSection = undefined;
     var count: u32 = 0;
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_parse_receive_buffer_complete(
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_nvs_parse_receive_buffer_complete(
         &response,
         response.len,
         16384,
@@ -1044,7 +1044,7 @@ test "receive section table and transfer ranges are bounded" {
     ));
     try std.testing.expectEqual(@as(u32, 2), count);
     put32(&response, 24, 1);
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_parse_receive_buffer_complete(
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_nvs_parse_receive_buffer_complete(
         &response,
         response.len,
         16384,
@@ -1054,7 +1054,7 @@ test "receive section table and transfer ranges are bounded" {
     ));
     put32(&response, 24, 8191);
 
-    var descriptor = [_]u8{0} ** 24;
+    var descriptor = @as([24]u8, @splat(0));
     put16(&descriptor, 0, rx_buffer_id);
     put32(&descriptor, 4, 2);
     put32(&descriptor, 8, 1600);
@@ -1062,60 +1062,60 @@ test "receive section table and transfer ranges are bounded" {
     put32(&descriptor, 16, 4000);
     put32(&descriptor, 20, 8192);
     var range_count: u32 = 0;
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_transfer_range_count(
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_nvs_transfer_range_count(
         &descriptor,
         descriptor.len,
         &range_count,
     ));
     try std.testing.expectEqual(@as(u32, 2), range_count);
-    var padded4 = [_]u8{0} ** 28;
+    var padded4 = @as([28]u8, @splat(0));
     @memcpy(padded4[0..descriptor.len], &descriptor);
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_transfer_range_count(
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_nvs_transfer_range_count(
         &padded4,
         padded4.len,
         &range_count,
     ));
-    var padded8 = [_]u8{0} ** 32;
+    var padded8 = @as([32]u8, @splat(0));
     @memcpy(padded8[0..descriptor.len], &descriptor);
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_transfer_range_count(
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_nvs_transfer_range_count(
         &padded8,
         padded8.len,
         &range_count,
     ));
-    try std.testing.expectEqual(@intFromEnum(Result.invalid), netvsc_nvs_transfer_range_count(
+    try std.testing.expectEqual(@backingInt(Result.invalid), netvsc_nvs_transfer_range_count(
         &descriptor,
         descriptor.len - 1,
         &range_count,
     ));
-    var misaligned = [_]u8{0} ** 25;
+    var misaligned = @as([25]u8, @splat(0));
     @memcpy(misaligned[0..descriptor.len], &descriptor);
-    try std.testing.expectEqual(@intFromEnum(Result.invalid), netvsc_nvs_transfer_range_count(
+    try std.testing.expectEqual(@backingInt(Result.invalid), netvsc_nvs_transfer_range_count(
         &misaligned,
         misaligned.len,
         &range_count,
     ));
     put32(&padded8, 4, std.math.maxInt(u32));
-    try std.testing.expectEqual(@intFromEnum(Result.invalid), netvsc_nvs_transfer_range_count(
+    try std.testing.expectEqual(@backingInt(Result.invalid), netvsc_nvs_transfer_range_count(
         &padded8,
         padded8.len,
         &range_count,
     ));
     descriptor[2] = 1;
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_transfer_range_count(
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_nvs_transfer_range_count(
         &descriptor,
         descriptor.len,
         &range_count,
     ));
     descriptor[2] = 0;
     descriptor[3] = 1;
-    try std.testing.expectEqual(@intFromEnum(Result.unexpected), netvsc_nvs_transfer_range_count(
+    try std.testing.expectEqual(@backingInt(Result.unexpected), netvsc_nvs_transfer_range_count(
         &descriptor,
         descriptor.len,
         &range_count,
     ));
     descriptor[3] = 0;
     var range: TransferRange = undefined;
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_parse_transfer_range(
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_nvs_parse_transfer_range(
         &descriptor,
         descriptor.len,
         0,
@@ -1125,7 +1125,7 @@ test "receive section table and transfer ranges are bounded" {
         &range,
     ));
     try std.testing.expectEqual(@as(u16, 0), range.section_index);
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_parse_transfer_range(
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_nvs_parse_transfer_range(
         &descriptor,
         descriptor.len,
         1,
@@ -1138,7 +1138,7 @@ test "receive section table and transfer ranges are bounded" {
 
     put32(&descriptor, 8, 4097);
     put32(&descriptor, 12, 3);
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_parse_transfer_range(
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_nvs_parse_transfer_range(
         &descriptor,
         descriptor.len,
         0,
@@ -1150,7 +1150,7 @@ test "receive section table and transfer ranges are bounded" {
     try std.testing.expectEqual(@as(u16, 0), range.section_index);
     put32(&descriptor, 8, 300);
     put32(&descriptor, 12, 8000);
-    try std.testing.expectEqual(@intFromEnum(Result.invalid), netvsc_nvs_parse_transfer_range(
+    try std.testing.expectEqual(@backingInt(Result.invalid), netvsc_nvs_parse_transfer_range(
         &descriptor,
         descriptor.len,
         0,
@@ -1161,7 +1161,7 @@ test "receive section table and transfer ranges are bounded" {
     ));
 
     put32(&descriptor, 20, 16380);
-    try std.testing.expectEqual(@intFromEnum(Result.invalid), netvsc_nvs_parse_transfer_range(
+    try std.testing.expectEqual(@backingInt(Result.invalid), netvsc_nvs_parse_transfer_range(
         &descriptor,
         descriptor.len,
         1,
@@ -1171,7 +1171,7 @@ test "receive section table and transfer ranges are bounded" {
         &range,
     ));
     put32(&response, 20, std.math.maxInt(u32));
-    try std.testing.expectEqual(@intFromEnum(Result.overflow), netvsc_nvs_parse_receive_buffer_complete(
+    try std.testing.expectEqual(@backingInt(Result.overflow), netvsc_nvs_parse_receive_buffer_complete(
         &response,
         response.len,
         16384,
@@ -1182,7 +1182,7 @@ test "receive section table and transfer ranges are bounded" {
 }
 
 test "maximum receive section reply accepts VMBus padding" {
-    var response = [_]u8{0} ** 144;
+    var response = @as([144]u8, @splat(0));
     put32(&response, 0, nvs_type_receive_buffer_complete);
     put32(&response, 4, nvs_status_ok);
     put32(&response, 8, max_sections);
@@ -1196,7 +1196,7 @@ test "maximum receive section reply accepts VMBus padding" {
     }
     var sections: [max_sections]NvsSection = undefined;
     var count: u32 = 0;
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_parse_receive_buffer_complete(
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_nvs_parse_receive_buffer_complete(
         &response,
         response.len,
         @intCast(max_sections * 4096),
@@ -1205,7 +1205,7 @@ test "maximum receive section reply accepts VMBus padding" {
         &count,
     ));
     try std.testing.expectEqual(@as(u32, @intCast(max_sections)), count);
-    try std.testing.expectEqual(@intFromEnum(Result.invalid), netvsc_nvs_parse_receive_buffer_complete(
+    try std.testing.expectEqual(@backingInt(Result.invalid), netvsc_nvs_parse_receive_buffer_complete(
         &response,
         139,
         @intCast(max_sections * 4096),
@@ -1216,25 +1216,25 @@ test "maximum receive section reply accepts VMBus padding" {
 }
 
 test "received NVS RNDIS envelope treats channel type as informational" {
-    var message = [_]u8{0} ** 40;
+    var message = @as([40]u8, @splat(0));
     put32(&message, 0, nvs_type_send_rndis);
     put32(&message, 4, nvs_rndis_control);
     var channel_type: u32 = 0;
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_parse_rndis(
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_nvs_parse_rndis(
         &message,
         message.len,
         &channel_type,
     ));
     try std.testing.expectEqual(nvs_rndis_control, channel_type);
     put32(&message, 4, 9);
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_parse_rndis(
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_nvs_parse_rndis(
         &message,
         message.len,
         &channel_type,
     ));
     try std.testing.expectEqual(@as(u32, 9), channel_type);
     put32(&message, 0, 999);
-    try std.testing.expectEqual(@intFromEnum(Result.unexpected), netvsc_nvs_parse_rndis(
+    try std.testing.expectEqual(@backingInt(Result.unexpected), netvsc_nvs_parse_rndis(
         &message,
         message.len,
         &channel_type,
@@ -1242,25 +1242,25 @@ test "received NVS RNDIS envelope treats channel type as informational" {
 }
 
 test "send buffer and RNDIS NVS envelope validate sections" {
-    var response = [_]u8{0} ** 40;
+    var response = @as([40]u8, @splat(0));
     put32(&response, 0, nvs_type_send_buffer_complete);
     put32(&response, 4, nvs_status_ok);
     put32(&response, 8, 6144);
     var complete: NvsSendBufferComplete = undefined;
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_parse_send_buffer_complete(
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_nvs_parse_send_buffer_complete(
         &response,
         12,
         6144 * 8,
         &complete,
     ));
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_nvs_parse_send_buffer_complete(
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_nvs_parse_send_buffer_complete(
         &response,
         response.len,
         6144 * 8,
         &complete,
     ));
     try std.testing.expectEqual(@as(u32, 8), complete.section_count);
-    try std.testing.expectEqual(@intFromEnum(Result.invalid), netvsc_nvs_parse_send_buffer_complete(
+    try std.testing.expectEqual(@backingInt(Result.invalid), netvsc_nvs_parse_send_buffer_complete(
         &response,
         11,
         6144 * 8,
@@ -1303,7 +1303,7 @@ test "RNDIS serializers use exact MS-RNDIS offsets" {
 }
 
 test "RNDIS lifecycle completions reject wrong late IDs and contradictions" {
-    var response = [_]u8{0} ** 52;
+    var response = @as([52]u8, @splat(0));
     put32(&response, 0, rndis_initialize_complete);
     put32(&response, 4, 52);
     put32(&response, 8, 0x20001);
@@ -1316,7 +1316,7 @@ test "RNDIS lifecycle completions reject wrong late IDs and contradictions" {
     put32(&response, 36, 2048);
     put32(&response, 40, 2);
     var complete: RndisCompletion = undefined;
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_rndis_parse_completion(
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_rndis_parse_completion(
         &response,
         response.len,
         rndis_initialize_complete,
@@ -1324,7 +1324,7 @@ test "RNDIS lifecycle completions reject wrong late IDs and contradictions" {
         &complete,
     ));
     try std.testing.expectEqual(@as(u32, 4), complete.alignment);
-    try std.testing.expectEqual(@intFromEnum(Result.unexpected), netvsc_rndis_parse_completion(
+    try std.testing.expectEqual(@backingInt(Result.unexpected), netvsc_rndis_parse_completion(
         &response,
         response.len,
         rndis_initialize_complete,
@@ -1332,7 +1332,7 @@ test "RNDIS lifecycle completions reject wrong late IDs and contradictions" {
         &complete,
     ));
     put32(&response, 28, 1);
-    try std.testing.expectEqual(@intFromEnum(Result.unexpected), netvsc_rndis_parse_completion(
+    try std.testing.expectEqual(@backingInt(Result.unexpected), netvsc_rndis_parse_completion(
         &response,
         response.len,
         rndis_initialize_complete,
@@ -1342,7 +1342,7 @@ test "RNDIS lifecycle completions reject wrong late IDs and contradictions" {
 }
 
 test "RNDIS query set and keepalive completion bounds" {
-    var response = [_]u8{0} ** 32;
+    var response = @as([32]u8, @splat(0));
     put32(&response, 0, rndis_query_complete);
     put32(&response, 4, 28);
     put32(&response, 8, 0x30001);
@@ -1351,7 +1351,7 @@ test "RNDIS query set and keepalive completion bounds" {
     put32(&response, 20, 16);
     put32(&response, 24, 1500);
     var complete: RndisCompletion = undefined;
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_rndis_parse_completion(
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_rndis_parse_completion(
         &response,
         response.len,
         rndis_query_complete,
@@ -1360,7 +1360,7 @@ test "RNDIS query set and keepalive completion bounds" {
     ));
     try std.testing.expectEqual(@as(u32, 24), complete.info_offset);
     put32(&response, 20, std.math.maxInt(u32));
-    try std.testing.expectEqual(@intFromEnum(Result.overflow), netvsc_rndis_parse_completion(
+    try std.testing.expectEqual(@backingInt(Result.overflow), netvsc_rndis_parse_completion(
         &response,
         response.len,
         rndis_query_complete,
@@ -1368,11 +1368,11 @@ test "RNDIS query set and keepalive completion bounds" {
         &complete,
     ));
 
-    response = [_]u8{0} ** 32;
+    response = @as([32]u8, @splat(0));
     put32(&response, 0, rndis_set_complete);
     put32(&response, 4, 16);
     put32(&response, 8, 0x30002);
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_rndis_parse_completion(
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_rndis_parse_completion(
         &response,
         response.len,
         rndis_set_complete,
@@ -1380,7 +1380,7 @@ test "RNDIS query set and keepalive completion bounds" {
         &complete,
     ));
     put32(&response, 0, rndis_keepalive_complete);
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_rndis_parse_completion(
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_rndis_parse_completion(
         &response,
         response.len,
         rndis_keepalive_complete,
@@ -1390,12 +1390,12 @@ test "RNDIS query set and keepalive completion bounds" {
 }
 
 test "RNDIS packet framing validates all host offsets" {
-    var packet = [_]u8{0} ** 128;
+    var packet = @as([128]u8, @splat(0));
     _ = netvsc_rndis_build_packet_header(&packet, packet.len, 60);
     for (44..104) |i|
         packet[i] = @truncate(i);
     var info: RndisPacketInfo = undefined;
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_rndis_parse_packet(
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_rndis_parse_packet(
         &packet,
         104,
         &info,
@@ -1404,28 +1404,28 @@ test "RNDIS packet framing validates all host offsets" {
     try std.testing.expectEqual(@as(u32, 60), info.data_length);
 
     put32(&packet, 8, std.math.maxInt(u32));
-    try std.testing.expectEqual(@intFromEnum(Result.overflow), netvsc_rndis_parse_packet(&packet, 104, &info));
+    try std.testing.expectEqual(@backingInt(Result.overflow), netvsc_rndis_parse_packet(&packet, 104, &info));
     put32(&packet, 8, rndis_packet_offset_min);
     put32(&packet, 12, 61);
-    try std.testing.expectEqual(@intFromEnum(Result.invalid), netvsc_rndis_parse_packet(&packet, 104, &info));
+    try std.testing.expectEqual(@backingInt(Result.invalid), netvsc_rndis_parse_packet(&packet, 104, &info));
     put32(&packet, 12, 60);
     put32(&packet, 28, 37);
     put32(&packet, 32, 12);
-    try std.testing.expectEqual(@intFromEnum(Result.invalid), netvsc_rndis_parse_packet(&packet, 104, &info));
+    try std.testing.expectEqual(@backingInt(Result.invalid), netvsc_rndis_parse_packet(&packet, 104, &info));
 }
 
 test "RNDIS status messages validate buffers and link transitions" {
-    var status = [_]u8{0} ** 24;
+    var status = @as([24]u8, @splat(0));
     put32(&status, 0, rndis_indicate_status);
     put32(&status, 4, 20);
     put32(&status, 8, rndis_status_media_connect);
     var info: RndisStatusInfo = undefined;
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_rndis_parse_status(&status, status.len, &info));
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_rndis_parse_status(&status, status.len, &info));
     try std.testing.expectEqual(@as(i32, 1), info.link_state);
     put32(&status, 8, rndis_status_media_disconnect);
-    try std.testing.expectEqual(@intFromEnum(Result.ok), netvsc_rndis_parse_status(&status, status.len, &info));
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_rndis_parse_status(&status, status.len, &info));
     try std.testing.expectEqual(@as(i32, 0), info.link_state);
     put32(&status, 12, 8);
     put32(&status, 16, std.math.maxInt(u32));
-    try std.testing.expectEqual(@intFromEnum(Result.overflow), netvsc_rndis_parse_status(&status, status.len, &info));
+    try std.testing.expectEqual(@backingInt(Result.overflow), netvsc_rndis_parse_status(&status, status.len, &info));
 }

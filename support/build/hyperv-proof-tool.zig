@@ -81,7 +81,7 @@ fn execute(init: std.process.Init, diagnostic: *proofs.Diagnostic) !void {
         try proofs.smp(model, cpus.?, diagnostic);
     } else if (std.mem.eql(u8, mode, "irq")) {
         const report = try proofs.irq(model, diagnostic);
-        const message = try std.fmt.allocPrint(allocator, "PASS: {d} returning IRQ functions, no FP/SIMD; {d} reviewed indirect call sites; {d} terminal assertion log calls excluded\n", .{ report.functions, report.indirect, report.fatal_logs });
+        const message = try allocator.print("PASS: {d} returning IRQ functions, no FP/SIMD; {d} reviewed indirect call sites; {d} terminal assertion log calls excluded\n", .{ report.functions, report.indirect, report.fatal_logs });
         try std.Io.File.stdout().writeStreamingAll(init.io, message);
     } else {
         try proofs.drivers(model, required.items, diagnostic);
