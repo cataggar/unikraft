@@ -3667,7 +3667,7 @@ test "frozen custody limits, component-bound roles and first excess" {
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024 * 1024), l.ignored_bytes);
     try std.testing.expectEqual(@as(usize, 512), l.bison_entries);
     try std.testing.expectEqual(@as(usize, 128), l.dependency_roots);
-    try std.testing.expectEqualStrings("5e809554cd1dd01e6a8a314dc17c055a89c6e907", l.wamr_revision);
+    try std.testing.expectEqualStrings("41cc890a60bb3ce6b997a92748d042e9aa1e7e9a", l.wamr_revision);
     for (l.roles, 0..) |role, index|
         try std.testing.expectEqual(index, try l.outputRole(role));
     try std.testing.expectEqual(@as(usize, 0), try l.outputRole(".d/private/file"));

@@ -7,7 +7,7 @@ pub const process = @import("build-tool-process.zig");
 pub const prepare = @import("build-tool-prepare.zig");
 pub const image = @import("build-tool-image.zig");
 
-pub const revision = "5e809554cd1dd01e6a8a314dc17c055a89c6e907";
+pub const revision = "41cc890a60bb3ce6b997a92748d042e9aa1e7e9a";
 pub const workload_revision = revision;
 pub const compiler_profile = "unikraft-x86_64";
 pub const zig_version = "0.17.0";
