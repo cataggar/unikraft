@@ -136,6 +136,14 @@ GNU Make remains the backend; this facade only maps Zig build steps and options
 to Make targets and assignments. It does not yet model Unikraft's components
 as a native Zig build graph.
 
+Zig 0.17's hosted standard-library OS floors are Linux 5.10+, macOS 15+, and
+OpenBSD 7.8+; its Windows floor is Windows 10+. These floors apply to tools
+running on the build/control host, including the facade and hosted verifiers,
+not to freestanding Unikraft guests. Meeting a floor does not establish facade
+support: hosts without the required filesystem/process safety capabilities are
+still rejected. The Windows floor does not add Windows facade support, and none
+of these hosted floors changes guest-platform support or requires a Linux guest.
+
 The facade also exposes an isolated native configuration parser and header
 generator. It consumes an already solved Kconfig `.config`; it does not
 evaluate `Config.uk`, resolve dependencies/defaults, or replace the Kconfig
