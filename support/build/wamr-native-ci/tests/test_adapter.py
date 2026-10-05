@@ -4245,11 +4245,11 @@ class Evidence(unittest.TestCase):
             altered["request"]["package_hash"] = ci.MIZ_PACKAGE_HASH
             with self.assertRaises(ValueError):
                 public_bundle.dependency_record(ci, altered, {})
-            altered = copy.deepcopy(historical)
-            altered["packages"]["hash_verification"]["algorithm"] = (
-                "zig-0.15.2-fetch-path")
-            with self.assertRaises(ValueError):
-                public_bundle.dependency_record(ci, altered, {})
+            for algorithm in ("zig-0.15.2-fetch-path", [], {"unexpected": True}):
+                altered = copy.deepcopy(historical)
+                altered["packages"]["hash_verification"]["algorithm"] = algorithm
+                with self.assertRaises(ValueError):
+                    public_bundle.dependency_record(ci, altered, {})
 
     def test_restore_manifest_requires_exact_miz_revision_hash_and_one_pin(self):
         valid = (

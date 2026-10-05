@@ -398,7 +398,8 @@ def dependency_record(ci, value, expected):
             and isinstance(value["packages"].get("hash_verification"), dict))
     algorithm = value.get("packages", {}).get(
         "hash_verification", {}).get("algorithm")
-    require(algorithm in {"zig-0.17.0-fetch-path", "zig-0.16.0-fetch-path"})
+    require(isinstance(algorithm, str)
+            and algorithm in {"zig-0.17.0-fetch-path", "zig-0.16.0-fetch-path"})
     historical = algorithm == "zig-0.16.0-fetch-path"
     root_package = (
         ci.HISTORICAL_MIZ_PACKAGE_HASH if historical else ci.MIZ_PACKAGE_HASH)
