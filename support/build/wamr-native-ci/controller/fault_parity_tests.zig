@@ -186,12 +186,12 @@ test "consumer retains the original executable but rejects same-byte inode repla
     const data = try fixture.root.openDir(io, "data", .{ .iterate = true });
     defer data.close(io);
     try write(data, "input", "same bytes", 0o600);
-    const source_path = try std.Io.Dir.realPathFileAbsoluteAlloc(io, "/usr/bin/true", a);
+    const source_path = try std.fs.path.resolve(a, &.{ options.repository_root, options.command_fixture });
     defer a.free(source_path);
     const original = try std.Io.Dir.openFileAbsolute(io, source_path, .{ .follow_symlinks = false });
     defer original.close(io);
     const size: usize = @intCast((try original.stat(io)).size);
-    try std.testing.expect(size >= 64 and size < 1024 * 1024);
+    try std.testing.expect(size >= 64 and size <= 64 * 1024 * 1024);
     const bytes = try a.alloc(u8, size);
     defer a.free(bytes);
     try std.testing.expectEqual(size, try original.readPositionalAll(io, bytes, 0));
@@ -502,7 +502,7 @@ test "transient in later package directory changes physical custody without chan
 test "pre-spawn timeout and cancellation leave no command or cleanup events" {
     var fixture = try Fixture.init("pre-spawn");
     defer fixture.deinit();
-    const executable_path = try std.Io.Dir.realPathFileAbsoluteAlloc(io, "/usr/bin/true", a);
+    const executable_path = try std.fs.path.resolve(a, &.{ options.repository_root, options.command_fixture });
     defer a.free(executable_path);
     const executable = try core.process.Executable.open(io, executable_path);
     defer executable.close(io);
