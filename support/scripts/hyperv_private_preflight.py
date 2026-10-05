@@ -2835,6 +2835,7 @@ def build_private_image(
         "XDG_CACHE_HOME": str(cache / "xdg"),
         "ZIG_GLOBAL_CACHE_DIR": str(cache / "zig-global"),
         "ZIG_LOCAL_CACHE_DIR": str(cache / "zig-local"),
+        "ZIG_LOCAL_PKG_DIR": str(cache / "zig-packages"),
         "PYTHONPYCACHEPREFIX": str(cache / "pycache"),
         "HOME": str(home),
         "XDG_CONFIG_HOME": str(cache / "xdg-config"),

@@ -161,7 +161,8 @@ jobs:
           grep -Fq '"reason":"production_bindings_unavailable"' \
             "${root}/candidate/${mode}/parked-refusal.json"
         done
-        zig build test-native-make-environment hyperv-object-proofs \
+        ZIG_LOCAL_PKG_DIR="${root}/native-build-packages" \
+          zig build test-native-make-environment hyperv-object-proofs \
           test-hyperv-persistence-workflow \
           -Doptimize=debug -j2 \
           --cache-dir "${root}/native-build-cache" \

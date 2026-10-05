@@ -321,6 +321,7 @@ jobs:
         log="${RUNNER_TEMP}/zig-build.log"
         export ZIG_GLOBAL_CACHE_DIR="${RUNNER_TEMP}/zig-global-cache"
         export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/zig-local-cache-x86_64"
+        export ZIG_LOCAL_PKG_DIR="${RUNNER_TEMP}/zig-packages-x86_64"
         rm -rf "${build}"
         cp "${GITHUB_WORKSPACE}/_helloworld/defconfigs/qemu-x86_64" "${config}"
         zig_args=(
@@ -456,6 +457,7 @@ jobs:
         log="${RUNNER_TEMP}/zig-build-lto.log"
         export ZIG_GLOBAL_CACHE_DIR="${RUNNER_TEMP}/zig-global-cache"
         export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/zig-local-cache-x86_64-lto"
+        export ZIG_LOCAL_PKG_DIR="${RUNNER_TEMP}/zig-packages-x86_64-lto"
         rm -rf "${build}"
         cp "${GITHUB_WORKSPACE}/_helloworld/defconfigs/qemu-x86_64" "${config}"
         printf '\nCONFIG_OPTIMIZE_LTO=y\n' >> "${config}"
@@ -1057,6 +1059,7 @@ jobs:
       run: |
         set -euo pipefail
         root="${RUNNER_TEMP}/hyperv-ci/native-build-tools"
+        export ZIG_LOCAL_PKG_DIR="${root}/packages"
         ZIG_LOCAL_CACHE_DIR="${root}/zig-local-cache" \
           zig build -j2 test-build-tools "-Doutput=${root}/build" \
             --summary all
@@ -1070,6 +1073,7 @@ jobs:
         export ZIG_GLOBAL_CACHE_DIR="${root}/zig-global"
         mkdir -p "${root}"/{tmp,cache,config,zig-local,zig-global}
         root="$(readlink -f "${root}")"
+        export ZIG_LOCAL_PKG_DIR="${root}/packages"
         # Hosted /usr/share can be writable; keep fixture data in a private copy.
         cp -R --no-preserve=mode,ownership \
           "$(/usr/bin/bison --print-datadir)" "${root}/bison-data"
@@ -1118,6 +1122,7 @@ jobs:
         set -euo pipefail
         for mode in debug safe; do
           root="${RUNNER_TEMP}/hyperv-ci/native-object-proofs-${mode}"
+          export ZIG_LOCAL_PKG_DIR="${root}/packages"
           ZIG_LOCAL_CACHE_DIR="${root}/zig-local-cache" \
             zig build -j2 hyperv-object-proofs test-hyperv-object-proofs \
               --cache-dir "${root}/zig-local-cache" \
@@ -1401,6 +1406,7 @@ jobs:
         test "$(zig version)" = "${ZIG_VERSION}"
         test "$(git -C .d/ci-miz rev-parse HEAD)" = "${MIZ_REVISION}"
         export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/hyperv-ci/miz-zig-local-cache"
+        export ZIG_LOCAL_PKG_DIR="${RUNNER_TEMP}/hyperv-ci/miz-packages"
         (
           cd .d/ci-miz
           zig build -j2 install-miz \
@@ -1490,6 +1496,7 @@ jobs:
           fi
           config="${RUNNER_TEMP}/hyperv-ci/${app}.config"
           export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/hyperv-ci/${variant}-zig-local-cache"
+          export ZIG_LOCAL_PKG_DIR="${RUNNER_TEMP}/hyperv-ci/${variant}-zig-packages"
           if [ "${network_application}" = "true" ]; then
             cp "support/apps/${app}/app-network.defconfig" "${config}"
             symbols+=(CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION)
@@ -1879,6 +1886,7 @@ jobs:
         log="${RUNNER_TEMP}/zig-arm64-build.log"
         export ZIG_GLOBAL_CACHE_DIR="${RUNNER_TEMP}/zig-global-cache"
         export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/zig-local-cache-arm64"
+        export ZIG_LOCAL_PKG_DIR="${RUNNER_TEMP}/zig-packages-arm64"
         rm -rf "${build}"
         cp "${GITHUB_WORKSPACE}/_helloworld/defconfigs/qemu-arm64" "${config}"
         zig_args=(

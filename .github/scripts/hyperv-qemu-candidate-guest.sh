@@ -198,7 +198,8 @@ if [[ "$1" == build ]]; then
     cp --no-preserve=mode,ownership "$public/build.zig" "$public/build.zig.zon" \
       "$guest/public-image/restore/"
     export ZIG_LOCAL_CACHE_DIR="$guest/public-image/restore-cache"
-    run_bounded "$evidence/logs/cli-restore.log" 300 $((8 * 1024 * 1024)) \
+    ZIG_LOCAL_PKG_DIR="$guest/public-image/restore/zig-pkg" \
+      run_bounded "$evidence/logs/cli-restore.log" 300 $((8 * 1024 * 1024)) \
       "$zig" build --build-file "$guest/public-image/restore/build.zig" --fetch=all -j2 \
         --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
         --prefix "$guest/public-image/restore-out"
@@ -214,7 +215,8 @@ if [[ "$1" == build ]]; then
   cp --no-preserve=mode,ownership "$repo/build.zig" "$repo/build.zig.zon" \
     "$guest/image/restore/"
   export ZIG_LOCAL_CACHE_DIR="$guest/image/restore-cache"
-  run_bounded "$evidence/logs/image-restore.log" 300 $((8 * 1024 * 1024)) \
+  ZIG_LOCAL_PKG_DIR="$guest/image/restore/zig-pkg" \
+    run_bounded "$evidence/logs/image-restore.log" 300 $((8 * 1024 * 1024)) \
     "$zig" build --build-file "$guest/image/restore/build.zig" --fetch=all -j2 \
       --cache-dir "$ZIG_LOCAL_CACHE_DIR" --prefix "$guest/image/restore-out"
   cmp "$repo/build.zig" "$guest/image/restore/build.zig"
