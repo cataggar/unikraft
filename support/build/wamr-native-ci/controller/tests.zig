@@ -244,8 +244,7 @@ fn handoffInspectFixtures() !void {
     defer a.free(efi);
     const executable = try std.fs.path.resolve(a, &.{ options.repository_root, options.command_fixture });
     defer a.free(executable);
-    const bound_tool = try std.Io.Dir.realPathFileAbsoluteAlloc(io, "/usr/bin/true", a);
-    defer a.free(bound_tool);
+    const bound_tool = executable;
     try copyFixtureExecutable(io, a, executable, tools_bin, "wamr-ci-package");
     try copyFixtureExecutable(io, a, bound_tool, supervisor_bin, "wamr-ci-supervisor");
     try copyFixtureExecutable(io, a, bound_tool, controller_bin, "uk-wamr-native-ci");
@@ -1069,8 +1068,7 @@ fn directSharedSupervisorFixtures() !void {
     defer a.free(fixture_root);
     const executable = try std.fs.path.resolve(a, &.{ options.repository_root, options.command_fixture });
     defer a.free(executable);
-    const bound_tool = try std.Io.Dir.realPathFileAbsoluteAlloc(io, "/usr/bin/true", a);
-    defer a.free(bound_tool);
+    const bound_tool = executable;
     const fixture_dir = try parent.openDir(io, name, .{ .iterate = true });
     defer fixture_dir.close(io);
     const scenarios = [_]struct {
@@ -1332,6 +1330,8 @@ test "trusted import authenticates relocated native tools without producer files
     defer destination.close(io);
     const producer_repo = try std.fs.path.join(a, &.{ path, "producer/source" });
     const repository = try std.fs.path.join(a, &.{ path, "destination/source" });
+    const reader_git = try std.fs.path.join(a, &.{ path, "destination/reader-tools/bin/git" });
+    try @import("local_acceptance_tests.zig").stageGit(a, io, reader_git);
     for ([_][]const u8{ producer_repo, repository }) |checkout| {
         const cloned = try std.process.run(a, io, .{
             .argv = &.{ options.git_executable, "clone", "-q", "--no-hardlinks", "--", options.repository_root, checkout },
@@ -1391,7 +1391,7 @@ test "trusted import authenticates relocated native tools without producer files
     checkpoint = "bind relocated tools";
     try producer.deleteFile(io, "git");
     try producer.deleteFile(io, "zig");
-    const local = controller.import_validator_build.LocalTools{ .git = options.git_executable, .supervisor = supervisor, .validator = validator };
+    const local = controller.import_validator_build.LocalTools{ .git = reader_git, .supervisor = supervisor, .validator = validator };
     var bound = try controller.import_validator_build.PortableTools.bind(a, io, .trusted_inner_zip, source_identity, start, repository, owner, local, null);
     defer bound.deinit(io);
     try bound.verify(io, repository, local.git);
@@ -2140,6 +2140,10 @@ test "current native reader authenticates its closure without historical Python 
     const root = try parent.openDir(io, name, .{ .iterate = true });
     defer root.close(io);
     const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    const reader_tools_name = try std.fmt.allocPrint(a, "{s}-reader-tools", .{name});
+    const reader_git = try std.fs.path.join(a, &.{ options.fixture_root, reader_tools_name, "bin/git" });
+    try @import("local_acceptance_tests.zig").stageGit(a, io, reader_git);
+    defer parent.deleteTree(io, reader_tools_name) catch @panic("native reader tools cleanup failed");
     for (controller.source_custody.closure) |entry|
         try writeRelativeFixtureFile(io, root, entry.name, entry.content);
     try fixtureGit(a, path, &.{ options.git_executable, "init", "-q" });
@@ -2149,12 +2153,12 @@ test "current native reader authenticates its closure without historical Python 
         "commit",               "-qm", "fixture: current native reader\n\nCo-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>",
     });
     const expected = try controller.import_supervisor_identity.nativeSourceContentClosure(a);
-    const observed = try controller.import_supervisor_identity.currentReaderSourceContentClosure(a, io, path, options.git_executable);
+    const observed = try controller.import_supervisor_identity.currentReaderSourceContentClosure(a, io, path, reader_git);
     try std.testing.expectEqualStrings(&expected, &observed);
     try std.testing.expectError(error.FileNotFound, root.openFile(io, "support/build/wamr-native-ci/run.py", .{}));
     try std.testing.expectError(error.UntrackedManifest, controller.import_supervisor_identity.supervisorSourceContentClosure(a, io, path, options.git_executable));
     const response = try std.process.run(a, io, .{
-        .argv = &.{ options.host_controller_cli, "reader-source-closure", "--git", options.git_executable, "--output", "sha256-v1" },
+        .argv = &.{ options.host_controller_cli, "reader-source-closure", "--git", reader_git, "--output", "sha256-v1" },
         .cwd = .{ .path = path },
         .stdout_limit = .limited(1024),
         .stderr_limit = .limited(4096),
@@ -2162,7 +2166,7 @@ test "current native reader authenticates its closure without historical Python 
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, response.term);
     try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}\n", .{expected}), response.stdout);
     try appendRelativeFixtureFile(io, root, "support/build/wamr-native-ci/controller/cli.zig", "\n");
-    try std.testing.expectError(error.UnsafeSource, controller.import_supervisor_identity.currentReaderSourceContentClosure(a, io, path, options.git_executable));
+    try std.testing.expectError(error.UnsafeSource, controller.import_supervisor_identity.currentReaderSourceContentClosure(a, io, path, reader_git));
 }
 
 test "supervisor source closure requires tracked clean Git blobs" {
@@ -2533,7 +2537,7 @@ fn legacyHandoffInspectLiveFixture() !void {
     const package_json = try writeCanonicalValue(io, evidence, "package.json", a, package_value);
 
     const executable = try std.fs.path.resolve(a, &.{ options.repository_root, options.command_fixture });
-    const bound_tool = try std.Io.Dir.realPathFileAbsoluteAlloc(io, "/usr/bin/true", a);
+    const bound_tool = executable;
     try copyFixtureExecutable(io, a, executable, tools_bin, "wamr-ci-package");
     var host_tool_paths: [controller.input_custody.host_tools.len][]const u8 = undefined;
     for (controller.input_custody.host_tools, 0..) |tool, i| {
@@ -4741,8 +4745,7 @@ test "native command refuses changed executable after use and retains failed rec
         try file.writePositionalAll(io, binary, 0);
         try file.sync(io);
     }
-    const bound_tool = try std.Io.Dir.realPathFileAbsoluteAlloc(io, "/usr/bin/true", a);
-    defer a.free(bound_tool);
+    const bound_tool = executable;
     const repeated = [_][]const u8{bound_tool} ** controller.input_custody.host_tools.len;
     const runner_path = try std.fs.path.join(a, &.{ work, "runner" });
     defer a.free(runner_path);

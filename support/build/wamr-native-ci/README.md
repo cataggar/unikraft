@@ -147,6 +147,12 @@ interpreter, relocating only `PT_INTERP` while preserving Git's loaded code and
 bundled-library search paths. This gives both system and bundled Git an actual
 owned runtime dependency for physical mutation tests without changing system
 libraries, weakening tool-file policy, or dropping any refusal case.
+The relocated-tool and Python-free current-reader fixtures use the same private
+Git setup. Unexecuted placeholder roles use the existing compiled native command
+fixture rather than assuming `/usr/bin/true` is ELF (some distributions install
+it as a coreutils script). The controller test runner omits debug sections
+because it is itself pinned as a supervisor under the unchanged 64 MiB tool
+limit; Debug safety checks and all frozen test declarations remain unchanged.
 Read-only Python-v2 custody checks bind the complete recorded producer checkout,
 not the newer reader's compiled source bytes, and recapture the original input
 roles and physical identities unchanged. The production local-consumer probe
