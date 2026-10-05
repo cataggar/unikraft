@@ -16,6 +16,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import traceback
@@ -2162,6 +2163,103 @@ class HypervAzureControllerTest(unittest.TestCase):
 
 
 class HypervWorkflowTest(unittest.TestCase):
+    def test_cost_qualification_retains_historical_compiler_and_package_inputs(self):
+        workflows = SUPPORT.parent / ".github/workflows"
+        public = (workflows / "hyperv-public-cost-qualification.yaml").read_text()
+        shared = (workflows / "hyperv-shared-hash-qualification.yaml").read_text()
+        retain = textwrap.dedent(public.split(
+            "    - name: Retain the baseline compiler independently of the candidate\n",
+            1,
+        )[1].split("      run: |\n", 1)[1].split("\n    - name:", 1)[0])
+        compare = textwrap.dedent(public.split(
+            "    - name: Compare dirty and clean SHA transitions and run every debug fixture\n",
+            1,
+        )[1].split("      run: |\n", 1)[1])
+        compiler_fixture = """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == version ]]; then printf '%s\\n' VERSION; exit 0; fi
+printf '%s %s\\n' VERSION "$*" >> "${QUALIFICATION_CALLS:?}"
+case "VERSION:$*" in
+  0.17.0:*public-cost-baseline*|0.17.0:*baseline-restore*|0.17.0:*-Doptimize=Debug*) exit 17 ;;
+  0.16.0:*-Doptimize=debug*|0.16.0:*--system*"/restore/zig-pkg"*) exit 17 ;;
+esac
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "qualification's spaced root"
+            workspace = root / "workspace"
+            runtime = root / "runtime"
+            runtime.mkdir(parents=True)
+            calls = root / "calls"
+            environment = dict(
+                os.environ, GITHUB_WORKSPACE=str(workspace),
+                RUNNER_TEMP=str(runtime), QUALIFICATION_CALLS=str(calls),
+            )
+            for version in ("0.16.0", "0.17.0"):
+                directory = root / version
+                directory.mkdir()
+                compiler = directory / "zig"
+                compiler.write_text(compiler_fixture.replace("VERSION", version))
+                compiler.chmod(0o700)
+            environment["PATH"] = str(root / "0.16.0") + os.pathsep + os.environ["PATH"]
+            result = subprocess.run(
+                ["bash", "-c", retain], env=environment,
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            environment["PATH"] = str(root / "0.17.0") + os.pathsep + os.environ["PATH"]
+            for source in (
+                workspace,
+                workspace / ".d/public-cost-baseline",
+            ):
+                package = source / "support/tools/hyperv/public_image"
+                package.mkdir(parents=True)
+                for name in ("build.zig", "build.zig.zon"):
+                    (package / name).write_text(".{}\n")
+            result = subprocess.run(
+                ["bash", "-c", compare], cwd=workspace, env=environment,
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            commands = calls.read_text().splitlines()
+            self.assertEqual(len(commands), 5)
+            self.assertIn("0.16.0 build --build-file", commands[1])
+            self.assertIn("/baseline-restore/build.zig --fetch=all", commands[1])
+            self.assertIn("0.16.0 build --build-file", commands[2])
+            self.assertIn("/baseline-restore/zig-pkg", commands[2])
+            self.assertIn("-Doptimize=Debug", commands[2])
+            self.assertIn("0.17.0 build --build-file", commands[3])
+            self.assertIn("-Doptimize=debug", commands[3])
+            calls.unlink()
+            zig16 = runtime / "public-cost-zig-0.16.0/zig"
+            for step in (
+                "Compare actual worker hashes and run all persistence cases",
+                "Compare original preparation hashes on identical actual namespace fixtures",
+            ):
+                body = textwrap.dedent(shared.split(
+                    f"    - name: {step}\n", 1,
+                )[1].split("      run: |\n", 1)[1].split("\n    - name:", 1)[0])
+                loop = "for variant in baseline candidate; do\n" + body.split(
+                    "for variant in baseline candidate; do\n", 1,
+                )[1].split("\ndone", 1)[0] + "\ndone\n"
+                environment.update(
+                    root=str(root / "shared"),
+                    baseline=str(workspace / ".d/shared-hash-baseline"),
+                    zig16=str(zig16), objcopy="/fixture/objcopy",
+                )
+                result = subprocess.run(
+                    ["bash", "-c", "set -euo pipefail\n" + loop],
+                    cwd=workspace, env=environment,
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+            commands = calls.read_text().splitlines()
+            self.assertEqual(len(commands), 4)
+            for baseline, candidate in zip(commands[::2], commands[1::2]):
+                self.assertIn("0.16.0 build --build-file", baseline)
+                self.assertIn("-Doptimize=Debug", baseline)
+                self.assertIn("0.17.0 build --build-file", candidate)
+                self.assertIn("-Doptimize=debug", candidate)
+
     def test_persistence_build_evidence_exact_roles_and_post_test_retention(self):
         workflow = (SUPPORT.parent / ".github/workflows/integration.yaml").read_text()
         job = workflow.split("  zig-hyperv-runtime:\n", 1)[1].split("\n  zig-hyperv", 1)[0]
