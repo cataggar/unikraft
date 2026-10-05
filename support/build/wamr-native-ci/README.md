@@ -469,16 +469,20 @@ create-only private report binds the observed output hashes and cleanup states,
 and the build gate verifies every required result. Each stream is capped at
 4 MiB; the independent native-result transport permits up to 12 MiB so the
 full allowed 8 MiB combined output is encoded without truncation. The
-`test-unit` also runs the controller custody and command fault fixtures in
-its isolated Zig cache. `test-controller` additionally checks invalid
+production adapter's `test-unit` runs the package command boundary and
+log-validator CLI, without cold-compiling and repeating the controller and
+source-limit suites already exercised by the mandatory fixture gate.
+Those suites remain in `test-controller` and aggregate `test`; all fixture
+cases and the original CI deadlines remain unchanged.
+`test-controller` additionally checks invalid
 installer build flags, which can restore `zig-pkg` in the source tree; that
 test runs in a separate clean worktree in the protected gate, never during
 the supervised production adapter build. Custody link and depth fixtures use
 the selected cache even when production sets `ZIG_LOCAL_CACHE_DIR` outside
 the checkout.
 The protected x86 job exercises `test-controller-limits` and then
-`test-controller` in separate clean worktrees, keeping test dependencies and
-cache outside the production source checkout; this reports fixture failures
+`test-controller` in the same retained clean worktree, keeping test dependencies
+and cache outside the production source checkout; this reports fixture failures
 without exposing private supervised-command output. On failure it runs the
 host test binary directly for diagnostic errors while keeping the original
 gate failed. The Python
@@ -957,8 +961,10 @@ WAMR_CI_SUPERVISOR_FIXTURE="$PWD/.d/wamr-ci-check/out/bin/wamr-ci-supervisor-fix
 `test` is the protected aggregate and requires `-Dtest-root`; `test-pipeline`
 runs the real conversion fixtures and two independently isolated private
 six-mode synthetic boot-proof fixtures with the same requirement.
-`test-unit` runs the package command boundary and native controller/fault
-fixtures; it does not run the real package conversion pipeline.
+`test-unit` runs the package command boundary and log-validator CLI tests only;
+it does not repeat the controller/source-limit suites or run the real package
+conversion pipeline. The protected controller gate and aggregate `test`
+retain those controller/source-limit cases.
 
 The Zig fixtures additionally run real raw-to-native-zstd-QCOW2 and
 exact-QCOW2-to-fixed-VHD workers, reopen both artifacts, validate byte/content
