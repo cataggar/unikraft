@@ -295,6 +295,10 @@ Strip-equivalence, strip-proof and build-evidence test steps require an explicit
 private `-Dtest-root`; none defaults to the source tree or build cache. Generated
 0.17 artifact option paths are resolved against the observed build cwd before
 private fixture execution, retaining absolute-path and no-follow checks.
+Capture arguments also normalize only configured graph-owned source paths
+against the observed build cwd. Incoming collector arguments still reject
+relative paths and dot components; source custody still opens without following
+symlinks.
 
 ### Default-off exact parent build evidence
 

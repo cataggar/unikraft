@@ -4,6 +4,23 @@ const metadata = @import("fixture_parent_metadata.zig");
 const schema = @import("fixture_build_schema.zig");
 const t = std.testing;
 
+test "capture source paths normalize graph-owned package scopes before strict argv validation" {
+    const paths = @import("fixture_build_path.zig");
+    const core = try paths.sourceAbsolute(t.allocator, "/private/reviewed", "support/tools/hyperv/persistence", "../core.zig");
+    defer t.allocator.free(core);
+    try t.expectEqualStrings("/private/reviewed/support/tools/hyperv/core.zig", core);
+    const package = try paths.sourceAbsolute(t.allocator, "/private/reviewed", "/private/packages/sdk", ".");
+    defer t.allocator.free(package);
+    try t.expectEqualStrings("/private/packages/sdk", package);
+}
+
+test "capture source paths require an observed absolute cwd and retain the native path bound" {
+    const paths = @import("fixture_build_path.zig");
+    try t.expectError(error.InvalidBuildCwd, paths.sourceAbsolute(t.allocator, "relative", "/private/packages/sdk", "."));
+    const long: [4096]u8 = @splat('x');
+    try t.expectError(error.InvalidCapturePath, paths.sourceAbsolute(t.allocator, "/private/reviewed", "scope", &long));
+}
+
 test "static serialization is bounded JSON with explicit compilation origin" {
     const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, &metadata.payload, .{});
     defer parsed.deinit();

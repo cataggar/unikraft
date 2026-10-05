@@ -249,14 +249,14 @@ pub fn build(b: *std.Build) void {
         const configured = configuredJson(b, tests, graph);
         const baseline = b.addRunArtifact(evidence_steps.collector);
         baseline.has_side_effects = true;
-        addCaptureArgs(b, baseline, "baseline", root, source_commit.?, source_tree.?, configured, null, tests, test_options, raw_worker, selected_worker, strip_report.?, test_root.?, graph);
+        addCaptureArgs(b, baseline, "baseline", root, source_commit.?, source_tree.?, configured, build_cwd, null, tests, test_options, raw_worker, selected_worker, strip_report.?, test_root.?, graph);
         // Bookend only the actual parent compilation. Options already depend on
         // the worker pair; changing those dependencies would create a cycle.
         tests.step.dependOn(&baseline.step);
         const prepare = b.addRunArtifact(evidence_steps.collector);
         prepare.has_side_effects = true;
         prepare.step.dependOn(&baseline.step);
-        addCaptureArgs(b, prepare, "prepare", root, source_commit.?, source_tree.?, configured, tests.getEmittedBin(), tests, test_options, raw_worker, selected_worker, strip_report.?, test_root.?, graph);
+        addCaptureArgs(b, prepare, "prepare", root, source_commit.?, source_tree.?, configured, build_cwd, tests.getEmittedBin(), tests, test_options, raw_worker, selected_worker, strip_report.?, test_root.?, graph);
         run.step.dependOn(&prepare.step);
         for (evidence_steps.tests) |evidence_test| evidence_test.step.dependOn(&run.step);
         b.step("prepare-build-evidence", "Compile and prepare exact parent custody without running or collecting fixtures").dependOn(&prepare.step);
@@ -462,6 +462,7 @@ fn addCaptureArgs(
     commit: []const u8,
     tree: []const u8,
     configured: []const u8,
+    build_cwd: []const u8,
     parent: ?std.Build.LazyPath,
     compile: *std.Build.Step.Compile,
     main_options: *std.Build.Step.Options,
@@ -478,21 +479,33 @@ fn addCaptureArgs(
     run.addFileArg2(std.Build.LazyPath.zig_exe, .{ .make_absolute = true });
     run.addDirectoryArg2(compile.zig_lib_dir orelse std.Build.LazyPath.zig_lib, .{ .make_absolute = true });
     run.addFileArg2(main_options.getOutput(), .{ .make_absolute = true });
-    run.addFileArg2(compile.root_module.root_source_file.?, .{ .make_absolute = true });
-    run.addDirectoryArg2(b.path(".."), .{ .make_absolute = true });
-    run.addDirectoryArg2(b.path("../../../build"), .{ .make_absolute = true });
+    run.addFileArg2(captureSourcePath(b, build_cwd, compile.root_module.root_source_file.?), .{ .make_absolute = true });
+    run.addDirectoryArg2(captureSourcePath(b, build_cwd, b.path("..")), .{ .make_absolute = true });
+    run.addDirectoryArg2(captureSourcePath(b, build_cwd, b.path("../../../build")), .{ .make_absolute = true });
     const mode_root = std.fs.path.dirname(test_root) orelse @panic("invalid test root");
     run.addArgs(&.{ proof, b.pathJoin(&.{ mode_root, "fixtures.log" }), b.pathJoin(&.{ mode_root, "fixture-build-exit.txt" }) });
     for (graph) |item| {
         const source = item.module.root_source_file orelse @panic("evidence module requires a root source");
         run.addArg(item.name);
-        run.addFileArg2(source, .{ .make_absolute = true });
+        run.addFileArg2(captureSourcePath(b, build_cwd, source), .{ .make_absolute = true });
         const scope = switch (source) {
             .generated => source.dirname(),
             else => if (item.module.owner == b) b.path("..") else item.module.owner.path("."),
         };
-        run.addDirectoryArg2(scope, .{ .make_absolute = true });
+        run.addDirectoryArg2(captureSourcePath(b, build_cwd, scope), .{ .make_absolute = true });
     }
+}
+
+fn captureSourcePath(b: *std.Build, build_cwd: []const u8, path: std.Build.LazyPath) std.Build.LazyPath {
+    return switch (path) {
+        .src_path => |source| normalized: {
+            const root = source.owner.root.toString(b.allocator) catch @panic("OOM");
+            const absolute = @import("fixture_build_path.zig").sourceAbsolute(b.allocator, build_cwd, root, source.sub_path) catch
+                @panic("invalid graph-owned evidence source path");
+            break :normalized b.graph.cwdRelativePath(absolute);
+        },
+        else => path,
+    };
 }
 
 fn addEvidenceTests(
