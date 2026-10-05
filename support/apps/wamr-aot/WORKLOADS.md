@@ -43,11 +43,18 @@ PIC, final-link-owned compiler-runtime sampler APIs. This supported source pin
 is not qualified image or deployment lineage.
 
 The generated consumer also pins `cataggar/translate-c`
-`62d06a5d3e93c82727544e8113e4762a315ca0ed`. Its target-aware
-`Translator.init` translates the actual `workloads.h`, `platform.h`, and
+`62d06a5d3e93c82727544e8113e4762a315ca0ed`, using the same
+`Translator` / `.init(b.dependency("translate_c", .{}), ...)` pattern as
+[Hearth #5](https://github.com/cataggar/hearth/pull/5). It translates the actual `workloads.h`, `platform.h`, and
 generated `wamr_aot.h` into the `workloads_c` module, including the package's
 required helper imports. Translation keeps the freestanding target, generated
 include paths, shared SDK module roots, PIC, and final-link-owned compiler runtime.
+The immutable translator package hash is
+`translate_c-2.0.0-Q_BUWlpOBwBWvgGBM20tJq-GXgPio3v3UD39rXEn70KN`.
+Its sole compatibility-fork change redirects Aro to `cataggar/arocc`
+`d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b`, whose verified hash is
+`aro-0.0.0-JSD1QtuBNwCASyBtNF3pqTl_W3oAJQGEVyFAtrBSE_Pa`.
+Aro has no package dependencies, so this chain downloads nothing from Codeberg.
 
 ```sh
 umask 077

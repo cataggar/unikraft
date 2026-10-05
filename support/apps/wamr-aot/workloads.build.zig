@@ -34,10 +34,7 @@ pub fn build(b: *std.Build) void {
     root.addIncludePath(b.path("."));
     root.addIncludePath(b.path("../artifacts"));
     if (variant != .tiny or coremark) {
-        const translated = Translator.init(b.dependency("translate_c", .{
-            .target = b.graph.host,
-            .optimize = std.lang.Optimize.safe,
-        }), .{
+        const translated: Translator = .init(b.dependency("translate_c", .{}), .{
             .name = "workloads_c",
             .c_source_file = b.path("workloads.h"),
             .target = target,

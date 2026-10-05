@@ -66,6 +66,10 @@ Generated workload manifests pin the standalone `cataggar/translate-c`
 `62d06a5d3e93c82727544e8113e4762a315ca0ed` translator. The target-aware
 generated `workloads_c` module uses the actual workload/platform/SDK headers;
 it is not a handwritten C ABI substitute.
+The translator uses the merged Hearth #5 standalone `Translator` pattern,
+with default dependency arguments and explicit guest target/optimization.
+Its Aro dependency is pinned to the GitHub compatibility mirror; see
+[WORKLOADS.md](WORKLOADS.md) for both verified package hashes.
 
 The integration archive explicitly uses x86_64 SysV, PIC, no red zone,
 stack protector, stack checking, unwind tables, libc, or error tracing, and
