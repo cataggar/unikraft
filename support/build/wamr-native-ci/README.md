@@ -283,6 +283,13 @@ checkout must be clean, match the owner's embedded tracked source closure,
 and remain unchanged throughout bounded native supervision. It is not required
 to masquerade as the historical producer checkout. No v1 build, boot,
 validator-build, profile admission, or Python fallback is enabled.
+Only that validated frozen-v1 compatibility selects the distinct bounded
+`import-historical-native-revalidation` command record: its validator verb is
+`historical-handoff` and its exact success marker starts with `Historical`.
+Ordinary current revalidation retains `handoff` and the `Compute` marker;
+neither route accepts the other's command binding or success marker. Fresh
+Python v1 import revalidation uses the same explicit historical verb and marker.
+Original producer records and Zig 0.16 SDK identities are never rewritten.
 The Python-owned archive/operator plumbing remains until its separate wiring
 cutover; merely adding this operation does not retire the Python controller.
 

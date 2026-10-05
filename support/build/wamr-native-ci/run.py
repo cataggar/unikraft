@@ -51,6 +51,7 @@ PRODUCTION_COMMAND_STAGES = frozenset({
     "derive-fixed-vhd", "inspect",
     "public-validator-build", "handoff-inspect", "handoff-inspect-legacy",
     "supervisor-import-identity", "native-revalidation",
+    "historical-native-revalidation",
 })
 LOG_VALIDATOR_STAGES = {
     "log-validator-x2apic": "forbidden",
@@ -2868,6 +2869,14 @@ def production_command_contract(stage, profile=CURRENT_PROFILE):
                 command_path("input:bundle"),
             ],
         },
+    }
+    contracts["historical-native-revalidation"] = {
+        **contracts["native-revalidation"],
+        "argv": [
+            command_path("input:validator"),
+            command_literal("historical-handoff"),
+            command_path("input:bundle"),
+        ],
     }
     for mode in (SIX_MODES if profile == CURRENT_PROFILE else MODES):
         contracts[mode] = {

@@ -255,6 +255,11 @@ class NativeRecordBridge(unittest.TestCase):
             "  'evidence/command-import-validator-build.json': b'{}',\n"
             "  'evidence/command-import-native-revalidation.json': b'{}',\n"
             "}\n"
+            "if mode == 'historical':\n"
+            "    del files['private/import-native-revalidation.log']\n"
+            "    del files['evidence/command-import-native-revalidation.json']\n"
+            "    files['private/import-historical-native-revalidation.log'] = b'Historical compute handoff revalidated; authority=not_admitted.\\n'\n"
+            "    files['evidence/command-import-historical-native-revalidation.json'] = b'{}'\n"
             "for name, data in files.items():\n"
             "    path = output / name\n"
             "    path.write_bytes(data)\n"
@@ -263,6 +268,12 @@ class NativeRecordBridge(unittest.TestCase):
             "if mode == 'stderr': os.write(2, b'unexpected')\n")
         stage = root / "stage"
         stage.mkdir(mode=0o700)
+        tools = {}
+        for role in ("git", "supervisor", "validator"):
+            path = root / role
+            path.write_bytes(b"local tool")
+            path.chmod(0o500)
+            tools[role] = path
         with mock.patch.dict(os.environ, {
                 bridge.CONTROLLER_ENV: str(controller),
                 "WAMR_CI_TEST_MODE": "accepted"}):
@@ -273,6 +284,21 @@ class NativeRecordBridge(unittest.TestCase):
                     self.assertRaisesRegex(ValueError, "revalidation refused"):
                 bridge.import_native_revalidation(stage, output)
             spawn.assert_not_called()
+            with self.assertRaisesRegex(ValueError, "revalidation refused"):
+                bridge.import_native_revalidation(
+                    stage, root / "wrong-historical-marker",
+                    historical=True, **tools)
+            with mock.patch.object(bridge.subprocess, "Popen") as spawn, \
+                    self.assertRaisesRegex(ValueError, "revalidation refused"):
+                bridge.import_native_revalidation(
+                    stage, root / "no-historical-tools", historical=True)
+            spawn.assert_not_called()
+        with mock.patch.dict(os.environ, {
+                bridge.CONTROLLER_ENV: str(controller),
+                "WAMR_CI_TEST_MODE": "historical"}):
+            output = root / "historical"
+            self.assertEqual(bridge.import_native_revalidation(
+                stage, output, historical=True, **tools), output)
         for mode in ("failed", "missing", "public", "stdout", "stderr"):
             with self.subTest(mode=mode), mock.patch.dict(os.environ, {
                     bridge.CONTROLLER_ENV: str(controller),
@@ -1385,9 +1411,11 @@ class NativeRecordBridge(unittest.TestCase):
             return root / ("identity-output" if stage ==
                            "supervisor-import-identity" else "native-output"), {}
 
+        native_marker = b"Compute handoff revalidated; authority=not_admitted.\n"
+
         def read(path, unused_limit):
             return (b"{}\n" if path == root / "identity-output"
-                    else b"Compute handoff revalidated; authority=not_admitted.\n")
+                    else native_marker)
 
         handoff = types.SimpleNamespace(ci=ci, private=mock.Mock())
         with mock.patch.object(public_bundle, "validate_local_supervisor",
@@ -1428,6 +1456,29 @@ class NativeRecordBridge(unittest.TestCase):
             self.assertEqual(
                 [call.args[1] for call in run.call_args_list],
                 ["supervisor-import-identity", "native-revalidation"])
+            with self.assertRaisesRegex(ValueError, "bundle refused"):
+                public_bundle.native(
+                    handoff, validator, supervisor, bundle, {},
+                    native_identity=identity, historical=True)
+            native_marker = (
+                b"Historical compute handoff revalidated; authority=not_admitted.\n")
+            run.reset_mock()
+            checked.reset_mock()
+            public_bundle.native(
+                handoff, validator, supervisor, bundle, {},
+                native_identity=identity, historical=True)
+            self.assertEqual(
+                [call.args[1] for call in run.call_args_list],
+                ["historical-native-revalidation"])
+            self.assertEqual(
+                run.call_args.args[2], [validator, "historical-handoff", bundle])
+            self.assertEqual(
+                [call.args[2] for call in checked.call_args_list],
+                ["historical-native-revalidation"])
+            with self.assertRaisesRegex(ValueError, "bundle refused"):
+                public_bundle.native(
+                    handoff, validator, supervisor, bundle, {},
+                    native_identity=identity)
 
     def test_trusted_v2_import_revalidation_selection_is_explicit(self):
         root, unused_controller = self.controller_fixture("")
@@ -1567,7 +1618,8 @@ class NativeRecordBridge(unittest.TestCase):
 
         def python_revalidation(
                 unused_handoff, validator, supervisor, candidate, expected_arg,
-                native_identity=None):
+                native_identity=None, *, historical=False):
+            self.assertFalse(historical)
             self.assertEqual(validator, root / "validator")
             self.assertEqual(supervisor, root / "supervisor")
             self.assertEqual(candidate, output / "candidate-bundle.json")

@@ -15,6 +15,7 @@ const source = @import("source_custody.zig");
 const supervisor_identity = @import("import_supervisor_identity.zig");
 
 const handoff_success = "Compute handoff revalidated; authority=not_admitted.\n";
+const historical_handoff_success = "Historical compute handoff revalidated; authority=not_admitted.\n";
 
 pub const LocalTools = struct {
     git: []const u8,
@@ -275,7 +276,7 @@ pub fn runPortable(
         return error.CandidateChanged;
     try authenticated.verify(io, repository, local.git);
     try accepted.revalidateWithSignal(signal);
-    _ = try revalidateHandoffCommand(allocator, io, .{
+    _ = try revalidateHandoffCommandStage(allocator, io, .{
         .source_root = repository,
         .work = output,
         .runtime = accepted.root,
@@ -287,7 +288,10 @@ pub fn runPortable(
         .direct_validator = local.validator,
         .bundle = candidate_path,
         .tools = @as([inputs.host_tools.len][]const u8, @splat("")),
-    }, private, evidence, signal);
+    }, private, evidence, signal, if (accepted.compatibility == .tiny_v1_legacy)
+        .@"import-historical-native-revalidation"
+    else
+        .@"import-native-revalidation");
     try authenticated.verify(io, repository, local.git);
     try accepted.revalidateWithSignal(signal);
     try pinned_start.verify(io);
@@ -555,13 +559,30 @@ pub fn revalidateHandoffCommand(
     evidence: std.Io.Dir,
     signal: ?*core.process.SignalCancellation,
 ) !@import("command_validation.zig").ValidatedCommand {
+    return revalidateHandoffCommandStage(allocator, io, roots, private, evidence, signal, .@"import-native-revalidation");
+}
+
+fn revalidateHandoffCommandStage(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    roots: plan.Roots,
+    private: std.Io.Dir,
+    evidence: std.Io.Dir,
+    signal: ?*core.process.SignalCancellation,
+    stage: plan.Stage,
+) !@import("command_validation.zig").ValidatedCommand {
+    const success = switch (stage) {
+        .@"import-native-revalidation" => handoff_success,
+        .@"import-historical-native-revalidation" => historical_handoff_success,
+        else => unreachable,
+    };
     var validator = try files.RetainedFile.open(io, roots.direct_validator, .tool);
     defer validator.close(io);
     var bundle = try files.RetainedFile.open(io, roots.bundle, .private);
     defer bundle.close(io);
     const outcome = try adapter.execute(allocator, io, .{
         .roots = roots,
-        .stage = .@"import-native-revalidation",
+        .stage = stage,
         .private_dir = private,
         .evidence_dir = evidence,
         .cancel = if (signal) |active| active.flag() else null,
@@ -570,9 +591,9 @@ pub fn revalidateHandoffCommand(
     defer allocator.free(outcome.stdout);
     if (outcome.poisoned) return error.CleanupPoisoned;
     if (!outcome.accepted or outcome.stderr_bytes != 0 or
-        !std.mem.eql(u8, outcome.stdout, handoff_success))
+        !std.mem.eql(u8, outcome.stdout, success))
         return error.StageRefused;
-    const checked = try validatedPostRun(allocator, io, roots.work, .@"import-native-revalidation", outcome.bytes);
+    const checked = try validatedPostRun(allocator, io, roots.work, stage, outcome.bytes);
     try validator.verify(io);
     try bundle.verify(io);
     return checked;

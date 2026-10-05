@@ -1310,6 +1310,10 @@ test "imported revalidation binds only the built validator and private bundle" {
     try std.testing.expectEqualStrings("input:validator", spec.argv[0].path.role);
     try std.testing.expectEqualStrings("handoff", spec.argv[1].literal);
     try std.testing.expectEqualStrings("input:bundle", spec.argv[2].path.role);
+    const historical = plan.spec(.@"import-historical-native-revalidation");
+    try std.testing.expectEqualStrings("historical-handoff", historical.argv[1].literal);
+    try std.testing.expectEqual(spec.seconds, historical.seconds);
+    try std.testing.expectEqual(spec.output_limit, historical.output_limit);
     const env = try plan.environment(std.testing.allocator, .@"import-native-revalidation");
     defer plan.freeEnvironment(std.testing.allocator, env);
     try std.testing.expectEqual(@as(usize, 6), env.len);
@@ -3395,7 +3399,7 @@ test "trusted historical inner stage accepts complete records and refuses tamper
         std.debug.print("legacy native revalidation: {s}\n", .{revalidated.stderr});
         if (parent.openDir(io, revalidated_name, .{})) |refused_output| {
             defer refused_output.close(io);
-            const log = refused_output.readFileAlloc(io, "private/import-native-revalidation.log", a, .limited(4096)) catch "private log unavailable";
+            const log = refused_output.readFileAlloc(io, "private/import-historical-native-revalidation.log", a, .limited(4096)) catch "private log unavailable";
             std.debug.print("legacy validator log: {s}\n", .{log});
         } else |_| {}
     }
@@ -3405,11 +3409,12 @@ test "trusted historical inner stage accepts complete records and refuses tamper
     const revalidated_output = try parent.openDir(io, revalidated_name, .{ .iterate = true });
     defer revalidated_output.close(io);
     try std.testing.expectEqualStrings(
-        "Compute handoff revalidated; authority=not_admitted.\n",
-        try revalidated_output.readFileAlloc(io, "private/import-native-revalidation.log", a, .limited(4096)),
+        "Historical compute handoff revalidated; authority=not_admitted.\n",
+        try revalidated_output.readFileAlloc(io, "private/import-historical-native-revalidation.log", a, .limited(4096)),
     );
-    const command = try revalidated_output.readFileAlloc(io, "evidence/command-import-native-revalidation.json", a, .limited(controller.records.max_record_bytes));
-    _ = try controller.accepted_run.validateCommandBinding(a, command, .@"import-native-revalidation", .trusted_inner_zip);
+    const command = try revalidated_output.readFileAlloc(io, "evidence/command-import-historical-native-revalidation.json", a, .limited(controller.records.max_record_bytes));
+    _ = try controller.accepted_run.validateCommandBinding(a, command, .@"import-historical-native-revalidation", .trusted_inner_zip);
+    try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBinding(a, command, .@"import-native-revalidation", .trusted_inner_zip));
     try accepted.revalidate();
     try parent.deleteTree(io, revalidated_name);
 

@@ -29,6 +29,7 @@ pub const Stage = enum {
     @"supervisor-import-identity",
     @"import-validator-build",
     @"import-native-revalidation",
+    @"import-historical-native-revalidation",
 };
 
 pub const Binding = union(enum) {
@@ -187,17 +188,8 @@ pub fn spec(stage: Stage) Spec {
                 .{ .literal = "--identity" },
             },
         },
-        .@"import-native-revalidation" => .{
-            .stage = stage,
-            .executable = "input:validator",
-            .seconds = 600,
-            .output_limit = 4096,
-            .argv = &.{
-                .{ .path = .{ .role = "input:validator" } },
-                .{ .literal = "handoff" },
-                .{ .path = .{ .role = "input:bundle" } },
-            },
-        },
+        .@"import-native-revalidation" => importHandoffSpec(.@"import-native-revalidation"),
+        .@"import-historical-native-revalidation" => importHandoffSpec(.@"import-historical-native-revalidation"),
         .@"finalize-qcow2" => packageSpec(.@"finalize-qcow2"),
         .@"derive-fixed-vhd" => packageSpec(.@"derive-fixed-vhd"),
         .@"raw-x2apic" => bootSpec(stage, .@"raw-x2apic"),
@@ -208,6 +200,20 @@ pub fn spec(stage: Stage) Spec {
         .@"vpc-legacy-apic" => bootSpec(stage, .@"vpc-legacy-apic"),
         .@"log-validator-x2apic" => validatorSpec(.@"log-validator-x2apic"),
         .@"log-validator-legacy" => validatorSpec(.@"log-validator-legacy"),
+    };
+}
+
+fn importHandoffSpec(comptime stage: Stage) Spec {
+    return .{
+        .stage = stage,
+        .executable = "input:validator",
+        .seconds = 600,
+        .output_limit = 4096,
+        .argv = &.{
+            .{ .path = .{ .role = "input:validator" } },
+            .{ .literal = if (stage == .@"import-historical-native-revalidation") "historical-handoff" else "handoff" },
+            .{ .path = .{ .role = "input:bundle" } },
+        },
     };
 }
 
@@ -372,7 +378,7 @@ pub fn environment(allocator: std.mem.Allocator, stage: Stage) ![]EnvironmentBin
         });
         return bindings.toOwnedSlice(allocator);
     }
-    if (stage == .@"import-native-revalidation") {
+    if (stage == .@"import-native-revalidation" or stage == .@"import-historical-native-revalidation") {
         try bindings.appendSlice(allocator, &.{
             .{ .name = "HOME", .value = .{ .path = .{ .role = "work", .relative = "private" } } },
             .{ .name = "LANG", .value = .{ .literal = "C" } },

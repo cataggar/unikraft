@@ -1048,7 +1048,7 @@ def validate_local_supervisor(handoff, supervisor, start, expected):
 
 def native(
         handoff, validator, supervisor, bundle, expected,
-        native_identity=None):
+        native_identity=None, *, historical=False):
     validator = Path(validator)
     supervisor = Path(supervisor)
     require(validator.is_absolute() and supervisor.is_absolute()
@@ -1096,9 +1096,15 @@ def native(
             require(native_identity == bundle.parent.with_name(
                 bundle.parent.name + "-native-identity") / "accepted")
             handoff.private(native_identity)
+        stage = ("historical-native-revalidation" if historical
+                 else "native-revalidation")
+        verb = "historical-handoff" if historical else "handoff"
+        success = (b"Historical compute handoff revalidated; authority=not_admitted.\n"
+                   if historical else
+                   b"Compute handoff revalidated; authority=not_admitted.\n")
         output, command = handoff.ci.execute(
-            bundle.parent, "native-revalidation",
-            [validator, "handoff", bundle], 600, 4096,
+            bundle.parent, stage,
+            [validator, verb, bundle], 600, 4096,
             input_records=input_records,
             path_roles={
                 "input:validator": validator,
@@ -1110,10 +1116,10 @@ def native(
                 validator_input["files"]["validator"]),
         }
         supervised_command_record(
-            handoff.ci, command, "native-revalidation",
+            handoff.ci, command, stage,
             role_identities, "producer_direct")
         require(handoff.ci.read(output, 4096)
-                == b"Compute handoff revalidated; authority=not_admitted.\n")
+                == success)
         handoff.ci.record_input_paths(
             {"validator": validator}, {}, content=True,
             expected=validator_input)
@@ -1573,7 +1579,8 @@ def pack(handoff, stage, archive, source, validator, supervisor, *, producer="py
             runtime, stage.with_name("handoff-revalidation"))
     else:
         native(
-            handoff, validator, supervisor, stage / "bundle.json", source)
+            handoff, validator, supervisor, stage / "bundle.json", source,
+            historical=bundle["version"] == 1)
     portable = copy.deepcopy(bundle)
     for item in members(handoff, portable, stage).values():
         item["path"] = Path(item["path"]).relative_to(stage).as_posix()
@@ -1824,7 +1831,8 @@ def import_bundle(
         native(
             handoff, validator, supervisor,
             output / "candidate-bundle.json", expected,
-            native_identity=native_identity)
+            native_identity=native_identity,
+            historical=bundle["version"] == 1)
     # Only a fully revalidated import publishes the operator-facing bundle.
     handoff.ci.save(output / "bundle.json", bundle)
     return bundle
