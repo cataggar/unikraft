@@ -232,7 +232,7 @@ cp support/tools/hyperv/local_boot/build.zig \
 zig build --build-file "$SCRATCH/restore/build.zig" --fetch=all \
   --pkg-dir "$SCRATCH/restore/zig-pkg" --cache-dir "$SCRATCH/restore/cache" \
   -j2
-zig build --build-file support/tools/hyperv/local_boot/build.zig \
+env -u ZIG_LOCAL_PKG_DIR zig build --build-file support/tools/hyperv/local_boot/build.zig \
   --system "$SCRATCH/restore/zig-pkg" \
   --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
   \

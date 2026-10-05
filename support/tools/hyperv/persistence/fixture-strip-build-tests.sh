@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
+unset ZIG_LOCAL_PKG_DIR
 
 if [ "$#" -ne 4 ] && [ "$#" -ne 5 ]; then
   echo 'Usage: fixture-strip-build-tests.sh ABS_ZIG ABS_LLVM_OBJCOPY ABS_PACKAGES EXISTING_PRIVATE_ROOT [LAYOUT_POLICY]' >&2

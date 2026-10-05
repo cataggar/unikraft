@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
+unset ZIG_LOCAL_PKG_DIR
 
 test "$(id -u)" -ne 0
 root="${RUNNER_TEMP:?}/hyperv-ci/native-operator-guard"

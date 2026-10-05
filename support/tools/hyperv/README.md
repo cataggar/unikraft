@@ -27,7 +27,7 @@ cp support/tools/hyperv/build.zig support/tools/hyperv/build.zig.zon "$CORE_WORK
 zig build --build-file "$CORE_WORK/restore/build.zig" \
   --fetch=all --pkg-dir "$CORE_WORK/restore/zig-pkg" \
   --cache-dir "$CORE_WORK/restore/cache" -j2
-zig build --build-file support/tools/hyperv/build.zig \
+env -u ZIG_LOCAL_PKG_DIR zig build --build-file support/tools/hyperv/build.zig \
   --system "$CORE_WORK/restore/zig-pkg" \
   --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
   --prefix "$CORE_WORK/out" -Dtest-root="$CORE_WORK/fixtures" \
@@ -92,6 +92,10 @@ Untracked fetched source under `zig-pkg` is not a custody exclusion and must
 not be ignored to make source admission pass. Standalone restores bind their
 own `--pkg-dir`; a shared environment setting must not redirect them into
 another restore's depot.
+For system-only builds, remove inherited `ZIG_LOCAL_PKG_DIR` from that child
+environment: Zig 0.17 otherwise lets it override the supplied `--system`
+directory. Explicit restore `--pkg-dir` still takes precedence over the
+environment and remains scoped to that restore.
 The direct native process and lifecycle child fixtures strip debug metadata in both checked modes;
 its safety checks and synthetic runtime modes remain enabled. This keeps exact executable
 snapshotting within the existing 120–200 ms fixture deadlines despite the

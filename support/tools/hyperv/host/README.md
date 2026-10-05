@@ -284,7 +284,7 @@ chmod 700 "$out/out/fixtures"
 cp support/tools/hyperv/host/build.zig support/tools/hyperv/host/build.zig.zon "$out/packages/restore/"
 /home/g/.local/bin/zig build --build-file "$out/packages/restore/build.zig" --fetch=all \
   --pkg-dir "$out/packages/restore/zig-pkg" --cache-dir "$out/packages/restore/cache" -j2
-/home/g/.local/bin/zig build --build-file support/tools/hyperv/host/build.zig test \
+env -u ZIG_LOCAL_PKG_DIR /home/g/.local/bin/zig build --build-file support/tools/hyperv/host/build.zig test \
   --system "$out/packages/restore/zig-pkg" --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
   --prefix "$out/out" \
   -Dtest-root="$out/out/fixtures" -j2 --summary all

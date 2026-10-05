@@ -273,7 +273,7 @@ TMPDIR and Zig/XDG caches beneath `.d/zig-migration-persistence`. With an
 existing owner-only absolute fixture directory:
 
 ```text
-ZIG_GLOBAL_CACHE_DIR=SCRATCH/global-cache zig build --build-file support/tools/hyperv/persistence/build.zig \
+ZIG_GLOBAL_CACHE_DIR=SCRATCH/global-cache env -u ZIG_LOCAL_PKG_DIR zig build --build-file support/tools/hyperv/persistence/build.zig \
   --system SCRATCH/restore/zig-pkg \
   --cache-dir SCRATCH/cache \
   --prefix SCRATCH/outputs/debug -Dtest-root=SCRATCH/fixtures \
@@ -575,7 +575,7 @@ for mode in debug safe; do
       mkdir -p "$run/fixtures"
       chmod 700 "$run" "$run/fixtures"
       status=0
-      "$ZIG" build --build-file support/tools/hyperv/persistence/build.zig \
+      env -u ZIG_LOCAL_PKG_DIR "$ZIG" build --build-file support/tools/hyperv/persistence/build.zig \
         --system "${PERSISTENCE_PACKAGES:?}" \
         --cache-dir "$run/cache" \
         --prefix "$run/out" -Dtest-root="$run/fixtures" \
@@ -698,7 +698,7 @@ remains the same 34 cases.
 ```bash
 umask 077
 export ZIG_GLOBAL_CACHE_DIR="$SCRATCH/global"
-"$ZIG" build --build-file support/tools/hyperv/persistence/build.zig \
+env -u ZIG_LOCAL_PKG_DIR "$ZIG" build --build-file support/tools/hyperv/persistence/build.zig \
   --system "$PERSISTENCE_PACKAGES" --cache-dir "$SCRATCH/cache" \
   --prefix "$SCRATCH/out" \
   -Dtest-root="$SCRATCH/fixtures" -Doptimize=debug \
@@ -772,7 +772,7 @@ for mode in debug safe; do
           "${layout[@]}" "-Dstrip-fixture-report=$run/qualification.json")
       fi
       status=0
-      "$ZIG" build --build-file support/tools/hyperv/persistence/build.zig \
+      env -u ZIG_LOCAL_PKG_DIR "$ZIG" build --build-file support/tools/hyperv/persistence/build.zig \
         --system "${PERSISTENCE_PACKAGES:?}" --cache-dir "$run/cache" \
         --prefix "$run/out" \
         -Dtest-root="$run/fixtures" -Dtest-filter="$filter" \
