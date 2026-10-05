@@ -463,7 +463,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_facade_tests = b.addRunArtifact(facade_tests);
-    run_facade_tests.setCwd(.cache_root);
+    // Private-file fixtures require trusted ancestors, unlike compiler caches
+    // which may be writable by other users.
+    run_facade_tests.setCwd(b.path("."));
     const native_environment_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("build.zig"),
@@ -473,7 +475,7 @@ pub fn build(b: *std.Build) void {
         .filters = &.{ "native Make environment", "Make assignments remain single arguments" },
     });
     const run_native_environment_tests = b.addRunArtifact(native_environment_tests);
-    run_native_environment_tests.setCwd(.cache_root);
+    run_native_environment_tests.setCwd(b.path("."));
     b.step("test-native-make-environment", "Test explicit private Make environment and unchanged default forwarding").dependOn(&run_native_environment_tests.step);
     const runner_tests = b.addTest(.{
         .root_module = b.createModule(.{

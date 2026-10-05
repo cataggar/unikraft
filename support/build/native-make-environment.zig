@@ -161,9 +161,17 @@ test "native Make environment reads only private state and validated explicit pa
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var temporary = std.testing.tmpDir(.{ .iterate = true });
-    defer temporary.cleanup();
-    try temporary.dir.setPermissions(io, .fromMode(0o700));
+    const cwd = std.Io.Dir.cwd();
+    var nonce: [16]u8 = undefined;
+    io.random(&nonce);
+    const dirname = try allocator.print(
+        ".native-make-environment-{s}",
+        .{std.fmt.bytesToHex(nonce, .lower)},
+    );
+    try cwd.createDir(io, dirname, .fromMode(0o700));
+    defer cwd.deleteTree(io, dirname) catch {};
+    const temporary = .{ .dir = try cwd.openDir(io, dirname, .{ .iterate = true }) };
+    defer temporary.dir.close(io);
     const base = try temporary.dir.realPathFileAlloc(io, ".", allocator);
     var contract = fixture;
     inline for (@typeInfo(Contract).@"struct".field_names) |name| {
