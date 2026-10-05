@@ -623,7 +623,9 @@ fn copyAlias(token: native_export.OutputReserved, start: *std.atomic.Value(bool)
 test "allocation refusal while acquiring source pins releases every descriptor" {
     var fixture = try ExportFixture.init("pin-allocation");
     defer fixture.deinit();
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, pinWithAllocator, .{&fixture});
+    // Arena growth must use the same allocations at every injected failure.
+    var fixed_growth = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(fixed_growth.allocator(), pinWithAllocator, .{&fixture});
 }
 
 fn pinWithAllocator(allocator: std.mem.Allocator, fixture: *ExportFixture) !void {
