@@ -172,7 +172,11 @@ zig build --fetch=all --cache-dir "$ZIG_LOCAL_CACHE_DIR" --prefix "$work/outputs
 ```
 
 Subsequent root invocations use `--system "$ZIG_LOCAL_PKG_DIR"` to prohibit
-implicit fetching. Guarded factories and CI must restore, authenticate, and
+implicit fetching. Zig 0.17 gives `ZIG_LOCAL_PKG_DIR` precedence over the
+directory argument to `--system`: fixed child environments must bind both to
+the same qualified depot, or remove the ambient variable before using the
+explicit directory. Never forward an unrelated or untrusted package selector.
+Guarded factories and CI must restore, authenticate, and
 bind the compiler and complete package closure **before** establishing
 source/admission custody. `--system` disables fetching; a directory path or
 hash-shaped package name alone is not authentication. Do not replace the
