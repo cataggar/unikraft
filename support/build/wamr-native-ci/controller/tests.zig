@@ -3488,6 +3488,24 @@ test "trusted historical inner stage accepts complete records and refuses tamper
         try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, replay.term);
         try std.testing.expectEqualStrings("", replay.stdout);
         try std.testing.expect(std.mem.indexOf(u8, replay.stderr, "PathAlreadyExists") != null);
+        for ([_]struct { index: usize, cause: []const u8 }{
+            .{ .index = 7, .cause = "ImportSupervisorChanged" },
+            .{ .index = 9, .cause = "InvalidValidator" },
+        }) |bad_tool| {
+            var refused_argv = argv.*;
+            refused_argv[bad_tool.index] = options.command_fixture;
+            refused_argv[11] = try std.fs.path.join(a, &.{ options.fixture_root, "refused-private-cli-tool" });
+            const refused_tool = try std.process.run(a, io, .{
+                .argv = &refused_argv,
+                .cwd = .{ .path = reader_repository },
+                .stdout_limit = .limited(4096),
+                .stderr_limit = .limited(4096),
+            });
+            try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, refused_tool.term);
+            try std.testing.expectEqualStrings("", refused_tool.stdout);
+            try std.testing.expect(std.mem.indexOf(u8, refused_tool.stderr, bad_tool.cause) != null);
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.openDirAbsolute(io, refused_argv[11], .{}));
+        }
     }
     {
         var private_bundle = try controller.accepted_run.PrivateBundle.open(a, io, &directory, stage_root_path, reader_repository, local_tools, null);

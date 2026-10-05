@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import resource
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -502,6 +503,14 @@ def private_cli(source, work, controller, validator):
     assert result.returncode == 0, result.stderr
     assert result.stdout == b"Private handoff exported; authority=not_admitted.\n"
     assert not result.stderr
+    for path in (native, *native.rglob("*")):
+        info = path.lstat()
+        assert info.st_uid == os.geteuid()
+        if stat.S_ISDIR(info.st_mode):
+            assert stat.S_IMODE(info.st_mode) == 0o700, path
+        else:
+            assert stat.S_ISREG(info.st_mode) and info.st_nlink == 1, path
+            assert stat.S_IMODE(info.st_mode) == 0o600, path
     handoff.export(runtime, oracle)
     actual, expected = (json.loads((path / "bundle.json").read_bytes())
                         for path in (native, oracle))

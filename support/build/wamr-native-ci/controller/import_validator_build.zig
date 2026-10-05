@@ -436,7 +436,7 @@ pub fn runPrivate(
         } else |_| {}
     }
     try bundle.revalidate(signal);
-    _ = try revalidateHandoffCommand(allocator, io, .{
+    const checked = try revalidateHandoffCommand(allocator, io, .{
         .source_root = bundle.evidence.repository.?,
         .work = output,
         .runtime = bundle.evidence.root,
@@ -449,6 +449,18 @@ pub fn runPrivate(
         .bundle = try std.fs.path.join(allocator, &.{ bundle.evidence.root, "bundle.json" }),
         .tools = @splat(""),
     }, private, evidence, signal);
+    var command_record = try files.RetainedFile.open(io, try std.fs.path.join(allocator, &.{
+        output, "evidence/command-import-native-revalidation.json",
+    }), .private);
+    defer command_record.close(io);
+    var command_log = try files.RetainedFile.open(io, try std.fs.path.join(allocator, &.{
+        output, "private/import-native-revalidation.log",
+    }), .private);
+    defer command_log.close(io);
+    const repeated = try validatedPostRun(allocator, io, output, .@"import-native-revalidation", @intCast(checked.output_bytes));
+    if (!std.meta.eql(checked, repeated)) return error.CommandOutputChanged;
+    try command_record.verify(io);
+    try command_log.verify(io);
     try bundle.revalidate(signal);
     try anchor.verify(io);
     try syncDirectory(io, evidence);
@@ -457,6 +469,8 @@ pub fn runPrivate(
     try syncDirectory(io, parent);
     try bundle.revalidate(signal);
     try anchor.verify(io);
+    try command_record.verify(io);
+    try command_log.verify(io);
 }
 
 fn syncDirectory(io: std.Io, directory: std.Io.Dir) !void {
