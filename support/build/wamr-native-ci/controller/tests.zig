@@ -3426,6 +3426,19 @@ test "trusted historical inner stage accepts complete records and refuses tamper
     const command = try revalidated_output.readFileAlloc(io, "evidence/command-import-historical-native-revalidation.json", a, .limited(controller.records.max_record_bytes));
     _ = try controller.accepted_run.validateCommandBinding(a, command, .@"import-historical-native-revalidation", .trusted_inner_zip);
     try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBinding(a, command, .@"import-native-revalidation", .trusted_inner_zip));
+    const current_refusal = try std.process.run(a, io, .{
+        .argv = &.{
+            options.import_validator,
+            "handoff",
+            try std.fs.path.join(a, &.{ revalidated_path, "private/candidate-bundle.json" }),
+        },
+        .cwd = .{ .path = reader_repository },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, current_refusal.term);
+    try std.testing.expectEqualStrings("", current_refusal.stdout);
+    try std.testing.expectEqualStrings("WAMR direct validation refused: WrongSdk\n", current_refusal.stderr);
     try accepted.revalidate();
     try parent.deleteTree(io, revalidated_name);
 
