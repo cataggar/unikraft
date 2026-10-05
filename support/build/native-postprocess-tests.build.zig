@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! Standalone, Python-free validation (Zig 0.17.0):
-//! zig build --build-file support/build/native-postprocess-tests.build.zig test -j2
+//! zig build --build-file support/build/native-postprocess-tests.build.zig --system "$ZIG_LOCAL_PKG_DIR" test -j2
 //! Use `integration -j2` for real LLVM strip/objcopy fixtures. Tool commands
 //! can be supplied with -Dobjcopy=... and -Dstrip=...; -Dfixture-arch=arm64
 //! also supports hosts whose native GNU binutils lack x86_64 support.

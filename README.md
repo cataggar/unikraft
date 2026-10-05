@@ -177,6 +177,11 @@ bind the compiler and complete package closure **before** establishing
 source/admission custody. `--system` disables fetching; a directory path or
 hash-shaped package name alone is not authentication. Do not replace the
 qualified depot with an empty tree or remove `--system` to make a gate pass.
+Keep package depots outside every source snapshot: Zig 0.17's default
+`zig-pkg` acquisition writes new package sources into the build root, which
+must fail strict source custody rather than be ignored. Scope this root depot
+to root invocations; independent restorers retain their own per-restore
+`--pkg-dir`. Do not override all restorers through a shared `GITHUB_ENV` entry.
 
 The facade also exposes an isolated native configuration parser and header
 generator. It consumes an already solved Kconfig `.config`; it does not

@@ -114,7 +114,8 @@ and exclusively owned by the build.
 Run the native ELF/image fixtures and actual strip/objcopy transformations:
 
 ```sh
-zig build --build-file support/build/native-postprocess-tests.build.zig integration -j2
+zig build --build-file support/build/native-postprocess-tests.build.zig \
+  --system "$ZIG_LOCAL_PKG_DIR" integration -j2
 ```
 
 The default fixture architecture is x86_64; `-Dfixture-arch=arm64` exercises
