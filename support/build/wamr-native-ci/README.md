@@ -28,6 +28,12 @@ algorithm still selects its original `669a27982b376311f558e820b69e9a692735b0cd`
 revision and package hash. Changing only an imported algorithm name cannot
 authenticate a package from the other generation.
 
+The WAMR-specific `dependency-restore/build.zig.zon` seeds both current Miz and
+the current SDK, so a cold `--fetch=all` also restores the SDK's immutable
+WABT/wasip2 and Translator/Aro closure before admission. Its Build installs no
+artifacts. It does not add SDK dependencies to generic local-boot consumers or
+change the historical singleton-Miz manifest.
+
 New SDK producers select exact-generation compatibility revision
 `bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20`, published by protected
 [WAMR PR #1081](https://github.com/cataggar/wamr/pull/1081).
