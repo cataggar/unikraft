@@ -834,12 +834,13 @@ fn dropPrivileges() !void {
 }
 fn wait(pid: linux.pid_t) !Status {
     while (true) {
-        var status: u32 = 0;
+        var status: i32 = 0;
         const result = linux.waitpid(-1, &status, 0);
         switch (linux.errno(result)) {
             .SUCCESS => if (result == @as(usize, @intCast(pid))) {
-                if (linux.W.IFEXITED(status)) return .{ .primary = .exited, .code = linux.W.EXITSTATUS(status) };
-                if (linux.W.IFSIGNALED(status)) return .{ .primary = .signaled, .code = @intCast(@backingInt(linux.W.TERMSIG(status))) };
+                const bits: u32 = @bitCast(status);
+                if (linux.W.IFEXITED(bits)) return .{ .primary = .exited, .code = linux.W.EXITSTATUS(bits) };
+                if (linux.W.IFSIGNALED(bits)) return .{ .primary = .signaled, .code = @intCast(@backingInt(linux.W.TERMSIG(bits))) };
                 return error.NamespaceWaitFailed;
             },
             .INTR => {},

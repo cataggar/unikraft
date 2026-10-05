@@ -581,11 +581,11 @@ fn parentDeathRace(allocator: std.mem.Allocator, io: std.Io) !void {
     var marker: [1]u8 = undefined;
     if (linux.read(ready[0], &marker, 1) != 1 or marker[0] != 'R') return error.FixtureFailed;
     if (linux.errno(linux.kill(@intCast(parent), .KILL)) != .SUCCESS) return error.FixtureFailed;
-    var status: u32 = 0;
-    if (linux.waitpid(@intCast(parent), &status, 0) != parent or !linux.W.IFSIGNALED(status)) return error.FixtureFailed;
+    var status: i32 = 0;
+    if (linux.waitpid(@intCast(parent), &status, 0) != parent or !linux.W.IFSIGNALED(@bitCast(status))) return error.FixtureFailed;
     // The original parent is dead and reaped before PID 1 registers PDEATHSIG.
     if (linux.write(release[1], "G", 1) != 1) return error.FixtureFailed;
-    if (linux.errno(linux.waitpid(-1, &status, 0)) != .SUCCESS or !linux.W.IFEXITED(status) or linux.W.EXITSTATUS(status) != 0)
+    if (linux.errno(linux.waitpid(-1, &status, 0)) != .SUCCESS or !linux.W.IFEXITED(@bitCast(status)) or linux.W.EXITSTATUS(@bitCast(status)) != 0)
         return error.FixtureFailed;
     if (linux.read(report[0], &marker, 1) != 1 or marker[0] != 'D') return error.FixtureFailed;
     for ([_]linux.fd_t{ ready[0], release[1], report[0] }) |fd| _ = linux.close(fd);
@@ -1665,7 +1665,7 @@ const FixtureChild = struct {
     fn collect(self: FixtureChild, allocator: std.mem.Allocator) !struct { status: ns.Status, stdout: []const u8, stderr: []const u8 } {
         defer _ = linux.close(self.output);
         defer _ = linux.close(self.diagnostic);
-        var status: u32 = 0;
+        var status: i32 = 0;
         while (true) {
             const result = linux.waitpid(self.pid, &status, 0);
             if (linux.errno(result) == .INTR) continue;
@@ -1676,11 +1676,12 @@ const FixtureChild = struct {
         // Reap before draining so the signal test cannot unblock a pending write.
         const stdout = try readPipe(allocator, self.output, 64 * 1024);
         const stderr = try readPipe(allocator, self.diagnostic, 4096);
+        const bits: u32 = @bitCast(status);
         return .{
-            .status = if (linux.W.IFEXITED(status))
-                .{ .primary = .exited, .code = linux.W.EXITSTATUS(status) }
-            else if (linux.W.IFSIGNALED(status))
-                .{ .primary = .signaled, .code = @intCast(@backingInt(linux.W.TERMSIG(status))) }
+            .status = if (linux.W.IFEXITED(bits))
+                .{ .primary = .exited, .code = linux.W.EXITSTATUS(bits) }
+            else if (linux.W.IFSIGNALED(bits))
+                .{ .primary = .signaled, .code = @intCast(@backingInt(linux.W.TERMSIG(bits))) }
             else
                 return error.FixtureFailed,
             .stdout = stdout,
@@ -1688,6 +1689,46 @@ const FixtureChild = struct {
         };
     }
 };
+
+test "namespace native child collection preserves exit and signal failure lanes" {
+    if (!builtin.single_threaded) @compileError("native child collection requires the single-threaded fixture root");
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |signaled| {
+        var output: [2]linux.fd_t = undefined;
+        if (linux.errno(linux.pipe2(&output, .{ .CLOEXEC = true })) != .SUCCESS) return error.FixtureFailed;
+        var output_owned = true;
+        defer if (output_owned) {
+            _ = linux.close(output[0]);
+            _ = linux.close(output[1]);
+        };
+        var diagnostic: [2]linux.fd_t = undefined;
+        if (linux.errno(linux.pipe2(&diagnostic, .{ .CLOEXEC = true })) != .SUCCESS) return error.FixtureFailed;
+        var diagnostic_owned = true;
+        defer if (diagnostic_owned) {
+            _ = linux.close(diagnostic[0]);
+            _ = linux.close(diagnostic[1]);
+        };
+        const pid = linux.fork();
+        if (linux.errno(pid) != .SUCCESS) return error.FixtureFailed;
+        if (pid == 0) {
+            if (signaled) {
+                _ = linux.kill(linux.getpid(), .KILL);
+                linux.exit_group(125);
+            }
+            linux.exit_group(19);
+        }
+        _ = linux.close(output[1]);
+        _ = linux.close(diagnostic[1]);
+        output_owned = false;
+        diagnostic_owned = false;
+        const result = try (FixtureChild{ .pid = @intCast(pid), .output = output[0], .diagnostic = diagnostic[0] }).collect(allocator);
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        try std.testing.expectEqual(@as(@TypeOf(result.status.primary), if (signaled) .signaled else .exited), result.status.primary);
+        try std.testing.expectEqual(@as(u8, if (signaled) @backingInt(linux.SIG.KILL) else 19), result.status.code);
+        try std.testing.expect(result.status.cleanup == .complete and result.status.recording == .complete);
+    }
+}
 
 fn readPipe(allocator: std.mem.Allocator, fd: linux.fd_t, maximum: usize) ![]const u8 {
     var bytes: std.ArrayList(u8) = .empty;
