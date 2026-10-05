@@ -35,7 +35,7 @@ tool="$tool_root/bin/uk-wamr-aot-build"
 ```
 
 `uk-wamr-aot-build prepare` exports exactly WAMR
-`4d393552cf1797e1d4a65328ddb444f96ee5b816` from the local Git object
+`5e809554cd1dd01e6a8a314dc17c055a89c6e907` from the local Git object
 database into this application's ignored `build/wamr-source/`. It never
 builds in, changes, or inherits uncommitted files from the source checkout.
 It builds that revision's host `wamrc`, its freestanding library audit,
