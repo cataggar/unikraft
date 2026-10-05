@@ -36,6 +36,44 @@ test "installed foundation executable has a stable version and bounded refusal" 
     try testing.expect(std.mem.indexOf(u8, refused.stderr, repository) == null);
 }
 
+test "native prepare refuses unbound or incorrectly hashed offline packages" {
+    const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
+    defer allocator.free(cli);
+    const fixture = try std.Io.Dir.cwd().realPathFileAlloc(io, options.prepare_fixture, allocator);
+    defer allocator.free(fixture);
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    try temporary.dir.setPermissions(io, .fromMode(0o700));
+    const archive = try sourceArchive(&temporary);
+    defer allocator.free(archive);
+    var environment = try fixtureEnvironment(fixture);
+    defer environment.deinit();
+    const unbound_repository = try fixtureRepository(&temporary, "unbound");
+    defer allocator.free(unbound_repository);
+    const unbound = try runCli(cli, &.{ cli, "prepare", "--repository", unbound_repository, "--source-archive", archive }, &environment);
+    defer allocator.free(unbound.stdout);
+    defer allocator.free(unbound.stderr);
+    try testing.expect(unbound.term == .exited and unbound.term.exited != 0);
+    const wrong_repository = try fixtureRepository(&temporary, "wrong-hash");
+    defer allocator.free(wrong_repository);
+    try environment.put("WAMR_PREPARE_FIXTURE_PACKAGE_HASH", "wrong-package-hash");
+    const wrong = try runPrepare(cli, wrong_repository, archive, .{ .name = "wrong-hash" }, &environment);
+    defer allocator.free(wrong.stdout);
+    defer allocator.free(wrong.stderr);
+    try testing.expect(wrong.term == .exited and wrong.term.exited != 0);
+    _ = environment.swapRemove("WAMR_PREPARE_FIXTURE_PACKAGE_HASH");
+    const missing_repository = try fixtureRepository(&temporary, "missing-sdk-package");
+    defer allocator.free(missing_repository);
+    try bindPreparePackages(missing_repository, &environment);
+    const packages = try build_tool.files.PrivateDirectory.open(io, environment.get("ZIG_LOCAL_PKG_DIR").?);
+    defer packages.close(io);
+    try packages.dir.deleteTree(io, build_tool.wabt_hash);
+    const missing = try runCli(cli, &.{ cli, "prepare", "--repository", missing_repository, "--source-archive", archive }, &environment);
+    defer allocator.free(missing.stdout);
+    defer allocator.free(missing.stderr);
+    try testing.expect(missing.term == .exited and missing.term.exited != 0);
+}
+
 test "native prepare and verify cover every variant with create-only output" {
     const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
     defer allocator.free(cli);
@@ -434,6 +472,7 @@ test "development checkout selection is explicit and cannot masquerade as suppor
     const git_path = try std.Io.Dir.cwd().realPathFileAlloc(io, options.git_executable, allocator);
     defer allocator.free(git_path);
     try environment.put("WAMR_CI_TOOL_GIT", git_path);
+    try bindPreparePackages(repository, &environment);
     const prepared = try runCli(
         cli,
         &.{ cli, "prepare", "--repository", repository, "--source", checkout, "--development-revision", revision },
@@ -1397,6 +1436,11 @@ fn runPrepare(
     case: PrepareCase,
     environment: *const std.process.Environ.Map,
 ) !std.process.RunResult {
+    var selected = std.process.Environ.Map.init(allocator);
+    defer selected.deinit();
+    var entries = environment.iterator();
+    while (entries.next()) |entry| try selected.put(entry.key_ptr.*, entry.value_ptr.*);
+    try bindPreparePackages(repository, &selected);
     var arguments: std.ArrayList([]const u8) = .empty;
     defer arguments.deinit(allocator);
     try arguments.appendSlice(allocator, &.{
@@ -1412,7 +1456,22 @@ fn runPrepare(
     if (case.coremark) try arguments.append(allocator, "--coremark");
     if (case.jit_mode) |mode|
         try arguments.appendSlice(allocator, &.{ "--jit-mode", mode });
-    return runCli(cli, arguments.items, environment);
+    return runCli(cli, arguments.items, &selected);
+}
+
+fn bindPreparePackages(repository: []const u8, environment: *std.process.Environ.Map) !void {
+    const parent = try build_tool.files.PrivateDirectory.open(io, std.fs.path.dirname(repository).?);
+    defer parent.close(io);
+    const packages = try build_tool.files.ensurePrivateDirectory(io, parent.dir, "prepare-packages");
+    defer packages.close(io);
+    for ([_][]const u8{ build_tool.translate_c_hash, build_tool.aro_hash, build_tool.wabt_hash, build_tool.wasip2_hash }) |name| {
+        const package = try build_tool.files.ensurePrivateDirectory(io, packages, name);
+        defer package.close(io);
+        try build_tool.files.writePrivateAtomicReplace(io, package, "build.zig", "fixture package\n");
+    }
+    const packages_path = try std.fs.path.join(allocator, &.{ std.fs.path.dirname(repository).?, "prepare-packages" });
+    defer allocator.free(packages_path);
+    try environment.put("ZIG_LOCAL_PKG_DIR", packages_path);
 }
 
 fn runCli(

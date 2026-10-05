@@ -2253,7 +2253,7 @@ test "historical v2 supervised bindings use the closed imported producer contrac
         \\for record in records.values():
         \\    request=record["supervisor"]["request"]
         \\    request["argv"]=[m.ci.command_literal("-Doptimize=ReleaseSafe") if item==m.ci.command_literal("-Doptimize=safe") else item for item in request["argv"]]
-        \\    if request["stage"] in ("config","native-image"):
+        \\    if request["stage"] in ("prepare","config","native-image"):
         \\        request["environment"]=[item for item in request["environment"] if item["name"]!="ZIG_LOCAL_PKG_DIR"]
         \\    e.rehash_supervised_binding(record)
         \\tampered=copy.deepcopy(records["adapter"]); tampered["supervisor"]["request"]["argv"][1]={"kind":"literal","value":"--arbitrary"}
@@ -2280,7 +2280,7 @@ test "historical v2 supervised bindings use the closed imported producer contrac
             continue;
         }
         const stage = std.meta.stringToEnum(controller.command_plan.Stage, name) orelse return error.UnexpectedStage;
-        const historical_root = stage == .config or stage == .@"native-image";
+        const historical_root = stage == .prepare or stage == .config or stage == .@"native-image";
         const historical_value = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .parse_numbers = false });
         const observed = if (historical_root)
             try controller.command_validation.validateHistoricalGeneration(a, historical_value, stage, .trusted_inner_zip)

@@ -750,11 +750,15 @@ The restoration command's fresh environment binds
 the Python restoration command also uses the restore directory as its cwd.
 This is a per-restoration binding, not a process-global or CI-wide package
 directory override. No default `zig-pkg` may be introduced into source custody.
-The current config and native-image command bindings pass this same
+The current prepare, config and native-image command bindings pass this same
 authenticated depot to the image helper as `ZIG_LOCAL_PKG_DIR`. The helper
 revalidates the immutable Translator/Aro closure before the root Build and
 passes `--system`; the current Miz closure already restores those exact
 packages transitively, so no additional manifest root is needed.
+That statement concerns the root translator only: raw SDK preparation also
+requires the immutable WABT and wasip2 closure from the qualified SDK manifest,
+restored and authenticated before source/admission custody. Preparation never
+fetches a missing SDK package implicitly.
 Historical command records retain their original environment through the
 explicit historical import selector, never current producer admission.
 Before reading package content it enumerates and snapshots the complete bounded

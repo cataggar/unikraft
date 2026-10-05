@@ -105,18 +105,37 @@ const Stage = enum {
     }
 };
 
-const RootPackages = struct {
+pub const RootPackages = struct {
     path: []const u8,
     directory: contract.files.PrivateDirectory,
     identity: contract.files.Snapshot,
     tree: [32]u8,
+    names: []const []const u8,
 
-    const names = [_][]const u8{ contract.translate_c_hash, contract.aro_hash };
+    pub const root_names = [_][]const u8{ contract.translate_c_hash, contract.aro_hash };
+    pub const sdk_names = [_][]const u8{ contract.translate_c_hash, contract.aro_hash, contract.wabt_hash, contract.wasip2_hash };
 
-    fn open(
+    pub fn open(
         allocator: std.mem.Allocator,
         io: std.Io,
         environment: *const std.process.Environ.Map,
+    ) !RootPackages {
+        return openNames(allocator, io, environment, &root_names);
+    }
+
+    pub fn openSDK(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        environment: *const std.process.Environ.Map,
+    ) !RootPackages {
+        return openNames(allocator, io, environment, &sdk_names);
+    }
+
+    fn openNames(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        environment: *const std.process.Environ.Map,
+        names: []const []const u8,
     ) !RootPackages {
         const path = environment.get("ZIG_LOCAL_PKG_DIR") orelse
             return error.UnboundRootPackages;
@@ -128,23 +147,24 @@ const RootPackages = struct {
             .path = path,
             .directory = directory,
             .identity = identity,
-            .tree = try fingerprint(allocator, io, directory.dir),
+            .tree = try fingerprint(allocator, io, directory.dir, names),
+            .names = names,
         };
     }
 
-    fn close(self: RootPackages, io: std.Io) void {
+    pub fn close(self: RootPackages, io: std.Io) void {
         self.directory.close(io);
     }
 
-    fn verify(self: RootPackages, allocator: std.mem.Allocator, io: std.Io) !void {
+    pub fn verify(self: RootPackages, allocator: std.mem.Allocator, io: std.Io) !void {
         const named = try contract.files.PrivateDirectory.open(io, self.path);
         defer named.close(io);
         if (!contract.files.sameSnapshot(self.identity, try contract.files.snapshot(.{ .handle = named.dir.handle, .flags = .{ .nonblocking = false } })) or
-            !std.meta.eql(self.tree, try fingerprint(allocator, io, self.directory.dir)))
+            !std.meta.eql(self.tree, try fingerprint(allocator, io, self.directory.dir, self.names)))
             return error.RootPackagesChanged;
     }
 
-    fn authenticate(
+    pub fn authenticate(
         self: RootPackages,
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -152,7 +172,7 @@ const RootPackages = struct {
         environment: *const std.process.Environ.Map,
         state: std.Io.Dir,
         state_path: []const u8,
-        runner: *Runner,
+        runner: anytype,
         cwd: std.Io.Dir,
         cwd_path: []const u8,
     ) !void {
@@ -160,7 +180,7 @@ const RootPackages = struct {
         defer hashes.close(io);
         const hashes_path = try std.fs.path.join(allocator, &.{ state_path, "root-package-hashes" });
         defer allocator.free(hashes_path);
-        for (names) |name| {
+        for (self.names) |name| {
             const package_path = try std.fs.path.join(allocator, &.{ self.path, name });
             defer allocator.free(package_path);
             var result = try runner.runSuccess(zig, .root_dependency_hash, &.{
@@ -175,7 +195,7 @@ const RootPackages = struct {
         try self.verify(allocator, io);
     }
 
-    fn fingerprint(allocator: std.mem.Allocator, io: std.Io, directory: std.Io.Dir) ![32]u8 {
+    fn fingerprint(allocator: std.mem.Allocator, io: std.Io, directory: std.Io.Dir, names: []const []const u8) ![32]u8 {
         var hasher = core.Sha256.init(.{});
         var entries: usize = 0;
         var bytes: u64 = 0;
@@ -198,7 +218,7 @@ const RootPackages = struct {
         bytes: *u64,
         depth: usize,
     ) !void {
-        if (depth > 64 or entries.* >= 65536) return error.RootPackageLimitExceeded;
+        if (depth > 64 or entries.* >= 16384) return error.RootPackageLimitExceeded;
         const before = try contract.files.snapshot(.{ .handle = directory.handle, .flags = .{ .nonblocking = false } });
         try bindMetadata(hasher, before, true);
         var names_list: std.ArrayList([]const u8) = .empty;
@@ -208,7 +228,7 @@ const RootPackages = struct {
         }
         var iterator = directory.iterate();
         while (try iterator.next(io)) |entry| {
-            if (entries.* >= 65536) return error.RootPackageLimitExceeded;
+            if (entries.* >= 16384) return error.RootPackageLimitExceeded;
             entries.* += 1;
             try core.private_files.basename(entry.name);
             const name = try allocator.dupe(u8, entry.name);
@@ -233,7 +253,7 @@ const RootPackages = struct {
                     const info = try contract.files.snapshot(file);
                     try bindMetadata(hasher, info, false);
                     bytes.* = try std.math.add(u64, bytes.*, info.size);
-                    if (info.size > 64 * 1024 * 1024 or bytes.* > maximum_source_bytes)
+                    if (info.size > 64 * 1024 * 1024 or bytes.* > 256 * 1024 * 1024)
                         return error.RootPackageLimitExceeded;
                 },
                 else => return err,

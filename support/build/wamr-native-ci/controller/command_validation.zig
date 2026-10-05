@@ -137,7 +137,7 @@ fn matchPlan(
     const environment = try get(request, "environment");
     const expected = try plan.environment(a, stage);
     defer plan.freeEnvironment(a, expected);
-    const historical_root_packages = historical_generation and variant != .native and (stage == .config or stage == .@"native-image");
+    const historical_root_packages = historical_generation and variant != .native and (stage == .prepare or stage == .config or stage == .@"native-image");
     if (environment != .array or environment.array.items.len != expected.len - @as(usize, @intFromBool(historical_root_packages)))
         return error.InvalidCommand;
     var environment_index: usize = 0;

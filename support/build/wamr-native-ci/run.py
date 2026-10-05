@@ -521,7 +521,7 @@ def command_environment(root, input_records=None, extra=None, *, stage=None):
     if stage == "dependency-restore":
         environment["ZIG_LOCAL_PKG_DIR"] = str(
             Path(root) / "dependencies/zig-pkg")
-    if stage in {"config", "native-image"}:
+    if stage in {"prepare", "config", "native-image"}:
         environment["ZIG_LOCAL_PKG_DIR"] = str(
             Path(root) / "dependencies/zig-pkg")
     return environment
@@ -2710,7 +2710,7 @@ def production_command_contract(stage, profile=CURRENT_PROFILE):
             ],
         },
         "prepare": {
-            "kind": "build-native", "seconds": 1800,
+            "kind": "build-root", "seconds": 1800,
             "output_limit": 8 * MIB,
             "command_executable": command_path(WAMR_AOT_BUILD_ROLE),
             "native_executable": command_path(WAMR_AOT_BUILD_ROLE),

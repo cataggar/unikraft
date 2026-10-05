@@ -4125,7 +4125,7 @@ class Evidence(unittest.TestCase):
         original = dict(ci.COMMAND_ENVIRONMENT)
         for name in ("restore-one", "restore-two"):
             root = self.root / name
-            for stage in ("dependency-restore", "config", "native-image"):
+            for stage in ("dependency-restore", "prepare", "config", "native-image"):
                 environment = ci.command_environment(root, stage=stage)
                 self.assertEqual(environment["ZIG_LOCAL_PKG_DIR"],
                                  str(root / "dependencies/zig-pkg"))
@@ -5196,7 +5196,7 @@ source/generated/
                         record, stage, changed_identities)
 
     def test_root_depot_binding_is_current_and_historical_imports_remain_explicit(self):
-        for stage in ("config", "native-image"):
+        for stage in ("prepare", "config", "native-image"):
             with self.subTest(stage=stage):
                 record, identities = self.supervised_binding(stage)
                 environment = record["supervisor"]["request"]["environment"]

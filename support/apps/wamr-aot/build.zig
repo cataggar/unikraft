@@ -69,6 +69,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tests/build_tool_prepare_fixture.zig"),
             .target = b.graph.host,
             .optimize = optimize,
+            .imports = &.{.{ .name = "wamr_aot_build", .module = module }},
         }),
     });
     const image_fixture = b.addExecutable(.{

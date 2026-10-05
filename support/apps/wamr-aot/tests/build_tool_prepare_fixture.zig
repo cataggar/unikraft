@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 const std = @import("std");
 const linux = std.os.linux;
+const build_tool = @import("wamr_aot_build");
 
 pub fn main(init: std.process.Init) void {
     run(init) catch |err| {
@@ -15,6 +16,17 @@ fn run(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const arguments = try init.minimal.args.toSlice(allocator);
     try recordEnvironment(init, allocator, arguments);
+    if (arguments.len == 5 and std.mem.eql(u8, arguments[1], "fetch")) {
+        const name = std.fs.path.basename(arguments[4]);
+        if (!std.mem.eql(u8, name, build_tool.translate_c_hash) and
+            !std.mem.eql(u8, name, build_tool.aro_hash) and
+            !std.mem.eql(u8, name, build_tool.wabt_hash) and
+            !std.mem.eql(u8, name, build_tool.wasip2_hash))
+            return error.UnpinnedPackage;
+        var stdout = std.Io.File.stdout().writer(init.io, &.{});
+        try stdout.interface.print("{s}\n", .{init.environ_map.get("WAMR_PREPARE_FIXTURE_PACKAGE_HASH") orelse name});
+        return;
+    }
     if (arguments.len >= 3 and std.mem.eql(u8, arguments[1], "ar")) {
         if (arguments.len == 4 and std.mem.eql(u8, arguments[2], "t")) {
             try failIfSelected(init, "runtime-archive-members");
@@ -107,6 +119,8 @@ fn run(init: std.process.Init) !void {
         return;
     }
     if (contains(arguments, "build")) {
+        if (!contains(arguments, "--system") or init.environ_map.get("ZIG_LOCAL_PKG_DIR") == null)
+            return error.MissingOfflinePackages;
         const prefix = optionAfter(arguments, "--prefix") orelse return error.MissingPrefix;
         if (contains(arguments, "native-aot-fixture")) {
             try failIfSelected(init, "compiler-build");

@@ -36,13 +36,17 @@ tool="$tool_root/bin/uk-wamr-aot-build"
 "$tool" native-images --repository "$PWD"
 ```
 
-`olddefconfig` and `native-images` require this explicit, private offline
+`prepare`, `olddefconfig` and `native-images` require this explicit, private offline
 depot. Before capturing application inputs or launching the root Build, the
 native helper authenticates the pinned Translator and Aro packages using
 bounded local-path `zig fetch --pkg-dir` operations. It retains their physical
 metadata and checks it again after the root command. The root Build receives
 `--system` with the same depot; an absent, changed, unsafe or mismatched depot
 is refused, never replaced with an ambient cache or an implicit fetch.
+Preparation additionally authenticates the SDK's exact WABT and
+wasip2 packages with the same physical and immutable-hash checks. The Miz
+closure alone restores Translator/Aro, not those additional SDK dependencies;
+the qualified SDK closure must be restored into the bound depot too.
 
 `uk-wamr-aot-build prepare` exports exactly WAMR
 `661ac49584c4d0ac57adb78eba62f3ff3e9795df` from the local Git object

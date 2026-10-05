@@ -413,7 +413,7 @@ pub fn environment(allocator: std.mem.Allocator, stage: Stage) ![]EnvironmentBin
     });
     if (stage == .adapter or stage == .@"local-boot-tool" or stage == .@"public-validator-build")
         try bindings.append(allocator, .{ .name = "WAMR_CI_LAUNCH_EXECUTABLE", .value = zig });
-    if (stage == .config or stage == .@"native-image")
+    if (stage == .prepare or stage == .config or stage == .@"native-image")
         try bindings.append(allocator, .{ .name = "ZIG_LOCAL_PKG_DIR", .value = .{ .path = .{ .role = "work", .relative = "dependencies/zig-pkg" } } });
     if (stage == .fixtures)
         try bindings.appendSlice(allocator, &.{
