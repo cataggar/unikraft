@@ -2,17 +2,23 @@
 set -euo pipefail
 umask 077
 
-if [ "$#" -ne 4 ]; then
-  echo 'Usage: fixture-strip-build-tests.sh ABS_ZIG ABS_LLVM_OBJCOPY ABS_PACKAGES EXISTING_PRIVATE_ROOT' >&2
+if [ "$#" -ne 4 ] && [ "$#" -ne 5 ]; then
+  echo 'Usage: fixture-strip-build-tests.sh ABS_ZIG ABS_LLVM_OBJCOPY ABS_PACKAGES EXISTING_PRIVATE_ROOT [LAYOUT_POLICY]' >&2
   exit 2
 fi
-for path in "$@"; do
+for path in "$1" "$2" "$3" "$4"; do
   case "$path" in /*) ;; *) echo 'All test paths must be absolute' >&2; exit 2 ;; esac
 done
 zig="$1"
 objcopy="$2"
 packages="$3"
 root="$4"
+layout_policy="${5:-identical_program_headers}"
+case "$layout_policy" in
+  identical_program_headers) layout=() ;;
+  file_offset_relayout) layout=(-Dfixture-file-relayout=true) ;;
+  *) echo 'Unsupported layout policy' >&2; exit 2 ;;
+esac
 if [ -L "$root" ] || [ "$(stat -c '%u:%a' "$root")" != "$(id -u):700" ]; then
   echo 'The test root must be an existing private owner-only directory' >&2
   exit 2
@@ -31,15 +37,16 @@ sha256sum -- "$objcopy" > "$root/objcopy.sha256"
 common=(
   "$zig" build --build-file "$package/build.zig" --system "$packages"
   --cache-dir "$root/cache" --prefix "$root/out"
-  "-Dtest-root=$root/fixtures" -Doptimize=debug -j2 --summary all
+  -Doptimize=debug -j2 --summary all
 )
-qualified=(-Dstrip-fixture-debug=true "-Dfixture-objcopy=$objcopy")
+qualified=(-Dstrip-fixture-debug=true "-Dfixture-objcopy=$objcopy" "${layout[@]}")
 filter="-Dtest-filter=persistence timing native malformed delivery"
 
 run_build() {
   local name="$1" expected="$2" status=0
   shift 2
-  "${common[@]}" "$@" > "$root/$name.log" 2>&1 || status=$?
+  mkdir -m 700 -- "$root/fixtures/$name"
+  "${common[@]}" "-Dtest-root=$root/fixtures/$name" "$@" > "$root/$name.log" 2>&1 || status=$?
   printf '%s\n' "$status" > "$root/$name.exit"
   if { [ "$expected" = pass ] && [ "$status" -ne 0 ]; } ||
      { [ "$expected" = refuse ] && [ "$status" -eq 0 ]; }; then
@@ -51,7 +58,7 @@ run_build() {
 }
 
 run_build raw pass test "$filter"
-grep -Fq '1/1 tests passed' "$root/raw.log"
+grep -Fq 'run test 1 pass (1 total)' "$root/raw.log"
 if grep -Eq '^persistence_timing |run exe persistence-fixture-strip-verifier|run .*objcopy' "$root/raw.log"; then
   echo 'Default-off unexpectedly activated qualification' >&2
   exit 1
@@ -73,16 +80,16 @@ grep -Fq 'strip-fixture-report must be absolute' "$root/relative-report.log"
 
 proof="$root/qualification.json"
 run_build qualified pass qualify-fixture test "$filter" "${qualified[@]}" "-Dstrip-fixture-report=$proof"
-grep -Fq '1/1 tests passed' "$root/qualified.log"
+grep -Fq 'run test 1 pass (1 total)' "$root/qualified.log"
 if grep -q '^persistence_timing ' "$root/qualified.log"; then
   echo 'Stripping unexpectedly enabled timing' >&2
   exit 1
 fi
 test "$(stat -c '%u:%a:%h' "$proof")" = "$(id -u):600:1"
-jq -e '.schema == "hyperv_persistence_fixture_debug_stripping_v1" and
+jq -e --arg layout_policy "$layout_policy" '.schema == "hyperv_persistence_fixture_debug_stripping_v1" and
   .authority == "synthetic_only_not_admitted" and .admitted == false and
   .qualification_only == true and .worker.role == "persistence_worker" and
-  .layout_policy == "identical_program_headers" and
+  .layout_policy == $layout_policy and
   .worker.candidate.size < .worker.raw.size' "$proof" > /dev/null
 raw="$(jq -er '.worker.raw.path' "$proof")"
 candidate="$(jq -er '.worker.candidate.path' "$proof")"
@@ -134,7 +141,7 @@ fi
 test "$(sha256sum -- "$raw")" = "$raw_hash"
 test "$(sha256sum -- "$proof")" = "$proof_hash"
 run_build raw-after-tamper pass test "$filter"
-grep -Fq '1/1 tests passed' "$root/raw-after-tamper.log"
+grep -Fq 'run test 1 pass (1 total)' "$root/raw-after-tamper.log"
 if grep -Eq '^persistence_timing |run exe persistence-fixture-strip-verifier|run .*objcopy' "$root/raw-after-tamper.log"; then
   echo 'Default-off unexpectedly consumed the qualified candidate' >&2
   exit 1

@@ -701,14 +701,21 @@ export ZIG_GLOBAL_CACHE_DIR="$SCRATCH/global"
   -Dstrip-fixture-debug=true -Dfixture-objcopy="$LLVM_OBJCOPY" \
   -j2 test-strip-equivalence test-strip-proof --summary all
 bash support/tools/hyperv/persistence/fixture-strip-build-tests.sh \
-  "$ZIG" "$LLVM_OBJCOPY" "$PERSISTENCE_PACKAGES" "$PRIVATE_TEST_ROOT"
+  "$ZIG" "$LLVM_OBJCOPY" "$PERSISTENCE_PACKAGES" "$PRIVATE_TEST_ROOT" \
+  file_offset_relayout
 ```
 
-The Bash runner requires a new existing owner-only root. It uses the real
+The Bash runner requires a new existing owner-only root. Its optional fifth
+argument selects the existing layout policy before any build; omission keeps
+`identical_program_headers`. It never falls back from a refused layout.
+Each named case gets a distinct private fixture child, so cached binaries do
+not substitute for fresh native-case execution. It uses the real
 build/run graph to cover quiet raw selection, invalid flags, qualified native
 execution, create-only report refusal on a cache hit, uncached verification
 with no report, namespace-schema refusal, invalid tool output and cached
-candidate tampering. Deliberately invalid shell payloads would leave a marker
+candidate tampering. It requires the selected native run's exact one-case
+result, not an aggregate summary that also counts the shared SHA tests.
+Deliberately invalid shell payloads would leave a marker
 if incorrectly executed; both rejection paths must leave none. Only the
 runner's candidate cache copy is corrupted, after retaining full good raw/
 candidate copies. The selected raw is never modified, and a final default-off
