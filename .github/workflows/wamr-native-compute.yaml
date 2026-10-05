@@ -91,26 +91,33 @@ jobs:
         timeout-minutes: 30
         run: |
           set -euo pipefail
-          source_root="${RUNNER_TEMP}/wamr-source-custody-limits"
+          source_root="${RUNNER_TEMP}/wamr-controller-fixtures"
           test ! -e "${source_root}"
           git worktree add --detach "${source_root}" HEAD
-          cleanup() { git worktree remove --force -- "${source_root}"; }
+          retain_source=false
+          cleanup() {
+            if [ "${retain_source}" != true ]; then
+              git worktree remove --force -- "${source_root}"
+            fi
+          }
           trap cleanup EXIT
-          mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-source-custody-limits-cache"
-          ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-source-custody-limits-cache" \
+          mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-controller-fixture-cache"
+          ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
             zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
-            -Doptimize=ReleaseSafe -j2 test-controller-limits
+              -Doptimize=ReleaseSafe -j2 test-controller-limits
+          retain_source=true
 
       - name: Exercise native controller, custody limits, and package-boot fixtures in an isolated x86 worktree
         timeout-minutes: 15
         run: |
           set -euo pipefail
           source_root="${RUNNER_TEMP}/wamr-controller-fixtures"
-          test ! -e "${source_root}"
-          git worktree add --detach "${source_root}" HEAD
+          test -d "${source_root}"
           cleanup() { git worktree remove --force -- "${source_root}"; }
           trap cleanup EXIT
-          mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-controller-fixture-cache"
+          test "$(git -C "${source_root}" rev-parse HEAD)" = "$(git rev-parse HEAD)"
+          test -z "$(git -C "${source_root}" status --porcelain)"
+          test -d "${RUNNER_TEMP}/wamr-controller-fixture-cache"
           mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-controller-pipeline-root"
           mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-controller-python-private"
           export TMPDIR="${RUNNER_TEMP}/wamr-controller-python-private"
