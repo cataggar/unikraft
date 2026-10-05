@@ -8,13 +8,17 @@ I/O, interrupt delivery, or AP workload acceptance.
 
 ## Build and run
 
+Restore the immutable root translator/Aro closure explicitly as described in
+the root README. Guarded callers must authenticate and bind that depot and
+compiler before source/admission custody; retain the offline `--system` fence.
+
 ```sh
-zig build build-hyperv-image-proofs -j2
+zig build --system "$ZIG_LOCAL_PKG_DIR" build-hyperv-image-proofs -j2
 zig-out/bin/hyperv-image-proof smp --image kernel.dbg --max-cpus 4
 zig-out/bin/hyperv-image-proof irq --image kernel.dbg
 zig-out/bin/hyperv-image-proof drivers --image kernel.dbg \
   --require-driver storvsc --require-driver netvsc
-zig build test-hyperv-image-proofs -j2 \
+zig build --system "$ZIG_LOCAL_PKG_DIR" test-hyperv-image-proofs -j2 \
   -Dproof-nm=/path/to/llvm-nm -Dproof-objdump=/path/to/llvm-objdump
 ```
 

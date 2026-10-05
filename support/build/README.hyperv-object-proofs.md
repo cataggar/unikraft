@@ -111,12 +111,17 @@ work="$HOME/unikraft-zig17-object-proofs"
 export HOME="$work/home" TMPDIR="$work/tmp"
 export ZIG_LOCAL_CACHE_DIR="$work/cache"
 export ZIG_GLOBAL_CACHE_DIR="$work/global-cache"
+export ZIG_LOCAL_PKG_DIR="$work/packages"
 export PATH="/home/g/.local/bin:/d/unikraft-worktrees/fleet-ci/.d/tools/llvm-tools-22.1.8-aarch64-linux/bin:$PATH"
-mkdir -p "$HOME" "$TMPDIR" "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
+mkdir -p "$HOME" "$TMPDIR" "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_PKG_DIR"
+/home/g/.local/bin/zig build --fetch=all --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
+  --prefix "$work/outputs/restore"
 /home/g/.local/bin/zig build hyperv-object-proofs test-hyperv-object-proofs \
+  --system "$ZIG_LOCAL_PKG_DIR" \
   -Doptimize=debug -j2 --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
   --prefix "$work/outputs/debug"
 /home/g/.local/bin/zig build hyperv-object-proofs test-hyperv-object-proofs \
+  --system "$ZIG_LOCAL_PKG_DIR" \
   -Doptimize=safe -j2 --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
   --prefix "$work/outputs/safe"
 ```
@@ -132,7 +137,12 @@ Producer-closure additions for parent integration: the six
 `tests/hyperv-object-undefined.c`, existing `elf-common-validator.zig`, and
 the shared `support/tools/hyperv/process.zig` / `diagnostics.zig` modules and
 their transitive `contracts.zig` / `sensitive.zig` dependencies.
-There are no new package dependencies or package restores. Required CI runs the
+The verifier adds no packages beyond the root's immutable translator/Aro
+closure, but root selectors require that depot too. The restore command above
+is an explicit developer bootstrap, not part of guarded source/admission
+custody. Required CI must authenticate and bind compiler/package inputs first,
+then retain `--system` with the qualified depot; it must not fetch implicitly or
+substitute an empty package tree. Required CI runs the
 focused selector in debug and safe. Both guarded producer maps bind the
 complete guarded build closure outside the separate `wamr-native-ci` controller
 subtree and the shared core dependencies.

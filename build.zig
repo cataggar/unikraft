@@ -1803,7 +1803,18 @@ pub fn build(b: *std.Build) void {
     target_config_cache_test.addDirectoryArg(
         b.graph.path(.local_cache, "target-config-cache"),
     );
-    target_config_cache_test.addArgs(&.{ "--zig", b.graph.zig_exe });
+    const translator_dependency = b.dependency("translate_c", .{
+        .target = b.graph.host,
+        .optimize = .safe,
+    });
+    const translator_root = std.fs.path.resolve(b.allocator, &.{
+        cwd,
+        translator_dependency.builder.root.toString(b.allocator) catch @panic("OOM"),
+    }) catch @panic("OOM");
+    target_config_cache_test.addArgs(&.{
+        "--zig",      b.graph.zig_exe,
+        "--packages", std.fs.path.dirname(translator_root) orelse @panic("missing translator package directory"),
+    });
     target_config_cache_test.setCwd(.{ .cwd_relative = root });
     target_config_cache_test.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
     test_step.dependOn(&target_config_cache_test.step);
