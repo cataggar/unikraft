@@ -105,11 +105,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "local_boot_serial", .module = portable_serial },
         },
     });
-    const source_closure_module = b.createModule(.{
-        .root_source_file = b.path("../../controller_source_closure.zig"),
-        .target = portable_target,
-        .optimize = optimize,
-    });
+    const source_closure_module = sourceClosureModule(b, portable_target, optimize);
     const controller_module = b.addModule("wamr_controller", .{
         .root_source_file = b.path("controller/root.zig"),
         .target = portable_target,
@@ -162,11 +158,7 @@ pub fn build(b: *std.Build) void {
     });
     if (b.graph.host.result.cpu.arch == .x86_64)
         host_core.addAssemblyFile(b.path("../../tools/hyperv/sha256_clear_upper.S"));
-    const host_closure = b.createModule(.{
-        .root_source_file = b.path("../../controller_source_closure.zig"),
-        .target = b.graph.host,
-        .optimize = optimize,
-    });
+    const host_closure = sourceClosureModule(b, b.graph.host, optimize);
     const host_serial = b.createModule(.{
         .root_source_file = b.path("../../tools/hyperv/local_boot/serial.zig"),
         .target = b.graph.host,
@@ -404,11 +396,7 @@ pub fn build(b: *std.Build) void {
         "test_root",
         b.option([]const u8, "test-root", "Existing absolute private compute fixture directory"),
     );
-    const proof_closure = b.createModule(.{
-        .root_source_file = b.path("../../controller_source_closure.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const proof_closure = sourceClosureModule(b, target, optimize);
     const proof_serial = b.createModule(.{
         .root_source_file = b.path("controller/public_image_serial.zig"),
         .target = target,
@@ -462,6 +450,55 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&handoff_python_goldens.step);
     test_step.dependOn(&authority_contracts_run.step);
     test_step.dependOn(&authority_python_goldens.step);
+}
+
+fn sourceClosureModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+) *std.Build.Module {
+    const source_file = b.path("../../controller_source_closure.zig");
+    b.dependOnFileContents(source_file);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(
+        b.graph.io,
+        b.root.joinString(b.allocator, "../../controller_source_closure.zig") catch @panic("OOM"),
+        b.allocator,
+        .limited(1024 * 1024),
+    ) catch |err| std.debug.panic("read controller source closure: {s}", .{@errorName(err)});
+    const text = b.allocator.dupeSentinel(u8, bytes, 0) catch @panic("OOM");
+    const module = b.createModule(.{
+        .root_source_file = source_file,
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Zig 0.17 interns nested build-root files separately from this module's
+    // root. Bind their existing embed names to explicit source dependencies.
+    var tokenizer = std.zig.Tokenizer.init(text);
+    while (true) {
+        const token = tokenizer.next();
+        if (token.tag == .eof) break;
+        if (token.tag == .invalid)
+            @panic("invalid controller source inventory");
+        if (token.tag != .builtin or
+            !std.mem.eql(u8, text[token.loc.start..token.loc.end], "@embedFile"))
+            continue;
+        if (tokenizer.next().tag != .l_paren)
+            @panic("invalid controller source embed");
+        const literal = tokenizer.next();
+        if (literal.tag != .string_literal or tokenizer.next().tag != .r_paren)
+            @panic("controller source embeds must name literal files");
+        const name = std.zig.string_literal.parseAlloc(b.allocator, text[literal.loc.start..literal.loc.end]) catch
+            @panic("invalid controller source embed name");
+        if (module.import_table.contains(name))
+            @panic("duplicate controller source embed");
+        module.addImport(name, b.createModule(.{
+            .root_source_file = b.path(b.fmt("../../{s}", .{name})),
+            .target = target,
+            .optimize = optimize,
+        }));
+    }
+    return module;
 }
 
 fn validatorIdentity(

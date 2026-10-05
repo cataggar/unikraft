@@ -17,6 +17,11 @@ The historical source, canonical records, physical custody, dependency graph,
 and actual native output revalidation remain required; schema versions and
 resource bounds are unchanged.
 
+The standalone controller Build declares embedded source inputs directly from
+`support/controller_source_closure.zig`. This handles Zig 0.17's distinct
+nested-build-root path domains without changing the compiled source bytes or
+closure recipe. Inventory changes invalidate cached configuration.
+
 New dependency restoration binds the qualified exact-generation Miz
 `66ea6701cf0e1b6d31e5f30fade00b7a546d4b44` package; the Zig 0.16 import
 algorithm still selects its original `669a27982b376311f558e820b69e9a692735b0cd`
