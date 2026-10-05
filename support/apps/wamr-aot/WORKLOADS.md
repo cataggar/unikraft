@@ -199,6 +199,9 @@ teardown. Base adapter page-permission/failure selftests still execute first.
 ## Validation, without relabeling emulation
 
 ```sh
+umask 077
+mkdir -p .zig-cache/tmp
+chmod 0700 .zig-cache .zig-cache/tmp
 zig build --build-file support/apps/wamr-aot/build.zig test-unit test-integration
 zig build --build-file support/apps/wamr-aot/validator.build.zig \
   --cache-dir "$PWD/.d/wamr-validator-cache" -Doptimize=safe test

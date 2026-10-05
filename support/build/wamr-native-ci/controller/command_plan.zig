@@ -170,11 +170,11 @@ pub fn spec(stage: Stage) Spec {
             .seconds = 1800,
             .output_limit = 8 * 1024 * 1024,
             .argv = &.{
-                zig,                                                                                     .{ .literal = "build" },                                      .{ .literal = "--build-file" },
-                .{ .path = .{ .role = "source", .relative = "support/tools/hyperv/direct/build.zig" } }, .{ .literal = "--cache-dir" },                                .{ .path = .{ .role = "work", .relative = "cache" } },
-                .{ .literal = "--global-cache-dir" },                                                    .{ .path = .{ .role = "work", .relative = "global-cache" } }, .{ .literal = "--prefix" },
-                .{ .path = .{ .role = "work", .relative = "public-source/tools" } },                     .{ .literal = "-Dtarget=x86_64-linux-gnu" },                  .{ .literal = "-Dcpu=x86_64_v2" },
-                .{ .literal = "-Doptimize=safe" },                                                       .{ .literal = "-j2" },                                        .{ .literal = "install" },
+                zig,                                                                                     .{ .literal = "build" },                                             .{ .literal = "--build-file" },
+                .{ .path = .{ .role = "source", .relative = "support/tools/hyperv/direct/build.zig" } }, .{ .literal = "--cache-dir" },                                       .{ .path = .{ .role = "work", .relative = "cache" } },
+                .{ .literal = "--prefix" },                                                              .{ .path = .{ .role = "work", .relative = "public-source/tools" } }, .{ .literal = "-Dtarget=x86_64-linux-gnu" },
+                .{ .literal = "-Dcpu=x86_64_v2" },                                                       .{ .literal = "-Doptimize=safe" },                                   .{ .literal = "-j2" },
+                .{ .literal = "install" },
             },
         },
         .@"supervisor-import-identity" => .{

@@ -2279,6 +2279,52 @@ test "historical v2 supervised bindings use the closed imported producer contrac
     try std.testing.expectEqual(@as(usize, 18), verified);
 }
 
+test "public validator cache flag is historical import only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const script =
+        \\import copy, importlib.util, sys
+        \\s=importlib.util.spec_from_file_location("witness",sys.argv[1])
+        \\m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+        \\e=m.Evidence(); current=e.supervised_binding("public-validator-build")[0]
+        \\q=current["supervisor"]["request"]; q["argv"]=q["argv"][2:]
+        \\q["native_executable"]=copy.deepcopy(q["command_executable"])
+        \\q["timeout_ns"]=1800*1000000000
+        \\q["issued_ns"]=q["primary_deadline_ns"]-q["timeout_ns"]
+        \\current["supervisor"]["result"]["command"]["executable"]=q["native_executable"]["identity"]
+        \\e.rehash_supervised_binding(current)
+        \\old=copy.deepcopy(current); q=old["supervisor"]["request"]
+        \\i=q["argv"].index(m.ci.command_literal("--prefix"))
+        \\q["argv"][i:i]=[m.ci.command_literal("--global-cache-dir"),m.ci.command_path("work","global-cache")]
+        \\q["argv"]=[m.ci.command_literal("-Doptimize=ReleaseSafe") if item==m.ci.command_literal("-Doptimize=safe") else item for item in q["argv"]]
+        \\e.rehash_supervised_binding(old)
+        \\bad=copy.deepcopy(old); q=bad["supervisor"]["request"]
+        \\i=q["argv"].index(m.ci.command_literal("--global-cache-dir"))
+        \\q["argv"][i+1]=m.ci.command_path("work","unbound-cache")
+        \\e.rehash_supervised_binding(bad)
+        \\sys.stdout.buffer.write(m.ci.canonical_json({"current":current,"historical":old,"tampered":bad}))
+    ;
+    const witness = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/tests/test_adapter.py" });
+    const response = try std.process.run(a, std.testing.io, .{
+        .argv = &.{ options.python_executable, "-B", "-c", script, witness },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(4096),
+    });
+    if (response.term != .exited or response.term.exited != 0)
+        std.debug.print("public validator cache witness: {s}\n", .{response.stderr});
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, response.term);
+    const values = try std.json.parseFromSliceLeaky(std.json.Value, a, response.stdout, .{ .duplicate_field_behavior = .@"error" });
+    const current = try fixtureCanonical(a, values.object.get("current").?);
+    _ = try controller.accepted_run.validateCommandBinding(a, current, .@"public-validator-build", .local_runtime);
+    const historical = try fixtureCanonical(a, values.object.get("historical").?);
+    _ = try controller.accepted_run.validateCommandBinding(a, historical, .@"public-validator-build", .trusted_inner_zip);
+    try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBinding(a, historical, .@"public-validator-build", .local_runtime));
+    const tampered = try fixtureCanonical(a, values.object.get("tampered").?);
+    try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBinding(a, tampered, .@"public-validator-build", .trusted_inner_zip));
+}
+
 test "legacy handoff inspect command fixture matches Python strictness" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

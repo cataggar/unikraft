@@ -324,9 +324,8 @@ fn restoreDependencies(context: *Context) !void {
     try dir.createDir(io, "zig-pkg", .fromMode(0o700));
     context.failed_operation = "fetch-pinned-package";
     _ = try runBootstrap(context, "dependency-restore", &.{
-        context.roots.zig,                    "build",       "--build-file",                try join(context, &.{ restore_root, "build.zig" }),
-        "--fetch=all",                        "--cache-dir", try subpath(context, "cache"), "--global-cache-dir",
-        try subpath(context, "global-cache"), "-j2",
+        context.roots.zig, "build",       "--build-file",                try join(context, &.{ restore_root, "build.zig" }),
+        "--fetch=all",     "--cache-dir", try subpath(context, "cache"), "-j2",
     }, restore_root, 900, 8 * limits.mib);
     const packages = try join(context, &.{ restore_root, "zig-pkg" });
     context.failed_operation = "inventory-packages";

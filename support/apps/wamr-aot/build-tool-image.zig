@@ -655,6 +655,7 @@ fn executeOpen(
     var root_environment = try cloneEnvironment(allocator, inherited);
     defer root_environment.deinit();
     try root_environment.put("TMPDIR", make_environment.tmp);
+    try root_environment.put("ZIG_GLOBAL_CACHE_DIR", make_environment.zig_global_cache);
     const environment_path = try std.fs.path.join(
         a,
         &.{ state_path, "environment.json" },
@@ -1118,8 +1119,6 @@ fn rootCommand(
         "-j2",
         "--cache-dir",
         make_environment.zig_local_cache,
-        "--global-cache-dir",
-        make_environment.zig_global_cache,
         try allocator.print("-Dapp={s}", .{repository.app.path}),
         try std.mem.Allocator.print(
             allocator,

@@ -2809,8 +2809,6 @@ def production_command_contract(stage, profile=CURRENT_PROFILE):
                     "source", "support/tools/hyperv/direct/build.zig"),
                 command_literal("--cache-dir"),
                 command_path("work", "cache"),
-                command_literal("--global-cache-dir"),
-                command_path("work", "global-cache"),
                 command_literal("--prefix"),
                 command_path("work", "public-source/tools"),
                 *(command_literal(value)
@@ -2950,11 +2948,17 @@ def validate_supervised_command_binding(
       "invalid supervised command binding")
     request = supervisor["request"]
     if transport_context == "trusted_inner_zip" and isinstance(request, dict):
-        historical_argv = [
-            command_literal("-Doptimize=ReleaseSafe")
-            if item == command_literal("-Doptimize=safe") else item
-            for item in contract["argv"]
-        ]
+        historical_argv = []
+        for item in contract["argv"]:
+            if (stage == "public-validator-build"
+                    and item == command_literal("--prefix")):
+                historical_argv.extend([
+                    command_literal("--global-cache-dir"),
+                    command_path("work", "global-cache"),
+                ])
+            historical_argv.append(
+                command_literal("-Doptimize=ReleaseSafe")
+                if item == command_literal("-Doptimize=safe") else item)
         if request.get("argv") == historical_argv:
             contract = {**contract, "argv": historical_argv}
     digest_fields = {
@@ -4497,7 +4501,7 @@ def restore_dependencies(runtime, root, expected_inputs):
         _, command = execute(root, "dependency-restore", [
             tool("zig"), "build", "--build-file", restore / "build.zig",
             "--fetch=all", "--cache-dir", root / "cache",
-            "--global-cache-dir", root / "global-cache", "-j2",
+            "-j2",
         ], 900, evidence=False,
             input_records=consumer_file_records(expected_inputs),
             allow_bootstrap=True)

@@ -407,12 +407,18 @@ not the host Python version: native goldens include Unicode 16-only rejection
 ranges and printable Unicode 15 boundary cases.
 
 ```sh
+umask 077
+mkdir -p .zig-cache/tmp
+chmod 0700 .zig-cache .zig-cache/tmp
 zig build --build-file support/apps/wamr-aot/build.zig test-unit test-integration
 zig test build.zig --test-filter 'native WAMR'
 zig test support/build/native-image-graph.zig
 zig build test-hyperv-image-proofs test-native-compiler-options -j2
 zig build test-hyperv-clock -j2
 ```
+
+The fixture parents must be owner-only: Zig 0.17's testing helper defaults to
+writable directory modes, which the unchanged source-custody checks refuse.
 
 The app's native tests own producer golden bytes/modes, image command plans,
 refusals and supervision faults; the former parser-only Python tests have

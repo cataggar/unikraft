@@ -3,6 +3,9 @@
 ## Compiler and historical-import compatibility
 
 New producers require official Zig 0.17.0 and use `-Doptimize=safe`.
+`zig build` receives its global cache through the bound
+`ZIG_GLOBAL_CACHE_DIR` environment variable, not `--global-cache-dir`;
+historical imported build commands retain their original flag bindings.
 Dependency-custody schema version 1 now records the producer-specific
 `zig-0.17.0-fetch-path` algorithm. Read-only imports explicitly retain
 `zig-0.16.0-fetch-path`, its original Miz revision/package hash, historical
@@ -810,7 +813,7 @@ cp support/tools/hyperv/local_boot/build.zig \
   support/tools/hyperv/local_boot/build.zig.zon "$check_root/restore/"
 zig build --build-file "$check_root/restore/build.zig" --fetch=all \
   --cache-dir "$check_root/restore-cache" \
-  --global-cache-dir "$check_root/global-cache" -j2
+  -j2
 zig build --build-file support/build/wamr-native-ci/build.zig \
   --system "$check_root/restore/zig-pkg" \
   --cache-dir "$check_root/controller-cache" --prefix "$check_root/out" \
@@ -823,7 +826,6 @@ SUPERVISOR_SOURCE_SHA256="$(
 zig build --build-file support/build/wamr-native-ci/supervisor.build.zig \
   --system "$check_root/restore/zig-pkg" \
   --cache-dir "$check_root/supervisor-cache" \
-  --global-cache-dir "$check_root/global-cache" \
   --prefix "$check_root/supervisor" \
   -Dsource-closure-sha256="$SUPERVISOR_SOURCE_SHA256" \
   -Doptimize=safe -j2 install

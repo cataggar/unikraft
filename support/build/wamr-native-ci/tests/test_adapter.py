@@ -5037,6 +5037,14 @@ source/generated/
                 index = request["argv"].index(current)
                 request["argv"][index] = ci.command_literal(
                     "-Doptimize=ReleaseSafe")
+                if stage == "public-validator-build":
+                    prefix = request["argv"].index(ci.command_literal("--prefix"))
+                    request["argv"][prefix:prefix] = [
+                        ci.command_literal("--global-cache-dir"),
+                        ci.command_path("work", "global-cache"),
+                    ]
+                    index = request["argv"].index(
+                        ci.command_literal("-Doptimize=ReleaseSafe"))
                 self.rehash_supervised_binding(record)
                 ci.validate_supervised_command_binding(
                     record, stage, identities,

@@ -628,8 +628,8 @@ test "native image commands preserve config plans identities and failed publicat
     defer allocator.free(log_bytes);
     try testing.expect(std.mem.indexOf(u8, log_bytes, "--print-datadir") != null);
     const root_argv = try allocator.print(
-        "{s}\tbuild\tnative-images\t-j2\t--cache-dir\t{s}/zig_local_cache\t--global-cache-dir\t{s}/zig_global_cache",
-        .{ fixture, root_state, root_state },
+        "{s}\tbuild\tnative-images\t-j2\t--cache-dir\t{s}/zig_local_cache",
+        .{ fixture, root_state },
     );
     defer allocator.free(root_argv);
     try testing.expect(std.mem.indexOf(u8, log_bytes, root_argv) != null);
@@ -642,7 +642,11 @@ test "native image commands preserve config plans identities and failed publicat
     const expected_tmp = try allocator.print("{s}/tmp", .{root_state});
     defer allocator.free(expected_tmp);
     try testing.expectEqualStrings(expected_tmp, root_fields.next().?);
-    inline for (0..5) |_| try testing.expectEqualStrings("", root_fields.next().?);
+    inline for (0..2) |_| try testing.expectEqualStrings("", root_fields.next().?);
+    const expected_global = try allocator.print("{s}/zig_global_cache", .{root_state});
+    defer allocator.free(expected_global);
+    try testing.expectEqualStrings(expected_global, root_fields.next().?);
+    inline for (0..2) |_| try testing.expectEqualStrings("", root_fields.next().?);
     const identity_file = try std.Io.Dir.openFileAbsolute(io, identity_path, .{});
     defer identity_file.close(io);
     try testing.expectEqual(

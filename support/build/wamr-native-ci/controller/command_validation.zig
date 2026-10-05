@@ -107,21 +107,32 @@ fn matchPlan(
         .{ .literal = "-v" },
     };
     const expected_argv = if (historical and stage == .fixtures) historical_fixture else selected.argv;
-    if (argv != .array or argv.array.items.len != expected_argv.len + @as(usize, @intFromBool(wrapper)) * 2)
+    const historical_cache = variant != .native and
+        (stage == .@"public-validator-build" or stage == .@"import-validator-build");
+    if (argv != .array or argv.array.items.len != expected_argv.len +
+        @as(usize, @intFromBool(wrapper)) * 2 + @as(usize, @intFromBool(historical_cache)) * 2)
         return error.InvalidCommand;
     if (wrapper) {
         try matchBinding(a, argv.array.items[0], .{ .path = .{ .role = "command-supervisor" } });
         try matchBinding(a, argv.array.items[1], .{ .literal = "--launch-retained" });
     }
-    for (argv.array.items[if (wrapper) @as(usize, 2) else 0..], expected_argv, 0..) |observed, expected, index| {
+    var observed_index: usize = if (wrapper) 2 else 0;
+    for (expected_argv, 0..) |expected, index| {
+        if (historical_cache and expected == .literal and std.mem.eql(u8, expected.literal, "--prefix")) {
+            try matchBinding(a, argv.array.items[observed_index], .{ .literal = "--global-cache-dir" });
+            try matchBinding(a, argv.array.items[observed_index + 1], .{ .path = .{ .role = "work", .relative = "global-cache" } });
+            observed_index += 2;
+        }
         const selected_binding: plan.Binding = if (historical and stage == .@"local-boot-tool" and index == 7)
             .{ .path = .{ .role = "work", .relative = "tools" } }
         else if (variant != .native and expected == .literal and std.mem.eql(u8, expected.literal, "-Doptimize=safe"))
             .{ .literal = "-Doptimize=ReleaseSafe" }
         else
             expected;
-        try matchBinding(a, observed, selected_binding);
+        try matchBinding(a, argv.array.items[observed_index], selected_binding);
+        observed_index += 1;
     }
+    if (observed_index != argv.array.items.len) return error.InvalidCommand;
     const environment = try get(request, "environment");
     const expected = try plan.environment(a, stage);
     defer plan.freeEnvironment(a, expected);

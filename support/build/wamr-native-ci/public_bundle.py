@@ -1866,7 +1866,6 @@ def publish_ci(handoff):
             handoff.ci.tool("zig"), "build", "--build-file",
             handoff.ci.REPO / "support/tools/hyperv/direct/build.zig",
             "--cache-dir", runtime / "compute/cache",
-            "--global-cache-dir", runtime / "compute/global-cache",
             "--prefix", publication / "tools",
             *handoff.ci.RECORDED_EXECUTABLE_TARGET,
             "-Doptimize=safe", "-j2", "install"], 600,
