@@ -1113,6 +1113,20 @@ No arbitrary command, Make argument,
 shell string, inherited environment or alternate facade lock hook is exposed
 by the worker protocol.
 
+Root builds require the root manifest's Hearth `translate_c` package and its Aro
+dependency closure. Restoring only the standalone preparation manifest's miz
+closure is insufficient. The factory must restore, authenticate and bind the
+complete selected root-build depot before source/admission custody; an empty
+depot is no longer a valid root-build input. Restoration is not a producer or
+namespace-helper operation.
+
+The producer already supplies its reviewed `tools.packages` directory through
+`--system`, binds its complete origin/tree contract in `producer.Binding`, and
+revalidates it before helper entry and after execution. The helper reopens that
+same binding and mounts the dependency runtime read-only. Keep `--system`:
+missing packages must refuse the build, never trigger an implicit network fetch,
+an ambient package-cache fallback, or an unreviewed replacement depot.
+
 `producer.describe` and `bindingDigest` create material for independent review.
 They do not approve it. `producer.execute` requires an independently supplied
 binding commitment, revalidates source-bound selection and tools, invokes the
