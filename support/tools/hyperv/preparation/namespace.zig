@@ -695,8 +695,8 @@ fn interpreterMount(allocator: std.mem.Allocator, io: std.Io, mounts: *std.Array
     defer allocator.free(bytes);
     var image = try elf.Image.parse(allocator, bytes);
     defer image.deinit();
-    for (image.programs) |program| if (program.p_type == std.elf.PT_INTERP) {
-        const interpreter = try elf.range(bytes, program.p_offset, program.p_filesz);
+    for (image.programs) |program| if (program.type == .INTERP) {
+        const interpreter = try elf.range(bytes, program.offset, program.filesz);
         const path = interpreter[0 .. interpreter.len - 1];
         if (!std.mem.startsWith(u8, path, "/lib/") and !std.mem.startsWith(u8, path, "/lib64/")) return error.InvalidRuntime;
         try addFile(allocator, io, mounts, bound.directory, bound.contract.loader orelse return error.IncompleteRuntime, try allocator.dupe(u8, path), .artifact);

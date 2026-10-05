@@ -23,8 +23,8 @@ fn image(raw: bool, machine: u16) [768]u8 {
     integer(u16, &bytes, 58, 64);
     integer(u16, &bytes, 60, if (raw) 4 else 3);
     integer(u16, &bytes, 62, if (raw) 3 else 2);
-    integer(u32, &bytes, 64, std.elf.PT_LOAD);
-    integer(u32, &bytes, 68, std.elf.PF_R | std.elf.PF_X);
+    integer(u32, &bytes, 64, @backingInt(std.elf.PT.LOAD));
+    integer(u32, &bytes, 68, @bitCast(std.elf.PF{ .R = true, .X = true }));
     integer(u64, &bytes, 80, 0x400000);
     integer(u64, &bytes, 88, 0x400000);
     integer(u64, &bytes, 96, 256);
@@ -209,10 +209,10 @@ test "debug equivalence reports are private bounded create-only and non-admittin
     try t.expectError(error.FileNotFound, temporary.dir.openFile(io, "oversize.json", .{}));
 }
 
-fn program(bytes: []u8, index: usize, kind: u32, flags: u32, offset: u64, address: u64, size: u64, memory: u64, alignment: u64) void {
+fn program(bytes: []u8, index: usize, kind: std.elf.PT, flags: std.elf.PF, offset: u64, address: u64, size: u64, memory: u64, alignment: u64) void {
     const start = 64 + index * 56;
-    integer(u32, bytes, start, kind);
-    integer(u32, bytes, start + 4, flags);
+    integer(u32, bytes, start, @backingInt(kind));
+    integer(u32, bytes, start + 4, @bitCast(flags));
     integer(u64, bytes, start + 8, offset);
     integer(u64, bytes, start + 16, address);
     integer(u64, bytes, start + 24, address);
@@ -240,13 +240,13 @@ fn relayoutImage(raw: bool, machine: u16) [524288]u8 {
     const ro: usize = if (raw) 0x60000 else 0x30000;
     const rx: usize = if (raw) 0x40000 else 0x10000;
     const rw: usize = if (raw) 0x30000 else 0x20000;
-    program(&bytes, 0, std.elf.PT_PHDR, std.elf.PF_R, 64, 0x400040, 7 * 56, 7 * 56, 8);
-    program(&bytes, 1, std.elf.PT_LOAD, std.elf.PF_R, 0, 0x400000, 512, 512, 4096);
-    program(&bytes, 2, std.elf.PT_LOAD, std.elf.PF_R, ro, 0x401000, 256, 256, 256);
-    program(&bytes, 3, std.elf.PT_LOAD, std.elf.PF_R | std.elf.PF_X, rx, 0x402000, 512, 512, 256);
-    program(&bytes, 4, std.elf.PT_LOAD, std.elf.PF_R | std.elf.PF_W, rw, 0x403000, 512, 768, 256);
-    program(&bytes, 5, std.elf.PT_GNU_EH_FRAME, std.elf.PF_R, ro + 64, 0x401040, 16, 16, 8);
-    program(&bytes, 6, std.elf.PT_GNU_STACK, std.elf.PF_R | std.elf.PF_W, 0, 0, 0, 0, 16);
+    program(&bytes, 0, .PHDR, .{ .R = true }, 64, 0x400040, 7 * 56, 7 * 56, 8);
+    program(&bytes, 1, .LOAD, .{ .R = true }, 0, 0x400000, 512, 512, 4096);
+    program(&bytes, 2, .LOAD, .{ .R = true }, ro, 0x401000, 256, 256, 256);
+    program(&bytes, 3, .LOAD, .{ .R = true, .X = true }, rx, 0x402000, 512, 512, 256);
+    program(&bytes, 4, .LOAD, .{ .R = true, .W = true }, rw, 0x403000, 512, 768, 256);
+    program(&bytes, 5, std.elf.PT.GNU_EH_FRAME, .{ .R = true }, ro + 64, 0x401040, 16, 16, 8);
+    program(&bytes, 6, std.elf.PT.GNU_STACK, .{ .R = true, .W = true }, 0, 0, 0, 0, 16);
     @memset(bytes[ro..][0..256], 0x71);
     @memset(bytes[rx..][0..512], 0x92);
     @memset(bytes[rw..][0..512], 0x53);
@@ -357,18 +357,18 @@ test "file relayout rejects misaligned out of bounds zero byte unknown and ancho
     bad = good;
     integer(u64, &bad, 64 + 8, 128);
     try t.expectError(error.InvalidPhdrMapping, gate.compareWithPolicy(a, &raw, bad[0..0x40000], .file_offset_relayout));
-    for ([_]u32{ std.elf.PT_NULL, 0x12345678 }) |kind| {
+    for ([_]std.elf.PT{ .NULL, @fromBackingInt(@as(u32, 0x12345678)) }) |kind| {
         var before = raw;
         bad = good;
-        program(&before, 5, kind, std.elf.PF_R, 0x60040, 0, 16, 16, 8);
-        program(&bad, 5, kind, std.elf.PF_R, 0x30040, 0, 16, 16, 8);
+        program(&before, 5, kind, .{ .R = true }, 0x60040, 0, 16, 16, 8);
+        program(&bad, 5, kind, .{ .R = true }, 0x30040, 0, 16, 16, 8);
         try t.expectError(error.UnmovableProgramOffset, gate.compareWithPolicy(a, &before, bad[0..0x40000], .file_offset_relayout));
     }
     for ([_]u64{ 32, 184 }) |offset| {
         var before = raw;
         bad = good;
-        program(&before, 6, std.elf.PT_NOTE, std.elf.PF_R, offset, 0, 8, 8, 8);
-        program(&bad, 6, std.elf.PT_NOTE, std.elf.PF_R, offset + 8, 0, 8, 8, 8);
+        program(&before, 6, .NOTE, .{ .R = true }, offset, 0, 8, 8, 8);
+        program(&bad, 6, .NOTE, .{ .R = true }, offset + 8, 0, 8, 8, 8);
         try t.expectError(error.MetadataMappingChanged, gate.compareWithPolicy(a, &before, bad[0..0x40000], .file_offset_relayout));
     }
     bad = good;
@@ -389,8 +389,8 @@ test "file relayout rejects ambiguous loads and changed nonload backing aliases"
     for ([_]u64{ 0x30050, 0x33000 }) |offset| {
         var before = raw;
         bad = good;
-        program(&before, 5, std.elf.PT_NOTE, std.elf.PF_R, 0x60040, 0, 16, 16, 8);
-        program(&bad, 5, std.elf.PT_NOTE, std.elf.PF_R, offset, 0, 16, 16, 8);
+        program(&before, 5, .NOTE, .{ .R = true }, 0x60040, 0, 16, 16, 8);
+        program(&bad, 5, .NOTE, .{ .R = true }, offset, 0, 16, 16, 8);
         @memset(bad[@intCast(offset)..][0..16], 0x71);
         try t.expectError(error.ProgramBackingChanged, gate.compareWithPolicy(a, &before, bad[0..0x40000], .file_offset_relayout));
     }
@@ -399,8 +399,8 @@ test "file relayout rejects ambiguous loads and changed nonload backing aliases"
 test "file relayout compares nonload program bytes outside every LOAD" {
     var raw = relayoutImage(true, @backingInt(std.elf.EM.AARCH64));
     var candidate = relayoutImage(false, @backingInt(std.elf.EM.AARCH64));
-    program(&raw, 6, std.elf.PT_NOTE, std.elf.PF_R, 0x65000, 0, 16, 16, 8);
-    program(&candidate, 6, std.elf.PT_NOTE, std.elf.PF_R, 0x33000, 0, 16, 16, 8);
+    program(&raw, 6, .NOTE, .{ .R = true }, 0x65000, 0, 16, 16, 8);
+    program(&candidate, 6, .NOTE, .{ .R = true }, 0x33000, 0, 16, 16, 8);
     @memset(raw[0x65000..][0..16], 0x36);
     @memset(candidate[0x33000..][0..16], 0x36);
     const proof = try gate.compareWithPolicy(a, &raw, candidate[0..0x40000], .file_offset_relayout);
@@ -439,8 +439,8 @@ test "file relayout does not normalize executable or allocated program header by
     var candidate = relayoutImage(false, @backingInt(std.elf.EM.AARCH64));
     integer(u64, &raw, 24, 0x4000b8);
     integer(u64, &candidate, 24, 0x4000b8);
-    integer(u32, &raw, 64 + 56 + 4, std.elf.PF_R | std.elf.PF_X);
-    integer(u32, &candidate, 64 + 56 + 4, std.elf.PF_R | std.elf.PF_X);
+    integer(u32, &raw, 64 + 56 + 4, @bitCast(std.elf.PF{ .R = true, .X = true }));
+    integer(u32, &candidate, 64 + 56 + 4, @bitCast(std.elf.PF{ .R = true, .X = true }));
     try t.expectError(error.EntryInProgramHeaders, gate.compareWithPolicy(a, &raw, candidate[0..0x40000], .file_offset_relayout));
     raw = relayoutImage(true, @backingInt(std.elf.EM.AARCH64));
     candidate = relayoutImage(false, @backingInt(std.elf.EM.AARCH64));
@@ -452,8 +452,8 @@ test "file relayout does not normalize executable or allocated program header by
     try t.expectError(error.AllocatedProgramHeaders, gate.compareWithPolicy(a, &raw, candidate[0..0x40000], .file_offset_relayout));
     raw = relayoutImage(true, @backingInt(std.elf.EM.AARCH64));
     candidate = relayoutImage(false, @backingInt(std.elf.EM.AARCH64));
-    integer(u32, &raw, 64 + 56 + 4, std.elf.PF_R | std.elf.PF_X);
-    integer(u32, &candidate, 64 + 56 + 4, std.elf.PF_R | std.elf.PF_X);
+    integer(u32, &raw, 64 + 56 + 4, @bitCast(std.elf.PF{ .R = true, .X = true }));
+    integer(u32, &candidate, 64 + 56 + 4, @bitCast(std.elf.PF{ .R = true, .X = true }));
     try t.expectError(error.ExecutableProgramHeaderNormalization, gate.compareWithPolicy(a, &raw, candidate[0..0x40000], .file_offset_relayout));
 }
 

@@ -51,8 +51,8 @@ export WORK="$S/run"
 ```
 
 The local dependency is `..`, module `hyperv_preparation`; its manifest pins
-`miz_source` revision `669a27982b376311f558e820b69e9a692735b0cd`, package hash
-`miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx`.
+`miz_source` revision `66ea6701cf0e1b6d31e5f30fade00b7a546d4b44`, package hash
+`miz-0.2.0-Z3lHlLgL2wDiGxutMJMDy9Qy4CLNCwOptwgQLp1ZDSiv`.
 Core, native ELF and Kconfig helpers are its existing explicit imports.
 There is no root build dependency. No dependencies are downloaded by these
 commands. An absent declared package is a failure, not a restore authorization.

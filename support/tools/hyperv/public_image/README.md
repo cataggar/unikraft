@@ -116,10 +116,11 @@ templates. Those are not this producer. Revision 4 sets `controller_sha256`
 to the physically reverified native executable SHA256;
 `artifacts.miz.sha256` identifies that same executable containing embedded
 miz, rather than an unused external miz CLI. `artifacts.miz.revision` is the
-reviewed bounded-open commit
-`669a27982b376311f558e820b69e9a692735b0cd`, with package hash
-`miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx` pinned in
-`build.zig.zon`.
+Zig 0.17 port of the reviewed bounded-open generation,
+`66ea6701cf0e1b6d31e5f30fade00b7a546d4b44`, with package hash
+`miz-0.2.0-Z3lHlLgL2wDiGxutMJMDy9Qy4CLNCwOptwgQLp1ZDSiv` pinned in
+`build.zig.zon`. Earlier images retain their original compiler and producer
+records; changing this pin does not authenticate or relabel them.
 
 Consequently the **unchanged legacy revision-3 importer intentionally
 rejects this export**. Parent integration must explicitly admit native

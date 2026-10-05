@@ -125,17 +125,17 @@ pub const Bound = struct {
             return error.InvalidRuntime;
         var result: ElfInfo = .{ .needed = &.{} };
         var dynamic: ?@TypeOf(image.programs[0]) = null;
-        for (image.programs) |program| switch (program.p_type) {
-            std.elf.PT_INTERP => {
+        for (image.programs) |program| switch (program.type) {
+            .INTERP => {
                 if (self.contract.loader == null) return error.IncompleteRuntime;
-                if (result.interpreter != null or program.p_filesz < 2 or program.p_filesz > 4096) return error.InvalidRuntime;
-                const value = try elf.range(bytes, program.p_offset, program.p_filesz);
+                if (result.interpreter != null or program.filesz < 2 or program.filesz > 4096) return error.InvalidRuntime;
+                const value = try elf.range(bytes, program.offset, program.filesz);
                 if (value[value.len - 1] != 0 or std.mem.indexOfScalar(u8, value[0 .. value.len - 1], 0) != null)
                     return error.InvalidRuntime;
                 try absolutePath(value[0 .. value.len - 1]);
                 result.interpreter = try allocator.dupe(u8, value[0 .. value.len - 1]);
             },
-            std.elf.PT_DYNAMIC => {
+            .DYNAMIC => {
                 if (dynamic != null) return error.InvalidRuntime;
                 dynamic = program;
             },
@@ -146,8 +146,8 @@ pub const Bound = struct {
         for (image.sections) |section| {
             if (section.header.sh_type != std.elf.SHT_DYNAMIC) continue;
             dynamic_count += 1;
-            if (dynamic_count != 1 or dynamic == null or section.header.sh_offset != dynamic.?.p_offset or
-                section.header.sh_addr != dynamic.?.p_vaddr or section.header.sh_size != dynamic.?.p_filesz or
+            if (dynamic_count != 1 or dynamic == null or section.header.sh_offset != dynamic.?.offset or
+                section.header.sh_addr != dynamic.?.vaddr or section.header.sh_size != dynamic.?.filesz or
                 section.header.sh_size == 0 or section.header.sh_size % @sizeOf(std.elf.Elf64_Dyn) != 0 or
                 section.header.sh_entsize != @sizeOf(std.elf.Elf64_Dyn) or section.header.sh_link >= image.sections.len)
                 return error.InvalidRuntime;

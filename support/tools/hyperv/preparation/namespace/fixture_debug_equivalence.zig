@@ -156,15 +156,15 @@ fn hashRange(sha: *core.Sha256, bytes: []const u8, offset: u64, length: u64, mas
     sha.update(data[cursor..]);
 }
 
-fn movableProgram(kind: u32) bool {
+fn movableProgram(kind: std.elf.PT) bool {
     return switch (kind) {
-        std.elf.PT_LOAD,
-        std.elf.PT_DYNAMIC,
-        std.elf.PT_INTERP,
-        std.elf.PT_NOTE,
-        std.elf.PT_TLS,
-        std.elf.PT_GNU_EH_FRAME,
-        std.elf.PT_GNU_RELRO,
+        .LOAD,
+        .DYNAMIC,
+        .INTERP,
+        .NOTE,
+        .TLS,
+        std.elf.PT.GNU_EH_FRAME,
+        std.elf.PT.GNU_RELRO,
         => true,
         // PHDR is anchored. NULL, STACK and unknown records have no proven
         // movable file backing in this qualification policy.
@@ -182,39 +182,39 @@ fn validateRelayoutLayout(image: elf.Image) !void {
     const table_bytes = image.programs.len * @sizeOf(Program);
     var phdr_seen = false;
     for (image.programs, 0..) |program, index| {
-        _ = try elf.add(program.p_vaddr, program.p_filesz);
-        _ = try elf.add(program.p_paddr, program.p_memsz);
-        if (program.p_align > 1 and
-            (!std.math.isPowerOfTwo(program.p_align) or
-                program.p_offset % program.p_align != program.p_vaddr % program.p_align))
+        _ = try elf.add(program.vaddr, program.filesz);
+        _ = try elf.add(program.paddr, program.memsz);
+        if (program.@"align" > 1 and
+            (!std.math.isPowerOfTwo(program.@"align") or
+                program.offset % program.@"align" != program.vaddr % program.@"align"))
             return error.InvalidProgramAlignment;
-        if (program.p_type == std.elf.PT_PHDR) {
-            if (phdr_seen or program.p_offset != image.header.phoff or
-                program.p_filesz != table_bytes or program.p_memsz != table_bytes)
+        if (program.type == .PHDR) {
+            if (phdr_seen or program.offset != image.header.phoff or
+                program.filesz != table_bytes or program.memsz != table_bytes)
                 return error.InvalidPhdrMapping;
             phdr_seen = true;
         }
-        if (program.p_type == std.elf.PT_LOAD) {
-            if (program.p_offset % 4096 != program.p_vaddr % 4096)
+        if (program.type == .LOAD) {
+            if (program.offset % 4096 != program.vaddr % 4096)
                 return error.InvalidLoadPageAlignment;
             for (image.programs[0..index]) |other| {
-                if (other.p_type != std.elf.PT_LOAD) continue;
-                if (overlaps(program.p_offset, program.p_filesz, other.p_offset, other.p_filesz) or
-                    overlaps(program.p_vaddr, program.p_memsz, other.p_vaddr, other.p_memsz))
+                if (other.type != .LOAD) continue;
+                if (overlaps(program.offset, program.filesz, other.offset, other.filesz) or
+                    overlaps(program.vaddr, program.memsz, other.vaddr, other.memsz))
                     return error.AmbiguousLoadMapping;
             }
-            if (image.header.entry >= program.p_vaddr and image.header.entry - program.p_vaddr < program.p_filesz) {
-                const offset = try elf.add(program.p_offset, image.header.entry - program.p_vaddr);
+            if (image.header.entry >= program.vaddr and image.header.entry - program.vaddr < program.filesz) {
+                const offset = try elf.add(program.offset, image.header.entry - program.vaddr);
                 if (overlaps(offset, 1, image.header.phoff, table_bytes)) return error.EntryInProgramHeaders;
             }
-        } else if (program.p_filesz != 0 and program.p_vaddr != 0) {
+        } else if (program.filesz != 0 and program.vaddr != 0) {
             var backed = false;
             for (image.programs) |load| {
-                if (load.p_type != std.elf.PT_LOAD or program.p_vaddr < load.p_vaddr or program.p_offset < load.p_offset)
+                if (load.type != .LOAD or program.vaddr < load.vaddr or program.offset < load.offset)
                     continue;
-                const delta = program.p_vaddr - load.p_vaddr;
-                if (delta == program.p_offset - load.p_offset and delta <= load.p_filesz and
-                    program.p_filesz <= load.p_filesz - delta) backed = true;
+                const delta = program.vaddr - load.vaddr;
+                if (delta == program.offset - load.offset and delta <= load.filesz and
+                    program.filesz <= load.filesz - delta) backed = true;
             }
             if (!backed) return error.UnmappedProgramRecord;
         }
@@ -228,17 +228,17 @@ fn validateRelayoutLayout(image: elf.Image) !void {
 }
 
 fn sameOverlap(raw_a: Program, raw_b: Program, candidate_a: Program, candidate_b: Program) bool {
-    const before = overlaps(raw_a.p_offset, raw_a.p_filesz, raw_b.p_offset, raw_b.p_filesz);
-    const after = overlaps(candidate_a.p_offset, candidate_a.p_filesz, candidate_b.p_offset, candidate_b.p_filesz);
+    const before = overlaps(raw_a.offset, raw_a.filesz, raw_b.offset, raw_b.filesz);
+    const after = overlaps(candidate_a.offset, candidate_a.filesz, candidate_b.offset, candidate_b.filesz);
     if (before != after) return false;
     if (!before) return true;
     // All endpoints have already passed the parser's file bounds checks.
-    const start = @max(raw_a.p_offset, raw_b.p_offset);
-    const candidate_start = @max(candidate_a.p_offset, candidate_b.p_offset);
-    const length = @min(raw_a.p_offset + raw_a.p_filesz, raw_b.p_offset + raw_b.p_filesz) - start;
-    const candidate_length = @min(candidate_a.p_offset + candidate_a.p_filesz, candidate_b.p_offset + candidate_b.p_filesz) - candidate_start;
-    return length == candidate_length and start - raw_a.p_offset == candidate_start - candidate_a.p_offset and
-        start - raw_b.p_offset == candidate_start - candidate_b.p_offset;
+    const start = @max(raw_a.offset, raw_b.offset);
+    const candidate_start = @max(candidate_a.offset, candidate_b.offset);
+    const length = @min(raw_a.offset + raw_a.filesz, raw_b.offset + raw_b.filesz) - start;
+    const candidate_length = @min(candidate_a.offset + candidate_a.filesz, candidate_b.offset + candidate_b.filesz) - candidate_start;
+    return length == candidate_length and start - raw_a.offset == candidate_start - candidate_a.offset and
+        start - raw_b.offset == candidate_start - candidate_b.offset;
 }
 
 fn logicalIdentity(index: usize, header_bytes: []const u8) [64]u8 {
@@ -260,15 +260,15 @@ fn validateLayout(image: elf.Image) !void {
     if (overlaps(header.phoff, program_bytes, header.shoff, section_bytes)) return error.OverlappingElfTables;
     var executable_entry = false;
     for (image.programs) |program| {
-        if (program.p_type != std.elf.PT_LOAD) continue;
-        if (program.p_flags & std.elf.PF_X != 0 and header.entry >= program.p_vaddr and
-            header.entry - program.p_vaddr < program.p_filesz)
+        if (program.type != .LOAD) continue;
+        if (program.flags.X and header.entry >= program.vaddr and
+            header.entry - program.vaddr < program.filesz)
         {
-            const entry_offset = program.p_offset + (header.entry - program.p_vaddr);
+            const entry_offset = program.offset + (header.entry - program.vaddr);
             if (entry_offset < 64) return error.EntryInElfHeader;
             executable_entry = true;
         }
-        if (overlaps(program.p_offset, program.p_filesz, header.shoff, section_bytes))
+        if (overlaps(program.offset, program.filesz, header.shoff, section_bytes))
             return error.LoadedSectionTable;
     }
     if (!executable_entry) return error.UnmappedEntry;
@@ -312,22 +312,22 @@ pub fn compareWithPolicy(allocator: std.mem.Allocator, raw: []const u8, candidat
         const after = candidate_programs[start..][0..@sizeOf(Program)];
         if (!std.mem.eql(u8, before[0..8], after[0..8]) or !std.mem.eql(u8, before[16..], after[16..]))
             return error.ProgramHeadersChanged;
-        const changed = program.p_offset != other.p_offset;
+        const changed = program.offset != other.offset;
         const field_offset = left.header.phoff + start + 8;
         if (changed) {
             if (policy != .file_offset_relayout) return error.ProgramHeadersChanged;
-            if (program.p_filesz == 0 or !movableProgram(program.p_type)) return error.UnmovableProgramOffset;
-            if (program.p_type == std.elf.PT_LOAD and
-                program.p_offset % loadOffsetModulus(left.header.machine) != other.p_offset % loadOffsetModulus(left.header.machine))
+            if (program.filesz == 0 or !movableProgram(program.type)) return error.UnmovableProgramOffset;
+            if (program.type == .LOAD and
+                program.offset % loadOffsetModulus(left.header.machine) != other.offset % loadOffsetModulus(left.header.machine))
                 return error.LoadPageOffsetChanged;
-            if (overlaps(program.p_offset, program.p_filesz, 0, 64) or
-                overlaps(other.p_offset, other.p_filesz, 0, 64) or
-                overlaps(program.p_offset, program.p_filesz, left.header.phoff, phdr_bytes) or
-                overlaps(other.p_offset, other.p_filesz, right.header.phoff, phdr_bytes))
+            if (overlaps(program.offset, program.filesz, 0, 64) or
+                overlaps(other.offset, other.filesz, 0, 64) or
+                overlaps(program.offset, program.filesz, left.header.phoff, phdr_bytes) or
+                overlaps(other.offset, other.filesz, right.header.phoff, phdr_bytes))
                 return error.MetadataMappingChanged;
             for (left.programs) |load| {
-                if (load.p_type == std.elf.PT_LOAD and load.p_flags & std.elf.PF_X != 0 and
-                    overlaps(load.p_offset, load.p_filesz, field_offset, 8))
+                if (load.type == .LOAD and load.flags.X and
+                    overlaps(load.offset, load.filesz, field_offset, 8))
                     return error.ExecutableProgramHeaderNormalization;
             }
             masks.records[masks.len] = .{ .offset = field_offset, .width = 8 };
@@ -341,18 +341,18 @@ pub fn compareWithPolicy(allocator: std.mem.Allocator, raw: []const u8, candidat
         }
         mappings.records[index] = .{
             .index = index,
-            .raw_offset = program.p_offset,
-            .candidate_offset = other.p_offset,
+            .raw_offset = program.offset,
+            .candidate_offset = other.offset,
             .changed = changed,
             .offset_field_file_offset = field_offset,
             .logical_mapping = .{
-                .type = program.p_type,
-                .flags = program.p_flags,
-                .virtual_address = program.p_vaddr,
-                .physical_address = program.p_paddr,
-                .file_bytes = program.p_filesz,
-                .memory_bytes = program.p_memsz,
-                .alignment = program.p_align,
+                .type = @backingInt(program.type),
+                .flags = @bitCast(program.flags),
+                .virtual_address = program.vaddr,
+                .physical_address = program.paddr,
+                .file_bytes = program.filesz,
+                .memory_bytes = program.memsz,
+                .alignment = program.@"align",
             },
             .logical_mapping_sha256 = logicalIdentity(index, before),
         };
@@ -372,14 +372,14 @@ pub fn compareWithPolicy(allocator: std.mem.Allocator, raw: []const u8, candidat
     var load_segments: usize = 0;
     var loaded_bytes: u64 = 0;
     for (left.programs, right.programs, mappings.slice()) |program, other, mapping| {
-        try compareRange(raw, candidate, program.p_offset, other.p_offset, program.p_filesz, masks.slice());
+        try compareRange(raw, candidate, program.offset, other.offset, program.filesz, masks.slice());
         all_binding.update(&mapping.logical_mapping_sha256);
-        try hashRange(&all_binding, raw, program.p_offset, program.p_filesz, masks.slice());
-        if (program.p_type != std.elf.PT_LOAD) continue;
+        try hashRange(&all_binding, raw, program.offset, program.filesz, masks.slice());
+        if (program.type != .LOAD) continue;
         load_segments += 1;
-        loaded_bytes += program.p_filesz;
+        loaded_bytes += program.filesz;
         binding.update(&mapping.logical_mapping_sha256);
-        try hashRange(&binding, raw, program.p_offset, program.p_filesz, masks.slice());
+        try hashRange(&binding, raw, program.offset, program.filesz, masks.slice());
     }
     if (load_segments == 0) return error.MissingLoadSegment;
     var removed_sections: usize = 0;
@@ -389,7 +389,7 @@ pub fn compareWithPolicy(allocator: std.mem.Allocator, raw: []const u8, candidat
         const sh = section.header;
         if (sh.sh_flags & std.elf.SHF_ALLOC != 0 or sh.sh_type == std.elf.SHT_NOBITS) return error.LoadedDebugData;
         for (left.programs) |program|
-            if (overlaps(sh.sh_offset, sh.sh_size, program.p_offset, program.p_filesz)) return error.LoadedDebugData;
+            if (overlaps(sh.sh_offset, sh.sh_size, program.offset, program.filesz)) return error.LoadedDebugData;
         for (left.sections, 0..) |other, other_index| {
             if (index == other_index or other.header.sh_type == std.elf.SHT_NOBITS) continue;
             if (overlaps(sh.sh_offset, sh.sh_size, other.header.sh_offset, other.header.sh_size))

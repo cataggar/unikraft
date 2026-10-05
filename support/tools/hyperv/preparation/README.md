@@ -1335,8 +1335,10 @@ with independently specified seed/intent/receipt layouts and fixed-VHD footer.
 It never reads, copies, hashes or regenerates the original 4 GiB seed.
 Persistence's later custody gate still requires original IDs and exact
 LUN 7 / 8388608 x 512 geometry. Pinned miz revision is
-`669a27982b376311f558e820b69e9a692735b0cd`, package hash
-`miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx`.
+`66ea6701cf0e1b6d31e5f30fade00b7a546d4b44`, package hash
+`miz-0.2.0-Z3lHlLgL2wDiGxutMJMDy9Qy4CLNCwOptwgQLp1ZDSiv`, the Zig 0.17
+port of the same reviewed bounded-open generation. Earlier execution records
+below remain historical; their producer provenance is not relabelled.
 
 Filesystem traversal/hash byte/count bounds and between-operation deadlines
 do not interrupt every blocked syscall or native miz call. An independent
