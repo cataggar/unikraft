@@ -136,7 +136,7 @@ release_profile=false
 profile_used=false
 installation_identity=
 record_fixture_copies() {
-  for mode in Debug ReleaseSafe; do
+  for mode in debug safe; do
     for directory in "${root}/${mode}/namespace-cache" "${root}/${mode}/fixture-out" "${root}/${mode}/namespace-out"; do
       if [ -d "${directory}" ]; then
         find "${directory}" -type f "${fixture_find_names[@]}" \
@@ -163,12 +163,12 @@ cleanup() {
   fi
   if [ "${release_profile}" = true ] &&
      ! sudo -n "${parser}" --remove "${installation}/profile-release-safe"; then
-    echo 'Failed to remove the synthetic ReleaseSafe namespace profile' >&2
+    echo 'Failed to remove the synthetic safe namespace profile' >&2
     cleanup_failed=true
   fi
   if [ "${debug_profile}" = true ] &&
      ! sudo -n "${parser}" --remove "${installation}/profile-debug"; then
-    echo 'Failed to remove the synthetic Debug namespace profile' >&2
+    echo 'Failed to remove the synthetic debug namespace profile' >&2
     cleanup_failed=true
   fi
   restriction=null
@@ -244,8 +244,7 @@ else
 fi
 
 # Two physical native children: each embeds its mode's actual workspace/helper.
-for mode in Debug ReleaseSafe; do
-  if [ "${mode}" = Debug ]; then optimize=debug; else optimize=safe; fi
+for mode in debug safe; do
   mkdir -p "${root}/${mode}/namespace-work"
   strip_report=()
   if [ "${qualify_strip}" = true ]; then
@@ -255,7 +254,7 @@ for mode in Debug ReleaseSafe; do
     --cache-dir "${root}/${mode}/namespace-cache" --prefix "${root}/${mode}/fixture-out" \
     "-Dworkspace=${root}/${mode}/namespace-work" "${git_fixture[@]}" \
     "${namespace_variant[@]}" "${strip_report[@]}" \
-    "-Doptimize=${optimize}" -j2 install-fixture --summary all \
+    "-Doptimize=${mode}" -j2 install-fixture --summary all \
     > "${root}/${mode}/fixture-build.log" 2>&1
   if [ "${qualify_strip}" = true ]; then
     bash "${package}/ci-strip-proof.sh" "${root}/${mode}/fixture-strip-proof.json" \
@@ -274,20 +273,20 @@ created=true
 installation_identity="$(stat -c '%d:%i:%u:%g:%a' "${installation}")"
 test "$(stat -c '%u:%g:%a' "${installation}")" = 0:0:755
 sudo -n install -o root -g root -m 0555 \
-  "${root}/Debug/fixture-out/bin/preparation-namespace-fixture" "${installation}/namespace-fixture-debug"
+  "${root}/debug/fixture-out/bin/preparation-namespace-fixture" "${installation}/namespace-fixture-debug"
 sudo -n install -o root -g root -m 0555 \
-  "${root}/ReleaseSafe/fixture-out/bin/preparation-namespace-fixture" "${installation}/namespace-fixture-release-safe"
+  "${root}/safe/fixture-out/bin/preparation-namespace-fixture" "${installation}/namespace-fixture-release-safe"
 declare -A fixture_identity
 for variant in debug release-safe; do
   test "$(stat -c '%u:%g:%a:%h' "${installation}/namespace-fixture-${variant}")" = 0:0:555:1
   fixture_identity["${variant}"]="$(stat -c '%d:%i:%s:%u:%g:%a:%h' "${installation}/namespace-fixture-${variant}")"
 done
-cmp "${root}/Debug/fixture-out/bin/preparation-namespace-fixture" "${installation}/namespace-fixture-debug"
-cmp "${root}/ReleaseSafe/fixture-out/bin/preparation-namespace-fixture" "${installation}/namespace-fixture-release-safe"
+cmp "${root}/debug/fixture-out/bin/preparation-namespace-fixture" "${installation}/namespace-fixture-debug"
+cmp "${root}/safe/fixture-out/bin/preparation-namespace-fixture" "${installation}/namespace-fixture-release-safe"
 if [ "${qualify_strip}" = true ]; then
-  bash "${package}/ci-strip-proof.sh" "${root}/Debug/fixture-strip-proof.json" \
+  bash "${package}/ci-strip-proof.sh" "${root}/debug/fixture-strip-proof.json" \
     "${installation}/namespace-fixture-debug" file_offset_relayout
-  bash "${package}/ci-strip-proof.sh" "${root}/ReleaseSafe/fixture-strip-proof.json" \
+  bash "${package}/ci-strip-proof.sh" "${root}/safe/fixture-strip-proof.json" \
     "${installation}/namespace-fixture-release-safe" file_offset_relayout
 fi
 sha256sum "${installation}/namespace-fixture-debug" "${installation}/namespace-fixture-release-safe" \
@@ -297,10 +296,10 @@ record_fixture_copies > "${root}/fixture-copies.tsv"
 started="$(date --utc '+%Y-%m-%d %H:%M:%S.%6N UTC')"
 baseline=0
 native "${zig}" build --build-file "${package}/namespace/build.zig" \
-  --cache-dir "${root}/Debug/namespace-cache" --prefix "${root}/Debug/namespace-out" \
-  "-Dworkspace=${root}/Debug/namespace-work" "${git_fixture[@]}" \
+  --cache-dir "${root}/debug/namespace-cache" --prefix "${root}/debug/namespace-out" \
+  "-Dworkspace=${root}/debug/namespace-work" "${git_fixture[@]}" \
   "-Dfixture-executable=${installation}/namespace-fixture-debug" \
-  "-Dci-report=${root}/Debug/baseline.json" \
+  "-Dci-report=${root}/debug/baseline.json" \
   "${namespace_variant[@]}" \
   -Dtest-filter='namespace CI baseline crosses' -Doptimize=debug -j2 test --summary all \
   > "${root}/baseline.log" 2>&1 || baseline=$?
@@ -320,7 +319,7 @@ if [ "${baseline}" -ne 0 ]; then
       }
     ' > "${root}/namespace-capability-diagnostics.log"
   # A supervised failure alone never authorizes a profile.
-  jq -e -f "${package}/ci-baseline.jq" "${root}/Debug/baseline.json" > /dev/null
+  jq -e -f "${package}/ci-baseline.jq" "${root}/debug/baseline.json" > /dev/null
   test "$(/usr/sbin/sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = 1
   sudo -n /usr/bin/journalctl -k --since "${started}" --until "${finished}" \
     --no-pager --output=cat --lines=256 |
@@ -347,14 +346,13 @@ if [ "${baseline}" -ne 0 ]; then
   test "$(/usr/sbin/sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = 1
 fi
 
-for mode in Debug ReleaseSafe; do
-  if [ "${mode}" = Debug ]; then optimize=debug; else optimize=safe; fi
+for mode in debug safe; do
   variant=debug
-  if [ "${mode}" = ReleaseSafe ]; then variant=release-safe; fi
+  if [ "${mode}" = safe ]; then variant=release-safe; fi
   native "${zig}" build --build-file "${package}/build.zig" \
     --system "${packages}" --cache-dir "${root}/${mode}/zig-local-cache" \
     --prefix "${root}/${mode}/out" "-Dproof-fixture=${proof_workspace}" "${git_fixture[@]}" \
-    "-Doptimize=${optimize}" -j2 test install --summary all \
+    "-Doptimize=${mode}" -j2 test install --summary all \
     > "${root}/${mode}/preparation.log" 2>&1
   native "${zig}" build --build-file "${package}/namespace/build.zig" \
     --cache-dir "${root}/${mode}/namespace-cache" --prefix "${root}/${mode}/namespace-out" \
@@ -362,11 +360,11 @@ for mode in Debug ReleaseSafe; do
     "-Dfixture-executable=${installation}/namespace-fixture-${variant}" \
     "-Dci-report=${root}/${mode}/namespace-baseline.json" \
     "${namespace_variant[@]}" \
-    "-Doptimize=${optimize}" -j2 test install --summary all \
+    "-Doptimize=${mode}" -j2 test install --summary all \
     > "${root}/${mode}/namespace.log" 2>&1
   native "${zig}" build --build-file "${package}/integration/build.zig" \
     --system "${packages}" --cache-dir "${root}/${mode}/integration-cache" \
-    --prefix "${root}/${mode}/integration-out" "-Doptimize=${optimize}" -j2 test install --summary all \
+    --prefix "${root}/${mode}/integration-out" "-Doptimize=${mode}" -j2 test install --summary all \
     > "${root}/${mode}/integration.log" 2>&1
 done
 for variant in debug release-safe; do

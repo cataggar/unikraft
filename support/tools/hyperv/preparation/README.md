@@ -1405,7 +1405,7 @@ use its `review-*` filenames:
 ```
 
 The six commands were `bash .../focused.sh SUITE MODE`, with `SUITE=prep,ns,int`
-and `MODE=Debug,ReleaseSafe`. The wrapper uses the build files in this package,
+and `MODE=debug,safe`. The wrapper uses the build files in this package,
 `test install -j2 -Doptimize=MODE --summary all`, explicit per-suite caches/
 prefixes below that fresh root, and the **read-only**
 `/d/unikraft-worktrees/fleet-ci/.d/zig-migration-preparation/restore/zig-pkg`
