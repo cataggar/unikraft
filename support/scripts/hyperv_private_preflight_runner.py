@@ -78,10 +78,10 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "109e7345aff40fed3feaa9bf51bd09fc8f20c34493409447a10feb2b0b5d501b"
+            "47a3408967d905990e3ee0d1a637b806bf0aef58face217f1c2f85ff0e72687a"
         ),
-        "size": 1780570,
-        "files": 217,
+        "size": 1794402,
+        "files": 220,
     },
     "support/kconfig": {
         "name": "support/kconfig",
@@ -172,37 +172,37 @@ GUARDED_PRODUCER_CLOSURES = {
 }
 GUARDED_PRODUCER_FILES = {
     "support/build/hyperv-image-proofs.zig": (
-        "dd7b58050e5c2e7fe1a0d6c07bc111bcc5807c46a7b09237f5a9cca94debe0ff"
+        "b2a3d76e24973764467c36a5bb2197dd6d6754309e6c8a4ae102af4d4316ddfa"
     ),
     "support/build/hyperv-proof-binding.zig": (
         "8748440c3f6d12b3e1d723fec9f5e8095a54c8f740267260ec09dd0a6772e3fc"
     ),
     "support/build/hyperv-proof-build.zig": (
-        "126c878df99bef797d3ccf03f6e011ba326b998d78bedb42d961dac53336f1ac"
+        "dd1b0e02ee0dec4ebe8dad8e8fc1b127057f5aad333bb6b2ccc52b5cf39011a2"
     ),
     "support/build/hyperv-proof-disasm.zig": (
         "17102f939527f340d8db18911536de9388b829865ce37cc492364340082b342a"
     ),
     "support/build/hyperv-proof-fixtures.zig": (
-        "4ebe7456ea3c9aede8e3e3376d54b2e80c1995cffe3587dd17d44af7e7ee06bf"
+        "1e787519bfed589cec80bda089572729158481b09c6e7b90281098fe75205297"
     ),
     "support/build/hyperv-proof-flow.zig": (
         "ef746e4075bf57c148f6f81911e773ead518eb6277ee9ec4ff5fe7214a91bac4"
     ),
     "support/build/hyperv-proof-image.zig": (
-        "3b0a6543f178fde897eb84847663eb611f27cffc58398f170d2aa6f0a0af98f5"
+        "f351f9643a81884eecdd56e931df9629c4229411882c13a5ce83b3f29160e43f"
     ),
     "support/build/hyperv-proof-instructions.zig": (
         "06139edf95d95a268460748a4f75796fee81b7b880a349dfaaf7c8b6ed7e8dab"
     ),
     "support/build/hyperv-proof-paths.zig": (
-        "9b90a3ccbded4ac7f18f7ea0c2530a69277d555d750248fa963816dac252b900"
+        "fc97c3b2c5ee0950cdf7217c04e7cd0e009b770ce75448d2fcd7bd1a71c9c49e"
     ),
     "support/build/hyperv-proof-tests.zig": (
-        "a6620356326c4e3a1d63c029efd4f91c586e7b6ccf690893aad2c2d546cee2f9"
+        "0cf66054f049da126c7a4152f5733891d0664f621d863614f801b6ae214f8243"
     ),
     "support/build/hyperv-proof-tool.zig": (
-        "5320cece80eb649c58200edf8e854dccbbc3340a3f3b4f520716403fd355e759"
+        "33b69f186344f642bc99884f88d7f4c8b20c16adc8c2e5d1af31d013f39c1bae"
     ),
     "support/build/tests/cc-option-test.mk": (
         "a7288ddf1eb5c84dd88e42fcc8720ac10103c0ecdd8aea72e77033787c1c3b27"
@@ -226,10 +226,10 @@ GUARDED_PRODUCER_FILES = {
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
     ),
     "build.zig": (
-        "e8c8045183e07e5f016f27373ad54b61d1c59dbac51b6fc125af48d6ac675a5c"
+        "f325e77c03de2af846421e35ffb6a6b78cd283c1756348a77f3d122aa42a3db4"
     ),
     "build.zig.zon": (
-        "511efb394c90490f52120af26e87c5e0a3ea27a444ab1c197ce04f1b3b709e4e"
+        "8c9bab9a0d0c3cbd68c3b21bcfc212f7148d03c5a30ed9b3c669f1f68e886fba"
     ),
     "version.mk": (
         "cafea59f9f8b9ca7b2d8c15e907cc984f2b8992e52766ed2e826337de0c9503c"
@@ -253,31 +253,31 @@ GUARDED_PRODUCER_FILES = {
         "fcf53f6cd69d082189c1e1a57c10fb0c34a5c0ac6b5e23f6035562287cfd9ae9"
     ),
     "support/build/component-api.zig": (
-        "f34516c624f42b1151d45fe4674e41a3bd8cb76dd03ad279b74afe9feb6860c2"
+        "5345579acb2b4cd24489b0fde25cc219f3d629a3e4ea780a7d0f381f33112991"
     ),
     "support/build/config-submenu.sh": (
         "8036c9d1665fcf577b3ac96d28e0fc6196fada7683077884ba85b8ba4ca5f9cd"
     ),
     "support/build/elf-common-validator.zig": (
-        "9aa2cd402443fa41ce65040332698859853a89c4916be65a8b032907a4bf108f"
+        "c671e8949d3f44e8117398c9509dc2c17c0bd46df25d49a440ac40ab212aa7fa"
     ),
     "support/build/final-link.zig": (
-        "2b2934844c13e511351ae5a6f63fd7f4168a98ee007a1cc37e2411016fb71067"
+        "9a231ece8e661f54800393fc042c5c3635f24c30c7ab47e6eee5c1ba32d7f3d9"
     ),
     "support/build/hyperv-object-elf.zig": (
-        "5f875a510bda0220409fa4bc9c23ae5da19e3d314e5b009aae518e84ad9cd96e"
+        "943e9f3a90bd0ea245a57b99b7c64db18fc4a37283958c29619e288e1ab91622"
     ),
     "support/build/hyperv-object-proofs.build.zig": (
-        "807f946664ee48b07c87984147eed50bd4ede954a4b989cc0b352072f85dae76"
+        "2cbb8f4013ad9294fe0037127409c293e50ccfd8802debd7313a933509145a6b"
     ),
     "support/build/hyperv-object-proofs.zig": (
-        "d287564200048482edde82d9eb17ba88f4a09560d550dbf17a554395f59652fa"
+        "302be56b22cc509f6616f84660b64fb668c7ab5a24c83a3167cde3a3d334d95d"
     ),
     "support/build/hyperv-object-tests.zig": (
-        "8226540d853cb37ae40eb25c3eed1163fd240d224c9f8338d767bfc267f21243"
+        "fdfc757a2029221c074af3f78f54f7de8889ac67ebc776b3b2845b7e0dfe230d"
     ),
     "support/build/hyperv-object-tool-fixture.zig": (
-        "1d9aea3e733325ec76cbeeb3d288ff2e3236b785b60bb4e811494481264731a9"
+        "0d6db8aa63bec7a7de4656081d454bc1f070ea83dc5d9eb28c63a89263ca9484"
     ),
     "support/build/hyperv-object-tools.zig": (
         "72344d506608f7297a6b8c84aa08dd818609796cc7f88c011c0d98c4dc45d483"
@@ -292,19 +292,22 @@ GUARDED_PRODUCER_FILES = {
         "139c967944d7460b92dcad82c8a2149a56d5698a27f7bc1029b1b789da4b19ce"
     ),
     "support/build/lto-symbol-policy.zig": (
-        "c9866d7d1e93b7fa63f338e0b5dab79dc09469ed0346e4d900df43d8c4e4b2e5"
+        "562e4c8abf804d79296d2962228c0d6d139d489d9ffe5215a972469f10cdbb08"
     ),
     "support/build/merge-linker-scripts.py": (
         "dd39b9cec861bdf4771fba05c0b477aea37e2b2f1d40d843f31d3c1df011ee3a"
     ),
     "support/build/native-build-tools.zig": (
-        "d6ae0548d15f54eecbfe333490b648165047e1a63e72a61aafea62aec2b8aeab"
+        "fec22a514bf52fd4b4b8502a61dc056842b7b894f6a2463255c36c22bd164e88"
     ),
     "support/build/native-config-metadata.py": (
         "b6ff513dcfd0cddd55ccd75e3b3c78ddaa286190bfa283621cfe08d9b3fe0ef6"
     ),
+    "support/build/native-config-input.zig": (
+        "928e68535e0c4288c00ae2630e228474c72e57773bde865f8ab7a77380738e9d"
+    ),
     "support/build/native-config-metadata.zig": (
-        "12ec5aa6fd3b8d93efa20d861f268010c4b8a7d9bbdf994ad83318d23eacb117"
+        "7d0091540a533386c64ec451bf1343c74b85b431c433e5a708018f31a8949549"
     ),
     "support/build/native-config-tool.zig": (
         "30291f034f98c970bbf7879189e9bc4c8bc5aa5a6a19fe1ed247d508641d46a9"
@@ -316,34 +319,34 @@ GUARDED_PRODUCER_FILES = {
         "457137bfa280d69f8c3c819ca059c20b76a6c5dcb190575d10a7e5b1ea05f93a"
     ),
     "support/build/native-library-link.zig": (
-        "562a0b713e67e6e3de6897077f6bd18cc0ee135b8522bfaecd6d8c11a61423fe"
+        "632a6bdea90ec8837cf80919a85b71f89c3aaffb089c3071c0550507f63a496c"
     ),
     "support/build/native-lto.zig": (
-        "c1c75f1364efe3a84da48f5fb399030822901262d0e6c728529e89341e72b63d"
+        "09abfbdb180fc98da34b565febd5cfb2f723c5e33d4dd7bf4bf28df624827c2c"
     ),
     "support/build/native-make-environment-contract.zig": (
-        "b1eb05c19383d5b3da64c5820b60d41a14334dc0f0dda56b14b2435d24e508d7"
+        "4117515795db6f2de1c8e7169e78e6dd8d43452e859462c40752389e56ee8cab"
     ),
     "support/build/native-make-environment.zig": (
-        "2c9d31594401b9d7a095e4620d13dd375a7163b9df168284113dce41eb084caa"
+        "481a8e9c2bfad546ecc94647f69b82d9d6dc8d86534d5f284d841d1f39475858"
     ),
     "support/build/native-target-object.zig": (
-        "cdbf48bdabc4a82c7922efe3d44e412dd88d751160a19d048f39636023e77d98"
+        "19b26c34bd433a46aa1861a44a15eb2c373b3d6e29e8988898504da1bbb56925"
     ),
     "support/build/postprocess-elf.zig": (
-        "e227ca4b63adfd76ad5e768b424cf750f7e12d6eac8743b7fe9420e339083180"
+        "a5216c490acbf66c7b9c97cba3ebea8a5cd024416e494e61658d9f505b5b7376"
     ),
     "support/build/postprocess-files.zig": (
-        "246755ac1072ef405b0899eb68383eede069eb5d4d0151e8f54844eb8ad5f33f"
+        "1073f0dd62d950f97e1c0d3504e1c02d4c6af596b3f73221afb93977db3f4260"
     ),
     "support/build/postprocess-image.zig": (
-        "5421eb54f11e132ec71551c724b6713e9bda781bd9ecd584aa5f846457209114"
+        "528654fe904ddfa17268a6315c388fb644c4eb8acf3d356a9547b653a9c6b169"
     ),
     "support/build/symbols/libukrandom-lcpu.localize": (
         "b00d5cfee43ae40b56bda292365bf7339d2c8f4239131d632edbebe623e940c6"
     ),
     "support/build/target/native-profile.zig": (
-        "ab321fb4434415ddd6ed4e34e173956a9555af91b91f26557b47673b6fe310de"
+        "5f162fefe617dac9b3507fb19856aa1cc8fde1fb63924d52e3be96bfac440b53"
     ),
     "support/build/tests/hyperv-object-undefined.c": (
         "13ab823738d09c0b1d479c523c034f891081871a2a7d69f0cc556828346c2793"
@@ -352,7 +355,7 @@ GUARDED_PRODUCER_FILES = {
         "38325cf826d855004e9808924e2687dc70bc42264b952da98f2dce0ad801b8f0"
     ),
     "support/build/zig-facade-runner.zig": (
-        "5ba4f753fd4a0537564009a47298f242d10a1b831fe6fda00b5172023de8db77"
+        "95a227e6bcb263d4e9d721ca3f8b86641b869194c81d2c294e1440050ce6fb07"
     ),
     "support/tools/hyperv/contracts.zig": (
         "a51fe40c42a660ca1218275f88c9ddf5d45bebb41f1c7893de8408cec592a1ce"
@@ -364,19 +367,19 @@ GUARDED_PRODUCER_FILES = {
         "39db3cd37dffe39608220e267b627010c6b0aabcfd0a436b98fe9556f5d92516"
     ),
     "support/tools/hyperv/private_files.zig": (
-        "4dbfa7ec59f5c5f18bb20b21e0ae3307a9e9b30208695a9514bc8b881941741d"
+        "ba0022dcefa33f03edc025749b32e85d913e74f13e19650773e18d7066a20b88"
     ),
     "support/tools/hyperv/process-command-v1.json": (
         "ee1e038f6538beecac8a09d4d52a6c601a9ca1f503fd70a3753bd8d2e3ac904b"
     ),
     "support/tools/hyperv/process.zig": (
-        "453bcc06e36f43a906f98f4c28e8e2f802245ebdbc47b5bea4d23a11ef448dac"
+        "cd393d5ea9df2f877b837454ddf8a3a937362bef7b79ca3de6af157883b56b2b"
     ),
     "support/tools/hyperv/sensitive.zig": (
         "e5845b7623116f3ef6e6e062463f39c2f3840bec5d36c75ccf413643dfae1eca"
     ),
     "support/tools/hyperv/sha256.zig": (
-        "9df4a987600791dd1b8497143d40e40b86adcc345a7dec51963467b6bdb8ec9a"
+        "8de8969668fdbe6054960760e866749d097e3cc786a977ef943223c6bfcafc46"
     ),
     "support/tools/hyperv/sha256_clear_upper.S": (
         "b7a0c49539870ecb32d4a36a5409154d15d89fcecba97f98b6918539c81c2834"
@@ -421,7 +424,7 @@ GUARDED_PRODUCER_FILES = {
         "5a7e349ed5300c3fe0603740dfb34320e72de1ca3bffcab35e6fa9a728a9162c"
     ),
     "drivers/hyperv/netvsc/Makefile.uk": (
-        "452014b4e98da4bece34f18bc59b4fdbda46abf6a15627611580912fb31a81c4"
+        "1fa21b27ba606ba5dc55962d65c854ccdd718c134a3c53fb0dcbe9d89ffd4722"
     ),
     "drivers/hyperv/netvsc/exportsyms.uk": (
         "664a748b4fabfa6a175994cfa828054b2d8626fd2efbe1227ba43a962b9a8571"
@@ -436,7 +439,7 @@ GUARDED_PRODUCER_FILES = {
         "4ee6997ebb98a63bf8cc39ac219e447c5bcec0b783140d2802ba19238711b12c"
     ),
     "drivers/hyperv/storvsc/Makefile.uk": (
-        "29cfdd7a324e52cc4ada63321311b34b6f119190c0afef38b55543165fba8dba"
+        "01f528db1d51a740ccf58da7a89be4677321b9f892fc146518f4d3125e3b908e"
     ),
     "drivers/hyperv/storvsc/exportsyms.uk": (
         "96d418ad387c2fa392afc96dfc8b1eb77cc20a0bcdb8a88fbd44038a5fdfa5de"
@@ -451,13 +454,13 @@ GUARDED_PRODUCER_FILES = {
         "8422dd6de969b13a533fe0291a7019442712ae9b7f6177420e6fd4df22860ab7"
     ),
     "drivers/hyperv/storvsc/storvsc_core.zig": (
-        "0c09b2e8399302294e9c037619189798b5ef82dce18ca05a04f532ec3b34bb94"
+        "059b4a6bae2c6ee12503b07e082351dfba7acdc806f31863f6e6b7bf199f1998"
     ),
     "drivers/hyperv/vmbus/Config.uk": (
         "05a880a38a10e130510fafbfa786f080d3da1413feb84ca7fc2a068c04a4d069"
     ),
     "drivers/hyperv/vmbus/Makefile.uk": (
-        "c25184fea66e2de8612bb39a49d3daeb13da68617a03cef066303583ba655763"
+        "415661b84cf6ea6dd5ad944a27c15257e8953e348463f234c075ff635663e644"
     ),
     "drivers/hyperv/vmbus/exportsyms.uk": (
         "f26fc7b7de9220cb994e4a81722bfa44e900c9ed84eefab480db9deedaf3a9bb"
@@ -478,7 +481,7 @@ GUARDED_PRODUCER_FILES = {
         "c00e58790f9d8ece3518fdda9b82b02b843eccb3c2cc90002344192b554e44a9"
     ),
     "drivers/hyperv/vmbus/vmbus_protocol.zig": (
-        "4815d095de1aefcbc8f9bd40c87f7b17b1ff5e51bc816b8ba0b73980b5eab2a3"
+        "4fe45a6d38535195d5433fc557ab7f3f8e4ec61ef1c21230429decb319224f87"
     ),
     "lib/uktimeconv/include/uk/timeconv.h": (
         "022634efc8985d508279fead89c925268df5cd290551d41c2f2aabbeb2e5dd5f"
@@ -490,10 +493,10 @@ GUARDED_PRODUCER_FILES = {
         "c5fe6226a426333e2119845366cac6c712b4258d8c7ead82980d7ac57c7c0505"
     ),
     "plat/hyperv/Makefile.uk": (
-        "5d88fbd2aa40331b421a76817533e3a00b3c2692dcb04acac05a562869418acb"
+        "d73b989cc28c7884e4f26156fad52dd92847ed71ff45dba17a12d2feb9120990"
     ),
     "plat/hyperv/hyperv_runtime.zig": (
-        "901a9caf76b33fa9990acdc061139553862caf394d1c78039cb71008262ec076"
+        "fc12400e185046f5aa8bb7469a68824d3e47ca855f9487f662e600206d9605a2"
     ),
     "plat/hyperv/include/hyperv/clock.h": (
         "378e4b267ca5330d5a7a1fd9da306d1fd59244528e15560d1ef8842ce26eea35"
@@ -511,13 +514,13 @@ GUARDED_PRODUCER_FILES = {
         "82e672e9659bfb4851d574c0c1ce4a48b55c415e9ffc6bc36eda57dde9e7764b"
     ),
     "support/build/native-image-graph.zig": (
-        "6465bc8c33deba57d3ae86edbc97a0f78f3b0cfea1669896855ad3c0a7b3c2c9"
+        "dc2c69e762d8030054b7670036e872d377857baf606c626c5be627e55ce38805"
     ),
     "support/build/native-postprocess-runner.py": (
         "3379115753b149a6f16675cb3d5f315c25bfb49bf702720cdc882470434ef0f1"
     ),
     "support/build/native-postprocess-runner.zig": (
-        "3077b7aa0af7ed5be4ce2506da7d1941f595622b6a70f7af4d3b8ac77821e766"
+        "f7700d90475285230dd5bc1dbf9c4142b1c16c90c931bf4fcc07605e725861d1"
     ),
     "support/build/native-postprocess.zig": (
         "294ffe3767a69e7cb60aecf4a8417924e27eb69996562afe954f7efdc6b57381"
