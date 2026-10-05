@@ -63,6 +63,15 @@ pub fn build(b: *std.Build) void {
     });
     const test_step = b.step("test", "Run native read-only direct validation fixtures (no cloud or disks)");
     test_step.dependOn(&b.addRunArtifact(fixtures).step);
+    const compute_runtime_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("compute.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &imports,
+    }) });
+    const compute_runtime_run = b.addRunArtifact(compute_runtime_tests);
+    b.step("test-compute-runtime", "Check current and frozen historical handoff runtime identities").dependOn(&compute_runtime_run.step);
+    test_step.dependOn(&compute_runtime_run.step);
     const log_cli_tests = b.addSystemCommand(&.{ "python3", "-B" });
     log_cli_tests.addFileArg2(b.path("../../../apps/wamr-aot/validator/cli_test.py"), .{ .make_absolute = true });
     log_cli_tests.addFileArg2(log_cli.getEmittedBin(), .{ .make_absolute = true });

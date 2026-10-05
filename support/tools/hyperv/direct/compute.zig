@@ -12,6 +12,7 @@ pub const Artifact = base.Artifact;
 pub const SerialMode = base.SerialMode;
 pub const parse = base.parse;
 pub const sdk = "a53205d77be3b880eb8f8b96679512ba58e2331a";
+const historical_sdk = "a53205d77be3b880eb8f8b96679512ba58e2331a";
 pub const marker = log_validator.tiny.marker;
 pub const artifact_names = .{
     "efi",   "debug_elf",   "bootinfo",    "raw",              "vhd",            "runtime",      "compiler",
@@ -706,6 +707,64 @@ fn legacyLocalPins(source_revision: []const u8, source_tree: []const u8) bool {
         eq(source_revision, "34e5c88a165c4da878b3122b8b91716116d65d4b") or
         eq(source_revision, "b5a8fdbee033349f7145fbc76aebfee29b2fa04f")) and
         eq(source_tree, "54f8e118146c78c24e7c802657c6ec62b268a5de");
+}
+
+const HandoffRuntime = struct {
+    sdk_revision: []const u8,
+    zig_version: []const u8,
+};
+
+fn handoffRuntime(version: u8, source_revision: []const u8, source_tree: []const u8) HandoffRuntime {
+    if (version == 1 and legacyLocalPins(source_revision, source_tree))
+        return .{ .sdk_revision = historical_sdk, .zig_version = "0.16.0" };
+    return .{ .sdk_revision = sdk, .zig_version = "0.17.0" };
+}
+
+fn verifyHandoffRuntime(runtime: std.json.Value, expected: HandoffRuntime) !void {
+    if (!eq(try string(runtime, "wamr_revision"), expected.sdk_revision) or
+        !eq(try string(runtime, "compiler_profile"), "unikraft-x86_64") or
+        !eq(try string(runtime, "zig_version"), expected.zig_version))
+        return error.WrongSdk;
+    const wasi = try field(runtime, "minimal_wasi");
+    if (wasi != .bool or wasi.bool) return error.WrongSdk;
+}
+
+fn testHandoffRuntime(
+    version: u8,
+    source_revision: []const u8,
+    source_tree: []const u8,
+    sdk_revision: []const u8,
+    zig_version: []const u8,
+) !void {
+    const a = std.testing.allocator;
+    const bytes = try a.print(
+        "{{\"wamr_revision\":\"{s}\",\"compiler_profile\":\"unikraft-x86_64\",\"zig_version\":\"{s}\",\"minimal_wasi\":false}}",
+        .{ sdk_revision, zig_version },
+    );
+    defer a.free(bytes);
+    const document = try c.Document.parse(a, bytes, .{ .bytes = 65536 });
+    defer document.deinit();
+    try verifyHandoffRuntime(document.value(), handoffRuntime(version, source_revision, source_tree));
+}
+
+test "frozen version-one handoff retains historical compiler and SDK identity" {
+    const revision = "993e4d0d394c08202c0d0c57ea97450a19a4f394";
+    const tree = "54f8e118146c78c24e7c802657c6ec62b268a5de";
+    try testHandoffRuntime(1, revision, tree, historical_sdk, "0.16.0");
+    try std.testing.expectError(error.WrongSdk, testHandoffRuntime(1, revision, tree, historical_sdk, "0.17.0"));
+    try std.testing.expectError(error.WrongSdk, testHandoffRuntime(1, revision, tree, "0000000000000000000000000000000000000000", "0.16.0"));
+    try std.testing.expectError(error.WrongSdk, testHandoffRuntime(1, revision, "0000000000000000000000000000000000000000", historical_sdk, "0.16.0"));
+    try std.testing.expectError(error.WrongSdk, testHandoffRuntime(2, revision, tree, historical_sdk, "0.16.0"));
+}
+
+test "current handoffs do not acquire historical compiler compatibility" {
+    const revision = "0000000000000000000000000000000000000000";
+    const tree = "0000000000000000000000000000000000000000";
+    inline for (.{ @as(u8, 1), @as(u8, 2) }) |version| {
+        try testHandoffRuntime(version, revision, tree, sdk, "0.17.0");
+        try std.testing.expectError(error.WrongSdk, testHandoffRuntime(version, revision, tree, sdk, "0.16.0"));
+        try std.testing.expectError(error.WrongSdk, testHandoffRuntime(version, revision, tree, "ffffffffffffffffffffffffffffffffffffffff", "0.17.0"));
+    }
 }
 
 pub const Result = log_validator.tiny.Result;
@@ -1567,7 +1626,8 @@ pub fn verifyHandoff(a: std.mem.Allocator, io: std.Io, bytes: []const u8) !void 
 
 pub fn verifyBundle(a: std.mem.Allocator, io: std.Io, bundle: Bundle) !void {
     if (!eq(bundle.schema, "uk.wamr.local-image-handoff") or bundle.version != 1 or
-        !eq(bundle.identity.wamr_revision, sdk)) return error.WrongSdk;
+        !eq(bundle.identity.wamr_revision, handoffRuntime(bundle.version, bundle.source_revision, bundle.source_tree).sdk_revision))
+        return error.WrongSdk;
     try hex(bundle.source_revision, 40);
     try hex(bundle.source_tree, 40);
     inline for (.{ .{ "runtime", "runtime_sha256" }, .{ "compiler", "compiler_sha256" }, .{ "wasm", "wasm_sha256" }, .{ "cwasm", "cwasm_sha256" }, .{ "config", "config_sha256" } }) |pair|
@@ -1694,11 +1754,7 @@ fn evidenceRecords(a: std.mem.Allocator, io: std.Io, bundle: anytype, package_vh
     if (!eq(try string(source, "revision"), bundle.source_revision) or !eq(try string(source, "tree"), bundle.source_tree))
         return error.WrongSource;
     const runtime = try field(build_doc.value(), "runtime");
-    if (!eq(try string(runtime, "wamr_revision"), sdk) or
-        !eq(try string(runtime, "compiler_profile"), "unikraft-x86_64") or
-        !eq(try string(runtime, "zig_version"), "0.17.0")) return error.WrongSdk;
-    const wasi = try field(runtime, "minimal_wasi");
-    if (wasi != .bool or wasi.bool) return error.WrongSdk;
+    try verifyHandoffRuntime(runtime, handoffRuntime(bundle.version, bundle.source_revision, bundle.source_tree));
     const runtime_files = try field(runtime, "files");
     inline for (.{ .{ "tiny.wasm", "wasm" }, .{ "tiny.cwasm", "cwasm" }, .{ "wamrc", "compiler" }, .{ "libwamr-aot.a", "runtime" } }) |pair|
         if (!eq(try string(runtime_files, pair[0]), bundle.get(pair[1]).sha256)) return error.WrongComputeIdentity;
