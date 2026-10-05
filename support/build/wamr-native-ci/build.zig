@@ -2,6 +2,11 @@ const std = @import("std");
 const controller_target = @import("controller/target.zig");
 
 pub fn build(b: *std.Build) void {
+    const repository_root = std.Io.Dir.cwd().realPathFileAlloc(
+        b.graph.io,
+        b.root.joinString(b.allocator, "../../..") catch @panic("OOM"),
+        b.allocator,
+    ) catch |err| std.debug.panic("resolve controller repository root: {s}", .{@errorName(err)});
     const requested_target = b.standardTargetOptionsQueryOnly(.{});
     const target = b.resolveTargetQuery(requested_target);
     const optimize = b.standardOptimizeOption(.{});
@@ -146,7 +151,7 @@ pub fn build(b: *std.Build) void {
         "Existing absolute owner-only runtime directory for create-only controller install",
     ) orelse "";
     const controller_options = b.addOptions();
-    controller_options.addOptionPathDirectory("repository_root", b.path("../../.."));
+    controller_options.addOptionPathDirectory("repository_root", b.graph.cwdRelativePath(repository_root));
     controller_options.addOption([]const u8, "zig_executable", b.graph.zig_exe);
     controller_options.addOptionPath("git_executable", b.findProgramLazy(.{ .names = &.{"git"} }));
     controller_options.addOptionPath("python_executable", b.findProgramLazy(.{ .names = &.{"python3"} }));
@@ -350,8 +355,14 @@ pub fn build(b: *std.Build) void {
     });
     const handoff_options = b.addOptions();
     handoff_options.addOptionPathUntracked("fixture_root", .cache_root);
-    handoff_options.addOptionPath("python_oracle", b.path("tests/test_handoff_contract_goldens.py"));
-    handoff_options.addOptionPath("accepted_result_fixture", b.path("tests/fixtures/differential/accepted-v2.json"));
+    handoff_options.addOptionPath("python_oracle", b.graph.cwdRelativePath(b.fmt(
+        "{s}/support/build/wamr-native-ci/tests/test_handoff_contract_goldens.py",
+        .{repository_root},
+    )));
+    handoff_options.addOptionPath("accepted_result_fixture", b.graph.cwdRelativePath(b.fmt(
+        "{s}/support/build/wamr-native-ci/tests/fixtures/differential/accepted-v2.json",
+        .{repository_root},
+    )));
     handoff_contracts.root_module.addOptions("test_options", handoff_options);
     const handoff_contracts_run = b.addRunArtifact(handoff_contracts);
     const handoff_python_goldens = b.addSystemCommand(&.{"env"});
