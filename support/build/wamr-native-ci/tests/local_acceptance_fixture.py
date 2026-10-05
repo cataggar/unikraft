@@ -39,6 +39,42 @@ def copy_file(source, target, executable=False):
     target.chmod(0o500 if executable else 0o600)
 
 
+def stage_git(git, target):
+    git, target = map(Path, (git, target))
+    copy_file(git, target, True)
+    target.chmod(0o700)
+    local_lib = target.parent.parent / "lib"
+    local_lib.mkdir(mode=0o700, exist_ok=True)
+    original_lib = git.parent.parent / "lib"
+    if original_lib.is_dir():
+        for library in original_lib.iterdir():
+            if library.is_file() and ".so" in library.name:
+                copy_file(library, local_lib / library.name)
+    image = bytearray(target.read_bytes())
+    assert image[:6] == b"\x7fELF\x02\x01", "fixture requires little-endian ELF64 Git"
+    phoff = struct.unpack_from("<Q", image, 32)[0]
+    entsize, count = struct.unpack_from("<HH", image, 54)
+    assert entsize == 56 and phoff + count * entsize <= len(image)
+    entries = [phoff + index * entsize for index in range(count)
+               if struct.unpack_from("<I", image, phoff + index * entsize)[0] == 3]
+    assert len(entries) == 1, "fixture requires Git's real ELF interpreter"
+    entry = entries[0]
+    offset, size = (struct.unpack_from("<Q", image, entry + part)[0]
+                    for part in (8, 32))
+    assert size > 1 and offset + size <= len(image) and image[offset + size - 1] == 0
+    interpreter = Path(os.fsdecode(bytes(image[offset:offset + size - 1]))).resolve(strict=True)
+    private_loader = local_lib / interpreter.name
+    copy_file(interpreter, private_loader, True)
+    private_loader.chmod(0o700)
+    # Relocate only PT_INTERP; Git's loaded code and bundled-library RPATH stay intact.
+    relocated = os.fsencode(private_loader) + b"\0"
+    struct.pack_into("<Q", image, entry + 8, len(image))
+    struct.pack_into("<Q", image, entry + 32, len(relocated))
+    struct.pack_into("<Q", image, entry + 40, len(relocated))
+    image.extend(relocated)
+    target.write_bytes(image)
+
+
 def identity(record):
     dev, ino, mode, uid, unused_gid, unused_links, size, mtime, ctime = record["metadata"]
     return {
@@ -140,14 +176,7 @@ def prepare(args):
     # Git and Python are genuine executables. Other unexecuted command roles
     # use the purpose-built native command fixture, with its real identity.
     local_git = runtime / "host-tools/git"
-    copy_file(git, local_git, True)
-    original_lib = Path(git).parent.parent / "lib"
-    if original_lib.is_dir():
-        local_lib = runtime / "lib"
-        local_lib.mkdir(mode=0o700)
-        for library in original_lib.iterdir():
-            if library.is_file() and ".so" in library.name:
-                copy_file(library, local_lib / library.name)
+    stage_git(git, local_git)
     tools = {}
     names = list(ci.HOST_TOOLS) + ([] if v2 else ["head", "timeout"])
     for name in names:
@@ -517,9 +546,6 @@ def mutate(work, case):
         custody = record["consumer_inputs"] if case == "runtime-path-build" else record
         libraries = [(role, Path(value["path"])) for role, value in
                      custody["files"].items() if role.startswith("runtime:")]
-        if case == "runtime-path-build":
-            libraries = [(role, path) for role, path in libraries
-                         if str(path).startswith(str(runtime / "lib") + "/")]
         assert libraries, "real discovered runtime library unavailable"
         role, path = libraries[0]
         redirected = work / "redirected-runtime"
@@ -615,6 +641,8 @@ if __name__ == "__main__":
     os.umask(0o077)
     if sys.argv[1] == "prepare":
         prepare(sys.argv[2:])
+    elif sys.argv[1] == "stage-git":
+        stage_git(*sys.argv[2:])
     elif sys.argv[1] == "mutate":
         mutate(*sys.argv[2:])
     else:

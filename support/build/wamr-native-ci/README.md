@@ -142,6 +142,11 @@ repository, so qualification from a shallow checkout must first fetch its
 complete history with `git fetch --unshallow`. The native CI checkout uses
 `fetch-depth: 0`, matching the existing integration runtime job. Missing
 historical objects refuse the fixture; no synthetic commit replaces them.
+Reader fixtures stage a single-link private copy of real Git and its real ELF
+interpreter, relocating only `PT_INTERP` while preserving Git's loaded code and
+bundled-library search paths. This gives both system and bundled Git an actual
+owned runtime dependency for physical mutation tests without changing system
+libraries, weakening tool-file policy, or dropping any refusal case.
 Read-only Python-v2 custody checks bind the complete recorded producer checkout,
 not the newer reader's compiled source bytes, and recapture the original input
 roles and physical identities unchanged. The production local-consumer probe

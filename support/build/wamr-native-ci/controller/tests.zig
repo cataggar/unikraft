@@ -3379,8 +3379,12 @@ test "trusted historical inner stage accepts complete records and refuses tamper
         std.debug.print("historical Git fixture {s}: {s}\n", .{ source.revision, seeded.stderr });
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, seeded.term);
     const self = try std.process.executablePathAlloc(io, a);
+    const reader_tools_name = try std.fmt.allocPrint(a, "{s}-reader-tools", .{name});
+    const reader_git = try std.fs.path.join(a, &.{ options.fixture_root, reader_tools_name, "bin/git" });
+    try @import("local_acceptance_tests.zig").stageGit(a, io, reader_git);
+    defer parent.deleteTree(io, reader_tools_name) catch @panic("legacy reader tools cleanup failed");
     const local_tools = controller.import_validator_build.LocalTools{
-        .git = options.git_executable,
+        .git = reader_git,
         .supervisor = self,
         .validator = options.import_validator,
     };
@@ -3510,7 +3514,7 @@ test "trusted historical inner stage accepts complete records and refuses tamper
         .argv = &.{
             options.host_controller_cli, "import-handoff-revalidation",
             "--stage-root",              stage_root_path,
-            "--git",                     options.git_executable,
+            "--git",                     reader_git,
             "--supervisor",              options.host_controller_cli,
             "--validator",               options.import_validator,
             "--output",                  revalidated_path,
@@ -3546,7 +3550,7 @@ test "trusted historical inner stage accepts complete records and refuses tamper
             .argv = &.{
                 options.host_controller_cli, "import-handoff-revalidation",
                 "--stage-root",              stage_root_path,
-                "--git",                     options.git_executable,
+                "--git",                     reader_git,
                 "--supervisor",              if (std.mem.eql(u8, substituted, "supervisor")) options.command_fixture else options.host_controller_cli,
                 "--validator",               if (std.mem.eql(u8, substituted, "validator")) options.command_fixture else options.import_validator,
                 "--output",                  revalidated_path,
@@ -3571,7 +3575,7 @@ test "trusted historical inner stage accepts complete records and refuses tamper
         .argv = &.{
             options.host_controller_cli, "import-handoff-revalidation",
             "--stage-root",              stage_root_path,
-            "--git",                     options.git_executable,
+            "--git",                     reader_git,
             "--supervisor",              options.host_controller_cli,
             "--validator",               options.import_validator,
             "--output",                  revalidated_path,
@@ -3606,7 +3610,7 @@ test "trusted historical inner stage accepts complete records and refuses tamper
         .argv = &.{
             options.host_controller_cli, "import-handoff-revalidation",
             "--stage-root",              stage_root_path,
-            "--git",                     options.git_executable,
+            "--git",                     reader_git,
             "--supervisor",              options.host_controller_cli,
             "--validator",               options.import_validator,
             "--output",                  revalidated_path,
@@ -3654,8 +3658,8 @@ fn qualifyLegacyLocalReadOnly(a: std.mem.Allocator, io: std.Io, stage: []const u
     try work.createDir(io, "bin", .fromMode(0o700));
     const bin = try work.openDir(io, "bin", .{});
     defer bin.close(io);
-    try copyFixtureExecutable(io, a, options.git_executable, bin, "reader-git");
     const git = try std.fs.path.join(a, &.{ work_path, "bin/reader-git" });
+    try @import("local_acceptance_tests.zig").stageGit(a, io, git);
     const repository = try std.fs.path.join(a, &.{ work_path, "producer" });
     const runtime = try std.fs.path.join(a, &.{ work_path, "runtime" });
     const script =
@@ -3663,15 +3667,6 @@ fn qualifyLegacyLocalReadOnly(a: std.mem.Allocator, io: std.Io, stage: []const u
         \\os.umask(0o077)
         \\git,source,stage,repository,runtime,revision,reader_git=sys.argv[1:]
         \\stage,repository,runtime=map(pathlib.Path,(stage,repository,runtime))
-        \\original_lib=pathlib.Path(git).parent.parent/"lib"
-        \\if original_lib.is_dir():
-        \\    fixture_lib=pathlib.Path(reader_git).parent.parent/"lib"
-        \\    fixture_lib.mkdir(mode=0o700)
-        \\    for library in original_lib.iterdir():
-        \\        if library.is_file() and ".so" in library.name:
-        \\            target=fixture_lib/library.name
-        \\            shutil.copyfile(library,target)
-        \\            target.chmod(0o600)
         \\subprocess.run([git,"-c","gc.auto=0","-c","maintenance.auto=false","clone","-q","--no-hardlinks","--",source,str(repository)],check=True)
         \\subprocess.run([git,"-C",str(repository),"-c","gc.auto=0","-c","maintenance.auto=false","checkout","-q","--detach",revision],check=True)
         \\def save(path,value):
@@ -3759,6 +3754,7 @@ fn qualifyLegacyLocalReadOnly(a: std.mem.Allocator, io: std.Io, stage: []const u
         mutated_runtime = true;
         break;
     }
+    if (!mutated_runtime) std.debug.print("legacy local fixture has no owned discovered Git runtime\n", .{});
     try std.testing.expect(mutated_runtime);
     const changed_git = try bin.openFile(io, "reader-git", .{ .mode = .read_write, .follow_symlinks = false });
     defer changed_git.close(io);

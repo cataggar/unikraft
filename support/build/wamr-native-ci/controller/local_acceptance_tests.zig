@@ -20,6 +20,10 @@ fn python(a: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
 }
 
+pub fn stageGit(a: std.mem.Allocator, io: std.Io, target: []const u8) !void {
+    try python(a, io, &.{ "stage-git", options.git_executable, target });
+}
+
 fn open(io: std.Io, directory: *const files.Directory, runtime: []const u8, repository: []const u8) !controller.accepted_run.AcceptedRun {
     return controller.accepted_run.openAndValidateReadOnlyWithSignal(
         std.testing.allocator,
