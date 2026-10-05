@@ -61,17 +61,19 @@ def main():
             "--cache-dir", str(root / ".cache"), "--prefix", str(root / "out"),
             "-j2", "install", "--summary", "failures",
         ]
-        for payload in (b"# reviewed peer A\n", b"# reviewed peer B\n"):
-            peer.write_bytes(payload)
-            subprocess.run(command, check=True)
-            pin = subprocess.check_output([root / "out/bin/uk-hyperv-public-image"]).strip()
-            if pin != hashlib.sha256(payload).hexdigest().encode():
-                raise SystemExit("stale configure-time peer commitment")
-        peer.unlink()
-        refused = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        if refused.returncode == 0 or b"public peer source unavailable" not in refused.stdout:
-            raise SystemExit("deleted peer source was not refused on a warm configure cache")
-        print("public-image warm configure cache updates peer bytes and refuses deletion")
+        for mode in ("debug", "safe"):
+            selected = command + ["-Doptimize=" + mode]
+            for payload in (b"# reviewed peer A\n", b"# reviewed peer B\n"):
+                peer.write_bytes(payload)
+                subprocess.run(selected, check=True)
+                pin = subprocess.check_output([root / "out/bin/uk-hyperv-public-image"]).strip()
+                if pin != hashlib.sha256(payload).hexdigest().encode():
+                    raise SystemExit("stale configure-time peer commitment")
+            peer.unlink()
+            refused = subprocess.run(selected, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            if refused.returncode == 0 or b"public peer source unavailable" not in refused.stdout:
+                raise SystemExit("deleted peer source was not refused on a warm configure cache")
+        print("public-image debug/safe warm configure caches update peer bytes and refuse deletion")
     finally:
         shutil.rmtree(root)
 
