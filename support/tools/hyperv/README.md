@@ -81,7 +81,7 @@ imports bound to the existing immutable historical source revision/tree allowlis
 and frozen Zig 0.16 runtime/SDK/profile. Its SDK remains
 `a53205d77be3b880eb8f8b96679512ba58e2331a`. Ordinary `handoff` validation always
 requires Zig 0.17 and current SDK
-`661ac49584c4d0ac57adb78eba62f3ff3e9795df`, even if input strings quote historical
+`bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20`, even if input strings quote historical
 pins. The historical command is not a fallback for failed current validation and does not
 relax artifact, boot, private-file or authority validation. The standalone direct
 `test-compute-runtime` selector checks rejection across those generation boundaries.
