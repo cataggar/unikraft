@@ -142,7 +142,9 @@ outside the source worktree before building; Zig 0.17 otherwise creates an
 untracked `zig-pkg` directory, which source-provenance checks correctly refuse.
 Strict producers restore exact copied `build.zig` and `build.zig.zon` files into
 private scratch with `zig build --fetch=all`, then pass the restored depot with
-`--system`. Keep that restoration before source/admission custody; do not hide
+`--system` and the same `ZIG_LOCAL_PKG_DIR` binding. The environment variable
+takes precedence over the `--system` directory in Zig 0.17. Keep that restoration
+before source/admission custody; do not hide
 untracked dependency sources or allow an ambient depot to substitute for the
 authenticated binding. Set the global cache with `ZIG_GLOBAL_CACHE_DIR`;
 Zig 0.17 `build` and `fetch` no longer accept `--global-cache-dir`.

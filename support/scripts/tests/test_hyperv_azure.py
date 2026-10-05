@@ -2540,6 +2540,17 @@ esac
         harness = r"""
         set -euo pipefail
         zig() {
+          [[ "$ZIG_LOCAL_PKG_DIR" == \
+            "$RUNNER_TEMP/hyperv-ci/native-public-image/restore/zig-pkg" ]] || return 18
+          local arg next=false
+          for arg in "$@"; do
+            if [[ "$next" == true ]]; then
+              [[ "$arg" == "$ZIG_LOCAL_PKG_DIR" ]] || return 18
+              next=false
+            elif [[ "$arg" == --system ]]; then
+              next=true
+            fi
+          done
           printf 'fixture-zig %s\n' "$*"
           if [[ "${FAIL_PHASE:-}" == restore && "$*" == *--fetch=all* ]] ||
              [[ -n "${FAIL_PHASE:-}" && "$*" == *"-Doptimize=${FAIL_PHASE}"* ]]; then
@@ -2557,6 +2568,7 @@ esac
             with self.subTest(args=args), tempfile.TemporaryDirectory() as root:
                 env = dict(os.environ, RUNNER_TEMP=root,
                            ZIG_GLOBAL_CACHE_DIR=str(Path(root) / "global"),
+                           ZIG_LOCAL_PKG_DIR="/untrusted-ambient-depot",
                            FAIL_PHASE="")
                 result = subprocess.run(
                     ["bash", "-c", harness, "fixture-api", str(helper), *args],

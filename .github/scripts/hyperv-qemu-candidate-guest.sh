@@ -176,6 +176,7 @@ if [[ "$1" == build ]]; then
 
   export ZIG_LOCAL_CACHE_DIR="$guest/public-image/zig-local-cache"
   packages="$guest/empty-packages"
+  export ZIG_LOCAL_PKG_DIR="$packages"
   cli_args=(
     --build-file "$public/build.zig" --cache-dir "$ZIG_LOCAL_CACHE_DIR"
     --prefix "$guest/public-image/out"
@@ -206,6 +207,7 @@ if [[ "$1" == build ]]; then
     cmp "$public/build.zig" "$guest/public-image/restore/build.zig"
     cmp "$public/build.zig.zon" "$guest/public-image/restore/build.zig.zon"
     packages="$guest/public-image/restore/zig-pkg"
+    export ZIG_LOCAL_PKG_DIR="$packages"
     export ZIG_LOCAL_CACHE_DIR="$guest/public-image/zig-local-cache"
     run_bounded "$evidence/logs/cli-build.log" 900 $((8 * 1024 * 1024)) \
       "$zig" build --system "$packages" "${cli_args[@]}"
@@ -222,6 +224,7 @@ if [[ "$1" == build ]]; then
   cmp "$repo/build.zig" "$guest/image/restore/build.zig"
   cmp "$repo/build.zig.zon" "$guest/image/restore/build.zig.zon"
 
+  export ZIG_LOCAL_PKG_DIR="$guest/image/restore/zig-pkg"
   export ZIG_LOCAL_CACHE_DIR="$guest/image/zig-local-cache"
   bison="$(native_tool bison)"
   bison_data="${BISON_PKGDATADIR:-$("$bison" --print-datadir)}"

@@ -18,6 +18,7 @@ time (
   # A standalone restore can unpack SQLite before any compilation creates tmp.
   mkdir -p "${ZIG_GLOBAL_CACHE_DIR:?}/tmp"
   mkdir -p "${root}/restore"
+  export ZIG_LOCAL_PKG_DIR="${root}/restore/zig-pkg"
   cp support/tools/hyperv/public_image/build.zig \
     support/tools/hyperv/public_image/build.zig.zon "${root}/restore/"
   (
