@@ -175,6 +175,13 @@ unchanged manifests, then repeats SDK fetch-all before its fixture executions.
 Failed limit qualification removes the checkout; successful limits leave it
 for the controller gate's cleanup. No fixture execution is moved outside the
 controller gate, and its 15-minute deadline remains unchanged.
+The ReleaseSafe controller test harness and its host reader CLI use LLVM
+code generation: repeated genuine tool, image and runtime custody hashing
+dominates their execution, rather than compilation alone. Their safety checks,
+fixture identities and all constructor/recheck/CLI refusals remain intact.
+Debug fixtures retain the compiler's default backend, as do the production
+portable controller, supervisor and other native targets. The compile-only
+prerequisite target prepares these exact artifacts before fixture execution.
 The test graph preallocates the native and Python contract scratch parents
 before any fixture runs, and completes source-limit fixtures before controller
 custody capture. Contract goldens may still run in parallel within their

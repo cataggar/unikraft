@@ -236,6 +236,7 @@ pub fn build(b: *std.Build) void {
     });
     const host_cli = b.addExecutable(.{
         .name = "uk-wamr-native-ci-host-fixture",
+        .use_llvm = if (optimize == .ReleaseSafe) true else null,
         .root_module = b.createModule(.{
             .root_source_file = b.path("controller/main.zig"),
             .target = b.graph.host,
@@ -323,6 +324,7 @@ pub fn build(b: *std.Build) void {
         ).step);
     const controller_tests = b.addTest(.{
         .filters = b.option([]const []const u8, "test-filter", "Select bounded controller fixtures") orelse &.{},
+        .use_llvm = if (optimize == .ReleaseSafe) true else null,
         .root_module = b.createModule(.{
             .root_source_file = b.path("controller/tests.zig"),
             .target = b.graph.host,
