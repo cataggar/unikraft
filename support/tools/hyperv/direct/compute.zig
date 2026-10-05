@@ -11,7 +11,7 @@ const files = core.private_files;
 pub const Artifact = base.Artifact;
 pub const SerialMode = base.SerialMode;
 pub const parse = base.parse;
-pub const sdk = "a53205d77be3b880eb8f8b96679512ba58e2331a";
+pub const sdk = "661ac49584c4d0ac57adb78eba62f3ff3e9795df";
 const historical_sdk = "a53205d77be3b880eb8f8b96679512ba58e2331a";
 pub const marker = log_validator.tiny.marker;
 pub const artifact_names = .{
@@ -759,6 +759,8 @@ fn testHandoffRuntime(
 test "explicit historical import retains only frozen compiler and SDK identities" {
     try testHandoffRuntime(historical_handoff_runtime, historical_sdk, "0.16.0");
     try std.testing.expectError(error.WrongSdk, testHandoffRuntime(historical_handoff_runtime, historical_sdk, "0.17.0"));
+    try std.testing.expectError(error.WrongSdk, testHandoffRuntime(historical_handoff_runtime, sdk, "0.16.0"));
+    try std.testing.expectError(error.WrongSdk, testHandoffRuntime(historical_handoff_runtime, sdk, "0.17.0"));
     try std.testing.expectError(error.WrongSdk, testHandoffRuntime(historical_handoff_runtime, "0000000000000000000000000000000000000000", "0.16.0"));
 }
 
@@ -774,6 +776,8 @@ test "historical import requires exact frozen version and source pins" {
 test "ordinary handoff validation never accepts a historical compiler identity" {
     try testHandoffRuntime(current_handoff_runtime, sdk, "0.17.0");
     try std.testing.expectError(error.WrongSdk, testHandoffRuntime(current_handoff_runtime, historical_sdk, "0.16.0"));
+    try std.testing.expectError(error.WrongSdk, testHandoffRuntime(current_handoff_runtime, historical_sdk, "0.17.0"));
+    try std.testing.expectError(error.WrongSdk, testHandoffRuntime(current_handoff_runtime, sdk, "0.16.0"));
     try std.testing.expectError(error.WrongSdk, testHandoffRuntime(current_handoff_runtime, "ffffffffffffffffffffffffffffffffffffffff", "0.17.0"));
 }
 

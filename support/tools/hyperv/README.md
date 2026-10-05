@@ -78,8 +78,10 @@ The synthetic v1 sampling records keep their existing `Debug`/`ReleaseSafe`
 wire enum spellings; lowercase compiler mode names do not alter that contract.
 The explicit direct WAMR `historical-handoff` command revalidates only version-one
 imports bound to the existing immutable historical source revision/tree allowlist
-and frozen Zig 0.16 runtime/SDK/profile. Ordinary `handoff` validation always
-requires the current Zig 0.17 identity, even if input strings quote historical
+and frozen Zig 0.16 runtime/SDK/profile. Its SDK remains
+`a53205d77be3b880eb8f8b96679512ba58e2331a`. Ordinary `handoff` validation always
+requires Zig 0.17 and current SDK
+`661ac49584c4d0ac57adb78eba62f3ff3e9795df`, even if input strings quote historical
 pins. The historical command is not a fallback for failed current validation and does not
 relax artifact, boot, private-file or authority validation. The standalone direct
 `test-compute-runtime` selector checks rejection across those generation boundaries.

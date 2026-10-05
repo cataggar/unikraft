@@ -8,7 +8,7 @@ import shutil
 import struct
 import subprocess
 
-SDK = "a53205d77be3b880eb8f8b96679512ba58e2331a"
+SDK = "661ac49584c4d0ac57adb78eba62f3ff3e9795df"
 SOURCE = "2830293aaf1df37877cddf4dae97f5cf255b9ae2"
 TREE = "1234567890abcdef1234567890abcdef12345678"
 MODES = (
