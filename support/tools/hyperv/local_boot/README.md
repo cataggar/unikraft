@@ -212,9 +212,10 @@ The build restores reviewed Miz revision
 `miz-0.2.0-Z3lHlLgL2wDiGxutMJMDy9Qy4CLNCwOptwgQLp1ZDSiv` from
 `build.zig.zon`; Miz's exported `dependency.module("miz")` supplies its native
 zstd wiring. After that pinned restore is available, builds run offline through `--system`.
-This Zig distribution creates `zig-pkg` beside the selected build file, so
-restore copied manifests under owned scratch before source custody is
-established. Never fetch beside the tracked build file. Use Zig 0.17.0, `-j2`,
+This Zig distribution defaults to `zig-pkg` beside the selected build file, so
+bind each restore's `--pkg-dir` under owned scratch before source custody is
+established, even when `ZIG_LOCAL_PKG_DIR` is already set. Never fetch beside
+the tracked build file. Use Zig 0.17.0, `-j2`,
 and explicit owned scratch for HOME, TMPDIR, XDG/Zig caches and outputs:
 
 ```sh
@@ -229,7 +230,7 @@ export ZIG_GLOBAL_CACHE_DIR="$SCRATCH/global-cache"
 cp support/tools/hyperv/local_boot/build.zig \
   support/tools/hyperv/local_boot/build.zig.zon "$SCRATCH/restore/"
 zig build --build-file "$SCRATCH/restore/build.zig" --fetch=all \
-  --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
+  --pkg-dir "$SCRATCH/restore/zig-pkg" --cache-dir "$SCRATCH/restore/cache" \
   -j2
 zig build --build-file support/tools/hyperv/local_boot/build.zig \
   --system "$SCRATCH/restore/zig-pkg" \

@@ -273,15 +273,20 @@ ReleaseSafe children. Native child and cross-target fixture builds strip debug
 metadata, not runtime safety checks. `compile-guard` honors `-Doptimize` for the
 complete target fixture and its module.
 
+This package has no external dependencies; an empty private system depot
+disables fetching without allowing ambient package-directory selection.
 From the worktree root, using existing private fixture directories:
 
 ```sh
 root="$PWD/.d/zig-migration-operator-guard"
+umask 077
+mkdir -p "$root/packages"
 export TMPDIR="$root/tmp" XDG_CACHE_HOME="$root/cache"
 export ZIG_GLOBAL_CACHE_DIR="$root/global-cache"
 for mode in debug safe; do
     export ZIG_LOCAL_CACHE_DIR="$root/$mode/cache"
     /home/g/.local/bin/zig build --build-file support/tools/hyperv/operator_guard/build.zig test install \
+        --system "$root/packages" \
         -Dtest-root="$root/$mode/fixtures" -Doptimize="$mode" -Dfixture-optimize=safe -j2 \
         --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
         --prefix "$root/$mode/install" --summary all
@@ -289,6 +294,7 @@ done
 for target in x86_64-linux-musl aarch64-linux-musl; do
     export ZIG_LOCAL_CACHE_DIR="$root/targets-release-safe/$target/cache"
     /home/g/.local/bin/zig build --build-file support/tools/hyperv/operator_guard/build.zig compile-guard \
+        --system "$root/packages" \
         -Dtarget="$target" -Doptimize=safe -j2 \
         --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
         --prefix "$root/targets-release-safe/$target/install" --summary all

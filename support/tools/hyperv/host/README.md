@@ -272,6 +272,8 @@ The later image-target compile remains default-off. These records are diagnostic
 Zig 0.17.0 is required. Run from the owned worktree. Restore only the pinned
 package manifests, into scratch; this distribution otherwise creates `zig-pkg`
 beside the build file. All subsequent builds use `--system` to disable fetching.
+Bind each restore's `--pkg-dir` explicitly so an inherited
+`ZIG_LOCAL_PKG_DIR` cannot redirect it to a different depot.
 
 ```sh
 out=/d/fleet-platform/.d/zig-migration-host
@@ -280,7 +282,8 @@ export ZIG_GLOBAL_CACHE_DIR="$out/global-cache" ZIG_LOCAL_CACHE_DIR="$out/local-
 mkdir -p "$out/packages/restore" "$out/out/fixtures"
 chmod 700 "$out/out/fixtures"
 cp support/tools/hyperv/host/build.zig support/tools/hyperv/host/build.zig.zon "$out/packages/restore/"
-/home/g/.local/bin/zig build --build-file "$out/packages/restore/build.zig" --fetch=all -j2
+/home/g/.local/bin/zig build --build-file "$out/packages/restore/build.zig" --fetch=all \
+  --pkg-dir "$out/packages/restore/zig-pkg" --cache-dir "$out/packages/restore/cache" -j2
 /home/g/.local/bin/zig build --build-file support/tools/hyperv/host/build.zig test \
   --system "$out/packages/restore/zig-pkg" --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
   --prefix "$out/out" \

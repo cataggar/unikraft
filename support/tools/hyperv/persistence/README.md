@@ -266,7 +266,9 @@ No historical private artifacts, original seed, image, credential or cloud
 operation is needed or permitted.
 
 Use the pinned manifest, restore copied manifests into scoped scratch with
-`--fetch=all`, then build with `--system SCRATCH/restore/zig-pkg`. Set HOME,
+`--fetch=all --pkg-dir SCRATCH/restore/zig-pkg`, then build with
+`--system SCRATCH/restore/zig-pkg`. Each restore binds its own depot instead
+of inheriting another restore's `ZIG_LOCAL_PKG_DIR`. Set HOME,
 TMPDIR and Zig/XDG caches beneath `.d/zig-migration-persistence`. With an
 existing owner-only absolute fixture directory:
 

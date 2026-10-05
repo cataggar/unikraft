@@ -5,6 +5,7 @@ umask 077
 test "$(id -u)" -ne 0
 root="${RUNNER_TEMP:?}/hyperv-ci/native-operator-guard"
 package=support/tools/hyperv/operator_guard
+packages="${root}/packages"
 installation=/var/lib/unikraft-hyperv-custody-ci
 executable="${installation}/operator-guard-fixture"
 profile="${installation}/profile"
@@ -32,8 +33,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "${root}/baseline/fixtures"
+mkdir -p "${root}/baseline/fixtures" "${packages}"
 zig build --build-file "${package}/build.zig" \
+  --system "${packages}" \
   --cache-dir "${root}/fixture-cache" --prefix "${root}/fixture-out" \
   -Dfixture-optimize=safe -j2 install-fixture --summary all
 
@@ -52,6 +54,7 @@ sha256sum "${executable}" > "${root}/fixture-sha256.txt"
 started="$(date --utc '+%Y-%m-%d %H:%M:%S')"
 baseline=0
 zig build --build-file "${package}/build.zig" \
+  --system "${packages}" \
   --cache-dir "${root}/baseline/cache" --prefix "${root}/baseline/out" \
   -Dtest-root="${root}/baseline/fixtures" \
   "-Dfixture-executable=${executable}" \
@@ -84,6 +87,7 @@ fi
 for mode in debug safe; do
   mkdir -p "${root}/${mode}/fixtures"
   zig build --build-file "${package}/build.zig" \
+    --system "${packages}" \
     --cache-dir "${root}/${mode}/zig-local-cache" \
     --prefix "${root}/${mode}/out" \
     -Dtest-root="${root}/${mode}/fixtures" \
@@ -105,6 +109,7 @@ fi
 
 for target in x86_64-linux-musl aarch64-linux-musl; do
   zig build --build-file "${package}/build.zig" \
+    --system "${packages}" \
     --cache-dir "${root}/${target}/zig-local-cache" \
     --prefix "${root}/${target}/out" \
     -Dtarget="${target}" -Doptimize=safe \

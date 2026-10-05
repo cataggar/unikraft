@@ -21,11 +21,12 @@ export TMPDIR="$CORE_WORK/tmp" HOME="$CORE_WORK/home"
 export XDG_CACHE_HOME="$CORE_WORK/cache"
 export ZIG_GLOBAL_CACHE_DIR="$CORE_WORK/zig-global"
 export ZIG_LOCAL_CACHE_DIR="$CORE_WORK/zig-local"
-# This Zig distribution restores beside the build file. Keep that operation
-# in scratch, then disable fetching for every source-tree build.
+# Bind this restore's package directory explicitly, independently of ambient
+# ZIG_LOCAL_PKG_DIR, then disable fetching for every source-tree build.
 cp support/tools/hyperv/build.zig support/tools/hyperv/build.zig.zon "$CORE_WORK/restore/"
 zig build --build-file "$CORE_WORK/restore/build.zig" \
-  --fetch=all --cache-dir "$ZIG_LOCAL_CACHE_DIR" -j2
+  --fetch=all --pkg-dir "$CORE_WORK/restore/zig-pkg" \
+  --cache-dir "$CORE_WORK/restore/cache" -j2
 zig build --build-file support/tools/hyperv/build.zig \
   --system "$CORE_WORK/restore/zig-pkg" \
   --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
@@ -84,6 +85,13 @@ relax artifact, boot, private-file or authority validation. The standalone direc
 `test-compute-runtime` selector checks rejection across those generation boundaries.
 `zig build` reads the private global cache from `ZIG_GLOBAL_CACHE_DIR` rather
 than accepting the old `--global-cache-dir` build option.
+Zig 0.17 defaults its package directory to `zig-pkg` beside the build file.
+Every source-tree build/fetch caller must instead bind an authenticated
+external depot with `--system`, or an explicit external `ZIG_LOCAL_PKG_DIR`.
+Untracked fetched source under `zig-pkg` is not a custody exclusion and must
+not be ignored to make source admission pass. Standalone restores bind their
+own `--pkg-dir`; a shared environment setting must not redirect them into
+another restore's depot.
 The direct native process and lifecycle child fixtures strip debug metadata in both checked modes;
 its safety checks and synthetic runtime modes remain enabled. This keeps exact executable
 snapshotting within the existing 120–200 ms fixture deadlines despite the
