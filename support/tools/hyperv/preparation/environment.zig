@@ -79,6 +79,8 @@ pub const Record = struct {
     pub fn apply(self: Record, allocator: std.mem.Allocator, map: *std.process.Environ.Map, canonical_home: []const u8) !void {
         try self.validate();
         try absolute(canonical_home);
+        // Zig 0.17 lets this override the producer's authenticated --system depot.
+        _ = map.orderedRemove("ZIG_LOCAL_PKG_DIR");
         try map.put("HOME", canonical_home);
         inline for (.{ "TMPDIR", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "ZIG_LOCAL_CACHE_DIR", "ZIG_GLOBAL_CACHE_DIR" }, .{ "tmp", "cache", "config", "zig-local", "zig-global" }) |key, suffix|
             try map.put(key, try std.fs.path.join(allocator, &.{ self.workspace, suffix }));
@@ -120,6 +122,28 @@ pub const Record = struct {
         return map;
     }
 };
+
+test "native policy removes package-directory overrides before system-only root builds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const record: Record = .{
+        .workspace = "/private/scratch",
+        .bison_pkgdatadir = "/reviewed/bison",
+        .m4 = "/reviewed/m4",
+        .git_exec_path = "/private/disabled-git-exec",
+        .trust_bundle = "/reviewed/trust.pem",
+    };
+    var polluted = std.process.Environ.Map.init(allocator);
+    defer polluted.deinit();
+    try polluted.put("ZIG_LOCAL_PKG_DIR", "/unreviewed/packages");
+    try record.apply(allocator, &polluted, "/account/home");
+    try std.testing.expect(polluted.get("ZIG_LOCAL_PKG_DIR") == null);
+    try std.testing.expectEqualStrings("/private/scratch/zig-global", polluted.get("ZIG_GLOBAL_CACHE_DIR").?);
+    var fresh = try record.create(allocator, "/account/home");
+    defer fresh.deinit();
+    try std.testing.expect(fresh.get("ZIG_LOCAL_PKG_DIR") == null);
+}
 
 pub fn absolute(value: []const u8) !void {
     if (value.len < 2 or !std.fs.path.isAbsolute(value)) return error.UnsafePath;

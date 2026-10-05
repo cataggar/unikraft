@@ -1127,6 +1127,13 @@ same binding and mounts the dependency runtime read-only. Keep `--system`:
 missing packages must refuse the build, never trigger an implicit network fetch,
 an ambient package-cache fallback, or an unreviewed replacement depot.
 
+Zig 0.17 gives `ZIG_LOCAL_PKG_DIR` precedence over the `--system` directory. The
+helper creates a fresh allowlisted environment, and `Record.apply` removes that
+override so the producer's bound `--system` depot remains authoritative. Direct
+factory/qualification callers must either unset it or explicitly bind it to the
+same authenticated depot. A standalone restorer must keep its own per-restore
+package directory; do not globally override all restorers with one depot.
+
 `producer.describe` and `bindingDigest` create material for independent review.
 They do not approve it. `producer.execute` requires an independently supplied
 binding commitment, revalidates source-bound selection and tools, invokes the
