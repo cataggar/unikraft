@@ -64,8 +64,8 @@ test "raw UTF-8 and CSI grammar refuse malformed bytes before they can be hidden
     const allowed = try normalized("plain\tUTF-8 \xc3\xa9\n", .optional);
     defer a.free(allowed);
     try t.expectEqualStrings("plain\tUTF-8 \xc3\xa9\n", allowed);
-    try t.expectError(error.SerialLineLimit, normalized("x" ** 8193 ++ "\n", .tiny));
-    const exact = try normalized("x" ** 8192 ++ "\n", .tiny);
+    try t.expectError(error.SerialLineLimit, normalized(@as([8193]u8, @splat('x')) ++ "\n", .tiny));
+    const exact = try normalized(@as([8192]u8, @splat('x')) ++ "\n", .tiny);
     defer a.free(exact);
     try t.expectEqual(@as(usize, 8193), exact.len);
 }
@@ -98,9 +98,12 @@ test "optional pins Unicode 15 printable boundary without changing tiny or local
 
 test "mode-specific raw bounds and deterministic one-byte mutation refusals" {
     try t.expectError(error.SerialLimit, normalized("", .local_boot));
-    try t.expectError(error.SerialLimit, normalized("x\n" ** (2 * 1024 * 1024), .tiny));
-    try t.expectError(error.SerialLimit, normalized("x\n" ** (1024 * 1024) ++ "x", .optional));
-    const boundary = try normalized("x\n" ** (1024 * 1024), .optional);
+    const repeated = try a.alloc(u8, 4 * 1024 * 1024 + 1);
+    defer a.free(repeated);
+    for (repeated, 0..) |*byte, index| byte.* = if (index % 2 == 0) 'x' else '\n';
+    try t.expectError(error.SerialLimit, normalized(repeated[0 .. 4 * 1024 * 1024], .tiny));
+    try t.expectError(error.SerialLimit, normalized(repeated[0 .. 2 * 1024 * 1024 + 1], .optional));
+    const boundary = try normalized(repeated[0 .. 2 * 1024 * 1024], .optional);
     defer a.free(boundary);
     try t.expectEqual(@as(usize, 2 * 1024 * 1024), boundary.len);
     const small = "WAMR_JIT_SAMPLE={}\n";
@@ -214,32 +217,32 @@ test "input kind limits, symlinks, writable/nonregular entries and invalid paths
     try t.expectError(error.UnsafeFile, read(small, .tiny_serial));
     try t.expectError(error.UnsafePath, read("", .identity));
     try t.expectError(error.UnsafePath, read("invalid\x00name", .identity));
-    try t.expectError(error.UnsafePath, read("a" ** 4096, .identity));
+    try t.expectError(error.UnsafePath, read(&@as([4096]u8, @splat('a')), .identity));
     try write(fixture.dir, "empty", "");
     const empty = try std.fs.path.join(a, &.{ base, "empty" });
     defer a.free(empty);
     try t.expectError(error.InputLimit, read(empty, .identity));
-    try write(fixture.dir, "identity", "v" ** (64 * 1024));
+    try write(fixture.dir, "identity", &@as([64 * 1024]u8, @splat('v')));
     const identity = try std.fs.path.join(a, &.{ base, "identity" });
     defer a.free(identity);
     var accepted = try read(identity, .identity);
     accepted.deinit();
-    try write(fixture.dir, "oversized", "v" ** (64 * 1024 + 1));
+    try write(fixture.dir, "oversized", &@as([64 * 1024 + 1]u8, @splat('v')));
     const oversized = try std.fs.path.join(a, &.{ base, "oversized" });
     defer a.free(oversized);
     try t.expectError(error.InputLimit, read(oversized, .identity));
-    try write(fixture.dir, "optional", "v" ** (2 * 1024 * 1024));
+    try write(fixture.dir, "optional", &@as([2 * 1024 * 1024]u8, @splat('v')));
     const optional = try std.fs.path.join(a, &.{ base, "optional" });
     defer a.free(optional);
     var exact = try read(optional, .optional_serial);
     exact.deinit();
     try t.expectError(error.InputLimit, read(optional, .identity));
-    try write(fixture.dir, "tiny-bound", "v" ** (4 * 1024 * 1024 - 1));
+    try write(fixture.dir, "tiny-bound", &@as([4 * 1024 * 1024 - 1]u8, @splat('v')));
     const tiny_bound = try std.fs.path.join(a, &.{ base, "tiny-bound" });
     defer a.free(tiny_bound);
     var last = try read(tiny_bound, .tiny_serial);
     last.deinit();
-    try write(fixture.dir, "tiny-over", "v" ** (4 * 1024 * 1024));
+    try write(fixture.dir, "tiny-over", &@as([4 * 1024 * 1024]u8, @splat('v')));
     const tiny_over = try std.fs.path.join(a, &.{ base, "tiny-over" });
     defer a.free(tiny_over);
     try t.expectError(error.InputLimit, read(tiny_over, .tiny_serial));
