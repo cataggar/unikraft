@@ -190,7 +190,7 @@ TMPDIR="$PWD/.d/direct-runtime" zig build \
   --build-file support/tools/hyperv/direct/build.zig -j2 \
   --cache-dir "$PWD/.d/direct-cache" \
   --global-cache-dir "$PWD/.d/direct-global" \
-  --prefix "$PWD/.d/direct-tools" -Doptimize=ReleaseSafe
+  --prefix "$PWD/.d/direct-tools" -Doptimize=safe
 
 # ONLY after new explicit destructive approval, never as part of build/test:
 "$PWD/.d/direct-tools/bin/uk-hyperv-direct-two-boot" \
@@ -473,7 +473,7 @@ TMPDIR="$PWD/.d/direct-runtime" zig build \
   --prefix "$PWD/.d/direct-tools" \
   -Dtest-root="$PWD/.d/direct-foundation-fixtures" \
   -Dlifecycle-root="$fixture_parent/native" \
-  -Doptimize=ReleaseSafe test test-foundation test-controller test-lifecycle-native install
+  -Doptimize=safe test test-foundation test-controller test-lifecycle-native install
 ```
 
 `test-lifecycle-native` builds a separate **noninstalled** fixture controller
@@ -494,7 +494,7 @@ for inventory or explicitly isolated native runs, never the fixture controller:
 TMPDIR="$PWD/.d/direct-runtime" zig build \
   --build-file support/tools/hyperv/direct/build.zig -j2 \
   --cache-dir "$PWD/.d/direct-cache" --global-cache-dir "$PWD/.d/direct-global" \
-  --prefix "$PWD/.d/direct-tools" -Doptimize=ReleaseSafe fixture-tools
+  --prefix "$PWD/.d/direct-tools" -Doptimize=safe fixture-tools
 "$PWD/.d/direct-tools/bin/hyperv-direct-lifecycle-fixtures" \
   --inventory
 ```

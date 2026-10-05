@@ -27,7 +27,7 @@ cp --no-preserve=mode,ownership \
   "$(readlink -f /usr/share/OVMF/OVMF_CODE_4M.fd)" "${root}/firmware/code.fd"
 cp --no-preserve=mode,ownership \
   "$(readlink -f /usr/share/OVMF/OVMF_VARS_4M.fd)" "${root}/firmware/vars.fd"
-cli="$(readlink -f "${ci}/native-public-image/ReleaseSafe/out/bin/uk-hyperv-public-image")"
+cli="$(readlink -f "${ci}/native-public-image/safe/out/bin/uk-hyperv-public-image")"
 efi="$(readlink -f "${ci}/build/helloworld_hyperv-x86_64-efi-netvsc")"
 qemu="${runtime}/bin/qemu-system-x86_64"
 sha256sum "${cli}" > "${root}/source-exporter.sha256"

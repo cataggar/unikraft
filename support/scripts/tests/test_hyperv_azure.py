@@ -2185,7 +2185,7 @@ class HypervWorkflowTest(unittest.TestCase):
         upload = job.split("    - name: Retain bounded runtime fixture evidence\n", 1)[1]
         self.assertIn("retention-days: 7", upload)
         self.assertIn("actions/upload-artifact@v4", upload)
-        for mode in ("Debug", "ReleaseSafe"):
+        for mode in ("debug", "safe"):
             for name in ("parent-test", "worker-raw", "worker-selected", "report.json"):
                 self.assertIn(f"/{mode}/build-evidence/evidence/{name}", upload)
         for forbidden in ("**/test", "build-evidence/pending", "build-evidence/collector",
@@ -2201,12 +2201,12 @@ class HypervWorkflowTest(unittest.TestCase):
         marker = fixture.split("          marker_result=0\n", 1)[1].split("          result=0\n", 1)[0]
         for primary in (0, 137):
             with self.subTest(primary=primary), tempfile.TemporaryDirectory() as tmp:
-                work = Path(tmp) / "Debug"
+                work = Path(tmp) / "debug"
                 work.mkdir()
                 (work / "fixture-build-exit.txt").write_bytes(b"prior immutable record\n")
                 command = (
                     "set -euo pipefail\n"
-                    'root="$1"\nmode=Debug\n'
+                    'root="$1"\nmode=debug\n'
                     f"fixture_result={primary}\nmarker_result=0\n"
                     + marker
                 )
@@ -2218,7 +2218,7 @@ class HypervWorkflowTest(unittest.TestCase):
         helper = SUPPORT.parent / ".github/scripts/hyperv-persistence-build-evidence.sh"
         for result_code in (0, 13):
             with self.subTest(result_code=result_code), tempfile.TemporaryDirectory() as tmp:
-                work = Path(tmp) / "hyperv-ci/native-persistence/Debug"
+                work = Path(tmp) / "hyperv-ci/native-persistence/debug"
                 work.mkdir(parents=True, mode=0o700)
                 work.parent.chmod(0o700)
                 capture = work / "build-evidence"
@@ -2253,7 +2253,7 @@ class HypervWorkflowTest(unittest.TestCase):
                     root.symlink_to(root.parent / "missing", target_is_directory=True)
                 elif case != "absent":
                     root.mkdir(mode=0o700)
-                    work = root / "Debug"
+                    work = root / "debug"
                     work.mkdir(mode=0o700)
                     if case in ("failed-before-baseline", "success-without-baseline"):
                         (work / "fixtures.log").write_bytes(b"original build log\n")
@@ -2296,7 +2296,7 @@ class HypervWorkflowTest(unittest.TestCase):
         )
         for marker in valid + invalid:
             with self.subTest(marker=marker), tempfile.TemporaryDirectory() as tmp:
-                work = Path(tmp) / "hyperv-ci/native-persistence/Debug"
+                work = Path(tmp) / "hyperv-ci/native-persistence/debug"
                 work.mkdir(parents=True, mode=0o700)
                 work.parent.chmod(0o700)
                 log = work / "fixtures.log"
@@ -2331,7 +2331,7 @@ class HypervWorkflowTest(unittest.TestCase):
                 "\n    - name:", 1
             )[0]
             self.assertIn(flag, step)
-            self.assertIn("for mode in Debug ReleaseSafe; do", step)
+            self.assertIn("for mode in debug safe; do", step)
             self.assertIn("set -euo pipefail", step)
             self.assertIn('2>&1 | tee "${root}/${mode}/fixtures.log"', step)
             self.assertNotIn("-Dtest-filter=", step)
@@ -2362,7 +2362,7 @@ class HypervWorkflowTest(unittest.TestCase):
                     root = Path(tmp) / "hyperv-ci" / f"native-{family}"
                     root.mkdir(parents=True, mode=0o700)
                     expected = {}
-                    modes = ("Debug", "ReleaseSafe") if outcome == "success" else ("Debug",)
+                    modes = ("debug", "safe") if outcome == "success" else ("debug",)
                     for mode in modes:
                         work = root / mode
                         work.mkdir(mode=0o700)
@@ -2398,7 +2398,7 @@ class HypervWorkflowTest(unittest.TestCase):
             with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp) / "hyperv-ci/native-host"
                 root.mkdir(parents=True, mode=0o700)
-                work = root / "Debug"
+                work = root / "debug"
                 work.mkdir(mode=0o700)
                 log = work / "fixtures.log"
                 log.write_bytes(b"bounded\n")
@@ -2427,7 +2427,7 @@ class HypervWorkflowTest(unittest.TestCase):
                     capture_output=True, timeout=10,
                 )
                 self.assertNotEqual(result.returncode, 0)
-                self.assertFalse((root / "observation-evidence/Debug-fixtures.log").exists())
+                self.assertFalse((root / "observation-evidence/debug-fixtures.log").exists())
         with tempfile.TemporaryDirectory() as tmp:
             for family, expected in (("host", 0), ("persistence", 0), ("unknown", 2)):
                 result = subprocess.run(
@@ -2452,9 +2452,9 @@ class HypervWorkflowTest(unittest.TestCase):
         exec bash "$@"
         """
         for args, expected_modes in (
-            ((), ("Debug", "ReleaseSafe")),
-            (("Debug",), ("Debug",)),
-            (("ReleaseSafe",), ("ReleaseSafe",)),
+            ((), ("debug", "safe")),
+            (("debug",), ("debug",)),
+            (("safe",), ("safe",)),
         ):
             with self.subTest(args=args), tempfile.TemporaryDirectory() as root:
                 env = dict(os.environ, RUNNER_TEMP=root,
@@ -2479,7 +2479,7 @@ class HypervWorkflowTest(unittest.TestCase):
                     self.assertIn(f"public-image {mode}:", result.stderr)
                 self.assertIn("public-image restore:", result.stderr)
                 self.assertIn("public-image total:", result.stderr.splitlines()[-1])
-        for phase in ("restore", "Debug", "ReleaseSafe"):
+        for phase in ("restore", "debug", "safe"):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as root:
                 env = dict(os.environ, RUNNER_TEMP=root,
                            ZIG_GLOBAL_CACHE_DIR=str(Path(root) / "global"),
@@ -2492,7 +2492,10 @@ class HypervWorkflowTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 17)
                 self.assertIn(f"public-image {phase}:", result.stderr)
                 self.assertIn("public-image total:", result.stderr.splitlines()[-1])
-        for args in (("ReleaseFast",), ("",), ("Debug", "ReleaseSafe")):
+        for args in (
+            ("fast",), ("",), ("debug", "safe"),
+            ("Debug",), ("ReleaseSafe",), ("ReleaseFast",),
+        ):
             result = subprocess.run(
                 ["bash", "-c", harness, "fixture-api", str(helper), *args],
                 cwd=SUPPORT.parent, capture_output=True, text=True, timeout=10,
@@ -2506,7 +2509,7 @@ class HypervWorkflowTest(unittest.TestCase):
         ).read_text()
         inventory = (
             ("public-debug", (
-                "hyperv-native-public-fixtures.sh Debug",
+                "hyperv-native-public-fixtures.sh debug",
             )),
             ("runtime", (
                 "operator_guard/ci-fixtures.sh",
@@ -2564,9 +2567,9 @@ class HypervWorkflowTest(unittest.TestCase):
             "\n  zig-hyperv-complete:", 1
         )[0]
         for target in (
-            "hyperv-native-public-fixtures.sh ReleaseSafe",
+            "hyperv-native-public-fixtures.sh safe",
             "support/tools/hyperv/local_boot/build.zig",
-            "for mode in Debug ReleaseSafe; do",
+            "for mode in debug safe; do",
             "for variant in acceptance smp; do",
             "hyperv-native-qemu-acquire.sh",
             "QUALIFICATION_SOURCE_JOB: zig-hyperv",
@@ -2599,7 +2602,7 @@ class HypervWorkflowTest(unittest.TestCase):
             "support/tools/hyperv/local_boot/build.zig.zon",
             '--build-file "${root}/restore/build.zig" --fetch=all',
             '--system "${root}/restore/zig-pkg"',
-            "for mode in Debug ReleaseSafe; do",
+            "for mode in debug safe; do",
             '-Dstrip-fixture-debug=true "-Dfixture-objcopy=${objcopy}"',
             '"-Dstrip-fixture-report=${root}/${mode}/fixture-strip-proof.json"',
             '-Doptimize="${mode}" -j2',
@@ -2613,7 +2616,7 @@ class HypervWorkflowTest(unittest.TestCase):
         retained = producer.split(
             "    - name: Retain bounded local image evidence\n", 1
         )[1]
-        for mode in ("Debug", "ReleaseSafe"):
+        for mode in ("debug", "safe"):
             for artifact in (
                 "fixtures.log", "fixture-strip-proof.json",
                 "zig-local-cache/**/local-boot-qemu-fixture",
@@ -2678,7 +2681,7 @@ class HypervWorkflowTest(unittest.TestCase):
             'compute_fixture_root="$(readlink -f "${compute_fixture_root}")"',
             'test "$(stat -c \'%a\' -- "${compute_fixture_root}")" = 700',
             '-Dtest-root="${compute_fixture_root}"',
-            "-Doptimize=ReleaseSafe test install",
+            "-Doptimize=safe test install",
             '"${root}/compute-tools/bin/uk-wamr-native-ci"',
             "supervisor-source-closure --git /usr/bin/git --output sha256-v1",
         ):

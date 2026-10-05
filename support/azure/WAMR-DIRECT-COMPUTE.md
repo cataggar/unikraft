@@ -72,7 +72,7 @@ optional workload qualification follows from a successful tiny result.
 
 ## Build and offline tests
 
-Zig 0.16.0, Linux, existing Python unittest, and the existing native packaging
+Zig 0.17.0, Linux, existing Python unittest, and the existing native packaging
 dependencies suffice. Native tests run on aarch64; x64 build-only is useful
 but cannot establish guest execution. These commands do not authenticate or
 provision. Keep caches and private state in ignored `.d/`.
@@ -97,7 +97,7 @@ zig build --build-file support/build/wamr-native-ci/build.zig \
   --cache-dir "$PWD/.d/wamr-direct/package-cache" \
   --prefix "$PWD/.d/wamr-direct/package-tools" \
   -Dtest-root="$PWD/.d/wamr-direct/package-fixtures" \
-  -Doptimize=ReleaseSafe -j2 test install
+  -Doptimize=safe -j2 test install
 SUPERVISOR_SOURCE_SHA256="$(
   python3 - <<'PY'
 import importlib.util
@@ -115,7 +115,7 @@ zig build --build-file support/build/wamr-native-ci/supervisor.build.zig \
   --cache-dir "$PWD/.d/wamr-direct/supervisor-cache" \
   --prefix "$PWD/.d/wamr-direct/supervisor" \
   -Dsource-closure-sha256="$SUPERVISOR_SOURCE_SHA256" \
-  -Doptimize=ReleaseSafe -j2 install
+  -Doptimize=safe -j2 install
 WAMR_DIRECT_TOOLS="$PWD/.d/wamr-direct/tools/bin" \
 WAMR_CI_PACKAGE="$PWD/.d/wamr-direct/package-tools/bin/wamr-ci-package" \
 WAMR_CI_SUPERVISOR="$PWD/.d/wamr-direct/supervisor/bin/wamr-ci-supervisor" \
@@ -127,9 +127,9 @@ aarch64. For production, the native compute lane explicitly builds the recorded
 supervisor and public validator with
 `-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2`, independent of the runner CPU.
 Use those same flags when rebuilding them from the selected source with the
-pinned Zig compiler, source-closure digest and `ReleaseSafe` optimization.
+pinned Zig compiler, source-closure digest and `safe` optimization.
 Release validator builds strip path-dependent debug data, matching the
-supervisor's stripped build; Debug validator builds retain it for diagnostics.
+supervisor's stripped build; debug validator builds retain it for diagnostics.
 The workflow logs both the runner's native CPU and the recorded executable
 target. That source import disables Python bytecode at interpreter startup:
 setting it inside the imported module is too late to prevent a first

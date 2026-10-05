@@ -691,7 +691,7 @@ jobs:
         GH_TOKEN: ${{ github.token }}
       with:
         ghr-version: v0.8.0
-        tools: cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+        tools: cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
     - name: Acquire the pinned native LLVM tools
       uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495
@@ -725,7 +725,7 @@ jobs:
         name: zig-hyperv-preparation-evidence
         path: |
           ${{ runner.temp }}/hyperv-ci/native-preparation/baseline.log
-          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/baseline.json
+          ${{ runner.temp }}/hyperv-ci/native-preparation/debug/baseline.json
           ${{ runner.temp }}/hyperv-ci/native-preparation/namespace-denial.log
           ${{ runner.temp }}/hyperv-ci/native-preparation/namespace-capability-diagnostics.log
           ${{ runner.temp }}/hyperv-ci/native-preparation/credentials.json
@@ -734,22 +734,22 @@ jobs:
           ${{ runner.temp }}/hyperv-ci/native-preparation/fixture-copies.tsv
           ${{ runner.temp }}/hyperv-ci/native-preparation/fixture-objcopy-version.txt
           ${{ runner.temp }}/hyperv-ci/native-preparation/fixture-objcopy-sha256.txt
-          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/fixture-strip-proof.json
-          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/namespace-cache/**/preparation-namespace
-          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/namespace-cache/**/preparation-namespace-fixture
-          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/fixture-build.log
-          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/namespace-baseline.json
-          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/preparation.log
-          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/namespace.log
-          ${{ runner.temp }}/hyperv-ci/native-preparation/Debug/integration.log
-          ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/fixture-strip-proof.json
-          ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/namespace-cache/**/preparation-namespace
-          ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/namespace-cache/**/preparation-namespace-fixture
-          ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/fixture-build.log
-          ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/namespace-baseline.json
-          ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/preparation.log
-          ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/namespace.log
-          ${{ runner.temp }}/hyperv-ci/native-preparation/ReleaseSafe/integration.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/debug/fixture-strip-proof.json
+          ${{ runner.temp }}/hyperv-ci/native-preparation/debug/namespace-cache/**/preparation-namespace
+          ${{ runner.temp }}/hyperv-ci/native-preparation/debug/namespace-cache/**/preparation-namespace-fixture
+          ${{ runner.temp }}/hyperv-ci/native-preparation/debug/fixture-build.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/debug/namespace-baseline.json
+          ${{ runner.temp }}/hyperv-ci/native-preparation/debug/preparation.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/debug/namespace.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/debug/integration.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/safe/fixture-strip-proof.json
+          ${{ runner.temp }}/hyperv-ci/native-preparation/safe/namespace-cache/**/preparation-namespace
+          ${{ runner.temp }}/hyperv-ci/native-preparation/safe/namespace-cache/**/preparation-namespace-fixture
+          ${{ runner.temp }}/hyperv-ci/native-preparation/safe/fixture-build.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/safe/namespace-baseline.json
+          ${{ runner.temp }}/hyperv-ci/native-preparation/safe/preparation.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/safe/namespace.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/safe/integration.log
         retention-days: 7
         if-no-files-found: error
 
@@ -772,9 +772,9 @@ jobs:
     - name: Restore independent fixture tools
       uses: ./.github/actions/hyperv-fixture-setup
 
-    - name: Run native public Hyper-V Debug packaging, export and import fixtures
+    - name: Run native public Hyper-V debug packaging, export and import fixtures
       run: |
-        bash .github/scripts/hyperv-native-public-fixtures.sh Debug
+        bash .github/scripts/hyperv-native-public-fixtures.sh debug
 
   zig-hyperv-runtime:
     name: zig-hyperv-runtime
@@ -830,7 +830,7 @@ jobs:
           "${restore}/"
         ZIG_LOCAL_CACHE_DIR="${restore}/zig-local-cache" \
           zig build --build-file "${restore}/build.zig" --fetch=all -j2
-        for mode in Debug ReleaseSafe; do
+        for mode in debug safe; do
           root="${RUNNER_TEMP}/hyperv-ci/native-${mode}"
           mkdir -p "${root}/fixtures"
           ZIG_LOCAL_CACHE_DIR="${root}/zig-local-cache" \
@@ -851,13 +851,13 @@ jobs:
           support/tools/hyperv/transfer/build.zig.zon "${root}/restore/"
         ZIG_LOCAL_CACHE_DIR="${root}/restore-cache" \
           zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
-        mkdir -p "${root}/ReleaseSafe/fixtures"
-        ZIG_LOCAL_CACHE_DIR="${root}/ReleaseSafe/zig-local-cache" \
+        mkdir -p "${root}/safe/fixtures"
+        ZIG_LOCAL_CACHE_DIR="${root}/safe/zig-local-cache" \
           zig build --build-file support/tools/hyperv/transfer/build.zig \
             --system "${root}/restore/zig-pkg" \
-            --prefix "${root}/ReleaseSafe/out" \
-            -Dfixture-root="${root}/ReleaseSafe/fixtures" \
-            -Doptimize=ReleaseSafe -j2 test install --summary all
+            --prefix "${root}/safe/out" \
+            -Dfixture-root="${root}/safe/fixtures" \
+            -Doptimize=safe -j2 test install --summary all
 
     - name: Run native Hyper-V persistence engine fixtures
       run: |
@@ -877,7 +877,7 @@ jobs:
           support/tools/hyperv/persistence/build.zig.zon "${root}/restore/"
         ZIG_LOCAL_CACHE_DIR="${root}/restore-cache" \
           zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
-        for mode in Debug ReleaseSafe; do
+        for mode in debug safe; do
           mkdir -p "${root}/${mode}/fixtures"
           fixture_result=0
           ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
@@ -923,7 +923,7 @@ jobs:
         export TMPDIR="${root}/tmp"
         zig build --build-file support/tools/hyperv/direct/build.zig -j2 \
           --cache-dir "${root}/cache" --global-cache-dir "${root}/global" \
-          --prefix "${root}/tools" -Doptimize=ReleaseSafe \
+          --prefix "${root}/tools" -Doptimize=safe \
           -Dtest-root="${root}/fixtures" \
           -Dlifecycle-root="${parent}/native" \
           test test-foundation test-controller test-lifecycle-native install compute-fixture-tools
@@ -960,7 +960,7 @@ jobs:
           --cache-dir "${root}/compute-cache" --global-cache-dir "${root}/global" \
           --prefix "${root}/compute-tools" \
           -Dtest-root="${compute_fixture_root}" \
-          -Doptimize=ReleaseSafe test install
+          -Doptimize=safe test install
         supervisor_source_closure="$(
           "${root}/compute-tools/bin/uk-wamr-native-ci" \
             supervisor-source-closure --git /usr/bin/git --output sha256-v1
@@ -970,7 +970,7 @@ jobs:
           --cache-dir "${root}/supervisor-cache" \
           --global-cache-dir "${root}/global" \
           --prefix "${root}/compute-supervisor" \
-          -Doptimize=ReleaseSafe \
+          -Doptimize=safe \
           -Dsource-closure-sha256="${supervisor_source_closure}"
         userns_restriction=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
         if test -e "${userns_restriction}" &&
@@ -1001,24 +1001,24 @@ jobs:
           ${{ runner.temp }}/hyperv-ci/native-operator-guard/fixture-sha256.txt
           ${{ runner.temp }}/hyperv-ci/native-persistence/fixture-objcopy-version.txt
           ${{ runner.temp }}/hyperv-ci/native-persistence/fixture-objcopy-sha256.txt
-          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/fixture-strip-proof.json
-          ${{ runner.temp }}/hyperv-ci/native-persistence/observation-evidence/Debug-fixtures.log
-          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/build-evidence/evidence/parent-test
-          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/build-evidence/evidence/worker-raw
-          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/build-evidence/evidence/worker-selected
-          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/build-evidence/evidence/report.json
-          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/fixture-build-exit.txt
-          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/stdout
-          ${{ runner.temp }}/hyperv-ci/native-persistence/Debug/stderr
-          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/fixture-strip-proof.json
-          ${{ runner.temp }}/hyperv-ci/native-persistence/observation-evidence/ReleaseSafe-fixtures.log
-          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/build-evidence/evidence/parent-test
-          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/build-evidence/evidence/worker-raw
-          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/build-evidence/evidence/worker-selected
-          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/build-evidence/evidence/report.json
-          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/fixture-build-exit.txt
-          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/stdout
-          ${{ runner.temp }}/hyperv-ci/native-persistence/ReleaseSafe/stderr
+          ${{ runner.temp }}/hyperv-ci/native-persistence/debug/fixture-strip-proof.json
+          ${{ runner.temp }}/hyperv-ci/native-persistence/observation-evidence/debug-fixtures.log
+          ${{ runner.temp }}/hyperv-ci/native-persistence/debug/build-evidence/evidence/parent-test
+          ${{ runner.temp }}/hyperv-ci/native-persistence/debug/build-evidence/evidence/worker-raw
+          ${{ runner.temp }}/hyperv-ci/native-persistence/debug/build-evidence/evidence/worker-selected
+          ${{ runner.temp }}/hyperv-ci/native-persistence/debug/build-evidence/evidence/report.json
+          ${{ runner.temp }}/hyperv-ci/native-persistence/debug/fixture-build-exit.txt
+          ${{ runner.temp }}/hyperv-ci/native-persistence/debug/stdout
+          ${{ runner.temp }}/hyperv-ci/native-persistence/debug/stderr
+          ${{ runner.temp }}/hyperv-ci/native-persistence/safe/fixture-strip-proof.json
+          ${{ runner.temp }}/hyperv-ci/native-persistence/observation-evidence/safe-fixtures.log
+          ${{ runner.temp }}/hyperv-ci/native-persistence/safe/build-evidence/evidence/parent-test
+          ${{ runner.temp }}/hyperv-ci/native-persistence/safe/build-evidence/evidence/worker-raw
+          ${{ runner.temp }}/hyperv-ci/native-persistence/safe/build-evidence/evidence/worker-selected
+          ${{ runner.temp }}/hyperv-ci/native-persistence/safe/build-evidence/evidence/report.json
+          ${{ runner.temp }}/hyperv-ci/native-persistence/safe/fixture-build-exit.txt
+          ${{ runner.temp }}/hyperv-ci/native-persistence/safe/stdout
+          ${{ runner.temp }}/hyperv-ci/native-persistence/safe/stderr
         retention-days: 7
         if-no-files-found: warn
 
@@ -1071,7 +1071,7 @@ jobs:
         # Hosted /usr/share can be writable; keep fixture data in a private copy.
         cp -R --no-preserve=mode,ownership \
           "$(/usr/bin/bison --print-datadir)" "${root}/bison-data"
-        for mode in Debug ReleaseSafe; do
+        for mode in debug safe; do
           zig build -j2 test-native-make-environment \
             --cache-dir "${root}/tests" \
             --global-cache-dir "${root}/zig-global" \
@@ -1117,7 +1117,7 @@ jobs:
     - name: Run native Hyper-V object and ABI verifier fixtures
       run: |
         set -euo pipefail
-        for mode in Debug ReleaseSafe; do
+        for mode in debug safe; do
           root="${RUNNER_TEMP}/hyperv-ci/native-object-proofs-${mode}"
           ZIG_LOCAL_CACHE_DIR="${root}/zig-local-cache" \
             zig build -j2 hyperv-object-proofs test-hyperv-object-proofs \
@@ -1141,7 +1141,7 @@ jobs:
           support/tools/hyperv/host/build.zig.zon "${root}/restore/"
         ZIG_LOCAL_CACHE_DIR="${root}/restore-cache" \
           zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
-        for mode in Debug ReleaseSafe; do
+        for mode in debug safe; do
           mkdir -p "${root}/${mode}/fixtures"
           ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
             zig build --build-file support/tools/hyperv/host/build.zig \
@@ -1159,7 +1159,7 @@ jobs:
             --system "${root}/restore/zig-pkg" \
             --cache-dir "${root}/image/zig-local-cache" \
             --prefix "${root}/image/out" \
-            -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe \
+            -Dtarget=x86_64-linux-musl -Doptimize=safe \
             -Dimage-trust-key="${fixture_key}" \
             -j2 install --summary all
         runner_bytes="$(stat -c %s "${root}/image/out/bin/uk-hyperv-host")"
@@ -1202,7 +1202,7 @@ jobs:
           support/tools/hyperv/azure/build.zig.zon "${root}/restore/"
         ZIG_LOCAL_CACHE_DIR="${root}/restore-cache" \
           zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
-        for mode in Debug ReleaseSafe; do
+        for mode in debug safe; do
           ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
             zig build --build-file support/tools/hyperv/azure/build.zig \
               --system "${root}/restore/zig-pkg" \
@@ -1220,7 +1220,7 @@ jobs:
           support/tools/hyperv/preflight/build.zig.zon "${root}/restore/"
         ZIG_LOCAL_CACHE_DIR="${root}/restore-cache" \
           zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
-        for mode in Debug ReleaseSafe; do
+        for mode in debug safe; do
           mkdir -p "${root}/${mode}/fixtures"
           ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
             zig build --build-file support/tools/hyperv/preflight/build.zig \
@@ -1405,7 +1405,7 @@ jobs:
         (
           cd .d/ci-miz
           zig build -j2 install-miz \
-            -Doptimize=ReleaseSafe \
+            -Doptimize=safe \
             --prefix "${RUNNER_TEMP}/hyperv-ci/miz"
         )
         miz="${RUNNER_TEMP}/hyperv-ci/miz/bin/miz"
@@ -1433,7 +1433,7 @@ jobs:
           support/tools/hyperv/local_boot/build.zig.zon "${root}/restore/"
         ZIG_LOCAL_CACHE_DIR="${root}/restore-cache" \
           zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
-        for mode in Debug ReleaseSafe; do
+        for mode in debug safe; do
           mkdir -p "${root}/${mode}/fixtures"
           ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
             zig build --build-file support/tools/hyperv/local_boot/build.zig \
@@ -1449,10 +1449,10 @@ jobs:
         done
         sha256sum --check "${root}/fixture-objcopy-sha256.txt"
 
-    - name: Run native public Hyper-V ReleaseSafe packaging, export and import fixtures
+    - name: Run native public Hyper-V safe packaging, export and import fixtures
       if: ${{ success() && !cancelled() }}
       run: |
-        bash .github/scripts/hyperv-native-public-fixtures.sh ReleaseSafe
+        bash .github/scripts/hyperv-native-public-fixtures.sh safe
 
     - name: Fetch pinned application-network stack
       if: ${{ success() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.hyperv_network_application }}
@@ -1628,7 +1628,7 @@ jobs:
         cp --no-preserve=mode,ownership /usr/share/OVMF/OVMF_VARS_4M.fd \
           "${firmware}/OVMF_VARS.fd"
         timeout --signal=TERM --kill-after=5s 180s \
-          "${RUNNER_TEMP}/hyperv-ci/native-local-boot/ReleaseSafe/out/bin/uk-hyperv-local-boot" \
+          "${RUNNER_TEMP}/hyperv-ci/native-local-boot/safe/out/bin/uk-hyperv-local-boot" \
           --raw-disk "$(readlink -f "${disk}")" \
           --ovmf-code "$(readlink -f "${firmware}/OVMF_CODE.fd")" \
           --ovmf-vars "$(readlink -f "${firmware}/OVMF_VARS.fd")" \
@@ -1696,14 +1696,14 @@ jobs:
         path: |
           ${{ runner.temp }}/hyperv-ci/native-local-boot/fixture-objcopy-version.txt
           ${{ runner.temp }}/hyperv-ci/native-local-boot/fixture-objcopy-sha256.txt
-          ${{ runner.temp }}/hyperv-ci/native-local-boot/Debug/fixtures.log
-          ${{ runner.temp }}/hyperv-ci/native-local-boot/Debug/fixture-strip-proof.json
-          ${{ runner.temp }}/hyperv-ci/native-local-boot/Debug/zig-local-cache/**/local-boot-qemu-fixture
-          ${{ runner.temp }}/hyperv-ci/native-local-boot/Debug/zig-local-cache/**/local-boot-qemu-diagnostic-fixture
-          ${{ runner.temp }}/hyperv-ci/native-local-boot/ReleaseSafe/fixtures.log
-          ${{ runner.temp }}/hyperv-ci/native-local-boot/ReleaseSafe/fixture-strip-proof.json
-          ${{ runner.temp }}/hyperv-ci/native-local-boot/ReleaseSafe/zig-local-cache/**/local-boot-qemu-fixture
-          ${{ runner.temp }}/hyperv-ci/native-local-boot/ReleaseSafe/zig-local-cache/**/local-boot-qemu-diagnostic-fixture
+          ${{ runner.temp }}/hyperv-ci/native-local-boot/debug/fixtures.log
+          ${{ runner.temp }}/hyperv-ci/native-local-boot/debug/fixture-strip-proof.json
+          ${{ runner.temp }}/hyperv-ci/native-local-boot/debug/zig-local-cache/**/local-boot-qemu-fixture
+          ${{ runner.temp }}/hyperv-ci/native-local-boot/debug/zig-local-cache/**/local-boot-qemu-diagnostic-fixture
+          ${{ runner.temp }}/hyperv-ci/native-local-boot/safe/fixtures.log
+          ${{ runner.temp }}/hyperv-ci/native-local-boot/safe/fixture-strip-proof.json
+          ${{ runner.temp }}/hyperv-ci/native-local-boot/safe/zig-local-cache/**/local-boot-qemu-fixture
+          ${{ runner.temp }}/hyperv-ci/native-local-boot/safe/zig-local-cache/**/local-boot-qemu-diagnostic-fixture
           ${{ runner.temp }}/hyperv-ci/image-sha256.txt
           ${{ runner.temp }}/hyperv-ci/smp-image-sha256.txt
           ${{ runner.temp }}/hyperv-ci/smp-disk-sha256.txt

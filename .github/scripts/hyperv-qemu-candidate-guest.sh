@@ -167,8 +167,8 @@ if [[ "$1" == build ]]; then
     sha256sum "$path" >> "$evidence/tool-files.sha256"
   done > "$evidence/tool-paths.txt"
   zig="$(native_tool zig)"
-  [[ "$("$zig" version)" == 0.16.0 ]] || die 'Zig 0.16.0 required'
-  printf '0.16.0\n' > "$evidence/zig-version.txt"
+  [[ "$("$zig" version)" == 0.17.0 ]] || die 'Zig 0.17.0 required'
+  printf '0.17.0\n' > "$evidence/zig-version.txt"
   private_dir "$root/firmware"
   private_file "$root/firmware/code.fd" $((16 * 1024 * 1024))
   private_file "$root/firmware/vars.fd" $((4 * 1024 * 1024))
@@ -179,7 +179,7 @@ if [[ "$1" == build ]]; then
   cli_args=(
     --build-file "$public/build.zig" --cache-dir "$ZIG_LOCAL_CACHE_DIR"
     --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" --prefix "$guest/public-image/out"
-    -Doptimize=ReleaseSafe -j2 install --summary all
+    -Doptimize=safe -j2 install --summary all
   )
   if run_bounded "$evidence/logs/cli-system-check.log" 900 $((8 * 1024 * 1024)) \
     "$zig" build --system "$packages" "${cli_args[@]}"; then
@@ -229,7 +229,7 @@ if [[ "$1" == build ]]; then
   image_args=(
     --system "$guest/empty-packages" --cache-dir "$ZIG_LOCAL_CACHE_DIR"
     --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" --prefix "$guest/image/out"
-    -Doptimize=ReleaseSafe -j2
+    -Doptimize=safe -j2
     "-Dapp=$repo/support/apps/hyperv-acceptance" "-Doutput=$guest/image/build"
     "-Dconfig=$evidence/hyperv-acceptance.config"
     "-Dnative-make-environment=$evidence/native-make-environment.json"
@@ -271,7 +271,7 @@ if [[ "$1" == build ]]; then
   sha256sum --check "$evidence/tool-files.sha256" "$evidence/firmware.sha256"
   sha256sum "$cli" "$efi" "$efi.dbg" "$evidence/hyperv-acceptance.config" \
     "$evidence/native-make-environment.json" > "$evidence/build-artifacts.sha256"
-  printf 'Native public CPU1 EFI and ReleaseSafe CLI built; no boot acceptance claimed.\n'
+  printf 'Native public CPU1 EFI and safe CLI built; no boot acceptance claimed.\n'
   exit 0
 fi
 

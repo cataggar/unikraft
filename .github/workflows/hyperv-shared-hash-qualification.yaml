@@ -33,7 +33,7 @@ jobs:
       uses: cataggar/ghr/actions/install@114926d37d3825e63bede2ccc7ce56b67eda7495
       with:
         ghr-version: v0.8.0
-        tools: cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+        tools: cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
     - name: Acquire pinned native ELF qualification tools
       uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495
@@ -85,17 +85,17 @@ jobs:
         for variant in baseline candidate; do
           source="${GITHUB_WORKSPACE}"
           if [[ "${variant}" == baseline ]]; then source="${baseline}"; fi
-          mkdir -p "${root}/${variant}/Debug/fixtures"
+          mkdir -p "${root}/${variant}/debug/fixtures"
           echo "persistence synthetic configuration: ${variant} on the same native runner"
           zig build --build-file "${source}/support/tools/hyperv/persistence/build.zig" \
             --system "${root}/restore/zig-pkg" \
-            --cache-dir "${root}/${variant}/Debug/cache" \
-            -Dtest-root="${root}/${variant}/Debug/fixtures" \
+            --cache-dir "${root}/${variant}/debug/cache" \
+            -Dtest-root="${root}/${variant}/debug/fixtures" \
             -Dpersistence-timing=true -Dstrip-fixture-debug=true \
             -Dfixture-file-relayout=true "-Dfixture-objcopy=${objcopy}" \
-            -Doptimize=Debug -j2 diagnose-cost --summary all
+            -Doptimize=debug -j2 diagnose-cost --summary all
         done
-        for mode in Debug ReleaseSafe; do
+        for mode in debug safe; do
           mkdir -p "${root}/candidate/${mode}/fixtures"
           zig build --build-file support/tools/hyperv/persistence/build.zig \
             --system "${root}/restore/zig-pkg" \
@@ -118,7 +118,7 @@ jobs:
         done
         zig build test-native-make-environment hyperv-object-proofs \
           test-hyperv-persistence-workflow \
-          -Doptimize=Debug -j2 \
+          -Doptimize=debug -j2 \
           --cache-dir "${root}/native-build-cache" \
           --prefix "${root}/native-build-out" --summary all
 
@@ -170,7 +170,7 @@ jobs:
           zig build --build-file support/tools/hyperv/preparation/namespace/build.zig \
             --cache-dir "${root}/${kind}/cache" --prefix "${root}/${kind}/out" \
             "-Dworkspace=${root}/fixtures" "${git_fixture[@]}" "${qualification[@]}" \
-            -Doptimize=Debug -j2 install-fixture --summary all
+            -Doptimize=debug -j2 install-fixture --summary all
         done
         cp support/tools/hyperv/preparation/namespace/build.zig \
           "${baseline}/support/tools/hyperv/preparation/namespace/"
@@ -187,7 +187,7 @@ jobs:
           zig build --build-file "${source}/support/tools/hyperv/preparation/namespace/build.zig" \
             --cache-dir "${root}/${variant}-probe-cache" \
             "-Dworkspace=${root}/fixtures" -Dhash-cost-only=true \
-            -Doptimize=Debug -j2 diagnose-hash-cost --summary all -- \
+            -Doptimize=debug -j2 diagnose-hash-cost --summary all -- \
             "${root}/raw/out/bin/preparation-namespace-fixture" \
             "${root}/selected/out/bin/preparation-namespace-fixture"
         done
