@@ -385,6 +385,10 @@ does not filter or exclude any original fixture case.
 ### Zig 0.17 configure cache
 
 Native commands use Zig 0.17's `debug` and `safe` optimization modes.
+Give each standalone `--build-file` its own local `--cache-dir` or
+`ZIG_LOCAL_CACHE_DIR`; do not reuse one configuration cache across public,
+preparation, namespace or integration scripts. A different script argument is
+not sufficient isolation in Zig 0.17. The global compiler cache may be shared.
 The configure-time peer commitment explicitly depends on the peer script's
 contents: reusing a build cache neither preserves an old hash after an edit
 nor accepts a deleted source. Run the isolated native build-schema regression

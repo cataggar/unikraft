@@ -329,6 +329,9 @@ Ubuntu/archive authority.
 
 Use installed Zig 0.17.0, never the repository root build. Put all caches,
 outputs and temporary directories under an explicit fresh preparation scratch.
+Use distinct local configuration caches for preparation, namespace and
+integration `--build-file` scripts, even when their source tree is the same.
+The CI wrapper already selects separate cache directories for each script.
 The existing dependency cache is read-only through `--system`. These focused
 commands do not authorize dependency restoration or real evidence acquisition.
 The existing `test` target accepts repeatable `-Dtest-filter=...` selectors;

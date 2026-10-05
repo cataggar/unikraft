@@ -38,10 +38,10 @@ cd /d/unikraft-worktrees/fleet-origin
 umask 077
 export S="$PWD/.d/zig-migration-preparation/integration-parent-v2"
 test ! -e "$S"
-mkdir -p "$S"/{tmp,home,xdg-cache,xdg-config,zig-global,zig-local,run/requests}
+mkdir -p "$S"/{tmp,home,xdg-cache,xdg-config,zig-global,integration-cache,run/requests}
 export HOME="$S/home" TMPDIR="$S/tmp"
 export XDG_CACHE_HOME="$S/xdg-cache" XDG_CONFIG_HOME="$S/xdg-config"
-export ZIG_GLOBAL_CACHE_DIR="$S/zig-global" ZIG_LOCAL_CACHE_DIR="$S/zig-local"
+export ZIG_GLOBAL_CACHE_DIR="$S/zig-global" ZIG_LOCAL_CACHE_DIR="$S/integration-cache"
 /home/g/.local/bin/zig build \
   --build-file support/tools/hyperv/preparation/integration/build.zig \
   --system /d/unikraft-worktrees/fleet-ci/.d/zig-migration-preparation/restore/zig-pkg \
