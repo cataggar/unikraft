@@ -921,8 +921,9 @@ jobs:
         mkdir -p "${root}/tmp" "${root}/fixtures" "${GITHUB_WORKSPACE}/.d"
         mkdir -m 0700 "${parent}"
         export TMPDIR="${root}/tmp"
+        export ZIG_GLOBAL_CACHE_DIR="${root}/global"
         zig build --build-file support/tools/hyperv/direct/build.zig -j2 \
-          --cache-dir "${root}/cache" --global-cache-dir "${root}/global" \
+          --cache-dir "${root}/cache" \
           --prefix "${root}/tools" -Doptimize=safe \
           -Dtest-root="${root}/fixtures" \
           -Dlifecycle-root="${parent}/native" \
@@ -942,6 +943,7 @@ jobs:
         umask 077
         root="${RUNNER_TEMP}/hyperv-ci/direct"
         export TMPDIR="${root}/tmp"
+        export ZIG_GLOBAL_CACHE_DIR="${root}/global"
         # Even creating/removing ignored zig-pkg changes pinned directory metadata.
         # Do not move this independent dependency restoration before collection.
         # WAMR uses the same isolated fake backend, never an authenticated CLI.
@@ -954,10 +956,10 @@ jobs:
         cp support/tools/hyperv/local_boot/build.zig \
           support/tools/hyperv/local_boot/build.zig.zon "${root}/restore/"
         zig build --build-file "${root}/restore/build.zig" --fetch=all -j2 \
-          --cache-dir "${root}/restore-cache" --global-cache-dir "${root}/global"
+          --cache-dir "${root}/restore-cache"
         zig build --build-file support/build/wamr-native-ci/build.zig -j2 \
           --system "${root}/restore/zig-pkg" \
-          --cache-dir "${root}/compute-cache" --global-cache-dir "${root}/global" \
+          --cache-dir "${root}/compute-cache" \
           --prefix "${root}/compute-tools" \
           -Dtest-root="${compute_fixture_root}" \
           -Doptimize=safe test install
@@ -968,7 +970,6 @@ jobs:
         zig build \
           --build-file support/build/wamr-native-ci/supervisor.build.zig -j2 \
           --cache-dir "${root}/supervisor-cache" \
-          --global-cache-dir "${root}/global" \
           --prefix "${root}/compute-supervisor" \
           -Doptimize=safe \
           -Dsource-closure-sha256="${supervisor_source_closure}"
@@ -1066,6 +1067,7 @@ jobs:
         export PATH="/usr/bin:/bin:${GHR_BIN_DIR}"
         umask 077
         root="${RUNNER_TEMP}/hyperv-ci/native-make-environment"
+        export ZIG_GLOBAL_CACHE_DIR="${root}/zig-global"
         mkdir -p "${root}"/{tmp,cache,config,zig-local,zig-global}
         root="$(readlink -f "${root}")"
         # Hosted /usr/share can be writable; keep fixture data in a private copy.
@@ -1074,7 +1076,6 @@ jobs:
         for mode in debug safe; do
           zig build -j2 test-native-make-environment \
             --cache-dir "${root}/tests" \
-            --global-cache-dir "${root}/zig-global" \
             "-Doutput=${root}/test-build" "-Doptimize=${mode}" \
             --summary all
         done
@@ -1089,7 +1090,6 @@ jobs:
         umask 022
         zig build -j2 olddefconfig \
           --cache-dir "${root}/zig-local" \
-          --global-cache-dir "${root}/zig-global" \
           "-Dnative-make-environment=${root}/environment.json" \
           -Dmake-command=/usr/bin/make \
           "-Dapp=${GITHUB_WORKSPACE}/support/apps/hyperv-acceptance" \
@@ -1103,7 +1103,6 @@ jobs:
         chmod 644 "${root}/environment.json"
         if zig build -j2 olddefconfig \
           --cache-dir "${root}/zig-local" \
-          --global-cache-dir "${root}/zig-global" \
           "-Dnative-make-environment=${root}/environment.json" \
           "-Doutput=${root}/build" "-Dcompiler=zig cc" \
           > "${root}/refusal.log" 2>&1; then
@@ -1320,7 +1319,7 @@ jobs:
       uses: actions/checkout@v4
       with:
         repository: cataggar/miz
-        ref: 669a27982b376311f558e820b69e9a692735b0cd
+        ref: 66ea6701cf0e1b6d31e5f30fade00b7a546d4b44
         fetch-depth: 1
         path: .d/ci-miz
 

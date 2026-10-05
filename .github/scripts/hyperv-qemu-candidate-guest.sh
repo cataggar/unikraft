@@ -7,10 +7,10 @@
 # plus the real GITHUB_REPOSITORY, GITHUB_WORKFLOW_REF, GITHUB_JOB,
 # GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT and GITHUB_SHA. The declared job must
 # equal the actual zig-hyperv job; these metadata fields are not an attestation.
-# Build needs Zig 0.16, LLVM binutils, Make/Bison/Flex/M4, Bash/Git and
+# Build needs Zig 0.17, LLVM binutils, Make/Bison/Flex/M4, Bash/Git and
 # standard Ubuntu GNU utilities on PATH. BISON_PKGDATADIR is optional.
 # Keep HOME unchanged. Created build/boot slots are never reused.
-# CLI build: 900s; fetch: 300s; config: 600s; image: 1800s, with 8-MiB logs.
+# CLI build: 900s; each fetch: 300s; config: 600s; image: 1800s, with 8-MiB logs.
 # Boot CLI phases share 480s, plus bounded termination; records cap at 64 KiB.
 # Retain guest/evidence/** plus native packaging records/logs and the export
 # manifest. Binaries, caches, firmware and disk images stay outside evidence/.
@@ -143,7 +143,7 @@ if [[ "$1" == build ]]; then
     "$guest/zig-global-cache" "$guest/empty-packages" "$guest/public-image" "$guest/image"
   mkdir -m 700 "$evidence/logs" "$guest/public-image/zig-local-cache" "$guest/public-image/out" \
     "$guest/image/zig-local-cache" "$guest/image/out"
-  # Zig 0.16 ZIP fetching does not create this parent before its exclusive file.
+  # Package restoration needs its temporary-file parent before compilation.
   mkdir -m 700 "$guest/zig-global-cache/tmp"
   export TMPDIR="$guest/tmp" XDG_CACHE_HOME="$guest/cache" XDG_CONFIG_HOME="$guest/xdg-config"
   export ZIG_GLOBAL_CACHE_DIR="$guest/zig-global-cache"
@@ -178,7 +178,7 @@ if [[ "$1" == build ]]; then
   packages="$guest/empty-packages"
   cli_args=(
     --build-file "$public/build.zig" --cache-dir "$ZIG_LOCAL_CACHE_DIR"
-    --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" --prefix "$guest/public-image/out"
+    --prefix "$guest/public-image/out"
     -Doptimize=safe -j2 install --summary all
   )
   if run_bounded "$evidence/logs/cli-system-check.log" 900 $((8 * 1024 * 1024)) \
@@ -200,7 +200,7 @@ if [[ "$1" == build ]]; then
     export ZIG_LOCAL_CACHE_DIR="$guest/public-image/restore-cache"
     run_bounded "$evidence/logs/cli-restore.log" 300 $((8 * 1024 * 1024)) \
       "$zig" build --build-file "$guest/public-image/restore/build.zig" --fetch=all -j2 \
-        --cache-dir "$ZIG_LOCAL_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
+        --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
         --prefix "$guest/public-image/restore-out"
     cmp "$public/build.zig" "$guest/public-image/restore/build.zig"
     cmp "$public/build.zig.zon" "$guest/public-image/restore/build.zig.zon"
@@ -209,6 +209,16 @@ if [[ "$1" == build ]]; then
     run_bounded "$evidence/logs/cli-build.log" 900 $((8 * 1024 * 1024)) \
       "$zig" build --system "$packages" "${cli_args[@]}"
   fi
+
+  mkdir -m 700 "$guest/image/restore" "$guest/image/restore-cache"
+  cp --no-preserve=mode,ownership "$repo/build.zig" "$repo/build.zig.zon" \
+    "$guest/image/restore/"
+  export ZIG_LOCAL_CACHE_DIR="$guest/image/restore-cache"
+  run_bounded "$evidence/logs/image-restore.log" 300 $((8 * 1024 * 1024)) \
+    "$zig" build --build-file "$guest/image/restore/build.zig" --fetch=all -j2 \
+      --cache-dir "$ZIG_LOCAL_CACHE_DIR" --prefix "$guest/image/restore-out"
+  cmp "$repo/build.zig" "$guest/image/restore/build.zig"
+  cmp "$repo/build.zig.zon" "$guest/image/restore/build.zig.zon"
 
   export ZIG_LOCAL_CACHE_DIR="$guest/image/zig-local-cache"
   bison="$(native_tool bison)"
@@ -227,8 +237,8 @@ if [[ "$1" == build ]]; then
   cp --no-preserve=mode,ownership "$repo/support/apps/hyperv-acceptance/defconfig" \
     "$evidence/hyperv-acceptance.config"
   image_args=(
-    --system "$guest/empty-packages" --cache-dir "$ZIG_LOCAL_CACHE_DIR"
-    --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" --prefix "$guest/image/out"
+    --system "$guest/image/restore/zig-pkg" --cache-dir "$ZIG_LOCAL_CACHE_DIR"
+    --prefix "$guest/image/out"
     -Doptimize=safe -j2
     "-Dapp=$repo/support/apps/hyperv-acceptance" "-Doutput=$guest/image/build"
     "-Dconfig=$evidence/hyperv-acceptance.config"
