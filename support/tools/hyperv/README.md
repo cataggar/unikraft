@@ -75,9 +75,11 @@ boundary; termination, cancellation and cleanup diagnostics keep their existing
 schemas. Use `-Doptimize=debug` or `-Doptimize=safe` for checked qualification.
 The synthetic v1 sampling records keep their existing `Debug`/`ReleaseSafe`
 wire enum spellings; lowercase compiler mode names do not alter that contract.
-Direct WAMR version-one handoffs retain the frozen Zig 0.16 runtime/SDK identity
-only for the existing immutable historical source revision/tree allowlist.
-Current version-one and all version-two handoffs require Zig 0.17; this does not
+The explicit direct WAMR `historical-handoff` command revalidates only version-one
+imports bound to the existing immutable historical source revision/tree allowlist
+and frozen Zig 0.16 runtime/SDK/profile. Ordinary `handoff` validation always
+requires the current Zig 0.17 identity, even if input strings quote historical
+pins. The historical command is not a fallback for failed current validation and does not
 relax artifact, boot, private-file or authority validation. The standalone direct
 `test-compute-runtime` selector checks rejection across those generation boundaries.
 `zig build` reads the private global cache from `ZIG_GLOBAL_CACHE_DIR` rather

@@ -195,7 +195,7 @@ def dependency_custody(source):
                 "sha256": manifest_digest.hexdigest(),
             },
             "hash_verification": {
-                "algorithm": "zig-0.16.0-fetch-path",
+                "algorithm": "zig-0.17.0-fetch-path",
                 "count": 1,
                 "sha256": digest(json.dumps(
                     hash_records, sort_keys=True,
