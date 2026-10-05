@@ -159,12 +159,17 @@ existing integration runtime job. Every copied package still undergoes the
 original content-hash and custody checks; missing packages are not synthesized
 or ignored. Offline qualification must provide that same complete graph.
 The mandatory source-custody limit gate and the subsequent controller fixture
-gate retain the same isolated checkout and local compiler cache. The latter
-checks the exact checkout identity and cleanliness before reusing genuinely
-compiled prerequisites, instead of compiling the same helpers again at new
-absolute paths. Failed limit qualification removes the checkout; successful
-limits leave it for the controller gate's cleanup. All fixture executions and
-the controller gate's 15-minute deadline remain unchanged.
+gate retain the same isolated checkout, compiler caches and genuine
+dependency forest. Both compile against the same physical `--system` paths:
+changing from the lazy default forest to a separately restored copy invalidates
+package helpers and their dependent test options even with a shared cache.
+The first gate restores that complete forest for its existing helper builds,
+with a private global-cache temporary directory for SDK ZIP downloads.
+The controller gate checks the exact checkout identity, cleanliness and both
+unchanged manifests, then repeats SDK fetch-all before its fixture executions.
+Failed limit qualification removes the checkout; successful limits leave it
+for the controller gate's cleanup. No fixture execution is moved outside the
+controller gate, and its 15-minute deadline remains unchanged.
 Reader fixtures stage a single-link private copy of real Git and its real ELF
 interpreter, relocating only `PT_INTERP` while preserving Git's loaded code and
 bundled-library search paths. This gives both system and bundled Git an actual
