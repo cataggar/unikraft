@@ -81,7 +81,7 @@ fn write(raw: ?*anyopaque, fd: u32, bytes: []const u8) wasi.WriteResult {
     @memcpy(buffer[length.*..][0..count], bytes[0..count]);
     length.* += count;
     if (count != bytes.len) {
-        s.output.output_error = @intFromEnum(wasi.Errno.nospc);
+        s.output.output_error = @backingInt(wasi.Errno.nospc);
         return .{ .written = count, .errno = .nospc };
     }
     return .{ .written = count };
@@ -125,11 +125,11 @@ fn Thunk(comptime index: usize) type {
             if (comptime std.mem.eql(u8, spec.name, "clock_time_get")) {
                 noteClockRequest(s, @truncate(bits[0]));
             }
-            const outcome = s.context.dispatch(host.memory(), @enumFromInt(index), &bits) catch return 2;
+            const outcome = s.context.dispatch(host.memory(), @fromBackingInt(@intCast(index)), &bits) catch return 2;
             switch (outcome) {
                 .returned => |errno| {
                     if (comptime spec.results.len != 1) return 2;
-                    results[0] = .{ .kind = 0x7f, .bits = @intFromEnum(errno) };
+                    results[0] = .{ .kind = 0x7f, .bits = @backingInt(errno) };
                 },
                 .exited => |code| host.terminate(code),
             }
@@ -175,8 +175,8 @@ export fn wamr_wasi_check(config: *const runtime.Config, bytes: [*]const u8, len
         if (result.kind == 0) result = runtime.wamr_aot_start(instance);
         if (result.kind == 0) result = runtime.wamr_aot_call(instance, "_start", 6, null, 0, null, 0);
     }
-    if (state.context.pendingWriteError(1)) |errno| output.pending_stdout = @intFromEnum(errno);
-    if (state.context.pendingWriteError(2)) |errno| output.pending_stderr = @intFromEnum(errno);
+    if (state.context.pendingWriteError(1)) |errno| output.pending_stdout = @backingInt(errno);
+    if (state.context.pendingWriteError(2)) |errno| output.pending_stderr = @backingInt(errno);
     return result;
 }
 
@@ -237,7 +237,7 @@ test "qualified realtime clock bridge writes actual WASI ID0 nanoseconds" {
     bindClock(&state);
     try std.testing.expectEqual(@as(u32, 1), output.realtime_supported);
     try std.testing.expectEqual(@as(u64, 1000000000), state.context.clock.?.resolution_ns[0]);
-    var memory: [16]u8 = @splat(0xa5);
+    var memory: [16]u8 = @as([16]u8, @splat(0xa5));
     noteClockRequest(&state, 0);
     try std.testing.expectEqual(wasi.Errno.success, state.context.clockTimeGet(&memory, 0, 1, 4));
     try std.testing.expectEqual(TestClock.ns, std.mem.readInt(u64, memory[4..12], .little));
@@ -288,7 +288,7 @@ test "unqualified failed zero sentinel and changed clocks never write success" {
         }
         bindClock(&state);
         try std.testing.expectEqual(@as(u32, 0), output.realtime_supported);
-        var memory: [8]u8 = @splat(0xa5);
+        var memory: [8]u8 = @as([8]u8, @splat(0xa5));
         noteClockRequest(&state, 0);
         try std.testing.expectEqual(wasi.Errno.notsup, state.context.clockTimeGet(&memory, 0, 0, 0));
         try std.testing.expectEqualSlices(u8, &@as([8]u8, @splat(0xa5)), &memory);
@@ -304,7 +304,7 @@ test "unqualified failed zero sentinel and changed clocks never write success" {
             3 => TestClock.caps.resolution_ns = 100,
             else => unreachable,
         }
-        var memory: [8]u8 = @splat(0xa5);
+        var memory: [8]u8 = @as([8]u8, @splat(0xa5));
         try std.testing.expectEqual(wasi.Errno.overflow, state.context.clockTimeGet(&memory, 0, 0, 0));
         try std.testing.expectEqualSlices(u8, &@as([8]u8, @splat(0xa5)), &memory);
         try std.testing.expectEqual(@as(u32, 0), output.realtime_supported);

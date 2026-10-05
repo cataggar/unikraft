@@ -5,7 +5,7 @@ test "install-controller rejects incompatible build flags without creating outpu
     const allocator = std.testing.allocator;
     const runtime = try std.fs.path.join(allocator, &.{ options.repository_root, ".d/controller-invalid-target" });
     defer allocator.free(runtime);
-    const runtime_flag = try std.fmt.allocPrint(allocator, "-Dcontroller-runtime={s}", .{runtime});
+    const runtime_flag = try allocator.print("-Dcontroller-runtime={s}", .{runtime});
     defer allocator.free(runtime_flag);
     for ([_]struct { triple: []const u8, cpu: []const u8 }{
         .{ .triple = "-Dtarget=x86_64-linux-musl", .cpu = "-Dcpu=x86_64_v2" },
@@ -13,9 +13,9 @@ test "install-controller rejects incompatible build flags without creating outpu
     }) |bad| {
         const result = try std.process.run(allocator, std.testing.io, .{
             .argv = &.{
-                options.zig_executable,                   "build",                  "--build-file",
-                "support/build/wamr-native-ci/build.zig", "install-controller",     bad.triple,
-                bad.cpu,                                  "-Doptimize=ReleaseSafe", runtime_flag,
+                options.zig_executable,                   "build",              "--build-file",
+                "support/build/wamr-native-ci/build.zig", "install-controller", bad.triple,
+                bad.cpu,                                  "-Doptimize=safe",    runtime_flag,
             },
             .cwd = .{ .path = options.repository_root },
             .stdout_limit = .limited(32 * 1024),

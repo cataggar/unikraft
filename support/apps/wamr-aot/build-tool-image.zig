@@ -224,7 +224,7 @@ const Diagnostics = struct {
             .{ self.index, stage.name() },
         );
         self.index += 1;
-        const contents = try std.fmt.allocPrint(
+        const contents = try std.mem.Allocator.print(
             allocator,
             "{s}\n",
             .{@errorName(err)},
@@ -383,8 +383,8 @@ const SelectedTools = struct {
     }
 
     fn close(self: *SelectedTools, allocator: std.mem.Allocator, io: std.Io) void {
-        inline for (std.meta.fields(SelectedTools)) |field|
-            @field(self, field.name).close(allocator, io);
+        inline for (@typeInfo(SelectedTools).@"struct".field_names) |name|
+            @field(self, name).close(allocator, io);
         self.* = undefined;
     }
 
@@ -413,15 +413,15 @@ const SelectedTools = struct {
     }
 
     fn same(left: *const SelectedTools, right: *const SelectedTools) bool {
-        inline for (std.meta.fields(SelectedTools)) |field| {
+        inline for (@typeInfo(SelectedTools).@"struct".field_names) |name| {
             if (!std.meta.eql(
-                @field(left, field.name).executable.identity,
-                @field(right, field.name).executable.identity,
+                @field(left, name).executable.identity,
+                @field(right, name).executable.identity,
             )) return false;
             if (!std.mem.eql(
                 u8,
-                @field(left, field.name).path,
-                @field(right, field.name).path,
+                @field(left, name).path,
+                @field(right, name).path,
             )) return false;
         }
         return true;
@@ -1120,36 +1120,36 @@ fn rootCommand(
         make_environment.zig_local_cache,
         "--global-cache-dir",
         make_environment.zig_global_cache,
-        try std.fmt.allocPrint(allocator, "-Dapp={s}", .{repository.app.path}),
-        try std.fmt.allocPrint(
+        try allocator.print("-Dapp={s}", .{repository.app.path}),
+        try std.mem.Allocator.print(
             allocator,
             "-Dnative-make-environment={s}",
             .{environment_path},
         ),
-        try std.fmt.allocPrint(allocator, "-Dconfig={s}", .{config_path}),
-        try std.fmt.allocPrint(allocator, "-Dmake-command={s}", .{tools.make.path}),
-        try std.fmt.allocPrint(allocator, "-Dbison-command={s}", .{tools.bison.path}),
-        try std.fmt.allocPrint(allocator, "-Dflex-command={s}", .{tools.flex.path}),
-        try std.fmt.allocPrint(
+        try allocator.print("-Dconfig={s}", .{config_path}),
+        try allocator.print("-Dmake-command={s}", .{tools.make.path}),
+        try allocator.print("-Dbison-command={s}", .{tools.bison.path}),
+        try allocator.print("-Dflex-command={s}", .{tools.flex.path}),
+        try std.mem.Allocator.print(
             allocator,
             "-Dcompiler={s} cc -target x86_64-freestanding-none",
             .{tools.zig.path},
         ),
         "-Dcompiler-targeted=true",
-        try std.fmt.allocPrint(allocator, "-Dhost-cc={s} cc", .{tools.zig.path}),
-        try std.fmt.allocPrint(allocator, "-Dhost-cxx={s} c++", .{tools.zig.path}),
+        try allocator.print("-Dhost-cc={s} cc", .{tools.zig.path}),
+        try allocator.print("-Dhost-cxx={s} c++", .{tools.zig.path}),
         "-Dhost-cflags=-fno-sanitize=null",
-        try std.fmt.allocPrint(allocator, "-Dmake-arg=AR={s} ar", .{tools.zig.path}),
-        try std.fmt.allocPrint(allocator, "-Dmake-arg=CP={s} -f", .{tools.cp.path}),
-        try std.fmt.allocPrint(allocator, "-Dmake-arg=MKDIR={s}", .{tools.mkdir.path}),
-        try std.fmt.allocPrint(allocator, "-Dmake-arg=PYTHON={s}", .{tools.python3.path}),
-        try std.fmt.allocPrint(allocator, "-Dmake-arg=READLINK={s}", .{tools.readlink.path}),
+        try allocator.print("-Dmake-arg=AR={s} ar", .{tools.zig.path}),
+        try allocator.print("-Dmake-arg=CP={s} -f", .{tools.cp.path}),
+        try allocator.print("-Dmake-arg=MKDIR={s}", .{tools.mkdir.path}),
+        try allocator.print("-Dmake-arg=PYTHON={s}", .{tools.python3.path}),
+        try allocator.print("-Dmake-arg=READLINK={s}", .{tools.readlink.path}),
         "-Dmake-arg=HOSTOSENV=Linux",
         "-Dmake-arg=WGET_VERSION=unavailable",
         "-Dmake-arg=WGET=false",
-        try std.fmt.allocPrint(allocator, "-Dmake-arg=ZIG={s}", .{tools.zig.path}),
-        try std.fmt.allocPrint(allocator, "-Dmake-arg=YACC={s}", .{tools.bison.path}),
-        try std.fmt.allocPrint(allocator, "-Dmake-arg=LEX={s}", .{tools.flex.path}),
+        try allocator.print("-Dmake-arg=ZIG={s}", .{tools.zig.path}),
+        try allocator.print("-Dmake-arg=YACC={s}", .{tools.bison.path}),
+        try allocator.print("-Dmake-arg=LEX={s}", .{tools.flex.path}),
         "-Dmake-arg=KCONFIG_OVERWRITECONFIG=1",
         "-Dmake-arg=UK_CFLAGS=-std=gnu17",
         "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt",
@@ -1165,7 +1165,7 @@ fn rootCommand(
     }) |entry| {
         try arguments.append(
             allocator,
-            try std.fmt.allocPrint(
+            try std.mem.Allocator.print(
                 allocator,
                 "-Dmake-arg={s}={s}",
                 .{ entry[0], @field(tools, entry[1]).path },
@@ -1174,7 +1174,7 @@ fn rootCommand(
     }
     try arguments.append(
         allocator,
-        try std.fmt.allocPrint(
+        try std.mem.Allocator.print(
             allocator,
             "-Dwamr-aot-tool={s}",
             .{executable_path},
@@ -1716,7 +1716,7 @@ fn writePrimary(
         .exited => |code| try writer.print("\"exited\":{d}", .{code}),
         .signal => |signal| try writer.print(
             "\"signal\":{d}",
-            .{@intFromEnum(signal)},
+            .{@backingInt(signal)},
         ),
         .unknown => |status| try writer.print("\"unknown\":{d}", .{status}),
         else => try contract.json.writeString(writer, @tagName(primary)),

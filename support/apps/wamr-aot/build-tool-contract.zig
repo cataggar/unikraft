@@ -10,7 +10,7 @@ pub const image = @import("build-tool-image.zig");
 pub const revision = "a53205d77be3b880eb8f8b96679512ba58e2331a";
 pub const workload_revision = revision;
 pub const compiler_profile = "unikraft-x86_64";
-pub const zig_version = "0.16.0";
+pub const zig_version = "0.17.0";
 pub const source_identity_recipe = "sorted-compact-json-relative-file-path-to-bytes-and-sha256-v1";
 pub const development_scope = "local-development-build-only-not-supported-lineage";
 pub const supported_scope = "native-build-inputs-not-hardware-qualification";
@@ -19,7 +19,7 @@ pub const native_flags = [_][]const u8{
     "-target",
     "x86_64-freestanding-none",
     "-O",
-    "ReleaseSafe",
+    "safe",
     "-fPIC",
     "-mno-red-zone",
     "-fno-stack-check",

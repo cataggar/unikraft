@@ -49,7 +49,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("build-tool-main.zig"),
             .target = target,
             .optimize = optimize,
-            .strip = optimize != .Debug,
+            .strip = optimize != .debug,
             .imports = &.{.{ .name = "wamr_aot_build", .module = module }},
         }),
     });
@@ -84,21 +84,9 @@ pub fn build(b: *std.Build) void {
     options.addOptionPath("process_fixture", process_fixture.getEmittedBin());
     options.addOptionPath("prepare_fixture", prepare_fixture.getEmittedBin());
     options.addOptionPath("image_fixture", image_fixture.getEmittedBin());
-    options.addOption(
-        []const u8,
-        "zig_lib_dir",
-        b.graph.zig_lib_directory.path.?,
-    );
-    options.addOption([]const u8, "git_executable", b.findProgram(&.{"git"}, &.{}) catch
-        @panic("native Git archive fixture requires Git"));
-    options.addOption(
-        []const u8,
-        "repository_root",
-        std.fs.path.resolve(
-            b.allocator,
-            &.{ b.build_root.path.?, "../../.." },
-        ) catch @panic("cannot resolve repository root"),
-    );
+    options.addOptionPath("zig_lib_dir", .zig_lib);
+    options.addOptionPath("git_executable", b.findProgramLazy(.{ .names = &.{"git"} }));
+    options.addOptionPath("repository_root", b.path("../../.."));
 
     const unit_tests = b.addTest(.{
         .filters = b.option(
@@ -123,11 +111,8 @@ pub fn build(b: *std.Build) void {
     });
     unit_tests.root_module.addOptions("test_options", options);
     const unit_run = b.addRunArtifact(unit_tests);
-    const test_cwd = if (std.mem.eql(u8, b.build_root.path.?, "."))
-        "."
-    else
-        b.pathFromRoot("../../..");
-    unit_run.setCwd(.{ .cwd_relative = test_cwd });
+    const test_cwd = b.path("../../..");
+    unit_run.setCwd(test_cwd);
     const unit_step = b.step("test-unit", "Run native WAMR build helper unit and fault fixtures");
     unit_step.dependOn(&unit_run.step);
 
@@ -141,7 +126,7 @@ pub fn build(b: *std.Build) void {
     });
     integration_tests.root_module.addOptions("test_options", options);
     const integration_run = b.addRunArtifact(integration_tests);
-    integration_run.setCwd(.{ .cwd_relative = test_cwd });
+    integration_run.setCwd(test_cwd);
     const integration_step = b.step("test-integration", "Run native WAMR build executable and supervisor fixtures");
     integration_step.dependOn(&integration_run.step);
 

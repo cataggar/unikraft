@@ -84,7 +84,7 @@ fn matchBinding(a: std.mem.Allocator, observed: std.json.Value, expected: plan.B
     try eq(encoded, want);
 }
 
-const PlanVariant = enum { native, historical_import };
+const PlanVariant = enum { native, historical_native, historical_import };
 
 fn matchPlan(
     a: std.mem.Allocator,
@@ -113,11 +113,15 @@ fn matchPlan(
         try matchBinding(a, argv.array.items[0], .{ .path = .{ .role = "command-supervisor" } });
         try matchBinding(a, argv.array.items[1], .{ .literal = "--launch-retained" });
     }
-    for (argv.array.items[if (wrapper) @as(usize, 2) else 0..], expected_argv, 0..) |observed, expected, index|
-        try matchBinding(a, observed, if (historical and stage == .@"local-boot-tool" and index == 7)
+    for (argv.array.items[if (wrapper) @as(usize, 2) else 0..], expected_argv, 0..) |observed, expected, index| {
+        const selected_binding: plan.Binding = if (historical and stage == .@"local-boot-tool" and index == 7)
             .{ .path = .{ .role = "work", .relative = "tools" } }
+        else if (variant != .native and expected == .literal and std.mem.eql(u8, expected.literal, "-Doptimize=safe"))
+            .{ .literal = "-Doptimize=ReleaseSafe" }
         else
-            expected);
+            expected;
+        try matchBinding(a, observed, selected_binding);
+    }
     const environment = try get(request, "environment");
     const expected = try plan.environment(a, stage);
     defer plan.freeEnvironment(a, expected);
@@ -339,6 +343,9 @@ fn validateWithProfile(
     const variant: PlanVariant = blk: {
         matchPlan(a, request, stage, .native, context) catch |err| {
             if (context == .local_runtime or err == error.OutOfMemory) return err;
+            if (matchPlan(a, request, stage, .historical_native, context)) |_| {
+                break :blk .historical_native;
+            } else |legacy_err| if (legacy_err == error.OutOfMemory) return legacy_err;
             try matchPlan(a, request, stage, .historical_import, context);
             break :blk .historical_import;
         };

@@ -522,7 +522,7 @@ test "every export phase failure retains private evidence forbids final bundle a
             if (phase != .output_reserved) {
                 const output = try core.private_files.Directory.open(std.testing.io, fixture.output_path);
                 defer output.close(std.testing.io);
-                const journal = try std.fmt.allocPrint(std.testing.allocator, "private/export/failed-{s}.json", .{@tagName(phase)});
+                const journal = try std.testing.allocator.print("private/export/failed-{s}.json", .{@tagName(phase)});
                 defer std.testing.allocator.free(journal);
                 const diagnostic = try output.dir.openFile(std.testing.io, journal, .{ .follow_symlinks = false });
                 defer diagnostic.close(std.testing.io);
@@ -1352,18 +1352,18 @@ fn replaceOwned(a: std.mem.Allocator, source: []u8, old: []const u8, new: []cons
 }
 
 fn oversizedBundle(a: std.mem.Allocator) ![]u8 {
-    const raw_big = try std.fmt.allocPrint(a, "\"path\":\"artifacts/raw\",\"size\":{},\"sha256\":\"{s}\"", .{ layout.max_large_artifact_bytes, sha });
+    const raw_big = try a.print("\"path\":\"artifacts/raw\",\"size\":{},\"sha256\":\"{s}\"", .{ layout.max_large_artifact_bytes, sha });
     defer a.free(raw_big);
-    const qcow2_big = try std.fmt.allocPrint(a, "\"path\":\"artifacts/qcow2\",\"size\":{},\"sha256\":\"{s}\"", .{ layout.max_large_artifact_bytes, sha });
+    const qcow2_big = try a.print("\"path\":\"artifacts/qcow2\",\"size\":{},\"sha256\":\"{s}\"", .{ layout.max_large_artifact_bytes, sha });
     defer a.free(qcow2_big);
     const first = try replaceOwned(a, try sampleBundle(a, .tiny_qcow2_derived_vhd_v2), "\"path\":\"artifacts/raw\",\"size\":1,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"", raw_big);
     return replaceOwned(a, first, "\"path\":\"artifacts/qcow2\",\"size\":1,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"", qcow2_big);
 }
 
 fn oversizedManifest(a: std.mem.Allocator) ![]u8 {
-    const raw_big = try std.fmt.allocPrint(a, "\"artifacts/raw\":{{\"size\":{},\"sha256\":\"{s}\"}}", .{ layout.max_large_artifact_bytes, sha });
+    const raw_big = try a.print("\"artifacts/raw\":{{\"size\":{},\"sha256\":\"{s}\"}}", .{ layout.max_large_artifact_bytes, sha });
     defer a.free(raw_big);
-    const qcow2_big = try std.fmt.allocPrint(a, "\"artifacts/qcow2\":{{\"size\":{},\"sha256\":\"{s}\"}}", .{ layout.max_large_artifact_bytes, sha });
+    const qcow2_big = try a.print("\"artifacts/qcow2\":{{\"size\":{},\"sha256\":\"{s}\"}}", .{ layout.max_large_artifact_bytes, sha });
     defer a.free(qcow2_big);
     const first = try replaceOwned(a, try sampleManifest(a, .tiny_qcow2_derived_vhd_v2), "\"artifacts/raw\":{\"size\":1,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}", raw_big);
     return replaceOwned(a, first, "\"artifacts/qcow2\":{\"size\":1,\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}", qcow2_big);
@@ -1726,13 +1726,13 @@ fn generatedPublicMembers(a: std.mem.Allocator, compatibility: profile.Compatibi
         list.deinit(a);
     }
     for (layout.artifactNames(compatibility)) |name|
-        try list.append(a, try std.fmt.allocPrint(a, "artifacts/{s}", .{name}));
+        try list.append(a, try a.print("artifacts/{s}", .{name}));
     for (profile.modes(compatibility)) |mode| {
         inline for (.{ "serial", "request", "report", "compute" }) |key|
-            try list.append(a, try std.fmt.allocPrint(a, "boots/{s}/{s}", .{ @tagName(mode), key }));
+            try list.append(a, try a.print("boots/{s}/{s}", .{ @tagName(mode), key }));
     }
     for (layout.evidenceNames(compatibility)) |name|
-        try list.append(a, try std.fmt.allocPrint(a, "evidence/{s}", .{name}));
+        try list.append(a, try a.print("evidence/{s}", .{name}));
     std.mem.sort([]const u8, list.items, {}, struct {
         fn less(_: void, lhs: []const u8, rhs: []const u8) bool {
             return std.mem.lessThan(u8, lhs, rhs);
@@ -1848,7 +1848,7 @@ const ExportFixture = struct {
                 try fixtureJson(a, .{ .producer_sha256 = sha, .image = .{ .fixture = true } })
             else
                 try fixtureJson(a, .{ .fixture_record = name });
-            try self.put(try std.fmt.allocPrint(a, "source/runtime/compute/evidence/{s}", .{name}), bytes);
+            try self.put(try a.print("source/runtime/compute/evidence/{s}", .{name}), bytes);
             hashes.getPtr(name).?.* = .{ .string = try a.dupe(u8, &std.fmt.bytesToHex(controller.records.fileIdentity(bytes), .lower)) };
         }
         const result_raw = try std.json.Stringify.valueAlloc(a, result.value(), .{});
@@ -1871,13 +1871,13 @@ const ExportFixture = struct {
             "repository/support/apps/wamr-aot/build/image-identity.json",
         };
         for (source_paths, 0..) |path, i|
-            try self.put(try std.fmt.allocPrint(a, "source/{s}", .{path}), try std.fmt.allocPrint(a, "{s}\x00\xff\n", .{layout.artifact_names_v2[i]}));
+            try self.put(try a.print("source/{s}", .{path}), try a.print("{s}\x00\xff\n", .{layout.artifact_names_v2[i]}));
         if (cleanup_complete) try self.put("source/runtime/evidence/runtime-cleanup.txt", "primary=0 cleanup=0\n");
         try self.put("source/runtime/inputs/tool", "fixture-tool\x00\xff\n");
         try self.put("source/runtime/inputs/tree/data", "fixture-tree-data\n");
         for (profile.production_modes) |mode| {
             inline for (.{ "serial", "request", "report" }) |part|
-                try self.put(try std.fmt.allocPrint(a, "source/runtime/compute/boot-{s}/{s}", .{ @tagName(mode), if (std.mem.eql(u8, part, "serial")) "hyperv-efi-boot.log" else part ++ ".json" }), try fixtureJson(a, .{ .mode = @tagName(mode), .part = part }));
+                try self.put(try a.print("source/runtime/compute/boot-{s}/{s}", .{ @tagName(mode), if (std.mem.eql(u8, part, "serial")) "hyperv-efi-boot.log" else part ++ ".json" }), try fixtureJson(a, .{ .mode = @tagName(mode), .part = part }));
         }
         var accepted = try self.capture();
         defer accepted.deinit();
@@ -1971,7 +1971,7 @@ const CopyFixture = struct {
         var parent = try fixture_root.openDir(io, "handoff-export-tests", .{ .iterate = true });
         defer parent.close(io);
         copy_fixture_counter += 1;
-        const leaf = try std.fmt.allocPrint(a, "{s}-{d}-{d}", .{ label, std.os.linux.getpid(), copy_fixture_counter });
+        const leaf = try a.print("{s}-{d}-{d}", .{ label, std.os.linux.getpid(), copy_fixture_counter });
         defer a.free(leaf);
         try parent.createDir(io, leaf, .fromMode(0o700));
         const rel_path = try std.fs.path.join(a, &.{ test_options.fixture_root, "handoff-export-tests", leaf });

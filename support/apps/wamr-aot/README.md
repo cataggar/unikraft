@@ -15,7 +15,7 @@ compiler-free image; all current application modes produce **no benchmark score*
 
 ## Build the actual EFI image
 
-Use Zig **0.16.0**, Make, Bison/Flex (including their usual `yacc`/`lex`
+Use Zig **0.17.0**, Make, Bison/Flex (including their usual `yacc`/`lex`
 names), M4, Bash, LLVM binary tools, and Python 3 for the still-native
 Make graph and separate log validators. Python does **not** prepare or
 verify artifacts, solve the config, or build the native image. From a
@@ -26,7 +26,7 @@ umask 077
 tool_root="$PWD/support/apps/wamr-aot/build/tool"
 test ! -e "$tool_root"
 zig build --build-file support/apps/wamr-aot/build.zig \
-  --prefix "$tool_root" -Doptimize=ReleaseSafe install
+  --prefix "$tool_root" -Doptimize=safe install
 tool="$tool_root/bin/uk-wamr-aot-build"
 "$tool" prepare --repository "$PWD" --source /path/to/wamr
 "$tool" verify --repository "$PWD"
@@ -62,7 +62,7 @@ native boot, hardware or measurement qualification.
 
 The integration archive explicitly uses x86_64 SysV, PIC, no red zone,
 stack protector, stack checking, unwind tables, libc, or error tracing, and
-single-threaded Zig support. ReleaseSafe checks remain enabled. The wrapper
+single-threaded Zig support. Safe-mode checks remain enabled. The wrapper
 records the actual required native-link properties:
 
 * **PIC** is necessary for Unikraft's EFI PIE link; non-PIC absolute 32-bit
@@ -339,7 +339,8 @@ the private serial record with the installed native validator:
 
 ```sh
 zig build --build-file support/apps/wamr-aot/validator.build.zig \
-  --prefix "$PWD/.d/wamr-validator" -Doptimize=ReleaseSafe install
+  --cache-dir "$PWD/.d/wamr-validator-cache" \
+  --prefix "$PWD/.d/wamr-validator" -Doptimize=safe install
 "$PWD/.d/wamr-validator/bin/uk-wamr-log-validate" tiny \
   --log /private/attempt/hyperv-efi-boot.log \
   --identity support/apps/wamr-aot/build/artifacts/identity.json \
@@ -394,7 +395,8 @@ tiny-only serial scope. Run synthetic unit/property/fault, C oracle and native
 CLI integration fixtures without building or booting an image:
 
 ```sh
-zig build --build-file support/apps/wamr-aot/validator.build.zig -Doptimize=ReleaseSafe test
+zig build --build-file support/apps/wamr-aot/validator.build.zig \
+  --cache-dir "$PWD/.d/wamr-validator-cache" -Doptimize=safe test
 ```
 
 The native golden and property cases cover the former parser mutation matrices;

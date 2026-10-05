@@ -28,7 +28,7 @@ fn run(init: std.process.Init) !void {
         ),
         .olddefconfig, .native_images => {
             const executable: [:0]u8 = if (init.environ_map.get("WAMR_CI_EXECUTABLE_PATH")) |path|
-                try init.gpa.dupeZ(u8, path)
+                try init.gpa.dupeSentinel(u8, path, 0)
             else
                 try std.Io.Dir.cwd().realPathFileAlloc(
                     init.io,

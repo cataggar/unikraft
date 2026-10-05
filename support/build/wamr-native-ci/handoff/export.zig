@@ -281,7 +281,7 @@ const Attempt = struct {
     fn journal(self: *Attempt, phase: Phase, terminal: ?Terminal) !void {
         if (self.private_lock == null or self.private_anchor == null) return;
         try copy.verifyRetained(self.invocation.io, &self.private_anchor.?);
-        const name = try std.fmt.allocPrint(self.a(), "{s}-{s}.json", .{
+        const name = try self.a().print("{s}-{s}.json", .{
             if (terminal != null) "failed" else "phase", @tagName(phase),
         });
         const bytes = try canonical(self.a(), .{
@@ -331,7 +331,7 @@ const Attempt = struct {
         self.evidence = try self.a().alloc(Member, layout.evidence_v2.len);
         for (layout.artifact_names_v2, 0..) |name, i| {
             const role = if (std.mem.eql(u8, name, "build")) accepted_run.ArtifactRole.build_record else std.meta.stringToEnum(accepted_run.ArtifactRole, name) orelse return error.UnknownArtifactRole;
-            const relative = try std.fmt.allocPrint(self.a(), "artifacts/{s}", .{name});
+            const relative = try self.a().print("artifacts/{s}", .{name});
             const retained = if (role == .cleanup)
                 try accepted.pinExportCleanup()
             else
@@ -341,13 +341,13 @@ const Attempt = struct {
         for (controller.profile.modes(accepted.compatibility), 0..) |mode, i| {
             self.boots[i].mode = @tagName(mode);
             inline for (.{ "serial", "request", "report", "compute" }) |part| {
-                const relative = try std.fmt.allocPrint(self.a(), "boots/{s}/{s}", .{ @tagName(mode), part });
+                const relative = try self.a().print("boots/{s}/{s}", .{ @tagName(mode), part });
                 const retained = try accepted.pinBoot(mode, @field(accepted_run.BootRole, part));
                 try self.addSource(retained, .boots_copied, relative, &@field(self.boots[i], part), if (std.mem.eql(u8, part, "serial")) layout.max_serial_bytes else layout.max_json_bytes);
             }
         }
         for (layout.evidence_v2, 0..) |name, i| {
-            const relative = try std.fmt.allocPrint(self.a(), "evidence/{s}", .{name});
+            const relative = try self.a().print("evidence/{s}", .{name});
             const retained = try accepted.pinRecord(name);
             try self.addSource(retained, .evidence_copied, relative, &self.evidence[i], layout.max_json_bytes);
         }
@@ -438,7 +438,7 @@ const Attempt = struct {
     fn sealDirectories(self: *Attempt) !void {
         for ([_][]const u8{ "artifacts", "boots", "evidence" }) |relative| try self.sealDirectory(relative);
         for (profile.production_modes) |mode|
-            try self.sealDirectory(try std.fmt.allocPrint(self.a(), "boots/{s}", .{@tagName(mode)}));
+            try self.sealDirectory(try self.a().print("boots/{s}", .{@tagName(mode)}));
         self.sealed_root = try copy.directorySnapshot(self.output.?.dir);
     }
     fn sealDirectory(self: *Attempt, relative: []const u8) !void {
@@ -762,16 +762,16 @@ pub const Test = if (builtin.is_test) struct {
     pub fn buildRootBoundBundleV2(a: std.mem.Allocator, root: []const u8, sha256: []const u8) ![]const u8 {
         const artifacts = try a.alloc(Member, layout.artifact_names_v2.len);
         for (layout.artifact_names_v2, 0..) |name, i|
-            artifacts[i] = try fixtureMember(a, root, try std.fmt.allocPrint(a, "artifacts/{s}", .{name}), sha256);
+            artifacts[i] = try fixtureMember(a, root, try a.print("artifacts/{s}", .{name}), sha256);
         const boots = try a.alloc(Boot, profile.production_modes.len);
         for (profile.production_modes, 0..) |mode, i| {
             boots[i].mode = @tagName(mode);
             inline for (.{ "serial", "request", "report", "compute" }) |part|
-                @field(boots[i], part) = try fixtureMember(a, root, try std.fmt.allocPrint(a, "boots/{s}/{s}", .{ @tagName(mode), part }), sha256);
+                @field(boots[i], part) = try fixtureMember(a, root, try a.print("boots/{s}/{s}", .{ @tagName(mode), part }), sha256);
         }
         const evidence = try a.alloc(Member, layout.evidence_v2.len);
         for (layout.evidence_v2, 0..) |name, i|
-            evidence[i] = try fixtureMember(a, root, try std.fmt.allocPrint(a, "evidence/{s}", .{name}), sha256);
+            evidence[i] = try fixtureMember(a, root, try a.print("evidence/{s}", .{name}), sha256);
         return buildBundleBytes(a, "0123456789012345678901234567890123456789", "0123456789012345678901234567890123456789", "1", "1", artifacts, boots, evidence);
     }
     fn fixtureMember(a: std.mem.Allocator, root: []const u8, relative: []const u8, sha256: []const u8) !Member {

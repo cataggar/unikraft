@@ -79,7 +79,7 @@ fn addRuntime(
         allocator.free(paths);
     }
     for (paths) |path| {
-        const role = try std.fmt.allocPrint(allocator, "runtime:{s}", .{path});
+        const role = try allocator.print("runtime:{s}", .{path});
         if (!allowed.contains(role)) try addRole(allowed, role);
     }
 }
@@ -112,7 +112,7 @@ fn buildRoles(
     defer allowed.deinit();
     for (inputs.host_tools) |name| {
         try notCancelled(signal);
-        const role = try std.fmt.allocPrint(allocator, "tool:{s}", .{name});
+        const role = try allocator.print("tool:{s}", .{name});
         try addRole(&allowed, role);
         const entry = try get(files_map, role);
         if (!std.mem.eql(u8, try contracts.string(try get(entry, "sha256")), try contracts.string(try get(tools, name))))

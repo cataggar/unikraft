@@ -116,10 +116,10 @@ pub fn verifyGitSource(
     const tree_ref = try std.mem.concat(a, u8, &.{ identity.revision, "^{tree}" });
     try notCancelled(signal);
     const commit = try source.gitOutput(a, io, repository, git, &.{ "rev-parse", "--verify", revision_ref }, 65, null);
-    try same(commit, try std.fmt.allocPrint(a, "{s}\n", .{identity.revision}));
+    try same(commit, try a.print("{s}\n", .{identity.revision}));
     try notCancelled(signal);
     const tree = try source.gitOutput(a, io, repository, git, &.{ "rev-parse", tree_ref }, 65, null);
-    try same(tree, try std.fmt.allocPrint(a, "{s}\n", .{identity.tree}));
+    try same(tree, try a.print("{s}\n", .{identity.tree}));
     for (records_map.object.keys(), records_map.object.values()) |name, value| {
         try notCancelled(signal);
         try @import("custody_limits.zig").relative(name, 256, 8);
@@ -316,7 +316,7 @@ pub fn run(
         .supervisor = supervisor_path,
         .package_tool = "",
         .validator = "",
-        .tools = @splat(""),
+        .tools = @as([inputs.host_tools.len][]const u8, @splat("")),
     };
     const outcome = try adapter.execute(allocator, io, .{
         .roots = roots,

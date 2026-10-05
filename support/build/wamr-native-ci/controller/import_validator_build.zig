@@ -286,7 +286,7 @@ pub fn runPortable(
         .validator = "",
         .direct_validator = local.validator,
         .bundle = candidate_path,
-        .tools = @splat(""),
+        .tools = @as([inputs.host_tools.len][]const u8, @splat("")),
     }, private, evidence, signal);
     try authenticated.verify(io, repository, local.git);
     try accepted.revalidateWithSignal(signal);
@@ -333,7 +333,7 @@ fn tool(
     name: []const u8,
     bound: usize,
 ) !Tool {
-    const role = try std.fmt.allocPrint(allocator, "tool:{s}", .{name});
+    const role = try allocator.print("tool:{s}", .{name});
     defer allocator.free(role);
     const record = try get(try get(try get(start, "consumer_inputs"), "files"), role);
     const path = try contracts.string(try get(record, "path"));
@@ -353,7 +353,7 @@ fn pinRecordedRuntime(
     path: []const u8,
     pinned: *std.ArrayList(RuntimePin),
 ) !void {
-    const role = try std.fmt.allocPrint(allocator, "runtime:{s}", .{path});
+    const role = try allocator.print("runtime:{s}", .{path});
     defer allocator.free(role);
     const identity = try recordedFile(io, start, role, path, 64 * limits.mib);
     const owned_path = try allocator.dupe(u8, path);
@@ -466,7 +466,7 @@ fn handoffCandidate(
         if (boot.* != .object or
             !std.mem.eql(u8, try contracts.string(try get(boot.*, "mode")), @tagName(mode)))
             return error.InvalidImportedBundle;
-        const prefix = try std.fmt.allocPrint(allocator, "boots/{s}/", .{@tagName(mode)});
+        const prefix = try allocator.print("boots/{s}/", .{@tagName(mode)});
         for ([_][]const u8{ "serial", "request", "report", "compute" }) |part| {
             const item = boot.object.getPtr(part) orelse return error.InvalidImportedBundle;
             try rebase(allocator, root, item, prefix);
@@ -521,7 +521,7 @@ fn validatedPostRun(
     stage: plan.Stage,
     expected_bytes: usize,
 ) !@import("command_validation.zig").ValidatedCommand {
-    const record_path = try std.fmt.allocPrint(allocator, "{s}/evidence/command-{s}.json", .{ output, @tagName(stage) });
+    const record_path = try allocator.print("{s}/evidence/command-{s}.json", .{ output, @tagName(stage) });
     const identity = try physical.readFile(io, record_path, records.max_record_bytes, true);
     var retained = try files.RetainedFile.open(io, record_path, .private);
     defer retained.close(io);
@@ -538,7 +538,7 @@ fn validatedPostRun(
         stage,
         .trusted_inner_zip,
     );
-    const log_path = try std.fmt.allocPrint(allocator, "{s}/private/{s}.log", .{ output, @tagName(stage) });
+    const log_path = try allocator.print("{s}/private/{s}.log", .{ output, @tagName(stage) });
     const log = try physical.readFile(io, log_path, plan.spec(stage).output_limit + 1, true);
     if (checked.output_bytes != expected_bytes or checked.output_bytes != log.bytes or
         !std.mem.eql(u8, &checked.output_sha256, &log.sha256))
@@ -671,7 +671,7 @@ pub fn run(
         try file.writeStreamingAll(io, candidate);
         try file.sync(io);
     }
-    var tools: [inputs.host_tools.len][]const u8 = @splat("");
+    var tools: [inputs.host_tools.len][]const u8 = @as([inputs.host_tools.len][]const u8, @splat(""));
     tools[0] = git.path;
     var roots = plan.Roots{
         .source_root = repository,

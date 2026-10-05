@@ -683,9 +683,9 @@ fn processEntry(
                 return error.InvalidHardLinkTarget;
             var parent = try createParentDirectories(io, root, name);
             defer parent.close(io);
-            const target_z = try allocator.dupeZ(u8, target);
+            const target_z = try allocator.dupeSentinel(u8, target, 0);
             defer allocator.free(target_z);
-            const name_z = try allocator.dupeZ(u8, parent.name);
+            const name_z = try allocator.dupeSentinel(u8, parent.name, 0);
             defer allocator.free(name_z);
             if (linux.errno(linux.linkat(
                 root.handle,

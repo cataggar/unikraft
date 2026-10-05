@@ -34,7 +34,7 @@ pub const Context = struct {
     bootstrap_files: []const inputs.Binding = &.{},
     bootstrap_trees: []const inputs.Binding = &.{},
     consumer: ?inputs.Production = null,
-    command_records: [std.meta.fields(plan.Stage).len]?physical.File = .{null} ** std.meta.fields(plan.Stage).len,
+    command_records: [@typeInfo(plan.Stage).@"enum".field_names.len]?physical.File = @as([@typeInfo(plan.Stage).@"enum".field_names.len]?physical.File, @splat(null)),
     build_start_record: ?physical.File = null,
     fixture_report: ?physical.File = null,
     test_before_publication: ?*const fn (*Context) void = null,
@@ -220,7 +220,7 @@ pub fn reserve(bound: RuntimeBound) !SlotsReserved {
     defer global.close(context.io);
     try global.createDir(context.io, "tmp", .fromMode(0o700));
     for (profile.production_modes) |mode| {
-        const name = try std.fmt.allocPrint(context.allocator, "boot-{s}", .{@tagName(mode)});
+        const name = try context.allocator.print("boot-{s}", .{@tagName(mode)});
         try work.dir.createDir(context.io, name, .fromMode(0o700));
     }
     try createSourceOutputs(context);
@@ -278,7 +278,7 @@ fn runBootstrap(context: *Context, stage: []const u8, argv: []const []const u8, 
     const combined = try std.mem.concat(context.allocator, u8, &.{ result.stdout, result.stderr });
     const log_dir = try contextDir(context, "private");
     defer log_dir.close(io);
-    try create(io, log_dir, try std.fmt.allocPrint(context.allocator, "{s}.log", .{stage}), combined[0..@min(combined.len, bound + 1)]);
+    try create(io, log_dir, try context.allocator.print("{s}.log", .{stage}), combined[0..@min(combined.len, bound + 1)]);
     if (!result.cleanup_complete or !result.executable_stable) return error.CleanupPoisoned;
     if (!result.succeeded() or combined.len > bound) return error.BootstrapCommandFailed;
     try requireBootstrapInputs(context);
@@ -291,7 +291,7 @@ fn freezeBootstrapInputs(context: *Context) !void {
     files_bound[0] = .{ .role = "command-supervisor", .path = context.roots.supervisor };
     files_bound[1] = .{ .role = "wamr-source-archive", .path = try join(context, &.{ context.runtime, "custody/wamr-source.tar" }) };
     for (inputs.host_tools, context.tools, 0..) |name, path, i|
-        files_bound[i + 2] = .{ .role = try std.fmt.allocPrint(a, "tool:{s}", .{name}), .path = path };
+        files_bound[i + 2] = .{ .role = try a.print("tool:{s}", .{name}), .path = path };
     const trees_bound = try a.alloc(inputs.Binding, 3);
     trees_bound[0] = .{ .role = "bison", .path = try join(context, &.{ context.runtime, "bison" }) };
     trees_bound[1] = .{ .role = "zig", .path = std.fs.path.dirname(context.roots.zig) orelse return error.UnsafePath };
@@ -342,12 +342,12 @@ fn restoreDependencies(context: *Context) !void {
     try work.createDir(io, "dependency-hash-cache", .fromMode(0o700));
     context.failed_operation = "verify-package-hashes";
     for (listing.packages, 0..) |package, index| {
-        const name = try std.fmt.allocPrint(a, "dependency-hash-{d:0>3}", .{index});
+        const name = try a.print("dependency-hash-{d:0>3}", .{index});
         const raw = try runBootstrap(context, name, &.{
             context.roots.zig,                             "fetch",                                         "--global-cache-dir",
             try subpath(context, "dependency-hash-cache"), try join(context, &.{ packages, package.name }),
         }, hash_work, 300, 511);
-        if (!std.mem.eql(u8, raw, try std.fmt.allocPrint(a, "{s}\n", .{package.name})))
+        if (!std.mem.eql(u8, raw, try a.print("{s}\n", .{package.name})))
             return error.PackageHashMismatch;
     }
     context.failed_operation = "record-dependencies";
@@ -406,8 +406,8 @@ fn runStage(state: anytype, selected: plan.Stage, check_consumer: bool) !void {
     });
     if (result.poisoned) return error.CleanupPoisoned;
     if (!result.accepted) return error.StageRefused;
-    const record_path = try subpath(context, try std.fmt.allocPrint(context.allocator, "evidence/command-{s}.json", .{@tagName(selected)}));
-    context.command_records[@intFromEnum(selected)] = try physical.readFile(context.io, record_path, limits.tracked_file, true);
+    const record_path = try subpath(context, try context.allocator.print("evidence/command-{s}.json", .{@tagName(selected)}));
+    context.command_records[@backingInt(selected)] = try physical.readFile(context.io, record_path, limits.tracked_file, true);
     try requireBuildEvidence(context);
     try requireSource(context);
     try dependencies.requireDocument(context.allocator, context.io, context.repository, context.git, context.compute, context.dependency.?);
@@ -418,7 +418,7 @@ pub fn requireBuildEvidence(context: *Context) !void {
     for (std.enums.values(plan.Stage), context.command_records) |stage, expected| {
         try cancelled(context);
         const recorded = expected orelse continue;
-        const relative = try std.fmt.allocPrint(context.allocator, "evidence/command-{s}.json", .{@tagName(stage)});
+        const relative = try context.allocator.print("evidence/command-{s}.json", .{@tagName(stage)});
         defer context.allocator.free(relative);
         const path = try subpath(context, relative);
         defer context.allocator.free(path);
@@ -543,9 +543,9 @@ const MapEntry = struct { name: []const u8, file: physical.File };
 
 fn guardedMap(a: std.mem.Allocator, domain: []const u8, sorted: []const MapEntry) !Map {
     var content = Sha256.init(.{});
-    content.update(try std.fmt.allocPrint(a, "{s}-content\x00", .{domain}));
+    content.update(try a.print("{s}-content\x00", .{domain}));
     var physical_hash = Sha256.init(.{});
-    physical_hash.update(try std.fmt.allocPrint(a, "{s}-physical\x00", .{domain}));
+    physical_hash.update(try a.print("{s}-physical\x00", .{domain}));
     var result = std.json.Value{ .object = .empty };
     var total: usize = 0;
     for (sorted) |entry| {
@@ -582,7 +582,7 @@ fn supervisorRuntimeMap(a: std.mem.Allocator, io: std.Io, supervisor: []const u8
     try entries.append(a, .{ .name = "executable", .file = binary });
     const runtime_paths = try inputs.executableRuntimePaths(a, io, supervisor);
     for (runtime_paths) |path| {
-        const role = try std.fmt.allocPrint(a, "runtime:{s}", .{path});
+        const role = try a.print("runtime:{s}", .{path});
         try entries.append(a, .{ .name = role, .file = try physical.readFile(io, path, limits.tracked_file, false) });
     }
     return guardedMap(a, "uk.wamr.command-supervisor-runtime-v1", entries.items);
@@ -628,16 +628,28 @@ fn verifyRuntimeIdentity(context: *Context) !void {
 }
 
 pub fn admitPreparedIdentity(value: std.json.Value) !void {
+    return admitIdentity(value, "0.17.0", limits.wamr_revision);
+}
+
+pub fn admitImportedIdentity(value: std.json.Value) !void {
+    if (value != .object) return error.InvalidProducer;
+    const version = try core.contracts.string(value.object.get("zig_version") orelse return error.InvalidProducer);
+    if (std.mem.eql(u8, version, "0.16.0"))
+        return admitIdentity(value, "0.16.0", limits.historical_wamr_revision);
+    return admitPreparedIdentity(value);
+}
+
+fn admitIdentity(value: std.json.Value, zig_version: []const u8, wamr_revision: []const u8) !void {
     if (value != .object) return error.InvalidProducer;
     const object = value.object;
     const revision = try core.contracts.string(object.get("wamr_revision") orelse return error.InvalidProducer);
     const jit = object.get("jit_mode") orelse std.json.Value.null;
     const development = object.get("development_only") orelse std.json.Value{ .bool = false };
     const wasi = object.get("minimal_wasi") orelse return error.InvalidProducer;
-    if (!std.mem.eql(u8, revision, limits.wamr_revision) or
+    if (!std.mem.eql(u8, revision, wamr_revision) or
         !std.mem.eql(u8, try core.contracts.string(object.get("variant") orelse std.json.Value{ .string = "tiny" }), "tiny") or
         !std.mem.eql(u8, try core.contracts.string(object.get("compiler_profile") orelse return error.InvalidProducer), "unikraft-x86_64") or
-        !std.mem.eql(u8, try core.contracts.string(object.get("zig_version") orelse return error.InvalidProducer), "0.16.0") or
+        !std.mem.eql(u8, try core.contracts.string(object.get("zig_version") orelse return error.InvalidProducer), zig_version) or
         jit != .null)
         return error.InvalidProducer;
     if (development != .bool or development.bool or wasi != .bool or wasi.bool)
@@ -797,7 +809,7 @@ pub fn loadAccepted(context: *Context) !void {
     const selected = consumer.object.get("files") orelse return error.InvalidInputCustody;
     if (selected != .object) return error.InvalidInputCustody;
     for (inputs.host_tools, 0..) |name, index| {
-        const role = try std.fmt.allocPrint(a, "tool:{s}", .{name});
+        const role = try a.print("tool:{s}", .{name});
         const record = selected.object.get(role) orelse return error.MissingTool;
         if (record != .object) return error.InvalidInputCustody;
         context.tools[index] = try a.dupe(u8, try core.contracts.string(record.object.get("path") orelse return error.MissingTool));
@@ -833,7 +845,7 @@ pub fn loadAccepted(context: *Context) !void {
     if (!std.mem.eql(u8, expected, canonical)) return error.BuildStartChanged;
     context.build_start_record = try physical.readFile(io, try subpath(context, "evidence/build-start.json"), limits.tracked_file, true);
     for ([_]plan.Stage{ .adapter, .@"local-boot-tool", .fixtures, .prepare, .config, .@"native-image" }) |stage| {
-        const name = try std.fmt.allocPrint(a, "evidence/command-{s}.json", .{@tagName(stage)});
+        const name = try a.print("evidence/command-{s}.json", .{@tagName(stage)});
         const path = try subpath(context, name);
         const raw = try read(context, path, records.max_record_bytes, true);
         const command = try core.contracts.Document.parse(a, raw, .{ .bytes = records.max_record_bytes });
@@ -844,7 +856,7 @@ pub fn loadAccepted(context: *Context) !void {
         if (!std.mem.eql(u8, try core.contracts.string(object.get("stage") orelse return error.InvalidCommand), @tagName(stage)) or
             try core.contracts.integer(i32, object.get("exit_code") orelse return error.InvalidCommand) != 0)
             return error.BuildStageRefused;
-        context.command_records[@intFromEnum(stage)] = try physical.readFile(io, path, limits.tracked_file, true);
+        context.command_records[@backingInt(stage)] = try physical.readFile(io, path, limits.tracked_file, true);
     }
     try revalidateAccepted(context);
 }

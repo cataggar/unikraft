@@ -126,8 +126,7 @@ test "native prepare and verify cover every variant with create-only output" {
         const library = if (case.coremark)
             "fixture-library variant=tiny coremark=true\n"
         else
-            try std.fmt.allocPrint(
-                allocator,
+            try allocator.print(
                 "fixture-library variant={s} coremark=false\n",
                 .{case.variant},
             );
@@ -628,8 +627,7 @@ test "native image commands preserve config plans identities and failed publicat
     const log_bytes = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
     defer allocator.free(log_bytes);
     try testing.expect(std.mem.indexOf(u8, log_bytes, "--print-datadir") != null);
-    const root_argv = try std.fmt.allocPrint(
-        allocator,
+    const root_argv = try allocator.print(
         "{s}\tbuild\tnative-images\t-j2\t--cache-dir\t{s}/zig_local_cache\t--global-cache-dir\t{s}/zig_global_cache",
         .{ fixture, root_state, root_state },
     );
@@ -641,7 +639,7 @@ test "native image commands preserve config plans identities and failed publicat
     const root_line_start_index = if (std.mem.lastIndexOfScalar(u8, root_line, '\n')) |index| index + 1 else 0;
     var root_fields = std.mem.splitScalar(u8, root_line[root_line_start_index..], '\t');
     try testing.expectEqualStrings(repository, root_fields.next().?);
-    const expected_tmp = try std.fmt.allocPrint(allocator, "{s}/tmp", .{root_state});
+    const expected_tmp = try allocator.print("{s}/tmp", .{root_state});
     defer allocator.free(expected_tmp);
     try testing.expectEqualStrings(expected_tmp, root_fields.next().?);
     inline for (0..5) |_| try testing.expectEqualStrings("", root_fields.next().?);
@@ -721,8 +719,7 @@ test "native image commands reject config runtime and application mutation" {
     inline for (.{ "config", "runtime", "application" }) |mutation| {
         const repository = try imageRepository(&temporary, mutation);
         defer allocator.free(repository);
-        const log_name = try std.fmt.allocPrint(
-            allocator,
+        const log_name = try allocator.print(
             "{s}.log",
             .{mutation},
         );
@@ -827,8 +824,7 @@ test "native config refuses a supplied executable that differs from the running 
         fixture,
     );
     defer wrong.close(allocator, io);
-    const retained_path = try std.fmt.allocPrint(
-        allocator,
+    const retained_path = try allocator.print(
         "/proc/{d}/fd/{d}",
         .{ linux.getpid(), wrong.executable.file.handle },
     );
@@ -904,8 +900,7 @@ test "native config binds a supervisor snapshot to its retained physical executa
         cli,
     );
     defer tool.close(allocator, io);
-    const retained_path = try std.fmt.allocPrint(
-        allocator,
+    const retained_path = try allocator.print(
         "/proc/{d}/fd/{d}",
         .{ linux.getpid(), tool.executable.file.handle },
     );
@@ -1388,8 +1383,7 @@ fn fixtureEnvironment(fixture: []const u8) !std.process.Environ.Map {
 }
 
 fn fixtureRepository(temporary: *testing.TmpDir, name: []const u8) ![:0]u8 {
-    const relative = try std.fmt.allocPrint(
-        allocator,
+    const relative = try allocator.print(
         "{s}/support/apps/wamr-aot",
         .{name},
     );
@@ -1422,8 +1416,7 @@ fn fixtureRepository(temporary: *testing.TmpDir, name: []const u8) ![:0]u8 {
 }
 
 fn imageRepository(temporary: *testing.TmpDir, name: []const u8) ![:0]u8 {
-    const relative = try std.fmt.allocPrint(
-        allocator,
+    const relative = try allocator.print(
         "{s}/support/apps/wamr-aot",
         .{name},
     );
@@ -1660,9 +1653,9 @@ fn tamperRefusals(
         &.{ repository, "support/apps/wamr-aot/build/artifacts/identity-link.json" },
     );
     defer allocator.free(identity_link);
-    const identity_z = try allocator.dupeZ(u8, identity_path);
+    const identity_z = try allocator.dupeSentinel(u8, identity_path, 0);
     defer allocator.free(identity_z);
-    const link_z = try allocator.dupeZ(u8, identity_link);
+    const link_z = try allocator.dupeSentinel(u8, identity_link, 0);
     defer allocator.free(link_z);
     if (linux.errno(linux.linkat(
         linux.AT.FDCWD,
@@ -1789,7 +1782,7 @@ const Tar = struct {
     }
 
     fn entry(self: *Tar, name: []const u8, contents: []const u8) !void {
-        var header: [512]u8 = [_]u8{0} ** 512;
+        var header: [512]u8 = @as([512]u8, @splat(0));
         if (name.len > 100) return error.FixturePathTooLong;
         @memcpy(header[0..name.len], name);
         putOctal(header[100..108], 0o644);

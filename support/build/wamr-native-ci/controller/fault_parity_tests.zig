@@ -27,7 +27,7 @@ const Fixture = struct {
             return error.UnsafeFixtureRoot;
         const parent = try core.private_files.openDirectory(io, base, .private);
         errdefer parent.close(io);
-        const name = try std.fmt.allocPrint(a, "controller-fault-parity-{s}-{d}", .{ label, linux.getpid() });
+        const name = try a.print("controller-fault-parity-{s}-{d}", .{ label, linux.getpid() });
         errdefer a.free(name);
         try parent.createDir(io, name, .fromMode(0o700));
         errdefer parent.deleteTree(io, name) catch {};
@@ -229,17 +229,16 @@ test "only pinned Zig and LLVM roles admit large executables under retained cust
     var fixture = try Fixture.init("zig-tool-bound");
     defer fixture.deinit();
     const file = try fixture.root.createFile(io, "zig", .{
-        .exclusive = true, .permissions = .fromMode(0o700),
+        .exclusive = true,
+        .permissions = .fromMode(0o700),
     });
     defer file.close(io);
     const path = try fixture.child("zig");
     defer a.free(path);
     if (linux.errno(linux.ftruncate(file.handle, 65 * 1024 * 1024)) != .SUCCESS)
         return error.FixtureTruncateFailed;
-    try std.testing.expectError(error.UnsafeFile,
-        controller.command_adapter.openPinnedTool(io, path, "tool:git"));
-    try std.testing.expectError(error.UnsafeFile,
-        controller.command_adapter.openPinnedTool(io, path, "tool:llvm-other"));
+    try std.testing.expectError(error.UnsafeFile, controller.command_adapter.openPinnedTool(io, path, "tool:git"));
+    try std.testing.expectError(error.UnsafeFile, controller.command_adapter.openPinnedTool(io, path, "tool:llvm-other"));
     var retained = try controller.command_adapter.openPinnedTool(io, path, "tool:zig");
     defer retained.close(io);
     try retained.verify(io);
@@ -248,15 +247,12 @@ test "only pinned Zig and LLVM roles admit large executables under retained cust
     try llvm.verify(io);
 
     try chmod(file, 0o722);
-    try std.testing.expectError(error.UnsafeFile,
-        controller.command_adapter.openPinnedTool(io, path, "tool:zig"));
+    try std.testing.expectError(error.UnsafeFile, controller.command_adapter.openPinnedTool(io, path, "tool:zig"));
     try chmod(file, 0o700);
     if (linux.errno(linux.ftruncate(file.handle, 256 * 1024 * 1024 + 1)) != .SUCCESS)
         return error.FixtureTruncateFailed;
-    try std.testing.expectError(error.UnsafeFile,
-        controller.command_adapter.openPinnedTool(io, path, "tool:zig"));
-    try std.testing.expectError(error.UnsafeFile,
-        controller.command_adapter.openPinnedTool(io, path, "tool:llvm-objdump"));
+    try std.testing.expectError(error.UnsafeFile, controller.command_adapter.openPinnedTool(io, path, "tool:zig"));
+    try std.testing.expectError(error.UnsafeFile, controller.command_adapter.openPinnedTool(io, path, "tool:llvm-objdump"));
 }
 
 test "consumer tree permits a directory alias inside its root but refuses external directory" {
@@ -346,8 +342,7 @@ test "pinned package custody accepts writable archive members only beneath its p
     defer admitted.deinit(a);
     try controller.dependency_custody.requireSame(a, io, path, admitted);
     try chmod(source, 0o600);
-    try std.testing.expectError(error.DependencyChanged,
-        controller.dependency_custody.requireSame(a, io, path, admitted));
+    try std.testing.expectError(error.DependencyChanged, controller.dependency_custody.requireSame(a, io, path, admitted));
     try chmod(.{ .handle = packages.handle, .flags = .{ .nonblocking = false } }, 0o755);
     try expectPackageError(path, error.UnsafeFile);
 }
@@ -357,8 +352,7 @@ test "empty package dependencies do not unpin the root manifest" {
     const hashes = try controller.dependency_custody.packageDependencies(a, manifest);
     defer a.free(hashes);
     try std.testing.expectEqual(@as(usize, 0), hashes.len);
-    try std.testing.expectError(error.UnpinnedDependency,
-        controller.dependency_custody.pinnedManifest(a, manifest));
+    try std.testing.expectError(error.UnpinnedDependency, controller.dependency_custody.pinnedManifest(a, manifest));
 }
 
 test "identical-content package root replacement breaks retained physical dependency custody" {
@@ -444,7 +438,7 @@ test "dependency record refuses same-byte restore manifest copy replacement" {
     defer entry.close(io);
     try package(entry);
     try write(private, "dependency-restore.log", "restored\n", 0o600);
-    const hash = try std.fmt.allocPrint(a, "{s}\n", .{miz});
+    const hash = try a.print("{s}\n", .{miz});
     defer a.free(hash);
     try write(private, "dependency-hash-000.log", hash, 0o600);
     const compute_path = try fixture.child("compute");
@@ -512,7 +506,7 @@ test "pre-spawn timeout and cancellation leave no command or cleanup events" {
     defer environment.deinit();
     const cancelled = std.atomic.Value(bool).init(true);
     try core.process.initialize();
-    for ([_]struct { kind: std.meta.Tag(core.process.CommandPrimary), cancel: bool }{
+    for ([_]struct { kind: @typeInfo(core.process.CommandPrimary).@"union".tag_type.?, cancel: bool }{
         .{ .kind = .timeout, .cancel = false },
         .{ .kind = .cancelled, .cancel = true },
     }) |scenario| {
@@ -556,20 +550,20 @@ fn descendantFixture(fixture: Fixture) ![]u8 {
     defer a.free(local_cache);
     const global_cache = try fixture.child("global-cache");
     defer a.free(global_cache);
-    const emit = try std.fmt.allocPrint(a, "-femit-bin={s}", .{binary});
+    const emit = try a.print("-femit-bin={s}", .{binary});
     defer a.free(emit);
-    const module = try std.fmt.allocPrint(a, "-Mroot={s}", .{source});
+    const module = try a.print("-Mroot={s}", .{source});
     defer a.free(module);
-    const core_module = try std.fmt.allocPrint(a, "-Mhyperv_core={s}", .{core_source});
+    const core_module = try a.print("-Mhyperv_core={s}", .{core_source});
     defer a.free(core_module);
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(a);
     try argv.appendSlice(a, &.{
-        options.zig_executable, "build-exe", "-O",                 "ReleaseSafe",
+        options.zig_executable, "build-exe", "-O",                 "safe",
         "--cache-dir",          local_cache, "--global-cache-dir", global_cache,
         emit,
     });
-    if (@import("builtin").cpu.arch == .x86_64) try argv.append(a, assembly);
+    if (@import("builtin").target.cpu.arch == .x86_64) try argv.append(a, assembly);
     try argv.appendSlice(a, &.{ "--dep", "hyperv_core", module, core_module });
     var environment = std.process.Environ.Map.init(a);
     defer environment.deinit();
@@ -625,7 +619,7 @@ fn expectGone(bytes: []const u8, allow_partial: bool, minimum: usize) !void {
         if (line.len == 0) continue;
         const pid = try std.fmt.parseInt(linux.pid_t, line, 10);
         if (pid <= 1) return error.InvalidDescendantPid;
-        try std.testing.expectEqual(linux.E.SRCH, linux.errno(linux.kill(pid, @enumFromInt(0))));
+        try std.testing.expectEqual(linux.E.SRCH, linux.errno(linux.kill(pid, @fromBackingInt(@intCast(0)))));
         count += 1;
     }
     try std.testing.expect(count >= minimum);

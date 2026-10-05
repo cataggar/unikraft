@@ -224,7 +224,7 @@ fn run(init: std.process.Init) !void {
             return;
         };
         retained_count += 1;
-        const retained_path = std.fmt.allocPrint(
+        const retained_path = std.mem.Allocator.print(
             allocator,
             "/proc/{d}/fd/{d}",
             .{ std.os.linux.getpid(), retained[index].file.handle },
@@ -249,7 +249,7 @@ fn run(init: std.process.Init) !void {
         return;
     };
     defer executable.close(init.io);
-    const executable_path = std.fmt.allocPrint(
+    const executable_path = std.mem.Allocator.print(
         allocator,
         "/proc/{d}/fd/{d}",
         .{ std.os.linux.getpid(), executable.file.handle },
@@ -371,7 +371,7 @@ fn launchRetained(
 ) !void {
     const path = init.environ_map.get(launch_executable_environment) orelse
         return error.InvalidLaunch;
-    const prefix = try std.fmt.allocPrint(
+    const prefix = try std.mem.Allocator.print(
         allocator,
         "/proc/{d}/fd/",
         .{std.os.linux.getppid()},
@@ -380,7 +380,7 @@ fn launchRetained(
         return error.InvalidLaunch;
     for (path[prefix.len..]) |byte| if (!std.ascii.isDigit(byte))
         return error.InvalidLaunch;
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     const opened = std.os.linux.openat(
         std.os.linux.AT.FDCWD,
         path_z,
@@ -412,7 +412,7 @@ fn launchRetained(
         null,
     );
     for (args, 0..) |argument, index|
-        pointers[index] = (try allocator.dupeZ(u8, argument)).ptr;
+        pointers[index] = (try allocator.dupeSentinel(u8, argument, 0)).ptr;
     _ = std.os.linux.execveat(
         descriptor,
         "",
@@ -524,7 +524,7 @@ fn executableIdentity(
 fn primary(value: process.CommandPrimary) Primary {
     return switch (value) {
         .exited => |code| .{ .kind = "exited", .code = code },
-        .signal => |signal| .{ .kind = "signal", .code = @intFromEnum(signal) },
+        .signal => |signal| .{ .kind = "signal", .code = @backingInt(signal) },
         .unknown => |status| .{ .kind = "unknown", .code = status },
         inline else => |_, tag| .{ .kind = @tagName(tag) },
     };
@@ -533,8 +533,8 @@ fn primary(value: process.CommandPrimary) Primary {
 fn termination(value: ?std.process.Child.Term) Termination {
     return if (value) |term| switch (term) {
         .exited => |code| .{ .kind = "exited", .code = code },
-        .signal => |signal| .{ .kind = "signal", .code = @intFromEnum(signal) },
-        .stopped => |signal| .{ .kind = "stopped", .code = @intFromEnum(signal) },
+        .signal => |signal| .{ .kind = "signal", .code = @backingInt(signal) },
+        .stopped => |signal| .{ .kind = "stopped", .code = @backingInt(signal) },
         .unknown => |status| .{ .kind = "unknown", .code = status },
     } else .{};
 }

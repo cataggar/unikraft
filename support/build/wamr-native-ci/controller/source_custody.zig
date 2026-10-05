@@ -321,7 +321,7 @@ const TrackedLinks = struct {
         defer allocator.free(listed);
         if (listed.len != expected_bytes or listed[listed.len - 1] != 0)
             return error.IgnoredLinkEscapesRole;
-        var seen = std.StaticBitSet(64).initEmpty();
+        var seen: std.StaticBitSet(64) = .empty;
         var entries = std.mem.splitScalar(u8, listed[0 .. listed.len - 1], 0);
         while (entries.next()) |entry| {
             var matched: ?usize = null;
@@ -407,7 +407,7 @@ fn inspectOutput(
             }
         }.less);
         for (names.items) |name| {
-            const child = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ relative, name });
+            const child = try allocator.print("{s}/{s}", .{ relative, name });
             defer allocator.free(child);
             try inspectOutput(allocator, io, repo, git, role, child, state, hash, tracked_links, allow_missing_roots);
         }
@@ -589,7 +589,7 @@ fn trackedFile(
         try retained.verify(io);
     }
     defer allocator.free(raw);
-    const header = try std.fmt.allocPrint(allocator, "blob {d}\x00", .{raw.len});
+    const header = try allocator.print("blob {d}\x00", .{raw.len});
     defer allocator.free(header);
     if (std.mem.eql(u8, format, "sha1")) {
         var hash = std.crypto.hash.Sha1.init(.{});
@@ -739,7 +739,7 @@ fn sealRevisionWithLimit(allocator: std.mem.Allocator, io: std.Io, checkout: []c
     const head = try gitLine(allocator, io, checkout, git, &.{ "rev-parse", "HEAD" });
     defer allocator.free(head);
     if (!std.mem.eql(u8, head, pinned)) return error.UnpinnedSource;
-    const reference = try std.fmt.allocPrint(allocator, "{s}^{{commit}}", .{pinned});
+    const reference = try allocator.print("{s}^{{commit}}", .{pinned});
     defer allocator.free(reference);
     const revision = try gitLine(allocator, io, checkout, git, &.{ "rev-parse", "--verify", reference });
     defer allocator.free(revision);
@@ -938,13 +938,13 @@ pub fn metadataChanges(allocator: std.mem.Allocator, before: []const MetadataEnt
         current.deinit();
     }
     for (before) |item| {
-        const key = try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ item.kind, item.path });
+        const key = try allocator.print("{s}\x00{s}", .{ item.kind, item.path });
         errdefer allocator.free(key);
         if (originals.contains(key)) return error.InvalidMetadataBaseline;
         try originals.put(key, item.metadata);
     }
     for (after) |item| {
-        const key = try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ item.kind, item.path });
+        const key = try allocator.print("{s}\x00{s}", .{ item.kind, item.path });
         errdefer allocator.free(key);
         if (current.contains(key)) return error.InvalidMetadataBaseline;
         try current.put(key, item.metadata);
@@ -952,7 +952,7 @@ pub fn metadataChanges(allocator: std.mem.Allocator, before: []const MetadataEnt
     var changes: std.ArrayList(MetadataChange) = .empty;
     defer changes.deinit(allocator);
     for (before) |original| {
-        const key = try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ original.kind, original.path });
+        const key = try allocator.print("{s}\x00{s}", .{ original.kind, original.path });
         defer allocator.free(key);
         const replacement = current.get(key);
         if (replacement) |snapshot| if (std.meta.eql(original.metadata, snapshot)) continue;
@@ -964,7 +964,7 @@ pub fn metadataChanges(allocator: std.mem.Allocator, before: []const MetadataEnt
         });
     }
     for (after) |item| {
-        const key = try std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ item.kind, item.path });
+        const key = try allocator.print("{s}\x00{s}", .{ item.kind, item.path });
         defer allocator.free(key);
         if (!originals.contains(key)) {
             try changes.append(allocator, .{

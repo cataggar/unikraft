@@ -52,26 +52,15 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    const fixture_root = std.fs.path.resolve(b.allocator, &.{
-        b.graph.cache.cwd, b.cache_root.path orelse ".",
-    }) catch @panic("cannot resolve private handoff test root");
     const options = b.addOptions();
-    options.addOption([]const u8, "fixture_root", fixture_root);
-    // Nested --build-file invocations can render source LazyPaths relatively.
-    options.addOptionPath("python_oracle", .{
-        .cwd_relative = std.fs.path.resolve(b.allocator, &.{
-            b.graph.cache.cwd, b.path("tests/test_handoff_contract_goldens.py").getPath(b),
-        }) catch @panic("cannot resolve handoff Python oracle"),
-    });
-    options.addOptionPath("accepted_result_fixture", .{
-        .cwd_relative = std.fs.path.resolve(b.allocator, &.{
-            b.graph.cache.cwd, b.path("tests/fixtures/differential/accepted-v2.json").getPath(b),
-        }) catch @panic("cannot resolve accepted handoff fixture"),
-    });
+    options.addOptionPath("fixture_root", .cache_root);
+    options.addOptionPath("python_oracle", b.path("tests/test_handoff_contract_goldens.py"));
+    options.addOptionPath("accepted_result_fixture", b.path("tests/fixtures/differential/accepted-v2.json"));
     tests.root_module.addOptions("test_options", options);
     const run = b.addRunArtifact(tests);
-    const python = b.addSystemCommand(&.{ "python3", "-B" });
-    python.setEnvironmentVariable("WAMR_HANDOFF_GOLDEN_ROOT", fixture_root);
+    const python = b.addSystemCommand(&.{"env"});
+    python.addPrefixedDirectoryArg("WAMR_HANDOFF_GOLDEN_ROOT=", .cache_root);
+    python.addArgs(&.{ "python3", "-B" });
     python.addFileArg(b.path("tests/test_handoff_contract_goldens.py"));
     const step = b.step("test", "Run native and Python handoff contract goldens");
     step.dependOn(&run.step);

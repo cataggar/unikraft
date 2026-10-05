@@ -258,7 +258,7 @@ fn expectCommand(commands: std.json.ObjectMap, name: []const u8, required: []con
     const options = try array(m.get("options") orelse return error.MissingGolden);
     const count = required.len + optional.len + repeated_required.len + repeated_optional.len;
     if (options.len != count or count > 64) return error.UnexpectedOptions;
-    var seen = [_]bool{false} ** 64;
+    var seen = @as([64]bool, @splat(false));
     for (options) |option| {
         const object = try c.exactFields(option, &contracts.cli.option_fields);
         const flags = try array(object.get("flags").?);
@@ -375,15 +375,15 @@ fn expectAzureRuntime(value: std.json.Value) !void {
 
 fn expectSchemas(value: std.json.Value) !void {
     const domains = comptime blk: {
-        const declarations = std.meta.declarations(contracts.schema_fields);
+        const declarations = @typeInfo(contracts.schema_fields).@"struct".decl_names;
         var names: [declarations.len][]const u8 = undefined;
-        for (declarations, 0..) |decl, index| names[index] = decl.name;
+        for (declarations, 0..) |name, index| names[index] = name;
         break :blk names;
     };
     const m = try c.exactFields(value, &domains);
-    inline for (comptime std.meta.declarations(contracts.schema_fields)) |decl| {
-        const expected = &@field(contracts.schema_fields, decl.name);
-        const items = try array(m.get(decl.name) orelse return error.MissingGolden);
+    inline for (@typeInfo(contracts.schema_fields).@"struct".decl_names) |declaration_name| {
+        const expected = &@field(contracts.schema_fields, declaration_name);
+        const items = try array(m.get(declaration_name) orelse return error.MissingGolden);
         try std.testing.expectEqual(expected.len, items.len);
         var previous: []const u8 = "";
         for (items) |item| {

@@ -92,8 +92,8 @@ pub fn identityHeaderAlloc(allocator: std.mem.Allocator, header: Header) ![]u8 {
             "#define WAMR_LIBRARY_SHA256 \"{s}\"\n",
         .{
             header.revision,
-            @intFromEnum(header.variant),
-            if (header.jit_mode) |mode| @as(u8, @intFromEnum(mode)) + 1 else 0,
+            @backingInt(header.variant),
+            if (header.jit_mode) |mode| @as(u8, @backingInt(mode)) + 1 else 0,
             header.source_tree_sha256,
             header.compiler_sha256,
             @intFromBool(header.coremark),
@@ -282,7 +282,7 @@ const Diagnostics = struct {
             .{ self.index, stage.name() },
         );
         self.index += 1;
-        const contents = try std.fmt.allocPrint(allocator, "{s}\n", .{@errorName(err)});
+        const contents = try allocator.print("{s}\n", .{@errorName(err)});
         defer allocator.free(contents);
         try contract.files.writePrivateCreate(io, self.directory, name, contents);
     }
@@ -441,7 +441,7 @@ fn prepareRepository(
             return error.SourceOutputAlias;
         source_directory = try contract.files.SourceDirectory.open(allocator, io, source_path);
         git = try contract.process.resolveTool(allocator, io, inherited, "git");
-        const revision_spec = try std.fmt.allocPrint(a, "{s}^{{commit}}", .{revision});
+        const revision_spec = try a.print("{s}^{{commit}}", .{revision});
         var result = try runner.run(
             git.?,
             .git_revision,
@@ -613,7 +613,7 @@ fn buildRuntimeAndCompiler(
                 zig.path,
                 "build",
                 "-Dprofile=unikraft-aot",
-                "-Doptimize=ReleaseSafe",
+                "-Doptimize=safe",
                 "--prefix",
                 runtime_prefix,
                 "-j2",
@@ -633,7 +633,7 @@ fn buildRuntimeAndCompiler(
                 zig.path,
                 "build",
                 "native-aot-fixture",
-                "-Doptimize=ReleaseSafe",
+                "-Doptimize=safe",
                 "-Dstrip=true",
                 "--prefix",
                 host_prefix,
@@ -686,6 +686,7 @@ fn buildWorkload(
         "build.zig.zon",
         ".{ .name = .wamr_workload_image, .version = \"0.0.0\", " ++
             ".fingerprint = 0xcb36ebabb0542062, " ++
+            ".minimum_zig_version = \"0.17.0\", " ++
             ".dependencies = .{ .wamr = .{ .path = \"../wamr-source\" } }, " ++
             ".paths = .{ \".\" } }\n",
     );
@@ -746,7 +747,7 @@ fn buildWorkload(
                 "fixture.zig",
             });
             {
-                const emit = try std.fmt.allocPrint(a, "-femit-bin={s}", .{matched_wasm});
+                const emit = try a.print("-femit-bin={s}", .{matched_wasm});
                 var result = try runner.run(
                     zig,
                     .matched_wasm,
@@ -757,7 +758,7 @@ fn buildWorkload(
                         "-target",
                         "wasm32-freestanding",
                         "-O",
-                        "ReleaseSmall",
+                        "small",
                         "-fno-entry",
                         "-rdynamic",
                         "--stack",
@@ -805,8 +806,8 @@ fn buildWorkload(
     try contract.files.writePrivateCreate(io, consumer, "artifacts.zig", generated);
 
     const output = try std.fs.path.join(a, &.{ consumer_path, "out" });
-    const variant_option = try std.fmt.allocPrint(a, "-Dvariant={s}", .{variantName(variant)});
-    const coremark_option = try std.fmt.allocPrint(
+    const variant_option = try a.print("-Dvariant={s}", .{variantName(variant)});
+    const coremark_option = try std.mem.Allocator.print(
         a,
         "-Dcoremark={s}",
         .{if (coremark) "true" else "false"},
@@ -887,7 +888,7 @@ fn buildWorkload(
         defer result.deinit(allocator);
         try requireRuntimeArchiveMember(a, result.stdout, build_path);
     }
-    const output_option = try std.fmt.allocPrint(
+    const output_option = try std.mem.Allocator.print(
         a,
         "--output={s}",
         .{archive_members_path},
@@ -940,7 +941,7 @@ fn requireRuntimeArchiveMember(
     output: []const u8,
     build_path: []const u8,
 ) !void {
-    const prefix = try std.fmt.allocPrint(
+    const prefix = try std.mem.Allocator.print(
         allocator,
         "{s}/native-environment/zig_local_cache/o/",
         .{build_path},
@@ -970,7 +971,7 @@ fn buildTinyAndCoremark(
     const tiny_wasm = try std.fs.path.join(a, &.{ artifacts_path, "tiny.wasm" });
     const fixture = try std.fs.path.join(a, &.{ repository.app.path, "fixture.zig" });
     {
-        const emit = try std.fmt.allocPrint(a, "-femit-bin={s}", .{tiny_wasm});
+        const emit = try a.print("-femit-bin={s}", .{tiny_wasm});
         var result = try runner.run(
             zig,
             .tiny_wasm,
@@ -981,7 +982,7 @@ fn buildTinyAndCoremark(
                 "-target",
                 "wasm32-freestanding",
                 "-O",
-                "ReleaseSmall",
+                "small",
                 "-fno-entry",
                 "-rdynamic",
                 "--stack",
@@ -1049,7 +1050,7 @@ fn compileAot(
     defer compiler.close(allocator, io);
     const input = try std.fs.path.join(a, &.{ artifacts_path, input_name });
     const output = try std.fs.path.join(a, &.{ artifacts_path, output_name });
-    const profile = try std.fmt.allocPrint(a, "--profile={s}", .{contract.compiler_profile});
+    const profile = try a.print("--profile={s}", .{contract.compiler_profile});
     var result = try runner.run(
         compiler,
         stage,
@@ -1253,7 +1254,7 @@ fn identityManifestAlloc(
     try jsonFieldName(&raw.writer, "commands", true);
     try writeCommands(a, &raw.writer, commands, repository.app.path, zig_path, objcopy_path);
     try jsonFieldName(&raw.writer, "compiler_options", true);
-    try writeStringArray(&raw.writer, &.{ "optimize=ReleaseSafe", "strip=true" });
+    try writeStringArray(&raw.writer, &.{ "optimize=safe", "strip=true" });
     try jsonFieldName(&raw.writer, "minimal_wasi", true);
     try raw.writer.writeAll(if (arguments.coremark) "true" else "false");
     try jsonFieldName(&raw.writer, "wasi_bridge_sha256", true);
@@ -1388,7 +1389,7 @@ fn verifyIdentityBytes(
         ))
         return error.UnsupportedProducerIdentity;
     try expectStringArray(identity.fields.get("runtime_options").?, &contract.native_flags);
-    try expectStringArray(identity.fields.get("compiler_options").?, &.{ "optimize=ReleaseSafe", "strip=true" });
+    try expectStringArray(identity.fields.get("compiler_options").?, &.{ "optimize=safe", "strip=true" });
 
     const build_path = try std.fs.path.join(allocator, &.{ repository.app.path, "build" });
     defer allocator.free(build_path);
@@ -1834,7 +1835,7 @@ fn verifyCommands(
         const candidate = try jsonCommand(identity.commands.items[index]);
         const candidate_argv = candidate.argv();
         if (candidate_argv.len != 0 and std.mem.eql(u8, candidate_argv[0], "git")) {
-            const revision_spec = try std.fmt.allocPrint(
+            const revision_spec = try std.mem.Allocator.print(
                 allocator,
                 "{s}^{{commit}}",
                 .{identity.revision},
@@ -1866,7 +1867,7 @@ fn verifyCommands(
         zig,
         "build",
         "-Dprofile=unikraft-aot",
-        "-Doptimize=ReleaseSafe",
+        "-Doptimize=safe",
         "--prefix",
         runtime,
         "-j2",
@@ -1875,7 +1876,7 @@ fn verifyCommands(
         zig,
         "build",
         "native-aot-fixture",
-        "-Doptimize=ReleaseSafe",
+        "-Doptimize=safe",
         "-Dstrip=true",
         "--prefix",
         host,
@@ -1883,7 +1884,7 @@ fn verifyCommands(
     }, work_path);
     const compiler = try std.fs.path.join(allocator, &.{ artifacts_path, "wamrc" });
     defer allocator.free(compiler);
-    const profile = try std.fmt.allocPrint(
+    const profile = try std.mem.Allocator.print(
         allocator,
         "--profile={s}",
         .{contract.compiler_profile},
@@ -1891,9 +1892,9 @@ fn verifyCommands(
     defer allocator.free(profile);
     if (identity.variant == .snapshot) {
         inline for (.{ "compute", "memory" }) |stem| {
-            const input = try std.fmt.allocPrint(allocator, "{s}/{s}.wasm", .{ artifacts_path, stem });
+            const input = try allocator.print("{s}/{s}.wasm", .{ artifacts_path, stem });
             defer allocator.free(input);
-            const output = try std.fmt.allocPrint(allocator, "{s}/{s}.cwasm", .{ artifacts_path, stem });
+            const output = try allocator.print("{s}/{s}.cwasm", .{ artifacts_path, stem });
             defer allocator.free(output);
             try nextCommand(
                 identity.commands.items,
@@ -1910,7 +1911,7 @@ fn verifyCommands(
         defer allocator.free(fixture);
         const matched = try std.fs.path.join(allocator, &.{ artifacts_path, "matched.wasm" });
         defer allocator.free(matched);
-        const emit = try std.fmt.allocPrint(allocator, "-femit-bin={s}", .{matched});
+        const emit = try allocator.print("-femit-bin={s}", .{matched});
         defer allocator.free(emit);
         try nextCommand(identity.commands.items, &index, &.{
             zig,
@@ -1919,7 +1920,7 @@ fn verifyCommands(
             "-target",
             "wasm32-freestanding",
             "-O",
-            "ReleaseSmall",
+            "small",
             "-fno-entry",
             "-rdynamic",
             "--stack",
@@ -1939,13 +1940,13 @@ fn verifyCommands(
     }
     const output = try std.fs.path.join(allocator, &.{ consumer_path, "out" });
     defer allocator.free(output);
-    const variant_option = try std.fmt.allocPrint(
+    const variant_option = try std.mem.Allocator.print(
         allocator,
         "-Dvariant={s}",
         .{variantName(identity.variant)},
     );
     defer allocator.free(variant_option);
-    const coremark_option = try std.fmt.allocPrint(
+    const coremark_option = try std.mem.Allocator.print(
         allocator,
         "-Dcoremark={s}",
         .{if (identity.coremark) "true" else "false"},
@@ -1980,7 +1981,7 @@ fn verifyCommands(
         &.{ build_path, "scratch", "runtime-archive" },
     );
     defer allocator.free(archive_members);
-    const output_option = try std.fmt.allocPrint(
+    const output_option = try std.mem.Allocator.print(
         allocator,
         "--output={s}",
         .{archive_members},
@@ -2004,7 +2005,7 @@ fn verifyCommands(
     defer allocator.free(fixture);
     const tiny = try std.fs.path.join(allocator, &.{ artifacts_path, "tiny.wasm" });
     defer allocator.free(tiny);
-    const emit = try std.fmt.allocPrint(allocator, "-femit-bin={s}", .{tiny});
+    const emit = try allocator.print("-femit-bin={s}", .{tiny});
     defer allocator.free(emit);
     try nextCommand(identity.commands.items, &index, &.{
         zig,
@@ -2013,7 +2014,7 @@ fn verifyCommands(
         "-target",
         "wasm32-freestanding",
         "-O",
-        "ReleaseSmall",
+        "small",
         "-fno-entry",
         "-rdynamic",
         "--stack",
@@ -2032,9 +2033,9 @@ fn verifyCommands(
     );
     if (identity.coremark) {
         inline for (.{ "coremark", "coremark-nofp" }) |stem| {
-            const input = try std.fmt.allocPrint(allocator, "{s}/{s}.wasm", .{ artifacts_path, stem });
+            const input = try allocator.print("{s}/{s}.wasm", .{ artifacts_path, stem });
             defer allocator.free(input);
-            const output_path = try std.fmt.allocPrint(
+            const output_path = try std.mem.Allocator.print(
                 allocator,
                 "{s}/{s}.cwasm",
                 .{ artifacts_path, stem },
@@ -2367,7 +2368,7 @@ fn portableAppPath(
     if (!std.mem.startsWith(u8, value, app_path) or
         (value.len != app_path.len and value[app_path.len] != '/'))
         return null;
-    const portable: []const u8 = try std.fmt.allocPrint(
+    const portable: []const u8 = try std.mem.Allocator.print(
         allocator,
         "<app>{s}",
         .{value[app_path.len..]},
@@ -2383,7 +2384,7 @@ fn portableCommandValue(
     if (try portableAppPath(allocator, value, app_path)) |portable| return portable;
     if (std.mem.indexOfScalar(u8, value, '=')) |separator| {
         if (try portableAppPath(allocator, value[separator + 1 ..], app_path)) |portable|
-            return std.fmt.allocPrint(allocator, "{s}={s}", .{ value[0..separator], portable });
+            return allocator.print("{s}={s}", .{ value[0..separator], portable });
     }
     return value;
 }
@@ -2511,7 +2512,7 @@ fn writePrimary(writer: *std.Io.Writer, primary: contract.process.CommandPrimary
     try writer.writeByte('{');
     switch (primary) {
         .exited => |code| try writer.print("\"exited\":{d}", .{code}),
-        .signal => |signal| try writer.print("\"signal\":{d}", .{@intFromEnum(signal)}),
+        .signal => |signal| try writer.print("\"signal\":{d}", .{@backingInt(signal)}),
         .unknown => |status| try writer.print("\"unknown\":{d}", .{status}),
         else => try contract.json.writeString(writer, @tagName(primary)),
     }

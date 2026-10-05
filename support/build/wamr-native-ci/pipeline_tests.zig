@@ -9,7 +9,7 @@ const options = @import("test_options");
 const Value = std.json.Value;
 
 fn efi() [512]u8 {
-    var bytes = [_]u8{0} ** 512;
+    var bytes = @as([512]u8, @splat(0));
     bytes[0..2].* = "MZ".*;
     std.mem.writeInt(u32, bytes[0x3c..0x40], 0x80, .little);
     bytes[0x80..0x84].* = "PE\x00\x00".*;
@@ -41,7 +41,7 @@ const Fixture = struct {
         errdefer parent.close(io);
         var nonce: [8]u8 = undefined;
         io.random(&nonce);
-        const name = try std.fmt.allocPrint(alloc, "wamr-compute-{s}", .{
+        const name = try alloc.print("wamr-compute-{s}", .{
             std.fmt.bytesToHex(nonce, .lower),
         });
         const path = try image.files.path(alloc, root_path, name);
@@ -300,12 +300,12 @@ fn syntheticChain(comptime case: ChainCase) !void {
     try writePrivate(fixture.directory, "code.fd", "synthetic firmware code");
     try writePrivate(fixture.directory, "vars.fd", "synthetic firmware vars");
     const identity = .{
-        .wamr_revision = "f" ** 40,
+        .wamr_revision = &@as([40]u8, @splat('f')),
         .minimal_wasi = false,
         .files = .{
-            .@"tiny.wasm" = "0" ** 64,
-            .@"tiny.cwasm" = "1" ** 64,
-            .@"libwamr-aot.a" = "2" ** 64,
+            .@"tiny.wasm" = &@as([64]u8, @splat('0')),
+            .@"tiny.cwasm" = &@as([64]u8, @splat('1')),
+            .@"libwamr-aot.a" = &@as([64]u8, @splat('2')),
         },
     };
     try writePrivate(fixture.directory, "identity.json", try c.encode(alloc, identity));
@@ -313,23 +313,45 @@ fn syntheticChain(comptime case: ChainCase) !void {
     var signal = try controller.build_pipeline.installCancellation();
     defer signal.deinit();
     var build_context: controller.build_pipeline.Context = .{
-        .allocator = alloc, .io = io, .environ = undefined, .runtime = fixture.path,
-        .repository = fixture.path, .wamr = "", .compute = fixture.path,
-        .git = undefined, .tools = undefined,
+        .allocator = alloc,
+        .io = io,
+        .environ = undefined,
+        .runtime = fixture.path,
+        .repository = fixture.path,
+        .wamr = "",
+        .compute = fixture.path,
+        .git = undefined,
+        .tools = undefined,
         .roots = .{
-            .source_root = fixture.path, .work = fixture.path, .runtime = fixture.path,
-            .zig = fixture.cli, .producer = fixture.cli, .fixture_runner = fixture.cli,
-            .supervisor = fixture.cli, .package_tool = fixture.cli, .validator = validator_cli,
-            .supervisor_fixture = fixture.cli, .tools = [_][]const u8{fixture.cli} ** controller.input_custody.host_tools.len,
-            .efi = efi_path, .local_boot_tool = fixture.cli, .qemu = fixture.cli,
-            .ovmf_code = code_path, .ovmf_vars = vars_path, .identity = identity_path,
+            .source_root = fixture.path,
+            .work = fixture.path,
+            .runtime = fixture.path,
+            .zig = fixture.cli,
+            .producer = fixture.cli,
+            .fixture_runner = fixture.cli,
+            .supervisor = fixture.cli,
+            .package_tool = fixture.cli,
+            .validator = validator_cli,
+            .supervisor_fixture = fixture.cli,
+            .tools = @as([controller.input_custody.host_tools.len][]const u8, @splat(fixture.cli)),
+            .efi = efi_path,
+            .local_boot_tool = fixture.cli,
+            .qemu = fixture.cli,
+            .ovmf_code = code_path,
+            .ovmf_vars = vars_path,
+            .identity = identity_path,
         },
         .signal = &signal,
         .source = .{
-            .revision = "f" ** 40, .tree = "f" ** 40,
+            .revision = &@as([40]u8, @splat('f')),
+            .tree = &@as([40]u8, @splat('f')),
             .custody = .{
-                .object_format = "sha1", .files = 0, .directories = 0, .bytes = 0,
-                .content_sha256 = [_]u8{'0'} ** 64, .physical_sha256 = [_]u8{'0'} ** 64,
+                .object_format = "sha1",
+                .files = 0,
+                .directories = 0,
+                .bytes = 0,
+                .content_sha256 = @as([64]u8, @splat('0')),
+                .physical_sha256 = @as([64]u8, @splat('0')),
             },
         },
     };
@@ -365,7 +387,7 @@ fn syntheticChain(comptime case: ChainCase) !void {
     try expectMissing(package_dir, image.compute_artifacts.qcow2_name);
     try gate.qcow2Intent(&context);
     const finalized_run = try run(fixture, &.{
-        fixture.cli, "finalize-qcow2",
+        fixture.cli,                                                                  "finalize-qcow2",
         try image.files.path(alloc, evidence_path, "qcow2-finalization-intent.json"), package_path,
     });
     try t.expectEqual(std.process.Child.Term{ .exited = 0 }, finalized_run.term);
@@ -383,7 +405,7 @@ fn syntheticChain(comptime case: ChainCase) !void {
     try gate.vhdIntent(&context);
     try gate.vhdGate(&context);
     const derived_run = try run(fixture, &.{
-        fixture.cli, "derive-fixed-vhd",
+        fixture.cli,                                                                    "derive-fixed-vhd",
         try image.files.path(alloc, evidence_path, "fixed-vhd-derivation-intent.json"), package_path,
     });
     try t.expectEqual(std.process.Child.Term{ .exited = 0 }, derived_run.term);
@@ -404,8 +426,7 @@ fn syntheticChain(comptime case: ChainCase) !void {
     try gate.inspect(&context);
     try expectMissing(evidence_dir, "result.json");
     if (case == .complete) {
-        const inspection = try fixtureJson(alloc, try evidence_dir.read(
-            io, alloc, "final-inspection.json", controller.records.max_record_bytes, null));
+        const inspection = try fixtureJson(alloc, try evidence_dir.read(io, alloc, "final-inspection.json", controller.records.max_record_bytes, null));
         const modes = inspection.object.get("modes").?.array.items;
         const boots = inspection.object.get("boots").?.object;
         try t.expectEqual(controller.profile.production_modes.len, modes.len);
@@ -433,10 +454,8 @@ fn syntheticChain(comptime case: ChainCase) !void {
             try controller.records.verifyRecord(accepted.value, name, bytes);
             if (std.mem.startsWith(u8, name, "command-")) {
                 const command = try fixtureJson(alloc, bytes);
-                try t.expectEqualStrings("synthetic_fixture_not_command_proof",
-                    command.object.get("scope").?.string);
-                try t.expectEqualStrings(name["command-".len .. name.len - ".json".len],
-                    command.object.get("stage").?.string);
+                try t.expectEqualStrings("synthetic_fixture_not_command_proof", command.object.get("scope").?.string);
+                try t.expectEqualStrings(name["command-".len .. name.len - ".json".len], command.object.get("stage").?.string);
                 fixture_commands += 1;
             }
         }
@@ -455,8 +474,7 @@ fn syntheticChain(comptime case: ChainCase) !void {
     try t.expectError(error.UnexpectedEvidence, gate.resultAfterInspection(&context));
     try expectMissing(evidence_dir, "result.json");
     try evidence_dir.dir.deleteFile(io, "unlisted.json");
-    const last_slot = try image.core.private_files.Directory.open(io,
-        try image.files.path(alloc, fixture.path, "boot-vpc-legacy-apic"));
+    const last_slot = try image.core.private_files.Directory.open(io, try image.files.path(alloc, fixture.path, "boot-vpc-legacy-apic"));
     defer last_slot.close(io);
     const serial = try last_slot.dir.openFile(io, "hyperv-efi-boot.log", .{ .mode = .read_write });
     var original: [1]u8 = undefined;
@@ -477,15 +495,18 @@ fn syntheticChain(comptime case: ChainCase) !void {
 
 fn publishFixtureOnlyCommandRecord(ctx: *controller.boot_pipeline.Context, stage: []const u8) !void {
     const allocator = ctx.build_context.allocator;
-    const name = try std.fmt.allocPrint(allocator, "command-{s}.json", .{stage});
+    const name = try allocator.print("command-{s}.json", .{stage});
     try controller.boot_pipeline.testing.publish(ctx, name, try fixtureValue(allocator, .{
-        .scope = "synthetic_fixture_not_command_proof", .stage = stage,
+        .scope = "synthetic_fixture_not_command_proof",
+        .stage = stage,
     }));
 }
 
 fn fixtureJson(allocator: std.mem.Allocator, raw: []const u8) !Value {
     return std.json.parseFromSliceLeaky(Value, allocator, raw, .{
-        .duplicate_field_behavior = .@"error", .parse_numbers = false, .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+        .parse_numbers = false,
+        .allocate = .alloc_always,
     });
 }
 
@@ -495,7 +516,8 @@ fn fixtureValue(allocator: std.mem.Allocator, value: anytype) !Value {
 
 fn writePrivate(directory: image.core.private_files.Directory, name: []const u8, bytes: []const u8) !void {
     try directory.dir.writeFile(io, .{
-        .sub_path = name, .data = bytes,
+        .sub_path = name,
+        .data = bytes,
         .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) },
     });
 }
@@ -503,49 +525,62 @@ fn writePrivate(directory: image.core.private_files.Directory, name: []const u8,
 fn syntheticBoot(fixture: Fixture, ctx: *controller.boot_pipeline.Context, index: usize, validator: []const u8) !void {
     const alloc = fixture.arena.allocator();
     const mode = controller.profile.production_modes[index];
-    const slot_name = try std.fmt.allocPrint(alloc, "boot-{s}", .{@tagName(mode)});
+    const slot_name = try alloc.print("boot-{s}", .{@tagName(mode)});
     try fixture.directory.dir.createDir(io, slot_name, .fromMode(0o700));
     const slot_path = try image.files.path(alloc, fixture.path, slot_name);
     const slot = try image.core.private_files.Directory.open(io, slot_path);
     defer slot.close(io);
     const config = try controller.boot_pipeline.testing.config(ctx, index);
-    const source_path = try image.files.path(alloc, fixture.path,
-        try std.fmt.allocPrint(alloc, "package/{s}", .{controller.command_plan.bootImage(mode)}));
+    const source_path = try image.files.path(alloc, fixture.path, try alloc.print("package/{s}", .{controller.command_plan.bootImage(mode)}));
     var pins = Value{ .array = std.array_list.Managed(Value).init(alloc) };
-    for ([_][]const u8{ source_path, ctx.build_context.roots.ovmf_code,
-        ctx.build_context.roots.ovmf_vars, ctx.build_context.roots.qemu }) |path_name|
+    for ([_][]const u8{ source_path, ctx.build_context.roots.ovmf_code, ctx.build_context.roots.ovmf_vars, ctx.build_context.roots.qemu }) |path_name|
         try pins.array.append(try controller.boot_pipeline.testing.pin(ctx, path_name));
-    try writePrivate(slot, "request.json", try controller.records.canonicalAlloc(alloc,
-        try std.json.Stringify.valueAlloc(alloc, .{
-            .schema_version = @as(u8, 2), .supervisor_pid = @as(u32, 1),
-            .config = config, .pins = pins,
-        }, .{})));
+    try writePrivate(slot, "request.json", try controller.records.canonicalAlloc(alloc, try std.json.Stringify.valueAlloc(alloc, .{
+        .schema_version = @as(u8, 2),
+        .supervisor_pid = @as(u32, 1),
+        .config = config,
+        .pins = pins,
+    }, .{})));
     try writePrivate(slot, "launched", "");
     const computation = try std.json.Stringify.valueAlloc(alloc, .{
-        .version = 1, .workload = "tiny", .wamr_revision = "f" ** 40,
-        .wasm_sha256 = "0" ** 64, .cwasm_sha256 = "1" ** 64,
-        .runtime_sha256 = "2" ** 64, .platform_status = 0, .checks = 2,
-        .answer = 42, .terminal = 1, .detail = 2, .reserved_bytes = 0,
-        .frame_bytes = 0, .accessible_bytes = 0, .allocation_bytes = 0,
-        .error_name = "", .system_page_table_bytes = 4096,
+        .version = 1,
+        .workload = "tiny",
+        .wamr_revision = &@as([40]u8, @splat('f')),
+        .wasm_sha256 = &@as([64]u8, @splat('0')),
+        .cwasm_sha256 = &@as([64]u8, @splat('1')),
+        .runtime_sha256 = &@as([64]u8, @splat('2')),
+        .platform_status = 0,
+        .checks = 2,
+        .answer = 42,
+        .terminal = 1,
+        .detail = 2,
+        .reserved_bytes = 0,
+        .frame_bytes = 0,
+        .accessible_bytes = 0,
+        .allocation_bytes = 0,
+        .error_name = "",
+        .system_page_table_bytes = 4096,
     }, .{});
-    const serial = try std.fmt.allocPrint(alloc,
-        "{s}Hyper-V Hv#1 hypercall page enabled\nHyper-V SynIC:\nPowered by\n" ++
-            "Calling main(0, 0)\nWAMR_NATIVE_COMPUTE={s}\n" ++
-            "WAMR_NATIVE_AOT_OK answer=42 teardown=0\nmain returned 0\n",
-        .{ if (mode.legacyApic()) "Using legacy xAPIC MMIO\n" else "", computation });
+    const serial = try alloc.print("{s}Hyper-V Hv#1 hypercall page enabled\nHyper-V SynIC:\nPowered by\n" ++
+        "Calling main(0, 0)\nWAMR_NATIVE_COMPUTE={s}\n" ++
+        "WAMR_NATIVE_AOT_OK answer=42 teardown=0\nmain returned 0\n", .{ if (mode.legacyApic()) "Using legacy xAPIC MMIO\n" else "", computation });
     try writePrivate(slot, "hyperv-efi-boot.log", serial);
     const digest = std.fmt.bytesToHex(controller.records.fileIdentity(serial), .lower);
-    try writePrivate(slot, "report.json", try controller.records.canonicalAlloc(alloc,
-        try std.json.Stringify.valueAlloc(alloc, .{
-            .schema_version = @as(u8, 1), .scope = "public_local_qemu_only",
-            .acceptance = "not_established", .passed = true, .consumed = true,
-            .cleanup_complete = true, .input_unchanged = true, .serial_valid = true,
-            .serial_limit_reached = false, .serial_bytes = serial.len,
-            .serial_sha256 = digest, .termination = .{ .exited = 0 },
-            .failures = .{ .primary = @as(?u8, null), .cleanup = @as(?u8, null),
-                .recording = @as(?u8, null) },
-        }, .{})));
+    try writePrivate(slot, "report.json", try controller.records.canonicalAlloc(alloc, try std.json.Stringify.valueAlloc(alloc, .{
+        .schema_version = @as(u8, 1),
+        .scope = "public_local_qemu_only",
+        .acceptance = "not_established",
+        .passed = true,
+        .consumed = true,
+        .cleanup_complete = true,
+        .input_unchanged = true,
+        .serial_valid = true,
+        .serial_limit_reached = false,
+        .serial_bytes = serial.len,
+        .serial_sha256 = digest,
+        .termination = .{ .exited = 0 },
+        .failures = .{ .primary = @as(?u8, null), .cleanup = @as(?u8, null), .recording = @as(?u8, null) },
+    }, .{})));
     const stage: controller.command_plan.Stage = if (mode.legacyApic())
         .@"log-validator-legacy"
     else
@@ -556,14 +591,17 @@ fn syntheticBoot(fixture: Fixture, ctx: *controller.boot_pipeline.Context, index
     ctx.build_context.roots.serial = try image.files.path(alloc, slot_path, "hyperv-efi-boot.log");
     try t.expectEqualStrings(validator, ctx.build_context.roots.validator);
     const outcome = try controller.command_adapter.execute(alloc, io, .{
-        .roots = ctx.build_context.roots, .stage = stage,
-        .private_dir = slot.dir, .evidence_dir = slot.dir,
+        .roots = ctx.build_context.roots,
+        .stage = stage,
+        .private_dir = slot.dir,
+        .evidence_dir = slot.dir,
         .cancel = ctx.build_context.signal.flag(),
-        .capture_stdout = true, .private_record = true,
+        .capture_stdout = true,
+        .private_record = true,
     });
     try t.expect(outcome.accepted and !outcome.poisoned);
     try t.expectEqual(@as(usize, 0), outcome.stderr_bytes);
-    const name = try std.fmt.allocPrint(alloc, "command-{s}.json", .{@tagName(stage)});
+    const name = try alloc.print("command-{s}.json", .{@tagName(stage)});
     const record_path = try image.files.path(alloc, slot_path, name);
     _ = try controller.custody_files.readFile(io, record_path, controller.records.max_record_bytes, true);
     const command = try fixtureJson(alloc, try slot.read(io, alloc, name, controller.records.max_record_bytes, null));

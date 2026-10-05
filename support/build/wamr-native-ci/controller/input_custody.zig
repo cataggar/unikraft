@@ -198,7 +198,7 @@ fn collectRuntime(allocator: std.mem.Allocator, io: std.Io, executable: []const 
         allocator.free(paths);
     }
     for (paths) |path| {
-        const role = try std.fmt.allocPrint(allocator, "runtime:{s}", .{path});
+        const role = try allocator.print("runtime:{s}", .{path});
         defer allocator.free(role);
         var present = false;
         for (bindings.items) |item| if (std.mem.eql(u8, item.role, role)) {
@@ -227,7 +227,7 @@ pub fn captureProduction(allocator: std.mem.Allocator, io: std.Io, paths: Produc
         tree_bindings.deinit(allocator);
     }
     for (host_tools, paths.tools) |name, path| {
-        const role = try std.fmt.allocPrint(allocator, "tool:{s}", .{name});
+        const role = try allocator.print("tool:{s}", .{name});
         defer allocator.free(role);
         try appendBinding(allocator, &file_bindings, role, path);
         try collectRuntime(allocator, io, path, &file_bindings);
@@ -370,7 +370,7 @@ fn bisonWalk(
     }
     for (names) |name| {
         try limits.addBounded(count, 1, limits.bison_entries);
-        const relative = if (prefix.len == 0) try allocator.dupe(u8, name) else try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, name });
+        const relative = if (prefix.len == 0) try allocator.dupe(u8, name) else try allocator.print("{s}/{s}", .{ prefix, name });
         var owned = true;
         defer if (owned) allocator.free(relative);
         const path = try std.fs.path.join(allocator, &.{ root, relative });
@@ -561,7 +561,7 @@ fn treeWalk(allocator: std.mem.Allocator, io: std.Io, root: []const u8, prefix: 
         allocator.free(names);
     }
     for (names) |name| {
-        const relative = if (prefix.len == 0) try allocator.dupe(u8, name) else try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, name });
+        const relative = if (prefix.len == 0) try allocator.dupe(u8, name) else try allocator.print("{s}/{s}", .{ prefix, name });
         defer allocator.free(relative);
         try limits.relative(relative, limits.ignored_path, limits.ignored_depth);
         const member = try dir.openFile(io, name, .{ .path_only = true, .follow_symlinks = false });
@@ -833,8 +833,8 @@ test "captured production inputs compare every pinned field without recapture" {
     var files_before = [_]FileRecord{.{
         .role = "tool:zig",
         .path = "/runtime/zig",
-        .metadata = [_]i128{0} ** 9,
-        .sha256 = [_]u8{'a'} ** 64,
+        .metadata = @as([9]i128, @splat(0)),
+        .sha256 = @as([64]u8, @splat('a')),
     }};
     var trees_before = [_]TreeRecord{.{
         .role = "zig",
@@ -843,18 +843,18 @@ test "captured production inputs compare every pinned field without recapture" {
         .directories = 1,
         .symlinks = 0,
         .bytes = 1,
-        .content_sha256 = [_]u8{'b'} ** 64,
-        .physical_sha256 = [_]u8{'c'} ** 64,
+        .content_sha256 = @as([64]u8, @splat('b')),
+        .physical_sha256 = @as([64]u8, @splat('c')),
     }};
     var directories_before = [_]DirectoryRecord{.{
         .path = "/runtime",
-        .metadata = [_]i128{0} ** 9,
+        .metadata = @as([9]i128, @splat(0)),
     }};
     const expected: Custody = .{
         .files = &files_before,
         .trees = &trees_before,
         .directories = &directories_before,
-        .aggregate_sha256 = [_]u8{'d'} ** 64,
+        .aggregate_sha256 = @as([64]u8, @splat('d')),
     };
     var files_after = files_before;
     var trees_after = trees_before;

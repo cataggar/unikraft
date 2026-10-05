@@ -393,15 +393,24 @@ def command_supervisor_record(value):
 
 
 def dependency_record(ci, value, expected):
+    require(isinstance(value, dict)
+            and isinstance(value.get("packages"), dict)
+            and isinstance(value["packages"].get("hash_verification"), dict))
+    algorithm = value.get("packages", {}).get(
+        "hash_verification", {}).get("algorithm")
+    require(algorithm in {"zig-0.17.0-fetch-path", "zig-0.16.0-fetch-path"})
+    historical = algorithm == "zig-0.16.0-fetch-path"
+    root_package = (
+        ci.HISTORICAL_MIZ_PACKAGE_HASH if historical else ci.MIZ_PACKAGE_HASH)
     require(set(value) == {
         "schema", "version", "request", "source_manifests",
         "restore_directory", "restore", "packages",
     } and value["schema"] == "uk.wamr.zig-dependency-custody"
       and type(value["version"]) is int and value["version"] == 1
       and value["request"] == {
-          "url": ci.MIZ_URL,
-          "revision": ci.MIZ_REVISION,
-          "package_hash": ci.MIZ_PACKAGE_HASH,
+          "url": ci.HISTORICAL_MIZ_URL if historical else ci.MIZ_URL,
+          "revision": ci.HISTORICAL_MIZ_REVISION if historical else ci.MIZ_REVISION,
+          "package_hash": root_package,
       })
     expected_paths = {
         "build.zig": "support/tools/hyperv/local_boot/build.zig",
@@ -506,9 +515,9 @@ def dependency_record(ci, value, expected):
             and total_files == files
             and total_directories == directories
             and total_bytes == package_bytes
-            and ci.MIZ_PACKAGE_HASH in dependency_graph)
+            and root_package in dependency_graph)
     reachable = set()
-    pending = [ci.MIZ_PACKAGE_HASH]
+    pending = [root_package]
     while pending:
         name = pending.pop()
         require(name in dependency_graph)
@@ -528,7 +537,8 @@ def dependency_record(ci, value, expected):
             and manifest_summary["sha256"] == manifest_digest.hexdigest())
     hash_verification = packages["hash_verification"]
     require(set(hash_verification) == {"algorithm", "count", "sha256"}
-            and hash_verification["algorithm"] == "zig-0.16.0-fetch-path")
+            and hash_verification["algorithm"] in {
+                "zig-0.17.0-fetch-path", "zig-0.16.0-fetch-path"})
     bounded_integer(hash_verification["count"], 1, ci.PACKAGE_MAX_ROOTS)
     require(hash_verification["count"] == roots)
     hash_records = [{
@@ -1858,7 +1868,7 @@ def publish_ci(handoff):
             "--global-cache-dir", runtime / "compute/global-cache",
             "--prefix", publication / "tools",
             *handoff.ci.RECORDED_EXECUTABLE_TARGET,
-            "-Doptimize=ReleaseSafe", "-j2", "install"], 600,
+            "-Doptimize=safe", "-j2", "install"], 600,
             input_records=handoff.ci.consumer_file_records(
                 start["consumer_inputs"]))
         del unused_output

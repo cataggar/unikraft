@@ -156,7 +156,7 @@ fn truncateContents(_: std.Io, path: []const u8) !void {
 }
 
 fn replaceName(_: std.Io, path: []const u8) !void {
-    const replacement = try std.fmt.allocPrint(a, "{s}.replacement", .{path});
+    const replacement = try a.print("{s}.replacement", .{path});
     defer a.free(replacement);
     try std.Io.Dir.cwd().rename(replacement, std.Io.Dir.cwd(), path, io);
 }
@@ -170,7 +170,7 @@ test "relative and absolute regular input retains original bytes/hash and never 
     defer fixture.cleanup();
     const raw = "\x00\x1b[32mrecord\x1b[0m\r\n";
     try write(fixture.dir, "serial.log", raw);
-    const relative = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/serial.log", .{fixture.sub_path});
+    const relative = try a.print(".zig-cache/tmp/{s}/serial.log", .{fixture.sub_path});
     defer a.free(relative);
     const absolute = try fixture.dir.realPathFileAlloc(io, "serial.log", a);
     defer a.free(absolute);

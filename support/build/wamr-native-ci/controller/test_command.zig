@@ -59,18 +59,18 @@ pub fn runScenario(io: std.Io, scenario: []const u8) void {
         std.process.exit(2);
     }
     if (std.mem.eql(u8, scenario, "overflow")) {
-        const chunk = [_]u8{'X'} ** 65536;
+        const chunk = @as([65536]u8, @splat('X'));
         for (0..140) |_|
             std.Io.File.stdout().writeStreamingAll(io, &chunk) catch std.process.exit(2);
         return;
     }
     if (std.mem.eql(u8, scenario, "large-3m") or std.mem.eql(u8, scenario, "large-8m")) {
-        const chunk = [_]u8{'A'} ** 65536;
+        const chunk = @as([65536]u8, @splat('A'));
         const count: usize = if (std.mem.eql(u8, scenario, "large-3m")) 48 else 64;
         for (0..count) |_|
             std.Io.File.stdout().writeStreamingAll(io, &chunk) catch std.process.exit(2);
         if (count == 64) {
-            const stderr_chunk = [_]u8{'B'} ** 65536;
+            const stderr_chunk = @as([65536]u8, @splat('B'));
             for (0..64) |_|
                 std.Io.File.stderr().writeStreamingAll(io, &stderr_chunk) catch std.process.exit(2);
         }

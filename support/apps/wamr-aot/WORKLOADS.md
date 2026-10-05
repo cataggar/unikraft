@@ -47,7 +47,7 @@ umask 077
 tool_root="$PWD/support/apps/wamr-aot/build/tool"
 test ! -e "$tool_root"
 zig build --build-file support/apps/wamr-aot/build.zig \
-  --prefix "$tool_root" -Doptimize=ReleaseSafe install
+  --prefix "$tool_root" -Doptimize=safe install
 tool="$tool_root/bin/uk-wamr-aot-build"
 "$tool" prepare --repository "$PWD" \
   --source /path/to/local/wamr --variant snapshot
@@ -67,6 +67,15 @@ An explicitly selected development revision also supports local tiny/CoreMark
 bridge integration, but its manifest remains development-only and the
 credential-free CI adapter refuses it.
 
+The Zig 0.17.0 build translates the actual `workloads.h` with the translator
+provided by that exact compiler release. Translation uses the same x86_64
+freestanding target and generated `../artifacts` include directory as the
+native consumer; `native-services.zig` imports the generated C ABI module.
+SDK modules remain shared, PIC is applied to their existing import graph,
+and the static library does not bundle a second compiler runtime.
+An exact-generation Zig 0.17-compatible SDK pin must be qualified separately;
+compile-only fixtures do not establish workload or hardware qualification.
+
 The same existing `hyperv-x86_64-efi-wamr` graph produces the real native ELF and
 EFI, including its final IRQ/SMP/relocation safety gates. No selector-only or
 audit ELF is substituted. A fresh optional solved config provisions a **1 MiB
@@ -85,7 +94,7 @@ to invent an argument or an unbound sidecar. The two correctness images cannot
 be presented as the single JIT image expected by a future independently qualified
 fast/full measurement transport.
 
-All consumers and imported SDK modules are PIC, ReleaseSafe, single-threaded,
+All consumers and imported SDK modules are PIC, safe-mode, single-threaded,
 x86_64 freestanding SysV, with no red zone, libc, stack checker/protector, unwind
 tables or Zig error tracing. The archive does **not** bundle compiler-rt:
 Unikraft's existing final link supplies those intrinsics. Preparation records
@@ -191,9 +200,11 @@ teardown. Base adapter page-permission/failure selftests still execute first.
 
 ```sh
 zig build --build-file support/apps/wamr-aot/build.zig test-unit test-integration
-zig build --build-file support/apps/wamr-aot/validator.build.zig -Doptimize=ReleaseSafe test
 zig build --build-file support/apps/wamr-aot/validator.build.zig \
-  --prefix "$PWD/.d/wamr-validator" -Doptimize=ReleaseSafe install
+  --cache-dir "$PWD/.d/wamr-validator-cache" -Doptimize=safe test
+zig build --build-file support/apps/wamr-aot/validator.build.zig \
+  --cache-dir "$PWD/.d/wamr-validator-cache" \
+  --prefix "$PWD/.d/wamr-validator" -Doptimize=safe install
 "$PWD/.d/wamr-validator/bin/uk-wamr-log-validate" workload \
   --mode snapshot --log /private/exact-boot/serial.log \
   --identity /private/exact-boot/identity.json --output json-v1

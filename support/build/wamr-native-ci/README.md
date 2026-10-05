@@ -1,5 +1,21 @@
 # Credential-free tiny native WAMR PR gate
 
+## Compiler and historical-import compatibility
+
+New producers require official Zig 0.17.0 and use `-Doptimize=safe`.
+Dependency-custody schema version 1 now records the producer-specific
+`zig-0.17.0-fetch-path` algorithm. Read-only imports explicitly retain
+`zig-0.16.0-fetch-path`, its original Miz revision/package hash, historical
+`ReleaseSafe` command bindings, and Zig 0.16.0 runtime identities. These are
+not accepted as new local producer inputs or relabelled as Zig 0.17 evidence.
+The historical source, canonical records, physical custody, dependency graph,
+and actual native output revalidation remain required; schema versions and
+resource bounds are unchanged.
+
+The exact-generation WAMR/Miz dependency qualification is a separate
+prerequisite to an integrated build. Validator or controller fixture success
+alone does not qualify the SDK, hardware, deployment, or cloud lineage.
+
 ## Authority contract freeze (#189 PR1; no caller cutover)
 
 `authority/root.zig` is a contract/test surface importing only `hyperv_core`;
@@ -32,7 +48,7 @@ embedded records and the outer document; malformed metadata, extra domains or
 nested fields, scalar coercions and unsupported versions must fail that same
 consumer, not a comparison against another golden.
 
-Run with Zig 0.16 and fresh owner-only roots (no credentials or cloud calls):
+Run with Zig 0.17.0 and fresh owner-only roots (no credentials or cloud calls):
 
 ```sh
 umask 077
@@ -272,14 +288,14 @@ local proof after the original consumer files or loader are removed.
 `zig build --build-file support/build/wamr-native-ci/build.zig test-controller`
 runs the native controller foundation's CLI/profile, canonical-record,
 source-closure and refusal fixtures. Build the portable executable with
-`-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=ReleaseSafe`. To place
+`-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=safe`. To place
 only that executable in an existing canonical, owner-only `0700` runtime,
 invoke `install-controller` with `-Dcontroller-runtime=/absolute/runtime`.
 Installation creates `controller/bin/uk-wamr-native-ci` (private `0700` path
 and ELF) and refuses any preexisting slot; it does not install over a prior
 controller. The controller is always compiled for GNU/x86_64_v2, independent
 of the other package artifacts; `install-controller` additionally requires
-the explicit GNU/v2 and `ReleaseSafe` flags and refuses musl, v3, or an
+the explicit GNU/v2 and `safe` flags and refuses musl, v3, or an
 unspecified target before creating a slot. `describe --output json-v1`
 reports that fixed target and the embedded source-content closure without
 accessing a runtime or granting boot authority.
@@ -370,7 +386,7 @@ unchanged. This does not complete #88's guarded Azure authority or image handoff
 
 The job builds the distinct `hyperv-x86_64-efi-wamr` target using the
 adapter-installed app-owned `uk-wamr-aot-build` executable, pinned WAMR
-`a53205d77be3b880eb8f8b96679512ba58e2331a`, Zig 0.16.0, the existing LLVM
+`a53205d77be3b880eb8f8b96679512ba58e2331a`, Zig 0.17.0, the existing LLVM
 distribution and the native final-image graph. Its constructor/returning-IRQ,
 SMP, relocation and EFI checks are not replaced, mocked or disabled.
 There is no guest compiler or hosted-runtime substitute. Only the tiny
@@ -518,7 +534,7 @@ supervisor's exact tracked source closure are checked before and after that
 build. The native production controller supervises commands directly through
 the shared process library and records its own embedded source closure.
 Both supervisor implementations and the public validator use the fixed
-`-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2` target with `ReleaseSafe`, not the
+`-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2` target with `safe`, not the
 runner's native microarchitecture. The validator's supervised command contract
 binds these exact flags; the supervisor's source closure binds the bootstrap
 selection. Rebuilding the same sources with the pinned Zig compiler and those
@@ -700,7 +716,7 @@ An upstream package's `.dependencies = .{}` has no transitive edges; the
 source-pinned root manifest must still name exactly one Miz dependency.
 Under its owner-only `0700` root, descriptor-relative native custody admits
 and records upstream package file/directory modes (including `0777`) without
-relaxing the general host-artifact policy. Zig 0.16
+relaxing the general host-artifact policy. Zig 0.17.0
 `fetch PATH` independently recomputes every package hash, including Miz rather
 than trusting its directory name. `build-start.json` embeds
 `uk.wamr.zig-dependency-custody` version 1: request and source/copy manifest
@@ -779,37 +795,42 @@ artifact.
 
 ## Focused checks
 
-From a checkout with Zig 0.16:
+From a checkout with Zig 0.17.0 and qualified dependency pins:
+set `WAMR_CI_CHECK_ROOT` to a fresh canonical, owner-only scratch directory
+outside the source checkout. Source-custody limit fixtures deliberately refuse
+a cache root inside the checkout. Each build script uses a distinct local cache.
 
 ```sh
-mkdir -p .d/wamr-ci-check/{cache,global-cache/tmp,scratch,restore,out}
-export TMPDIR="$PWD/.d/wamr-ci-check/scratch"
-export ZIG_GLOBAL_CACHE_DIR="$PWD/.d/wamr-ci-check/global-cache"
+umask 077
+check_root="${WAMR_CI_CHECK_ROOT:?select a private directory outside the checkout}"
+mkdir -p "$check_root"/{restore-cache,controller-cache,supervisor-cache,global-cache/tmp,scratch,restore,out}
+export TMPDIR="$check_root/scratch"
+export ZIG_GLOBAL_CACHE_DIR="$check_root/global-cache"
 cp support/tools/hyperv/local_boot/build.zig \
-  support/tools/hyperv/local_boot/build.zig.zon .d/wamr-ci-check/restore/
-zig build --build-file .d/wamr-ci-check/restore/build.zig --fetch=all \
-  --cache-dir .d/wamr-ci-check/cache \
-  --global-cache-dir .d/wamr-ci-check/global-cache -j2
+  support/tools/hyperv/local_boot/build.zig.zon "$check_root/restore/"
+zig build --build-file "$check_root/restore/build.zig" --fetch=all \
+  --cache-dir "$check_root/restore-cache" \
+  --global-cache-dir "$check_root/global-cache" -j2
 zig build --build-file support/build/wamr-native-ci/build.zig \
-  --system "$PWD/.d/wamr-ci-check/restore/zig-pkg" \
-  --cache-dir .d/wamr-ci-check/cache --prefix "$PWD/.d/wamr-ci-check/out" \
-  -Dtest-root="$PWD/.d/wamr-ci-check/fixtures" \
-  -Doptimize=ReleaseSafe -j2 test install
+  --system "$check_root/restore/zig-pkg" \
+  --cache-dir "$check_root/controller-cache" --prefix "$check_root/out" \
+  -Dtest-root="$check_root/fixtures" \
+  -Doptimize=safe -j2 test install
 SUPERVISOR_SOURCE_SHA256="$(
-  "$PWD/.d/wamr-ci-check/out/bin/uk-wamr-native-ci" \
+  "$check_root/out/bin/uk-wamr-native-ci" \
     supervisor-source-closure --git "$(command -v git)" --output sha256-v1
 )"
 zig build --build-file support/build/wamr-native-ci/supervisor.build.zig \
-  --system "$PWD/.d/wamr-ci-check/restore/zig-pkg" \
-  --cache-dir .d/wamr-ci-check/cache \
-  --global-cache-dir .d/wamr-ci-check/global-cache \
-  --prefix "$PWD/.d/wamr-ci-check/supervisor" \
+  --system "$check_root/restore/zig-pkg" \
+  --cache-dir "$check_root/supervisor-cache" \
+  --global-cache-dir "$check_root/global-cache" \
+  --prefix "$check_root/supervisor" \
   -Dsource-closure-sha256="$SUPERVISOR_SOURCE_SHA256" \
-  -Doptimize=ReleaseSafe -j2 install
-WAMR_CI_PACKAGE="$PWD/.d/wamr-ci-check/out/bin/wamr-ci-package" \
-WAMR_CI_LOG_VALIDATE="$PWD/.d/wamr-ci-check/out/bin/uk-wamr-log-validate" \
-WAMR_CI_SUPERVISOR="$PWD/.d/wamr-ci-check/supervisor/bin/wamr-ci-supervisor" \
-WAMR_CI_SUPERVISOR_FIXTURE="$PWD/.d/wamr-ci-check/out/bin/wamr-ci-supervisor-fixture" \
+  -Doptimize=safe -j2 install
+WAMR_CI_PACKAGE="$check_root/out/bin/wamr-ci-package" \
+WAMR_CI_LOG_VALIDATE="$check_root/out/bin/uk-wamr-log-validate" \
+WAMR_CI_SUPERVISOR="$check_root/supervisor/bin/wamr-ci-supervisor" \
+WAMR_CI_SUPERVISOR_FIXTURE="$check_root/out/bin/wamr-ci-supervisor-fixture" \
   python3 -m unittest discover -s support/build/wamr-native-ci/tests -v
 ```
 
@@ -995,7 +1016,7 @@ local-boot installation paths, and native-only boot-input validator role are
 checked against their own exact physical contracts; each QCOW2 acceptance
 binds its own boot-input record rather than treating different hashes as equal.
 Shared production executables are built without path-dependent debug sections
-outside Debug mode so separately cached ReleaseSafe builds retain identical
+outside debug mode so separately cached safe builds retain identical
 bytes for strict paired tool and boot-input custody. The pinned upstream WAMR
 compiler is also built with its supported `-Dstrip=true` option: otherwise its
 debug sections change the compiler and generated runtime-identity bytes across

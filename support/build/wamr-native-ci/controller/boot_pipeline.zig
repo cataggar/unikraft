@@ -34,7 +34,7 @@ pub const Context = struct {
     finalization: ?Value = null,
     derivation: ?Value = null,
     acceptance: ?Value = null,
-    boots: [profile.production_modes.len]?Value = .{null} ** profile.production_modes.len,
+    boots: [profile.production_modes.len]?Value = @as([profile.production_modes.len]?Value, @splat(null)),
 
     fn allocator(self: *Context) std.mem.Allocator {
         return self.build_context.allocator;
@@ -242,14 +242,14 @@ pub fn admitHost(architecture: std.Target.Cpu.Arch, kvm_mode: u32, accessible: b
 pub fn admit(context: *Context) !HostAdmitted {
     context.build_context.failed_stage = "boot-platform";
     try context.cancelled();
-    if (builtin.cpu.arch != .x86_64) return error.KvmUnavailable;
+    if (builtin.target.cpu.arch != .x86_64) return error.KvmUnavailable;
     const device = std.Io.Dir.openFileAbsolute(context.io(), "/dev/kvm", .{
         .mode = .read_write,
         .follow_symlinks = false,
     }) catch return error.KvmUnavailable;
     defer device.close(context.io());
     const info = try files.snapshot(device);
-    try admitHost(builtin.cpu.arch, info.mode, true);
+    try admitHost(builtin.target.cpu.arch, info.mode, true);
     const runtime = try files.Directory.open(context.io(), context.build_context.runtime);
     defer runtime.close(context.io());
     const work = try files.Directory.open(context.io(), context.build_context.compute);
@@ -314,7 +314,7 @@ fn captureBootInputs(ctx: *Context) !void {
                 break;
             };
             if (!found) try bound.append(a, .{
-                .role = try std.fmt.allocPrint(a, "runtime:{s}", .{path_name}),
+                .role = try a.print("runtime:{s}", .{path_name}),
                 .path = path_name,
             });
         }
@@ -356,7 +356,7 @@ fn runStage(ctx: *Context, stage: plan.Stage, private_record: bool) !Value {
     if (outcome.poisoned) return error.CleanupPoisoned;
     if (!outcome.accepted) return error.StageRefused;
     try ctx.base();
-    const name = try std.fmt.allocPrint(ctx.allocator(), "command-{s}.json", .{@tagName(stage)});
+    const name = try ctx.allocator().print("command-{s}.json", .{@tagName(stage)});
     if (is_validator) {
         _ = try physical.readFile(ctx.io(), try std.fs.path.join(ctx.allocator(), &.{ slot, name }), records.max_record_bytes, true);
     } else try ctx.pin(name);
@@ -438,11 +438,11 @@ fn modeConfig(ctx: *Context, mode: profile.Mode) !Value {
     return expectedModeConfig(
         a,
         mode,
-        try ctx.path(try std.fmt.allocPrint(a, "package/{s}", .{plan.bootImage(mode)})),
+        try ctx.path(try a.print("package/{s}", .{plan.bootImage(mode)})),
         roots.ovmf_code,
         roots.ovmf_vars,
         roots.qemu,
-        try ctx.path(try std.fmt.allocPrint(a, "boot-{s}", .{@tagName(mode)})),
+        try ctx.path(try a.print("boot-{s}", .{@tagName(mode)})),
     );
 }
 
@@ -515,7 +515,7 @@ const CheckedBoot = struct {
 fn checkBoot(ctx: *Context, index: usize) !CheckedBoot {
     const mode = profile.production_modes[index];
     const a = ctx.allocator();
-    const work = try ctx.path(try std.fmt.allocPrint(a, "boot-{s}", .{@tagName(mode)}));
+    const work = try ctx.path(try a.print("boot-{s}", .{@tagName(mode)}));
     const request_path = try std.fs.path.join(a, &.{ work, "request.json" });
     const report_path = try std.fs.path.join(a, &.{ work, "report.json" });
     const raw_path = try std.fs.path.join(a, &.{ work, "hyperv-efi-boot.log" });
@@ -527,7 +527,7 @@ fn checkBoot(ctx: *Context, index: usize) !CheckedBoot {
     const pins = try field(request, "pins");
     if (pins != .array or pins.array.items.len != 4) return error.InvalidBootPins;
     const roots = ctx.build_context.roots;
-    const source = try ctx.path(try std.fmt.allocPrint(a, "package/{s}", .{plan.bootImage(mode)}));
+    const source = try ctx.path(try a.print("package/{s}", .{plan.bootImage(mode)}));
     for ([_][]const u8{ source, roots.ovmf_code, roots.ovmf_vars, roots.qemu }, pins.array.items) |path_name, pin|
         try sameJson(a, pin, try pinFor(ctx, path_name));
     const launched = try physical.readFile(ctx.io(), try std.fs.path.join(a, &.{ work, "launched" }), 1, true);
@@ -567,7 +567,7 @@ fn checkBoot(ctx: *Context, index: usize) !CheckedBoot {
 }
 
 fn summary(ctx: *Context, index: usize, checked: CheckedBoot) !Value {
-    const name = try std.fmt.allocPrint(ctx.allocator(), "{s}-compute.json", .{@tagName(profile.production_modes[index])});
+    const name = try ctx.allocator().print("{s}-compute.json", .{@tagName(profile.production_modes[index])});
     return typed(ctx.allocator(), .{
         .request_sha256 = checked.request_sha256,
         .report_sha256 = checked.report_sha256,
@@ -584,13 +584,13 @@ fn requireModeImage(ctx: *Context, index: usize) !void {
         try field(ctx.finalization orelse return error.MissingFinalization, "output")
     else
         try field(ctx.derivation orelse return error.MissingDerivation, "output");
-    _ = try matchFile(ctx, try ctx.path(try std.fmt.allocPrint(ctx.allocator(), "package/{s}", .{plan.bootImage(mode)})), expected, 66 * mib + 512, true);
+    _ = try matchFile(ctx, try ctx.path(try ctx.allocator().print("package/{s}", .{plan.bootImage(mode)})), expected, 66 * mib + 512, true);
 }
 
 fn verifyMode(ctx: *Context, index: usize) !Value {
     const mode = profile.production_modes[index];
     const checked = try checkBoot(ctx, index);
-    const name = try std.fmt.allocPrint(ctx.allocator(), "{s}-compute.json", .{@tagName(mode)});
+    const name = try ctx.allocator().print("{s}-compute.json", .{@tagName(mode)});
     const evidence = try ctx.readEvidence(name);
     try sameText(try field(evidence, "scope"), "local_native_compute_only");
     try sameJson(ctx.allocator(), try field(evidence, "report"), checked.report);
@@ -598,7 +598,7 @@ fn verifyMode(ctx: *Context, index: usize) !Value {
     try sameText(try field(evidence, "request_sha256"), checked.request_sha256);
     try sameText(try field(evidence, "report_sha256"), checked.report_sha256);
     if (try field(evidence, "compute") != .object) return error.InvalidComputeEvidence;
-    const serial = try ctx.path(try std.fmt.allocPrint(ctx.allocator(), "boot-{s}/hyperv-efi-boot.log", .{@tagName(mode)}));
+    const serial = try ctx.path(try ctx.allocator().print("boot-{s}/hyperv-efi-boot.log", .{@tagName(mode)}));
     var checked_serial = try log_validator.validate(ctx.allocator(), ctx.io(), serial, ctx.build_context.roots.identity, .{ .tiny = if (mode.legacyApic()) .required else .forbidden });
     defer checked_serial.deinit();
     const hash = std.fmt.bytesToHex(checked_serial.raw_serial_sha256, .lower);
@@ -625,7 +625,7 @@ fn publishCheckedMode(ctx: *Context, index: usize, checked: CheckedBoot, compute
 
 fn publishMode(ctx: *Context, index: usize, evidence: Value) !void {
     try requireModeImage(ctx, index);
-    const name = try std.fmt.allocPrint(ctx.allocator(), "{s}-compute.json", .{@tagName(profile.production_modes[index])});
+    const name = try ctx.allocator().print("{s}-compute.json", .{@tagName(profile.production_modes[index])});
     try ctx.publish(name, evidence);
 }
 
@@ -635,7 +635,7 @@ fn runMode(ctx: *Context, index: usize) !void {
     const checked_before = try checkBoot(ctx, index);
     try sameJson(ctx.allocator(), report_result, checked_before.report);
     const a = ctx.allocator();
-    const serial = try ctx.path(try std.fmt.allocPrint(a, "boot-{s}/hyperv-efi-boot.log", .{@tagName(mode)}));
+    const serial = try ctx.path(try a.print("boot-{s}/hyperv-efi-boot.log", .{@tagName(mode)}));
     const identity = ctx.build_context.roots.identity;
     const serial_pin = try physical.readFile(ctx.io(), serial, 4 * mib, true);
     const identity_pin = try physical.readFile(ctx.io(), identity, mib, false);
@@ -1337,7 +1337,7 @@ fn testMarkers(a: std.mem.Allocator, raw: []const u8) !Value {
             break;
         };
         if (!safe) continue;
-        const marker_name = try std.fmt.allocPrint(a, "{s}.{s}", .{ module, line[0..at] });
+        const marker_name = try a.print("{s}.{s}", .{ module, line[0..at] });
         var duplicate = false;
         for (found.array.items) |known| if (std.mem.eql(u8, known.string, marker_name)) {
             duplicate = true;
@@ -1349,7 +1349,7 @@ fn testMarkers(a: std.mem.Allocator, raw: []const u8) !Value {
 }
 
 fn commandFailure(ctx: *Context, name: []const u8) !?i32 {
-    const path_name = try ctx.evidencePath(try std.fmt.allocPrint(ctx.allocator(), "command-{s}.json", .{name}));
+    const path_name = try ctx.evidencePath(try ctx.allocator().print("command-{s}.json", .{name}));
     const record = ctx.readValue(path_name, records.max_record_bytes, true) catch return null;
     if (record != .object) return null;
     const code = number(i32, record.object.get("exit_code") orelse return null) catch return null;
@@ -1411,7 +1411,7 @@ pub fn diagnostics(ctx: *Context) !void {
     var observations = Value{ .object = .empty };
     for (profile.production_modes) |mode| {
         var item = try typed(a, .{ .report = "unavailable", .serial = "unavailable" });
-        const work_path = try ctx.path(try std.fmt.allocPrint(a, "boot-{s}", .{@tagName(mode)}));
+        const work_path = try ctx.path(try a.print("boot-{s}", .{@tagName(mode)}));
         const report_path = try std.fs.path.join(a, &.{ work_path, "report.json" });
         if (ctx.readValue(report_path, 64 * 1024, true) catch null) |report| {
             if (report != .object) {

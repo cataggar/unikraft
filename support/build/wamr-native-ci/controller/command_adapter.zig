@@ -133,7 +133,7 @@ fn stream(allocator: Allocator, bytes: []const u8, status: process.CommandStream
 fn kind(allocator: Allocator, primary: process.CommandPrimary) !Value {
     return switch (primary) {
         .exited => |code| json(allocator, .{ .kind = "exited", .code = @as(?u32, code) }),
-        .signal => |signal| json(allocator, .{ .kind = "signal", .code = @as(?u32, @intFromEnum(signal)) }),
+        .signal => |signal| json(allocator, .{ .kind = "signal", .code = @as(?u32, @backingInt(signal)) }),
         .unknown => |code| json(allocator, .{ .kind = "unknown", .code = @as(?u32, code) }),
         else => json(allocator, .{ .kind = @tagName(primary), .code = @as(?u32, null) }),
     };
@@ -143,8 +143,8 @@ fn termination(allocator: Allocator, value: ?std.process.Child.Term) !Value {
     const item = value orelse return json(allocator, .{ .kind = @as(?[]const u8, null), .code = @as(?u32, null) });
     return switch (item) {
         .exited => |code| json(allocator, .{ .kind = "exited", .code = @as(?u32, code) }),
-        .signal => |signal| json(allocator, .{ .kind = "signal", .code = @as(?u32, @intFromEnum(signal)) }),
-        .stopped => |signal| json(allocator, .{ .kind = "stopped", .code = @as(?u32, @intFromEnum(signal)) }),
+        .signal => |signal| json(allocator, .{ .kind = "signal", .code = @as(?u32, @backingInt(signal)) }),
+        .stopped => |signal| json(allocator, .{ .kind = "stopped", .code = @as(?u32, @backingInt(signal)) }),
         .unknown => |code| json(allocator, .{ .kind = "unknown", .code = @as(?u32, code) }),
     };
 }
@@ -371,7 +371,7 @@ pub fn execute(allocator: Allocator, io: std.Io, request: Request) !Outcome {
     }
     const combined = try std.mem.concat(a, u8, &.{ result.stdout, result.stderr });
     const capped = combined[0..@min(combined.len, selected.output_limit + 1)];
-    const log_name = try std.fmt.allocPrint(a, "{s}.log", .{@tagName(request.stage)});
+    const log_name = try a.print("{s}.log", .{@tagName(request.stage)});
     try create(io, request.private_dir, log_name, capped);
 
     const primary_value = try kind(a, result.primary);
@@ -512,7 +512,7 @@ pub fn execute(allocator: Allocator, io: std.Io, request: Request) !Outcome {
             .result = public_result,
         },
     });
-    const record_name = try std.fmt.allocPrint(a, "command-{s}.json", .{@tagName(request.stage)});
+    const record_name = try a.print("command-{s}.json", .{@tagName(request.stage)});
     if (plan.isValidator(request.stage) != request.private_record)
         return error.InvalidCommandRecordLocation;
     try create(io, request.evidence_dir, record_name, try canonical(a, command_record));

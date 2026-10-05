@@ -64,6 +64,9 @@ MIB = 1024 * 1024
 MIZ_REVISION = "669a27982b376311f558e820b69e9a692735b0cd"
 MIZ_PACKAGE_HASH = "miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx"
 MIZ_URL = "git+https://github.com/cataggar/miz.git#" + MIZ_REVISION
+HISTORICAL_MIZ_REVISION = "669a27982b376311f558e820b69e9a692735b0cd"
+HISTORICAL_MIZ_PACKAGE_HASH = "miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx"
+HISTORICAL_MIZ_URL = "git+https://github.com/cataggar/miz.git#" + HISTORICAL_MIZ_REVISION
 SOURCE_MAX_ENTRIES = 40_000
 SOURCE_MAX_BYTES = 2 * 1024 * MIB
 SOURCE_MAX_FILE = 256 * MIB
@@ -2649,7 +2652,7 @@ def production_command_contract(stage, profile=CURRENT_PROFILE):
                 command_path("work", "dependencies/zig-pkg"),
                 command_literal("--prefix"),
                 command_path("work", "tools"),
-                command_literal("-Doptimize=ReleaseSafe"),
+                command_literal("-Doptimize=safe"),
                 command_literal("-j2"),
                 command_literal("test-unit"),
                 command_literal("install"),
@@ -2673,7 +2676,7 @@ def production_command_contract(stage, profile=CURRENT_PROFILE):
                 command_path("work", "dependencies/zig-pkg"),
                 command_literal("--prefix"),
                 command_path("work", "tools"),
-                command_literal("-Doptimize=ReleaseSafe"),
+                command_literal("-Doptimize=safe"),
                 command_literal("-j2"),
                 command_literal("install"),
             ],
@@ -2812,7 +2815,7 @@ def production_command_contract(stage, profile=CURRENT_PROFILE):
                 command_path("work", "public-source/tools"),
                 *(command_literal(value)
                   for value in RECORDED_EXECUTABLE_TARGET),
-                command_literal("-Doptimize=ReleaseSafe"),
+                command_literal("-Doptimize=safe"),
                 command_literal("-j2"),
                 command_literal("install"),
             ],
@@ -2946,6 +2949,14 @@ def validate_supervised_command_binding(
       and supervisor["bootstrap"] is False,
       "invalid supervised command binding")
     request = supervisor["request"]
+    if transport_context == "trusted_inner_zip" and isinstance(request, dict):
+        historical_argv = [
+            command_literal("-Doptimize=ReleaseSafe")
+            if item == command_literal("-Doptimize=safe") else item
+            for item in contract["argv"]
+        ]
+        if request.get("argv") == historical_argv:
+            contract = {**contract, "argv": historical_argv}
     digest_fields = {
         "canonical_sha256", "argv_sha256",
         "environment_sha256", "cwd_sha256",
@@ -4390,7 +4401,7 @@ def dependency_custody(root):
                 "sha256": manifest_digest.hexdigest(),
             },
             "hash_verification": {
-                "algorithm": "zig-0.16.0-fetch-path",
+                "algorithm": "zig-0.17.0-fetch-path",
                 "count": len(hash_records),
                 "sha256": hashlib.sha256(
                     compact_json(hash_records)).hexdigest(),
@@ -4521,7 +4532,7 @@ def build_command_supervisor(runtime, root, packages, expected_inputs):
         "--system", packages, "--prefix", root / "supervisor",
         "-Dsource-closure-sha256=" + source_map["content_closure_sha256"],
         *RECORDED_EXECUTABLE_TARGET,
-        "-Doptimize=ReleaseSafe", "-j2", "install",
+        "-Doptimize=safe", "-j2", "install",
     ], 900, evidence=False, input_records=records, allow_bootstrap=True)
     require(command["known_error_markers"] == [],
             "command supervisor build reported an error")
@@ -4669,7 +4680,7 @@ def check_build():
             and identity.get("variant", "tiny") == "tiny"
             and identity.get("jit_mode") is None
             and identity["compiler_profile"] == "unikraft-x86_64"
-            and identity["zig_version"] == "0.16.0"
+            and identity["zig_version"] == "0.17.0"
             and identity["minimal_wasi"] is False, "not the pinned tiny producer")
     names = {"embedded.c", "identity.h", "libwamr-aot.a", "tiny.cwasm",
              "tiny.wasm", "wamr_aot.h", "wamrc"}
@@ -5074,15 +5085,15 @@ def build(runtime, wamr):
         evidence=False, input_records=consumer_records)
     del unused_record
     version = read(version_path, 65)
-    require(version.strip() == b"0.16.0", "Zig 0.16.0 required")
+    require(version.strip() == b"0.17.0", "Zig 0.17.0 required")
     run_custodied(runtime, bootstrap, root, "adapter", [
         tool("zig"), "build", "--build-file", HERE / "build.zig",
         "--system", packages, "--prefix", root / "tools",
-        "-Doptimize=ReleaseSafe", "-j2", "test-unit", "install"], 900)
+        "-Doptimize=safe", "-j2", "test-unit", "install"], 900)
     run_custodied(runtime, bootstrap, root, "local-boot-tool", [
         tool("zig"), "build", "--build-file", LOCAL_BOOT / "build.zig",
         "--system", packages, "--prefix", root / "tools",
-        "-Doptimize=ReleaseSafe", "-j2", "install"], 900)
+        "-Doptimize=safe", "-j2", "install"], 900)
     consumer_inputs = consumer_input_state(runtime)
     COMMAND_ENVIRONMENT.update(bind_command_tools(consumer_inputs))
     os.environ.update(COMMAND_ENVIRONMENT)

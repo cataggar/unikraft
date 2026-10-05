@@ -15,12 +15,12 @@ pub fn build(b: *std.Build) void {
     const sdk = b.dependency("wamr", .{
         .profile = @as([]const u8, if (variant == .snapshot or variant == .tiny) "unikraft-aot" else "unikraft-jit"),
         .target = target,
-        .optimize = std.builtin.OptimizeMode.ReleaseSafe,
+        .optimize = std.lang.Optimize.safe,
     });
     const root = if (variant == .tiny and !coremark) sdk.module("wamr-aot") else b.createModule(.{
         .root_source_file = b.path(if (variant == .tiny) "wasi.zig" else if (variant == .snapshot) "snapshot.zig" else "sampler.zig"),
         .target = target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .single_threaded = true,
         .red_zone = false,
         .stack_check = false,
@@ -32,10 +32,21 @@ pub fn build(b: *std.Build) void {
     });
     root.addIncludePath(b.path("."));
     root.addIncludePath(b.path("../artifacts"));
+    if (variant != .tiny or coremark) {
+        const translated = b.addTranslateC(.{
+            .root_source_file = b.path("workloads.h"),
+            .target = target,
+            .optimize = .safe,
+            .link_libc = false,
+        });
+        translated.addIncludePath(b.path("."));
+        translated.addIncludePath(b.path("../artifacts"));
+        root.addImport("workloads_c", translated.createModule());
+    }
     if (variant != .tiny) root.addAnonymousImport("workload-artifacts", .{
         .root_source_file = b.path("artifacts.zig"),
         .target = target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     });
     if (variant == .snapshot or coremark) {
         root.addImport("wamr-aot", sdk.module("wamr-aot"));

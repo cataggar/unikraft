@@ -1966,7 +1966,7 @@ class Contract(unittest.TestCase):
     def test_build_refuses_development_and_optional_images(self):
         identity = {
             "wamr_revision": ci.REVISION, "minimal_wasi": False,
-            "compiler_profile": "unikraft-x86_64", "zig_version": "0.16.0",
+            "compiler_profile": "unikraft-x86_64", "zig_version": "0.17.0",
             "variant": "tiny", "development_only": False, "jit_mode": None,
         }
         for key, value in (("development_only", True), ("variant", "snapshot"),
@@ -3932,7 +3932,7 @@ class Evidence(unittest.TestCase):
         def execute_direct(root, stage, args, *unused, **unused_keywords):
             self.assertEqual(stage, "zig-version")
             path = root / "private/zig-version.log"
-            path.write_bytes(b"0.16.0\n")
+            path.write_bytes(b"0.17.0\n")
             return path, {}
 
         original_supervisor = ci.COMMAND_SUPERVISOR_PATH
@@ -3974,13 +3974,13 @@ class Evidence(unittest.TestCase):
                         ({"/tools/zig": "/tools/zig"}, ())),
                 }),
                 ("bounded_subprocess_output", {
-                    "return_value": b"0.16.0\n"}),
+                    "return_value": b"0.17.0\n"}),
                 ("tool", {
                     "side_effect": lambda name: "/tools/" + name}),
             ):
                 stack.enter_context(mock.patch.object(ci, name, **kwargs))
             stack.enter_context(mock.patch.object(
-                ci.subprocess, "check_output", return_value=b"0.16.0\n"))
+                ci.subprocess, "check_output", return_value=b"0.17.0\n"))
             ci.build(runtime, self.root)
         ci.COMMAND_TOOL_PATHS.clear()
         ci.COMMAND_TOOL_PATHS.update(original_tools)
@@ -4222,6 +4222,35 @@ class Evidence(unittest.TestCase):
         return root, packages, mock.patch.object(
             ci, "tracked_manifest", side_effect=manifest_record)
 
+    def test_historical_dependency_import_keeps_its_producer_pin(self):
+        root, _, tracked = self.dependency_fixture()
+        with tracked:
+            current = ci.dependency_custody(root)
+        historical = copy.deepcopy(current)
+        historical["packages"]["hash_verification"]["algorithm"] = (
+            "zig-0.16.0-fetch-path")
+        sources = {
+            name: item["source"]
+            for name, item in historical["source_manifests"].items()
+        }
+        with (mock.patch.object(
+                public_bundle, "trusted_source_manifests", return_value=sources),
+              mock.patch.object(ci, "MIZ_REVISION", "b" * 40),
+              mock.patch.object(ci, "MIZ_PACKAGE_HASH", "miz-0.2.0-new-current"),
+              mock.patch.object(ci, "MIZ_URL", "git+https://example.invalid#new")):
+            public_bundle.dependency_record(ci, historical, {})
+            with self.assertRaises(ValueError):
+                public_bundle.dependency_record(ci, current, {})
+            altered = copy.deepcopy(historical)
+            altered["request"]["package_hash"] = ci.MIZ_PACKAGE_HASH
+            with self.assertRaises(ValueError):
+                public_bundle.dependency_record(ci, altered, {})
+            altered = copy.deepcopy(historical)
+            altered["packages"]["hash_verification"]["algorithm"] = (
+                "zig-0.15.2-fetch-path")
+            with self.assertRaises(ValueError):
+                public_bundle.dependency_record(ci, altered, {})
+
     def test_restore_manifest_requires_exact_miz_revision_hash_and_one_pin(self):
         valid = (
             '.{ .dependencies = .{ .miz_source = .{ '
@@ -4338,7 +4367,7 @@ class Evidence(unittest.TestCase):
     .name = .fixture,
     .version = "0.0.0",
     .fingerprint = 0x5e540eeabebe342,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{},
     .paths = .{""},
 }
@@ -4946,7 +4975,7 @@ source/generated/
             [arg for arg in args if str(arg).startswith(("-Dtarget=", "-Dcpu="))],
             list(target),
         )
-        self.assertIn("-Doptimize=ReleaseSafe", args)
+        self.assertIn("-Doptimize=safe", args)
 
     def test_public_validator_build_and_contract_pin_portable_target(self):
         target = ("-Dtarget=x86_64-linux-gnu", "-Dcpu=x86_64_v2")
@@ -4978,7 +5007,7 @@ source/generated/
             [arg for arg in args if str(arg).startswith(("-Dtarget=", "-Dcpu="))],
             list(target),
         )
-        self.assertIn("-Doptimize=ReleaseSafe", args)
+        self.assertIn("-Doptimize=safe", args)
         record, identities = self.supervised_binding("public-validator-build")
         argv = record["supervisor"]["request"]["argv"]
         for flag in target:
@@ -4998,6 +5027,29 @@ source/generated/
                         public_bundle.supervised_command_record(
                             ci, changed, "public-validator-build", identities,
                             "trusted_inner_zip")
+
+    def test_historical_optimize_flags_are_import_only(self):
+        for stage in ("adapter", "local-boot-tool", "public-validator-build"):
+            with self.subTest(stage=stage):
+                record, identities = self.supervised_binding(stage)
+                request = record["supervisor"]["request"]
+                current = ci.command_literal("-Doptimize=safe")
+                index = request["argv"].index(current)
+                request["argv"][index] = ci.command_literal(
+                    "-Doptimize=ReleaseSafe")
+                self.rehash_supervised_binding(record)
+                ci.validate_supervised_command_binding(
+                    record, stage, identities,
+                    transport_context="trusted_inner_zip")
+                with self.assertRaises(ci.Refusal):
+                    ci.validate_supervised_command_binding(
+                        record, stage, identities)
+                request["argv"][index] = ci.command_literal("-Doptimize=fast")
+                self.rehash_supervised_binding(record)
+                with self.assertRaises(ci.Refusal):
+                    ci.validate_supervised_command_binding(
+                        record, stage, identities,
+                        transport_context="trusted_inner_zip")
 
     def test_native_wamr_command_binding_refuses_rehashed_tamper(self):
         for stage in ("prepare", "config", "native-image"):

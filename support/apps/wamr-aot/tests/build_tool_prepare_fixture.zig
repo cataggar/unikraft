@@ -79,7 +79,7 @@ fn run(init: std.process.Init) !void {
     if (arguments.len >= 2 and std.mem.eql(u8, arguments[1], "version")) {
         try failIfSelected(init, "version");
         var stdout = std.Io.File.stdout().writer(init.io, &.{});
-        try stdout.interface.writeAll("0.16.0\n");
+        try stdout.interface.writeAll("0.17.0\n");
         return;
     }
     if (arguments.len >= 2 and std.mem.eql(u8, arguments[1], "compile")) {
@@ -92,7 +92,7 @@ fn run(init: std.process.Init) !void {
             allocator,
             .limited(1024 * 1024),
         );
-        const encoded = try std.fmt.allocPrint(allocator, "fixture-cwasm:{s}", .{bytes});
+        const encoded = try allocator.print("fixture-cwasm:{s}", .{bytes});
         try writeFile(init.io, output, encoded, 0o600);
         return;
     }
@@ -125,15 +125,13 @@ fn run(init: std.process.Init) !void {
             const member_name = if (init.environ_map.get(
                 "WAMR_PREPARE_FIXTURE_ARCHIVE_PATH_DEPENDENT",
             ) != null)
-                try std.fmt.allocPrint(
-                    allocator,
+                try allocator.print(
                     "member-name={s}\n",
                     .{init.environ_map.get("ZIG_LOCAL_CACHE_DIR") orelse return error.MissingCache},
                 )
             else
                 "";
-            const payload = try std.fmt.allocPrint(
-                allocator,
+            const payload = try allocator.print(
                 "fixture-library variant={s} coremark={s}\n{s}",
                 .{ variant, coremark, member_name },
             );

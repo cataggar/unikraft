@@ -27,6 +27,10 @@ pub const wamr_revision = "a53205d77be3b880eb8f8b96679512ba58e2331a";
 pub const miz_revision = "669a27982b376311f558e820b69e9a692735b0cd";
 pub const miz_package_hash = "miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx";
 pub const miz_url = "git+https://github.com/cataggar/miz.git#" ++ miz_revision;
+pub const historical_miz_revision = "669a27982b376311f558e820b69e9a692735b0cd";
+pub const historical_miz_package_hash = "miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx";
+pub const historical_miz_url = "git+https://github.com/cataggar/miz.git#" ++ historical_miz_revision;
+pub const historical_wamr_revision = "a53205d77be3b880eb8f8b96679512ba58e2331a";
 pub const roles = [_][]const u8{
     ".d",                          ".zig-cache", "support/apps/wamr-aot/.config",
     "support/apps/wamr-aot/build",

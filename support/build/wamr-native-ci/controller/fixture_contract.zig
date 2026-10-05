@@ -25,7 +25,7 @@ fn expected(allocator: std.mem.Allocator) ![]u8 {
         const stdout = switch (scenario) {
             .ok => "native fixture ok\n",
             .partial => "partial private output\n",
-            .overflow => &([_]u8{'X'} ** 33),
+            .overflow => &@as([33]u8, @splat('X')),
             else => "",
         };
         const stderr = switch (scenario) {
