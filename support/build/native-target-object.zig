@@ -146,8 +146,8 @@ pub fn execute(
             target_module.addCMacro(macro.name, macro.value);
         }
         if (planned.object.c_translation) |translation| {
-            const translate_c = @import("translate-c");
-            const dependency = b.dependency("translate-c", .{
+            const translate_c = @import("translate_c");
+            const dependency = b.dependency("translate_c", .{
                 .target = b.graph.host,
                 .optimize = .safe,
             });

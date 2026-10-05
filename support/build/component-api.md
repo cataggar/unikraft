@@ -23,7 +23,7 @@ frame-pointer policy. `native-target-object.zig` materializes those entries as
 `LazyPath` objects with libc disabled, no red zone, no stack checks or
 unwinding, single-threaded runtime assumptions, and trap-on-panic behavior.
 An optional `c_translation` declares C header names and the Zig import name
-(default `config`). The pinned `translate-c` build dependency translates a
+(default `config`). The pinned `translate_c` build dependency translates a
 generated C wrapper before compilation; the same global/object include roots,
 macros, target and generated-file bindings apply to translation. Generated
 headers are tracked inputs of the translator, not configure-time files or

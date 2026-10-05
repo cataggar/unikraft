@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
@@ -86,15 +87,27 @@ def tracked_config(zig, base, work):
     if installed.read_text(encoding="utf-8") != "other\n":
         raise SystemExit("warm configuration cache reused replaced .config contents")
     config.unlink()
-    expect_build(zig, fixture, work, arguments, "configuration failed")
+    expect_build(zig, fixture, work, arguments, "FileNotFound")
 
 
 def live_trust(zig, base, work):
+    identity = hashlib.sha256(os.fsencode(work)).hexdigest()[:16]
+    backend_dir = base / f".target-config-backend-{identity}"
+    backend_dir.mkdir(mode=0o700)
+    try:
+        live_trust_fixture(zig, base, work, backend_dir)
+    finally:
+        shutil.rmtree(backend_dir)
+
+
+def live_trust_fixture(zig, base, work, backend_dir):
     app = work / "application"
     app.mkdir()
     recorded = work / "make-argv"
-    source = work / "record-make.c"
-    make = work / "record-make"
+    # Cache directories may be writable by other users; the backend policy
+    # correctly rejects executables beneath such ancestors.
+    source = backend_dir / "record-make.c"
+    make = backend_dir / "record-make"
     source.write_text(
         "#include <stdio.h>\n"
         "int main(int argc, char **argv) {\n"
@@ -105,7 +118,7 @@ def live_trust(zig, base, work):
         encoding="utf-8",
     )
     subprocess.run(
-        [zig, "cc", "-static", "-O2", str(source), "-o", str(make)],
+        [zig, "cc", "-O2", str(source), "-o", str(make)],
         cwd=base, env=build_environment(work), check=True,
     )
     make.chmod(0o700)
