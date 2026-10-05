@@ -524,6 +524,8 @@ def command_environment(root, input_records=None, extra=None, *, stage=None):
     if stage in {"prepare", "config", "native-image"}:
         environment["ZIG_LOCAL_PKG_DIR"] = str(
             Path(root) / "dependencies/zig-pkg")
+    if stage not in {"dependency-restore", "prepare", "config", "native-image"}:
+        environment.pop("ZIG_LOCAL_PKG_DIR", None)
     return environment
 
 
@@ -3592,7 +3594,7 @@ def bootstrap_execute(root, stage, args, seconds, limit, cwd, evidence,
             "bootstrap command output exceeded",
             "bootstrap command timed out",
             "bootstrap command failed",
-            env=command_environment(root, input_records),
+            env=command_environment(root, input_records, stage=stage),
             pass_fds=pass_fds,
         )
     with output.open("xb") as stream:

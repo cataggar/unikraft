@@ -764,6 +764,10 @@ That statement concerns the root translator only: raw SDK preparation also
 requires the immutable WABT and wasip2 closure from the qualified SDK manifest,
 restored and authenticated before source/admission custody. Preparation never
 fetches a missing SDK package implicitly.
+Zig 0.17 gives `ZIG_LOCAL_PKG_DIR` precedence over the `--system` directory.
+Root and preparation helpers therefore bind both to the same authenticated
+depot. Other fixed bootstrap/tool environments remove that variable instead
+of forwarding ambient or extra package-directory overrides.
 Historical command records retain their original environment through the
 explicit historical import selector, never current producer admission.
 Before reading package content it enumerates and snapshots the complete bounded

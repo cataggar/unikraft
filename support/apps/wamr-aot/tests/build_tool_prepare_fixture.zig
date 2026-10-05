@@ -119,8 +119,9 @@ fn run(init: std.process.Init) !void {
         return;
     }
     if (contains(arguments, "build")) {
-        if (!contains(arguments, "--system") or init.environ_map.get("ZIG_LOCAL_PKG_DIR") == null)
-            return error.MissingOfflinePackages;
+        const package_path = optionAfter(arguments, "--system") orelse return error.MissingOfflinePackages;
+        if (!std.mem.eql(u8, package_path, init.environ_map.get("ZIG_LOCAL_PKG_DIR") orelse ""))
+            return error.UnboundOfflinePackages;
         const prefix = optionAfter(arguments, "--prefix") orelse return error.MissingPrefix;
         if (contains(arguments, "native-aot-fixture")) {
             try failIfSelected(init, "compiler-build");

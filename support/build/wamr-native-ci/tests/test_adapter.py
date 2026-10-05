@@ -4133,6 +4133,17 @@ class Evidence(unittest.TestCase):
         self.assertNotIn(
             "ZIG_LOCAL_PKG_DIR",
             ci.command_environment(self.root, stage="adapter"))
+        with mock.patch.dict(os.environ, {"ZIG_LOCAL_PKG_DIR": "/untrusted/ambient"}):
+            for stage in ("adapter", "local-boot-tool", "supervisor-build"):
+                self.assertNotIn("ZIG_LOCAL_PKG_DIR", ci.command_environment(
+                    self.root, extra={"ZIG_LOCAL_PKG_DIR": "/untrusted/extra"},
+                    stage=stage))
+            for stage in ("dependency-restore", "prepare", "config", "native-image"):
+                self.assertEqual(
+                    ci.command_environment(
+                        self.root, extra={"ZIG_LOCAL_PKG_DIR": "/untrusted/extra"},
+                        stage=stage)["ZIG_LOCAL_PKG_DIR"],
+                    str(self.root / "dependencies/zig-pkg"))
 
     def test_dependency_paths_refuse_outside_or_missing_repository_without_leak(self):
         manifests = {
@@ -4980,11 +4991,25 @@ source/generated/
                     ci.execute(
                         self.root, "public-validator-build",
                         [PYTHON, "-c", "print('must not run')"])
-            output, record = ci.execute(
-                self.root, "dependency-restore",
-                [PYTHON, "-c", "print('bootstrap')"],
-                allow_bootstrap=True)
-            self.assertEqual(output.read_bytes(), b"bootstrap\n")
+            with mock.patch.dict(
+                    os.environ, {"ZIG_LOCAL_PKG_DIR": "/untrusted/ambient"}), \
+                    mock.patch.dict(
+                        ci.COMMAND_ENVIRONMENT,
+                        {"ZIG_LOCAL_PKG_DIR": "/untrusted/global"}):
+                output, record = ci.execute(
+                    self.root, "dependency-restore",
+                    [PYTHON, "-c",
+                     "import os; print(os.environ['ZIG_LOCAL_PKG_DIR'])"],
+                    allow_bootstrap=True)
+                self.assertEqual(
+                    output.read_bytes(),
+                    (str(self.root / "dependencies/zig-pkg") + "\n").encode())
+                clean_output, _ = ci.execute(
+                    self.root, "supervisor-build",
+                    [PYTHON, "-c",
+                     "import os; print('ZIG_LOCAL_PKG_DIR' in os.environ)"],
+                    allow_bootstrap=True)
+                self.assertEqual(clean_output.read_bytes(), b"False\n")
             self.assertTrue(record["supervisor"]["bootstrap"])
             for stage in (
                     "dependency-restore-extra", "dependency-hash",
