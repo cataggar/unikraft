@@ -170,6 +170,11 @@ unchanged manifests, then repeats SDK fetch-all before its fixture executions.
 Failed limit qualification removes the checkout; successful limits leave it
 for the controller gate's cleanup. No fixture execution is moved outside the
 controller gate, and its 15-minute deadline remains unchanged.
+The test graph preallocates the native and Python contract scratch parents
+before any fixture runs, and completes source-limit fixtures before controller
+custody capture. Contract goldens may still run in parallel within their
+existing scratch parents, but cannot add siblings to a recorded tool's cache
+ancestor during revalidation. All ancestor metadata checks remain enforced.
 Reader fixtures stage a single-link private copy of real Git and its real ELF
 interpreter, relocating only `PT_INTERP` while preserving Git's loaded code and
 bundled-library search paths. This gives both system and bundled Git an actual

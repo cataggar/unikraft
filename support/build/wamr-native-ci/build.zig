@@ -394,6 +394,7 @@ pub fn build(b: *std.Build) void {
     const source_limits_run = b.addRunArtifact(source_limits_tests);
     b.step("test-controller-limits", "Run native source-custody production boundary fixtures")
         .dependOn(&source_limits_run.step);
+    controller_run.step.dependOn(&source_limits_run.step);
     controller_step.dependOn(&source_limits_run.step);
     const fault_parity_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -481,6 +482,20 @@ pub fn build(b: *std.Build) void {
     authority_step.dependOn(&authority_python_goldens.step);
     controller_step.dependOn(&authority_contracts_run.step);
     controller_step.dependOn(&authority_python_goldens.step);
+    // Parallel goldens must not create ancestors of recorded controller tools.
+    const contract_fixture_dirs = b.addSystemCommand(&.{ "mkdir", "-p", "-m", "0700", "--" });
+    contract_fixture_dirs.has_side_effects = true;
+    for ([_][]const u8{ "tmp", "handoff-export-tests", "handoff-python-goldens", "authority-contract-work" }) |name|
+        contract_fixture_dirs.addArg(b.pathJoin(&.{ handoff_fixture_root, name }));
+    for ([_]*std.Build.Step{
+        &controller_run.step,
+        &controller_direct.step,
+        &source_limits_run.step,
+        &handoff_contracts_run.step,
+        &handoff_python_goldens.step,
+        &authority_contracts_run.step,
+        &authority_python_goldens.step,
+    }) |step| step.dependOn(&contract_fixture_dirs.step);
     const tests = b.addTest(.{ .root_module = root });
     const unit_tests = b.addRunArtifact(tests);
     const unit_step = b.step("test-unit", "Test the compute packaging adapter command boundary");
