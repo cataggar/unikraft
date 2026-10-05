@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 const std = @import("std");
 const controller = @import("wamr_controller");
+const handoff = @import("wamr_handoff");
 
 pub fn main(init: std.process.Init) void {
     _ = std.os.linux.syscall1(.umask, 0o077);
@@ -108,6 +109,54 @@ pub fn main(init: std.process.Init) void {
             command.expected_boot_inputs_sha256.?,
             &signal,
         ) catch |err| failed(init.io, @tagName(command.action), "", err);
+        return;
+    }
+    if (command.action == .@"private-export") {
+        const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
+        var signal = controller.build_pipeline.installCancellation() catch refused(init.io);
+        defer signal.deinit();
+        switch (handoff.export_state.run(.{
+            .allocator = allocator,
+            .io = init.io,
+            .environ = init.minimal.environ,
+            .runtime_path = command.runtime.?,
+            .repository_path = repository,
+            .output_path = command.output.?,
+            .signal = &signal,
+        })) {
+            .success => {},
+            .refused, .poisoned => |diagnostic| {
+                var stderr = std.Io.File.stderr().writerStreaming(init.io, &.{});
+                stderr.interface.print(
+                    "WAMR_CI_FAILED_STAGE: private-export/{s}; cause: {s}; publication: {s}; private partial state retained; no resume.\n",
+                    .{ @tagName(diagnostic.phase), @errorName(diagnostic.err), @tagName(diagnostic.publication) },
+                ) catch {};
+                std.process.exit(1);
+            },
+        }
+        std.Io.File.stdout().writeStreamingAll(init.io, "Private handoff exported; authority=not_admitted.\n") catch refused(init.io);
+        return;
+    }
+    if (command.action == .@"private-validate") {
+        const stage = @tagName(command.action);
+        const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
+        const root = command.stage_root.?;
+        const directory = controller.layout.runtime(init.io, root) catch refused(init.io);
+        defer directory.close(init.io);
+        var signal = controller.build_pipeline.installCancellation() catch refused(init.io);
+        defer signal.deinit();
+        var bundle = controller.accepted_run.PrivateBundle.open(
+            allocator,
+            init.io,
+            &directory,
+            root,
+            repository,
+            .{ .git = command.git.?, .supervisor = command.supervisor.?, .validator = command.validator.? },
+            &signal,
+        ) catch |err| failed(init.io, stage, "", err);
+        defer bundle.deinit();
+        controller.import_validator_build.runPrivate(allocator, init.io, &bundle, command.output.?, &signal) catch |err| failed(init.io, stage, "", err);
+        std.Io.File.stdout().writeStreamingAll(init.io, "Compute handoff revalidated; authority=not_admitted.\n") catch refused(init.io);
         return;
     }
     if (command.action == .@"supervisor-import-identity") {
@@ -292,6 +341,7 @@ pub fn main(init: std.process.Init) void {
         .@"import-validator-build" => unreachable,
         .@"import-native-revalidation" => unreachable,
         .@"import-handoff-revalidation" => unreachable,
+        .@"private-export", .@"private-validate" => unreachable,
     }
 }
 
@@ -307,6 +357,8 @@ fn usage(io: std.Io) noreturn {
             "       uk-wamr-native-ci records --runtime ABS --output handoff-v1\n" ++
             "       uk-wamr-native-ci records --stage-root ABS --transport trusted-inner-zip --output handoff-v1\n" ++
             "       uk-wamr-native-ci import-handoff-revalidation --stage-root ABS --git ABS --supervisor ABS --validator ABS --output ABS\n" ++
+            "       uk-wamr-native-ci private-export --runtime ABS --output ABS\n" ++
+            "       uk-wamr-native-ci private-validate --stage-root ABS --git ABS --supervisor ABS --validator ABS --output ABS\n" ++
             "       uk-wamr-native-ci local-consumer-custody --runtime ABS --expected-build-start-sha256 HEX --expected-boot-inputs-sha256 HEX\n" ++
             "       uk-wamr-native-ci handoff-inspect --runtime ABS --output ABS\n" ++
             "       uk-wamr-native-ci handoff-inspect-legacy --runtime ABS --output ABS\n" ++

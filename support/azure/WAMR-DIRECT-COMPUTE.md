@@ -184,6 +184,36 @@ python3 support/build/wamr-native-ci/handoff.py candidate \
   --output "$PRIVATE_PARENT/FRESH-non-authorizing-candidate.json"
 ```
 
+The Python publication sequence above remains the production caller.
+The separately qualified local-only native private product surface is:
+
+```sh
+# In the retained producer checkout; outputs must not already exist.
+uk-wamr-native-ci private-export \
+  --runtime "$RUNTIME" --output "$PRIVATE_PARENT/FRESH-native-handoff"
+# In the clean current reader checkout matching the native executable.
+uk-wamr-native-ci private-validate \
+  --stage-root "$PRIVATE_PARENT/FRESH-native-handoff" --git "$GIT" \
+  --supervisor "$NATIVE_CONTROLLER" --validator "$DIRECT_VALIDATOR" \
+  --output "$PRIVATE_PARENT/FRESH-native-validation"
+```
+
+This authenticates genuine private `bundle.json`, physical records, available
+producer Git revision/tree and source maps, the current reader checkout,
+caller-supplied native supervisor/validator and their ELF runtime identities.
+Validation runs the retained supervised direct-validator adapter and rechecks
+custody afterwards; invoking the lower-level `handoff` validator alone is not
+equivalent to the complete product owner. Export preserves frozen v1/v2
+dispatch, original package inspection, private create-only copies and durable
+publication. Missing historical supervisor custody still refuses.
+V2 export retains the existing three `GITHUB_*` run identity inputs.
+Only successful commands print the fixed private-export/revalidation line with
+`authority=not_admitted`; failures retain partial state, logs and available
+diagnostics and cannot resume or retry in place. Preserve an ambiguous visible
+publication even when its command failed.
+No public ZIP, import/transport, candidate product, workflow/local caller
+cutover, Python retirement, approval, deployment or Azure command is enabled.
+
 `export` rechecks the actual source/build/tool inputs, all original result
 record hashes, each original request/report/raw serial, and a real physical
 native package reload under the existing 150-second/64-KiB inspection bound.

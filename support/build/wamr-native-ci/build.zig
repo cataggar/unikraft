@@ -10,6 +10,18 @@ fn handoffContracts(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
     });
 }
 
+fn handoffModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, core: *std.Build.Module, controller: *std.Build.Module) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("handoff/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = core },
+            .{ .name = "wamr_controller", .module = controller },
+        },
+    });
+}
+
 fn wamrAotBuild(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Dependency {
     return b.dependency("wamr_aot_build", .{ .target = target, .optimize = optimize });
 }
@@ -138,7 +150,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("controller/portable_main.zig"),
             .target = portable_target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "wamr_controller", .module = controller_module }},
+            .imports = &.{
+                .{ .name = "wamr_controller", .module = controller_module },
+                .{ .name = "wamr_handoff", .module = handoffModule(b, portable_target, optimize, portable_core, controller_module) },
+            },
         }),
     });
     b.installArtifact(controller_cli);
@@ -241,7 +256,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("controller/main.zig"),
             .target = b.graph.host,
             .optimize = optimize,
-            .imports = &.{.{ .name = "wamr_controller", .module = host_controller }},
+            .imports = &.{
+                .{ .name = "wamr_controller", .module = host_controller },
+                .{ .name = "wamr_handoff", .module = handoffModule(b, b.graph.host, optimize, host_core, host_controller) },
+            },
         }),
     });
     // Producer import requires an installable ReleaseSafe supervisor.
@@ -291,7 +309,10 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("controller/main.zig"),
                 .target = b.graph.host,
                 .optimize = .ReleaseSafe,
-                .imports = &.{.{ .name = "wamr_controller", .module = import_controller }},
+                .imports = &.{
+                    .{ .name = "wamr_controller", .module = import_controller },
+                    .{ .name = "wamr_handoff", .module = handoffModule(b, b.graph.host, .ReleaseSafe, import_core, import_controller) },
+                },
             }),
         });
     };

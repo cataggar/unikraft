@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import resource
 import shutil
 import struct
 import subprocess
@@ -480,6 +481,111 @@ def chain(ci, evidence, compute, source, package, boots, images):
          records={name: ref(name) for name in names}, modes=list(ci.SIX_MODES), boots=boots)
 
 
+def private_cli(source, work, controller, validator):
+    """Exercise real product processes and the retained Python export oracle."""
+    source, work = map(Path, (source, work))
+    repository, runtime = work / "producer", work / "runtime"
+    os.chdir(repository)
+    os.environ.update(WAMR_CI_CONTROLLER=controller,
+                      GITHUB_REPOSITORY="cataggar/unikraft",
+                      GITHUB_RUN_ID="1", GITHUB_RUN_ATTEMPT="1")
+    handoff = load("private_cli_oracle", source / "support/build/wamr-native-ci/handoff.py")
+    handoff.ci.REPO = repository
+    handoff.ci.APP = repository / "support/apps/wamr-aot"
+    handoff.ci.LOCAL_BOOT = repository / "support/tools/hyperv/local_boot"
+    native, oracle = work / "native-private-export", work / "python-private-export"
+    export_argv = [controller, "private-export", "--runtime", str(runtime),
+                   "--output", str(native)]
+    result = subprocess.run(export_argv, capture_output=True, timeout=900)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == b"Private handoff exported; authority=not_admitted.\n"
+    assert not result.stderr
+    handoff.export(runtime, oracle)
+    actual, expected = (json.loads((path / "bundle.json").read_bytes())
+                        for path in (native, oracle))
+    for key in ("artifacts", "evidence"):
+        for entry in expected[key]:
+            entry["path"] = str(native / Path(entry["path"]).relative_to(oracle))
+    for boot in expected["boots"]:
+        for key in ("serial", "request", "report", "compute"):
+            entry = boot[key]
+            entry["path"] = str(native / Path(entry["path"]).relative_to(oracle))
+    assert encoded(actual) == encoded(expected), "native/Python private manifest parity"
+    for entry in actual["artifacts"] + actual["evidence"]:
+        path = Path(entry["path"]).relative_to(native)
+        assert (native / path).read_bytes() == (oracle / path).read_bytes(), path
+    for boot in actual["boots"]:
+        for key in ("serial", "request", "report", "compute"):
+            path = Path(boot[key]["path"]).relative_to(native)
+            assert (native / path).read_bytes() == (oracle / path).read_bytes(), path
+    before = (native / "bundle.json").read_bytes()
+    replay = subprocess.run(export_argv, capture_output=True, timeout=900)
+    assert replay.returncode == 1 and not replay.stdout, replay
+    assert (native / "bundle.json").read_bytes() == before
+    start = json.loads((runtime / "compute/evidence/build-start.json").read_bytes())
+    git = start["consumer_inputs"]["files"]["tool:git"]["path"]
+
+    def validate(bundle, output, **kwargs):
+        return subprocess.run(
+            [controller, "private-validate", "--stage-root", str(bundle),
+             "--git", git, "--supervisor", controller, "--validator", validator,
+             "--output", str(output)], cwd=source,
+            capture_output=True, timeout=900, **kwargs)
+
+    output = work / "native-private-validation"
+    checked = validate(native, output)
+    assert checked.returncode == 0, checked.stderr
+    assert checked.stdout == b"Compute handoff revalidated; authority=not_admitted.\n"
+    assert not checked.stderr
+    command = output / "evidence/command-import-native-revalidation.json"
+    saved = command.read_bytes()
+    replay = validate(native, output)
+    assert replay.returncode == 1 and not replay.stdout
+    assert command.read_bytes() == saved
+    assert not (native / "portable-bundle.json").exists()
+    assert not (native / "public-source.json").exists()
+
+    # Rehash the serial member's private manifest entry, not a public envelope.
+    serial = Path(actual["boots"][0]["serial"]["path"])
+    original = serial.read_bytes()
+    serial.write_bytes(original + b"tampered\n")
+    actual["boots"][0]["serial"].update(size=serial.stat().st_size,
+                                      sha256=digest(serial))
+    save(native / "bundle.json", actual)
+    refused_output = work / "rehashed-private-refusal"
+    refused = validate(native, refused_output)
+    assert refused.returncode == 1 and not refused.stdout, refused
+    assert not refused_output.exists()
+    serial.write_bytes(original)
+    (native / "bundle.json").write_bytes(before)
+
+    def io_fault():
+        resource.setrlimit(resource.RLIMIT_FSIZE, (1, 1))
+
+    partial = work / "private-validation-io-fault"
+    failed = validate(native, partial, preexec_fn=io_fault)
+    assert failed.returncode != 0 and not failed.stdout, failed
+    assert partial.is_dir(), failed.stderr
+    assert (partial / "private").is_dir()
+    retry = validate(native, partial)
+    assert retry.returncode == 1 and not retry.stdout, retry
+    export_partial = work / "private-export-io-fault"
+    failed = subprocess.run(
+        [controller, "private-export", "--runtime", str(runtime),
+         "--output", str(export_partial)],
+        capture_output=True, timeout=900, preexec_fn=io_fault)
+    assert failed.returncode != 0 and not failed.stdout, failed
+    assert export_partial.is_dir(), failed.stderr
+    assert not (export_partial / "bundle.json").exists()
+    retry = subprocess.run(
+        [controller, "private-export", "--runtime", str(runtime),
+         "--output", str(export_partial)], capture_output=True, timeout=900)
+    assert retry.returncode == 1 and not retry.stdout
+    assert not (export_partial / "bundle.json").exists()
+    print("private product CLI: 83-member Python parity, v2 validation, rehashed "
+          "tamper, replay and real file-size I/O faults passed", file=sys.stderr)
+
+
 def mutate(work, case):
     work = Path(work)
     repository, runtime = work / "producer", work / "runtime"
@@ -645,5 +751,7 @@ if __name__ == "__main__":
         stage_git(*sys.argv[2:])
     elif sys.argv[1] == "mutate":
         mutate(*sys.argv[2:])
+    elif sys.argv[1] == "private-cli":
+        private_cli(*sys.argv[2:])
     else:
         raise AssertionError(sys.argv[1])

@@ -400,6 +400,7 @@ pub fn runPrivate(
     const parent = try files.openDirectory(io, parent_path, .private);
     defer parent.close(io);
     try parent.createDir(io, name, .fromMode(0o700));
+    try syncDirectory(io, parent);
     const work = try files.openDirectory(io, output, .private);
     defer work.close(io);
     for ([_][]const u8{ "private", "evidence" }) |entry|
@@ -408,6 +409,32 @@ pub fn runPrivate(
     defer private.close(io);
     const evidence = try work.openDir(io, "evidence", .{ .iterate = true });
     defer evidence.close(io);
+    try syncDirectory(io, private);
+    try syncDirectory(io, evidence);
+    try syncDirectory(io, work);
+    var lock = try (files.Directory{ .dir = private }).lock(io);
+    defer lock.close(io);
+    var anchor = try files.RetainedFile.open(io, try std.fs.path.join(allocator, &.{ output, "private/.writer.lock" }), .private);
+    defer anchor.close(io);
+    try syncDirectory(io, private);
+    errdefer |err| {
+        if (anchor.verify(io)) |_| {
+            const raw = std.json.Stringify.valueAlloc(allocator, .{
+                .phase = "private_validation",
+                .outcome = "poisoned",
+                .err = @errorName(err),
+                .authority = "not_admitted",
+            }, .{}) catch null;
+            if (raw) |bytes| {
+                defer allocator.free(bytes);
+                const canonical = records.canonicalAlloc(allocator, bytes) catch null;
+                if (canonical) |diagnostic| {
+                    defer allocator.free(diagnostic);
+                    _ = lock.createImmutable(io, "failed-private-validation.json", diagnostic) catch {};
+                }
+            }
+        } else |_| {}
+    }
     try bundle.revalidate(signal);
     _ = try revalidateHandoffCommand(allocator, io, .{
         .source_root = bundle.evidence.repository.?,
@@ -423,6 +450,17 @@ pub fn runPrivate(
         .tools = @splat(""),
     }, private, evidence, signal);
     try bundle.revalidate(signal);
+    try anchor.verify(io);
+    try syncDirectory(io, evidence);
+    try syncDirectory(io, private);
+    try syncDirectory(io, work);
+    try syncDirectory(io, parent);
+    try bundle.revalidate(signal);
+    try anchor.verify(io);
+}
+
+fn syncDirectory(io: std.Io, directory: std.Io.Dir) !void {
+    try (std.Io.File{ .handle = directory.handle, .flags = .{ .nonblocking = false } }).sync(io);
 }
 
 fn get(value: std.json.Value, key: []const u8) !std.json.Value {

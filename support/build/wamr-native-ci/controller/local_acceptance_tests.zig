@@ -183,6 +183,21 @@ pub fn qualify(a: std.mem.Allocator, io: std.Io, stage: []const u8) !void {
             }
             try std.testing.expect(std.mem.indexOf(u8, refused.stderr, "MissingInput") != null);
             try std.testing.expectError(error.FileNotFound, std.Io.Dir.openDirAbsolute(io, output, .{}));
+            const export_refused = try std.process.run(a, io, .{
+                .argv = &.{ options.host_controller_cli, "private-export", "--runtime", runtime, "--output", output },
+                .cwd = .{ .path = repository },
+                .stdout_limit = .limited(4096),
+                .stderr_limit = .limited(4096),
+            });
+            try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, export_refused.term);
+            try std.testing.expectEqualStrings("", export_refused.stdout);
+            try std.testing.expect(std.mem.indexOf(u8, export_refused.stderr, "MissingInput") != null);
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.openDirAbsolute(io, output, .{}));
+        } else {
+            try python(a, io, &.{
+                "private-cli",               options.repository_root,  work,
+                options.host_controller_cli, options.import_validator,
+            });
         }
         {
             var signal = try controller.build_pipeline.installCancellation();

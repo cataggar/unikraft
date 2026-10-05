@@ -4,6 +4,40 @@ const controller = @import("wamr_controller");
 const core = @import("hyperv_core");
 const options = @import("test_options");
 
+test "private product CLI closes arguments and refuses unavailable custody without output" {
+    const cli = controller.cli;
+    const valid = [_][]const u8{
+        "uk-wamr-native-ci", "private-validate",   "--stage-root", "/private/bundle",
+        "--git",             "/private/git",       "--supervisor", "/private/controller",
+        "--validator",       "/private/validator", "--output",     "/private/validation",
+    };
+    _ = try cli.parse(&valid);
+    _ = try cli.parse(&.{ "uk-wamr-native-ci", "private-export", "--runtime", "/private/runtime", "--output", "/private/export" });
+    var missing = valid;
+    missing[8] = "--git";
+    try std.testing.expectError(error.InvalidUsage, cli.parse(&missing));
+    missing = valid;
+    missing[3] = "/private/../bundle";
+    try std.testing.expectError(error.InvalidUsage, cli.parse(&missing));
+    try std.testing.expectError(error.InvalidUsage, cli.parse(valid[0..10]));
+    try std.testing.expectError(error.InvalidUsage, cli.parse(&.{ "uk-wamr-native-ci", "private-export", "--runtime", "/private/runtime", "--output", "/private/export", "--resume", "true" }));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const runtime = try std.fs.path.join(a, &.{ options.fixture_root, "absent-private-product-runtime" });
+    const output = try std.fs.path.join(a, &.{ options.fixture_root, "refused-private-product-output" });
+    const result = try std.process.run(a, std.testing.io, .{
+        .argv = &.{ options.host_controller_cli, "private-export", "--runtime", runtime, "--output", output },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, result.term);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "private-export/runtime_opened") != null);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.openDirAbsolute(std.testing.io, output, .{}));
+}
+
 test "build command table has closed roles, order, deadlines and native executables" {
     const plan = controller.command_plan;
     const expected = [_]struct { stage: plan.Stage, seconds: u32, executable: []const u8 }{
@@ -3418,6 +3452,43 @@ test "trusted historical inner stage accepts complete records and refuses tamper
     const private_bytes = try fixtureCanonical(a, private_value);
     try writeFixtureFile(io, root, "bundle.json", private_bytes);
     try writeFixtureFile(io, root, "evidence/private-inspection-diagnostic.json", "{}\n");
+    {
+        // A private consumer must not need or adopt public envelopes.
+        try root.rename("portable-bundle.json", root, "saved-portable-envelope", io);
+        try root.rename("public-source.json", root, "saved-public-envelope", io);
+        defer {
+            root.rename("saved-portable-envelope", root, "portable-bundle.json", io) catch @panic("portable envelope restore failed");
+            root.rename("saved-public-envelope", root, "public-source.json", io) catch @panic("public envelope restore failed");
+        }
+        const cli_run_name = try std.fmt.allocPrint(a, "{s}-private-cli", .{name});
+        const cli_output = try std.fs.path.join(a, &.{ options.fixture_root, cli_run_name });
+        defer parent.deleteTree(io, cli_run_name) catch @panic("private CLI cleanup failed");
+        const argv = &[_][]const u8{
+            options.host_controller_cli, "private-validate",       "--stage-root", stage_root_path,
+            "--git",                     reader_git,               "--supervisor", options.host_controller_cli,
+            "--validator",               options.import_validator, "--output",     cli_output,
+        };
+        const private_cli_result = try std.process.run(a, io, .{
+            .argv = argv,
+            .cwd = .{ .path = reader_repository },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        if (private_cli_result.term != .exited or private_cli_result.term.exited != 0)
+            std.debug.print("private v1 CLI: {s}\n", .{private_cli_result.stderr});
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, private_cli_result.term);
+        try std.testing.expectEqualStrings("Compute handoff revalidated; authority=not_admitted.\n", private_cli_result.stdout);
+        try std.testing.expectEqualStrings("", private_cli_result.stderr);
+        const replay = try std.process.run(a, io, .{
+            .argv = argv,
+            .cwd = .{ .path = reader_repository },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, replay.term);
+        try std.testing.expectEqualStrings("", replay.stdout);
+        try std.testing.expect(std.mem.indexOf(u8, replay.stderr, "PathAlreadyExists") != null);
+    }
     {
         var private_bundle = try controller.accepted_run.PrivateBundle.open(a, io, &directory, stage_root_path, reader_repository, local_tools, null);
         defer private_bundle.deinit();
