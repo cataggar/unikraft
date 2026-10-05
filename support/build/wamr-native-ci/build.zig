@@ -268,6 +268,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
     controller_options.addOptionPath("command_fixture", command_fixture.getEmittedBin());
+    const noop_fixture = b.addExecutable(.{
+        .name = "wamr-ci-noop-test-command",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("controller/noop_fixture.zig"),
+            .target = b.graph.host,
+            .optimize = .safe,
+            .strip = true,
+        }),
+    });
+    controller_options.addOptionPath("noop_fixture", noop_fixture.getEmittedBin());
     const controller_run = b.addRunArtifact(controller_tests);
     const controller_direct = b.addSystemCommand(&.{"/usr/bin/env"});
     controller_direct.addFileArg(controller_tests.getEmittedBin());

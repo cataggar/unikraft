@@ -918,6 +918,12 @@ a second controller acceptance implementation. Native export produces only v2;
 the literal historical v1 layouts remain read-only compatibility.
 `test-controller-limits`, `test-controller-fault-parity`,
 `test-differential-records`, and `test-handoff-contracts` run those suites separately.
+Executable-custody and pre-spawn fixtures use a build-produced native no-op ELF,
+not an ambient `/usr/bin/true`. The no-op is built in `safe` without debug symbols
+to retain the existing fixture size bound; the test runners retain their selected
+`debug` or `safe` mode. Executable admission, retained-descriptor and cancellation
+policies are unchanged. Keep the test executable and fixture artifacts under the
+canonical, owner-only private qualification root.
 The neutral v1/v2 fixture constructors in `tests/controller_record_fixtures.py`
 remain available to #187/#189. `test_differential_parity.DeterministicContracts`
 is only a compatibility import of their neutral byte tests, not a controller

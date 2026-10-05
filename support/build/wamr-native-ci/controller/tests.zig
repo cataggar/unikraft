@@ -244,7 +244,7 @@ fn handoffInspectFixtures() !void {
     defer a.free(efi);
     const executable = try std.fs.path.resolve(a, &.{ options.repository_root, options.command_fixture });
     defer a.free(executable);
-    const bound_tool = try std.Io.Dir.realPathFileAbsoluteAlloc(io, "/usr/bin/true", a);
+    const bound_tool = try std.Io.Dir.realPathFileAbsoluteAlloc(io, options.noop_fixture, a);
     defer a.free(bound_tool);
     try copyFixtureExecutable(io, a, executable, tools_bin, "wamr-ci-package");
     try copyFixtureExecutable(io, a, bound_tool, supervisor_bin, "wamr-ci-supervisor");
@@ -1079,7 +1079,7 @@ fn directSharedSupervisorFixtures() !void {
     defer a.free(fixture_root);
     const executable = try std.fs.path.resolve(a, &.{ options.repository_root, options.command_fixture });
     defer a.free(executable);
-    const bound_tool = try std.Io.Dir.realPathFileAbsoluteAlloc(io, "/usr/bin/true", a);
+    const bound_tool = try std.Io.Dir.realPathFileAbsoluteAlloc(io, options.noop_fixture, a);
     defer a.free(bound_tool);
     const fixture_dir = try parent.openDir(io, name, .{ .iterate = true });
     defer fixture_dir.close(io);
@@ -2553,7 +2553,7 @@ fn legacyHandoffInspectLiveFixture() !void {
     const package_json = try writeCanonicalValue(io, evidence, "package.json", a, package_value);
 
     const executable = try std.fs.path.resolve(a, &.{ options.repository_root, options.command_fixture });
-    const bound_tool = try std.Io.Dir.realPathFileAbsoluteAlloc(io, "/usr/bin/true", a);
+    const bound_tool = try std.Io.Dir.realPathFileAbsoluteAlloc(io, options.noop_fixture, a);
     try copyFixtureExecutable(io, a, executable, tools_bin, "wamr-ci-package");
     var host_tool_paths: [controller.input_custody.host_tools.len][]const u8 = undefined;
     for (controller.input_custody.host_tools, 0..) |tool, i| {
@@ -4460,7 +4460,7 @@ test "native command refuses changed executable after use and retains failed rec
         try file.writePositionalAll(io, binary, 0);
         try file.sync(io);
     }
-    const bound_tool = try std.Io.Dir.realPathFileAbsoluteAlloc(io, "/usr/bin/true", a);
+    const bound_tool = try std.Io.Dir.realPathFileAbsoluteAlloc(io, options.noop_fixture, a);
     defer a.free(bound_tool);
     const repeated = @as([controller.input_custody.host_tools.len][]const u8, @splat(bound_tool));
     const runner_path = try std.fs.path.join(a, &.{ work, "runner" });
