@@ -1342,9 +1342,9 @@ test "trusted import authenticates relocated native tools without producer files
         try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, cloned.term);
     }
     checkpoint = "copy tools";
-    try copyFixtureExecutable(io, a, options.host_controller_cli, producer, "controller");
-    try copyFixtureExecutable(io, a, options.host_controller_cli, destination, "controller");
-    try copyFixtureExecutable(io, a, options.host_controller_cli, destination, "supervisor");
+    try copyFixtureExecutable(io, a, options.host_import_controller_cli, producer, "controller");
+    try copyFixtureExecutable(io, a, options.host_import_controller_cli, destination, "controller");
+    try copyFixtureExecutable(io, a, options.host_import_controller_cli, destination, "supervisor");
     try copyFixtureExecutable(io, a, options.import_validator, destination, "validator");
     try copyFixtureExecutable(io, a, options.git_executable, producer, "git");
     {

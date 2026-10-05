@@ -243,6 +243,57 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "wamr_controller", .module = host_controller }},
         }),
     });
+    // Producer import requires an installable ReleaseSafe supervisor.
+    // Keep the selected profile for the other CLI fixtures and test modules.
+    const host_import_cli = if (optimize == .ReleaseSafe) host_cli else blk: {
+        const import_core = b.createModule(.{
+            .root_source_file = b.path("../../tools/hyperv/core.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        });
+        if (b.graph.host.result.cpu.arch == .x86_64)
+            import_core.addAssemblyFile(b.path("../../tools/hyperv/sha256_clear_upper.S"));
+        const import_serial = b.createModule(.{
+            .root_source_file = b.path("../../tools/hyperv/local_boot/serial.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "hyperv_core", .module = import_core }},
+        });
+        const import_validator = b.createModule(.{
+            .root_source_file = b.path("../../apps/wamr-aot/validator/root.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "hyperv_core", .module = import_core },
+                .{ .name = "local_boot_serial", .module = import_serial },
+            },
+        });
+        const import_controller = b.createModule(.{
+            .root_source_file = b.path("controller/root.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "hyperv_core", .module = import_core },
+                .{ .name = "wamr_log_validator", .module = import_validator },
+                .{ .name = "controller_source_closure", .module = b.createModule(.{
+                    .root_source_file = b.path("../../controller_source_closure.zig"),
+                    .target = b.graph.host,
+                    .optimize = .ReleaseSafe,
+                }) },
+                .{ .name = "import_validator_identity", .module = host_identity },
+                .{ .name = "handoff_contracts", .module = handoffContracts(b, b.graph.host, .ReleaseSafe, import_core) },
+            },
+        });
+        break :blk b.addExecutable(.{
+            .name = "uk-wamr-native-ci-host-import-fixture",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("controller/main.zig"),
+                .target = b.graph.host,
+                .optimize = .ReleaseSafe,
+                .imports = &.{.{ .name = "wamr_controller", .module = import_controller }},
+            }),
+        });
+    };
     const host_cli_run = b.addRunArtifact(host_cli);
     if (b.args) |args| host_cli_run.addArgs(args);
     b.step("run-controller-fixture", "Run host controller CLI for bounded CLI fixtures")
@@ -286,6 +337,7 @@ pub fn build(b: *std.Build) void {
     });
     controller_tests.root_module.addOptions("test_options", controller_options);
     controller_options.addOptionPath("host_controller_cli", host_cli.getEmittedBin());
+    controller_options.addOptionPath("host_import_controller_cli", host_import_cli.getEmittedBin());
     controller_options.addOptionPath("import_validator", host_direct.getEmittedBin());
     const fixture_host = b.addExecutable(.{
         .name = "wamr-native-ci-fixtures-host-test",

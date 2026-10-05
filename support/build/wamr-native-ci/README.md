@@ -160,6 +160,13 @@ by the unchanged 64 MiB tool limit rather than a distro-specific small file size
 The controller test runner omits debug sections because it is itself pinned as
 a supervisor under that limit; Debug safety checks and all frozen test
 declarations remain unchanged.
+The relocated producer-import fixture uses the genuine native controller in
+its installable ReleaseSafe profile, including its imported modules, even when
+the test runner uses Debug. Its supervisor must fit the separate unchanged
+16 MiB import-runtime bound; stripping a Debug CLI alone is insufficient.
+Other CLI fixtures and native test modules retain the selected optimization
+profile. ReleaseSafe reuses the existing CLI artifact; Debug adds one genuine
+ReleaseSafe CLI build, not a mock identity executable.
 Read-only Python-v2 custody checks bind the complete recorded producer checkout,
 not the newer reader's compiled source bytes, and recapture the original input
 roles and physical identities unchanged. The production local-consumer probe
