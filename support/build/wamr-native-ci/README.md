@@ -289,7 +289,8 @@ Only that validated frozen-v1 compatibility selects the distinct bounded
 Ordinary current revalidation retains `handoff` and the `Compute` marker;
 neither route accepts the other's command binding or success marker. Fresh
 Python v1 import revalidation uses the same explicit historical verb and marker.
-Original producer records and Zig 0.16 SDK identities are never rewritten.
+Original producer records, Zig 0.16 SDK identities, and frozen Miz packaging
+revisions are never rewritten.
 The Python-owned archive/operator plumbing remains until its separate wiring
 cutover; merely adding this operation does not retire the Python controller.
 

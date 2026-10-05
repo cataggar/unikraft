@@ -1581,7 +1581,7 @@ fn verifyImportedEvidence(self: *AcceptedRun, portable: std.json.Value) !void {
         try vhd.verify(self.io);
         const footer_sha = std.fmt.bytesToHex(records.fileIdentity(&footer), .lower);
         try equal(try text(try get(packaged, "footer_sha256")), &footer_sha);
-        try equal(try text(try get(packaged, "miz_revision")), limits.miz_revision);
+        try equal(try text(try get(packaged, "miz_revision")), if (old) limits.historical_miz_revision else limits.miz_revision);
         try sameJson(a, try get(packaged, "packaging"), try valueOf(a, .{
             .architecture = "x86_64",
             .@"boot-file-sha256" = efi_file.sha256,
