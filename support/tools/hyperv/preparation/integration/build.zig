@@ -32,6 +32,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run = b.addRunArtifact(tests);
+    run.has_side_effects = true;
     run.setCwd(std.Build.LazyPath.cache_root);
     b.step("test", "Run non-executing integration argument/material fixtures").dependOn(&run.step);
 }

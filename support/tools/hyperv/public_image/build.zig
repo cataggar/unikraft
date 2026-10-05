@@ -62,6 +62,7 @@ pub fn build(b: *std.Build) void {
     }), .filters = filters });
     tests.root_module.addOptions("test_options", options);
     const run_tests = b.addRunArtifact(tests);
+    run_tests.has_side_effects = true;
     b.step("test", "Test native public packaging/export without real guest boots").dependOn(&run_tests.step);
     const hash_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("../sha256_tests.zig"),
@@ -83,7 +84,9 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "public_image", .module = module }},
     }), .filters = filters });
     import_tests.root_module.addOptions("test_options", import_options);
-    b.step("test-import", "Test physical native import and reload without guests or networking").dependOn(&b.addRunArtifact(import_tests).step);
+    const run_import_tests = b.addRunArtifact(import_tests);
+    run_import_tests.has_side_effects = true;
+    b.step("test-import", "Test physical native import and reload without guests or networking").dependOn(&run_import_tests.step);
     const measurement = b.createModule(.{
         .root_source_file = b.path("../synthetic_measurement.zig"),
         .target = target,

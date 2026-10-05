@@ -396,3 +396,5 @@ python3 support/tools/hyperv/public_image/configure_cache_tests.py \
 
 It uses fresh private synthetic sources and the actual package build script,
 then removes its own directory. No guest, network or cloud resource is used.
+Filesystem-custody fixture runs are deliberately uncached: a previous successful
+run is not a substitute for current no-follow, metadata and source validation.

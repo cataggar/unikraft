@@ -433,7 +433,7 @@ pub fn validateBindingStructure(allocator: std.mem.Allocator, binding: Binding) 
 
 fn validateNativeStructure(allocator: std.mem.Allocator, native_tools: []const NativeBinding, git: ToolBinding) !void {
     if (native_tools.len == 0 or native_tools.len > @typeInfo(Alias).@"enum".field_names.len) return error.DependencyUnavailable;
-    var seen = std.EnumSet(Alias).initEmpty();
+    var seen = std.EnumSet(Alias).empty;
     for (native_tools) |native| {
         if (seen.contains(native.name)) return error.InvalidRuntime;
         seen.insert(native.name);

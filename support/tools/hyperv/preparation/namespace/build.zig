@@ -106,6 +106,7 @@ pub fn build(b: *std.Build) void {
     }) });
     gate_tests.step.dependOn(&verifier.step);
     const run_gate_tests = b.addRunArtifact(gate_tests);
+    run_gate_tests.has_side_effects = true;
     run_gate_tests.setCwd(.{ .cwd_relative = workspace });
     b.step("test-strip-equivalence", "Test qualification-only ELF preservation and private file gates").dependOn(&run_gate_tests.step);
     const sample_raw = b.option([]const u8, "relayout-sample-raw", "Explicit read-only x64 regression data, never executed");
@@ -232,6 +233,7 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addOptions("test_options", test_options);
     tests.root_module.addImport("synthetic_measurement", measurement);
     const run = b.addRunArtifact(tests);
+    run.has_side_effects = true;
     run.step.dependOn(&exclusion.step);
     if (suite_gate) |check| run.step.dependOn(&check.step);
     run.setCwd(.{ .cwd_relative = workspace });
@@ -267,6 +269,7 @@ fn observationTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
     test_options.addOptionPath("internal_probe", internalProbe(b, target, optimize, workspace).getEmittedBin());
     tests.root_module.addOptions("test_options", test_options);
     const run = b.addRunArtifact(tests);
+    run.has_side_effects = true;
     run.setCwd(.{ .cwd_relative = workspace });
     b.step("test-observations", "Run only bounded observation format, phase, refusal and failure-retention tests").dependOn(&run.step);
     return run;
@@ -291,6 +294,7 @@ fn exclusionTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std
         },
     }) });
     const run = b.addRunArtifact(tests);
+    run.has_side_effects = true;
     run.setCwd(.{ .cwd_relative = workspace });
     b.step("test-observer-exclusion", "Compile hook-free shared roots and exercise only pre-IO refusals").dependOn(&run.step);
     return run;

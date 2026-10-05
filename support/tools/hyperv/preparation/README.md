@@ -858,6 +858,9 @@ node option, so the selected literal's AST source span is decoded with
 `fromSlice` only after complete-manifest ZonGen validation. Decoded strings and
 diagnostics belong to the declaration arena; selected values remain valid
 after AST/ZOIR and source cleanup until declaration comparison completes.
+Filesystem-custody test runs remain live on every build invocation rather than
+reusing an earlier test result for changed source, fixture or private-file
+metadata; compilation and generated-artifact caching remain available.
 
 Canonical JSON has sorted keys, exact fields/types and one final LF, included
 in document hashes. Duplicate/unknown/missing fields, noncanonical encodings,

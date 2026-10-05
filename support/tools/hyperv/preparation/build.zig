@@ -68,6 +68,7 @@ pub fn build(b: *std.Build) void {
     options.addOptionPath("preparation_cli", executable.getEmittedBin());
     tests.root_module.addOptions("test_options", options);
     const run = b.addRunArtifact(tests);
+    run.has_side_effects = true;
     run.setCwd(std.Build.LazyPath.cache_root);
     const test_step = b.step("test", "Run native synthetic preparation and provenance fixtures");
     test_step.dependOn(&run.step);
@@ -102,6 +103,7 @@ pub fn build(b: *std.Build) void {
     }) });
     seed_tests.root_module.addOptions("test_options", options);
     const seed_run = b.addRunArtifact(seed_tests);
+    seed_run.has_side_effects = true;
     seed_run.setCwd(std.Build.LazyPath.cache_root);
     const seed_step = b.step("test-original-seed", "Run bounded original-seed native fixtures (no full-size disks)");
     seed_step.dependOn(&seed_run.step);
@@ -115,6 +117,7 @@ pub fn build(b: *std.Build) void {
     }) });
     config_tests.root_module.addOptions("test_options", options);
     const config_run = b.addRunArtifact(config_tests);
+    config_run.has_side_effects = true;
     config_run.setCwd(std.Build.LazyPath.cache_root);
     const config_step = b.step("test-direct-config", "Run bounded direct configuration and custody fixtures");
     config_step.dependOn(&config_run.step);
