@@ -107,34 +107,52 @@ fn diagnoseInputs(a: std.mem.Allocator, io: std.Io, runtime: []const u8) !void {
     }
 }
 
-pub fn qualify(a: std.mem.Allocator, io: std.Io, stage: []const u8) !void {
-    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
-    defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "complete-local-{d}", .{std.os.linux.getpid()});
-    try parent.createDir(io, name, .fromMode(0o700));
-    defer parent.deleteTree(io, name) catch @panic("complete local fixture cleanup failed");
-    const root = try parent.openDir(io, name, .{ .iterate = true });
-    defer root.close(io);
-    const root_path = try std.fs.path.join(a, &.{ options.fixture_root, name });
-    const revisions = [_][]const u8{
-        "e98623f780fa23d05b5797004e4b88160404eb1b",
-        "0711a0b6bf2285a4ba6ab6dd3bd4088478d665e1",
-        "c9c00535399354063486957611bf6e09c8ae4592",
-        "3c6d5d98dc5736d86e97884184b26be39c3f11d5",
-    };
-    var matched = options.local_fixture_source.len == 0;
-    for (revisions) |revision| {
-        if (options.local_fixture_source.len != 0 and !std.mem.eql(u8, options.local_fixture_source, revision)) continue;
-        matched = true;
-        try root.createDir(io, revision, .fromMode(0o700));
-        const work = try std.fs.path.join(a, &.{ root_path, revision });
-        const repository = try std.fs.path.join(a, &.{ work, "producer" });
-        const runtime = try std.fs.path.join(a, &.{ work, ".d/wamr-native-runtime" });
+const Fixture = struct {
+    revision: []const u8,
+    work: []const u8,
+    repository: []const u8,
+    runtime: []const u8,
+    stage: []const u8,
+
+    fn prepare(self: Fixture, io: std.Io) !void {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
         try python(a, io, &.{
-            "prepare",                options.repository_root,    stage,                  work,                    revision,
+            "prepare",                options.repository_root,    self.stage,             self.work,               self.revision,
             options.git_executable,   options.python_executable,  options.zig_executable, options.command_fixture, options.miz_package,
             options.host_package_cli, options.host_log_validator, options.host_aot_build,
         });
+        std.debug.print("complete local {s}: prepared\n", .{self.revision});
+    }
+
+    fn cancellation(self: Fixture, io: std.Io) !void {
+        const directory = try controller.layout.runtime(io, self.runtime);
+        defer directory.close(io);
+        var signal = try controller.build_pipeline.installCancellation();
+        defer signal.deinit();
+        try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.kill(std.os.linux.getpid(), .INT)));
+        try std.testing.expectError(error.Cancelled, controller.accepted_run.openAndValidateReadOnlyWithSignal(
+            std.testing.allocator,
+            io,
+            .empty,
+            &directory,
+            self.runtime,
+            self.repository,
+            &signal,
+        ));
+    }
+
+    fn qualify(self: Fixture, io: std.Io) !void {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const revision = self.revision;
+        const work = self.work;
+        const repository = self.repository;
+        const runtime = self.runtime;
+        const root = try std.Io.Dir.openDirAbsolute(io, work, .{});
+        defer root.close(io);
         const directory = try controller.layout.runtime(io, runtime);
         defer directory.close(io);
         const v2 = std.mem.eql(u8, revision, "e98623f780fa23d05b5797004e4b88160404eb1b");
@@ -156,7 +174,7 @@ pub fn qualify(a: std.mem.Allocator, io: std.Io, stage: []const u8) !void {
             try std.testing.expectEqualStrings("", emitted.stderr);
             try compareHandoff(a, &accepted, emitted.stdout);
             if (v2) {
-                const raw = try root.readFileAlloc(io, try std.fs.path.join(a, &.{ revision, ".d/wamr-native-runtime/compute/evidence/build-start.json" }), a, .limited(controller.records.max_record_bytes));
+                const raw = try root.readFileAlloc(io, ".d/wamr-native-runtime/compute/evidence/build-start.json", a, .limited(controller.records.max_record_bytes));
                 const start = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{ .parse_numbers = false });
                 const source_map = start.object.get("command_supervisor").?.object.get("source_map").?;
                 _ = try controller.import_supervisor_identity.verifyGitSource(std.testing.allocator, io, accepted.source, repository, options.git_executable, source_map, null);
@@ -203,20 +221,6 @@ pub fn qualify(a: std.mem.Allocator, io: std.Io, stage: []const u8) !void {
                 options.host_controller_cli, options.import_validator,
             });
         }
-        {
-            var signal = try controller.build_pipeline.installCancellation();
-            defer signal.deinit();
-            try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.kill(std.os.linux.getpid(), .INT)));
-            try std.testing.expectError(error.Cancelled, controller.accepted_run.openAndValidateReadOnlyWithSignal(
-                std.testing.allocator,
-                io,
-                .empty,
-                &directory,
-                runtime,
-                repository,
-                &signal,
-            ));
-        }
         const cases = [_]struct { name: []const u8, expected: anyerror, v2_only: bool = false }{
             .{ .name = "source-custody", .expected = error.RecordedCustodyChanged },
             .{ .name = "dependency-custody", .expected = error.RecordedCustodyChanged },
@@ -256,7 +260,7 @@ pub fn qualify(a: std.mem.Allocator, io: std.Io, stage: []const u8) !void {
             }
             if (std.mem.eql(u8, case.name, "input-runtime")) {
                 try std.testing.expectError(error.RecordedCustodyChanged, accepted.revalidate());
-                const role = try root.readFileAlloc(io, try std.fs.path.join(a, &.{ revision, "mutated-runtime-role" }), a, .limited(4096));
+                const role = try root.readFileAlloc(io, "mutated-runtime-role", a, .limited(4096));
                 try std.testing.expectError(error.InputChanged, accepted.pinInput(role));
             }
             const refused = try cli(a, io, runtime, repository);
@@ -266,5 +270,88 @@ pub fn qualify(a: std.mem.Allocator, io: std.Io, stage: []const u8) !void {
         }
         std.debug.print("complete local {s}: constructor, recheck, CLI and refusals passed\n", .{revision});
     }
-    try std.testing.expect(matched);
+};
+
+fn together(io: std.Io, fixtures: []const Fixture, comptime operation: fn (Fixture, std.Io) anyerror!void) !void {
+    var index: usize = 0;
+    while (index < fixtures.len) : (index += 2) {
+        if (index + 1 == fixtures.len) {
+            try operation(fixtures[index], io);
+            return;
+        }
+        var other = try io.concurrent(operation, .{ fixtures[index + 1], io });
+        defer _ = other.cancel(io) catch {};
+        const first_result = operation(fixtures[index], io);
+        const other_result = other.await(io);
+        try first_result;
+        try other_result;
+    }
+}
+
+pub fn workerFailure(a: std.mem.Allocator, io: std.Io) !void {
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{});
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "complete-local-workers-{d}", .{std.os.linux.getpid()});
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("complete local worker cleanup failed");
+    const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    const probe = struct {
+        fn run(fixture: Fixture, worker_io: std.Io) !void {
+            const directory = try std.Io.Dir.openDirAbsolute(worker_io, fixture.work, .{});
+            defer directory.close(worker_io);
+            try std.Io.sleep(worker_io, .fromMilliseconds(20), .awake);
+            const file = try directory.createFile(worker_io, "drained", .{ .exclusive = true, .permissions = .fromMode(0o600) });
+            defer file.close(worker_io);
+            try file.writeStreamingAll(worker_io, "joined\n");
+        }
+    };
+    const fixtures = [_]Fixture{
+        .{ .revision = "", .work = try std.fs.path.join(a, &.{ path, "unavailable" }), .repository = "", .runtime = "", .stage = "" },
+        .{ .revision = "", .work = path, .repository = "", .runtime = "", .stage = "" },
+    };
+    try std.testing.expectError(error.FileNotFound, together(io, &fixtures, probe.run));
+    const directory = try std.Io.Dir.openDirAbsolute(io, path, .{});
+    defer directory.close(io);
+    try std.testing.expectEqualStrings("joined\n", try directory.readFileAlloc(io, "drained", a, .limited(64)));
+    try directory.deleteFile(io, "drained");
+    const reversed = [_]Fixture{ fixtures[1], fixtures[0] };
+    try std.testing.expectError(error.FileNotFound, together(io, &reversed, probe.run));
+    try std.testing.expectEqualStrings("joined\n", try directory.readFileAlloc(io, "drained", a, .limited(64)));
+}
+
+pub fn qualify(a: std.mem.Allocator, io: std.Io, stage: []const u8) !void {
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "complete-local-{d}", .{std.os.linux.getpid()});
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("complete local fixture cleanup failed");
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    const root_path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    const revisions = [_][]const u8{
+        "e98623f780fa23d05b5797004e4b88160404eb1b",
+        "0711a0b6bf2285a4ba6ab6dd3bd4088478d665e1",
+        "c9c00535399354063486957611bf6e09c8ae4592",
+        "3c6d5d98dc5736d86e97884184b26be39c3f11d5",
+    };
+    var fixtures: std.ArrayList(Fixture) = .empty;
+    defer fixtures.deinit(a);
+    for (revisions) |revision| {
+        if (options.local_fixture_source.len != 0 and !std.mem.eql(u8, options.local_fixture_source, revision)) continue;
+        // All common custody ancestors exist before any worker captures inputs.
+        try root.createDir(io, revision, .fromMode(0o700));
+        const work = try std.fs.path.join(a, &.{ root_path, revision });
+        try fixtures.append(a, .{
+            .revision = revision,
+            .work = work,
+            .repository = try std.fs.path.join(a, &.{ work, "producer" }),
+            .runtime = try std.fs.path.join(a, &.{ work, ".d/wamr-native-runtime" }),
+            .stage = stage,
+        });
+    }
+    try std.testing.expect(fixtures.items.len != 0);
+    try together(io, fixtures.items, Fixture.prepare);
+    // Signal dispositions belong to the process, not the concurrent workers.
+    for (fixtures.items) |fixture| try fixture.cancellation(io);
+    try together(io, fixtures.items, Fixture.qualify);
 }
