@@ -561,6 +561,17 @@ pub fn build(b: *std.Build) void {
     const pipeline_run = b.addRunArtifact(pipeline_tests);
     const pipeline_step = b.step("test-pipeline", "Run the real private raw-to-QCOW2-to-VHD pipeline fixtures");
     pipeline_step.dependOn(&pipeline_run.step);
+    const fixture_build = b.step("build-controller-fixtures", "Compile controller and package-boot fixture binaries without running them");
+    for ([_]*std.Build.Step.Compile{
+        controller_tests,
+        source_limits_tests,
+        fault_parity_tests,
+        install_target_tests,
+        record_goldens,
+        handoff_contracts,
+        authority_contracts,
+        pipeline_tests,
+    }) |artifact| fixture_build.dependOn(&artifact.step);
     const test_step = b.step("test", "Run unit and required private compute pipeline fixtures");
     test_step.dependOn(&unit_tests.step);
     test_step.dependOn(&pipeline_run.step);

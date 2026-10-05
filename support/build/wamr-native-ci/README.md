@@ -165,6 +165,11 @@ changing from the lazy default forest to a separately restored copy invalidates
 package helpers and their dependent test options even with a shared cache.
 The first gate restores that complete forest for its existing helper builds,
 with a private global-cache temporary directory for SDK ZIP downloads.
+The compile-only `build-controller-fixtures` target prepares all controller
+and package-boot test binaries alongside that mandatory limit gate. Every
+fixture invocation uses the same pipeline-root option so emitted test options
+and artifacts remain reusable. This target does not execute fixture cases;
+controller, pipeline and Python fixture execution stays in the later gate.
 The controller gate checks the exact checkout identity, cleanliness and both
 unchanged manifests, then repeats SDK fetch-all before its fixture executions.
 Failed limit qualification removes the checkout; successful limits leave it

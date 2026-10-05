@@ -113,7 +113,9 @@ jobs:
           ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
             zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
               --system "${restore_root}/zig-pkg" \
-              -Doptimize=ReleaseSafe -j2 test-controller-limits
+              -Doptimize=ReleaseSafe \
+              -Dtest-root="${RUNNER_TEMP}/wamr-controller-pipeline-root" \
+              -j2 test-controller-limits build-controller-fixtures
           retain_source=true
 
       - name: Exercise native controller, custody limits, and package-boot fixtures in an isolated x86 worktree
@@ -141,11 +143,15 @@ jobs:
           if ! ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
             zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
             --system "${restore_root}/zig-pkg" \
-            -Doptimize=ReleaseSafe -j2 test-controller; then
+            -Doptimize=ReleaseSafe \
+            -Dtest-root="${RUNNER_TEMP}/wamr-controller-pipeline-root" \
+            -j2 test-controller; then
             if ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
               zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
               --system "${restore_root}/zig-pkg" \
-              -Doptimize=ReleaseSafe -j1 test-controller-direct; then
+              -Doptimize=ReleaseSafe \
+              -Dtest-root="${RUNNER_TEMP}/wamr-controller-pipeline-root" \
+              -j1 test-controller-direct; then
               echo "Direct controller diagnostic passed after the gate failed" >&2
             else
               echo "Direct controller diagnostic also failed" >&2
