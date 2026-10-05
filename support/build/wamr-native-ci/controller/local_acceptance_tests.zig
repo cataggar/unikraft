@@ -24,6 +24,10 @@ pub fn stageGit(a: std.mem.Allocator, io: std.Io, target: []const u8) !void {
     try python(a, io, &.{ "stage-git", options.git_executable, target });
 }
 
+pub fn stagePython(a: std.mem.Allocator, io: std.Io, source: []const u8, target: []const u8) !void {
+    try python(a, io, &.{ "stage-python", source, target });
+}
+
 fn open(io: std.Io, directory: *const files.Directory, runtime: []const u8, repository: []const u8) !controller.accepted_run.AcceptedRun {
     return controller.accepted_run.openAndValidateReadOnlyWithSignal(
         std.testing.allocator,

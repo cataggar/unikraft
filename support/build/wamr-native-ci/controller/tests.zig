@@ -38,6 +38,51 @@ test "private product CLI closes arguments and refuses unavailable custody witho
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.openDirAbsolute(std.testing.io, output, .{}));
 }
 
+test "private fixture stages genuine shared Python before native tool custody" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "private-python-{d}", .{std.os.linux.getpid()});
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("private Python fixture cleanup failed");
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    const original = try std.Io.Dir.realPathFileAbsoluteAlloc(io, options.python_executable, a);
+    try copyFixtureExecutable(io, a, original, root, "shared-python");
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(
+        std.os.linux.linkat(root.handle, "shared-python", root.handle, "python-alias", 0),
+    ));
+    const shared = try std.fs.path.join(a, &.{ path, "shared-python" });
+    try std.testing.expectError(error.UnsafeFile, controller.command_adapter.openPinnedTool(io, shared, "tool:python3"));
+    const staged = try std.fs.path.join(a, &.{ path, "bin/python3" });
+    try @import("local_acceptance_tests.zig").stagePython(a, io, shared, staged);
+    var pinned = try controller.command_adapter.openPinnedTool(io, staged, "tool:python3");
+    defer pinned.close(io);
+    const before = try controller.custody_files.readFile(io, original, 64 * 1024 * 1024, false);
+    const after = try controller.custody_files.readFile(io, staged, 64 * 1024 * 1024, false);
+    try std.testing.expectEqualStrings(&before.sha256, &after.sha256);
+    const query = "import sysconfig; print(sysconfig.get_path('stdlib'))";
+    const expected = try std.process.run(a, io, .{
+        .argv = &.{ original, "-c", query },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    const actual = try std.process.run(a, io, .{
+        .argv = &.{ staged, "-c", query },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, expected.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, actual.term);
+    try std.testing.expectEqualStrings("", actual.stderr);
+    try std.testing.expectEqualStrings(expected.stdout, actual.stdout);
+    try pinned.verify(io);
+}
+
 test "build command table has closed roles, order, deadlines and native executables" {
     const plan = controller.command_plan;
     const expected = [_]struct { stage: plan.Stage, seconds: u32, executable: []const u8 }{

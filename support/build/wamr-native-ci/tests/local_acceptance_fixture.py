@@ -77,6 +77,10 @@ def stage_git(git, target):
     target.write_bytes(image)
 
 
+def stage_python(python, target):
+    copy_file(Path(python).resolve(strict=True), Path(target), True)
+
+
 def identity(record):
     dev, ino, mode, uid, unused_gid, unused_links, size, mtime, ctime = record["metadata"]
     return {
@@ -186,7 +190,8 @@ def prepare(args):
         if name == "git":
             path = local_git
         elif name == "python3":
-            path = Path(python).resolve(strict=True)
+            path = runtime / "host-tools/python3"
+            stage_python(python, path)
         elif name == "zig":
             path = runtime / "zig/zig"
             copy_file(zig, path, True)
@@ -766,6 +771,8 @@ if __name__ == "__main__":
         prepare(sys.argv[2:])
     elif sys.argv[1] == "stage-git":
         stage_git(*sys.argv[2:])
+    elif sys.argv[1] == "stage-python":
+        stage_python(*sys.argv[2:])
     elif sys.argv[1] == "mutate":
         mutate(*sys.argv[2:])
     elif sys.argv[1] == "private-cli":

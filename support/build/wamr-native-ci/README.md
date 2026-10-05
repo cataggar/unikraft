@@ -192,6 +192,11 @@ interpreter, relocating only `PT_INTERP` while preserving Git's loaded code and
 bundled-library search paths. This gives both system and bundled Git an actual
 owned runtime dependency for physical mutation tests without changing system
 libraries, weakening tool-file policy, or dropping any refusal case.
+Complete local fixtures also stage a byte-identical private copy of genuine
+Python before capturing tool, ELF-runtime and standard-library custody. System
+Python may have multiple hard links, which retained native post-run tools forbid.
+The regression keeps that refusal and verifies the staged executable's bytes,
+execution and unchanged standard-library path; it never changes system files.
 The relocated-tool and Python-free current-reader fixtures use the same private
 Git setup. Placeholder roles use the existing compiled native command fixture
 rather than assuming `/usr/bin/true` is ELF (some distributions install it as a
