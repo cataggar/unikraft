@@ -871,29 +871,29 @@ pub fn parentMetadata(a: std.mem.Allocator, bytes: []const u8, request: schema.R
     defer image.deinit();
     const section = try image.section(schema.section_name);
     const sh = section.header;
-    if ((sh.type != .NOTE and sh.type != .PROGBITS) or
-        sh.size < schema.note_prefix_bytes or sh.size > schema.max_note_bytes or
-        sh.addralign != schema.note_alignment or sh.addr % schema.note_alignment != 0 or
-        sh.offset % schema.note_alignment != 0 or
-        @as(u64, @bitCast(sh.flags)) & ~@as(u64, @as(u32, @bitCast(std.elf.SHF{ .ALLOC = true, .WRITE = true }))) != 0 or
-        (sh.type == .NOTE and sh.flags.shf.WRITE))
+    if ((sh.sh_type != @backingInt(std.elf.SHT.NOTE) and sh.sh_type != @backingInt(std.elf.SHT.PROGBITS)) or
+        sh.sh_size < schema.note_prefix_bytes or sh.sh_size > schema.max_note_bytes or
+        sh.sh_addralign != schema.note_alignment or sh.sh_addr % schema.note_alignment != 0 or
+        sh.sh_offset % schema.note_alignment != 0 or
+        sh.sh_flags & ~@as(u64, @as(u32, @bitCast(std.elf.SHF{ .ALLOC = true, .WRITE = true }))) != 0 or
+        (sh.sh_type == @backingInt(std.elf.SHT.NOTE) and sh.sh_flags & @as(u32, @bitCast(std.elf.SHF{ .WRITE = true })) != 0))
         return error.InvalidBuildMetadata;
     try image.requireLoadedSection(section);
     for (image.programs) |program| {
         if (program.type == .LOAD and program.flags.X and
-            sh.addr < program.vaddr + program.memsz and program.vaddr < sh.addr + sh.size)
+            sh.sh_addr < program.vaddr + program.memsz and program.vaddr < sh.sh_addr + sh.sh_size)
             return error.InvalidBuildMetadata;
     }
-    if (try image.symbol(schema.symbol_name) != sh.addr) return error.InvalidBuildMetadata;
+    if (try image.symbol(schema.symbol_name) != sh.sh_addr) return error.InvalidBuildMetadata;
     for (image.symbols) |symbol| {
         if (!std.mem.eql(u8, symbol.name, schema.symbol_name)) continue;
         const sym = symbol.header;
-        const binding = sym.info.bind;
+        const binding = sym.st_info >> 4;
         // The self-hosted linker localizes this export in its final executable.
-        if (sym.info.type != .OBJECT or
-            (binding != .GLOBAL and !(sh.type == .PROGBITS and binding == .LOCAL)) or @as(u8, @bitCast(sym.other)) != 0 or
-            sym.size != sh.size or @backingInt(sym.shndx) >= image.sections.len or
-            !std.mem.eql(u8, image.sections[@backingInt(sym.shndx)].name, schema.section_name))
+        if (sym.st_info & 15 != @backingInt(std.elf.STT.OBJECT) or
+            (binding != @backingInt(std.elf.STB.GLOBAL) and !(sh.sh_type == @backingInt(std.elf.SHT.PROGBITS) and binding == @backingInt(std.elf.STB.LOCAL))) or sym.st_other != 0 or
+            sym.st_size != sh.sh_size or sym.st_shndx >= image.sections.len or
+            !std.mem.eql(u8, image.sections[sym.st_shndx].name, schema.section_name))
             return error.InvalidBuildMetadata;
     }
     const data = try image.sectionData(section);
@@ -912,7 +912,7 @@ pub fn parentMetadata(a: std.mem.Allocator, bytes: []const u8, request: schema.R
     try literal(value.object.get("origin").?, "actual_tests_zig_compile_builtin");
     const observed = value.object.get("observed").?;
     if (observed != .object) return error.InvalidBuildMetadata;
-    if (sh.type == .PROGBITS) {
+    if (sh.sh_type == @backingInt(std.elf.SHT.PROGBITS)) {
         if (image.header.machine != .X86_64) return error.InvalidBuildMetadata;
         try literal(observed.object.get("zig_backend") orelse return error.InvalidBuildMetadata, "stage2_x86_64");
         try literal(observed.object.get("mode") orelse return error.InvalidBuildMetadata, "debug");
