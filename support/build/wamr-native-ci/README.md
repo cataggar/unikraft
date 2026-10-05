@@ -750,6 +750,13 @@ The restoration command's fresh environment binds
 the Python restoration command also uses the restore directory as its cwd.
 This is a per-restoration binding, not a process-global or CI-wide package
 directory override. No default `zig-pkg` may be introduced into source custody.
+The current config and native-image command bindings pass this same
+authenticated depot to the image helper as `ZIG_LOCAL_PKG_DIR`. The helper
+revalidates the immutable Translator/Aro closure before the root Build and
+passes `--system`; the current Miz closure already restores those exact
+packages transitively, so no additional manifest root is needed.
+Historical command records retain their original environment through the
+explicit historical import selector, never current producer admission.
 Before reading package content it enumerates and snapshots the complete bounded
 directory set, including `zig-pkg`, then requires the exact set and metadata
 after traversal. The restored tree rejects links, nonregular entries, unsafe

@@ -92,6 +92,7 @@ fn matchPlan(
     stage: plan.Stage,
     variant: PlanVariant,
     context: EvidenceContext,
+    historical_generation: bool,
 ) !void {
     const selected = plan.spec(stage);
     const argv = try get(request, "argv");
@@ -136,9 +137,14 @@ fn matchPlan(
     const environment = try get(request, "environment");
     const expected = try plan.environment(a, stage);
     defer plan.freeEnvironment(a, expected);
-    if (environment != .array or environment.array.items.len != expected.len)
+    const historical_root_packages = historical_generation and variant != .native and (stage == .config or stage == .@"native-image");
+    if (environment != .array or environment.array.items.len != expected.len - @as(usize, @intFromBool(historical_root_packages)))
         return error.InvalidCommand;
-    for (environment.array.items, expected) |observed, entry| {
+    var environment_index: usize = 0;
+    for (expected) |entry| {
+        if (historical_root_packages and std.mem.eql(u8, entry.name, "ZIG_LOCAL_PKG_DIR")) continue;
+        const observed = environment.array.items[environment_index];
+        environment_index += 1;
         try exact(observed, &.{ "name", "value" });
         try eq(try text(try get(observed, "name")), entry.name);
         try matchBinding(a, try get(observed, "value"), entry.value);
@@ -296,7 +302,17 @@ pub fn validate(
     stage: plan.Stage,
     context: EvidenceContext,
 ) !ValidatedCommand {
-    return validateWithProfile(a, record, stage, context);
+    return validateWithProfile(a, record, stage, context, false);
+}
+
+pub fn validateHistoricalGeneration(
+    a: std.mem.Allocator,
+    record: std.json.Value,
+    stage: plan.Stage,
+    context: EvidenceContext,
+) !ValidatedCommand {
+    if (context != .trusted_inner_zip) return error.InvalidCommand;
+    return validateWithProfile(a, record, stage, context, true);
 }
 
 pub fn validateLegacyV1(
@@ -307,7 +323,7 @@ pub fn validateLegacyV1(
 ) !ValidatedCommand {
     if (context != .local_runtime or stage != .@"handoff-inspect-legacy")
         return error.InvalidCommand;
-    return validateWithProfile(a, record, stage, context);
+    return validateWithProfile(a, record, stage, context, false);
 }
 
 fn validateWithProfile(
@@ -315,6 +331,7 @@ fn validateWithProfile(
     record: std.json.Value,
     stage: plan.Stage,
     context: EvidenceContext,
+    historical_generation: bool,
 ) !ValidatedCommand {
     try exact(record, &.{
         "scope",      "stage",               "exit_code",  "bytes", "sha256", "sha256_scope",
@@ -352,12 +369,12 @@ fn validateWithProfile(
     if (try num(u8, try get(request, "version")) != 1 or
         try num(u8, try get(request, "binding_version")) != 1) return error.InvalidCommand;
     const variant: PlanVariant = blk: {
-        matchPlan(a, request, stage, .native, context) catch |err| {
+        matchPlan(a, request, stage, .native, context, historical_generation) catch |err| {
             if (context == .local_runtime or err == error.OutOfMemory) return err;
-            if (matchPlan(a, request, stage, .historical_native, context)) |_| {
+            if (matchPlan(a, request, stage, .historical_native, context, historical_generation)) |_| {
                 break :blk .historical_native;
             } else |legacy_err| if (legacy_err == error.OutOfMemory) return legacy_err;
-            try matchPlan(a, request, stage, .historical_import, context);
+            try matchPlan(a, request, stage, .historical_import, context, historical_generation);
             break :blk .historical_import;
         };
         break :blk .native;

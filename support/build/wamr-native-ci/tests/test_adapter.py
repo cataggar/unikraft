@@ -4125,10 +4125,10 @@ class Evidence(unittest.TestCase):
         original = dict(ci.COMMAND_ENVIRONMENT)
         for name in ("restore-one", "restore-two"):
             root = self.root / name
-            environment = ci.command_environment(
-                root, stage="dependency-restore")
-            self.assertEqual(environment["ZIG_LOCAL_PKG_DIR"],
-                             str(root / "dependencies/zig-pkg"))
+            for stage in ("dependency-restore", "config", "native-image"):
+                environment = ci.command_environment(root, stage=stage)
+                self.assertEqual(environment["ZIG_LOCAL_PKG_DIR"],
+                                 str(root / "dependencies/zig-pkg"))
         self.assertEqual(ci.COMMAND_ENVIRONMENT, original)
         self.assertNotIn(
             "ZIG_LOCAL_PKG_DIR",
@@ -5194,6 +5194,34 @@ source/generated/
                 with self.assertRaises(ci.Refusal):
                     ci.validate_supervised_command_binding(
                         record, stage, changed_identities)
+
+    def test_root_depot_binding_is_current_and_historical_imports_remain_explicit(self):
+        for stage in ("config", "native-image"):
+            with self.subTest(stage=stage):
+                record, identities = self.supervised_binding(stage)
+                environment = record["supervisor"]["request"]["environment"]
+                selected = next(item for item in environment
+                                if item["name"] == "ZIG_LOCAL_PKG_DIR")
+                self.assertEqual(selected["value"],
+                                 ci.command_path("work", "dependencies/zig-pkg"))
+                legacy = copy.deepcopy(record)
+                legacy["supervisor"]["request"]["environment"] = [
+                    item for item in environment
+                    if item["name"] != "ZIG_LOCAL_PKG_DIR"
+                ]
+                self.rehash_supervised_binding(legacy)
+                for transport in ("producer_direct", "trusted_inner_zip"):
+                    with self.assertRaises(ci.Refusal):
+                        ci.validate_supervised_command_binding(
+                            legacy, stage, identities,
+                            transport_context=transport)
+                ci.validate_supervised_command_binding(
+                    legacy, stage, identities,
+                    transport_context="trusted_inner_zip",
+                    historical_generation=True)
+                with self.assertRaises(ci.Refusal):
+                    ci.validate_supervised_command_binding(
+                        legacy, stage, identities, historical_generation=True)
 
     def test_handoff_inspect_accepts_distinct_native_controller_supervisor_role(self):
         record, identities = self.supervised_binding("handoff-inspect")
@@ -7004,11 +7032,11 @@ source/generated/
         self.put(backend.parent.parent / "failure-error-name.txt",
                  b"InvalidToolOverride")
         self.put(backend.parent.parent / "failure-tool-role.txt", b"make")
-        ci.save(backend / "000-root-olddefconfig.json", {
+        ci.save(backend / "002-root-olddefconfig.json", {
             "stage": "root-olddefconfig",
             "primary": {"exited": 1},
         })
-        self.put(backend / "000-root-olddefconfig.stderr",
+        self.put(backend / "002-root-olddefconfig.stderr",
                  b"error: InvalidNativeMakePath\nPRIVATE_SYNTHETIC_STATE\n")
         ci.save(work / "report.json", {
             "passed": False, "cleanup_complete": True, "input_unchanged": True,

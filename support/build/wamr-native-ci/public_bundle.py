@@ -257,9 +257,10 @@ def executable_identity(value):
 
 def supervised_command_record(
         ci, value, stage, role_identities, transport_context,
-        profile="qcow2-derived-vhd"):
+        profile="qcow2-derived-vhd", *, historical_generation=False):
     ci.validate_supervised_command_binding(
-        value, stage, role_identities, transport_context, profile)
+        value, stage, role_identities, transport_context, profile,
+        historical_generation=historical_generation)
     request = value["supervisor"]["request"]
     bindings = [
         request["supervisor"],
@@ -1436,7 +1437,8 @@ def publication_records(
                     require(False)
                 supervised_command_record(
                     ci, item, command_stage, role_identities,
-                    transport_context, profile=profile)
+                    transport_context, profile=profile,
+                    historical_generation=bundle["identity"]["wamr_revision"] == HISTORICAL_WAMR_REVISION)
     by_name = dict(zip(
         handoff.NAMES if version == 1 else handoff.V2_NAMES,
         bundle["artifacts"]))

@@ -967,6 +967,8 @@ pub fn validateLocalPostRunCommand(self: *AcceptedRun, raw: []const u8, stage: S
 fn validateCommands(self: *AcceptedRun, legacy: bool, allow_historical_local: bool) !void {
     const start = if (legacy) std.json.Value.null else try canonicalFile(self, try recordPath(self, "build-start.json"), records.max_record_bytes);
     const boot_inputs = if (legacy) std.json.Value.null else try canonicalFile(self, try recordPath(self, "boot-inputs.json"), records.max_record_bytes);
+    const historical_generation = self.context == .trusted_inner_zip and
+        std.mem.eql(u8, self.imported_wamr_revision, limits.historical_wamr_revision);
     for (self.records) |item| {
         if (!std.mem.startsWith(u8, item.name, "command-")) continue;
         const stage_name = item.name["command-".len .. item.name.len - ".json".len];
@@ -987,11 +989,13 @@ fn validateCommands(self: *AcceptedRun, legacy: bool, allow_historical_local: bo
         } else {
             const validated = if (self.compatibility == .tiny_v1_legacy)
                 command.validateLegacyV1(self.allocator(), value, stage, self.context)
+            else if (historical_generation)
+                command.validateHistoricalGeneration(self.allocator(), value, stage, self.context)
             else
                 command.validate(self.allocator(), value, stage, self.context);
             if (validated) |_| {} else |err| {
                 if (!allow_historical_local or err == error.OutOfMemory) return err;
-                _ = try command.validate(self.allocator(), value, stage, .trusted_inner_zip);
+                _ = try command.validateHistoricalGeneration(self.allocator(), value, stage, .trusted_inner_zip);
             }
             if (self.context == .local_runtime) {
                 const log = try join(self.allocator(), &.{ self.root, "compute/private", try std.mem.Allocator.print(self.allocator(), "{s}.log", .{stage_name}) });

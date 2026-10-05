@@ -521,6 +521,9 @@ def command_environment(root, input_records=None, extra=None, *, stage=None):
     if stage == "dependency-restore":
         environment["ZIG_LOCAL_PKG_DIR"] = str(
             Path(root) / "dependencies/zig-pkg")
+    if stage in {"config", "native-image"}:
+        environment["ZIG_LOCAL_PKG_DIR"] = str(
+            Path(root) / "dependencies/zig-pkg")
     return environment
 
 
@@ -2556,6 +2559,9 @@ def command_environment_contract(kind):
             "WAMR_CI_LOG_VALIDATE": command_path(
                 WAMR_LOG_VALIDATOR_ROLE),
         })
+    if kind == "build-root":
+        environment["ZIG_LOCAL_PKG_DIR"] = command_path(
+            "work", "dependencies/zig-pkg")
     if kind in {"build-base", "public-validator"}:
         environment["WAMR_CI_LAUNCH_EXECUTABLE"] = command_path("tool:zig")
     return [
@@ -2719,7 +2725,7 @@ def production_command_contract(stage, profile=CURRENT_PROFILE):
             ],
         },
         "config": {
-            "kind": "build-native", "seconds": 600,
+            "kind": "build-root", "seconds": 600,
             "output_limit": 8 * MIB,
             "command_executable": command_path(WAMR_AOT_BUILD_ROLE),
             "native_executable": command_path(WAMR_AOT_BUILD_ROLE),
@@ -2732,7 +2738,7 @@ def production_command_contract(stage, profile=CURRENT_PROFILE):
             ],
         },
         "native-image": {
-            "kind": "build-native", "seconds": 1800,
+            "kind": "build-root", "seconds": 1800,
             "output_limit": 8 * MIB,
             "command_executable": command_path(WAMR_AOT_BUILD_ROLE),
             "native_executable": command_path(WAMR_AOT_BUILD_ROLE),
@@ -2930,10 +2936,20 @@ def production_command_contract(stage, profile=CURRENT_PROFILE):
 
 def validate_supervised_command_binding(
         value, stage, role_identities=None,
-        transport_context="producer_direct", profile=CURRENT_PROFILE):
+        transport_context="producer_direct", profile=CURRENT_PROFILE,
+        *, historical_generation=False):
     require(transport_context in {"producer_direct", "trusted_inner_zip"},
             "invalid supervised command transport context")
+    require(type(historical_generation) is bool,
+            "invalid supervised command generation")
     contract = production_command_contract(stage, profile)
+    if historical_generation:
+        require(transport_context == "trusted_inner_zip",
+                "historical command requires authenticated import transport")
+        contract = {**contract, "environment": [
+            item for item in contract["environment"]
+            if item["name"] != "ZIG_LOCAL_PKG_DIR"
+        ]}
     require(isinstance(value, dict) and set(value) == {
         "scope", "stage", "exit_code", "bytes", "sha256", "sha256_scope",
         "over_limit", "known_error_markers", "supervisor",
@@ -5658,12 +5674,19 @@ def diagnostics(runtime):
                 and info.st_uid == os.getuid()
                 and stat.S_IMODE(info.st_mode) == 0o700,
                 "invalid diagnostic directory")
-        backend = document(entries[0] / "000-root-olddefconfig.json")
+        backends = [
+            Path(item.path) for item in bounded_scandir(
+                entries[0], 128, "invalid diagnostic",
+                "invalid diagnostic")
+            if re.fullmatch(r"[0-9]{3}-root-olddefconfig\.json", item.name)
+        ]
+        require(len(backends) == 1, "invalid diagnostic")
+        backend = document(backends[0])
         code = backend["primary"]["exited"]
         require(backend["stage"] == "root-olddefconfig"
                 and type(code) is int and 0 <= code <= 255,
                 "invalid diagnostic")
-        output = read(entries[0] / "000-root-olddefconfig.stderr", 64 * 1024)
+        output = read(backends[0].with_suffix(".stderr"), 64 * 1024)
         build_failures["config"].update({
             "backend_exit_code": code,
             "known_error_markers": command_error_markers(output),
