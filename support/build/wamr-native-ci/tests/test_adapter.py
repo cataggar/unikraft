@@ -4121,6 +4121,19 @@ class Evidence(unittest.TestCase):
                 ci.restore_dependencies(
                     root.parent, root, {"schema": "fixture"})
 
+    def test_restore_depot_is_per_restore_without_global_environment_changes(self):
+        original = dict(ci.COMMAND_ENVIRONMENT)
+        for name in ("restore-one", "restore-two"):
+            root = self.root / name
+            environment = ci.command_environment(
+                root, stage="dependency-restore")
+            self.assertEqual(environment["ZIG_LOCAL_PKG_DIR"],
+                             str(root / "dependencies/zig-pkg"))
+        self.assertEqual(ci.COMMAND_ENVIRONMENT, original)
+        self.assertNotIn(
+            "ZIG_LOCAL_PKG_DIR",
+            ci.command_environment(self.root, stage="adapter"))
+
     def test_dependency_paths_refuse_outside_or_missing_repository_without_leak(self):
         manifests = {
             "build.zig": b"const std = @import(\"std\");\n",

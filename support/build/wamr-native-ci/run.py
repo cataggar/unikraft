@@ -518,6 +518,9 @@ def command_environment(root, input_records=None, extra=None, *, stage=None):
     }
     if extra is not None:
         environment.update(extra)
+    if stage == "dependency-restore":
+        environment["ZIG_LOCAL_PKG_DIR"] = str(
+            Path(root) / "dependencies/zig-pkg")
     return environment
 
 
@@ -4513,6 +4516,7 @@ def restore_dependencies(runtime, root, expected_inputs):
             "--fetch=all", "--cache-dir", root / "cache",
             "-j2",
         ], 900, evidence=False,
+            cwd=restore,
             input_records=consumer_file_records(expected_inputs),
             allow_bootstrap=True)
         require_consumer_inputs(runtime, expected_inputs)

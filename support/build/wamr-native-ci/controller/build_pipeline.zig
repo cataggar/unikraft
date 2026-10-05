@@ -262,6 +262,8 @@ fn runBootstrap(context: *Context, stage: []const u8, argv: []const []const u8, 
         .{ .key = "ZIG_LOCAL_CACHE_DIR", .val = try subpath(context, "cache") },
         .{ .key = "ZIG_GLOBAL_CACHE_DIR", .val = try subpath(context, "global-cache") },
     }) |item| try env.put(item.key, item.val);
+    if (std.mem.eql(u8, stage, "dependency-restore"))
+        try env.put("ZIG_LOCAL_PKG_DIR", try join(context, &.{ cwd, "zig-pkg" }));
     const primary = try process.Deadline.afterMilliseconds(@as(u64, timeout) * 1000);
     var result = try process.runCommand(context.allocator, io, .{
         .executable = executable,

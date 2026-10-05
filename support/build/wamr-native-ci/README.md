@@ -744,8 +744,13 @@ Before Zig runs it binds each copy's exact
 device/inode/type, ownership, links, size, mtime and ctime plus the parent
 directory metadata, and requires the same identities immediately afterward.
 It also byte-compares the copies, parses the one exact Miz
-URL/revision/package hash, and only then performs the bounded fetch. Before
-reading package content it enumerates and snapshots the complete bounded
+URL/revision/package hash, and only then performs the bounded fetch.
+The restoration command's fresh environment binds
+`ZIG_LOCAL_PKG_DIR` to that restore's `compute/dependencies/zig-pkg`;
+the Python restoration command also uses the restore directory as its cwd.
+This is a per-restoration binding, not a process-global or CI-wide package
+directory override. No default `zig-pkg` may be introduced into source custody.
+Before reading package content it enumerates and snapshots the complete bounded
 directory set, including `zig-pkg`, then requires the exact set and metadata
 after traversal. The restored tree rejects links, nonregular entries, unsafe
 names, extra/missing/duplicate roots and incomplete transitive manifests.
@@ -845,6 +850,7 @@ export TMPDIR="$check_root/scratch"
 export ZIG_GLOBAL_CACHE_DIR="$check_root/global-cache"
 cp support/tools/hyperv/local_boot/build.zig \
   support/tools/hyperv/local_boot/build.zig.zon "$check_root/restore/"
+ZIG_LOCAL_PKG_DIR="$check_root/restore/zig-pkg" \
 zig build --build-file "$check_root/restore/build.zig" --fetch=all \
   --cache-dir "$check_root/restore-cache" \
   -j2
