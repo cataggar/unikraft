@@ -4,6 +4,23 @@ const linux = std.os.linux;
 
 pub fn main(init: std.process.Init) void {
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch std.process.exit(2);
+    if (args.len == 15 and
+        std.mem.eql(u8, args[1], "build") and
+        std.mem.eql(u8, args[2], "--build-file") and
+        std.fs.path.isAbsolute(args[3]) and
+        std.mem.endsWith(u8, args[3], "/support/tools/hyperv/direct/build.zig") and
+        std.mem.eql(u8, args[4], "--cache-dir") and
+        std.fs.path.isAbsolute(args[5]) and
+        std.mem.eql(u8, args[6], "--global-cache-dir") and
+        std.fs.path.isAbsolute(args[7]) and
+        std.mem.eql(u8, args[8], "--prefix") and
+        std.fs.path.isAbsolute(args[9]) and
+        std.mem.eql(u8, args[10], "-Dtarget=x86_64-linux-gnu") and
+        std.mem.eql(u8, args[11], "-Dcpu=x86_64_v2") and
+        std.mem.eql(u8, args[12], "-Doptimize=ReleaseSafe") and
+        std.mem.eql(u8, args[13], "-j2") and
+        std.mem.eql(u8, args[14], "install"))
+        return;
     if (args.len == 3 and std.mem.eql(u8, args[1], "handoff")) {
         const bundle = std.Io.Dir.openFileAbsolute(init.io, args[2], .{ .follow_symlinks = false }) catch std.process.exit(2);
         defer bundle.close(init.io);
