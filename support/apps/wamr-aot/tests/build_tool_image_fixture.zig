@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 const std = @import("std");
 const linux = std.os.linux;
+const contract = @import("wamr_aot_build");
 
 pub fn main(init: std.process.Init) void {
     run(init) catch |err| {
@@ -16,6 +17,17 @@ fn run(init: std.process.Init) !void {
     const arguments = try init.minimal.args.toSlice(allocator);
     try record(init, allocator, arguments);
 
+    if (arguments.len == 5 and std.mem.eql(u8, arguments[1], "fetch") and
+        std.mem.eql(u8, arguments[2], "--pkg-dir"))
+    {
+        const name = std.fs.path.basename(arguments[4]);
+        if (!std.mem.eql(u8, name, contract.translate_c_hash) and
+            !std.mem.eql(u8, name, contract.aro_hash))
+            return error.UnexpectedPackage;
+        var stdout = std.Io.File.stdout().writer(init.io, &.{});
+        try stdout.interface.print("{s}\n", .{init.environ_map.get("WAMR_IMAGE_FIXTURE_PACKAGE_HASH") orelse name});
+        return;
+    }
     if (contains(arguments, "--print-datadir")) {
         try failIfSelected(init, "bison-data");
         const path = init.environ_map.get("WAMR_IMAGE_FIXTURE_BISON_DATA") orelse
@@ -49,6 +61,11 @@ fn run(init: std.process.Init) !void {
         try failIfSelected(init, stage);
         const app = prefixed(arguments, "-Dapp=") orelse return error.MissingApp;
         const config = prefixed(arguments, "-Dconfig=") orelse return error.MissingConfig;
+        const system_index = for (arguments, 0..) |argument, index| {
+            if (std.mem.eql(u8, argument, "--system")) break index;
+        } else return error.MissingOfflinePackages;
+        if (system_index + 1 >= arguments.len or !std.mem.eql(u8, arguments[system_index + 1], init.environ_map.get("ZIG_LOCAL_PKG_DIR") orelse ""))
+            return error.UnboundOfflinePackages;
         if (std.mem.eql(u8, stage, "olddefconfig")) {
             const source = try std.fs.path.join(allocator, &.{ app, ".config" });
             const bytes = try std.Io.Dir.cwd().readFileAlloc(
@@ -88,6 +105,8 @@ fn run(init: std.process.Init) !void {
                 )
             else if (std.mem.eql(u8, mutation, "application"))
                 try std.fs.path.join(allocator, &.{ app, "build-tool-image.zig" })
+            else if (std.mem.eql(u8, mutation, "package"))
+                try std.fs.path.join(allocator, &.{ init.environ_map.get("ZIG_LOCAL_PKG_DIR").?, contract.translate_c_hash, "build.zig" })
             else
                 return error.InvalidMutation;
             try appendFile(init.io, path, "mutated\n");

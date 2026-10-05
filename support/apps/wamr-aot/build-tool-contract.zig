@@ -13,6 +13,7 @@ pub const compiler_profile = "unikraft-x86_64";
 pub const zig_version = "0.17.0";
 pub const translate_c_url = "git+https://github.com/cataggar/translate-c#62d06a5d3e93c82727544e8113e4762a315ca0ed";
 pub const translate_c_hash = "translate_c-2.0.0-Q_BUWlpOBwBWvgGBM20tJq-GXgPio3v3UD39rXEn70KN";
+pub const aro_hash = "aro-0.0.0-JSD1QtuBNwCASyBtNF3pqTl_W3oAJQGEVyFAtrBSE_Pa";
 pub const source_identity_recipe = "sorted-compact-json-relative-file-path-to-bytes-and-sha256-v1";
 pub const development_scope = "local-development-build-only-not-supported-lineage";
 pub const supported_scope = "native-build-inputs-not-hardware-qualification";

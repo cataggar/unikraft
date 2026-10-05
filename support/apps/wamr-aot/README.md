@@ -23,9 +23,11 @@ clean Unikraft checkout with a fresh application output root:
 
 ```sh
 umask 077
+export ZIG_LOCAL_PKG_DIR=/path/to/qualified/private/package-depot
 tool_root="$PWD/support/apps/wamr-aot/build/tool"
 test ! -e "$tool_root"
 zig build --build-file support/apps/wamr-aot/build.zig \
+  --system "$ZIG_LOCAL_PKG_DIR" \
   --prefix "$tool_root" -Doptimize=safe install
 tool="$tool_root/bin/uk-wamr-aot-build"
 "$tool" prepare --repository "$PWD" --source /path/to/wamr
@@ -33,6 +35,14 @@ tool="$tool_root/bin/uk-wamr-aot-build"
 "$tool" olddefconfig --repository "$PWD"
 "$tool" native-images --repository "$PWD"
 ```
+
+`olddefconfig` and `native-images` require this explicit, private offline
+depot. Before capturing application inputs or launching the root Build, the
+native helper authenticates the pinned Translator and Aro packages using
+bounded local-path `zig fetch --pkg-dir` operations. It retains their physical
+metadata and checks it again after the root command. The root Build receives
+`--system` with the same depot; an absent, changed, unsafe or mismatched depot
+is refused, never replaced with an ambient cache or an implicit fetch.
 
 `uk-wamr-aot-build prepare` exports exactly WAMR
 `661ac49584c4d0ac57adb78eba62f3ff3e9795df` from the local Git object

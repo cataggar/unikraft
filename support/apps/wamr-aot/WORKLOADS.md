@@ -58,9 +58,11 @@ Aro has no package dependencies, so this chain downloads nothing from Codeberg.
 
 ```sh
 umask 077
+export ZIG_LOCAL_PKG_DIR=/path/to/qualified/private/package-depot
 tool_root="$PWD/support/apps/wamr-aot/build/tool"
 test ! -e "$tool_root"
 zig build --build-file support/apps/wamr-aot/build.zig \
+  --system "$ZIG_LOCAL_PKG_DIR" \
   --prefix "$tool_root" -Doptimize=safe install
 tool="$tool_root/bin/uk-wamr-aot-build"
 "$tool" prepare --repository "$PWD" \

@@ -495,6 +495,24 @@ test "portable CI config reaches only opted-in image builds" {
     const ordinary_log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
     defer allocator.free(ordinary_log);
     try testing.expect(std.mem.indexOf(u8, ordinary_log, "-Dci-portable-config=true") == null);
+    try testing.expect(std.mem.indexOf(u8, ordinary_log, "\t--system\t") != null);
+    try testing.expect(std.mem.indexOf(u8, ordinary_log, "\tfetch\t--pkg-dir\t") != null);
+
+    _ = environment.swapRemove("ZIG_LOCAL_PKG_DIR");
+    const unbound = try runCli(cli, argv, &environment);
+    defer allocator.free(unbound.stdout);
+    defer allocator.free(unbound.stderr);
+    try testing.expect(unbound.term == .exited and unbound.term.exited != 0);
+    const unbound_log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(unbound_log);
+    try testing.expectEqualStrings(ordinary_log, unbound_log);
+    try environment.put("ZIG_LOCAL_PKG_DIR", bison_data);
+    try environment.put("WAMR_IMAGE_FIXTURE_PACKAGE_HASH", "wrong-package-hash");
+    const wrong_hash = try runCli(cli, argv, &environment);
+    defer allocator.free(wrong_hash.stdout);
+    defer allocator.free(wrong_hash.stderr);
+    try testing.expect(wrong_hash.term == .exited and wrong_hash.term.exited != 0);
+    _ = environment.swapRemove("WAMR_IMAGE_FIXTURE_PACKAGE_HASH");
 
     try environment.put("WAMR_CI_PORTABLE_CONFIG", "1");
     const portable = try runCli(cli, argv, &environment);
@@ -755,7 +773,7 @@ test "native image commands reject config runtime and application mutation" {
     );
     defer allocator.free(bison_data);
 
-    inline for (.{ "config", "runtime", "application" }) |mutation| {
+    inline for (.{ "config", "runtime", "application", "package" }) |mutation| {
         const repository = try imageRepository(&temporary, mutation);
         defer allocator.free(repository);
         const log_name = try allocator.print(
@@ -1553,6 +1571,16 @@ fn imageEnvironment(
     try environment.put("PATH", "/usr/bin:/bin");
     try environment.put("WAMR_IMAGE_FIXTURE_BISON_DATA", bison_data);
     try environment.put("WAMR_IMAGE_FIXTURE_LOG", log_path);
+    if (std.fs.path.isAbsolute(bison_data)) {
+        const packages = try build_tool.files.PrivateDirectory.open(io, bison_data);
+        defer packages.close(io);
+        for ([_][]const u8{ build_tool.translate_c_hash, build_tool.aro_hash }) |name| {
+            const directory = try build_tool.files.ensurePrivateDirectory(io, packages.dir, name);
+            defer directory.close(io);
+            try build_tool.files.writePrivateAtomicReplace(io, directory, "build.zig", "fixture package\n");
+        }
+        try environment.put("ZIG_LOCAL_PKG_DIR", bison_data);
+    }
     try environment.put(
         "WAMR_IMAGE_FIXTURE_REVISION",
         "0123456789abcdef0123456789abcdef01234567",
