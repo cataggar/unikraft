@@ -1550,6 +1550,8 @@ jobs:
 
     - name: Acquire the separately pinned native public QEMU runtime
       if: ${{ success() && !cancelled() }}
+      env:
+        GH_TOKEN: ${{ github.token }}
       run: |
         bash .github/scripts/hyperv-native-qemu-acquire.sh "${RUNNER_TEMP}/hyperv-ci/native-qemu"
 

@@ -19,12 +19,29 @@ export GHR_CACHE_DIR="${root}/cache"
 export XDG_CACHE_HOME="${root}/cache"
 export GHR_TOOL_DIR="${root}/ghr-tools"
 export GHR_BIN_DIR="${root}/ghr-bin"
+download() {
+  local log="$1"
+  shift
+  local auth=(--no-auth)
+  if [[ -n "${GH_TOKEN:-}" ]]; then
+    auth=()
+  fi
+  if ghr download "${auth[@]}" "$@" > "${log}" 2>&1; then
+    return 0
+  else
+    local status=$?
+    printf 'Native QEMU acquisition refused: %s (exit %d)\n' \
+      "${log##*/}" "${status}" >&2
+    cat -- "${log}" >&2
+    return "${status}"
+  fi
+}
 metadata="${root}/evidence/release.json"
 archive="${root}/downloads/qemu-v11.0.50-z.7-linux-x64.tar.gz"
 expected=f8b9cc818959f95326010c95dad644177ebb0cbb0feef3db9528c4434855e397
-ghr download --no-auth \
+download "${root}/evidence/metadata-download.txt" \
   https://api.github.com/repos/cataggar/qemu/releases/tags/v11.0.50-z.7 \
-  -o "${metadata}" > "${root}/evidence/metadata-download.txt" 2>&1
+  -o "${metadata}"
 jq -e --arg digest "sha256:${expected}" '
   .tag_name == "v11.0.50-z.7" and
   .target_commitish == "559ac9def5a65912ae602cc5682fc7c045fcbbcd" and
@@ -33,9 +50,9 @@ jq -e --arg digest "sha256:${expected}" '
     .[0].name == "qemu-v11.0.50-z.7-linux-x64.tar.gz" and
     .[0].size == 137302371 and .[0].digest == $digest)
 ' "${metadata}" > "${root}/evidence/metadata-valid.txt"
-ghr download --no-auth --sha256 "${expected}" \
+download "${root}/evidence/archive-download.txt" --sha256 "${expected}" \
   cataggar/qemu/qemu-v11.0.50-z.7-linux-x64.tar.gz@v11.0.50-z.7 \
-  -o "${archive}" > "${root}/evidence/archive-download.txt" 2>&1
+  -o "${archive}"
 test "$(stat -c %s "${archive}")" -eq 137302371
 printf '%s  %s\n' "${expected}" "${archive}" | sha256sum -c - \
   > "${root}/evidence/archive-valid.txt"

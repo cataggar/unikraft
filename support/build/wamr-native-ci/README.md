@@ -1410,6 +1410,15 @@ import extracts through another duplicate of that same descriptor and requires
 the final descriptor identity to match. The workflow natively reconciles the
 ZIP before upload.
 
+Native QEMU acquisition uses the existing read-only Actions `GH_TOKEN` only
+in its acquisition step, consistently across compute, fault, public-image
+and candidate workflows. Without that explicitly supplied token it retains
+anonymous downloads and does not discover host credentials. Release, asset,
+digest, size, archive and package checks remain unchanged. Downloader failures
+retain their evidence, print the failed acquisition phase and original
+diagnostic, and preserve the original nonzero exit status; no failed download
+is accepted or converted into a fault-qualification result.
+
 Artifact name:
 `wamr-public-source-tiny-RUN_ID-RUN_ATTEMPT-SOURCE_SHA`.
 Its sole uploaded file is `tiny-aot-public-source.zip`, stored for seven days.
