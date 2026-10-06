@@ -229,17 +229,16 @@ test "only pinned Zig and LLVM roles admit large executables under retained cust
     var fixture = try Fixture.init("zig-tool-bound");
     defer fixture.deinit();
     const file = try fixture.root.createFile(io, "zig", .{
-        .exclusive = true, .permissions = .fromMode(0o700),
+        .exclusive = true,
+        .permissions = .fromMode(0o700),
     });
     defer file.close(io);
     const path = try fixture.child("zig");
     defer a.free(path);
     if (linux.errno(linux.ftruncate(file.handle, 65 * 1024 * 1024)) != .SUCCESS)
         return error.FixtureTruncateFailed;
-    try std.testing.expectError(error.UnsafeFile,
-        controller.command_adapter.openPinnedTool(io, path, "tool:git"));
-    try std.testing.expectError(error.UnsafeFile,
-        controller.command_adapter.openPinnedTool(io, path, "tool:llvm-other"));
+    try std.testing.expectError(error.UnsafeFile, controller.command_adapter.openPinnedTool(io, path, "tool:git"));
+    try std.testing.expectError(error.UnsafeFile, controller.command_adapter.openPinnedTool(io, path, "tool:llvm-other"));
     var retained = try controller.command_adapter.openPinnedTool(io, path, "tool:zig");
     defer retained.close(io);
     try retained.verify(io);
@@ -248,15 +247,12 @@ test "only pinned Zig and LLVM roles admit large executables under retained cust
     try llvm.verify(io);
 
     try chmod(file, 0o722);
-    try std.testing.expectError(error.UnsafeFile,
-        controller.command_adapter.openPinnedTool(io, path, "tool:zig"));
+    try std.testing.expectError(error.UnsafeFile, controller.command_adapter.openPinnedTool(io, path, "tool:zig"));
     try chmod(file, 0o700);
     if (linux.errno(linux.ftruncate(file.handle, 256 * 1024 * 1024 + 1)) != .SUCCESS)
         return error.FixtureTruncateFailed;
-    try std.testing.expectError(error.UnsafeFile,
-        controller.command_adapter.openPinnedTool(io, path, "tool:zig"));
-    try std.testing.expectError(error.UnsafeFile,
-        controller.command_adapter.openPinnedTool(io, path, "tool:llvm-objdump"));
+    try std.testing.expectError(error.UnsafeFile, controller.command_adapter.openPinnedTool(io, path, "tool:zig"));
+    try std.testing.expectError(error.UnsafeFile, controller.command_adapter.openPinnedTool(io, path, "tool:llvm-objdump"));
 }
 
 test "consumer tree permits a directory alias inside its root but refuses external directory" {
@@ -346,8 +342,7 @@ test "pinned package custody accepts writable archive members only beneath its p
     defer admitted.deinit(a);
     try controller.dependency_custody.requireSame(a, io, path, admitted);
     try chmod(source, 0o600);
-    try std.testing.expectError(error.DependencyChanged,
-        controller.dependency_custody.requireSame(a, io, path, admitted));
+    try std.testing.expectError(error.DependencyChanged, controller.dependency_custody.requireSame(a, io, path, admitted));
     try chmod(.{ .handle = packages.handle, .flags = .{ .nonblocking = false } }, 0o755);
     try expectPackageError(path, error.UnsafeFile);
 }
@@ -357,8 +352,7 @@ test "empty package dependencies do not unpin the root manifest" {
     const hashes = try controller.dependency_custody.packageDependencies(a, manifest);
     defer a.free(hashes);
     try std.testing.expectEqual(@as(usize, 0), hashes.len);
-    try std.testing.expectError(error.UnpinnedDependency,
-        controller.dependency_custody.pinnedManifest(a, manifest));
+    try std.testing.expectError(error.UnpinnedDependency, controller.dependency_custody.pinnedManifest(a, manifest));
 }
 
 test "identical-content package root replacement breaks retained physical dependency custody" {
@@ -544,53 +538,21 @@ test "pre-spawn timeout and cancellation leave no command or cleanup events" {
 }
 
 fn descendantFixture(fixture: Fixture) ![]u8 {
-    const source = try std.fs.path.join(a, &.{ options.repository_root, "support/tools/hyperv/direct/runtime_fixture.zig" });
-    defer a.free(source);
-    const core_source = try std.fs.path.join(a, &.{ options.repository_root, "support/tools/hyperv/core.zig" });
-    defer a.free(core_source);
-    const assembly = try std.fs.path.join(a, &.{ options.repository_root, "support/tools/hyperv/sha256_clear_upper.S" });
-    defer a.free(assembly);
+    const source_path = try std.fs.path.resolve(a, &.{ options.repository_root, options.descendant_fixture });
+    defer a.free(source_path);
+    var source = try core.private_files.RetainedFile.open(io, source_path, .artifact);
+    defer source.close(io);
+    const size: usize = @intCast(source.file_snapshot.size);
+    if (size < 64 or size > 64 * 1024 * 1024) return error.InvalidDescendantFixture;
+    const bytes = try a.alloc(u8, size);
+    defer a.free(bytes);
+    if (try source.file.readPositionalAll(io, bytes, 0) != size)
+        return error.DescendantFixtureChanged;
+    try source.verify(io);
+    try write(fixture.root, "runtime-fixture", bytes, 0o700);
+    try source.verify(io);
     const binary = try fixture.child("runtime-fixture");
     errdefer a.free(binary);
-    const local_cache = try fixture.child("local-cache");
-    defer a.free(local_cache);
-    const global_cache = try fixture.child("global-cache");
-    defer a.free(global_cache);
-    const emit = try std.fmt.allocPrint(a, "-femit-bin={s}", .{binary});
-    defer a.free(emit);
-    const module = try std.fmt.allocPrint(a, "-Mroot={s}", .{source});
-    defer a.free(module);
-    const core_module = try std.fmt.allocPrint(a, "-Mhyperv_core={s}", .{core_source});
-    defer a.free(core_module);
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(a);
-    try argv.appendSlice(a, &.{
-        options.zig_executable, "build-exe", "-O",                 "ReleaseSafe",
-        "--cache-dir",          local_cache, "--global-cache-dir", global_cache,
-        emit,
-    });
-    if (@import("builtin").cpu.arch == .x86_64) try argv.append(a, assembly);
-    try argv.appendSlice(a, &.{ "--dep", "hyperv_core", module, core_module });
-    var environment = std.process.Environ.Map.init(a);
-    defer environment.deinit();
-    try environment.put("HOME", fixture.path);
-    try environment.put("PATH", "/usr/bin:/bin");
-    try environment.put("LANG", "C");
-    try environment.put("ZIG_LOCAL_CACHE_DIR", local_cache);
-    try environment.put("ZIG_GLOBAL_CACHE_DIR", global_cache);
-    const result = try std.process.run(a, io, .{
-        .argv = argv.items,
-        .cwd = .{ .path = options.repository_root },
-        .environ_map = &environment,
-        .stdout_limit = .limited(4096),
-        .stderr_limit = .limited(16 * 1024),
-    });
-    defer a.free(result.stdout);
-    defer a.free(result.stderr);
-    if (result.term != .exited or result.term.exited != 0) {
-        std.debug.print("native descendant fixture build: {s}\n", .{result.stderr});
-        return error.DescendantFixtureBuildFailed;
-    }
     const executable = try core.process.Executable.open(io, binary);
     executable.close(io);
     return binary;

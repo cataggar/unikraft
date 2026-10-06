@@ -384,6 +384,23 @@ pub fn build(b: *std.Build) void {
         }),
     });
     controller_options.addOptionPath("command_fixture", command_fixture.getEmittedBin());
+    const descendant_core = b.createModule(.{
+        .root_source_file = b.path("../../tools/hyperv/core.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    if (b.graph.host.result.cpu.arch == .x86_64)
+        descendant_core.addAssemblyFile(b.path("../../tools/hyperv/sha256_clear_upper.S"));
+    const descendant_fixture = b.addExecutable(.{
+        .name = "wamr-ci-controller-descendant-fixture",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("../../tools/hyperv/direct/runtime_fixture.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "hyperv_core", .module = descendant_core }},
+        }),
+    });
+    controller_options.addOptionPath("descendant_fixture", descendant_fixture.getEmittedBin());
     const local_worker = b.addExecutable(.{
         .name = "wamr-ci-local-acceptance-worker",
         .use_llvm = if (optimize == .ReleaseSafe) true else null,

@@ -190,6 +190,15 @@ finish before the process-wide cancellation cases execute serially on their
 clean inputs. Constructor, recheck, CLI, private-product parity and every
 refusal then run unchanged within each owned revision. No digest is reused
 across live revalidation, and no case moves into the compile-only prerequisite.
+The two worker lanes claim the next prepared revision as soon as either lane
+finishes instead of waiting for a fixed pair. A failed operation stops queued
+work, but both already assigned workers finish before failure or cleanup.
+Physical descendant parity cases privately stage the genuine native
+`runtime_fixture.zig` executable compiled by the existing prerequisite graph,
+rather than recompiling it with three empty per-case SDK caches. Every case
+still owns a separate single-link executable and runs its real descendants,
+deadlines, cancellation, output-overflow and cleanup checks in the fixture
+gate; preparation only compiles the helper.
 Four-CPU measurements attributed the serial cost to repeated genuine custody
 hashing, not validators; CPU-target trials did not improve that cost. Backend,
 ISA, production defaults, inventories and the 900-second gate remain unchanged.

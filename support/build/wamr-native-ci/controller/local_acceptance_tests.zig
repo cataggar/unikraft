@@ -312,19 +312,84 @@ pub fn runWorker(a: std.mem.Allocator, io: std.Io, args: []const []const u8) !vo
 }
 
 fn together(io: std.Io, fixtures: []const Fixture, comptime operation: fn (Fixture, std.Io) anyerror!void) !void {
-    var index: usize = 0;
-    while (index < fixtures.len) : (index += 2) {
-        if (index + 1 == fixtures.len) {
-            try operation(fixtures[index], io);
-            return;
-        }
-        var other = try io.concurrent(operation, .{ fixtures[index + 1], io });
-        defer _ = other.cancel(io) catch {};
-        const first_result = operation(fixtures[index], io);
-        const other_result = other.await(io);
-        try first_result;
-        try other_result;
+    if (fixtures.len < 2) {
+        for (fixtures) |fixture| try operation(fixture, io);
+        return;
     }
+    const Queue = struct {
+        fixtures: []const Fixture,
+        next: usize = 2,
+        failure: ?anyerror = null,
+        mutex: std.Io.Mutex = .init,
+
+        fn run(queue: *@This(), worker_io: std.Io, first: usize) anyerror!void {
+            var index = first;
+            while (true) {
+                const result = operation(queue.fixtures[index], worker_io);
+                queue.mutex.lockUncancelable(worker_io);
+                defer queue.mutex.unlock(worker_io);
+                result catch |err| {
+                    if (queue.failure == null) queue.failure = err;
+                };
+                if (queue.failure != null or queue.next == queue.fixtures.len) return;
+                index = queue.next;
+                queue.next += 1;
+            }
+        }
+    };
+    var queue: Queue = .{ .fixtures = fixtures };
+    var other = try io.concurrent(Queue.run, .{ &queue, io, 1 });
+    defer _ = other.cancel(io) catch {};
+    try queue.run(io, 0);
+    try other.await(io);
+    if (queue.failure) |err| return err;
+}
+
+pub fn workerBackfill(a: std.mem.Allocator, io: std.Io) !void {
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{});
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "complete-local-backfill-{d}", .{std.os.linux.getpid()});
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("complete local backfill cleanup failed");
+    const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    const directory = try parent.openDir(io, name, .{});
+    defer directory.close(io);
+    const probe = struct {
+        fn run(fixture: Fixture, worker_io: std.Io) !void {
+            const root = try std.Io.Dir.openDirAbsolute(worker_io, fixture.work, .{});
+            defer root.close(worker_io);
+            if (std.mem.eql(u8, fixture.revision, "blocked")) {
+                for (0..200) |_| {
+                    if (root.openFile(worker_io, "released", .{})) |file| {
+                        file.close(worker_io);
+                        return;
+                    } else |err| {
+                        if (err != error.FileNotFound) return err;
+                    }
+                    try std.Io.sleep(worker_io, .fromMilliseconds(10), .awake);
+                }
+                return error.WorkerNotBackfilled;
+            }
+            const file = try root.createFile(worker_io, fixture.revision, .{
+                .exclusive = true,
+                .permissions = .fromMode(0o600),
+            });
+            defer file.close(worker_io);
+            try file.writeStreamingAll(worker_io, "joined\n");
+        }
+    };
+    const fixtures = [_]Fixture{
+        .{ .revision = "blocked", .work = path, .repository = "", .runtime = "", .stage = "" },
+        .{ .revision = "fast", .work = path, .repository = "", .runtime = "", .stage = "" },
+        .{ .revision = "released", .work = path, .repository = "", .runtime = "", .stage = "" },
+    };
+    try together(io, &fixtures, probe.run);
+    try std.testing.expectEqualStrings("joined\n", try directory.readFileAlloc(io, "released", a, .limited(64)));
+    try directory.deleteFile(io, "fast");
+    try directory.deleteFile(io, "released");
+    const reversed = [_]Fixture{ fixtures[1], fixtures[0], fixtures[2] };
+    try together(io, &reversed, probe.run);
+    try std.testing.expectEqualStrings("joined\n", try directory.readFileAlloc(io, "released", a, .limited(64)));
 }
 
 pub fn workerFailure(a: std.mem.Allocator, io: std.Io) !void {
@@ -339,7 +404,8 @@ pub fn workerFailure(a: std.mem.Allocator, io: std.Io) !void {
             const directory = try std.Io.Dir.openDirAbsolute(worker_io, fixture.work, .{});
             defer directory.close(worker_io);
             try std.Io.sleep(worker_io, .fromMilliseconds(20), .awake);
-            const file = try directory.createFile(worker_io, "drained", .{ .exclusive = true, .permissions = .fromMode(0o600) });
+            const member = if (fixture.revision.len == 0) "drained" else fixture.revision;
+            const file = try directory.createFile(worker_io, member, .{ .exclusive = true, .permissions = .fromMode(0o600) });
             defer file.close(worker_io);
             try file.writeStreamingAll(worker_io, "joined\n");
         }
@@ -347,15 +413,18 @@ pub fn workerFailure(a: std.mem.Allocator, io: std.Io) !void {
     const fixtures = [_]Fixture{
         .{ .revision = "", .work = try std.fs.path.join(a, &.{ path, "unavailable" }), .repository = "", .runtime = "", .stage = "" },
         .{ .revision = "", .work = path, .repository = "", .runtime = "", .stage = "" },
+        .{ .revision = "queued", .work = path, .repository = "", .runtime = "", .stage = "" },
     };
     try std.testing.expectError(error.FileNotFound, together(io, &fixtures, probe.run));
     const directory = try std.Io.Dir.openDirAbsolute(io, path, .{});
     defer directory.close(io);
     try std.testing.expectEqualStrings("joined\n", try directory.readFileAlloc(io, "drained", a, .limited(64)));
+    try std.testing.expectError(error.FileNotFound, directory.openFile(io, "queued", .{}));
     try directory.deleteFile(io, "drained");
-    const reversed = [_]Fixture{ fixtures[1], fixtures[0] };
+    const reversed = [_]Fixture{ fixtures[1], fixtures[0], fixtures[2] };
     try std.testing.expectError(error.FileNotFound, together(io, &reversed, probe.run));
     try std.testing.expectEqualStrings("joined\n", try directory.readFileAlloc(io, "drained", a, .limited(64)));
+    try std.testing.expectError(error.FileNotFound, directory.openFile(io, "queued", .{}));
 }
 
 pub fn qualify(a: std.mem.Allocator, io: std.Io, stage: []const u8) !void {

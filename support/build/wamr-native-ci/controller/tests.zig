@@ -10,6 +10,12 @@ test "complete local fixture workers drain before I/O failure cleanup" {
     try @import("local_acceptance_tests.zig").workerFailure(arena.allocator(), std.testing.io);
 }
 
+test "complete local fixture workers backfill either occupied lane" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try @import("local_acceptance_tests.zig").workerBackfill(arena.allocator(), std.testing.io);
+}
+
 test "private product CLI closes arguments and refuses unavailable custody without output" {
     const cli = controller.cli;
     const valid = [_][]const u8{
