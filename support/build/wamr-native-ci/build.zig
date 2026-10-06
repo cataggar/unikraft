@@ -384,6 +384,24 @@ pub fn build(b: *std.Build) void {
         }),
     });
     controller_options.addOptionPath("command_fixture", command_fixture.getEmittedBin());
+    const local_worker = b.addExecutable(.{
+        .name = "wamr-ci-local-acceptance-worker",
+        .use_llvm = if (optimize == .ReleaseSafe) true else null,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("controller/local_acceptance_worker.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .strip = true,
+            .imports = &.{
+                .{ .name = "wamr_controller", .module = host_controller },
+                .{ .name = "hyperv_core", .module = host_core },
+            },
+        }),
+    });
+    local_worker.root_module.addOptions("test_options", controller_options);
+    const local_worker_options = b.addOptions();
+    local_worker_options.addOptionPath("executable", local_worker.getEmittedBin());
+    controller_tests.root_module.addOptions("local_worker_options", local_worker_options);
     const controller_run = b.addRunArtifact(controller_tests);
     const controller_direct = b.addSystemCommand(&.{"/usr/bin/env"});
     controller_direct.addFileArg(controller_tests.getEmittedBin());

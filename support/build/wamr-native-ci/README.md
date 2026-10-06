@@ -182,9 +182,9 @@ fixture identities and all constructor/recheck/CLI refusals remain intact.
 Debug fixtures retain the compiler's default backend, as do the production
 portable controller, supervisor and other native targets. The compile-only
 prerequisite target prepares these exact artifacts before fixture execution.
-The four complete-local historical vectors use at most two fixture workers
-inside that same controller gate. Every revision directory is preallocated
-before custody capture; workers own separate checkouts, runtimes, compiler
+The four complete-local historical vectors use at most two process-isolated
+fixture workers inside that same controller gate. Every revision directory is
+preallocated before custody capture; workers own separate checkouts, runtimes, compiler
 caches and arenas, and are joined even when one fails. All four preparations
 finish before the process-wide cancellation cases execute serially on their
 clean inputs. Constructor, recheck, CLI, private-product parity and every
@@ -193,6 +193,10 @@ across live revalidation, and no case moves into the compile-only prerequisite.
 Four-CPU measurements attributed the serial cost to repeated genuine custody
 hashing, not validators; CPU-target trials did not improve that cost. Backend,
 ISA, production defaults, inventories and the 900-second gate remain unchanged.
+The fixture-only `wamr-ci-local-acceptance-worker` executes the existing helper
+and typed owners directly, not a substituted controller or acceptance record.
+Its real process boundary preserves the native owner's `SupervisorBusy` guard;
+concurrent typed acceptance inside one process remains forbidden.
 The test graph preallocates the native and Python contract scratch parents
 before any fixture runs, and completes source-limit fixtures before controller
 custody capture. Contract goldens may still run in parallel within their

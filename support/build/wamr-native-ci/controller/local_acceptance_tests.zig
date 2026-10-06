@@ -28,9 +28,9 @@ pub fn stagePython(a: std.mem.Allocator, io: std.Io, source: []const u8, target:
     try python(a, io, &.{ "stage-python", source, target });
 }
 
-fn open(io: std.Io, directory: *const files.Directory, runtime: []const u8, repository: []const u8) !controller.accepted_run.AcceptedRun {
+fn open(a: std.mem.Allocator, io: std.Io, directory: *const files.Directory, runtime: []const u8, repository: []const u8) !controller.accepted_run.AcceptedRun {
     return controller.accepted_run.openAndValidateReadOnlyWithSignal(
-        std.testing.allocator,
+        a,
         io,
         .empty,
         directory,
@@ -114,6 +114,28 @@ const Fixture = struct {
     runtime: []const u8,
     stage: []const u8,
 
+    fn process(self: Fixture, io: std.Io, action: []const u8) !void {
+        const worker = @import("local_worker_options");
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const result = try std.process.run(arena.allocator(), io, .{
+            .argv = &.{ worker.executable, action, self.revision, self.work, self.stage },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(8192),
+        });
+        std.debug.print("{s}", .{result.stderr});
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+        try std.testing.expectEqualStrings("", result.stdout);
+    }
+
+    fn prepareProcess(self: Fixture, io: std.Io) !void {
+        try self.process(io, "prepare");
+    }
+
+    fn qualifyProcess(self: Fixture, io: std.Io) !void {
+        try self.process(io, "qualify");
+    }
+
     fn prepare(self: Fixture, io: std.Io) !void {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
@@ -156,7 +178,7 @@ const Fixture = struct {
         const directory = try controller.layout.runtime(io, runtime);
         defer directory.close(io);
         const v2 = std.mem.eql(u8, revision, "e98623f780fa23d05b5797004e4b88160404eb1b");
-        var accepted = try open(io, &directory, runtime, repository);
+        var accepted = try open(a, io, &directory, runtime, repository);
         defer accepted.deinit();
         {
             try std.testing.expectEqual(controller.accepted_run.EvidenceContext.local_runtime, accepted.context);
@@ -177,15 +199,15 @@ const Fixture = struct {
                 const raw = try root.readFileAlloc(io, ".d/wamr-native-runtime/compute/evidence/build-start.json", a, .limited(controller.records.max_record_bytes));
                 const start = try std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{ .parse_numbers = false });
                 const source_map = start.object.get("command_supervisor").?.object.get("source_map").?;
-                _ = try controller.import_supervisor_identity.verifyGitSource(std.testing.allocator, io, accepted.source, repository, options.git_executable, source_map, null);
+                _ = try controller.import_supervisor_identity.verifyGitSource(a, io, accepted.source, repository, options.git_executable, source_map, null);
                 const source_records = source_map.object.get("records").?;
                 source_records.object.values()[0].object.getPtr("sha256").?.* = .{ .string = "0000000000000000000000000000000000000000000000000000000000000000" };
-                try std.testing.expectError(error.ImportIdentityChanged, controller.import_supervisor_identity.verifyGitSource(std.testing.allocator, io, accepted.source, repository, options.git_executable, source_map, null));
+                try std.testing.expectError(error.ImportIdentityChanged, controller.import_supervisor_identity.verifyGitSource(a, io, accepted.source, repository, options.git_executable, source_map, null));
             }
         }
         try std.testing.expectError(
             if (v2) error.UnsupportedLocalProducer else error.UnsupportedLocalLegacyRun,
-            controller.accepted_run.openAndValidate(std.testing.allocator, io, .empty, &directory, runtime, repository),
+            controller.accepted_run.openAndValidate(a, io, .empty, &directory, runtime, repository),
         );
         if (!v2) {
             const output = try std.fs.path.join(a, &.{ work, "refused-export" });
@@ -246,7 +268,7 @@ const Fixture = struct {
             const expected = if (!v2 and std.mem.eql(u8, case.name, "source-custody")) error.EvidenceChanged else case.expected;
             try python(a, io, &.{ "mutate", work, case.name });
             std.debug.print("local refusal {s} {s}: {s}\n", .{ revision, case.name, @errorName(expected) });
-            const outcome = open(io, &directory, runtime, repository);
+            const outcome = open(a, io, &directory, runtime, repository);
             if (outcome) |value| {
                 var unexpected = value;
                 unexpected.deinit();
@@ -271,6 +293,23 @@ const Fixture = struct {
         std.debug.print("complete local {s}: constructor, recheck, CLI and refusals passed\n", .{revision});
     }
 };
+
+pub fn runWorker(a: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+    if (args.len != 5) return error.InvalidUsage;
+    const fixture: Fixture = .{
+        .revision = args[2],
+        .work = args[3],
+        .repository = try std.fs.path.join(a, &.{ args[3], "producer" }),
+        .runtime = try std.fs.path.join(a, &.{ args[3], ".d/wamr-native-runtime" }),
+        .stage = args[4],
+    };
+    if (std.mem.eql(u8, args[1], "prepare"))
+        try fixture.prepare(io)
+    else if (std.mem.eql(u8, args[1], "qualify"))
+        try fixture.qualify(io)
+    else
+        return error.InvalidUsage;
+}
 
 fn together(io: std.Io, fixtures: []const Fixture, comptime operation: fn (Fixture, std.Io) anyerror!void) !void {
     var index: usize = 0;
@@ -350,8 +389,8 @@ pub fn qualify(a: std.mem.Allocator, io: std.Io, stage: []const u8) !void {
         });
     }
     try std.testing.expect(fixtures.items.len != 0);
-    try together(io, fixtures.items, Fixture.prepare);
+    try together(io, fixtures.items, Fixture.prepareProcess);
     // Signal dispositions belong to the process, not the concurrent workers.
     for (fixtures.items) |fixture| try fixture.cancellation(io);
-    try together(io, fixtures.items, Fixture.qualify);
+    try together(io, fixtures.items, Fixture.qualifyProcess);
 }
