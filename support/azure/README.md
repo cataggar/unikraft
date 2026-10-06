@@ -854,6 +854,12 @@ topology profile additionally checks distinct policy-2 seeds on two data LUNs
 under either controller-offer order, rejecting a swapped seed or duplicate OS
 boot signatures without issuing writes or flushes.
 
+The reoffer-cleanup fixture waits for the complete six-LUN inventory within
+the existing request-timeout bound before capturing a target and opening a
+read session; offer acceptance alone is not binding readiness. An unresolved
+inventory or failed target/session admission remains an explicit fixture
+failure, with the individual error codes retained in its diagnostic.
+
 `state.json` retains `local_platform_boot_modes` for the raw and fixed-VHD
 x2APIC/legacy-APIC boots, while `image_sha256` remains the deployment identity.
 Ordinary pull requests intentionally have no Azure stage or credentials.

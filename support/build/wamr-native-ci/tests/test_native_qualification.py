@@ -17,6 +17,95 @@ from controller_record_fixtures import RecordFixtures
 import native_fault_qualification as gate
 
 
+class NativeQemuAcquisition(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(
+            prefix="qemu-acquisition-", dir=os.environ["TMPDIR"]))
+        self.addCleanup(shutil.rmtree, self.root)
+        self.bin = self.root / "bin"
+        self.bin.mkdir(mode=0o700)
+        for name, output in (("uname", "x86_64"), ("id", "1000")):
+            path = self.bin / name
+            path.write_text(f"#!/bin/sh\nprintf '%s\\n' '{output}'\n")
+            path.chmod(0o700)
+        downloader = self.bin / "ghr"
+        downloader.write_text("""#!/usr/bin/env python3
+import json
+import os
+from pathlib import Path
+import sys
+
+args = sys.argv[1:]
+with open(os.environ["ACQUISITION_CALLS"], "a") as calls:
+    calls.write(json.dumps({
+        "anonymous": "--no-auth" in args,
+        "token": bool(os.environ.get("GH_TOKEN")),
+    }) + "\\n")
+output = Path(args[args.index("-o") + 1])
+if os.environ["ACQUISITION_FAILURE"] == "archive" and output.name == "release.json":
+    output.write_text(json.dumps({
+        "tag_name": "v11.0.50-z.7",
+        "target_commitish": "559ac9def5a65912ae602cc5682fc7c045fcbbcd",
+        "assets": [{
+            "id": 477103841,
+            "name": "qemu-v11.0.50-z.7-linux-x64.tar.gz",
+            "size": 137302371,
+            "digest": "sha256:f8b9cc818959f95326010c95dad644177ebb0cbb0feef3db9528c4434855e397",
+        }],
+    }))
+else:
+    print("fixture download refusal", file=sys.stderr)
+    sys.exit(3 if os.environ["ACQUISITION_FAILURE"] == "archive" else 2)
+""")
+        downloader.chmod(0o700)
+
+    def acquire(self, name, *, token="", failure="metadata"):
+        repository = Path(__file__).resolve().parents[4]
+        calls = self.root / f"{name}.jsonl"
+        runtime = self.root / name
+        environment = dict(
+            os.environ, PATH=f"{self.bin}:/usr/bin:/bin",
+            GITHUB_ACTIONS="true", GH_TOKEN=token,
+            ACQUISITION_CALLS=str(calls), ACQUISITION_FAILURE=failure)
+        result = subprocess.run(
+            ["bash", ".github/scripts/hyperv-native-qemu-acquire.sh", str(runtime)],
+            cwd=repository, env=environment, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=10)
+        return result, runtime, [
+            json.loads(line) for line in calls.read_text().splitlines()]
+
+    def test_http_failure_preserves_status_and_diagnostics_with_scoped_auth(self):
+        for name, token in (("anonymous", ""), ("authenticated", "fixture-token")):
+            with self.subTest(name=name):
+                result, runtime, calls = self.acquire(name, token=token)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(b"metadata-download.txt (exit 2)", result.stderr)
+                self.assertIn(b"fixture download refusal", result.stderr)
+                self.assertEqual(
+                    (runtime / "evidence/metadata-download.txt").read_bytes(),
+                    b"fixture download refusal\n")
+                self.assertEqual(calls, [{
+                    "anonymous": not bool(token), "token": bool(token)}])
+                self.assertFalse((runtime / "evidence/release.json").exists())
+                self.assertFalse(any((runtime / "bin").iterdir()))
+                if token:
+                    self.assertNotIn(token.encode(), result.stderr)
+
+    def test_archive_verification_failure_keeps_metadata_and_never_extracts(self):
+        result, runtime, calls = self.acquire(
+            "archive", token="fixture-token", failure="archive")
+        self.assertEqual(result.returncode, 3)
+        self.assertIn(b"archive-download.txt (exit 3)", result.stderr)
+        self.assertIn(b"fixture download refusal", result.stderr)
+        self.assertTrue((runtime / "evidence/release.json").is_file())
+        self.assertEqual(calls, [
+            {"anonymous": False, "token": True},
+            {"anonymous": False, "token": True},
+        ])
+        self.assertFalse(any((runtime / "bin").iterdir()))
+
+
 class NativeFaultGate(unittest.TestCase):
     def setUp(self):
         parent = Path(os.environ["TMPDIR"])

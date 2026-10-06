@@ -4505,12 +4505,432 @@ test "native ELF runtime closure retains sorted canonical dynamic-loader paths" 
         try std.testing.expectEqualStrings(path, canonical);
         if (index > 0) try std.testing.expect(std.mem.lessThan(u8, actual[index - 1], path));
     }
+    var cancel = std.atomic.Value(bool).init(false);
+    var evidence: controller.input_custody.RuntimeInventoryEvidence = .{};
+    defer evidence.deinit(allocator);
+    const cancellable = try controller.input_custody.executableRuntimePathsWithOptions(allocator, io, python_path, .{
+        .cancel = &cancel,
+        .evidence = &evidence,
+    });
+    defer {
+        for (cancellable) |path| allocator.free(path);
+        allocator.free(cancellable);
+    }
+    try std.testing.expectEqual(actual.len, cancellable.len);
+    for (actual, cancellable) |old, new| try std.testing.expectEqualStrings(old, new);
+    try std.testing.expect(evidence.command.?.succeeded());
+    try std.testing.expect(!evidence.cancellation_observed);
+    var loader_identity_found = false;
+    for (cancellable) |path| {
+        var retained = try core.private_files.RetainedFile.open(io, path, .artifact);
+        defer retained.close(io);
+        const identity = evidence.command.?.executable;
+        if (retained.file_snapshot.ino != identity.inode or
+            retained.file_snapshot.dev_major != identity.device_major or
+            retained.file_snapshot.dev_minor != identity.device_minor) continue;
+        const candidate = try core.process.Executable.fromFile(io, retained.file);
+        defer candidate.close(io);
+        if (std.meta.eql(candidate.identity, evidence.command.?.executable)) loader_identity_found = true;
+    }
+    try std.testing.expect(loader_identity_found);
+    try std.testing.expectError(error.RuntimeInventoryEvidenceInUse, controller.input_custody.executableRuntimePathsWithOptions(
+        allocator,
+        io,
+        python_path,
+        .{ .cancel = &cancel, .evidence = &evidence },
+    ));
     const invalid: controller.input_custody.ProductionPaths = .{
         .runtime = "/",
         .tools = .{""} ** controller.input_custody.host_tools.len,
         .python_stdlib = "/",
     };
     try std.testing.expectError(error.UnsafePath, controller.input_custody.captureProduction(allocator, io, invalid));
+}
+
+fn inventoryNoChildren() !void {
+    var status: u32 = 0;
+    try std.testing.expectEqual(.CHILD, std.os.linux.errno(std.os.linux.waitpid(-1, &status, std.os.linux.W.NOHANG)));
+}
+
+const InventoryCancellationProbe = struct {
+    table: std.Io.VTable = std.testing.io.vtable.*,
+    cancel: *std.atomic.Value(bool),
+    armed: bool = false,
+    on_read: bool = false,
+    injected: bool = false,
+    threadlocal var active: ?*InventoryCancellationProbe = null;
+
+    fn install(self: *InventoryCancellationProbe) std.Io {
+        std.debug.assert(active == null);
+        active = self;
+        self.table.fileReadPositional = read;
+        self.table.dirOpenDir = openDirectory;
+        return .{ .userdata = std.testing.io.userdata, .vtable = &self.table };
+    }
+
+    fn inject(self: *InventoryCancellationProbe) void {
+        if (self.armed and !self.injected) {
+            self.injected = true;
+            self.cancel.store(true, .release);
+        }
+    }
+
+    fn read(userdata: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+        const count = try std.testing.io.vtable.fileReadPositional(userdata, file, data, offset);
+        if (active.?.on_read) active.?.inject();
+        return count;
+    }
+
+    fn openDirectory(
+        userdata: ?*anyopaque,
+        directory: std.Io.Dir,
+        path: []const u8,
+        open_options: std.Io.Dir.OpenOptions,
+    ) std.Io.Dir.OpenError!std.Io.Dir {
+        const opened = try std.testing.io.vtable.dirOpenDir(userdata, directory, path, open_options);
+        if (!active.?.on_read) active.?.inject();
+        return opened;
+    }
+
+    fn arm(context: *anyopaque) !void {
+        const self: *InventoryCancellationProbe = @ptrCast(@alignCast(context));
+        self.armed = true;
+    }
+
+    fn cancelAtBoundary(context: *anyopaque) !void {
+        const self: *InventoryCancellationProbe = @ptrCast(@alignCast(context));
+        self.cancel.store(true, .release);
+    }
+};
+
+test "native ELF runtime inventory cancels before work during ELF and after native inventory" {
+    const inputs = controller.input_custody;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const python = try std.Io.Dir.realPathFileAbsoluteAlloc(io, "/usr/bin/python3", a);
+    defer a.free(python);
+    var cancel = std.atomic.Value(bool).init(true);
+    var evidence: inputs.RuntimeInventoryEvidence = .{};
+    defer evidence.deinit(a);
+    try std.testing.expectError(error.Cancelled, inputs.executableRuntimePathsWithOptions(a, io, python, .{
+        .cancel = &cancel,
+        .evidence = &evidence,
+    }));
+    try std.testing.expect(evidence.command == null);
+    try std.testing.expect(evidence.cancellation_observed);
+    evidence.deinit(a);
+    cancel.store(false, .release);
+    var boundary: InventoryCancellationProbe = .{ .cancel = &cancel };
+    try std.testing.expectError(error.Cancelled, inputs.RuntimeInventoryTest.paths(a, io, python, .{
+        .cancel = &cancel,
+        .evidence = &evidence,
+    }, .{ .before_command = .{ .context = &boundary, .run = InventoryCancellationProbe.cancelAtBoundary } }));
+    try std.testing.expectEqual(.cancelled, std.meta.activeTag(evidence.command.?.primary));
+    try std.testing.expectEqual(.not_required, evidence.command.?.cleanup);
+    try std.testing.expect(evidence.command.?.cleanup_complete);
+    try std.testing.expect(evidence.command.?.termination == null);
+    evidence.deinit(a);
+    cancel.store(false, .release);
+    var probe: InventoryCancellationProbe = .{ .cancel = &cancel, .armed = true, .on_read = true };
+    const traced = probe.install();
+    defer InventoryCancellationProbe.active = null;
+    try std.testing.expectError(error.Cancelled, inputs.executableRuntimePathsWithOptions(a, traced, python, .{
+        .cancel = &cancel,
+        .evidence = &evidence,
+    }));
+    try std.testing.expect(probe.injected);
+    try std.testing.expect(evidence.command == null);
+    evidence.deinit(a);
+    cancel.store(false, .release);
+    probe.armed = false;
+    probe.on_read = false;
+    probe.injected = false;
+    try std.testing.expectError(error.Cancelled, inputs.RuntimeInventoryTest.paths(a, traced, python, .{
+        .cancel = &cancel,
+        .evidence = &evidence,
+    }, .{ .after_command = .{ .context = &probe, .run = InventoryCancellationProbe.arm } }));
+    try std.testing.expect(probe.injected);
+    try std.testing.expect(evidence.command.?.succeeded());
+    try std.testing.expect(evidence.cancellation_observed);
+    try inventoryNoChildren();
+}
+
+const RuntimeInventoryFixture = struct {
+    const linux = std.os.linux;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Action = enum { fifo, replace_executable, hardlink, mutate_executable, replace_loader, invalid_executable, cancel };
+    parent: std.Io.Dir,
+    directory: std.Io.Dir,
+    name: []u8,
+    path: [:0]u8,
+    loader: []u8,
+    cancel: std.atomic.Value(bool) = .init(false),
+    action: Action = .fifo,
+    fifo: ?linux.fd_t = null,
+    watch: ?linux.fd_t = null,
+    observer: ?std.Thread = null,
+    observed: bool = false,
+    observer_error: ?anyerror = null,
+
+    fn copy(directory: std.Io.Dir, name: []const u8, path: []const u8) !void {
+        var source = try core.private_files.RetainedFile.open(io, path, .artifact);
+        defer source.close(io);
+        var data = try core.private_files.readSensitiveFile(io, a, source.file, 16 * 1024 * 1024, .artifact);
+        defer data.deinit();
+        const target = try directory.createFile(io, name, .{ .exclusive = true, .permissions = .fromMode(0o700) });
+        defer target.close(io);
+        try target.writePositionalAll(io, data.bytes(), 0);
+        try source.verify(io);
+    }
+
+    fn init() !RuntimeInventoryFixture {
+        const parent = try core.private_files.openDirectory(io, options.fixture_root, .private);
+        errdefer parent.close(io);
+        const name = try std.fmt.allocPrint(a, "runtime-inventory-{d}", .{linux.getpid()});
+        errdefer a.free(name);
+        try parent.createDir(io, name, .fromMode(0o700));
+        errdefer parent.deleteTree(io, name) catch @panic("inventory fixture cleanup failed");
+        const directory = try parent.openDir(io, name, .{ .iterate = true });
+        errdefer directory.close(io);
+        const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}/executable", .{ options.fixture_root, name }, 0);
+        errdefer a.free(path);
+        const loader = try std.fmt.allocPrint(a, "{s}/{s}/loader", .{ options.fixture_root, name });
+        errdefer a.free(loader);
+        const python = try std.Io.Dir.realPathFileAbsoluteAlloc(io, "/usr/bin/python3", a);
+        defer a.free(python);
+        try copy(directory, "executable", python);
+        const executable = try directory.openFile(io, "executable", .{ .mode = .read_write });
+        defer executable.close(io);
+        var header: [64]u8 = undefined;
+        if (try executable.readPositionalAll(io, &header, 0) != header.len or header[4] != 2)
+            return error.InventoryFixtureElf;
+        const offset = std.mem.readInt(u64, header[32..40], .little);
+        const size = std.mem.readInt(u16, header[54..56], .little);
+        const count = std.mem.readInt(u16, header[56..58], .little);
+        if (size != 56) return error.InventoryFixtureElf;
+        for (0..count) |index| {
+            var program: [56]u8 = undefined;
+            const at = offset + index * size;
+            if (try executable.readPositionalAll(io, &program, at) != program.len)
+                return error.InventoryFixtureElf;
+            if (std.mem.readInt(u32, program[0..4], .little) != 3) continue;
+            const start = std.mem.readInt(u64, program[8..16], .little);
+            const length = std.mem.readInt(u64, program[32..40], .little);
+            if (length < 2 or length > 4096) return error.InventoryFixtureElf;
+            const original = try a.alloc(u8, @intCast(length));
+            defer a.free(original);
+            if (try executable.readPositionalAll(io, original, start) != length or original[original.len - 1] != 0)
+                return error.InventoryFixtureElf;
+            const canonical = try std.Io.Dir.realPathFileAbsoluteAlloc(io, original[0 .. original.len - 1], a);
+            defer a.free(canonical);
+            try copy(directory, "loader", canonical);
+            const end = (try executable.stat(io)).size;
+            const interpreter_path = try a.dupeZ(u8, loader);
+            defer a.free(interpreter_path);
+            try executable.writePositionalAll(io, interpreter_path[0 .. interpreter_path.len + 1], end);
+            std.mem.writeInt(u64, program[8..16], end, .little);
+            std.mem.writeInt(u64, program[32..40], interpreter_path.len + 1, .little);
+            std.mem.writeInt(u64, program[40..48], interpreter_path.len + 1, .little);
+            try executable.writePositionalAll(io, &program, at);
+            return .{ .parent = parent, .directory = directory, .name = name, .path = path, .loader = loader };
+        }
+        return error.InventoryFixtureElf;
+    }
+
+    fn deinit(self: *RuntimeInventoryFixture) void {
+        if (self.observer) |observer| observer.join();
+        if (self.watch) |fd| _ = linux.close(fd);
+        if (self.fifo) |fd| _ = linux.close(fd);
+        self.directory.close(io);
+        self.parent.deleteTree(io, self.name) catch @panic("inventory fixture cleanup failed");
+        self.parent.close(io);
+        a.free(self.loader);
+        a.free(self.path);
+        a.free(self.name);
+    }
+
+    fn change(context: *anyopaque) !void {
+        const self: *RuntimeInventoryFixture = @ptrCast(@alignCast(context));
+        switch (self.action) {
+            .cancel => self.cancel.store(true, .release),
+            .replace_executable, .invalid_executable, .fifo => {
+                try std.Io.Dir.rename(self.directory, "executable", self.directory, "original", io);
+                if (self.action == .replace_executable) {
+                    const original = try std.fs.path.join(a, &.{ std.fs.path.dirname(self.path).?, "original" });
+                    defer a.free(original);
+                    try copy(self.directory, "executable", original);
+                } else if (self.action == .invalid_executable) {
+                    try writeFixtureFile(io, self.directory, "executable", "not an ELF executable\n");
+                } else {
+                    if (linux.errno(linux.mknodat(self.directory.handle, "executable", linux.S.IFIFO | 0o600, 0)) != .SUCCESS)
+                        return error.InventoryFixtureFifo;
+                    const opened = linux.openat(self.directory.handle, "executable", .{ .ACCMODE = .RDWR, .NONBLOCK = true, .CLOEXEC = true }, 0);
+                    if (linux.errno(opened) != .SUCCESS) return error.InventoryFixtureFifo;
+                    self.fifo = @intCast(opened);
+                    const watcher = linux.inotify_init1(linux.IN.CLOEXEC | linux.IN.NONBLOCK);
+                    if (linux.errno(watcher) != .SUCCESS) return error.InventoryFixtureWatch;
+                    self.watch = @intCast(watcher);
+                    if (linux.errno(linux.inotify_add_watch(self.watch.?, self.path, linux.IN.OPEN)) != .SUCCESS)
+                        return error.InventoryFixtureWatch;
+                    self.observer = try std.Thread.spawn(.{}, observe, .{self});
+                }
+            },
+            .hardlink => {
+                if (linux.errno(linux.linkat(self.directory.handle, "executable", self.directory.handle, "alias", 0)) != .SUCCESS)
+                    return error.InventoryFixtureLink;
+            },
+            .mutate_executable => {
+                const executable = try self.directory.openFile(io, "executable", .{ .mode = .read_write });
+                defer executable.close(io);
+                try executable.writePositionalAll(io, "X", 0);
+            },
+            .replace_loader => {
+                try std.Io.Dir.rename(self.directory, "loader", self.directory, "original-loader", io);
+                const original = try std.fs.path.join(a, &.{ std.fs.path.dirname(self.path).?, "original-loader" });
+                defer a.free(original);
+                try copy(self.directory, "loader", original);
+            },
+        }
+    }
+
+    fn observe(self: *RuntimeInventoryFixture) void {
+        observeOpen(self) catch |err| {
+            self.observer_error = err;
+        };
+        self.cancel.store(true, .release);
+    }
+
+    fn observeOpen(self: *RuntimeInventoryFixture) !void {
+        const deadline = try core.process.Deadline.afterMilliseconds(5000);
+        var pending = [_]linux.pollfd{.{ .fd = self.watch.?, .events = linux.POLL.IN, .revents = 0 }};
+        while (!try deadline.expired()) {
+            const ready = linux.poll(&pending, pending.len, 100);
+            if (linux.errno(ready) == .INTR) continue;
+            if (linux.errno(ready) != .SUCCESS) return error.InventoryFixturePoll;
+            if (ready == 0) continue;
+            var event: [64]u8 align(@alignOf(linux.inotify_event)) = undefined;
+            const amount = linux.read(self.watch.?, &event, event.len);
+            if (linux.errno(amount) == .AGAIN or linux.errno(amount) == .INTR) continue;
+            if (linux.errno(amount) != .SUCCESS or amount < @sizeOf(linux.inotify_event))
+                return error.InventoryFixtureWatch;
+            const observed: *const linux.inotify_event = @ptrCast(&event);
+            if (observed.mask & linux.IN.OPEN == 0) return error.InventoryFixtureWatch;
+            self.observed = true;
+            return;
+        }
+        return error.InventoryFixtureSynchronizationTimeout;
+    }
+};
+
+fn inventoryInFlightCancellation(poison: bool) !void {
+    const inputs = controller.input_custody;
+    const process = core.process;
+    const a = std.testing.allocator;
+    var scenario = try RuntimeInventoryFixture.init();
+    defer scenario.deinit();
+    const native_loader = try process.Executable.open(std.testing.io, scenario.loader);
+    defer native_loader.close(std.testing.io);
+    var evidence: inputs.RuntimeInventoryEvidence = .{};
+    defer evidence.deinit(a);
+    var fault: process.CommandPostReleaseTestState = .{ .fault = .cleanup_proof };
+    try std.testing.expectError(if (poison) error.RuntimeInventoryRefused else error.Cancelled, inputs.RuntimeInventoryTest.paths(
+        a,
+        std.testing.io,
+        scenario.path,
+        .{ .cancel = &scenario.cancel, .evidence = &evidence },
+        .{
+            .before_command = .{ .context = &scenario, .run = RuntimeInventoryFixture.change },
+            .command = .{ .post_release = if (poison) &fault else null },
+        },
+    ));
+    scenario.observer.?.join();
+    scenario.observer = null;
+    if (scenario.observer_error) |err| return err;
+    try std.testing.expect(scenario.observed);
+    const command = evidence.command.?;
+    try std.testing.expectEqualDeep(native_loader.identity, command.executable);
+    try std.testing.expect(command.executable_stable);
+    try std.testing.expect(command.termination != null);
+    try std.testing.expect(!command.primary_deadline_reached);
+    try std.testing.expectEqual(.cancelled, std.meta.activeTag(command.primary));
+    try std.testing.expect(command.cancellation_observed);
+    try std.testing.expect(evidence.cancellation_observed);
+    try std.testing.expectEqual(!poison, command.cleanup_complete);
+    const cleanup: process.CommandCleanup = if (poison) .reap_failed else .complete;
+    try std.testing.expectEqual(cleanup, command.cleanup);
+    try std.testing.expect(command.reap_events >= 2);
+    try std.testing.expect(command.cleanup_events >= process.command_complete_cleanup_events_min);
+    try inventoryNoChildren();
+    if (poison) {
+        try std.testing.expectEqual(@as(u32, 1), fault.fault_injections);
+        try std.Io.Dir.rename(scenario.directory, "executable", scenario.directory, "blocked-fifo", std.testing.io);
+        try std.Io.Dir.rename(scenario.directory, "original", scenario.directory, "executable", std.testing.io);
+        try std.testing.expectError(error.UnresolvedCleanup, inputs.executableRuntimePaths(a, std.testing.io, scenario.path));
+    }
+}
+
+test "native ELF runtime inventory cancellation interrupts a genuine blocked loader and reaps it" {
+    try inventoryInFlightCancellation(false);
+}
+
+test "native ELF runtime inventory cancellation retains irreversible native cleanup poison" {
+    const linux = std.os.linux;
+    const forked = linux.fork();
+    if (linux.errno(forked) != .SUCCESS) return error.InventoryFixtureFork;
+    if (forked == 0) {
+        inventoryInFlightCancellation(true) catch |err| {
+            const name = @errorName(err);
+            _ = linux.write(2, name.ptr, name.len);
+            linux.exit_group(125);
+        };
+        linux.exit_group(0);
+    }
+    var status: u32 = 0;
+    while (true) switch (linux.errno(linux.waitpid(@intCast(forked), &status, 0))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        else => return error.InventoryFixtureReap,
+    };
+    try std.testing.expect(linux.W.IFEXITED(status));
+    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+    try inventoryNoChildren();
+}
+
+test "native ELF runtime inventory preserves executable path hardlink loader and refusal boundaries" {
+    const inputs = controller.input_custody;
+    const a = std.testing.allocator;
+    for ([_]RuntimeInventoryFixture.Action{ .replace_executable, .hardlink, .mutate_executable, .replace_loader, .invalid_executable, .cancel }) |action| {
+        var scenario = try RuntimeInventoryFixture.init();
+        defer scenario.deinit();
+        scenario.action = action;
+        var evidence: inputs.RuntimeInventoryEvidence = .{};
+        defer evidence.deinit(a);
+        const hook: inputs.RuntimeInventoryTest.Hook = .{ .context = &scenario, .run = RuntimeInventoryFixture.change };
+        var late_cancel: InventoryCancellationProbe = .{ .cancel = &scenario.cancel };
+        const invalid = action == .invalid_executable;
+        try std.testing.expectError(
+            if (invalid) error.RuntimeInventoryRefused else if (action == .cancel) error.Cancelled else error.FileChanged,
+            inputs.RuntimeInventoryTest.paths(a, std.testing.io, scenario.path, .{
+                .cancel = &scenario.cancel,
+                .evidence = &evidence,
+            }, .{
+                .before_command = if (invalid) hook else null,
+                .after_command = if (invalid)
+                    .{ .context = &late_cancel, .run = InventoryCancellationProbe.cancelAtBoundary }
+                else
+                    hook,
+            }),
+        );
+        if (invalid) {
+            try std.testing.expect(!evidence.command.?.succeeded());
+            try std.testing.expect(evidence.command.?.stderr.len > 0);
+            try std.testing.expect(scenario.cancel.load(.acquire));
+            try std.testing.expect(!evidence.cancellation_observed);
+        } else try std.testing.expect(evidence.command.?.succeeded());
+        try std.testing.expect(evidence.command.?.cleanup_complete);
+        try inventoryNoChildren();
+    }
 }
 
 test "source custody diagnostics cap changes at 64 without losing total" {

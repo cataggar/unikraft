@@ -615,6 +615,13 @@ pub const CommandLimits = struct {
     term_grace_ms: u32 = 100,
 };
 
+pub const CommandCapture = union(enum) {
+    separate,
+    /// One pipe for both child descriptors; payload is the aggregate byte cap.
+    /// The merged bytes/status occupy stdout; stderr is empty and complete.
+    merged: usize,
+};
+
 /// Internal trusted-command contract. This is deliberately not a general CLI:
 /// argv, environment, cwd, executable descriptor and both absolute deadlines
 /// are supplied by the owning controller. After fork, the child remains behind
@@ -630,6 +637,7 @@ pub const CommandRequest = struct {
     cleanup_deadline: Deadline,
     cancel: ?*const std.atomic.Value(bool) = null,
     stdout_file: ?std.Io.File = null,
+    capture: CommandCapture = .separate,
     /// Some self-locating tools require the retained source inode rather than a memfd snapshot.
     snapshot_executable: bool = true,
     limits: CommandLimits = .{},
@@ -938,6 +946,11 @@ fn runCommandImpl(
     const options = commandOptions(request);
     try validateOptions(options, 8 * 1024 * 1024);
     try validateCommandLimits(request.limits);
+    switch (request.capture) {
+        .separate => {},
+        .merged => |limit| if (limit == 0 or request.stdout_file != null)
+            return error.InvalidOptions,
+    }
     try enter();
     defer busy.store(false, .release);
     try requireNoChildren();
@@ -946,7 +959,11 @@ fn runCommandImpl(
     try requirePidfds();
 
     const started_ns = try now();
-    const total = try std.math.add(usize, request.limits.stdout_bytes, request.limits.stderr_bytes);
+    const stdout_bytes = options.stdout_limit;
+    const total = switch (request.capture) {
+        .separate => try std.math.add(usize, stdout_bytes, request.limits.stderr_bytes),
+        .merged => stdout_bytes,
+    };
     var result: CommandResult = .{
         .storage = try allocator.alloc(u8, total),
         .started_ns = started_ns,
@@ -958,9 +975,10 @@ fn runCommandImpl(
     @memset(result.storage, 0);
     errdefer result.deinit(allocator);
     var capture: Capture = .{
-        .output = result.storage[0..request.limits.stdout_bytes],
-        .stderr_output = result.storage[request.limits.stdout_bytes..],
+        .output = result.storage[0..stdout_bytes],
+        .stderr_output = result.storage[stdout_bytes..],
         .stderr_limit = request.limits.stderr_bytes,
+        .stderr_eof = request.capture == .merged,
     };
     var observed_ns = try now();
     if (observed_ns >= request.primary_deadline.expires_ns)
@@ -1022,6 +1040,7 @@ fn runCommandImpl(
         allocator,
         options,
         snapshot,
+        request.capture == .merged,
         if (test_options) |options_value| options_value.pre_spawn else null,
         if (test_options) |options_value| options_value.gate else null,
     ) catch |err| {
@@ -1034,7 +1053,9 @@ fn runCommandImpl(
         );
     };
     defer _ = linux.close(child.stdout);
-    defer _ = linux.close(child.stderr);
+    defer if (child.stderr >= 0) {
+        _ = linux.close(child.stderr);
+    };
     defer _ = linux.close(child.control);
     defer child.closeGate();
     var cleanup_guard: CommandCleanupGuard = .{
@@ -1526,7 +1547,10 @@ fn commandOptions(request: CommandRequest) Options {
         .cwd = request.cwd,
         .deadline = request.primary_deadline,
         .cleanup_ms = 100,
-        .stdout_limit = request.limits.stdout_bytes,
+        .stdout_limit = switch (request.capture) {
+            .separate => request.limits.stdout_bytes,
+            .merged => |limit| limit,
+        },
         .stderr_limit = request.limits.stderr_bytes,
         .cancel = request.cancel,
         .stdout_file = request.stdout_file,
@@ -1581,7 +1605,7 @@ fn supervise(
         result.failures.primary = .{ .stage = .process_spawn, .category = .cancelled };
         return result;
     }
-    var child = spawnOwned(allocator, options, policy.fault, executable, false, null) catch {
+    var child = spawnOwned(allocator, options, policy.fault, executable, false, null, false) catch {
         result.failures.primary = .{ .stage = .process_spawn, .category = .spawn_failed };
         return result;
     };
@@ -1769,7 +1793,7 @@ fn monitorCommand(
     terminal_observed_ns: *?u64,
 ) !void {
     try nonblocking(child.stdout);
-    try nonblocking(child.stderr);
+    if (child.stderr >= 0) try nonblocking(child.stderr);
     try nonblocking(child.control);
     var exec_confirmed = false;
     while (true) {
@@ -2631,7 +2655,7 @@ fn finishCommandCapture(
     if (result.stdout_status != .overflow) capture.drainFinal(stdout, false) catch |err| {
         result.stdout_status = if (err == error.OutputLimit) .overflow else .io_failed;
     };
-    if (result.stderr_status != .overflow) capture.drainFinal(stderr, true) catch |err| {
+    if (stderr >= 0 and result.stderr_status != .overflow) capture.drainFinal(stderr, true) catch |err| {
         result.stderr_status = if (err == error.OutputLimit) .overflow else .io_failed;
     };
     if (result.stdout_status != .overflow and result.stdout_status != .io_failed)
@@ -3031,6 +3055,7 @@ fn spawnCommandOwned(
     allocator: std.mem.Allocator,
     options: Options,
     executable: linux.fd_t,
+    merged: bool,
     fault: ?CommandPreSpawnTestFault,
     gate_test: ?*CommandGateTestState,
 ) !Spawned {
@@ -3042,6 +3067,7 @@ fn spawnCommandOwned(
         executable,
         true,
         if (gate_test) |active| active.fault else null,
+        merged,
     );
 }
 
@@ -3054,6 +3080,7 @@ fn spawnOwned(
     executable: ?linux.fd_t,
     command_gate: bool,
     gate_fault: ?CommandGateTestFault,
+    merged: bool,
 ) !Spawned {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -3065,8 +3092,8 @@ fn spawnOwned(
 
     const stdout = try makePipe();
     errdefer closePipe(stdout);
-    const stderr = try makePipe();
-    errdefer closePipe(stderr);
+    const stderr = if (merged) stdout else try makePipe();
+    errdefer if (!merged) closePipe(stderr);
     const control = try makePipe();
     errdefer closePipe(control);
     const gate = if (command_gate) try makeGatePair() else null;
@@ -3082,7 +3109,7 @@ fn spawnOwned(
     if (forked == 0) {
         // No allocation, std.Io, libc, or locks are permitted between fork and exec.
         _ = linux.close(stdout[0]);
-        _ = linux.close(stderr[0]);
+        if (!merged) _ = linux.close(stderr[0]);
         _ = linux.close(control[0]);
         if (gate) |pair| _ = linux.close(pair[0]);
         if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(linux.SIG.KILL), 0, 0, 0)) != .SUCCESS or
@@ -3126,13 +3153,13 @@ fn spawnOwned(
     // the child into creating descendants between the group and leader signals.
     _ = linux.setpgid(@intCast(forked), @intCast(forked));
     _ = linux.close(stdout[1]);
-    _ = linux.close(stderr[1]);
+    if (!merged) _ = linux.close(stderr[1]);
     _ = linux.close(control[1]);
     if (gate) |pair| _ = linux.close(pair[1]);
     return .{
         .pid = @intCast(forked),
         .stdout = stdout[0],
-        .stderr = stderr[0],
+        .stderr = if (merged) -1 else stderr[0],
         .control = control[0],
         .gate = if (gate) |pair| pair[0] else null,
     };

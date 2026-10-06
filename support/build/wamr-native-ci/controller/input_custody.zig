@@ -16,11 +16,37 @@ pub const host_tools = [_][]const u8{
 };
 pub const native_roles = [_][]const u8{ "native:wamr-aot-build", "native:wamr-log-validate" };
 
-fn interpreter(allocator: std.mem.Allocator, io: std.Io, executable: []const u8) !?[]u8 {
+pub const RuntimeInventoryEvidence = struct {
+    command: ?process.CommandResult = null,
+    cancellation_observed: bool = false,
+
+    pub fn deinit(self: *RuntimeInventoryEvidence, allocator: std.mem.Allocator) void {
+        if (self.command) |*command| command.deinit(allocator);
+        self.* = .{};
+    }
+};
+
+pub const RuntimeInventoryOptions = struct {
+    cancel: ?*const std.atomic.Value(bool) = null,
+    /// Initially empty, caller-owned private evidence, including on refusal.
+    evidence: ?*RuntimeInventoryEvidence = null,
+};
+
+fn checkInventoryCancellation(options: RuntimeInventoryOptions) !void {
+    if (options.cancel) |flag| if (flag.load(.acquire)) {
+        if (options.evidence) |evidence| evidence.cancellation_observed = true;
+        return error.Cancelled;
+    };
+}
+
+fn interpreter(allocator: std.mem.Allocator, io: std.Io, executable: []const u8, options: RuntimeInventoryOptions) !?[]u8 {
+    try checkInventoryCancellation(options);
     var retained = try files.RetainedFile.open(io, executable, .artifact);
     defer retained.close(io);
     var header: [64]u8 = undefined;
-    if (try retained.file.readPositionalAll(io, &header, 0) != header.len or
+    const header_bytes = try retained.file.readPositionalAll(io, &header, 0);
+    try checkInventoryCancellation(options);
+    if (header_bytes != header.len or
         !std.mem.eql(u8, header[0..4], "\x7fELF"))
         return null;
     if (header[5] != 1 or (header[4] != 2 and header[4] != 1))
@@ -33,9 +59,11 @@ fn interpreter(allocator: std.mem.Allocator, io: std.Io, executable: []const u8)
         return error.UnsupportedElfFormat;
     var table: [256]u8 = undefined;
     for (0..count) |index| {
+        try checkInventoryCancellation(options);
         const at = try std.math.add(u64, offset, try std.math.mul(u64, index, size));
         if (try retained.file.readPositionalAll(io, table[0..size], at) != size)
             return error.UnsupportedElfFormat;
+        try checkInventoryCancellation(options);
         if (std.mem.readInt(u32, table[0..4], .little) != 3) continue;
         const start: u64 = if (is_64) std.mem.readInt(u64, table[8..16], .little) else std.mem.readInt(u32, table[4..8], .little);
         const length: u64 = if (is_64) std.mem.readInt(u64, table[32..40], .little) else std.mem.readInt(u32, table[16..20], .little);
@@ -45,21 +73,79 @@ fn interpreter(allocator: std.mem.Allocator, io: std.Io, executable: []const u8)
         if (try retained.file.readPositionalAll(io, buffer, start) != length or
             buffer[buffer.len - 1] != 0 or buffer[0] != '/')
             return error.UnsupportedElfFormat;
+        try checkInventoryCancellation(options);
         const resolved = try std.Io.Dir.realPathFileAbsoluteAlloc(io, buffer[0 .. buffer.len - 1], allocator);
         defer allocator.free(resolved);
+        try checkInventoryCancellation(options);
         var pinned = try files.RetainedFile.open(io, resolved, .artifact);
         defer pinned.close(io);
         try pinned.verify(io);
         try retained.verify(io);
+        try checkInventoryCancellation(options);
         return try allocator.dupe(u8, resolved);
     }
     try retained.verify(io);
+    try checkInventoryCancellation(options);
     return null;
 }
 
 pub fn executableRuntimePaths(allocator: std.mem.Allocator, io: std.Io, executable: []const u8) ![][]const u8 {
-    const loader = try interpreter(allocator, io, executable) orelse return allocator.alloc([]const u8, 0);
-    errdefer allocator.free(loader);
+    return executableRuntimePathsWithOptions(allocator, io, executable, .{});
+}
+
+/// The same closed loader inventory, with cancellation and optional private
+/// native evidence. Cancellation never returns a partial runtime closure.
+pub fn executableRuntimePathsWithOptions(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    executable: []const u8,
+    options: RuntimeInventoryOptions,
+) ![][]const u8 {
+    return executableRuntimePathsImpl(allocator, io, executable, options, null);
+}
+
+pub const RuntimeInventoryTest = struct {
+    pub const Hook = struct {
+        context: *anyopaque,
+        run: *const fn (*anyopaque) anyerror!void,
+    };
+    pub const Options = struct {
+        command: process.CommandTestOptions = .{},
+        before_command: ?Hook = null,
+        after_command: ?Hook = null,
+    };
+
+    pub fn paths(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        executable: []const u8,
+        options: RuntimeInventoryOptions,
+        test_options: Options,
+    ) ![][]const u8 {
+        if (!@import("builtin").is_test) @compileError("runtime inventory hooks are test-only");
+        return executableRuntimePathsImpl(allocator, io, executable, options, test_options);
+    }
+};
+
+fn executableRuntimePathsImpl(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    executable: []const u8,
+    options: RuntimeInventoryOptions,
+    test_options: ?RuntimeInventoryTest.Options,
+) ![][]const u8 {
+    if (options.evidence) |evidence| {
+        if (evidence.command != null or evidence.cancellation_observed)
+            return error.RuntimeInventoryEvidenceInUse;
+    }
+    try checkInventoryCancellation(options);
+    const loader = try interpreter(allocator, io, executable, options) orelse {
+        try checkInventoryCancellation(options);
+        return allocator.alloc([]const u8, 0);
+    };
+    var loader_appended = false;
+    errdefer if (!loader_appended) allocator.free(loader);
+    try checkInventoryCancellation(options);
     var pinned_executable = try files.RetainedFile.open(io, executable, .artifact);
     defer pinned_executable.close(io);
     var pinned_loader = try files.RetainedFile.open(io, loader, .artifact);
@@ -67,38 +153,58 @@ pub fn executableRuntimePaths(allocator: std.mem.Allocator, io: std.Io, executab
     try process.initialize();
     var native_loader = try process.Executable.open(io, loader);
     defer native_loader.close(io);
+    try checkInventoryCancellation(options);
     const cwd = try files.openDirectory(io, "/", .artifact);
     defer cwd.close(io);
     var env = std.process.Environ.Map.init(allocator);
     defer env.deinit();
     try env.put("LC_ALL", "C");
     const deadline = try process.Deadline.afterMilliseconds(30_000);
-    var result = try process.runCommand(allocator, io, .{
+    const request: process.CommandRequest = .{
         .executable = native_loader,
         .argv = &.{ loader, "--list", executable },
         .environment = &env,
         .cwd = cwd,
         .primary_deadline = deadline,
         .cleanup_deadline = .{ .expires_ns = try std.math.add(u64, deadline.expires_ns, 10 * std.time.ns_per_s) },
+        .cancel = options.cancel,
         .snapshot_executable = false,
         .limits = .{ .stdout_bytes = limits.mib, .stderr_bytes = 4096 },
-    });
-    defer result.deinit(allocator);
-    if (!result.succeeded() or result.stderr.len != 0) return error.RuntimeInventoryRefused;
+    };
+    if (test_options) |fixture| if (fixture.before_command) |hook| try hook.run(hook.context);
+    var result = if (@import("builtin").is_test and test_options != null)
+        try process.runCommandTest(allocator, io, request, test_options.?.command)
+    else
+        try process.runCommand(allocator, io, request);
+    defer if (options.evidence) |evidence| {
+        evidence.command = result;
+        evidence.cancellation_observed = evidence.cancellation_observed or result.cancellation_observed;
+    } else result.deinit(allocator);
+    if (test_options) |fixture| if (fixture.after_command) |hook| try hook.run(hook.context);
+    if (!result.succeeded() or result.stderr.len != 0) {
+        if (result.primary == .cancelled and result.cleanup_complete and
+            (result.cleanup == .complete or result.cleanup == .not_required))
+            return error.Cancelled;
+        return error.RuntimeInventoryRefused;
+    }
+    try checkInventoryCancellation(options);
     var paths: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (paths.items) |path| allocator.free(path);
         paths.deinit(allocator);
     }
     try paths.append(allocator, loader);
+    loader_appended = true;
     var lines = std.mem.splitScalar(u8, result.stdout, '\n');
     while (lines.next()) |line| {
+        try checkInventoryCancellation(options);
         var token = std.mem.trim(u8, line, " \t");
         if (std.mem.indexOf(u8, token, "=> ")) |at| token = token[at + 3 ..];
         if (token.len == 0 or token[0] != '/') continue;
         const end = std.mem.indexOfScalar(u8, token, ' ') orelse token.len;
         const resolved = try std.Io.Dir.realPathFileAbsoluteAlloc(io, token[0..end], allocator);
         defer allocator.free(resolved);
+        try checkInventoryCancellation(options);
         if (std.mem.eql(u8, resolved, executable)) continue;
         var seen = false;
         for (paths.items) |prior| if (std.mem.eql(u8, prior, resolved)) {
@@ -109,12 +215,17 @@ pub fn executableRuntimePaths(allocator: std.mem.Allocator, io: std.Io, executab
         var retained = try files.RetainedFile.open(io, resolved, .artifact);
         defer retained.close(io);
         try retained.verify(io);
+        try checkInventoryCancellation(options);
         if (paths.items.len >= 256) return error.RuntimeInventoryRefused;
-        try paths.append(allocator, try allocator.dupe(u8, resolved));
+        const owned = try allocator.dupe(u8, resolved);
+        errdefer allocator.free(owned);
+        try paths.append(allocator, owned);
     }
+    try checkInventoryCancellation(options);
     try pinned_executable.verify(io);
     try pinned_loader.verify(io);
     std.mem.sort([]const u8, paths.items, {}, entryLess);
+    try checkInventoryCancellation(options);
     return paths.toOwnedSlice(allocator);
 }
 

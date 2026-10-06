@@ -73,6 +73,8 @@ jobs:
           cache: 'false'
 
       - name: Acquire the existing pinned VPC-capable native QEMU runtime
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           bash .github/scripts/hyperv-native-qemu-acquire.sh /d/wamr-ci/wamr-native-runtime
 
@@ -894,6 +896,8 @@ jobs:
           cache: 'false'
 
       - name: Acquire the pinned QEMU runtime and private Bison data
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           bash .github/scripts/hyperv-native-qemu-acquire.sh /d/wamr-ci/wamr-native-runtime

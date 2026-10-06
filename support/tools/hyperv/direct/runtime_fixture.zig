@@ -18,6 +18,17 @@ fn emit(fd: linux.fd_t, bytes: []const u8) !void {
     }
 }
 
+fn emitBytes(fd: linux.fd_t, byte: u8, count: usize) !void {
+    var buffer: [4096]u8 = undefined;
+    @memset(&buffer, byte);
+    var left = count;
+    while (left != 0) {
+        const amount = @min(left, buffer.len);
+        try emit(fd, buffer[0..amount]);
+        left -= amount;
+    }
+}
+
 fn sleep(milliseconds: u32) void {
     const end = (core.process.Deadline.afterMilliseconds(milliseconds) catch unreachable);
     while (!(end.expired() catch unreachable)) {
@@ -124,17 +135,32 @@ pub fn main(init: std.process.Init) !void {
         if (args.len != 5) return error.InvalidFixture;
         const stdout = try std.fmt.parseInt(usize, args[2], 10);
         const stderr = try std.fmt.parseInt(usize, args[3], 10);
-        var buffer: [4096]u8 = undefined;
-        for ([_]usize{ stdout, stderr }, 0..) |count, stream| {
-            @memset(&buffer, if (stream == 0) 'o' else 'e');
-            var left = count;
-            while (left != 0) {
-                const amount = @min(left, buffer.len);
-                try emit(@intCast(stream + 1), buffer[0..amount]);
-                left -= amount;
-            }
-        }
+        try emitBytes(1, 'o', stdout);
+        try emitBytes(2, 'e', stderr);
         std.process.exit(try std.fmt.parseInt(u8, args[4], 10));
+    } else if (std.mem.eql(u8, mode, "interleaved")) {
+        try emit(1, "out-1\x00");
+        try emit(2, "err-1\n");
+        try emit(1, "out-2\n");
+        try emit(2, "err-2\xff");
+    } else if (std.mem.eql(u8, mode, "mixed-overflow-tree")) {
+        if (args.len != 3) return error.InvalidFixture;
+        const cap = try std.fmt.parseInt(usize, args[2], 10);
+        if (cap < 64 or cap > 8 * 1024 * 1024) return error.InvalidFixture;
+        try ignoreTerm();
+        const child = try spawnChild(.resistant);
+        var text: [32]u8 = undefined;
+        const prefix = try std.fmt.bufPrint(&text, "{d}\n", .{child});
+        try emit(1, prefix);
+        try emitBytes(1, 'o', cap / 2 - prefix.len);
+        try emitBytes(2, 'e', cap - cap / 2 + 1);
+        while (true) sleep(1000);
+    } else if (std.mem.eql(u8, mode, "stopped-partial")) {
+        try emit(1, "stopped-out\n");
+        try emit(2, "stopped-err\n");
+        if (linux.errno(linux.kill(linux.getpid(), .STOP)) != .SUCCESS)
+            return error.SignalSetup;
+        while (true) sleep(1000);
     } else if (std.mem.eql(u8, mode, "gate-marker")) {
         if (args.len != 3) return error.InvalidFixture;
         try createMarker(init.io, args[2]);

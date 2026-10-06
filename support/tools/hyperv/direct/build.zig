@@ -136,6 +136,7 @@ pub fn build(b: *std.Build) void {
     b.step("check-foundation", "Compile production direct foundation interfaces without running them").dependOn(&compile.step);
     foundation.dependOn(&compile.step);
     const runtime_tests = b.step("test-runtime", "Run private process and direct runtime fixtures");
+    const command_tests = b.step("test-command", "Run shared trusted-command process fixtures");
     inline for (.{
         "../process_command_tests.zig",
         "../process_command_gate_tests.zig",
@@ -146,6 +147,7 @@ pub fn build(b: *std.Build) void {
         "runtime_tests.zig",
         "../process_command_leader_track_fault_tests.zig",
         "../process_command_poison_tests.zig",
+        "../process_command_merged_poison_tests.zig",
         "../process_command_parent_fault_tests.zig",
         "../process_command_signal_fault_tests.zig",
         "../process_private_poison_tests.zig",
@@ -158,7 +160,10 @@ pub fn build(b: *std.Build) void {
             .imports = &runtime_imports,
         }) });
         tests.root_module.addOptions("test_options", test_options);
-        runtime_tests.dependOn(&b.addRunArtifact(tests).step);
+        const run = b.addRunArtifact(tests);
+        runtime_tests.dependOn(&run.step);
+        if (std.mem.startsWith(u8, source, "../process_command"))
+            command_tests.dependOn(&run.step);
     }
     foundation.dependOn(runtime_tests);
 
