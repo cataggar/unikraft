@@ -5394,6 +5394,8 @@ static int run_vmbus_reoffer_cleanup_case(
 	int guest_rc;
 	int inventory_rc;
 	int submit_rc;
+	int target_rc;
+	int session_rc;
 	int rescind_created = 0;
 	int error = 0;
 
@@ -5422,6 +5424,16 @@ static int run_vmbus_reoffer_cleanup_case(
 		error = 672;
 		goto out;
 	}
+	/* An accepted offer can still be queued behind another binding. */
+	error = wait_inventory_count(&inventory, 6,
+				     CONFIG_LIBSTORVSC_REQUEST_TIMEOUT_MS);
+	if (error) {
+		fprintf(stderr,
+			"reoffer cleanup inventory wait failed: rc=%d count=%u\n",
+			error, inventory.count);
+		error = 675;
+		goto out;
+	}
 	secondary = storvsc_host_blkdev_address(1, 0);
 	if (!secondary) {
 		error = 673;
@@ -5432,8 +5444,20 @@ static int run_vmbus_reoffer_cleanup_case(
 		error = 674;
 		goto out;
 	}
-	if (target_for_device(secondary, &target) ||
-	    uk_storvsc_session_begin_read(&target, &session)) {
+	target_rc = target_for_device(secondary, &target);
+	session_rc = target_rc ? 0 :
+		uk_storvsc_session_begin_read(&target, &session);
+	if (target_rc || session_rc) {
+		inventory_rc = uk_storvsc_inventory_get(&inventory);
+		fprintf(stderr,
+			"reoffer cleanup session failed: target=%d session=%d\n",
+			target_rc, session_rc);
+		fprintf(stderr,
+			"inventory=%d count=%u mappings=%u retries=%d ready=%d\n",
+			inventory_rc, inventory.count,
+			uk_storvsc_mapping_count(),
+			atomic_load(&bind_retry_calls),
+			atomic_load(&bind_ready_calls));
 		error = 675;
 		goto out;
 	}
