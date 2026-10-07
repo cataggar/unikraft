@@ -587,8 +587,9 @@ pub fn runImportedReader(
     var digests: [4][64]u8 = undefined;
     var held_count: usize = 0;
     errdefer for (held[0..held_count]) |*file| {
+        const path = file.path;
         file.close(io);
-        allocator.free(file.path);
+        allocator.free(path);
     };
     const roots: plan.Roots = .{
         .source_root = repository,
