@@ -62,7 +62,7 @@ pub const ZipError = error{
     UnexpectedMemberCount,
 };
 
-pub const WriteError = ZipError || std.Io.Writer.Error || std.Io.Reader.ShortError;
+pub const WriteError = ZipError || std.Io.Writer.Error || std.Io.Reader.ShortError || error{Cancelled};
 
 pub const Entry = struct {
     name: []const u8,
@@ -71,6 +71,7 @@ pub const Entry = struct {
     crc32: u32,
     sha256: [Sha256.digest_length]u8,
     limit: u64,
+    cancel: ?*const std.atomic.Value(bool) = null,
 };
 
 pub const SliceEntry = struct {
@@ -90,6 +91,19 @@ pub const ExpectedArchive = struct {
     members: []const ExpectedMember,
     archive_sha256: [Sha256.digest_length]u8,
 };
+
+pub const MemberView = struct {
+    name: []const u8,
+    bytes: []const u8,
+};
+
+// Views borrow the image. Indexing checks the complete ZIP32 structure and CRCs;
+// authenticity still requires verifyArchive with independently bound digests.
+pub fn indexArchive(bytes: []const u8, storage: []MemberView) ZipError![]const MemberView {
+    if (bytes.len > max_archive_bytes) return error.TooLarge;
+    const count = try parseAndVerify(bytes, null, storage);
+    return storage[0..count];
+}
 
 const MemberMeta = struct {
     name: []const u8,
@@ -206,7 +220,7 @@ pub fn expectedFromSlices(entries: []const SliceEntry, out: []ExpectedMember) Zi
 pub fn verifyArchive(bytes: []const u8, expected: ExpectedArchive) ZipError!void {
     if (bytes.len > max_archive_bytes) return error.TooLarge;
     try validateExpectedMembers(expected.members);
-    try parseAndVerify(bytes, expected.members);
+    _ = try parseAndVerify(bytes, expected.members, null);
     if (!std.mem.eql(u8, &sha256(bytes), &expected.archive_sha256)) return error.DigestMismatch;
 }
 
@@ -287,7 +301,7 @@ fn asciiCaseEql(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-fn parseAndVerify(bytes: []const u8, expected: []const ExpectedMember) ZipError!void {
+fn parseAndVerify(bytes: []const u8, expected: ?[]const ExpectedMember, views: ?[]MemberView) ZipError!usize {
     if (bytes.len < eocd_len) return error.Truncated;
     const last_eocd = bytes.len - eocd_len;
     if (!std.mem.eql(u8, bytes[last_eocd..][0..4], &eocd_sig_bytes)) {
@@ -304,7 +318,8 @@ fn parseAndVerify(bytes: []const u8, expected: []const ExpectedMember) ZipError!
         return error.Zip64;
     if (eocd.record_count_disk != eocd.record_count_total) return error.DiskUnsupported;
     if (eocd.record_count_total > max_members) return error.TooManyMembers;
-    if (eocd.record_count_total != expected.len) return error.UnexpectedMemberCount;
+    if (expected) |members| if (eocd.record_count_total != members.len) return error.UnexpectedMemberCount;
+    if (views) |storage| if (eocd.record_count_total > storage.len) return error.TooManyMembers;
     const cd_offset: usize = @intCast(eocd.central_offset);
     const cd_size: usize = @intCast(eocd.central_size);
     if (cd_offset > last_eocd or cd_size > last_eocd - cd_offset) return error.OutOfBounds;
@@ -320,7 +335,7 @@ fn parseAndVerify(bytes: []const u8, expected: []const ExpectedMember) ZipError!
     var seen: [max_members][]const u8 = undefined;
     var total_uncompressed: u64 = 0;
 
-    for (expected, 0..) |member, i| {
+    for (0..eocd.record_count_total) |i| {
         if (central_pos + central_header_len > last_eocd) return error.Truncated;
         const central = parseCentral(bytes[central_pos..][0..central_header_len]);
         try validateCentralMeta(central);
@@ -339,31 +354,38 @@ fn parseAndVerify(bytes: []const u8, expected: []const ExpectedMember) ZipError!
         try validateName(name);
         try checkNameCollision(seen[0..i], name);
         seen[i] = name;
-        if (!std.mem.eql(u8, name, member.name)) return error.OrderMismatch;
-        if (central.uncompressed_size != member.size) return error.SizeMismatch;
-        if (member.size > member.limit) return error.TooLarge;
-        total_uncompressed = addBounded(total_uncompressed, member.size) catch return error.TooLarge;
+        const member: ?ExpectedMember = if (expected) |members| members[i] else null;
+        if (member) |item| {
+            if (!std.mem.eql(u8, name, item.name)) return error.OrderMismatch;
+            if (central.uncompressed_size != item.size) return error.SizeMismatch;
+            if (item.size > item.limit) return error.TooLarge;
+        }
+        total_uncompressed = addBounded(total_uncompressed, central.uncompressed_size) catch return error.TooLarge;
         if (total_uncompressed > max_archive_bytes) return error.TooLarge;
         if (central.local_offset != local_end) {
             if (i == 0 and central.local_offset > 0) return error.PrependedBytes;
             if (central.local_offset < local_end) return error.Overlap;
             return error.OutOfBounds;
         }
-        local_end = try verifyLocal(bytes, cd_offset, local_end, central, name, member);
+        const local = try verifyLocal(bytes, cd_offset, local_end, central, name, member);
+        local_end = local.end;
+        if (views) |storage| storage[i] = .{ .name = name, .bytes = local.data };
         central_pos = central_end;
     }
     if (central_pos != last_eocd) return error.InvalidZip;
     if (local_end != cd_offset) return error.OutOfBounds;
+    return eocd.record_count_total;
 }
 
+const LocalView = struct { end: usize, data: []const u8 };
 fn verifyLocal(
     bytes: []const u8,
     cd_offset: usize,
     local_offset: usize,
     central: Central,
     central_name: []const u8,
-    expected: ExpectedMember,
-) ZipError!usize {
+    expected: ?ExpectedMember,
+) ZipError!LocalView {
     if (local_offset + local_header_len > cd_offset) return error.Truncated;
     const local = parseLocal(bytes[local_offset..][0..local_header_len]);
     try validateLocalMeta(local);
@@ -388,8 +410,9 @@ fn verifyLocal(
     const data_end = data_start + data_len;
     const data = bytes[data_start..data_end];
     if (Crc32.hash(data) != local.crc32) return error.CrcMismatch;
-    if (!std.mem.eql(u8, &sha256(data), &expected.sha256)) return error.DigestMismatch;
-    return data_end;
+    if (expected) |member|
+        if (!std.mem.eql(u8, &sha256(data), &member.sha256)) return error.DigestMismatch;
+    return .{ .end = data_end, .data = data };
 }
 
 fn validateLocalMeta(local: Local) ZipError!void {
@@ -574,6 +597,7 @@ fn streamEntryData(out: *CountingWriter, entry: Entry, buffer: []u8) WriteError!
     var crc = Crc32.init();
     var member_sha = Sha256.init(.{});
     while (remaining > 0) {
+        if (entry.cancel) |cancel| if (cancel.load(.acquire)) return error.Cancelled;
         const chunk_len: usize = @intCast(@min(remaining, buffer.len));
         const read = try entry.reader.readSliceShort(buffer[0..chunk_len]);
         if (read == 0) return error.SizeMismatch;
@@ -584,6 +608,7 @@ fn streamEntryData(out: *CountingWriter, entry: Entry, buffer: []u8) WriteError!
         remaining -= read;
     }
     var extra: [1]u8 = undefined;
+    if (entry.cancel) |cancel| if (cancel.load(.acquire)) return error.Cancelled;
     if (try entry.reader.readSliceShort(&extra) != 0) return error.SizeMismatch;
     if (crc.final() != entry.crc32) return error.CrcMismatch;
     var actual_sha: [Sha256.digest_length]u8 = undefined;

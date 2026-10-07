@@ -1,5 +1,81 @@
 # Credential-free tiny native WAMR PR gate
 
+## Native public products (additive; no caller cutover)
+
+The public product commands compose the merged private owners and the native
+archive/transport libraries. They perform real native supervised validation;
+portable materialization and a transport receipt alone are not acceptance.
+Python public producers, callers, workflows and historical witnesses remain
+unchanged pending protected product acceptance and actual merge.
+
+Every public command requires `--expected-source COMMIT --expected-tree TREE
+--run-id ID --run-attempt ID`. These are independently supplied identities,
+not values inferred from the archive. Source means the actual producer commit
+(including a genuine synthetic PR merge), not another commit with its tree.
+All paths below must be canonical absolute paths with private existing parents.
+
+* `public-export --runtime ABS --stage-root ABS --validation-output ABS
+  --output ARCHIVE_DIR --git ABS --supervisor ABS --validator ABS` creates the
+  private handoff, authenticates a `PrivateBundle`, runs native private
+  revalidation, then constructs and durably publishes the public ZIP.
+  `public-archive` has the same arguments except `--runtime`: it consumes an
+  already published private handoff. Both enforce the original fixed public CI
+  environment and public runtime's `compute/public-source/handoff` scope.
+  The validation output must be outside both the repository and input handoff.
+* `verify-public-source-bundle --archive ABS --expected-archive-sha256 HEX`
+  verifies retained ZIP bytes and canonical portable metadata without importing
+  or publishing anything.
+* `stage-public-source-upload --archive ABS --expected-archive-sha256 HEX
+  --output ABS` creates one private standalone upload containing exactly
+  `tiny-aot-public-source.zip`; no metadata file or success receipt is added.
+* `import-public-source-download --download-root ABS --container-archive ABS
+  --expected-archive-sha256 INNER_HEX --artifact-id EXPECTED_ID
+  --container-digest EXPECTED_CONTAINER_HEX --selected-artifact-id ACTUAL_ID
+  --selected-container-digest ACTUAL_CONTAINER_HEX --output ABS --git ABS
+  --supervisor ABS --validator ABS` consumes an exact-ID redownload containing
+  exactly that one regular, single-link filename. The expected upload metadata
+  and actual selection are separate trusted caller inputs. It hashes the
+  separately retained raw Actions container and the inner ZIP independently;
+  the artifact ID, container digest and inner digest are different types and
+  are never interchangeable. This is a local consumer, not a network downloader
+  or remote artifact authenticator.
+  The raw container is an opaque authenticated transport input, not a native
+  ZIP extraction API; the exact extracted member is independently authenticated
+  against the trusted inner digest.
+* `import-public-source-bundle --archive ABS --output ABS --git ABS
+  --supervisor ABS --validator ABS [--expected-archive-sha256 HEX]` preserves
+  the frozen historical v1 import. Digest omission remains confined to the
+  original historical source table and dependency-free build-start evidence.
+  V2 import requires the exact download command rather than an unbound raw ZIP.
+
+The importer retains a pure portable stage under `private/materialized`,
+then copies authenticated selected members to the operator root. The current
+native reader's supervisor must be the executing controller; the validator must
+match its compiled native validator identity. The producer's Git commit, tree
+and original source map are verified separately from the current reader's
+checkout, executable and runtime custody. Real supervised `--identity` and
+handoff validation produce retained command records and output logs under
+`private/native-validation`. Source, archive, download, container, selected
+members, canonical metadata and those command captures are revalidated before
+`bundle.json` is published create-only and durably last.
+
+The operator root preserves `portable-bundle.json`, `public-source.json`,
+`candidate-bundle.json`, the v2 `transport.json`, and root-bound `bundle.json`.
+The internal materialized archive is never silently relabeled a private owner.
+The library returns a heap-stable `ImportedProduct`; its `revalidate` checks
+the real private owner, fresh input hashes, sealed output directories and
+retained native validation captures. Its `deinit` closes borrowed consumers
+before `Download`/`Archive` owners and never removes retained evidence.
+The existing `private-validate --stage-root ABS --git ABS --supervisor ABS
+--validator ABS --output ABS` reopens an operator bundle and performs a fresh
+real native validation in another create-only external output. That fresh
+private validation does not reconstruct former archive/download descriptor
+custody after the `ImportedProduct` owner has been destroyed.
+Failures are explicit refused/poisoned outcomes with phase and publication
+durability; partially created state is non-resumable and retained.
+Authority stays `not_admitted`; there are no cloud operations, approvals,
+candidate execution, Python fallback, or production caller changes.
+
 ## Authority contract freeze (#189 PR1; no caller cutover)
 
 `authority/root.zig` is a contract/test surface importing only `hyperv_core`;
