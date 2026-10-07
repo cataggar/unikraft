@@ -71,17 +71,38 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
 
 name = Path(sys.argv[0]).name
 if name == "sleep":
     raise SystemExit(0)
+if name == "sudo":
+    if sys.argv[1] != "-n":
+        raise SystemExit(9)
+    os.execvp(sys.argv[2], sys.argv[2:])
+if name == "timeout":
+    if os.environ["FIXTURE_SCENARIO"].startswith("apt-"):
+        if sys.argv[1:3] != ["--kill-after=5", "240"]:
+            raise SystemExit(9)
+        os.execv("/usr/bin/timeout", ["timeout", "--kill-after=0.1", "1"]
+                 + sys.argv[3:])
+    os.execv("/usr/bin/timeout", ["timeout"] + sys.argv[1:])
 calls = Path(os.environ["FIXTURE_CALLS"])
 previous = calls.read_text().splitlines() if calls.exists() else []
 with calls.open("a") as output:
     output.write(json.dumps({"argv": [name] + sys.argv[1:],
-                             "authenticated": bool(os.environ.get("GH_TOKEN"))}) + "\\n")
+                             "authenticated": bool(os.environ.get("GH_TOKEN")),
+                             "noninteractive": os.environ.get("DEBIAN_FRONTEND") == "noninteractive"}) + "\\n")
 attempt = len(previous) + 1
 scenario = os.environ["FIXTURE_SCENARIO"]
+if name == "apt-get":
+    phase = "update" if "update" in sys.argv else "install"
+    if scenario == "apt-" + phase + "-timeout":
+        time.sleep(60)
+    if scenario == "apt-" + phase + "-failure":
+        sys.stderr.write("APT " + phase + " refused\\n")
+        raise SystemExit(100)
+    raise SystemExit(0)
 if name == "ghr":
     args = sys.argv[1:]
     if not os.environ.get("GH_TOKEN") or any(
@@ -139,7 +160,7 @@ if scenario == "read-timeout-once" and attempt == 1:
     raise SystemExit(124)
 sys.stdout.write('{"verified_read":true}\\n')
 """
-        for name in ("gh", "ghr", "sleep", "zig"):
+        for name in ("gh", "ghr", "sleep", "zig", "sudo", "timeout", "apt-get"):
             path = self.bin / name
             path.write_text(fixture, encoding="utf-8")
             path.chmod(0o700)
@@ -150,7 +171,7 @@ sys.stdout.write('{"verified_read":true}\\n')
                            + os.environ["PATH"], GH_TOKEN=token,
                            FIXTURE_CALLS=str(self.calls),
                            FIXTURE_SCENARIO=scenario,
-                           FIXTURE_DESTINATION=str(arguments[0]))
+                           FIXTURE_DESTINATION=str(arguments[0]) if arguments else "")
         return subprocess.run(
             ["bash", str(self.scripts / script), *map(str, arguments)],
             env=environment, capture_output=True, text=True, timeout=15)
@@ -288,6 +309,35 @@ sys.stdout.write('{"verified_read":true}\\n')
                 self.assertEqual(result.returncode, status, result.stderr)
                 self.assertEqual(len(self.recorded()), attempts)
                 self.assertFalse((destination / "zig-pkg").exists())
+
+    def test_apt_prerequisites_bound_noninteractive_installation(self):
+        result = self.invoke(
+            "hyperv-native-apt-prerequisites.sh", "apt-success")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.recorded()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("update", calls[0]["argv"])
+        self.assertIn("install", calls[1]["argv"])
+        for call in calls:
+            self.assertTrue(call["noninteractive"])
+            for option in ("Acquire::http::Timeout=30", "Acquire::https::Timeout=30",
+                           "DPkg::Lock::Timeout=60", "APT::Update::Error-Mode=any"):
+                self.assertIn(option, call["argv"])
+        self.assertIn("metadata", result.stderr)
+        self.assertIn("installation", result.stderr)
+
+    def test_apt_prerequisites_preserve_failure_and_timeout_phases(self):
+        for scenario, status, calls, phase in (
+                ("apt-update-failure", 100, 1, "metadata"),
+                ("apt-install-failure", 100, 2, "installation"),
+                ("apt-update-timeout", 124, 1, "metadata"),
+                ("apt-install-timeout", 124, 2, "installation")):
+            with self.subTest(scenario=scenario):
+                result = self.invoke(
+                    "hyperv-native-apt-prerequisites.sh", scenario)
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual(len(self.recorded()), calls)
+                self.assertIn(f"refused at {phase}", result.stderr)
 
 
 class NativeRecordBridge(unittest.TestCase):

@@ -1661,6 +1661,18 @@ their own inputs and now run alongside the producer, without changing their
 context names, job inventory, permissions or budgets. Setup failures therefore
 do not wait for the producer's full build/boot/publication chain.
 
+Both x86/KVM prerequisite steps have a ten-minute ceiling and command tracing,
+retain the same host/resource checks, and recheck every prerequisite after
+installation. Privileged operations use noninteractive `sudo -n`.
+The shared `hyperv-native-apt-prerequisites.sh` reports metadata/install phases
+and preserves failures, uses only the existing Ubuntu sources, and bounds each
+APT invocation to 240 seconds with five-second kill grace, 30-second HTTP/HTTPS
+timeouts, two acquisition retries and a 60-second lock wait. A failed metadata
+refresh cannot silently use stale indexes; installation is noninteractive.
+Cleanup runs only after QEMU acquisition was attempted, and controller
+diagnostic/publication steps require its successful installation, so an early
+prerequisite refusal does not manufacture missing-runtime secondary failures.
+
 Local CI monitors use `github-read-retry.sh` for read-only `gh api`, `pr view`,
 `pr list` and `run view` requests. It enforces GET for API requests, rejects
 method/body overrides and mutating commands, and retries timeouts, 429, selected

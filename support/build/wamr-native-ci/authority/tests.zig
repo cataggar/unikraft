@@ -203,9 +203,9 @@ test "Python authority scenario inventory is checked and sorted" {
     const root = try c.exactFields(document.value(), &golden_fields.inventory);
     try expectLiteral(root, "schema", "uk.wamr.authority-python-scenario-inventory");
     try expectInt(root, "schema_version", @as(u8, 1));
-    try expectInt(root, "count", @as(u16, 194));
+    try expectInt(root, "count", @as(u16, 196));
     const items = try array(root.get("scenarios") orelse return error.MissingGolden);
-    try std.testing.expectEqual(@as(usize, 194), items.len);
+    try std.testing.expectEqual(@as(usize, 196), items.len);
     var previous: []const u8 = "";
     for (items) |item| {
         const current = try c.string(item);

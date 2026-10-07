@@ -44,12 +44,14 @@ jobs:
           persist-credentials: false
 
       - name: Check the supported x86 runner and existing build prerequisites
+        timeout-minutes: 10
         run: |
           set -euo pipefail
+          set -x
           test "$(uname -m)" = x86_64
           test -c /dev/kvm
-          sudo install -d -o root -g root -m 755 /d
-          sudo install -d -o "$(id -u)" -g "$(id -g)" -m 700 /d/wamr-ci
+          sudo -n install -d -o root -g root -m 755 /d
+          sudo -n install -d -o "$(id -u)" -g "$(id -g)" -m 700 /d/wamr-ci
           export PATH="/usr/bin:/bin:${PATH}"
           if ! (
             for name in bash make bison yacc flex lex m4 python3 getfacl; do
@@ -58,12 +60,13 @@ jobs:
             test -r /usr/share/OVMF/OVMF_CODE_4M.fd
             test -r /usr/share/OVMF/OVMF_VARS_4M.fd
           ); then
-            sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources \
-              -o Dir::Etc::sourceparts=- update -qq
-            sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources \
-              -o Dir::Etc::sourceparts=- install -y --no-install-recommends \
-              make bison flex m4 python3 acl ovmf
+            bash .github/scripts/hyperv-native-apt-prerequisites.sh
           fi
+          for name in bash make bison yacc flex lex m4 python3 getfacl; do
+            test -x "/usr/bin/${name}"
+          done
+          test -r /usr/share/OVMF/OVMF_CODE_4M.fd
+          test -r /usr/share/OVMF/OVMF_VARS_4M.fd
           mkdir -p .d
 
       - name: Exercise cold acquisition and read-only monitoring failure fixtures
@@ -86,6 +89,7 @@ jobs:
           cache: 'false'
 
       - name: Acquire the existing pinned VPC-capable native QEMU runtime
+        id: qemu_runtime
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -187,6 +191,7 @@ jobs:
           )
 
       - name: Install the production portable native controller
+        id: native_controller
         timeout-minutes: 15
         run: |
           set -euo pipefail
@@ -437,7 +442,11 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
 
       - name: Remove only the managed QEMU dynamic runtime
-        if: always()
+        if: >-
+          always() &&
+          (steps.qemu_runtime.outcome == 'success' ||
+           steps.qemu_runtime.outcome == 'failure' ||
+           steps.qemu_runtime.outcome == 'cancelled')
         run: |
           bash .github/scripts/hyperv-native-libfdt-cleanup.sh /d/wamr-ci/wamr-native-runtime
 
@@ -831,13 +840,13 @@ jobs:
           test ! -e "${identity_parent}/refused-validator"
 
       - name: Retain redacted diagnostics separately from the public-source image bundle
-        if: always()
+        if: always() && steps.native_controller.outcome == 'success'
         run: |
           "${WAMR_CI_CONTROLLER:?}" diagnostics \
             --runtime /d/wamr-ci/wamr-native-runtime
 
       - name: Publish bounded local-only records
-        if: always()
+        if: always() && steps.native_controller.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: wamr-native-compute-${{ github.run_id }}-${{ github.run_attempt }}
@@ -873,12 +882,14 @@ jobs:
           persist-credentials: false
 
       - name: Check the x86 KVM runner and build prerequisites
+        timeout-minutes: 10
         run: |
           set -euo pipefail
+          set -x
           test "$(uname -m)" = x86_64
           test -c /dev/kvm
-          sudo install -d -o root -g root -m 755 /d
-          sudo install -d -o "$(id -u)" -g "$(id -g)" -m 700 /d/wamr-ci
+          sudo -n install -d -o root -g root -m 755 /d
+          sudo -n install -d -o "$(id -u)" -g "$(id -g)" -m 700 /d/wamr-ci
           export PATH="/usr/bin:/bin:${PATH}"
           if ! (
             for name in bash make bison yacc flex lex m4 python3 getfacl; do
@@ -887,12 +898,13 @@ jobs:
             test -r /usr/share/OVMF/OVMF_CODE_4M.fd
             test -r /usr/share/OVMF/OVMF_VARS_4M.fd
           ); then
-            sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources \
-              -o Dir::Etc::sourceparts=- update -qq
-            sudo apt-get -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources \
-              -o Dir::Etc::sourceparts=- install -y --no-install-recommends \
-              make bison flex m4 python3 acl ovmf
+            bash .github/scripts/hyperv-native-apt-prerequisites.sh
           fi
+          for name in bash make bison yacc flex lex m4 python3 getfacl; do
+            test -x "/usr/bin/${name}"
+          done
+          test -r /usr/share/OVMF/OVMF_CODE_4M.fd
+          test -r /usr/share/OVMF/OVMF_VARS_4M.fd
           mkdir -p .d
 
       - name: Set up the pinned native downloader
@@ -902,6 +914,7 @@ jobs:
           cache: 'false'
 
       - name: Acquire the pinned QEMU runtime and private Bison data
+        id: qemu_runtime
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -983,6 +996,10 @@ jobs:
             "${root}" fault "${NATIVE_FAULT_CASE}"
 
       - name: Remove only the managed QEMU dynamic runtime
-        if: always()
+        if: >-
+          always() &&
+          (steps.qemu_runtime.outcome == 'success' ||
+           steps.qemu_runtime.outcome == 'failure' ||
+           steps.qemu_runtime.outcome == 'cancelled')
         run: |
           bash .github/scripts/hyperv-native-libfdt-cleanup.sh /d/wamr-ci/wamr-native-runtime
