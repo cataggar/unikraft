@@ -73,6 +73,12 @@ jobs:
             -s support/build/wamr-native-ci/tests -p test_adapter.py \
             -k NativeAcquisitionFixtures
 
+      - name: Check the frozen Python scenario inventory
+        timeout-minutes: 2
+        run: |
+          python3 -B support/build/wamr-native-ci/tests/test_authority_contract_goldens.py \
+            AuthorityContractGoldens.test_python_scenario_inventory_matches_current_tests
+
       - name: Set up the existing verified native downloader
         uses: cataggar/ghr/actions/setup@114926d37d3825e63bede2ccc7ce56b67eda7495
         with:

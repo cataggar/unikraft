@@ -138,6 +138,22 @@ and removes only its fresh child below the scratch parent, preserving existing
 parent contents. `--write` intentionally regenerates checked-in goldens for
 review; it is not part of verification.
 
+The scenario inventory tracks every test in its three named Python sources.
+After adding or removing tests there, regenerate and review
+`authority/goldens/python-scenarios.json` and update the native inventory count
+in `authority/tests.zig`; unrelated additions must leave
+`authority/goldens/contracts.json` unchanged. Check inventory synchronization
+without restoring tools or running the full oracle:
+
+```sh
+python3 -B support/build/wamr-native-ci/tests/test_authority_contract_goldens.py \
+  AuthorityContractGoldens.test_python_scenario_inventory_matches_current_tests
+```
+
+The native compute and integration runtime jobs run this check before tool
+acquisition and native builds. The full native/Python authority gate remains
+unchanged.
+
 ## Native package and boot chain (production caller)
 
 The installed controller now implements `boot --runtime ABS` as a closed,
