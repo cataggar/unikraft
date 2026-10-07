@@ -4,7 +4,7 @@ const core = @import("hyperv_core");
 const files = core.private_files;
 const contracts = core.contracts;
 
-pub const Action = enum { build, boot, diagnostics, describe, @"--identity", @"supervisor-source-closure", @"reader-source-closure", records, @"readonly-records", @"local-consumer-custody", @"handoff-inspect", @"handoff-inspect-legacy", @"public-validator-build", @"local-handoff-revalidation", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation", @"import-handoff-revalidation", @"private-export", @"private-validate", @"public-export", @"public-archive", @"verify-public-source-bundle", @"stage-public-source-upload", @"import-public-source-bundle", @"import-public-source-download" };
+pub const Action = enum { build, boot, diagnostics, describe, @"--identity", @"supervisor-source-closure", @"reader-source-closure", records, @"readonly-records", @"local-consumer-custody", @"handoff-inspect", @"handoff-inspect-legacy", @"public-validator-build", @"local-handoff-revalidation", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation", @"import-handoff-revalidation", @"private-export", @"private-validate", @"public-export", @"public-archive", @"verify-public-source-bundle", @"stage-public-source-upload", @"import-public-source-bundle", @"import-public-source-download", candidate, @"candidate-inspect", @"candidate-result" };
 pub const Command = struct {
     action: Action,
     runtime: ?[]const u8 = null,
@@ -29,17 +29,84 @@ pub const Command = struct {
     container_digest: ?contracts.Sha256 = null,
     selected_artifact_id: ?[]const u8 = null,
     selected_container_digest: ?contracts.Sha256 = null,
+    bundle: ?[]const u8 = null,
+    candidate: ?[]const u8 = null,
+    attempt_id: ?[]const u8 = null,
+    subscription: ?[]const u8 = null,
+    prefix: ?[]const u8 = null,
+    serial_first: ?[]const u8 = null,
+    serial_second: ?[]const u8 = null,
 };
 
 pub fn parse(args: []const []const u8) !Command {
     if (args.len < 2) return error.InvalidUsage;
     const action = std.meta.stringToEnum(Action, args[1]) orelse return error.InvalidUsage;
+    if (isCandidate(action)) return parseCandidate(args, action);
     if (isPublic(action)) return parsePublic(args, action);
     if (action == .@"--identity") {
         if (args.len != 2) return error.InvalidUsage;
         return .{ .action = action };
     }
     return parseExisting(args, action);
+}
+
+pub fn isCandidate(action: Action) bool {
+    return action == .candidate or action == .@"candidate-inspect" or action == .@"candidate-result";
+}
+
+fn parseCandidate(args: []const []const u8, action: Action) !Command {
+    if (args.len % 2 != 0) return error.InvalidUsage;
+    var result: Command = .{ .action = action };
+    var i: usize = 2;
+    while (i < args.len) : (i += 2) {
+        const flag = args[i];
+        const value = args[i + 1];
+        if (std.mem.eql(u8, flag, "--bundle") and result.bundle == null) {
+            files.absoluteFilePath(value) catch return error.InvalidUsage;
+            if (!std.mem.eql(u8, std.fs.path.basename(value), "bundle.json")) return error.InvalidUsage;
+            result.bundle = value;
+        } else if (std.mem.eql(u8, flag, "--output") and result.output == null and action == .candidate) {
+            files.absoluteFilePath(value) catch return error.InvalidUsage;
+            result.output = value;
+        } else if (std.mem.eql(u8, flag, "--candidate") and result.candidate == null and action != .candidate) {
+            files.absoluteFilePath(value) catch return error.InvalidUsage;
+            result.candidate = value;
+        } else if (std.mem.eql(u8, flag, "--validation-output") and result.validation_output == null) {
+            files.absoluteFilePath(value) catch return error.InvalidUsage;
+            result.validation_output = value;
+        } else if (std.mem.eql(u8, flag, "--git") and result.git == null) {
+            files.absoluteFilePath(value) catch return error.InvalidUsage;
+            result.git = value;
+        } else if (std.mem.eql(u8, flag, "--supervisor") and result.supervisor == null) {
+            files.absoluteFilePath(value) catch return error.InvalidUsage;
+            result.supervisor = value;
+        } else if (std.mem.eql(u8, flag, "--validator") and result.validator == null) {
+            files.absoluteFilePath(value) catch return error.InvalidUsage;
+            result.validator = value;
+        } else if (std.mem.eql(u8, flag, "--attempt-id") and result.attempt_id == null and action == .candidate) {
+            _ = contracts.parseUuid(value) catch return error.InvalidUsage;
+            result.attempt_id = value;
+        } else if (std.mem.eql(u8, flag, "--subscription") and result.subscription == null and action == .candidate) {
+            if (value.len == 0 or value.len > 4096) return error.InvalidUsage;
+            result.subscription = value;
+        } else if (std.mem.eql(u8, flag, "--prefix") and result.prefix == null and action == .candidate) {
+            if (value.len == 0 or value.len > 32) return error.InvalidUsage;
+            result.prefix = value;
+        } else if (std.mem.eql(u8, flag, "--serial-first") and result.serial_first == null and action == .@"candidate-result") {
+            files.absoluteFilePath(value) catch return error.InvalidUsage;
+            result.serial_first = value;
+        } else if (std.mem.eql(u8, flag, "--serial-second") and result.serial_second == null and action == .@"candidate-result") {
+            files.absoluteFilePath(value) catch return error.InvalidUsage;
+            result.serial_second = value;
+        } else return error.InvalidUsage;
+    }
+    if (result.bundle == null or result.validation_output == null or result.git == null or
+        result.supervisor == null or result.validator == null or
+        (action == .candidate and result.output == null) or
+        (action != .candidate and result.candidate == null) or
+        (action == .@"candidate-result" and result.serial_first == null))
+        return error.InvalidUsage;
+    return result;
 }
 
 pub fn isPublic(action: Action) bool {

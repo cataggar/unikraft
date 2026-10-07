@@ -9,3 +9,4 @@ pub const zip = @import("zip.zig");
 pub const public_archive = @import("public_archive.zig");
 pub const public_transport = @import("public_transport.zig");
 pub const public_products = @import("public_products.zig");
+pub const candidate = @import("candidate.zig");

@@ -58,6 +58,19 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    const candidate_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("handoff/candidate.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "hyperv_core", .module = core },
+                .{ .name = "wamr_controller", .module = controller },
+            },
+        }),
+    });
+    b.step("test-candidate", "Run no-authority candidate encoding and result edge cases")
+        .dependOn(&b.addRunArtifact(candidate_tests).step);
     const fixture_root = b.option([]const u8, "test-root", "Existing absolute private handoff fixture root") orelse std.fs.path.resolve(b.allocator, &.{
         b.graph.cache.cwd, b.cache_root.path orelse ".",
     }) catch @panic("cannot resolve private handoff test root");

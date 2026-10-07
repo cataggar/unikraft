@@ -1,5 +1,16 @@
 # Credential-free tiny native WAMR PR gate
 
+## Native no-authority candidates (additive)
+
+The native CLI provides `candidate`, `candidate-inspect`, and
+`candidate-result`. They do not replace the Python `handoff.py candidate`
+caller, change the default backend, or grant execution authority. See
+[`handoff/README.md`](handoff/README.md#no-authority-candidate-boundary) for
+the closed arguments, retained native validation, and typed consumer boundary.
+The frozen Python candidate and direct serial validators remain differential
+oracles. This product has no Azure launch, approval consumption, deployment,
+or cleanup operation.
+
 ## Native public products (additive; no caller cutover)
 
 The public product commands compose the merged private owners and the native

@@ -8,10 +8,15 @@ pub fn main(init: std.process.Init) void {
     const allocator = init.arena.allocator();
     const args = init.minimal.args.toSlice(allocator) catch refused(init.io);
     const command = controller.cli.parse(args) catch usage(init.io);
+    if (controller.cli.isCandidate(command.action)) {
+        candidateCommand(init, command);
+        return;
+    }
     if (controller.cli.isPublic(command.action)) {
         publicCommand(init, command);
         return;
     }
+
     if (command.action == .@"--identity") {
         const closure = controller.import_supervisor_identity.nativeSourceContentClosure(allocator) catch refused(init.io);
         const encoded = controller.import_supervisor_identity.identityBytes(allocator, &closure) catch refused(init.io);
@@ -332,6 +337,7 @@ pub fn main(init: std.process.Init) void {
             controller.boot_pipeline.diagnostics(&boot_context) catch |err| failed(init.io, "diagnostics", "", err);
         },
         .describe => unreachable,
+        .candidate, .@"candidate-inspect", .@"candidate-result" => unreachable,
         .@"supervisor-source-closure" => unreachable,
         .@"reader-source-closure" => unreachable,
         .records => unreachable,
@@ -348,6 +354,72 @@ pub fn main(init: std.process.Init) void {
         .@"private-export", .@"private-validate" => unreachable,
         .@"public-export", .@"public-archive", .@"verify-public-source-bundle", .@"stage-public-source-upload", .@"import-public-source-bundle", .@"import-public-source-download" => unreachable,
     }
+}
+
+fn candidateCommand(init: std.process.Init, command: controller.cli.Command) void {
+    const a = init.arena.allocator();
+    const stage = @tagName(command.action);
+    const repository = std.process.currentPathAlloc(init.io, a) catch refused(init.io);
+    const root = std.fs.path.dirname(command.bundle.?) orelse usage(init.io);
+    const directory = controller.layout.runtime(init.io, root) catch |err| candidateFailed(init.io, stage, "inputs", err);
+    defer directory.close(init.io);
+    var signal = controller.build_pipeline.installCancellation() catch refused(init.io);
+    defer signal.deinit();
+    var bundle = controller.accepted_run.PrivateBundle.open(a, init.io, &directory, root, repository, .{
+        .git = command.git.?,
+        .supervisor = command.supervisor.?,
+        .validator = command.validator.?,
+    }, &signal) catch |err| candidateFailed(init.io, stage, "inputs", err);
+    defer bundle.deinit();
+    const inv: handoff.candidate.Invocation = .{
+        .allocator = a,
+        .io = init.io,
+        .source = .{ .private_bundle = &bundle },
+        .output = command.output orelse command.candidate.?,
+        .validation_output = command.validation_output.?,
+        .settings = .{
+            .attempt_id = command.attempt_id,
+            .subscription = command.subscription,
+            .prefix = command.prefix,
+        },
+        .signal = &signal,
+    };
+    const outcome = if (command.action == .candidate) handoff.candidate.create(inv) else handoff.candidate.open(inv);
+    const finalized = switch (outcome) {
+        .success => |owner| owner,
+        .refused, .poisoned => |diagnostic| {
+            var stderr = std.Io.File.stderr().writerStreaming(init.io, &.{});
+            stderr.interface.print("WAMR_CI_FAILED_STAGE: {s}/{s}; cause: {s}; publication: {s}; private partial state retained; no resume.\n", .{
+                stage, @tagName(diagnostic.phase), @errorName(diagnostic.err), @tagName(diagnostic.publication),
+            }) catch {};
+            std.process.exit(1);
+        },
+    };
+    defer finalized.deinit();
+    _ = finalized.inspect(&signal) catch |err| candidateFailed(init.io, stage, "final_revalidation", err);
+    if (command.action == .@"candidate-result") {
+        const result = finalized.result(command.serial_first.?, command.serial_second, &signal) catch |err| {
+            var stderr = std.Io.File.stderr().writerStreaming(init.io, &.{});
+            stderr.interface.print("WAMR_CI_FAILED_STAGE: candidate-result/serial; cause: {s}; authority=not_admitted.\n", .{@errorName(err)}) catch {};
+            std.process.exit(if (err == error.EvidenceIncomplete) 2 else 1);
+        };
+        var stdout = std.Io.File.stdout().writerStreaming(init.io, &.{});
+        std.json.Stringify.value(result, .{}, &stdout.interface) catch refused(init.io);
+        stdout.interface.writeByte('\n') catch refused(init.io);
+    } else {
+        std.Io.File.stdout().writeStreamingAll(init.io, if (command.action == .candidate)
+            "Compute candidate created; authority=not_admitted.\n"
+        else
+            "Compute candidate revalidated; authority=not_admitted.\n") catch refused(init.io);
+    }
+}
+
+fn candidateFailed(io: std.Io, action: []const u8, phase: []const u8, err: anyerror) noreturn {
+    var stderr = std.Io.File.stderr().writerStreaming(io, &.{});
+    stderr.interface.print("WAMR_CI_FAILED_STAGE: {s}/{s}; cause: {s}; authority=not_admitted; private evidence retained.\n", .{
+        action, phase, @errorName(err),
+    }) catch {};
+    std.process.exit(1);
 }
 
 fn publicCommand(init: std.process.Init, command: controller.cli.Command) void {

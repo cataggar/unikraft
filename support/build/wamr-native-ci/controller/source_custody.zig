@@ -16,6 +16,7 @@ pub const closure = inputs.entries;
 pub const previous_closure = inputs.previous_entries;
 pub const previous_native_closure = inputs.previous_native_entries;
 pub const previous_private_closure = inputs.previous_private_entries;
+pub const previous_export_closure = inputs.previous_export_entries;
 
 pub fn contentClosure() [Sha256.digest_length]u8 {
     var hash = Sha256.init(.{});
