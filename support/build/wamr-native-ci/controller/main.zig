@@ -560,6 +560,9 @@ fn usage(io: std.Io) noreturn {
             "       uk-wamr-native-ci import-handoff-revalidation --stage-root ABS --git ABS --supervisor ABS --validator ABS --output ABS\n" ++
             "       uk-wamr-native-ci private-export --runtime ABS --output ABS\n" ++
             "       uk-wamr-native-ci private-validate --stage-root ABS --git ABS --supervisor ABS --validator ABS --output ABS\n" ++
+            "       uk-wamr-native-ci candidate --bundle ABS/bundle.json --output ABS --validation-output ABS --git ABS --supervisor ABS --validator ABS [--attempt-id UUID] [--subscription TEXT] [--prefix NAME]\n" ++
+            "       uk-wamr-native-ci candidate-inspect --bundle ABS/bundle.json --candidate ABS --validation-output ABS --git ABS --supervisor ABS --validator ABS\n" ++
+            "       uk-wamr-native-ci candidate-result --bundle ABS/bundle.json --candidate ABS --validation-output ABS --git ABS --supervisor ABS --validator ABS --serial-first ABS [--serial-second ABS]\n" ++
             "       uk-wamr-native-ci public-export|public-archive --stage-root ABS --validation-output ABS --output ABS --git ABS --supervisor ABS --validator ABS --expected-source COMMIT --expected-tree TREE --run-id ID --run-attempt ID [--runtime ABS for public-export]\n" ++
             "       uk-wamr-native-ci verify-public-source-bundle|stage-public-source-upload --archive ABS --expected-source COMMIT --expected-tree TREE --run-id ID --run-attempt ID --expected-archive-sha256 HEX [--output ABS for upload]\n" ++
             "       uk-wamr-native-ci import-public-source-bundle --archive ABS --output ABS --git ABS --supervisor ABS --validator ABS --expected-source COMMIT --expected-tree TREE --run-id ID --run-attempt ID [--expected-archive-sha256 HEX] (historical v1 only)\n" ++
