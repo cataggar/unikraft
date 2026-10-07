@@ -112,14 +112,14 @@ pub const Finalized = opaque {
     ) !controller.tiny.Result {
         const owner = self.state();
         try owner.revalidate(signal);
-        var first = try owner.retain(first_path, contracts.layout.max_serial_bytes, signal);
+        var first = try owner.retainSerial(first_path, error.EvidenceIncomplete, signal);
         defer first.file.close(owner.inv.io);
         var first_bytes = try files.readSensitiveFile(owner.inv.io, owner.arena.allocator(), first.file.file, contracts.layout.max_serial_bytes, .private);
         defer first_bytes.deinit();
         const identity = owner.scope.identity;
         var observed = try checkSerial(owner.arena.allocator(), first_bytes.bytes(), identity);
         if (second_path) |path| {
-            var second = try owner.retain(path, contracts.layout.max_serial_bytes, signal);
+            var second = try owner.retainSerial(path, error.WrongSerialPrefix, signal);
             defer second.file.close(owner.inv.io);
             var second_bytes = try files.readSensitiveFile(owner.inv.io, owner.arena.allocator(), second.file.file, contracts.layout.max_serial_bytes, .private);
             defer second_bytes.deinit();
@@ -156,10 +156,10 @@ const State = struct {
     reserved: bool = false,
 
     fn retain(self: *State, path: []const u8, limit: u64, signal: ?*core.process.SignalCancellation) !Held {
-        const owned_path = try self.arena.allocator().dupe(u8, path);
-        var file = try files.RetainedFile.open(self.inv.io, owned_path, .private);
-        errdefer file.close(self.inv.io);
-        return .{ .file = file, .digest = try copy.hashRetained(self.inv.io, &file, limit, if (signal) |active| active.flag() else null), .limit = limit };
+        return retainFile(self.arena.allocator(), self.inv.io, path, limit, signal, null);
+    }
+    fn retainSerial(self: *State, path: []const u8, empty_error: anyerror, signal: ?*core.process.SignalCancellation) !Held {
+        return retainFile(self.arena.allocator(), self.inv.io, path, contracts.layout.max_serial_bytes, signal, empty_error);
     }
     fn verifyHeld(self: *State, held: *Held, signal: ?*core.process.SignalCancellation) !void {
         const digest = try copy.hashRetained(self.inv.io, &held.file, held.limit, if (signal) |active| active.flag() else null);
@@ -199,6 +199,20 @@ const State = struct {
         return committed.status;
     }
 };
+
+fn retainFile(a: std.mem.Allocator, io: std.Io, path: []const u8, limit: u64, signal: ?*core.process.SignalCancellation, empty_error: ?anyerror) !Held {
+    const owned_path = try a.dupe(u8, path);
+    var file = try files.RetainedFile.open(io, owned_path, .private);
+    errdefer file.close(io);
+    if (file.file_snapshot.size == 0) {
+        if (empty_error) |err| {
+            try copy.checkCancellation(if (signal) |active| active.flag() else null);
+            try copy.verifyRetained(io, &file);
+            return err;
+        }
+    }
+    return .{ .file = file, .digest = try copy.hashRetained(io, &file, limit, if (signal) |active| active.flag() else null), .limit = limit };
+}
 
 pub fn create(inv: Invocation) Outcome {
     return construct(inv, false);
@@ -410,4 +424,21 @@ test "candidate cumulative result requires the exact original prefix with Azure 
     try std.testing.expectEqualStrings("second", try secondBytes("firstsecond", "first\x00\x00"));
     try std.testing.expectError(error.WrongSerialPrefix, secondBytes("changedsecond", "first"));
     try std.testing.expectError(error.WrongSerialPrefix, secondBytes("second", "\x00\x00"));
+}
+
+test "candidate empty captures retain the frozen incomplete and cumulative prefix refusals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const directory = try std.Io.Dir.openDirAbsolute(io, @import("test_options").fixture_root, .{});
+    defer directory.close(io);
+    const name = try std.fmt.allocPrint(a, "candidate-empty-serial-{d}", .{std.os.linux.getpid()});
+    const file = try directory.createFile(io, name, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    file.close(io);
+    defer directory.deleteFile(io, name) catch @panic("empty candidate capture cleanup failed");
+    const path = try std.fs.path.join(a, &.{ @import("test_options").fixture_root, name });
+    try std.testing.expectError(error.EvidenceIncomplete, retainFile(a, io, path, contracts.layout.max_serial_bytes, null, error.EvidenceIncomplete));
+    try std.testing.expectError(error.WrongSerialPrefix, retainFile(a, io, path, contracts.layout.max_serial_bytes, null, error.WrongSerialPrefix));
+    try std.testing.expectError(error.UnsafeSource, retainFile(a, io, path, contracts.layout.max_json_bytes, null, null));
 }

@@ -69,14 +69,16 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    const candidate_run = b.addRunArtifact(candidate_tests);
     b.step("test-candidate", "Run no-authority candidate encoding and result edge cases")
-        .dependOn(&b.addRunArtifact(candidate_tests).step);
+        .dependOn(&candidate_run.step);
     const fixture_root = b.option([]const u8, "test-root", "Existing absolute private handoff fixture root") orelse std.fs.path.resolve(b.allocator, &.{
         b.graph.cache.cwd, b.cache_root.path orelse ".",
     }) catch @panic("cannot resolve private handoff test root");
     if (!std.fs.path.isAbsolute(fixture_root)) @panic("handoff fixture root must be absolute");
     const options = b.addOptions();
     options.addOption([]const u8, "fixture_root", fixture_root);
+    candidate_tests.root_module.addOptions("test_options", options);
     // Nested --build-file invocations can render source LazyPaths relatively.
     options.addOptionPath("python_oracle", .{
         .cwd_relative = std.fs.path.resolve(b.allocator, &.{
@@ -151,7 +153,7 @@ pub fn build(b: *std.Build) void {
     fixture_dirs.has_side_effects = true;
     inline for (.{ "handoff-export-tests", "handoff-python-goldens", "handoff-public-archive-tests", "handoff-public-transport-tests" }) |name|
         fixture_dirs.addArg(b.pathJoin(&.{ fixture_root, name }));
-    inline for (.{ &run.step, &python.step, &archive_run.step, &transport_run.step }) |test_step|
+    inline for (.{ &run.step, &python.step, &archive_run.step, &transport_run.step, &candidate_run.step }) |test_step|
         test_step.dependOn(&fixture_dirs.step);
     b.step("test-public-archive", "Run native public archive engine tests").dependOn(&archive_run.step);
     b.step("test-public-transport", "Run native public transport staging and binding tests").dependOn(&transport_run.step);
