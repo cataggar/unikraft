@@ -1610,6 +1610,34 @@ retain their evidence, print the failed acquisition phase and original
 diagnostic, and preserve the original nonzero exit status; no failed download
 is accepted or converted into a fault-qualification result.
 
+Native LLVM acquisition explicitly passes the same read-only `GH_TOKEN` to
+the pinned downloader, rather than only to its setup action. The shared
+`hyperv-native-llvm-acquire.sh` retains separate private staging/logs for up to
+three attempts (180 seconds each, 5-second kill grace, 5/10-second backoff).
+Only ghr 0.8.0's exact attestation-lookup `UnexpectedHttpStatus` failure is
+retried; that CLI does not
+expose the underlying status. Every attempt repeats the existing checksum and
+attestation checks. Cryptographic rejections, extraction failures and exhausted
+lookups preserve their nonzero status. Only a fully verified/extracted attempt
+is moved create-only into the final LLVM destination. No skip-verification
+flags or cached-success fallback are used.
+
+LLVM acquisition and synthetic cold-setup/refusal fixtures precede the long
+controller fixtures. The four required native fault jobs independently build
+their own inputs and now run alongside the producer, without changing their
+context names, job inventory, permissions or budgets. Setup failures therefore
+do not wait for the producer's full build/boot/publication chain.
+
+Local CI monitors use `github-read-retry.sh` for read-only `gh api`, `pr view`,
+`pr list` and `run view` requests. It enforces GET for API requests, rejects
+method/body overrides and mutating commands, and retries timeouts, 429, selected
+5xx responses or explicit rate-limit errors up to three times with 5/10-second
+backoff, a 120-second attempt cap and 5-second kill grace. Authorization
+failures and exhausted reads remain errors; failed output is never returned as
+successful JSON.
+Mutation calls are never replayed, and retrying reads does not extend an
+acceptance deadline or authorize auto-merge.
+
 Artifact name:
 `wamr-public-source-tiny-RUN_ID-RUN_ATTEMPT-SOURCE_SHA`.
 Its sole uploaded file is `tiny-aot-public-source.zip`, stored for seven days.

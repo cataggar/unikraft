@@ -9,6 +9,7 @@ on:
       - .github/scripts/hyperv-qemu-candidate-runtime.sh
       - .github/scripts/hyperv-qemu-candidate-guest.sh
       - .github/scripts/hyperv-native-qemu-acquire.sh
+      - .github/scripts/hyperv-native-llvm-acquire.sh
   workflow_dispatch:
 
 permissions:
@@ -46,14 +47,11 @@ jobs:
           tools: cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Acquire the existing native LLVM tool distribution
-        uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495
-        with:
-          ghr-version: v0.8.0
-          tools: cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
-          dest: ${{ runner.temp }}/qemu-vpc-candidate/llvm
-          extract: 'true'
-          strip-components: '1'
-          cache: 'false'
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash .github/scripts/hyperv-native-llvm-acquire.sh "${RUNNER_TEMP}/qemu-vpc-candidate/llvm"
 
       - name: Acquire firmware data without installation hooks
         run: |

@@ -66,6 +66,13 @@ jobs:
           fi
           mkdir -p .d
 
+      - name: Exercise cold acquisition and read-only monitoring failure fixtures
+        timeout-minutes: 2
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover \
+            -s support/build/wamr-native-ci/tests -p test_adapter.py \
+            -k NativeAcquisitionFixtures
+
       - name: Set up the existing verified native downloader
         uses: cataggar/ghr/actions/setup@114926d37d3825e63bede2ccc7ce56b67eda7495
         with:
@@ -88,6 +95,13 @@ jobs:
         with:
           ghr-version: v0.8.0
           tools: cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Acquire the existing native LLVM distribution
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash .github/scripts/hyperv-native-llvm-acquire.sh /d/wamr-ci/wamr-native-runtime/llvm
 
       - name: Exercise the production source-custody limits explicitly
         timeout-minutes: 30
@@ -226,16 +240,6 @@ jobs:
           print(" ".join(target))
           ' <<< "${describe}")"
           echo "Recorded supervisor/validator target: ${recorded_target}"
-
-      - name: Acquire the existing native LLVM distribution
-        uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495
-        with:
-          ghr-version: v0.8.0
-          tools: cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
-          dest: /d/wamr-ci/wamr-native-runtime/llvm
-          extract: 'true'
-          strip-components: '1'
-          cache: 'false'
 
       - name: Establish the exact QEMU dynamic runtime before custody
         run: |
@@ -842,9 +846,10 @@ jobs:
           retention-days: 7
 
   # Legacy required context names: these four jobs now qualify native-only
-  # fault outcomes. Rename only with a coordinated required-check transition.
+  # fault outcomes. Each builds its own inputs; run in parallel so acquisition
+  # failures do not wait for the complete producer/publication chain.
+  # Rename only with a coordinated required-check transition.
   wamr-differential-parity:
-    needs: wamr-native-compute
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     strategy:
@@ -911,14 +916,11 @@ jobs:
           tools: cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Acquire the pinned LLVM distribution
-        uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495
-        with:
-          ghr-version: v0.8.0
-          tools: cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
-          dest: /d/wamr-ci/wamr-native-runtime/llvm
-          extract: 'true'
-          strip-components: '1'
-          cache: 'false'
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash .github/scripts/hyperv-native-llvm-acquire.sh /d/wamr-ci/wamr-native-runtime/llvm
 
       - name: Install the portable controller and complete private runtime inputs
         timeout-minutes: 15
