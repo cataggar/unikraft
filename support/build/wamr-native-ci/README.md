@@ -1638,6 +1638,11 @@ lookups preserve their nonzero status. Only a fully verified/extracted attempt
 is moved create-only into the final LLVM destination. No skip-verification
 flags or cached-success fallback are used.
 
+The destination-collision fixture covers the host `mv` and both GNU
+`--no-clobber` behaviors: a successful skip and a nonzero refusal. In either
+case, acquisition must refuse explicitly, preserve the occupied destination
+and retain verified staging; it does not require a version-specific exit code.
+
 LLVM acquisition and synthetic cold-setup/refusal fixtures precede the long
 controller fixtures. The four required native fault jobs independently build
 their own inputs and now run alongside the producer, without changing their

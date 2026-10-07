@@ -173,14 +173,31 @@ sys.stdout.write('{"verified_read":true}\\n')
             "hyperv-native-llvm-acquire.sh", "success", destination, token="")
         self.assertEqual(result.returncode, 2)
         self.assertEqual(self.recorded(), [])
-        result = self.invoke(
-            "hyperv-native-llvm-acquire.sh", "collision", destination)
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertEqual((destination / "foreign").read_text(), "unchanged")
-        result = self.invoke(
-            "hyperv-native-llvm-acquire.sh", "success", destination)
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(self.recorded(), [])
+        # GNU mv variants either skip successfully or refuse with a nonzero exit.
+        for move_status in (None, 0, 1):
+            with self.subTest(move_status=move_status):
+                destination = self.root / f"llvm-{move_status}"
+                if move_status is not None:
+                    move = self.bin / "mv"
+                    move.write_text(
+                        "#!/bin/sh\n"
+                        f"if [ {move_status} -ne 0 ]; then\n"
+                        "  printf 'mv: refusing occupied destination\\n' >&2\n"
+                        "fi\n"
+                        f"exit {move_status}\n", encoding="utf-8")
+                    move.chmod(0o700)
+                result = self.invoke(
+                    "hyperv-native-llvm-acquire.sh", "collision", destination)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(result.stderr)
+                self.assertEqual((destination / "foreign").read_text(), "unchanged")
+                self.assertTrue(
+                    (self.root / f"llvm-{move_status}.acquisition"
+                     / "attempt-1/extracted/bin/llvm-readelf").is_file())
+                result = self.invoke(
+                    "hyperv-native-llvm-acquire.sh", "success", destination)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(self.recorded(), [])
 
     def test_monitor_retries_transport_errors_without_returning_failed_output(self):
         for scenario in ("read-500-once", "read-503-once",
