@@ -1594,6 +1594,9 @@ test "trusted import authenticates relocated native tools without producer files
     const producer_git = try std.fs.path.join(a, &.{ path, "producer/git" });
     const producer_zig = try std.fs.path.join(a, &.{ path, "producer/zig" });
     const producer_identity = try controller.custody_files.readFile(io, producer_controller, 64 * 1024 * 1024, false);
+    if (producer_identity.bytes > 16 * 1024 * 1024)
+        std.debug.print("ReleaseSafe supervisor exceeds frozen import bound: {d} bytes\n", .{producer_identity.bytes});
+    try std.testing.expect(producer_identity.bytes <= 16 * 1024 * 1024);
     const relocated_identity = try controller.custody_files.readFile(io, supervisor, 64 * 1024 * 1024, false);
     try std.testing.expectEqualSlices(u8, &producer_identity.sha256, &relocated_identity.sha256);
     try std.testing.expect(producer_identity.metadata[1] != relocated_identity.metadata[1]);

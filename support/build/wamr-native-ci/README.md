@@ -325,6 +325,10 @@ The relocated producer-import fixture uses the genuine native controller in
 its installable ReleaseSafe profile, including its imported modules, even when
 the test runner uses Debug. Its supervisor must fit the separate unchanged
 16 MiB import-runtime bound; stripping a Debug CLI alone is insufficient.
+ReleaseSafe controllers and the forced ReleaseSafe import fixture omit debug
+sections so the candidate/public-product implementation fits that unchanged
+bound on the host CPU as well as the portable target. The relocated-tool test
+measures the actual supervisor before binding and reports any excess directly.
 Other CLI fixtures and native test modules retain the selected optimization
 profile. ReleaseSafe reuses the existing CLI artifact; Debug adds one genuine
 ReleaseSafe CLI build, not a mock identity executable.
