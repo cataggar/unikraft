@@ -328,6 +328,18 @@ test "genuine transport fixed upload native imported acceptance and canonical Py
     defer owner.deinit(io);
     const receipt = try owner.receipt(a, io, null);
     defer a.free(receipt);
+    if (std.mem.eql(u8, options.genuine_source, "c8f45aefcb855480605830ea47a8990c72d0fda3") and
+        std.mem.eql(u8, options.genuine_run, "37321447300") and
+        std.mem.eql(u8, options.genuine_artifact_id, "11356844780"))
+    {
+        const historical_receipt =
+            "{\"artifact_id\":\"11356844780\",\"container_digest\":\"" ++ container_sha ++
+            "\",\"inner_zip_sha256\":\"269d0c17d48ac5c722d79774f6b399bd56d8b8e68f9d2ff24f827deab63c27c4" ++
+            "\",\"repository\":\"cataggar/unikraft\",\"run_attempt\":\"1\",\"run_id\":\"37321447300\"," ++
+            "\"schema\":\"uk.wamr.public-source-transport\",\"source_revision\":\"c8f45aefcb855480605830ea47a8990c72d0fda3\"," ++
+            "\"source_tree\":\"47fafaddda9b4c56cba06c868c1cad0a62084c60\",\"version\":2}\n";
+        try std.testing.expectEqualStrings(historical_receipt, receipt);
+    }
     const oracle_path = options.python_receipt orelse return error.MissingPythonTransportReceipt;
     const oracle = try std.Io.Dir.cwd().readFileAlloc(io, oracle_path, a, .limited(controller.handoff_contracts.layout.max_json_bytes));
     defer a.free(oracle);

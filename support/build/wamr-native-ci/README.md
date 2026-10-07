@@ -39,6 +39,9 @@ All paths below must be canonical absolute paths with private existing parents.
   the artifact ID, container digest and inner digest are different types and
   are never interchangeable. This is a local consumer, not a network downloader
   or remote artifact authenticator.
+  The raw container is an opaque authenticated transport input, not a native
+  ZIP extraction API; the exact extracted member is independently authenticated
+  against the trusted inner digest.
 * `import-public-source-bundle --archive ABS --output ABS --git ABS
   --supervisor ABS --validator ABS [--expected-archive-sha256 HEX]` preserves
   the frozen historical v1 import. Digest omission remains confined to the
@@ -63,6 +66,11 @@ The library returns a heap-stable `ImportedProduct`; its `revalidate` checks
 the real private owner, fresh input hashes, sealed output directories and
 retained native validation captures. Its `deinit` closes borrowed consumers
 before `Download`/`Archive` owners and never removes retained evidence.
+The existing `private-validate --stage-root ABS --git ABS --supervisor ABS
+--validator ABS --output ABS` reopens an operator bundle and performs a fresh
+real native validation in another create-only external output. That fresh
+private validation does not reconstruct former archive/download descriptor
+custody after the `ImportedProduct` owner has been destroyed.
 Failures are explicit refused/poisoned outcomes with phase and publication
 durability; partially created state is non-resumable and retained.
 Authority stays `not_admitted`; there are no cloud operations, approvals,
