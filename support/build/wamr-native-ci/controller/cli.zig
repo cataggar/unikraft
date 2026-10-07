@@ -4,7 +4,7 @@ const core = @import("hyperv_core");
 const files = core.private_files;
 const contracts = core.contracts;
 
-pub const Action = enum { build, boot, diagnostics, describe, @"--identity", @"supervisor-source-closure", @"reader-source-closure", records, @"readonly-records", @"local-consumer-custody", @"handoff-inspect", @"handoff-inspect-legacy", @"public-validator-build", @"local-handoff-revalidation", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation", @"import-handoff-revalidation", @"private-export", @"private-validate" };
+pub const Action = enum { build, boot, diagnostics, describe, @"--identity", @"supervisor-source-closure", @"reader-source-closure", records, @"readonly-records", @"local-consumer-custody", @"handoff-inspect", @"handoff-inspect-legacy", @"public-validator-build", @"local-handoff-revalidation", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation", @"import-handoff-revalidation", @"private-export", @"private-validate", @"public-export", @"public-archive", @"verify-public-source-bundle", @"stage-public-source-upload", @"import-public-source-bundle", @"import-public-source-download" };
 pub const Command = struct {
     action: Action,
     runtime: ?[]const u8 = null,
@@ -16,15 +16,133 @@ pub const Command = struct {
     validator: ?[]const u8 = null,
     expected_build_start_sha256: ?contracts.Sha256 = null,
     expected_boot_inputs_sha256: ?contracts.Sha256 = null,
+    archive: ?[]const u8 = null,
+    download_root: ?[]const u8 = null,
+    container_archive: ?[]const u8 = null,
+    validation_output: ?[]const u8 = null,
+    source_revision: ?[]const u8 = null,
+    source_tree: ?[]const u8 = null,
+    run_id: ?[]const u8 = null,
+    run_attempt: ?[]const u8 = null,
+    inner_digest: ?contracts.Sha256 = null,
+    artifact_id: ?[]const u8 = null,
+    container_digest: ?contracts.Sha256 = null,
+    selected_artifact_id: ?[]const u8 = null,
+    selected_container_digest: ?contracts.Sha256 = null,
 };
 
 pub fn parse(args: []const []const u8) !Command {
     if (args.len < 2) return error.InvalidUsage;
     const action = std.meta.stringToEnum(Action, args[1]) orelse return error.InvalidUsage;
+    if (isPublic(action)) return parsePublic(args, action);
     if (action == .@"--identity") {
         if (args.len != 2) return error.InvalidUsage;
         return .{ .action = action };
     }
+    return parseExisting(args, action);
+}
+
+pub fn isPublic(action: Action) bool {
+    return switch (action) {
+        .@"public-export", .@"public-archive", .@"verify-public-source-bundle", .@"stage-public-source-upload", .@"import-public-source-bundle", .@"import-public-source-download" => true,
+        else => false,
+    };
+}
+
+fn parsePublic(args: []const []const u8, action: Action) !Command {
+    if (args.len % 2 != 0) return error.InvalidUsage;
+    var result: Command = .{ .action = action };
+    const packing = action == .@"public-export" or action == .@"public-archive";
+    const importing = action == .@"import-public-source-bundle" or action == .@"import-public-source-download";
+    const download = action == .@"import-public-source-download";
+    const reading = action == .@"verify-public-source-bundle" or action == .@"stage-public-source-upload" or action == .@"import-public-source-bundle";
+    var i: usize = 2;
+    while (i < args.len) : (i += 2) {
+        const flag = args[i];
+        const value = args[i + 1];
+        if (std.mem.eql(u8, flag, "--expected-source") and result.source_revision == null) {
+            try sourceIdentity(value);
+            result.source_revision = value;
+        } else if (std.mem.eql(u8, flag, "--expected-tree") and result.source_tree == null) {
+            try sourceIdentity(value);
+            result.source_tree = value;
+        } else if (std.mem.eql(u8, flag, "--run-id") and result.run_id == null) {
+            try identifier(value);
+            result.run_id = value;
+        } else if (std.mem.eql(u8, flag, "--run-attempt") and result.run_attempt == null) {
+            try identifier(value);
+            result.run_attempt = value;
+        } else if (std.mem.eql(u8, flag, "--expected-archive-sha256") and result.inner_digest == null and !packing) {
+            result.inner_digest = contracts.parseSha256(value) catch return error.InvalidUsage;
+        } else if (std.mem.eql(u8, flag, "--output") and result.output == null and action != .@"verify-public-source-bundle") {
+            files.absoluteFilePath(value) catch return error.InvalidUsage;
+            result.output = value;
+        } else if (std.mem.eql(u8, flag, "--runtime") and result.runtime == null and action == .@"public-export") {
+            files.absoluteFilePath(value) catch return error.InvalidUsage;
+            result.runtime = value;
+        } else if (std.mem.eql(u8, flag, "--stage-root") and result.stage_root == null and packing) {
+            files.absoluteFilePath(value) catch return error.InvalidUsage;
+            result.stage_root = value;
+        } else if (std.mem.eql(u8, flag, "--validation-output") and result.validation_output == null and packing) {
+            files.absoluteFilePath(value) catch return error.InvalidUsage;
+            result.validation_output = value;
+        } else if (std.mem.eql(u8, flag, "--archive") and result.archive == null and reading) {
+            files.absoluteFilePath(value) catch return error.InvalidUsage;
+            result.archive = value;
+        } else if (std.mem.eql(u8, flag, "--download-root") and result.download_root == null and download) {
+            files.absoluteFilePath(value) catch return error.InvalidUsage;
+            result.download_root = value;
+        } else if (std.mem.eql(u8, flag, "--container-archive") and result.container_archive == null and download) {
+            files.absoluteFilePath(value) catch return error.InvalidUsage;
+            result.container_archive = value;
+        } else if (std.mem.eql(u8, flag, "--artifact-id") and result.artifact_id == null and download) {
+            try identifier(value);
+            result.artifact_id = value;
+        } else if (std.mem.eql(u8, flag, "--selected-artifact-id") and result.selected_artifact_id == null and download) {
+            try identifier(value);
+            result.selected_artifact_id = value;
+        } else if (std.mem.eql(u8, flag, "--container-digest") and result.container_digest == null and download) {
+            result.container_digest = contracts.parseSha256(value) catch return error.InvalidUsage;
+        } else if (std.mem.eql(u8, flag, "--selected-container-digest") and result.selected_container_digest == null and download) {
+            result.selected_container_digest = contracts.parseSha256(value) catch return error.InvalidUsage;
+        } else if (std.mem.eql(u8, flag, "--git") and result.git == null and (packing or importing)) {
+            files.absoluteFilePath(value) catch return error.InvalidUsage;
+            result.git = value;
+        } else if (std.mem.eql(u8, flag, "--supervisor") and result.supervisor == null and (packing or importing)) {
+            files.absoluteFilePath(value) catch return error.InvalidUsage;
+            result.supervisor = value;
+        } else if (std.mem.eql(u8, flag, "--validator") and result.validator == null and (packing or importing)) {
+            files.absoluteFilePath(value) catch return error.InvalidUsage;
+            result.validator = value;
+        } else return error.InvalidUsage;
+    }
+    if (result.source_revision == null or result.source_tree == null or result.run_id == null or result.run_attempt == null)
+        return error.InvalidUsage;
+    if (action != .@"verify-public-source-bundle" and result.output == null) return error.InvalidUsage;
+    if ((packing or importing) and (result.git == null or result.supervisor == null or result.validator == null))
+        return error.InvalidUsage;
+    if (packing and (result.stage_root == null or result.validation_output == null)) return error.InvalidUsage;
+    if (action == .@"public-export" and result.runtime == null) return error.InvalidUsage;
+    if (reading and result.archive == null) return error.InvalidUsage;
+    if (!packing and action != .@"import-public-source-bundle" and result.inner_digest == null) return error.InvalidUsage;
+    if (download and (result.download_root == null or result.container_archive == null or
+        result.artifact_id == null or result.container_digest == null or
+        result.selected_artifact_id == null or result.selected_container_digest == null))
+        return error.InvalidUsage;
+    return result;
+}
+
+fn identifier(value: []const u8) !void {
+    if (value.len == 0 or value.len > 20 or value[0] < '1' or value[0] > '9') return error.InvalidUsage;
+    for (value) |digit| if (!std.ascii.isDigit(digit)) return error.InvalidUsage;
+}
+fn sourceIdentity(value: []const u8) !void {
+    if (value.len != 40) return error.InvalidUsage;
+    for (value) |digit|
+        if (!std.ascii.isDigit(digit) and (digit < 'a' or digit > 'f')) return error.InvalidUsage;
+}
+
+fn parseExisting(args: []const []const u8, action: Action) !Command {
     if (action == .describe) {
         if (args.len != 4 or !std.mem.eql(u8, args[2], "--output") or
             !std.mem.eql(u8, args[3], "json-v1"))

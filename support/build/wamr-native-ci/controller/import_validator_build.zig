@@ -57,7 +57,7 @@ pub const PortableTools = struct {
         }
     };
 
-    const BindingPolicy = enum { producer, legacy_reader, private_reader };
+    const BindingPolicy = enum { producer, legacy_reader, private_reader, imported_reader };
 
     pub fn bind(
         allocator: std.mem.Allocator,
@@ -102,6 +102,20 @@ pub const PortableTools = struct {
         return bindWithPolicy(allocator, io, accepted.context, accepted.source, start, repository, controller_path, local, signal, .private_reader);
     }
 
+    pub fn bindImportedReader(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        accepted: *accepted_run.AcceptedRun,
+        start: std.json.Value,
+        repository: []const u8,
+        controller_path: []const u8,
+        local: LocalTools,
+        signal: ?*core.process.SignalCancellation,
+    ) !PortableTools {
+        if (accepted.context != .trusted_inner_zip) return error.InvalidContext;
+        return bindWithPolicy(allocator, io, accepted.context, accepted.source, start, repository, controller_path, local, signal, .imported_reader);
+    }
+
     fn bindWithPolicy(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -141,7 +155,7 @@ pub const PortableTools = struct {
         try native.verify(io);
         try validator.verify(io);
         for (runtime.items) |*entry| try entry.file.verify(io);
-        if (policy == .private_reader) {
+        if (policy == .private_reader or policy == .imported_reader) {
             if (start.object.contains("command_supervisor")) {
                 const source_map = try get(try get(start, "command_supervisor"), "source_map");
                 _ = try supervisor_identity.verifyGitSource(allocator, io, identity, repository, local.git, source_map, signal);
@@ -190,7 +204,7 @@ pub const PortableTools = struct {
         try source.verifyPhysical(io, allocator, repository);
         var producer_source: ?ProducerSource = null;
         errdefer if (producer_source) |proof| if (proof.map) |raw| allocator.free(raw);
-        if (policy == .private_reader) {
+        if (policy == .private_reader or policy == .imported_reader) {
             const map = if (start.object.get("command_supervisor")) |record| blk: {
                 const raw = try std.json.Stringify.valueAlloc(allocator, try get(record, "source_map"), .{});
                 defer allocator.free(raw);
@@ -471,6 +485,182 @@ pub fn runPrivate(
     try anchor.verify(io);
     try command_record.verify(io);
     try command_log.verify(io);
+}
+
+pub const RetainedValidation = struct {
+    allocator: std.mem.Allocator,
+    tools: PortableTools,
+    tool_paths: [4][]const u8,
+    held: [4]files.RetainedFile,
+    digests: [4][64]u8,
+
+    pub fn revalidate(self: *RetainedValidation, io: std.Io, repository: []const u8, signal: ?*core.process.SignalCancellation) !void {
+        try self.tools.verifyWithSignal(io, repository, self.tools.git.path, signal);
+        for (&self.held, &self.digests) |*file, *digest| {
+            try file.verify(io);
+            const observed = try physical.readRetained(io, file, records.max_record_bytes);
+            if (!std.mem.eql(u8, &observed.sha256, digest)) return error.CommandOutputChanged;
+        }
+        try self.tools.verifyWithSignal(io, repository, self.tools.git.path, signal);
+    }
+
+    pub fn deinit(self: *RetainedValidation, io: std.Io) void {
+        for (&self.held) |*file| {
+            const path = file.path;
+            file.close(io);
+            self.allocator.free(path);
+        }
+        self.tools.deinit(io);
+        for (self.tool_paths) |path| self.allocator.free(path);
+        self.* = undefined;
+    }
+};
+
+// Imported producer Git evidence and the current native reader are separate
+// owners. Neither a portable stage nor metadata alone completes this operation.
+pub fn runImportedReader(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    accepted: *accepted_run.AcceptedRun,
+    repository: []const u8,
+    candidate: *files.RetainedFile,
+    output: []const u8,
+    supplied: LocalTools,
+    signal: ?*core.process.SignalCancellation,
+) !RetainedValidation {
+    if (accepted.context != .trusted_inner_zip) return error.InvalidContext;
+    try files.absoluteFilePath(output);
+    if (contained(output, accepted.root) or contained(output, repository) or
+        contained(accepted.root, output) or contained(repository, output))
+        return error.AliasedOutput;
+    try accepted.revalidateWithSignal(signal);
+    try candidate.verify(io);
+    var paths: [4][]const u8 = undefined;
+    var paths_owned: usize = 0;
+    errdefer for (paths[0..paths_owned]) |path| allocator.free(path);
+    for ([_][]const u8{ supplied.git, supplied.supervisor, supplied.validator }, 0..) |path, i| {
+        paths[i] = try allocator.dupe(u8, path);
+        paths_owned += 1;
+    }
+    paths[3] = try std.process.executablePathAlloc(io, allocator);
+    paths_owned += 1;
+    const local: LocalTools = .{ .git = paths[0], .supervisor = paths[1], .validator = paths[2] };
+    var start = try accepted.pinArtifact(.build_start);
+    defer start.close(io);
+    var raw = try files.readSensitiveFile(io, allocator, start.file, records.max_record_bytes, .private);
+    defer raw.deinit();
+    var document = try contracts.Document.parse(allocator, raw.bytes(), .{
+        .bytes = records.max_record_bytes,
+        .depth = 32,
+        .items = 4096,
+        .tokens = 65536,
+    });
+    defer document.deinit();
+    try document.requireCanonical(allocator, raw.bytes());
+    var authenticated = try PortableTools.bindImportedReader(
+        allocator,
+        io,
+        accepted,
+        document.value(),
+        repository,
+        paths[3],
+        local,
+        signal,
+    );
+    errdefer authenticated.deinit(io);
+    const parent = try files.FileParent.open(io, output, .private);
+    defer parent.close(io);
+    try parent.directory.createDir(io, parent.name, .fromMode(0o700));
+    const directory = try files.Directory.open(io, output);
+    defer directory.close(io);
+    try syncDirectory(io, directory.dir);
+    try parent.sync(io);
+    for ([_][]const u8{ "private", "evidence" }) |name|
+        try directory.dir.createDir(io, name, .fromMode(0o700));
+    const private = try directory.dir.openDir(io, "private", .{ .iterate = true });
+    defer private.close(io);
+    const evidence = try directory.dir.openDir(io, "evidence", .{ .iterate = true });
+    defer evidence.close(io);
+    var lock = try (files.Directory{ .dir = private }).lock(io);
+    defer lock.close(io);
+    var held: [4]files.RetainedFile = undefined;
+    var digests: [4][64]u8 = undefined;
+    var held_count: usize = 0;
+    errdefer for (held[0..held_count]) |*file| {
+        file.close(io);
+        allocator.free(file.path);
+    };
+    const roots: plan.Roots = .{
+        .source_root = repository,
+        .work = output,
+        .runtime = accepted.root,
+        .zig = "",
+        .producer = "",
+        .supervisor = local.supervisor,
+        .package_tool = "",
+        .validator = "",
+        .direct_validator = local.validator,
+        .bundle = candidate.path,
+        .tools = @splat(""),
+    };
+    try authenticated.verifyWithSignal(io, repository, local.git, signal);
+    const identity = try adapter.execute(allocator, io, .{
+        .roots = roots,
+        .stage = .@"supervisor-import-identity",
+        .private_dir = private,
+        .evidence_dir = evidence,
+        .cancel = if (signal) |active| active.flag() else null,
+        .capture_stdout = true,
+    });
+    defer allocator.free(identity.stdout);
+    const closure = try supervisor_identity.nativeSourceContentClosure(allocator);
+    const expected = try supervisor_identity.identityBytes(allocator, &closure);
+    defer allocator.free(expected);
+    if (identity.poisoned) return error.CleanupPoisoned;
+    if (!identity.accepted or identity.stderr_bytes != 0 or !std.mem.eql(u8, identity.stdout, expected))
+        return error.ImportIdentityChanged;
+    _ = try validatedPostRun(allocator, io, output, .@"supervisor-import-identity", expected.len);
+    for ([_][]const u8{ "evidence/command-supervisor-import-identity.json", "private/supervisor-import-identity.log" }, 0..) |relative, i| {
+        const pinned = try pinValidationOutput(allocator, io, output, relative);
+        held[i] = pinned.file;
+        digests[i] = pinned.sha256;
+        held_count += 1;
+    }
+    try authenticated.verifyWithSignal(io, repository, local.git, signal);
+    try accepted.revalidateWithSignal(signal);
+    try candidate.verify(io);
+    _ = try revalidateHandoffCommand(allocator, io, roots, private, evidence, signal);
+    try authenticated.verifyWithSignal(io, repository, local.git, signal);
+    try accepted.revalidateWithSignal(signal);
+    try candidate.verify(io);
+    try start.verify(io);
+    for ([_][]const u8{ "evidence/command-import-native-revalidation.json", "private/import-native-revalidation.log" }, 2..) |relative, i| {
+        const pinned = try pinValidationOutput(allocator, io, output, relative);
+        held[i] = pinned.file;
+        digests[i] = pinned.sha256;
+        held_count += 1;
+    }
+    try syncDirectory(io, evidence);
+    try syncDirectory(io, private);
+    try syncDirectory(io, directory.dir);
+    try parent.sync(io);
+    var result: RetainedValidation = .{
+        .allocator = allocator,
+        .tools = authenticated,
+        .tool_paths = paths,
+        .held = held,
+        .digests = digests,
+    };
+    try result.revalidate(io, repository, signal);
+    return result;
+}
+
+fn pinValidationOutput(allocator: std.mem.Allocator, io: std.Io, output: []const u8, relative: []const u8) !struct { file: files.RetainedFile, sha256: [64]u8 } {
+    const path = try std.fs.path.join(allocator, &.{ output, relative });
+    errdefer allocator.free(path);
+    var retained = try files.RetainedFile.open(io, path, .private);
+    errdefer retained.close(io);
+    return .{ .file = retained, .sha256 = (try physical.readRetained(io, &retained, records.max_record_bytes)).sha256 };
 }
 
 fn syncDirectory(io: std.Io, directory: std.Io.Dir) !void {

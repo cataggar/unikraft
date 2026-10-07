@@ -16,6 +16,83 @@ test "complete local fixture workers backfill either occupied lane" {
     try @import("local_acceptance_tests.zig").workerBackfill(arena.allocator(), std.testing.io);
 }
 
+test "public product CLI separates trusted and selected transport identities and closes arguments" {
+    const cli = controller.cli;
+    const revision = "0123456789012345678901234567890123456789";
+    const digest = "0123456789012345678901234567890123456789012345678901234567890123";
+    const valid = [_][]const u8{
+        "uk-wamr-native-ci",           "import-public-source-download",
+        "--download-root",             "/private/download",
+        "--container-archive",         "/private/container.zip",
+        "--output",                    "/private/import",
+        "--git",                       "/private/git",
+        "--supervisor",                "/private/controller",
+        "--validator",                 "/private/validator",
+        "--expected-source",           revision,
+        "--expected-tree",             revision,
+        "--run-id",                    "37527403295",
+        "--run-attempt",               "1",
+        "--expected-archive-sha256",   digest,
+        "--artifact-id",               "11449019166",
+        "--container-digest",          digest,
+        "--selected-artifact-id",      "11449019167",
+        "--selected-container-digest", digest,
+    };
+    const parsed = try cli.parse(&valid);
+    try std.testing.expectEqualStrings("11449019166", parsed.artifact_id.?);
+    try std.testing.expectEqualStrings("11449019167", parsed.selected_artifact_id.?);
+    try std.testing.expectError(error.InvalidUsage, cli.parse(valid[0 .. valid.len - 2]));
+    var changed = valid;
+    changed[28] = "--artifact-id";
+    try std.testing.expectError(error.InvalidUsage, cli.parse(&changed));
+    changed = valid;
+    changed[17] = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
+    try std.testing.expectError(error.InvalidUsage, cli.parse(&changed));
+    changed = valid;
+    changed[19] = "01";
+    try std.testing.expectError(error.InvalidUsage, cli.parse(&changed));
+    changed = valid;
+    changed[3] = "/private/../download";
+    try std.testing.expectError(error.InvalidUsage, cli.parse(&changed));
+    _ = try cli.parse(&.{
+        "uk-wamr-native-ci",         "verify-public-source-bundle", "--archive",       "/private/inner.zip",
+        "--expected-source",         revision,                      "--expected-tree", revision,
+        "--run-id",                  "1",                           "--run-attempt",   "1",
+        "--expected-archive-sha256", digest,
+    });
+    try std.testing.expectError(error.InvalidUsage, cli.parse(&.{
+        "uk-wamr-native-ci",         "stage-public-source-upload", "--archive",       "/private/inner.zip",
+        "--expected-source",         revision,                     "--expected-tree", revision,
+        "--run-id",                  "1",                          "--run-attempt",   "1",
+        "--expected-archive-sha256", digest,
+    }));
+}
+
+test "public product CLI refuses missing inputs without a success receipt or output" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const revision = "0123456789012345678901234567890123456789";
+    const output = try std.fs.path.join(a, &.{ options.fixture_root, "refused-public-product-output" });
+    const missing = try std.fs.path.join(a, &.{ options.fixture_root, "absent-public-product.zip" });
+    const result = try std.process.run(a, std.testing.io, .{
+        .argv = &.{
+            options.host_controller_cli, "import-public-source-bundle", "--archive",       missing,
+            "--output",                  output,                        "--git",           "/private/git",
+            "--supervisor",              "/private/controller",         "--validator",     "/private/validator",
+            "--expected-source",         revision,                      "--expected-tree", revision,
+            "--run-id",                  "1",                           "--run-attempt",   "1",
+        },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, result.term);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "import-public-source-bundle/inputs") != null);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.openDirAbsolute(std.testing.io, output, .{}));
+}
+
 test "private product CLI closes arguments and refuses unavailable custody without output" {
     const cli = controller.cli;
     const valid = [_][]const u8{
