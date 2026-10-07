@@ -107,6 +107,29 @@ if name == "ghr":
         destination.mkdir()
         (destination / "foreign").write_text("unchanged")
     raise SystemExit(0)
+if name == "zig":
+    args = sys.argv[1:]
+    if args[:1] != ["build"] or "--fetch=all" not in args or "--system" in args:
+        raise SystemExit(9)
+    stage = Path(args[args.index("--build-file") + 1]).parent
+    temporary = Path(args[args.index("--global-cache-dir") + 1]) / "tmp"
+    if not temporary.is_dir() or temporary.stat().st_mode & 0o777 != 0o700:
+        raise SystemExit(9)
+    if scenario == "zig-closing-always" or scenario == "zig-closing-twice" and attempt < 3:
+        (stage / "partial").write_text("failed acquisition must remain staged")
+        sys.stderr.write("build.zig.zon:8:20: error: invalid HTTP response: HttpConnectionClosing\\n")
+        raise SystemExit(1)
+    if scenario in ("zig-hash", "zig-extraction", "zig-mixed"):
+        if scenario == "zig-mixed":
+            sys.stderr.write("build.zig.zon:8:20: error: invalid HTTP response: HttpConnectionClosing\\n")
+        sys.stderr.write("error: package " + scenario + " rejected\\n")
+        raise SystemExit(1)
+    if scenario == "zig-timeout":
+        raise SystemExit(124)
+    if scenario != "zig-missing-packages":
+        (stage / "zig-pkg").mkdir()
+        (stage / "zig-pkg/verified").write_text("verified package bytes")
+    raise SystemExit(0)
 match = re.fullmatch(r"read-(\\d+)-(once|always)", scenario)
 if match and (match[2] == "always" or attempt == 1):
     sys.stdout.write("incomplete failed response")
@@ -116,7 +139,7 @@ if scenario == "read-timeout-once" and attempt == 1:
     raise SystemExit(124)
 sys.stdout.write('{"verified_read":true}\\n')
 """
-        for name in ("gh", "ghr", "sleep"):
+        for name in ("gh", "ghr", "sleep", "zig"):
             path = self.bin / name
             path.write_text(fixture, encoding="utf-8")
             path.chmod(0o700)
@@ -233,6 +256,38 @@ sys.stdout.write('{"verified_read":true}\\n')
                     "github-read-retry.sh", "success", *arguments)
                 self.assertEqual(result.returncode, 2)
                 self.assertEqual(self.recorded(), [])
+
+    def test_zig_restore_retries_only_transport_failures(self):
+        destination = self.root / "packages"
+        result = self.invoke(
+            "hyperv-native-zig-restore.sh", "zig-closing-twice", destination)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.recorded()), 3)
+        self.assertEqual((destination / "zig-pkg/verified").read_text(),
+                         "verified package bytes")
+        for attempt in (1, 2):
+            self.assertTrue((destination / f"attempt-{attempt}/partial").is_file())
+            self.assertFalse((destination / f"attempt-{attempt}/zig-pkg").exists())
+        self.assertEqual(len({
+            call["argv"][call["argv"].index("--global-cache-dir") + 1]
+            for call in self.recorded()}), 3)
+        result = self.invoke(
+            "hyperv-native-zig-restore.sh", "zig-success", destination)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.recorded(), [])
+
+    def test_zig_restore_exhaustion_and_permanent_errors_never_publish(self):
+        for scenario, status, attempts in (
+                ("zig-closing-always", 1, 3), ("zig-hash", 1, 1),
+                ("zig-extraction", 1, 1), ("zig-mixed", 1, 1),
+                ("zig-timeout", 124, 1), ("zig-missing-packages", 1, 1)):
+            with self.subTest(scenario=scenario):
+                destination = self.root / scenario
+                result = self.invoke(
+                    "hyperv-native-zig-restore.sh", scenario, destination)
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual(len(self.recorded()), attempts)
+                self.assertFalse((destination / "zig-pkg").exists())
 
 
 class NativeRecordBridge(unittest.TestCase):

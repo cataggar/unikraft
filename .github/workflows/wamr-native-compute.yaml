@@ -127,11 +127,7 @@ jobs:
           export ZIG_GLOBAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-global-cache"
           mkdir -m 0700 -- "${ZIG_GLOBAL_CACHE_DIR}" "${ZIG_GLOBAL_CACHE_DIR}/tmp"
           restore_root="${RUNNER_TEMP}/wamr-controller-dependency-restore"
-          mkdir -m 0700 -- "${restore_root}"
-          cp "${source_root}/support/tools/hyperv/local_boot/build.zig" \
-            "${source_root}/support/tools/hyperv/local_boot/build.zig.zon" "${restore_root}/"
-          ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
-            zig build --build-file "${restore_root}/build.zig" --fetch=all -j2
+          bash .github/scripts/hyperv-native-zig-restore.sh "${restore_root}"
           ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
             zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
               --system "${restore_root}/zig-pkg" \
@@ -160,8 +156,6 @@ jobs:
           test -d "${restore_root}/zig-pkg"
           cmp -- "${source_root}/support/tools/hyperv/local_boot/build.zig" "${restore_root}/build.zig"
           cmp -- "${source_root}/support/tools/hyperv/local_boot/build.zig.zon" "${restore_root}/build.zig.zon"
-          ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
-            zig build --build-file "${restore_root}/build.zig" --fetch=all -j2
           if ! ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
             zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
             --system "${restore_root}/zig-pkg" \
@@ -203,6 +197,7 @@ jobs:
           mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-native-controller-cache"
           ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-native-controller-cache" \
             zig build --build-file "${GITHUB_WORKSPACE}/support/build/wamr-native-ci/build.zig" \
+              --system "${RUNNER_TEMP}/wamr-controller-dependency-restore/zig-pkg" \
               -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=ReleaseSafe \
               -Dcontroller-runtime="${controller_root}" -j2 install-controller
           rm -rf support/build/wamr-native-ci/.zig-cache support/build/wamr-native-ci/zig-pkg
@@ -928,6 +923,12 @@ jobs:
         run: |
           bash .github/scripts/hyperv-native-llvm-acquire.sh /d/wamr-ci/wamr-native-runtime/llvm
 
+      - name: Restore verified controller packages before offline installation
+        timeout-minutes: 10
+        run: |
+          bash .github/scripts/hyperv-native-zig-restore.sh \
+            "${RUNNER_TEMP}/wamr-native-fault-dependency-restore"
+
       - name: Install the portable controller and complete private runtime inputs
         timeout-minutes: 15
         run: |
@@ -961,6 +962,7 @@ jobs:
           mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-native-fault-controller-cache"
           ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-native-fault-controller-cache" \
             zig build --build-file "${GITHUB_WORKSPACE}/support/build/wamr-native-ci/build.zig" \
+              --system "${RUNNER_TEMP}/wamr-native-fault-dependency-restore/zig-pkg" \
               -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=ReleaseSafe \
               -Dcontroller-runtime="${root}" -j2 install-controller
           rm -rf support/build/wamr-native-ci/.zig-cache support/build/wamr-native-ci/zig-pkg

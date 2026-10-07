@@ -1643,6 +1643,18 @@ The destination-collision fixture covers the host `mv` and both GNU
 case, acquisition must refuse explicitly, preserve the occupied destination
 and retain verified staging; it does not require a version-specific exit code.
 
+Controller dependency restoration uses `hyperv-native-zig-restore.sh` before
+installation, never a retried build. It copies the unchanged pinned local-boot
+dependency graph outside the source tree and runs Zig's hash-verifying
+`--fetch=all` in up to three isolated stages/caches, each bounded to 180 seconds
+with five-second kill grace and 5/10-second backoff. Only exit 1 with exclusively
+`HttpConnectionClosing` transport errors permits another attempt; mixed,
+hash/extraction, timeout and exhausted failures retain their original nonzero
+status and evidence. Only a successful verified package directory is published.
+Both portable controller installations then use `--system` with those packages,
+so compilation cannot silently fetch dependencies or replay an installation.
+The primary's existing fixture restore is reused instead of fetched again.
+
 LLVM acquisition and synthetic cold-setup/refusal fixtures precede the long
 controller fixtures. The four required native fault jobs independently build
 their own inputs and now run alongside the producer, without changing their
