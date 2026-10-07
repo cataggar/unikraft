@@ -6,7 +6,9 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import resource
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -75,6 +77,10 @@ def stage_git(git, target):
     target.write_bytes(image)
 
 
+def stage_python(python, target):
+    copy_file(Path(python).resolve(strict=True), Path(target), True)
+
+
 def identity(record):
     dev, ino, mode, uid, unused_gid, unused_links, size, mtime, ctime = record["metadata"]
     return {
@@ -103,7 +109,7 @@ def pin(path):
 def prepare(args):
     source, stage, work, revision, git, python, zig, fixture, miz, package_cli, log_cli, aot_cli = args
     source, stage, work, miz = map(Path, (source, stage, work, miz))
-    repository, runtime = work / "producer", work / "runtime"
+    repository, runtime = work / "producer", work / ".d/wamr-native-runtime"
     v2 = revision == "e98623f780fa23d05b5797004e4b88160404eb1b"
     package = source / "support/build/wamr-native-ci"
     ci = load("local_ci", package / "run.py")
@@ -136,7 +142,8 @@ def prepare(args):
                  "firmware", "bin/share", "bison", "llvm", "zig",
                  "host-tools", "evidence"):
         (runtime / part).mkdir(mode=0o700, parents=True, exist_ok=True)
-    for part in ("original", "compiler-cache", "global", "supervisor-install", "image-records"):
+    for part in ("original", "compiler-cache", "global", "supervisor-install",
+                 "image-records", "private-products"):
         (work / part).mkdir(mode=0o700)
     (work / "mutated-runtime-role").write_bytes(b"")
     (work / "redirected-runtime").write_bytes(b"")
@@ -183,7 +190,8 @@ def prepare(args):
         if name == "git":
             path = local_git
         elif name == "python3":
-            path = Path(python).resolve(strict=True)
+            path = runtime / "host-tools/python3"
+            stage_python(python, path)
         elif name == "zig":
             path = runtime / "zig/zig"
             copy_file(zig, path, True)
@@ -451,8 +459,7 @@ def chain(ci, evidence, compute, source, package, boots, images):
                       ("unikraft.raw", "unikraft.qcow2", "unikraft-derived.vhd"))
     efi = package["image"]["efi"]
     def output(path):
-        return {"sha256": digest(path), "file_bytes": path.stat().st_size,
-                "virtual_bytes": raw.stat().st_size}
+        return ci.image_artifact(path, raw.stat().st_size)
     def emit(name, schema, **fields):
         save(evidence / name, {"schema": schema, "schema_version": 1, **fields})
     def ref(name):
@@ -475,14 +482,135 @@ def chain(ci, evidence, compute, source, package, boots, images):
              "fixed-vhd-derivation-intent.json", "fixed-vhd-derivation-gate.json", "fixed-vhd-derivation.json"]
     emit("final-inspection.json", "uk.wamr.compute-image-chain-inspection",
          profile="qcow2-derived-vhd", status="complete", source=source,
-         artifacts={"efi": {"sha256": efi["sha256"], "file_bytes": efi["size"]},
+         artifacts={"efi": ci.image_artifact(ci.APP / "build" / ci.EFI, efi["size"]),
                     "raw": output(raw), "qcow2": output(qcow), "vhd": output(vhd)},
          records={name: ref(name) for name in names}, modes=list(ci.SIX_MODES), boots=boots)
 
 
+def private_cli(source, work, controller, validator):
+    """Exercise real product processes and the retained Python export oracle."""
+    source, work = map(Path, (source, work))
+    repository, runtime = work / "producer", work / ".d/wamr-native-runtime"
+    os.chdir(repository)
+    os.environ.update(WAMR_CI_CONTROLLER=controller,
+                      GITHUB_REPOSITORY="cataggar/unikraft",
+                      GITHUB_RUN_ID="1", GITHUB_RUN_ATTEMPT="1")
+    handoff = load("private_cli_oracle", source / "support/build/wamr-native-ci/handoff.py")
+    handoff.ci.REPO = repository
+    handoff.ci.APP = repository / "support/apps/wamr-aot"
+    handoff.ci.LOCAL_BOOT = repository / "support/tools/hyperv/local_boot"
+    handoff.accepted_records.HERE = repository / "support/build/wamr-native-ci"
+    products = work / "private-products"
+    native, oracle = products / "native-export", products / "python-export"
+    export_argv = [controller, "private-export", "--runtime", str(runtime),
+                   "--output", str(native)]
+    result = subprocess.run(export_argv, capture_output=True, timeout=900)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == b"Private handoff exported; authority=not_admitted.\n"
+    assert not result.stderr
+    for path in (native, *native.rglob("*")):
+        info = path.lstat()
+        assert info.st_uid == os.geteuid()
+        if stat.S_ISDIR(info.st_mode):
+            assert stat.S_IMODE(info.st_mode) == 0o700, path
+        else:
+            assert stat.S_ISREG(info.st_mode) and info.st_nlink == 1, path
+            assert stat.S_IMODE(info.st_mode) == 0o600, path
+    handoff.export(runtime, oracle)
+    actual, expected = (json.loads((path / "bundle.json").read_bytes())
+                        for path in (native, oracle))
+    for key in ("artifacts", "evidence"):
+        for entry in expected[key]:
+            entry["path"] = str(native / Path(entry["path"]).relative_to(oracle))
+    for boot in expected["boots"]:
+        for key in ("serial", "request", "report", "compute"):
+            entry = boot[key]
+            entry["path"] = str(native / Path(entry["path"]).relative_to(oracle))
+    assert encoded(actual) == encoded(expected), "native/Python private manifest parity"
+    for entry in actual["artifacts"] + actual["evidence"]:
+        path = Path(entry["path"]).relative_to(native)
+        assert (native / path).read_bytes() == (oracle / path).read_bytes(), path
+    for boot in actual["boots"]:
+        for key in ("serial", "request", "report", "compute"):
+            path = Path(boot[key]["path"]).relative_to(native)
+            assert (native / path).read_bytes() == (oracle / path).read_bytes(), path
+    before = (native / "bundle.json").read_bytes()
+    replay = subprocess.run(export_argv, capture_output=True, timeout=900)
+    assert replay.returncode == 1 and not replay.stdout, replay
+    assert (native / "bundle.json").read_bytes() == before
+    start = json.loads((runtime / "compute/evidence/build-start.json").read_bytes())
+    git = start["consumer_inputs"]["files"]["tool:git"]["path"]
+
+    def validate(bundle, output, **kwargs):
+        return subprocess.run(
+            [controller, "private-validate", "--stage-root", str(bundle),
+             "--git", git, "--supervisor", controller, "--validator", validator,
+             "--output", str(output)], cwd=source,
+            capture_output=True, timeout=900, **kwargs)
+
+    output = products / "native-validation"
+    checked = validate(native, output)
+    if checked.returncode != 0:
+        log = output / "private/import-native-revalidation.log"
+        if log.is_file():
+            print("private validator diagnostic:",
+                  log.read_bytes()[:4096].decode(errors="replace"),
+                  file=sys.stderr)
+    assert checked.returncode == 0, checked.stderr
+    assert checked.stdout == b"Compute handoff revalidated; authority=not_admitted.\n"
+    assert not checked.stderr
+    command = output / "evidence/command-import-native-revalidation.json"
+    saved = command.read_bytes()
+    replay = validate(native, output)
+    assert replay.returncode == 1 and not replay.stdout
+    assert command.read_bytes() == saved
+    assert not (native / "portable-bundle.json").exists()
+    assert not (native / "public-source.json").exists()
+
+    # Rehash the serial member's private manifest entry, not a public envelope.
+    serial = Path(actual["boots"][0]["serial"]["path"])
+    original = serial.read_bytes()
+    serial.write_bytes(original + b"tampered\n")
+    actual["boots"][0]["serial"].update(size=serial.stat().st_size,
+                                      sha256=digest(serial))
+    save(native / "bundle.json", actual)
+    refused_output = products / "rehashed-refusal"
+    refused = validate(native, refused_output)
+    assert refused.returncode == 1 and not refused.stdout, refused
+    assert not refused_output.exists()
+    serial.write_bytes(original)
+    (native / "bundle.json").write_bytes(before)
+
+    def io_fault():
+        resource.setrlimit(resource.RLIMIT_FSIZE, (1, 1))
+
+    partial = products / "validation-io-fault"
+    failed = validate(native, partial, preexec_fn=io_fault)
+    assert failed.returncode != 0 and not failed.stdout, failed
+    assert partial.is_dir(), failed.stderr
+    assert (partial / "private").is_dir()
+    retry = validate(native, partial)
+    assert retry.returncode == 1 and not retry.stdout, retry
+    export_partial = products / "export-io-fault"
+    failed = subprocess.run(
+        [controller, "private-export", "--runtime", str(runtime),
+         "--output", str(export_partial)],
+        capture_output=True, timeout=900, preexec_fn=io_fault)
+    assert failed.returncode != 0 and not failed.stdout, failed
+    assert export_partial.is_dir(), failed.stderr
+    assert not (export_partial / "bundle.json").exists()
+    retry = subprocess.run(
+        [controller, "private-export", "--runtime", str(runtime),
+         "--output", str(export_partial)], capture_output=True, timeout=900)
+    assert retry.returncode == 1 and not retry.stdout
+    assert not (export_partial / "bundle.json").exists()
+    print("private product CLI: 83-member Python parity, v2 validation, rehashed "
+          "tamper, replay and real file-size I/O faults passed", file=sys.stderr)
+
+
 def mutate(work, case):
     work = Path(work)
-    repository, runtime = work / "producer", work / "runtime"
+    repository, runtime = work / "producer", work / ".d/wamr-native-runtime"
     evidence = runtime / "compute/evidence"
     for original in (work / "original").glob("*.json"):
         copy_file(original, evidence / original.name)
@@ -643,7 +771,11 @@ if __name__ == "__main__":
         prepare(sys.argv[2:])
     elif sys.argv[1] == "stage-git":
         stage_git(*sys.argv[2:])
+    elif sys.argv[1] == "stage-python":
+        stage_python(*sys.argv[2:])
     elif sys.argv[1] == "mutate":
         mutate(*sys.argv[2:])
+    elif sys.argv[1] == "private-cli":
+        private_cli(*sys.argv[2:])
     else:
         raise AssertionError(sys.argv[1])

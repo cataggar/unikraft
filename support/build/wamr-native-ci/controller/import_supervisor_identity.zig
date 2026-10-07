@@ -112,6 +112,9 @@ pub fn validateSourceNames(records_map: std.json.Value) !void {
     } else if (records_map.object.count() == source.closure.len) {
         for (source.closure) |entry|
             _ = try get(records_map, entry.name);
+    } else if (records_map.object.count() == source.previous_private_closure.len) {
+        for (source.previous_private_closure) |entry|
+            _ = try get(records_map, entry.name);
     } else if (records_map.object.count() == source.previous_native_closure.len) {
         for (source.previous_native_closure) |entry|
             _ = try get(records_map, entry.name);

@@ -4,6 +4,97 @@ const controller = @import("wamr_controller");
 const core = @import("hyperv_core");
 const options = @import("test_options");
 
+test "complete local fixture workers drain before I/O failure cleanup" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try @import("local_acceptance_tests.zig").workerFailure(arena.allocator(), std.testing.io);
+}
+
+test "complete local fixture workers backfill either occupied lane" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try @import("local_acceptance_tests.zig").workerBackfill(arena.allocator(), std.testing.io);
+}
+
+test "private product CLI closes arguments and refuses unavailable custody without output" {
+    const cli = controller.cli;
+    const valid = [_][]const u8{
+        "uk-wamr-native-ci", "private-validate",   "--stage-root", "/private/bundle",
+        "--git",             "/private/git",       "--supervisor", "/private/controller",
+        "--validator",       "/private/validator", "--output",     "/private/validation",
+    };
+    _ = try cli.parse(&valid);
+    _ = try cli.parse(&.{ "uk-wamr-native-ci", "private-export", "--runtime", "/private/runtime", "--output", "/private/export" });
+    var missing = valid;
+    missing[8] = "--git";
+    try std.testing.expectError(error.InvalidUsage, cli.parse(&missing));
+    missing = valid;
+    missing[3] = "/private/../bundle";
+    try std.testing.expectError(error.InvalidUsage, cli.parse(&missing));
+    try std.testing.expectError(error.InvalidUsage, cli.parse(valid[0..10]));
+    try std.testing.expectError(error.InvalidUsage, cli.parse(&.{ "uk-wamr-native-ci", "private-export", "--runtime", "/private/runtime", "--output", "/private/export", "--resume", "true" }));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const runtime = try std.fs.path.join(a, &.{ options.fixture_root, "absent-private-product-runtime" });
+    const output = try std.fs.path.join(a, &.{ options.fixture_root, "refused-private-product-output" });
+    const result = try std.process.run(a, std.testing.io, .{
+        .argv = &.{ options.host_controller_cli, "private-export", "--runtime", runtime, "--output", output },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, result.term);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "private-export/runtime_opened") != null);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.openDirAbsolute(std.testing.io, output, .{}));
+}
+
+test "private fixture stages genuine shared Python before native tool custody" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "private-python-{d}", .{std.os.linux.getpid()});
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("private Python fixture cleanup failed");
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    const original = try std.Io.Dir.realPathFileAbsoluteAlloc(io, options.python_executable, a);
+    try copyFixtureExecutable(io, a, original, root, "shared-python");
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(
+        std.os.linux.linkat(root.handle, "shared-python", root.handle, "python-alias", 0),
+    ));
+    const shared = try std.fs.path.join(a, &.{ path, "shared-python" });
+    try std.testing.expectError(error.UnsafeFile, controller.command_adapter.openPinnedTool(io, shared, "tool:python3"));
+    const staged = try std.fs.path.join(a, &.{ path, "bin/python3" });
+    try @import("local_acceptance_tests.zig").stagePython(a, io, shared, staged);
+    var pinned = try controller.command_adapter.openPinnedTool(io, staged, "tool:python3");
+    defer pinned.close(io);
+    const before = try controller.custody_files.readFile(io, original, 64 * 1024 * 1024, false);
+    const after = try controller.custody_files.readFile(io, staged, 64 * 1024 * 1024, false);
+    try std.testing.expectEqualStrings(&before.sha256, &after.sha256);
+    const query = "import sysconfig; print(sysconfig.get_path('stdlib'))";
+    const expected = try std.process.run(a, io, .{
+        .argv = &.{ original, "-c", query },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    const actual = try std.process.run(a, io, .{
+        .argv = &.{ staged, "-c", query },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, expected.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, actual.term);
+    try std.testing.expectEqualStrings("", actual.stderr);
+    try std.testing.expectEqualStrings(expected.stdout, actual.stdout);
+    try pinned.verify(io);
+}
+
 test "build command table has closed roles, order, deadlines and native executables" {
     const plan = controller.command_plan;
     const expected = [_]struct { stage: plan.Stage, seconds: u32, executable: []const u8 }{
@@ -3418,6 +3509,61 @@ test "trusted historical inner stage accepts complete records and refuses tamper
     const private_bytes = try fixtureCanonical(a, private_value);
     try writeFixtureFile(io, root, "bundle.json", private_bytes);
     try writeFixtureFile(io, root, "evidence/private-inspection-diagnostic.json", "{}\n");
+    {
+        // A private consumer must not need or adopt public envelopes.
+        try root.rename("portable-bundle.json", root, "saved-portable-envelope", io);
+        try root.rename("public-source.json", root, "saved-public-envelope", io);
+        defer {
+            root.rename("saved-portable-envelope", root, "portable-bundle.json", io) catch @panic("portable envelope restore failed");
+            root.rename("saved-public-envelope", root, "public-source.json", io) catch @panic("public envelope restore failed");
+        }
+        const cli_run_name = try std.fmt.allocPrint(a, "{s}-private-cli", .{name});
+        const cli_output = try std.fs.path.join(a, &.{ options.fixture_root, cli_run_name });
+        defer parent.deleteTree(io, cli_run_name) catch @panic("private CLI cleanup failed");
+        const argv = &[_][]const u8{
+            options.host_controller_cli, "private-validate",       "--stage-root", stage_root_path,
+            "--git",                     reader_git,               "--supervisor", options.host_controller_cli,
+            "--validator",               options.import_validator, "--output",     cli_output,
+        };
+        const private_cli_result = try std.process.run(a, io, .{
+            .argv = argv,
+            .cwd = .{ .path = reader_repository },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        if (private_cli_result.term != .exited or private_cli_result.term.exited != 0)
+            std.debug.print("private v1 CLI: {s}\n", .{private_cli_result.stderr});
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, private_cli_result.term);
+        try std.testing.expectEqualStrings("Compute handoff revalidated; authority=not_admitted.\n", private_cli_result.stdout);
+        try std.testing.expectEqualStrings("", private_cli_result.stderr);
+        const replay = try std.process.run(a, io, .{
+            .argv = argv,
+            .cwd = .{ .path = reader_repository },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, replay.term);
+        try std.testing.expectEqualStrings("", replay.stdout);
+        try std.testing.expect(std.mem.indexOf(u8, replay.stderr, "PathAlreadyExists") != null);
+        for ([_]struct { index: usize, cause: []const u8 }{
+            .{ .index = 7, .cause = "ImportSupervisorChanged" },
+            .{ .index = 9, .cause = "InvalidValidator" },
+        }) |bad_tool| {
+            var refused_argv = argv.*;
+            refused_argv[bad_tool.index] = options.command_fixture;
+            refused_argv[11] = try std.fs.path.join(a, &.{ options.fixture_root, "refused-private-cli-tool" });
+            const refused_tool = try std.process.run(a, io, .{
+                .argv = &refused_argv,
+                .cwd = .{ .path = reader_repository },
+                .stdout_limit = .limited(4096),
+                .stderr_limit = .limited(4096),
+            });
+            try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, refused_tool.term);
+            try std.testing.expectEqualStrings("", refused_tool.stdout);
+            try std.testing.expect(std.mem.indexOf(u8, refused_tool.stderr, bad_tool.cause) != null);
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.openDirAbsolute(io, refused_argv[11], .{}));
+        }
+    }
     {
         var private_bundle = try controller.accepted_run.PrivateBundle.open(a, io, &directory, stage_root_path, reader_repository, local_tools, null);
         defer private_bundle.deinit();

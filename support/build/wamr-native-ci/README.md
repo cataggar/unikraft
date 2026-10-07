@@ -182,6 +182,30 @@ fixture identities and all constructor/recheck/CLI refusals remain intact.
 Debug fixtures retain the compiler's default backend, as do the production
 portable controller, supervisor and other native targets. The compile-only
 prerequisite target prepares these exact artifacts before fixture execution.
+The four complete-local historical vectors use at most two process-isolated
+fixture workers inside that same controller gate. Every revision directory is
+preallocated before custody capture; workers own separate checkouts, runtimes, compiler
+caches and arenas, and are joined even when one fails. All four preparations
+finish before the process-wide cancellation cases execute serially on their
+clean inputs. Constructor, recheck, CLI, private-product parity and every
+refusal then run unchanged within each owned revision. No digest is reused
+across live revalidation, and no case moves into the compile-only prerequisite.
+The two worker lanes claim the next prepared revision as soon as either lane
+finishes instead of waiting for a fixed pair. A failed operation stops queued
+work, but both already assigned workers finish before failure or cleanup.
+Physical descendant parity cases privately stage the genuine native
+`runtime_fixture.zig` executable compiled by the existing prerequisite graph,
+rather than recompiling it with three empty per-case SDK caches. Every case
+still owns a separate single-link executable and runs its real descendants,
+deadlines, cancellation, output-overflow and cleanup checks in the fixture
+gate; preparation only compiles the helper.
+Four-CPU measurements attributed the serial cost to repeated genuine custody
+hashing, not validators; CPU-target trials did not improve that cost. Backend,
+ISA, production defaults, inventories and the 900-second gate remain unchanged.
+The fixture-only `wamr-ci-local-acceptance-worker` executes the existing helper
+and typed owners directly, not a substituted controller or acceptance record.
+Its real process boundary preserves the native owner's `SupervisorBusy` guard;
+concurrent typed acceptance inside one process remains forbidden.
 The test graph preallocates the native and Python contract scratch parents
 before any fixture runs, and completes source-limit fixtures before controller
 custody capture. Contract goldens may still run in parallel within their
@@ -192,6 +216,11 @@ interpreter, relocating only `PT_INTERP` while preserving Git's loaded code and
 bundled-library search paths. This gives both system and bundled Git an actual
 owned runtime dependency for physical mutation tests without changing system
 libraries, weakening tool-file policy, or dropping any refusal case.
+Complete local fixtures also stage a byte-identical private copy of genuine
+Python before capturing tool, ELF-runtime and standard-library custody. System
+Python may have multiple hard links, which retained native post-run tools forbid.
+The regression keeps that refusal and verifies the staged executable's bytes,
+execution and unchanged standard-library path; it never changes system files.
 The relocated-tool and Python-free current-reader fixtures use the same private
 Git setup. Placeholder roles use the existing compiled native command fixture
 rather than assuming `/usr/bin/true` is ELF (some distributions install it as a
@@ -379,8 +408,9 @@ objects independently of the current reader checkout. The owner retains those
 claims and repeats their Git proof at every recheck. Inspection diagnostics outside the selected
 evidence list are not acceptance evidence. Private views cannot serialize as
 trusted-inner-ZIP records; `import_validator_build.runPrivate` accepts the
-authenticated owner and supervises its real manifest. This is a library
-foundation only, not a private export command or a v1 production entry point.
+authenticated owner and supervises its real manifest. The bounded private
+product commands below consume these owners; they do not enable v1 production,
+public archive construction, import/transport, candidate products or authority.
 Temporary Git source-proof output buffers are freed on success and refusal;
 the owner retains its source claims rather than copies of the historical blobs.
 
@@ -1087,6 +1117,76 @@ controller's six-mode order, records, custody, supervision, reap and poison
 semantics; no Python controller reference decides those outcomes.
 
 ### Private export custody
+
+The installed `uk-wamr-native-ci` provides two local-only product commands:
+
+```sh
+# Run export in the original accepted producer checkout before discarding it.
+uk-wamr-native-ci private-export --runtime "$RUNTIME" --output "$FRESH_HANDOFF"
+# Run validation in a clean checkout matching this reader's embedded closure.
+uk-wamr-native-ci private-validate --stage-root "$FRESH_HANDOFF" \
+  --git "$GIT" --supervisor "$NATIVE_CONTROLLER" \
+  --validator "$DIRECT_VALIDATOR" --output "$FRESH_VALIDATION"
+```
+
+All paths are absolute, canonical and owner-private where required. Output
+parents must already exist; both output directories are fresh, create-only and
+non-resumable. Export reads the accepted local owner (native or read-only Python
+producer), dispatches the frozen v1/v2 member tables and runs the original
+retained package inspection before copying. Historical export without recorded
+supervisor custody still refuses; a current reader never manufactures it.
+V2 export requires the existing `GITHUB_REPOSITORY=cataggar/unikraft`,
+`GITHUB_RUN_ID` and `GITHUB_RUN_ATTEMPT` identity inputs. V1 has no run/profile/
+lineage fields and does not become a production profile.
+
+Validation opens genuine root-bound `bundle.json` through `PrivateBundle`,
+not `openImportedStage`, a public envelope, a raw validator bypass or Python.
+The caller-supplied supervisor must match the running reader; the validator
+must match the native build-derived direct-validator digest. Git, producer
+revision/tree/source-map availability, reader source, retained executables and
+ELF runtime loaders are authenticated and rechecked around the existing
+bounded direct-validator adapter. That adapter preserves its fixed empty
+environment, process limits, cancellation, descendant cleanup and poison
+handling. The supplied supervisor is not an arbitrary runner.
+
+Only complete success emits one stdout line:
+`Private handoff exported; authority=not_admitted.` or
+`Compute handoff revalidated; authority=not_admitted.` Refusal exits 1 with no
+success stdout; invalid CLI usage exits 2. Export stderr includes the failed
+phase and publication status, never evidence contents. Validation retains its
+private logs/requests and `evidence/command-import-native-revalidation.json`.
+Directory sync barriers and a retained private lock anchor bind its create-only
+output. Catchable failures after reservation retain a best-effort
+`private/failed-private-validation.json`; I/O failures or external termination
+can prevent diagnostics, but existing partial state is never removed or adopted.
+Neither a command record nor file existence substitutes for successful outer
+source/custody rechecks and the command exit status.
+
+These commands do **not** cut over the workflow or local production publisher.
+`handoff.py` and `public_bundle.py`, all live witnesses and shared removal gates
+remain unchanged. The executable imports the handoff owner above the controller
+library; the controller does not acquire an export dependency. Its expanded
+source-name closure retains the complete prior private-consumer name set for
+historical source-map authentication.
+
+Focused CLI coverage is included in the existing controller fixtures:
+
+```sh
+zig build test-controller-direct -Doptimize=ReleaseSafe \
+  -Dtest-filter='private product CLI' \
+  -Dtest-filter='trusted historical inner stage' --summary all
+zig build test-handoff-contracts --summary all
+```
+
+Use the same private cache roots, genuine dynamic Git and complete pinned
+`--system` dependency forest as the controller qualification described above.
+The complete-local fixture exercises actual native CLI export, all 83 v2
+members against the live Python export oracle, genuine private v1/v2 validator
+processes, public-envelope absence, fully rehashed serial tampering, reuse
+refusal and real file-size-limit write failures retaining non-resumable output.
+It uses real historical Git objects and native image/package tools, but its
+command/guest records are synthetic: it is not new managed-KVM, protected
+archive or production-native-run qualification.
 
 `handoff.export_state.run()` owns the complete attempt and releases its
 descriptors, accepted-run arena and installed cancellation handler on every

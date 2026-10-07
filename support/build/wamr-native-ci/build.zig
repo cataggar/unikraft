@@ -10,6 +10,18 @@ fn handoffContracts(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
     });
 }
 
+fn handoffModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, core: *std.Build.Module, controller: *std.Build.Module) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("handoff/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = core },
+            .{ .name = "wamr_controller", .module = controller },
+        },
+    });
+}
+
 fn wamrAotBuild(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Dependency {
     return b.dependency("wamr_aot_build", .{ .target = target, .optimize = optimize });
 }
@@ -138,7 +150,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("controller/portable_main.zig"),
             .target = portable_target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "wamr_controller", .module = controller_module }},
+            .imports = &.{
+                .{ .name = "wamr_controller", .module = controller_module },
+                .{ .name = "wamr_handoff", .module = handoffModule(b, portable_target, optimize, portable_core, controller_module) },
+            },
         }),
     });
     b.installArtifact(controller_cli);
@@ -241,7 +256,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("controller/main.zig"),
             .target = b.graph.host,
             .optimize = optimize,
-            .imports = &.{.{ .name = "wamr_controller", .module = host_controller }},
+            .imports = &.{
+                .{ .name = "wamr_controller", .module = host_controller },
+                .{ .name = "wamr_handoff", .module = handoffModule(b, b.graph.host, optimize, host_core, host_controller) },
+            },
         }),
     });
     // Producer import requires an installable ReleaseSafe supervisor.
@@ -291,7 +309,10 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("controller/main.zig"),
                 .target = b.graph.host,
                 .optimize = .ReleaseSafe,
-                .imports = &.{.{ .name = "wamr_controller", .module = import_controller }},
+                .imports = &.{
+                    .{ .name = "wamr_controller", .module = import_controller },
+                    .{ .name = "wamr_handoff", .module = handoffModule(b, b.graph.host, .ReleaseSafe, import_core, import_controller) },
+                },
             }),
         });
     };
@@ -363,6 +384,41 @@ pub fn build(b: *std.Build) void {
         }),
     });
     controller_options.addOptionPath("command_fixture", command_fixture.getEmittedBin());
+    const descendant_core = b.createModule(.{
+        .root_source_file = b.path("../../tools/hyperv/core.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    if (b.graph.host.result.cpu.arch == .x86_64)
+        descendant_core.addAssemblyFile(b.path("../../tools/hyperv/sha256_clear_upper.S"));
+    const descendant_fixture = b.addExecutable(.{
+        .name = "wamr-ci-controller-descendant-fixture",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("../../tools/hyperv/direct/runtime_fixture.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+            .imports = &.{.{ .name = "hyperv_core", .module = descendant_core }},
+        }),
+    });
+    controller_options.addOptionPath("descendant_fixture", descendant_fixture.getEmittedBin());
+    const local_worker = b.addExecutable(.{
+        .name = "wamr-ci-local-acceptance-worker",
+        .use_llvm = if (optimize == .ReleaseSafe) true else null,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("controller/local_acceptance_worker.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .strip = true,
+            .imports = &.{
+                .{ .name = "wamr_controller", .module = host_controller },
+                .{ .name = "hyperv_core", .module = host_core },
+            },
+        }),
+    });
+    local_worker.root_module.addOptions("test_options", controller_options);
+    const local_worker_options = b.addOptions();
+    local_worker_options.addOptionPath("executable", local_worker.getEmittedBin());
+    controller_tests.root_module.addOptions("local_worker_options", local_worker_options);
     const controller_run = b.addRunArtifact(controller_tests);
     const controller_direct = b.addSystemCommand(&.{"/usr/bin/env"});
     controller_direct.addFileArg(controller_tests.getEmittedBin());

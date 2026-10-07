@@ -298,7 +298,7 @@ const Attempt = struct {
         if (self.invocation.faults.phase == phase) return error.AmbiguousWrite;
         switch (phase) {
             .accepted_run_pinned => {
-                self.accepted = try accepted_run.openAndValidateWithSignal(self.a(), self.invocation.io, self.invocation.environ, &self.runtime.?, self.invocation.runtime_path, self.invocation.repository_path, self.invocation.signal);
+                self.accepted = try accepted_run.openAndValidateReadOnlyWithSignal(self.a(), self.invocation.io, self.invocation.environ, &self.runtime.?, self.invocation.runtime_path, self.invocation.repository_path, self.invocation.signal);
                 try self.pinSources();
             },
             .output_reserved => try self.reserve(),
@@ -323,16 +323,18 @@ const Attempt = struct {
 
     fn pinSources(self: *Attempt) !void {
         const accepted = &self.accepted.?;
-        if (accepted.compatibility != .tiny_v2_qcow2_derived_vhd or accepted.context != .local_runtime)
-            return error.UnsupportedVersion;
-        if (accepted.records.len != layout.evidence_v2.len) return error.InvalidMemberCount;
-        self.artifacts = try self.a().alloc(Member, layout.artifact_names_v2.len);
-        self.boots = try self.a().alloc(Boot, profile.production_modes.len);
-        self.evidence = try self.a().alloc(Member, layout.evidence_v2.len);
-        for (layout.artifact_names_v2, 0..) |name, i| {
+        if (accepted.context != .local_runtime) return error.InvalidContext;
+        const selected = self.compatibility();
+        const artifact_names = layout.artifactNames(selected);
+        const evidence_names = layout.evidenceNames(selected);
+        if (accepted.records.len != evidence_names.len) return error.InvalidMemberCount;
+        self.artifacts = try self.a().alloc(Member, artifact_names.len);
+        self.boots = try self.a().alloc(Boot, profile.modes(selected).len);
+        self.evidence = try self.a().alloc(Member, evidence_names.len);
+        for (artifact_names, 0..) |name, i| {
             const role = if (std.mem.eql(u8, name, "build")) accepted_run.ArtifactRole.build_record else std.meta.stringToEnum(accepted_run.ArtifactRole, name) orelse return error.UnknownArtifactRole;
             const relative = try std.fmt.allocPrint(self.a(), "artifacts/{s}", .{name});
-            const retained = if (role == .cleanup)
+            const retained = if (role == .cleanup and accepted.local_producer == .native)
                 try accepted.pinExportCleanup()
             else
                 try accepted.pinArtifact(role);
@@ -346,7 +348,7 @@ const Attempt = struct {
                 try self.addSource(retained, .boots_copied, relative, &@field(self.boots[i], part), if (std.mem.eql(u8, part, "serial")) layout.max_serial_bytes else layout.max_json_bytes);
             }
         }
-        for (layout.evidence_v2, 0..) |name, i| {
+        for (evidence_names, 0..) |name, i| {
             const relative = try std.fmt.allocPrint(self.a(), "evidence/{s}", .{name});
             const retained = try accepted.pinRecord(name);
             try self.addSource(retained, .evidence_copied, relative, &self.evidence[i], layout.max_json_bytes);
@@ -371,6 +373,10 @@ const Attempt = struct {
             if (source.held.retained.file_snapshot.size != accepted.result.bytes or
                 !std.mem.eql(u8, &source.held.sha256, &accepted.result.sha256)) return error.ResultChanged;
         }
+    }
+
+    fn compatibility(self: *Attempt) profile.Compatibility {
+        return if (self.accepted.?.compatibility == .tiny_v1_legacy) .frozen_tiny_v1 else .tiny_qcow2_derived_vhd_v2;
     }
 
     fn addSource(self: *Attempt, retained_: files.RetainedFile, phase: Phase, relative: []const u8, member: *Member, limit: u64) !void {
@@ -404,7 +410,7 @@ const Attempt = struct {
             try output.dir.createDir(self.invocation.io, "private", .fromMode(0o700));
             try output.dir.createDir(self.invocation.io, "evidence", .fromMode(0o700));
         } else {
-            self.inspection = try controller.handoff_inspect.runRetained(self.a(), self.invocation.io, &self.accepted.?, self.invocation.output_path, false, self.invocation.signal);
+            self.inspection = try controller.handoff_inspect.runRetained(self.a(), self.invocation.io, &self.accepted.?, self.invocation.output_path, self.compatibility() == .frozen_tiny_v1, self.invocation.signal);
             self.inspection_sha256 = try copy.hashRetained(self.invocation.io, &self.inspection.?.record, layout.max_json_bytes, self.cancel());
         }
         self.output = try files.Directory.open(self.invocation.io, self.invocation.output_path);
@@ -437,7 +443,7 @@ const Attempt = struct {
 
     fn sealDirectories(self: *Attempt) !void {
         for ([_][]const u8{ "artifacts", "boots", "evidence" }) |relative| try self.sealDirectory(relative);
-        for (profile.production_modes) |mode|
+        for (profile.modes(self.compatibility())) |mode|
             try self.sealDirectory(try std.fmt.allocPrint(self.a(), "boots/{s}", .{@tagName(mode)}));
         self.sealed_root = try copy.directorySnapshot(self.output.?.dir);
     }
@@ -476,8 +482,8 @@ const Attempt = struct {
         if (!std.mem.eql(u8, &digest, &held.sha256)) return error.CopyChanged;
     }
     fn verifyOutput(self: *Attempt) !void {
-        if (self.destinations.items.len != layout.selectedMemberCount(.tiny_qcow2_derived_vhd_v2) or
-            self.sealed.items.len != 3 + profile.production_modes.len) return error.MissingMembers;
+        if (self.destinations.items.len != layout.selectedMemberCount(self.compatibility()) or
+            self.sealed.items.len != 3 + self.boots.len) return error.MissingMembers;
         try copy.verifyRoot(self.invocation.io, self.invocation.output_path, self.output_snapshot);
         try copy.verifyRetained(self.invocation.io, &self.anchor.?);
         try copy.verifyRetained(self.invocation.io, &self.private_anchor.?);
@@ -525,7 +531,7 @@ const Attempt = struct {
                 if (!known) return error.UnexpectedMember;
                 found += 1;
             }
-            const expected: usize = if (std.mem.eql(u8, relative, "artifacts")) layout.artifact_names_v2.len else if (std.mem.eql(u8, relative, "evidence")) layout.evidence_v2.len + @as(usize, @intFromBool(!self.fixture)) else if (std.mem.eql(u8, relative, "boots")) profile.production_modes.len else layout.boot_keys.len;
+            const expected: usize = if (std.mem.eql(u8, relative, "artifacts")) self.artifacts.len else if (std.mem.eql(u8, relative, "evidence")) self.evidence.len + @as(usize, @intFromBool(!self.fixture)) else if (std.mem.eql(u8, relative, "boots")) self.boots.len else layout.boot_keys.len;
             if (found != expected) return error.MissingMembers;
         }
     }
@@ -533,8 +539,12 @@ const Attempt = struct {
     fn stage(self: *Attempt) !void {
         try self.verifySources();
         try self.verifyOutput();
-        const run_info = try runIdentity(self.invocation.environ);
-        self.bundle = try buildBundleBytes(self.a(), self.accepted.?.source.revision, self.accepted.?.source.tree, run_info.run_id, run_info.run_attempt, self.artifacts, self.boots, self.evidence);
+        self.bundle = if (self.compatibility() == .frozen_tiny_v1)
+            try buildLegacyBundleBytes(self.a(), self.accepted.?.source.revision, self.accepted.?.source.tree, self.artifacts, self.boots, self.evidence)
+        else blk: {
+            const run_info = try runIdentity(self.invocation.environ);
+            break :blk try buildBundleBytes(self.a(), self.accepted.?.source.revision, self.accepted.?.source.tree, run_info.run_id, run_info.run_attempt, self.artifacts, self.boots, self.evidence);
+        };
         if (self.bundle.len > layout.max_json_bytes) return error.ManifestTooLarge;
         try requireDurable(try self.private_lock.?.createImmutable(self.invocation.io, "handoff.json", self.bundle));
         var retained = try files.RetainedFile.open(self.invocation.io, try std.fs.path.join(self.a(), &.{ self.invocation.output_path, "private/export/handoff.json" }), .private);
@@ -552,7 +562,7 @@ const Attempt = struct {
         defer bytes.deinit();
         var document = try contracts.parseCanonical(self.a(), bytes.bytes());
         defer document.deinit();
-        if (try contracts.validateLocalImageHandoffWithRoot(document.value(), self.invocation.output_path) != .tiny_qcow2_derived_vhd_v2)
+        if (try contracts.validateLocalImageHandoffWithRoot(document.value(), self.invocation.output_path) != self.compatibility())
             return error.UnsupportedVersion;
         if (!std.mem.eql(u8, bytes.bytes(), self.bundle)) return error.CopyChanged;
     }
@@ -719,10 +729,34 @@ fn buildBundleBytes(a: std.mem.Allocator, revision: []const u8, tree: []const u8
         .evidence = evidence,
     });
 }
+fn buildLegacyBundleBytes(a: std.mem.Allocator, revision: []const u8, tree: []const u8, artifacts: []const Member, boots: []const Boot, evidence: []const Member) ![]const u8 {
+    if (artifacts.len != layout.artifact_names_v1.len or boots.len != profile.legacy_modes.len or evidence.len != layout.evidence_v1.len)
+        return error.InvalidMemberCount;
+    const by_name = ArtifactMap{ .items = artifacts };
+    return canonical(a, .{
+        .schema = "uk.wamr.local-image-handoff",
+        .version = @as(u8, 1),
+        .authority = profile.authority,
+        .source_revision = revision,
+        .source_tree = tree,
+        .identity = .{
+            .wamr_revision = profile.wamr_revision,
+            .wasm_sha256 = try by_name.sha("wasm"),
+            .cwasm_sha256 = try by_name.sha("cwasm"),
+            .runtime_sha256 = try by_name.sha("runtime"),
+            .compiler_sha256 = try by_name.sha("compiler"),
+            .config_sha256 = try by_name.sha("config"),
+        },
+        .artifacts = artifacts,
+        .boots = boots,
+        .evidence = evidence,
+    });
+}
 const ArtifactMap = struct {
     items: []const Member,
     fn sha(self: ArtifactMap, name: []const u8) ![]const u8 {
-        for (layout.artifact_names_v2, self.items) |candidate, member|
+        const names: []const []const u8 = if (self.items.len == layout.artifact_names_v1.len) &layout.artifact_names_v1 else &layout.artifact_names_v2;
+        for (names, self.items) |candidate, member|
             if (std.mem.eql(u8, candidate, name)) return member.sha256;
         return error.MissingArtifact;
     }
