@@ -94,6 +94,12 @@ class HistoricalControllerFixture(unittest.TestCase):
                                  for item in adapter), count, classification)
         self.assertEqual(sum(count for unused, count
                              in ledger.ADAPTER_CLASSES.values()), len(adapter))
+        successors = ledger.adapter_successors(inventory["scenarios"])
+        self.assertEqual(set(successors), set(adapter))
+        for old, entry in successors.items():
+            self.assertEqual(old, entry["successor"])
+        self.assertEqual(sum(not entry["current_controller_oracle"]
+                             for entry in successors.values()), 10)
         matrix = (package / "controller/local_acceptance_tests.zig").read_text()
         for producer in ledger.HISTORICAL_PRODUCERS:
             self.assertIn('"' + producer + '"', matrix)

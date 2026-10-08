@@ -60,6 +60,23 @@ ADAPTER_CLASSES = {
     "Evidence": ("retained-mixed-custody-supervision-public-owner", 93),
 }
 
+
+def adapter_successors(scenarios):
+    """Expand the frozen inventory into an exact old -> retained/native ledger."""
+    result = {}
+    for scenario in scenarios:
+        if "/tests/test_adapter.py::" not in scenario:
+            continue
+        unused_path, owner, unused_method = scenario.split("::")
+        classification, unused_count = ADAPTER_CLASSES[owner]
+        result[scenario] = {
+            "successor": scenario,
+            "classification": classification,
+            "current_controller_oracle": owner != "NativeAcquisitionFixtures",
+        }
+    return result
+
+
 HISTORICAL_GENERATION = {
     "prepare/current-run.py": "authenticated e986 controller physical scans",
     "prepare/current-test_adapter.py": "authenticated neutral helper AST only",
