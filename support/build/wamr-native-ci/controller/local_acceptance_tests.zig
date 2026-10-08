@@ -266,7 +266,7 @@ const Fixture = struct {
         for (cases) |case| {
             if (case.v2_only and !v2) continue;
             const expected = if (!v2 and std.mem.eql(u8, case.name, "source-custody")) error.EvidenceChanged else case.expected;
-            try python(a, io, &.{ "mutate", work, case.name });
+            try python(a, io, &.{ "mutate", work, case.name, options.git_executable });
             std.debug.print("local refusal {s} {s}: {s}\n", .{ revision, case.name, @errorName(expected) });
             const outcome = open(a, io, &directory, runtime, repository);
             if (outcome) |value| {
