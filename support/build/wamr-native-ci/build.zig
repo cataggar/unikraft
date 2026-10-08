@@ -199,6 +199,25 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     });
+    for ([_]bool{ false, true }) |native_owner| {
+        const supervisor_options = b.addOptions();
+        supervisor_options.addOption(bool, "native_source_owner", native_owner);
+        supervisor_options.addOption([]const u8, "source_closure_sha256", "a" ** 64);
+        const supervisor = b.addExecutable(.{
+            .name = if (native_owner) "wamr-ci-native-supervisor-host-test" else "wamr-ci-historical-supervisor-host-test",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("supervisor.zig"),
+                .target = b.graph.host,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "hyperv_core", .module = host_core },
+                    .{ .name = "build_options", .module = supervisor_options.createModule() },
+                    .{ .name = "supervisor_source_closure", .module = host_closure },
+                },
+            }),
+        });
+        controller_options.addOptionPath(if (native_owner) "native_standalone_supervisor" else "historical_standalone_supervisor", supervisor.getEmittedBin());
+    }
     const host_serial = b.createModule(.{
         .root_source_file = b.path("../../tools/hyperv/local_boot/serial.zig"),
         .target = b.graph.host,

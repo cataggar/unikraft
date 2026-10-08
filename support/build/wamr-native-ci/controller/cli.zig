@@ -4,7 +4,7 @@ const core = @import("hyperv_core");
 const files = core.private_files;
 const contracts = core.contracts;
 
-pub const Action = enum { build, boot, diagnostics, describe, @"--identity", @"supervisor-source-closure", @"reader-source-closure", records, @"readonly-records", @"local-consumer-custody", @"handoff-inspect", @"handoff-inspect-legacy", @"public-validator-build", @"local-handoff-revalidation", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation", @"import-handoff-revalidation", @"private-export", @"private-validate", @"public-export", @"public-archive", @"verify-public-source-bundle", @"stage-public-source-upload", @"import-public-source-bundle", @"import-public-source-download", candidate, @"candidate-inspect", @"candidate-result" };
+pub const Action = enum { build, boot, diagnostics, describe, @"--identity", @"supervisor-source-closure", @"standalone-supervisor-source-closure", @"reader-source-closure", records, @"check-local-records", @"readonly-records", @"local-consumer-custody", @"handoff-inspect", @"handoff-inspect-legacy", @"public-validator-build", @"local-handoff-revalidation", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation", @"import-handoff-revalidation", @"private-export", @"private-validate", @"public-export", @"public-archive", @"verify-public-source-bundle", @"stage-public-source-upload", @"import-public-source-bundle", @"import-public-source-download", candidate, @"candidate-inspect", @"candidate-result" };
 pub const Command = struct {
     action: Action,
     runtime: ?[]const u8 = null,
@@ -212,11 +212,17 @@ fn sourceIdentity(value: []const u8) !void {
 fn parseExisting(args: []const []const u8, action: Action) !Command {
     if (action == .describe) {
         if (args.len != 4 or !std.mem.eql(u8, args[2], "--output") or
-            !std.mem.eql(u8, args[3], "json-v1"))
+            (!std.mem.eql(u8, args[3], "json-v1") and !std.mem.eql(u8, args[3], "target-v1")))
             return error.InvalidUsage;
-        return .{ .action = action };
+        return .{ .action = action, .output = args[3] };
     }
-    if (action == .@"supervisor-source-closure" or action == .@"reader-source-closure") {
+    if (action == .@"check-local-records") {
+        if (args.len != 4 or !std.mem.eql(u8, args[2], "--runtime"))
+            return error.InvalidUsage;
+        files.absoluteFilePath(args[3]) catch return error.InvalidUsage;
+        return .{ .action = action, .runtime = args[3] };
+    }
+    if (action == .@"supervisor-source-closure" or action == .@"reader-source-closure" or action == .@"standalone-supervisor-source-closure") {
         if (args.len != 6) return error.InvalidUsage;
         var result = Command{ .action = action };
         var output = false;
