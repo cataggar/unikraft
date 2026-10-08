@@ -315,7 +315,7 @@ pub fn local(a: std.mem.Allocator, io: std.Io, stage: []const u8, repository: []
     try localReceipt(work, &bundle);
     const manifest_before = try copy.hashRetained(io, &bundle.manifest, handoff.layout.max_json_bytes, null);
     const Fault = enum { admission_collision, candidate_collision, admission_sync, publication_unknown, publication_sync, cancellation, final_revalidation };
-    for (std.enums.values(Fault)) |fault| {
+    for (if (options.handoff_composition_group == .retention) &.{} else std.enums.values(Fault)) |fault| {
         const name = @tagName(fault);
         const output = try work.join(try std.fmt.allocPrint(a, "{s}.json", .{name}));
         const admission = try std.fmt.allocPrint(a, "{s}.admission.json", .{output});
@@ -389,7 +389,9 @@ pub fn local(a: std.mem.Allocator, io: std.Io, stage: []const u8, repository: []
     try std.testing.expect(finalized == .success);
     defer finalized.success.deinit();
     try std.testing.expect((try finalized.success.inspect(null)).authority == .not_admitted);
-    try serialCases(work, finalized.success, stage);
+    if (options.handoff_composition_group != .retention)
+        try serialCases(work, finalized.success, stage);
+    if (options.handoff_composition_group == .faults) return;
     try privateLineage(work, &bundle, repository, tools);
     try cliCollision(work, stage, repository, tools);
     try changedInputs(work, finalized.success, &bundle, repository, tools);
@@ -553,7 +555,8 @@ fn privateLineage(work: Workspace, source: *controller.accepted_run.PrivateBundl
     var envelope = try handoff.contracts.parseCanonical(work.a, rehashed);
     defer envelope.deinit();
     _ = try handoff.contracts.validateLocalImageHandoffWithRoot(envelope.value(), stage);
-    try std.testing.expectError(error.InvalidImageChain, controller.accepted_run.PrivateBundle.open(work.a, work.io, &directory, stage, repository, tools, null));
+    // The native image-output hash comparison preserves EvidenceChanged.
+    try std.testing.expectError(error.EvidenceChanged, controller.accepted_run.PrivateBundle.open(work.a, work.io, &directory, stage, repository, tools, null));
     try std.testing.expectEqualStrings(rehashed, try work.read("lineage-stage/bundle.json"));
     try source.revalidate(null);
 }

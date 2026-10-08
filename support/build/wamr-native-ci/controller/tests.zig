@@ -3603,7 +3603,8 @@ fn trustedHistoricalFixture(comptime composition: bool) !void {
     const private_bytes = try fixtureCanonical(a, private_value);
     try writeFixtureFile(io, root, "bundle.json", private_bytes);
     if (composition) {
-        try @import("handoff_composition_tests").historical(a, io, &accepted, stage_root_path, reader_repository, local_tools);
+        if (options.handoff_composition_group != .retention)
+            try @import("handoff_composition_tests").historical(a, io, &accepted, stage_root_path, reader_repository, local_tools);
         try @import("local_acceptance_tests.zig").composition(a, io, stage_root_path, reader_repository);
         return;
     }
