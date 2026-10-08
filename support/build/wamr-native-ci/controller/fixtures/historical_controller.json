@@ -5663,6 +5663,10 @@
       "blob": "67386d4ab0fc9fb33e675a4232246878f6324c73",
       "sha256": "988abba2607410b1fb3864e6688b7078b46c1f8c4d167327400925030f55b380"
     },
+    "support/tools/hyperv/process-command-v1.json": {
+      "blob": "ad73db8f74d76dfb14a39969b2b0ec8f4bd73419",
+      "sha256": "ee1e038f6538beecac8a09d4d52a6c601a9ca1f503fd70a3753bd8d2e3ac904b"
+    },
     "tests/test_adapter.py": {
       "blob": "04c66355c791fd415ff3ad252dcebca0286fdad7",
       "sha256": "c1369266cd412a712e5fb94729b9cf69bc870213188c806409176aa3597e0cab"

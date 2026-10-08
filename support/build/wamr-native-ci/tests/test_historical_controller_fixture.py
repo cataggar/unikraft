@@ -51,6 +51,17 @@ class HistoricalControllerFixture(unittest.TestCase):
                 ci.validate_supervised_command_binding(
                     record, "config", identities)
 
+    def test_schema_is_authenticated_without_requiring_a_producer_checkout(self):
+        absent = ROOT / ".d/absent-historical-controller-checkout"
+        with mock.patch.object(
+                Path, "read_text",
+                side_effect=AssertionError("unauthenticated physical schema")):
+            ci = fixture.load_controller(ROOT, GIT, producer=absent)
+            evidence = fixture.load_bindings(ROOT, GIT, ci)
+            record, identities = evidence.supervised_binding("config")
+            ci.validate_supervised_command_binding(record, "config", identities)
+        self.assertEqual(ci.REPO, absent)
+
     def test_mixed_adapter_collects_native_cases_without_loading_owner_oracles(self):
         original = importlib.util.spec_from_file_location
 

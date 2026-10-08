@@ -14,6 +14,7 @@ import types
 
 REVISION = "e98623f780fa23d05b5797004e4b88160404eb1b"
 PACKAGE = "support/build/wamr-native-ci"
+COMMAND_CONTRACT = "support/tools/hyperv/process-command-v1.json"
 SOURCES = {
     "run.py": (
         "67386d4ab0fc9fb33e675a4232246878f6324c73",
@@ -22,6 +23,10 @@ SOURCES = {
     "tests/test_adapter.py": (
         "04c66355c791fd415ff3ad252dcebca0286fdad7",
         "c1369266cd412a712e5fb94729b9cf69bc870213188c806409176aa3597e0cab",
+    ),
+    COMMAND_CONTRACT: (
+        "ad73db8f74d76dfb14a39969b2b0ec8f4bd73419",
+        "ee1e038f6538beecac8a09d4d52a6c601a9ca1f503fd70a3753bd8d2e3ac904b",
     ),
 }
 STAGES = (
@@ -44,8 +49,9 @@ def git_blob(repository, git, relative):
     if executable is None:
         raise RuntimeError("explicit historical fixture Git unavailable")
     argv = [executable, "-C", str(repository), "-c", "core.fsmonitor=false"]
+    path = relative if relative == COMMAND_CONTRACT else PACKAGE + "/" + relative
     selected = subprocess.run(
-        argv + ["rev-parse", REVISION + ":" + PACKAGE + "/" + relative],
+        argv + ["rev-parse", REVISION + ":" + path],
         env=environment, capture_output=True, timeout=30, check=True,
     ).stdout
     if selected != (oid + "\n").encode("ascii"):
@@ -61,9 +67,26 @@ def git_blob(repository, git, relative):
 
 def load_controller(repository, git, producer=None):
     raw = git_blob(repository, git, "run.py")
+    contract = git_blob(repository, git, COMMAND_CONTRACT).decode("utf-8")
     module = types.ModuleType("immutable_historical_controller")
     module.__file__ = str(Path(producer or repository) / PACKAGE / "run.py")
-    exec(compile(raw, module.__file__, "exec"), module.__dict__)
+    tree = ast.parse(raw)
+    assignments = [node for node in tree.body
+                   if isinstance(node, ast.Assign)
+                   and any(isinstance(name, ast.Name)
+                           and name.id == "COMMAND_CONTRACT"
+                           for name in node.targets)]
+    if len(assignments) != 1:
+        raise RuntimeError("historical protocol schema binding changed")
+    # The older v1 checkouts predate this neutral protocol schema. Supply the
+    # exact authenticated historical JSON, never a current filesystem oracle;
+    # the controller's original schema checks and every function stay intact.
+    assignments[0].value = ast.Call(
+        func=ast.Attribute(value=ast.Name(id="json", ctx=ast.Load()),
+                           attr="loads", ctx=ast.Load()),
+        args=[ast.Constant(value=contract)], keywords=[])
+    ast.fix_missing_locations(tree)
+    exec(compile(tree, module.__file__, "exec"), module.__dict__)
     return module
 
 
