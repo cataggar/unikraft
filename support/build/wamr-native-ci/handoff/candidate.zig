@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 const std = @import("std");
+const builtin = @import("builtin");
 const core = @import("hyperv_core");
 const controller = @import("wamr_controller");
 const files = core.private_files;
@@ -110,6 +111,15 @@ pub const Finalized = opaque {
         second_path: ?[]const u8,
         signal: ?*core.process.SignalCancellation,
     ) !controller.tiny.Result {
+        return self.resultWithFault(first_path, second_path, signal, .none);
+    }
+    fn resultWithFault(
+        self: *Finalized,
+        first_path: []const u8,
+        second_path: ?[]const u8,
+        signal: ?*core.process.SignalCancellation,
+        fault: ResultFault,
+    ) !controller.tiny.Result {
         const owner = self.state();
         try owner.revalidate(signal);
         var first = try owner.retainSerial(first_path, error.EvidenceIncomplete, signal);
@@ -124,8 +134,18 @@ pub const Finalized = opaque {
             var second_bytes = try files.readSensitiveFile(owner.inv.io, owner.arena.allocator(), second.file.file, contracts.layout.max_serial_bytes, .private);
             defer second_bytes.deinit();
             observed = try checkSerial(owner.arena.allocator(), try secondBytes(second_bytes.bytes(), first_bytes.bytes()), identity);
+            if (builtin.is_test) switch (fault) {
+                .change_second => try changeFile(owner.inv.io, path),
+                .replace_second => try replaceCapture(owner.inv.io, owner.arena.allocator(), path, second_bytes.bytes()),
+                else => {},
+            };
             try owner.verifyHeld(&second, signal);
         }
+        if (builtin.is_test) switch (fault) {
+            .change_first => try changeFile(owner.inv.io, first_path),
+            .replace_first => try replaceCapture(owner.inv.io, owner.arena.allocator(), first_path, first_bytes.bytes()),
+            else => {},
+        };
         try owner.verifyHeld(&first, signal);
         try owner.revalidate(signal);
         return observed;
@@ -144,6 +164,13 @@ const Held = struct {
         return .{ .path = self.file.path, .sha256 = &self.digest, .size = self.file.file_snapshot.size };
     }
 };
+const Faults = struct {
+    admission: ?files.TestFault = null,
+    publication: ?files.TestFault = null,
+    cancel_after_admission: bool = false,
+    change_before_final_revalidation: bool = false,
+};
+const ResultFault = enum { none, change_first, replace_first, change_second, replace_second };
 const State = struct {
     inv: Invocation,
     arena: std.heap.ArenaAllocator,
@@ -154,6 +181,7 @@ const State = struct {
     phase: Phase = .inputs,
     publication: files.CommitStatus = .not_committed,
     reserved: bool = false,
+    faults: Faults = .{},
 
     fn retain(self: *State, path: []const u8, limit: u64, signal: ?*core.process.SignalCancellation) !Held {
         return retainFile(self.arena.allocator(), self.inv.io, path, limit, signal, null);
@@ -192,7 +220,11 @@ const State = struct {
         defer parent.close(self.inv.io);
         var lock = try (files.Directory{ .dir = parent.directory }).lock(self.inv.io);
         defer lock.close(self.inv.io);
-        const committed = try lock.createImmutable(self.inv.io, parent.name, bytes);
+        const fault = if (self.phase == .admission) self.faults.admission else self.faults.publication;
+        const committed = if (builtin.is_test and fault != null)
+            try lock.createImmutableFault(self.inv.io, parent.name, bytes, fault.?)
+        else
+            try lock.createImmutable(self.inv.io, parent.name, bytes);
         if (self.phase == .publication) self.publication = committed.status;
         if (committed.status != .durable or committed.failures.primary != null or committed.failures.cleanup != null or committed.failures.recording != null)
             return error.PublicationUncertain;
@@ -215,16 +247,16 @@ fn retainFile(a: std.mem.Allocator, io: std.Io, path: []const u8, limit: u64, si
 }
 
 pub fn create(inv: Invocation) Outcome {
-    return construct(inv, false);
+    return construct(inv, false, .{});
 }
 
 pub fn open(inv: Invocation) Outcome {
-    return construct(inv, true);
+    return construct(inv, true, .{});
 }
 
-fn construct(inv: Invocation, existing: bool) Outcome {
+fn construct(inv: Invocation, existing: bool, faults: Faults) Outcome {
     const owner = inv.allocator.create(State) catch |err| return .{ .refused = .{ .phase = .inputs, .err = err } };
-    owner.* = .{ .inv = inv, .arena = std.heap.ArenaAllocator.init(inv.allocator) };
+    owner.* = .{ .inv = inv, .arena = std.heap.ArenaAllocator.init(inv.allocator), .faults = faults };
     finish(owner, existing) catch |err| {
         const diagnostic: Diagnostic = .{ .phase = owner.phase, .err = err, .publication = owner.publication };
         const reserved = owner.reserved;
@@ -328,6 +360,8 @@ fn finish(owner: *State, existing: bool) !void {
         if (!std.mem.eql(u8, &owner.admission.?.digest, scope_bundle.sha256) or owner.admission.?.file.file_snapshot.size != bytes.len)
             return error.CandidateBindingChanged;
     }
+    if (builtin.is_test and owner.faults.cancel_after_admission)
+        @constCast((inv.signal orelse return error.InvalidFault).flag()).store(true, .release);
     try owner.revalidate(inv.signal);
     owner.phase = .publication;
     if (!existing) {
@@ -338,8 +372,43 @@ fn finish(owner: *State, existing: bool) !void {
     if (!std.mem.eql(u8, &owner.candidate.?.digest, &digest) or owner.candidate.?.file.file_snapshot.size != encoded.len)
         return error.CandidateBindingChanged;
     owner.phase = .final_revalidation;
+    if (builtin.is_test and owner.faults.change_before_final_revalidation)
+        try changeFile(inv.io, inv.output);
     try owner.revalidate(inv.signal);
 }
+
+fn changeFile(io: std.Io, path: []const u8) !void {
+    if (!builtin.is_test) @compileError("Fault injection is only available to native tests");
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write, .follow_symlinks = false });
+    defer file.close(io);
+    try file.writePositionalAll(io, "!", 0);
+    try file.sync(io);
+}
+
+fn replaceCapture(io: std.Io, a: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
+    if (!builtin.is_test) @compileError("Fault injection is only available to native tests");
+    const saved = try std.fmt.allocPrint(a, "{s}.retained-original", .{path});
+    try std.Io.Dir.cwd().renamePreserve(path, .cwd(), saved, io);
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    defer file.close(io);
+    try file.writePositionalAll(io, bytes, 0);
+    try file.sync(io);
+}
+
+pub const Test = if (builtin.is_test) struct {
+    pub fn create(inv: Invocation, faults: Faults) Outcome {
+        return construct(inv, false, faults);
+    }
+    pub fn result(
+        owner: *Finalized,
+        first: []const u8,
+        second: ?[]const u8,
+        signal: ?*core.process.SignalCancellation,
+        fault: ResultFault,
+    ) !controller.tiny.Result {
+        return owner.resultWithFault(first, second, signal, fault);
+    }
+} else struct {};
 
 fn encode(a: std.mem.Allocator, bundle: std.json.Value, scope_bundle: Artifact, settings: Settings) ![]const u8 {
     const fields = bundle.object;

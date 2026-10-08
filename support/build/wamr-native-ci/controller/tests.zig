@@ -3214,6 +3214,14 @@ fn fixtureSparseImage(
 }
 
 test "trusted historical inner stage accepts complete records and refuses tampered boot bytes" {
+    try trustedHistoricalFixture(false);
+}
+
+test "handoff composition retains historical imports and local private candidates across faults" {
+    try trustedHistoricalFixture(true);
+}
+
+fn trustedHistoricalFixture(comptime composition: bool) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -3594,6 +3602,11 @@ test "trusted historical inner stage accepts complete records and refuses tamper
     }
     const private_bytes = try fixtureCanonical(a, private_value);
     try writeFixtureFile(io, root, "bundle.json", private_bytes);
+    if (composition) {
+        try @import("handoff_composition_tests").historical(a, io, &accepted, stage_root_path, reader_repository, local_tools);
+        try @import("local_acceptance_tests.zig").composition(a, io, stage_root_path);
+        return;
+    }
     try writeFixtureFile(io, root, "evidence/private-inspection-diagnostic.json", "{}\n");
     {
         // A private consumer must not need or adopt public envelopes.

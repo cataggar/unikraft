@@ -156,6 +156,32 @@ network process or authority admission API here.
 
 ## Qualification
 
+The bounded source-only `test-handoff-composition` selector uses the existing
+complete historical inner-stage fixture and local v2 private-export fixture.
+It reconstructs real `ImportedProduct` and `PrivateBundle` owners and executes
+the genuine supervised native validator; it does not run guests, KVM, remote
+parity or an accepted public CI producer:
+
+```sh
+zig build --build-file support/build/wamr-native-ci/build.zig \
+  test-handoff-composition --system /absolute/system \
+  --cache-dir /absolute/private-cache --global-cache-dir /absolute/global \
+  -Doptimize=Debug -j1
+```
+
+Repeat with `ReleaseSafe`. Fixed test-only faults exercise materialization and
+copy failures, wrong-role native validator identity, immutable final collisions,
+uncertain/visible-not-durable publication and final retained-owner revalidation.
+Candidate cases cover admission-first collisions/sync, final collision after the
+sidecar, cancellation between publications, retained source/parent/executable
+changes, and serial incomplete/prefix/padding/overflow/replacement boundaries.
+A fully rehashed historical ZIP payload passes envelope verification but fails
+native evidence acceptance. Refusals retain input/foreign bytes and private
+state; the CLI collision case also checks its original status and empty stdout.
+The local v2 fixture receipt binds actual fixture ZIP/container hashes, but
+confers neither a `Download` owner nor public producer acceptance. Genuine
+current public import/transport/lineage qualification remains a separate gate.
+
 Use an existing external system dependency forest, caches, temporary root and
 private fixture root; hold the fleet qualification lease during sensitive tests:
 
