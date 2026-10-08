@@ -238,9 +238,27 @@ zig build --build-file \
 
 `test-shadow` runs **synthetic comparator/driver tests only**, including
 dependent-commitment, source/run/attempt/transport, authority, selected-payload,
-extra-member, command timeout/status/custody, partial-report and scope refusals.
+extra-member, command timeout/status/custody, exited-parent descendant cleanup,
+distinct producer/reader tool bindings, partial-report and scope refusals.
 It neither needs nor runs private producer resources, and a passing result
 does not count missing/skipped genuine tests as parity.
+
+To exercise the actual integrated publication parser, additionally pass
+`-Dpublication-cli=/absolute/actual/controller/cli.zig` to both builds.
+The parse-only executable receives the driver's real constructed import argv;
+it opens no runtime and executes no product. It checks separate expected and
+selected source/tree/run/attempt values and refuses missing selection flags.
+On a source-only branch preceding publication commit `c534ea6d`, retain its
+exact Git-object bytes in an owner-private external path:
+
+```sh
+git show c534ea6d:support/build/wamr-native-ci/controller/cli.zig \
+  > "$SHADOW/cli-c534ea6d.zig"
+test "$(git hash-object "$SHADOW/cli-c534ea6d.zig")" = \
+  "$(git rev-parse \
+    c534ea6d:support/build/wamr-native-ci/controller/cli.zig)"
+# Add -Dpublication-cli="$SHADOW/cli-c534ea6d.zig" to both build commands.
+```
 
 ### Required externally qualified inputs (not provisioned by this driver)
 
@@ -262,8 +280,9 @@ The canonical UTF-8 sorted-key compact-LF input document has exactly:
   `run_id`, `run_attempt`, `source_revision`, `source_tree`, `wamr_revision`);
 * canonical absolute `producer_repository`, `reader_repository`, `runtime`,
   `handoff`, `download_root`, and an explicitly supplied UUIDv4 `attempt_id`;
-* `tools`: pinned artifacts for `producer_controller`, `reader_controller`,
-  `python`, `git`, `supervisor`, `validator`, `comparator`;
+* `tools`: pinned artifacts for `producer_controller`, `producer_supervisor`,
+  `producer_validator`, `reader_controller`, `reader_supervisor`,
+  `reader_validator`, `python`, `git`, `comparator`;
 * `inputs`: pinned artifacts for `approved_stage`, `consumer_proof`,
   `custody`, `producer_records`, `upload_metadata`, `selection_metadata`,
   `transport_authentication`, `container`, `inner`, `serial_first`,
@@ -280,11 +299,26 @@ The original runtime, source checkout/objects, result, cleanup, six boots,
 images, dependencies and every runtime input/tool closure must remain available.
 No private owner is reconstructed from metadata by the witness.
 
+The producer/oracle controller and supervisor must both be the authenticated
+original `runtime/controller/bin/uk-wamr-native-ci`. Its validator must be the
+original runtime-installed public validator at
+`compute/public-source/validator-build/public-source/tools/bin/uk-wamr-direct-validate`.
+Those identities and the producer checkout serve private export, public archive,
+and every frozen Python oracle stage, including import's unchanged
+`native_import_revalidation=True` policy. Native import/candidate stages instead
+use the separately authenticated reader controller/supervisor pair, reader
+validator and reader checkout. The reader supervisor must match its executing
+controller; no old/new executable identity is substituted or normalized.
+Old input manifests with one ambiguous `supervisor`/`validator` pin refuse.
+
 `upload_metadata` has exactly `context`, `artifact_id`, `container_digest`,
 `inner_sha256`. `selection_metadata` has exactly `context`, `artifact_id`,
 `container_digest`, `artifact_ids`. Both contexts must equal the independently
 approved producer context. `artifact_ids` must be exactly the singleton trusted
 upload ID. Digests are lowercase 64-character hex, without `sha256:` prefixes.
+Native import forwards `--selected-source`, `--selected-tree`,
+`--selected-run-id`, and `--selected-run-attempt` from the independently pinned
+`selection_metadata.context`, never from the expected producer context.
 `container` is the retained raw Actions artifact container, while `inner` is
 the exact `download_root/tiny-aot-public-source.zip` single regular member.
 The IDs, container SHA and inner SHA are separately checked; equal receipts or
@@ -352,8 +386,14 @@ publishing result stdout.
 Each of the 17 ordered stages retains its exact argv/cwd, allowlisted original
 environment (no credentials), timeout, original status, stdout/stderr hashes
 and physical custody in create-only command/receipt files. Captures are bounded
-to 8 MiB each; stages to 2,400 seconds. Timeout kills include descendants in
-their own sessions. Existing native private command receipts/partial products
+to 8 MiB each; stages to 2,400 seconds. A scoped Linux subreaper retains kernel
+ownership of descendants after their original parent exits, including processes
+in new sessions holding capture pipes. Timeout/capture failures kill by retained
+pidfds and reap owned descendants independently of parent liveness. The original
+parent status, descendant termination/reaping records and separate cleanup
+failures are retained; any cleanup failure or unfinished cleanup refuses success.
+Pre-existing child processes are excluded and the prior subreaper setting is
+restored. Existing native private command receipts/partial products
 are retained too. Inventories, canonical records, requests, before/after custody,
 output pins and failed partial executions are durable external evidence.
 Missing, skipped, changed or failed stages refuse; no retry/resume or destructive

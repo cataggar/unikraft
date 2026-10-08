@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """TEST ONLY: bounded stagewise handoff witness. Never an acceptance/cutover gate."""
 import argparse
+import ctypes
 import hashlib
 import importlib.util
 import json
@@ -29,8 +30,9 @@ FLAGS = {
     "cleanup_owned_group", "exact_image_and_local_bundle_reviewed",
     "fresh_final_approval",
 }
-TOOLS = {"producer_controller", "reader_controller", "python", "git",
-         "supervisor", "validator", "comparator"}
+TOOLS = {"producer_controller", "producer_supervisor", "producer_validator",
+         "reader_controller", "reader_supervisor", "reader_validator",
+         "python", "git", "comparator"}
 INPUTS = {
     "approved_stage", "consumer_proof", "custody", "producer_records",
     "upload_metadata", "selection_metadata", "transport_authentication",
@@ -248,33 +250,216 @@ class Command:
     timeout_seconds: int = TIMEOUT
 
 
-def stop_tree(pid):
-    # The frozen records bridge creates its own sessions. Killing only the outer
-    # Python process group would leave those validators running after a timeout.
-    held = []
-    pending = [pid]
-    try:
+@dataclass(frozen=True)
+class StageTools:
+    controller: str
+    supervisor: str
+    validator: str
+
+    def validation_flags(self, git):
+        return ("--git", git, "--supervisor", self.supervisor,
+                "--validator", self.validator)
+
+
+def producer_stage(stage):
+    require(stage in STAGES, "unknown tool-binding stage")
+    return stage.startswith("python-") or stage in (
+        "producer-records", "native-export", "native-archive")
+
+
+def stage_tools(tools, stage):
+    role = "producer" if producer_stage(stage) else "reader"
+    return StageTools(*(tools[role + "_" + name] for name in (
+        "controller", "supervisor", "validator")))
+
+
+def stage_repository(stage, producer, reader):
+    return producer if producer_stage(stage) else reader
+
+
+def validate_tool_roles(tools, runtime):
+    require(tools["producer_controller"] == tools["producer_supervisor"]
+            == str(runtime / "controller/bin/uk-wamr-native-ci"),
+            "producer/oracle supervisor must be the original runtime controller")
+    require(tools["producer_validator"] == str(
+        runtime / "compute/public-source/validator-build/public-source/tools/bin/uk-wamr-direct-validate"),
+        "producer/oracle validator must be the original runtime validator")
+    require(tools["reader_controller"] == tools["reader_supervisor"],
+            "reader supervisor must match the executing reader controller")
+
+
+def context_flags(context, selected=False):
+    if selected:
+        names = ("--selected-source", "--selected-tree",
+                 "--selected-run-id", "--selected-run-attempt")
+    else:
+        names = ("--expected-source", "--expected-tree", "--run-id", "--run-attempt")
+    return tuple(item for name, key in zip(names, (
+        "source_revision", "source_tree", "run_id", "run_attempt"), strict=True)
+                 for item in (name, context[key]))
+
+
+def native_import_command(tools, paths, download, output, source, upload, selected):
+    binding = stage_tools(tools, "native-import")
+    return (
+        binding.controller, "import-public-source-download",
+        "--download-root", str(download), "--container-archive", str(paths["container"]),
+        "--expected-archive-sha256", upload["inner_sha256"],
+        "--artifact-id", upload["artifact_id"], "--container-digest", upload["container_digest"],
+        "--selected-artifact-id", selected["artifact_id"],
+        "--selected-container-digest", selected["container_digest"],
+        "--output", str(output), *binding.validation_flags(tools["git"]),
+        *context_flags(source), *context_flags(selected["context"], selected=True),
+    )
+
+
+class ProcessCustody:
+    """Kernel-owned adoption retains descendants even after their parent exits."""
+    def __init__(self):
+        self.libc = ctypes.CDLL(None, use_errno=True)
+        previous = ctypes.c_int()
+        if self.libc.prctl(37, ctypes.byref(previous), 0, 0, 0) != 0:
+            raise OSError(ctypes.get_errno(), "PR_GET_CHILD_SUBREAPER")
+        self.previous = previous.value
+        self.baseline = self.children(os.getpid())
+        self.held = {}
+        self.events = {}
+        self.failures = []
+        self.root = None
+        self.complete = False
+        if self.libc.prctl(36, 1, 0, 0, 0) != 0:
+            raise OSError(ctypes.get_errno(), "PR_SET_CHILD_SUBREAPER")
+
+    @staticmethod
+    def children(pid):
+        return {int(value) for value in Path(
+            f"/proc/{pid}/task/{pid}/children").read_text().split()}
+
+    def error(self, operation, err):
+        self.failures.append({"operation": operation, "error": str(err)})
+
+    def track(self, pid, parent):
+        if pid in self.held:
+            return True
+        descriptor = None
+        try:
+            require(len(self.held) < 512, "owned process bound")
+            descriptor = os.pidfd_open(pid)
+            signal.pidfd_send_signal(descriptor, 0)
+            fields_ = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+            require(int(fields_[1]) in (parent, os.getpid()), "process ownership changed")
+            signal.pidfd_send_signal(descriptor, 0)
+            self.held[pid] = descriptor
+            self.events[pid] = {"pid": pid, "start_ticks": int(fields_[19]),
+                                "signals": [], "reaped": False, "exit_status": None}
+            return True
+        except (ProcessLookupError, FileNotFoundError):
+            return False
+        except (OSError, ValueError) as err:
+            self.error("track:" + str(pid), err)
+            return False
+        finally:
+            if descriptor is not None and pid not in self.held:
+                os.close(descriptor)
+
+    def attach(self, process):
+        self.root = process.pid
+        require(self.track(process.pid, os.getpid()), "cannot retain original process ownership")
+
+    def send(self, pid, sig):
+        try:
+            signal.pidfd_send_signal(self.held[pid], sig)
+            self.events[pid]["signals"].append(sig)
+            return True
+        except ProcessLookupError:
+            return False
+        except OSError as err:
+            self.error("signal:" + str(pid) + ":" + str(sig), err)
+            return False
+
+    def collect_and_kill(self):
+        try:
+            pending = [(pid, os.getpid()) for pid in self.children(os.getpid()) - self.baseline]
+        except OSError as err:
+            self.error("enumerate-owned-children", err)
+            pending = []
+        seen = set()
         while pending:
-            child = pending.pop()
-            try:
-                descriptor = os.pidfd_open(child)
-            except ProcessLookupError:
+            pid, parent = pending.pop()
+            if pid in seen:
                 continue
-            held.append(descriptor)
+            seen.add(pid)
+            if not self.track(pid, parent) or not self.send(pid, signal.SIGSTOP):
+                continue
             try:
-                signal.pidfd_send_signal(descriptor, signal.SIGSTOP)
-                children = Path(f"/proc/{child}/task/{child}/children").read_text()
-                pending.extend(int(value) for value in children.split())
+                pending.extend((child, pid) for child in self.children(pid))
             except (FileNotFoundError, ProcessLookupError):
                 pass
-        for descriptor in reversed(held):
-            try:
-                signal.pidfd_send_signal(descriptor, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-    finally:
-        for descriptor in held:
-            os.close(descriptor)
+            except OSError as err:
+                self.error("enumerate:" + str(pid), err)
+        for pid in reversed(tuple(self.held)):
+            if not self.events[pid]["reaped"]:
+                self.send(pid, signal.SIGKILL)
+
+    def finish(self, process):
+        deadline = time.monotonic() + 5
+        try:
+            self.collect_and_kill()
+            if process is not None:
+                try:
+                    status = process.wait(timeout=max(0.001, deadline - time.monotonic()))
+                    if process.pid in self.events:
+                        self.events[process.pid].update(reaped=True, exit_status=status)
+                except (OSError, subprocess.SubprocessError) as err:
+                    self.error("wait-original-process", err)
+            while True:
+                # Killed parents reparent their descendants to this subreaper,
+                # including children that have started independent sessions.
+                self.collect_and_kill()
+                remaining = False
+                for pid in self.held:
+                    if self.events[pid]["reaped"]:
+                        continue
+                    try:
+                        waited, status = os.waitpid(pid, os.WNOHANG)
+                        if waited == pid:
+                            self.events[pid].update(
+                                reaped=True, exit_status=os.waitstatus_to_exitcode(status))
+                        else:
+                            remaining = True
+                    except ChildProcessError:
+                        try:
+                            stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+                            remaining |= int(stat[19]) == self.events[pid]["start_ticks"]
+                            if int(stat[19]) != self.events[pid]["start_ticks"]:
+                                self.events[pid]["reaped"] = True
+                        except FileNotFoundError:
+                            self.events[pid]["reaped"] = True
+                        except OSError as err:
+                            self.error("observe-reaping:" + str(pid), err)
+                            remaining = True
+                    except OSError as err:
+                        self.error("reap:" + str(pid), err)
+                        remaining = True
+                if not remaining and not self.children(os.getpid()) - self.baseline:
+                    self.complete = True
+                    break
+                if time.monotonic() >= deadline:
+                    self.error("cleanup-deadline", Refusal("owned descendants not reaped"))
+                    break
+                time.sleep(0.01)
+        except (OSError, ValueError) as err:
+            self.error("cleanup", err)
+        finally:
+            if self.libc.prctl(36, self.previous, 0, 0, 0) != 0:
+                self.error("restore-subreaper", OSError(ctypes.get_errno(), "prctl"))
+            for descriptor in self.held.values():
+                try:
+                    os.close(descriptor)
+                except OSError as err:
+                    self.error("close-pidfd", err)
+        return {"complete": self.complete, "failures": self.failures,
+                "processes": list(self.events.values())}
 
 
 def execute(command, output, environment):
@@ -295,15 +480,19 @@ def execute(command, output, environment):
     failure = None
     logs = {}
     process = None
+    custody = None
+    cleanup = {"complete": False, "failures": [], "processes": []}
     try:
         with (directory / "stdout").open("xb") as stdout, \
                 (directory / "stderr").open("xb") as stderr:
             os.chmod(directory / "stdout", 0o600)
             os.chmod(directory / "stderr", 0o600)
+            custody = ProcessCustody()
             process = subprocess.Popen(
                 command.argv, cwd=command.cwd, env=environment,
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, start_new_session=True)
+            custody.attach(process)
             deadline = time.monotonic() + command.timeout_seconds
             with selectors.DefaultSelector() as selector:
                 for pipe, target in ((process.stdout, stdout), (process.stderr, stderr)):
@@ -323,22 +512,23 @@ def execute(command, output, environment):
                             require(logs[key.data] <= MAX_LOG, "command output bound")
                             key.data.write(chunk)
                 term = process.wait(timeout=max(0.001, deadline - time.monotonic()))
+            require(not custody.children(os.getpid()) - custody.baseline,
+                    "command left descendant processes")
             for target in (stdout, stderr):
                 target.flush()
                 os.fsync(target.fileno())
     except (OSError, ValueError, subprocess.SubprocessError) as err:
         failure = str(err)
     finally:
+        if custody is not None:
+            cleanup = custody.finish(process)
         if process is not None:
-            if process.poll() is None:
-                stop_tree(process.pid)
+            term = process.returncode
+            for pipe in (process.stdout, process.stderr):
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            term = process.wait()
-            process.stdout.close()
-            process.stderr.close()
+                    pipe.close()
+                except OSError as err:
+                    cleanup["failures"].append({"operation": "close-capture", "error": str(err)})
         record.update(
             exit_status=term, failure=failure,
             elapsed_ns=time.monotonic_ns() - started,
@@ -346,9 +536,12 @@ def execute(command, output, environment):
             stderr=artifact(directory / "stderr"),
             command_custody=command_custody,
             capture_custody={name: hash_file(directory / name) for name in ("stdout", "stderr")},
+            cleanup=cleanup,
         )
         write(directory / "receipt.json", encoded(record))
-    require(failure is None and term == command.expected_exit, "failed stage " + command.stage)
+    require(failure is None and term == command.expected_exit
+            and cleanup["complete"] and not cleanup["failures"],
+            "failed stage " + command.stage)
     return record
 
 
@@ -370,8 +563,17 @@ def worker(args):
     require(hash_file(args.staged_inputs)["sha256"] == args.staged_inputs_sha256,
             "worker input changed")
     assert_public_scope(staged)
-    for value in staged["tools"].values():
-        checked_artifact(value)
+    tools = {name: str(checked_artifact(value)) for name, value in staged["tools"].items()}
+    validate_tool_roles(tools, absolute(staged["runtime"]))
+    operations = {
+        "python-export": "export", "python-archive-verify": "verify-archive",
+        "python-import": "import", "python-candidate": "candidate",
+    }
+    require(operations.get(args.stage) == args.operation, "worker stage/operation mismatch")
+    binding = stage_tools(tools, args.stage)
+    require(args.supervisor == binding.supervisor and args.validator == binding.validator
+            and os.environ.get("WAMR_CI_CONTROLLER") == binding.controller,
+            "worker tools do not match authenticated stage roles")
     for value in staged["inputs"].values():
         if value is not None:
             checked_artifact(value)
@@ -503,6 +705,8 @@ def validate_stages(receipts, command_root=None):
         expected = 2 if record["stage"].endswith("-incomplete") else 0
         require(record["failure"] is None and record["exit_status"] == expected
                 and record["expected_exit"] == expected, "misleading partial execution")
+        require(record["cleanup"]["complete"] and not record["cleanup"]["failures"],
+                "misleading cleanup outcome")
         for name in ("stdout", "stderr"):
             checked_artifact(record[name])
         if command_root is not None:
@@ -568,6 +772,7 @@ def run_stagewise(manifest_path, output_path):
     producer = absolute(manifest["producer_repository"])
     reader = absolute(manifest["reader_repository"])
     runtime = private(manifest["runtime"])
+    validate_tool_roles(tools, runtime)
     handoff_root = private(manifest["handoff"])
     download = private(manifest["download_root"])
     frozen, public = load_oracle(producer)
@@ -634,13 +839,12 @@ def run_stagewise(manifest_path, output_path):
     inventories = {}
     output_pins = {}
 
-    def run(stage, argv, cwd=reader, expected=0):
+    def run(stage, argv, cwd=None, expected=0):
+        if cwd is None:
+            cwd = stage_repository(stage, producer, reader)
         command = Command(stage, tuple(map(str, argv)), str(cwd), expected)
         stage_environment = dict(environment)
-        stage_environment["WAMR_CI_CONTROLLER"] = tools[
-            "producer_controller" if stage in (
-                "producer-records", "native-export", "python-export",
-                "native-archive", "python-archive-verify") else "reader_controller"]
+        stage_environment["WAMR_CI_CONTROLLER"] = stage_tools(tools, stage).controller
         try:
             receipt = execute(command, commands, stage_environment)
         except (OSError, ValueError) as err:
@@ -653,11 +857,13 @@ def run_stagewise(manifest_path, output_path):
         return commands / stage / "stdout"
 
     def python_stage(stage, operation, repository, input_path, output_path):
+        binding = stage_tools(tools, stage)
         return run(stage, (
             tools["python"], "-B", HERE / "handoff_shadow.py", "_worker",
-            "--operation", operation, "--repository", repository, "--input", input_path,
+            "--stage", stage, "--operation", operation,
+            "--repository", repository, "--input", input_path,
             "--output", output_path, "--context", output / "context.json",
-            "--validator", tools["validator"], "--supervisor", tools["supervisor"],
+            "--validator", binding.validator, "--supervisor", binding.supervisor,
             "--inner-sha256", inputs["inner"]["sha256"], "--artifact-id", upload["artifact_id"],
             "--container-digest", upload["container_digest"], "--attempt-id", manifest["attempt_id"],
             "--staged-inputs", output / "inputs.json",
@@ -673,11 +879,7 @@ def run_stagewise(manifest_path, output_path):
         output_pins[str(request)] = hash_file(request)
         run(stage, (tools["comparator"], "--request", request))
 
-    common = ("--git", tools["git"], "--supervisor", tools["supervisor"],
-              "--validator", tools["validator"])
-    context_flags = ("--expected-source", source["source_revision"], "--expected-tree",
-                     source["source_tree"], "--run-id", source["run_id"],
-                     "--run-attempt", source["run_attempt"])
+    common = stage_tools(tools, "native-import").validation_flags(tools["git"])
     roots = {}
     try:
         observed = run("producer-records", (
@@ -704,7 +906,9 @@ def run_stagewise(manifest_path, output_path):
         run("native-archive", (
             tools["producer_controller"], "public-archive", "--stage-root", handoff_root,
             "--validation-output", output / "native/archive-validation",
-            "--output", output / "native/archive", *common, *context_flags,
+            "--output", output / "native/archive",
+            *stage_tools(tools, "native-archive").validation_flags(tools["git"]),
+            *context_flags(source),
         ), producer)
         python_stage("python-archive-verify", "verify-archive", producer,
                      paths["inner"], output / "python/archive-verification")
@@ -718,16 +922,9 @@ def run_stagewise(manifest_path, output_path):
         same_bytes(native_zip, python_zip)
         require(artifact(native_zip)["sha256"] == inputs["inner"]["sha256"],
                 "archive differs from independently redownloaded artifact")
-        run("native-import", (
-            tools["reader_controller"], "import-public-source-download",
-            "--download-root", download, "--container-archive", paths["container"],
-            "--expected-archive-sha256", upload["inner_sha256"],
-            "--artifact-id", upload["artifact_id"], "--container-digest", upload["container_digest"],
-            "--selected-artifact-id", selected["artifact_id"],
-            "--selected-container-digest", selected["container_digest"],
-            "--output", output / "native/import", *common, *context_flags,
-        ))
-        python_stage("python-import", "import", reader, paths["inner"], output / "python/import")
+        run("native-import", native_import_command(
+            tools, paths, download, output / "native/import", source, upload, selected))
+        python_stage("python-import", "import", producer, paths["inner"], output / "python/import")
         for side in ("native", "python"):
             bundle_root = output / side / "import"
             roots[side]["bundle"] = str(bundle_root)
@@ -747,7 +944,7 @@ def run_stagewise(manifest_path, output_path):
             "--output", candidate, "--validation-output", output / "native/candidate-validation",
             "--attempt-id", manifest["attempt_id"], *common,
         ))
-        python_stage("python-candidate", "candidate", reader, output / "python/import/bundle.json",
+        python_stage("python-candidate", "candidate", producer, output / "python/import/bundle.json",
                      output / "python/candidate.json")
         for side in ("native", "python"):
             verify_candidate(output / side / "candidate.json")
@@ -755,7 +952,8 @@ def run_stagewise(manifest_path, output_path):
             tools["reader_controller"], "candidate-inspect", "--bundle", output / "native/import/bundle.json",
             "--candidate", candidate, "--validation-output", output / "native/inspect-validation", *common,
         ))
-        run("python-inspect", (tools["validator"], "candidate", output / "python/candidate.json"))
+        run("python-inspect", (stage_tools(tools, "python-inspect").validator,
+                               "candidate", output / "python/candidate.json"))
         require(read(commands / "native-inspect/stdout") == read(commands / "python-inspect/stdout"),
                 "inspection record differs")
         results = {}
@@ -769,7 +967,8 @@ def run_stagewise(manifest_path, output_path):
             "--candidate", candidate, "--validation-output", output / "native/result-validation", *common, *serial,
         ))
         results["python"] = run("python-result", (
-            tools["validator"], "serial", output / "python/candidate.json", *py_serial,
+            stage_tools(tools, "python-result").validator, "serial",
+            output / "python/candidate.json", *py_serial,
         ))
         run("native-incomplete", (
             tools["reader_controller"], "candidate-result", "--bundle", output / "native/import/bundle.json",
@@ -777,7 +976,8 @@ def run_stagewise(manifest_path, output_path):
             *common, "--serial-first", paths["serial_incomplete"],
         ), expected=2)
         run("python-incomplete", (
-            tools["validator"], "serial", output / "python/candidate.json", paths["serial_incomplete"],
+            stage_tools(tools, "python-incomplete").validator, "serial",
+            output / "python/candidate.json", paths["serial_incomplete"],
         ), expected=2)
         records = {}
         for side in ("native", "python"):
@@ -855,7 +1055,7 @@ def main():
     worker_parser.add_argument("--operation", choices=("export", "verify-archive", "import", "candidate"), required=True)
     for name in ("repository", "input", "output", "context", "validator", "supervisor",
                  "inner-sha256", "artifact-id", "container-digest", "attempt-id",
-                 "staged-inputs", "staged-inputs-sha256"):
+                 "staged-inputs", "staged-inputs-sha256", "stage"):
         worker_parser.add_argument("--" + name, required=True)
     args = parser.parse_args()
     try:

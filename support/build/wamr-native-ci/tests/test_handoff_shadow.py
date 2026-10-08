@@ -16,6 +16,7 @@ import handoff_shadow as shadow
 
 HERE = Path(__file__).resolve().parent
 COMPARATOR = None
+PUBLICATION_PARSER = None
 SCRATCH = None
 
 
@@ -28,6 +29,21 @@ class ShadowWitness(unittest.TestCase):
 
     def document(self, path, value):
         shadow.write(path, shadow.encoded(value))
+
+    def distinct_tools(self):
+        runtime = self.root / "synthetic-original-runtime"
+        producer = str(runtime / "controller/bin/uk-wamr-native-ci")
+        reader = str(self.root / "synthetic-new-reader/controller")
+        tools = {
+            "producer_controller": producer, "producer_supervisor": producer,
+            "producer_validator": str(
+                runtime / "compute/public-source/validator-build/public-source/tools/bin/uk-wamr-direct-validate"),
+            "reader_controller": reader, "reader_supervisor": reader,
+            "reader_validator": str(self.root / "synthetic-new-reader/validator"),
+            "python": sys.executable, "git": "/synthetic/git",
+            "comparator": str(COMPARATOR),
+        }
+        return runtime, tools
 
     def fixture(self):
         golden = shadow.decode(shadow.read(
@@ -222,10 +238,10 @@ class ShadowWitness(unittest.TestCase):
         timed_record = shadow.decode(shadow.read(self.root / "timed/receipt.json"))
         self.assertEqual(timed_record["failure"], "command timed out")
         self.assertLess(timed_record["exit_status"], 0)
+        self.assertTrue(timed_record["cleanup"]["complete"])
+        self.assertEqual(timed_record["cleanup"]["failures"], [])
         descendant = int(shadow.read(self.root / "timed/stdout").strip())
-        status = Path(f"/proc/{descendant}/stat")
-        if status.exists():
-            self.assertEqual(status.read_text().split()[2], "Z", "detached descendant still running")
+        self.assertFalse(Path(f"/proc/{descendant}").exists(), "descendant not reaped")
         incomplete = shadow.Command("native-incomplete", (sys.executable, "-c",
                                                          "import sys;sys.exit(2)"),
                                     str(self.root), expected_exit=2)
@@ -243,6 +259,7 @@ class ShadowWitness(unittest.TestCase):
             "exit_status": 2 if stage.endswith("-incomplete") else 0,
             "expected_exit": 2 if stage.endswith("-incomplete") else 0,
             "stdout": shadow.artifact(log), "stderr": shadow.artifact(log),
+            "cleanup": {"complete": True, "failures": [], "processes": []},
         } for stage in shadow.STAGES]
         shadow.validate_stages(receipts)
         with self.assertRaisesRegex(shadow.Refusal, "missing, skipped or reordered"):
@@ -250,6 +267,10 @@ class ShadowWitness(unittest.TestCase):
         failed = copy.deepcopy(receipts)
         failed[3]["exit_status"] = 1
         with self.assertRaisesRegex(shadow.Refusal, "misleading partial execution"):
+            shadow.validate_stages(failed)
+        failed = copy.deepcopy(receipts)
+        failed[3]["cleanup"]["failures"].append({"operation": "reap", "error": "synthetic failure"})
+        with self.assertRaisesRegex(shadow.Refusal, "misleading cleanup outcome"):
             shadow.validate_stages(failed)
         published = self.root / "misleading-result"
         shadow.write(published, b"{}\n")
@@ -298,14 +319,154 @@ class ShadowWitness(unittest.TestCase):
         changed = shadow.custody_snapshot(roots)
         self.assertNotEqual(original, changed)
 
+    def test_synthetic_import_command_forwards_independent_selected_context_to_actual_parser(self):
+        _, tools = self.distinct_tools()
+        source = {"source_revision": "a" * 40, "source_tree": "b" * 40,
+                  "run_id": "263", "run_attempt": "1"}
+        selected_context = {"source_revision": "c" * 40, "source_tree": "d" * 40,
+                            "run_id": "264", "run_attempt": "2"}
+        upload = {"inner_sha256": "e" * 64, "artifact_id": "100",
+                  "container_digest": "f" * 64}
+        selected = {"context": selected_context, "artifact_id": "101",
+                    "container_digest": "1" * 64}
+        command = shadow.native_import_command(
+            tools, {"container": self.root / "outer.zip"}, self.root / "download",
+            self.root / "import", source, upload, selected)
+        flags = dict(zip(command[2::2], command[3::2], strict=True))
+        for flag, key in (("--selected-source", "source_revision"), ("--selected-tree", "source_tree"),
+                          ("--selected-run-id", "run_id"), ("--selected-run-attempt", "run_attempt")):
+            self.assertEqual(flags[flag], selected_context[key])
+        self.assertEqual(flags["--expected-source"], source["source_revision"])
+        self.assertEqual(flags["--supervisor"], tools["reader_supervisor"])
+        if PUBLICATION_PARSER is not None:
+            observed = subprocess.run(
+                (str(PUBLICATION_PARSER), *command), stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            self.assertEqual(observed.returncode, 0, observed.stderr.decode())
+            parsed = shadow.decode(observed.stdout, canonical=False)
+            self.assertEqual(parsed["source_revision"], source["source_revision"])
+            self.assertEqual(parsed["selected_source_revision"], selected_context["source_revision"])
+            self.assertEqual(parsed["selected_source_tree"], selected_context["source_tree"])
+            self.assertEqual(parsed["selected_run_id"], selected_context["run_id"])
+            self.assertEqual(parsed["selected_run_attempt"], selected_context["run_attempt"])
+            omitted = command[:-8]
+            refused = subprocess.run(
+                (str(PUBLICATION_PARSER), *omitted), stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            self.assertEqual(refused.returncode, 1)
+            self.assertIn(b"InvalidUsage", refused.stderr)
+
+    def test_synthetic_distinct_producer_oracle_and_reader_bindings_never_alias(self):
+        runtime, tools = self.distinct_tools()
+        shadow.validate_tool_roles(tools, runtime)
+        for stage in ("producer-records", "native-export", "native-archive",
+                      "python-export", "python-import", "python-inspect", "python-result"):
+            binding = shadow.stage_tools(tools, stage)
+            self.assertEqual(binding.controller, tools["producer_controller"])
+            self.assertEqual(binding.supervisor, tools["producer_supervisor"])
+            self.assertEqual(binding.validator, tools["producer_validator"])
+            self.assertEqual(shadow.stage_repository(stage, "/original", "/new-reader"), "/original")
+        for stage in ("native-import", "native-candidate", "native-inspect", "native-result"):
+            binding = shadow.stage_tools(tools, stage)
+            self.assertEqual(binding.controller, tools["reader_controller"])
+            self.assertEqual(binding.supervisor, tools["reader_supervisor"])
+            self.assertEqual(binding.validator, tools["reader_validator"])
+            self.assertEqual(shadow.stage_repository(stage, "/original", "/new-reader"), "/new-reader")
+        changed = dict(tools, producer_supervisor=tools["reader_supervisor"])
+        with self.assertRaisesRegex(shadow.Refusal, "original runtime controller"):
+            shadow.validate_tool_roles(changed, runtime)
+        changed = dict(tools, reader_supervisor=tools["producer_supervisor"])
+        with self.assertRaisesRegex(shadow.Refusal, "executing reader controller"):
+            shadow.validate_tool_roles(changed, runtime)
+
+    def test_synthetic_exited_parent_session_descendant_is_killed_reaped_and_retained(self):
+        for stage, child, bound in (
+                ("exited-timeout", "import time;time.sleep(60)", None),
+                ("exited-capture", "import time,os;time.sleep(0.2);"
+                 "os.write(2,b'x'*65536);time.sleep(60)", 1024)):
+            code = (
+                "import subprocess,sys;"
+                f"p=subprocess.Popen([sys.executable,'-c',{child!r}],start_new_session=True);"
+                "print(p.pid,flush=True);sys.exit(0)"
+            )
+            command = shadow.Command(stage, (sys.executable, "-c", code),
+                                     str(self.root), timeout_seconds=1)
+            try:
+                with mock.patch.object(shadow, "MAX_LOG", bound or shadow.MAX_LOG):
+                    with self.assertRaisesRegex(shadow.Refusal, "failed stage"):
+                        shadow.execute(command, self.root, {"PATH": os.environ["PATH"]})
+                receipt = shadow.decode(shadow.read(self.root / stage / "receipt.json"))
+                self.assertEqual(receipt["exit_status"], 0, "original parent status changed")
+                self.assertEqual(receipt["failure"],
+                                 "command output bound" if bound else "command timed out")
+                descendant = int(shadow.read(self.root / stage / "stdout").strip())
+                self.assertTrue(receipt["cleanup"]["complete"])
+                self.assertEqual(receipt["cleanup"]["failures"], [])
+                child_record = next(value for value in receipt["cleanup"]["processes"]
+                                    if value["pid"] == descendant)
+                self.assertTrue(child_record["reaped"])
+                self.assertEqual(child_record["exit_status"], -shadow.signal.SIGKILL)
+                self.assertFalse(Path(f"/proc/{descendant}").exists())
+            finally:
+                # Precise emergency cleanup also applies when running this
+                # regression against the old, leaking implementation.
+                captured = self.root / stage / "stdout"
+                if captured.exists() and captured.read_bytes().strip().isdigit():
+                    pid = int(captured.read_bytes().strip())
+                    try:
+                        descriptor = os.pidfd_open(pid)
+                    except ProcessLookupError:
+                        descriptor = None
+                    if descriptor is not None:
+                        try:
+                            command_line = Path(f"/proc/{pid}/cmdline").read_bytes()
+                            expected = os.fsencode(sys.executable) + b"\0-c\0" + child.encode() + b"\0"
+                            if command_line == expected:
+                                shadow.signal.pidfd_send_signal(descriptor, shadow.signal.SIGKILL)
+                                try:
+                                    os.waitpid(pid, 0)
+                                except ChildProcessError:
+                                    pass
+                        except (FileNotFoundError, ProcessLookupError):
+                            pass
+                        finally:
+                            os.close(descriptor)
+
+    def test_synthetic_cleanup_failure_preserves_primary_failure_and_refuses_success(self):
+        original = shadow.signal.pidfd_send_signal
+        refused_once = False
+
+        def refuse_stop(descriptor, sig):
+            nonlocal refused_once
+            if sig == shadow.signal.SIGSTOP and not refused_once:
+                refused_once = True
+                raise PermissionError("synthetic stop refusal")
+            return original(descriptor, sig)
+
+        command = shadow.Command(
+            "cleanup-failure", (sys.executable, "-c", "import time;time.sleep(60)"),
+            str(self.root), timeout_seconds=1)
+        with mock.patch.object(shadow.signal, "pidfd_send_signal", side_effect=refuse_stop):
+            with self.assertRaisesRegex(shadow.Refusal, "failed stage"):
+                shadow.execute(command, self.root, {"PATH": os.environ["PATH"]})
+        receipt = shadow.decode(shadow.read(self.root / "cleanup-failure/receipt.json"))
+        self.assertEqual(receipt["failure"], "command timed out")
+        self.assertTrue(receipt["cleanup"]["complete"])
+        self.assertTrue(any("synthetic stop refusal" in entry["error"]
+                            for entry in receipt["cleanup"]["failures"]))
+        self.assertTrue(all(entry["reaped"] for entry in receipt["cleanup"]["processes"]))
+
 
 def main():
-    global COMPARATOR, SCRATCH
+    global COMPARATOR, PUBLICATION_PARSER, SCRATCH
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--comparator", required=True)
     parser.add_argument("--scratch", required=True)
+    parser.add_argument("--publication-parser")
     args, remaining = parser.parse_known_args()
     COMPARATOR = shadow.absolute(str(Path(args.comparator).resolve(strict=True)))
+    if args.publication_parser is not None:
+        PUBLICATION_PARSER = shadow.absolute(str(Path(args.publication_parser).resolve(strict=True)))
     SCRATCH = shadow.private(args.scratch)
     print("SYNTHETIC ONLY: comparator/driver validation; genuine parity not run.", flush=True)
     return not unittest.main(argv=[sys.argv[0], *remaining], exit=False).result.wasSuccessful()

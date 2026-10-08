@@ -54,6 +54,26 @@ pub fn build(b: *std.Build) void {
     python.addFileArg(b.path("../../tests/test_handoff_shadow.py"));
     python.addArg("--comparator");
     python.addArtifactArg(exe);
+    if (b.option([]const u8, "publication-cli", "Canonical path to the actual integrated publication CLI module")) |path| {
+        if (!std.fs.path.isAbsolute(path)) @panic("-Dpublication-cli must be absolute");
+        const publication_cli = b.createModule(.{
+            .root_source_file = .{ .cwd_relative = path },
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "hyperv_core", .module = core }},
+        });
+        const parser = b.addExecutable(.{
+            .name = "wamr-handoff-shadow-parse",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("../shadow_cli_main.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "publication_cli", .module = publication_cli }},
+            }),
+        });
+        python.addArg("--publication-parser");
+        python.addArtifactArg(parser);
+    }
     python.addArg("--scratch");
     const scratch = b.option([]const u8, "test-root", "Existing external owner-private scratch root") orelse @panic("-Dtest-root is required");
     if (!std.fs.path.isAbsolute(scratch)) @panic("-Dtest-root must be absolute");
