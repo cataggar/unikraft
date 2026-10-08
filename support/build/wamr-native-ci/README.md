@@ -1224,6 +1224,10 @@ python3 -B support/build/wamr-native-ci/tests/test_historical_controller_fixture
 only the reviewed neutral historical native input. It refuses missing or
 changed historical blobs before executing anything and imports no current
 PUBLIC/handoff implementation. It is not a production fallback.
+The module's original top-level protocol-schema read is bound to the
+authenticated historical `process-command-v1.json` blob because the older
+v1 producer checkouts predate it. All original schema checks and controller
+functions remain intact; no current physical schema is substituted.
 
 The credential-free KVM workflow runs the real native build and six-mode tiny
 chain once, then reopens its accepted native records and exercises the existing
