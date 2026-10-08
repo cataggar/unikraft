@@ -48,6 +48,59 @@ pub fn nativeSourceContentClosure(allocator: std.mem.Allocator) ![64]u8 {
     return physical.hex(&hash);
 }
 
+pub const standalone_supervisor_sources = @import("controller_source_closure").standalone_supervisor_entries;
+
+pub fn nativeStandaloneSourceContentClosure(allocator: std.mem.Allocator) ![64]u8 {
+    var hash = core.Sha256.init(.{});
+    hash.update("uk.wamr.native-standalone-supervisor-source-v1-content\x00");
+    for (standalone_supervisor_sources) |entry| {
+        const digest = std.fmt.bytesToHex(records.fileIdentity(entry.content), .lower);
+        try physical.bind(allocator, &hash, .{ entry.name, entry.content.len, digest });
+    }
+    return physical.hex(&hash);
+}
+
+pub fn currentStandaloneSourceContentClosure(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repository: []const u8,
+    git: []const u8,
+) ![64]u8 {
+    var retained = try adapter.openPinnedTool(io, git, "tool:git");
+    defer retained.close(io);
+    const before = try source.portableSource(allocator, io, repository, git);
+    for (standalone_supervisor_sources) |entry| {
+        const manifest = try source.trackedManifest(allocator, io, repository, git, entry.name);
+        defer manifest.deinit(allocator);
+        const expected = std.fmt.bytesToHex(records.fileIdentity(entry.content), .lower);
+        if (manifest.bytes != entry.content.len or !std.mem.eql(u8, &manifest.sha256, &expected))
+            return error.UnsafeSource;
+    }
+    const result = try nativeStandaloneSourceContentClosure(allocator);
+    const after = try source.portableSource(allocator, io, repository, git);
+    if (!before.same(after)) return error.SourceChanged;
+    try retained.verify(io);
+    return result;
+}
+
+pub fn nativeStandaloneIdentityBytes(allocator: std.mem.Allocator, source_sha256: []const u8) ![]const u8 {
+    const raw = try std.json.Stringify.valueAlloc(allocator, .{
+        .protocol = "uk.wamr.command-supervisor/1 process-command/1",
+        .schema = "uk.wamr.native-standalone-supervisor-identity",
+        .source_content_closure_sha256 = source_sha256,
+        .version = 1,
+    }, .{});
+    defer allocator.free(raw);
+    return records.canonicalAlloc(allocator, raw);
+}
+
+pub fn validateNativeStandaloneIdentity(allocator: std.mem.Allocator, bytes: []const u8) !void {
+    const closure = try nativeStandaloneSourceContentClosure(allocator);
+    const expected = try nativeStandaloneIdentityBytes(allocator, &closure);
+    defer allocator.free(expected);
+    if (!std.mem.eql(u8, bytes, expected)) return error.ImportIdentityChanged;
+}
+
 pub fn currentReaderSourceContentClosure(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -112,6 +165,9 @@ pub fn validateSourceNames(records_map: std.json.Value) !void {
     } else if (records_map.object.count() == source.closure.len) {
         for (source.closure) |entry|
             _ = try get(records_map, entry.name);
+    } else if (records_map.object.count() == source.previous_candidate_closure.len) {
+        for (source.previous_candidate_closure) |entry|
+            if (!records_map.object.contains(entry.name)) return error.UnsupportedSupervisorSource;
     } else if (records_map.object.count() == source.previous_export_closure.len) {
         for (source.previous_export_closure) |entry|
             if (!records_map.object.contains(entry.name)) return error.UnsupportedSupervisorSource;

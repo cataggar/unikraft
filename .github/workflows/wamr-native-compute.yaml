@@ -230,21 +230,7 @@ jobs:
           echo "Zig native CPU: ${zig_cpu}"
           controller="${WAMR_CI_CONTROLLER:?}"
           test -x "${controller}"
-          describe="$("${controller}" describe --output json-v1)"
-          recorded_target="$(python3 -B -c '
-          import json
-          import sys
-
-          payload = json.load(sys.stdin)
-          target = payload.get("recorded_executable_target")
-          if (payload.get("schema") != "uk.wamr.native-ci-describe" or
-              payload.get("schema_version") != 1 or
-              not isinstance(target, list) or
-              not target or
-              not all(isinstance(item, str) for item in target)):
-              raise SystemExit("native controller describe returned an invalid target")
-          print(" ".join(target))
-          ' <<< "${describe}")"
+          recorded_target="$("${controller}" describe --output target-v1)"
           echo "Recorded supervisor/validator target: ${recorded_target}"
 
       - name: Establish the exact QEMU dynamic runtime before custody
@@ -304,20 +290,9 @@ jobs:
         run: |
           set -euo pipefail
           root=/d/wamr-ci/wamr-native-runtime
-          python3 -B - "${root}" <<'PY'
-          import importlib.util
-          from pathlib import Path
-          import sys
-
-          runtime = Path(sys.argv[1])
-          module = Path("support/build/wamr-native-ci/handoff.py").resolve()
-          spec = importlib.util.spec_from_file_location("wamr_handoff", module)
-          handoff = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(handoff)
-          records = handoff.result_records(runtime / "compute")
-          if len(records) != 33:
-              raise SystemExit("local handoff refused completed native records")
-          PY
+          controller="${WAMR_CI_CONTROLLER:?}"
+          test -x "${controller}"
+          "${controller}" check-local-records --runtime "${root}"
 
       - name: Retain the expressly authorized public-source tiny image bundle
         id: public_bundle

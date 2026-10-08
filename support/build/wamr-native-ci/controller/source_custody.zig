@@ -13,6 +13,7 @@ pub const Entry = inputs.Entry;
 // The embedded bytes make this executable's own compile-time source inputs
 // independently checkable. Git revision/clean-tree admission is owned by PR 02.
 pub const closure = inputs.entries;
+pub const previous_candidate_closure = inputs.previous_candidate_entries;
 pub const previous_closure = inputs.previous_entries;
 pub const previous_native_closure = inputs.previous_native_entries;
 pub const previous_private_closure = inputs.previous_private_entries;
