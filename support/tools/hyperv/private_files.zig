@@ -929,11 +929,11 @@ pub const Locked = struct {
         };
         // std.Io owns the atomic-file mechanism; explicitly observe cleanup errors its
         // deinit normally suppresses so a failed write and failed cleanup stay separate.
+        if (fault == .cleanup) {
+            result.failures.cleanup = .{ .stage = .state_record, .category = .cleanup_failed };
+            return result;
+        }
         if (atomic.file_exists) {
-            if (fault == .cleanup) {
-                result.failures.cleanup = .{ .stage = .state_record, .category = .cleanup_failed };
-                return result;
-            }
             const scratch_name = std.fmt.hex(atomic.file_basename_hex);
             atomic.dir.deleteFile(io, &scratch_name) catch {
                 result.failures.cleanup = .{ .stage = .state_record, .category = .cleanup_failed };

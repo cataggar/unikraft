@@ -87,6 +87,46 @@ pub const Scope = struct {
     bundle: Artifact,
 };
 
+pub const Provenance = struct {
+    public_bundle: Artifact,
+    transport: Artifact,
+    qcow2: Artifact,
+    run: struct { repository: []const u8, run_id: []const u8, run_attempt: []const u8 },
+    lineage: struct {
+        raw_sha256: []const u8,
+        accepted_qcow2_sha256: []const u8,
+        derived_vhd_sha256: []const u8,
+        qcow2_finalization_sha256: []const u8,
+        qcow2_acceptance_sha256: []const u8,
+        fixed_vhd_derivation_gate_sha256: []const u8,
+        fixed_vhd_derivation_sha256: []const u8,
+        final_inspection_sha256: []const u8,
+    },
+    artifact_id: []const u8,
+    inner_zip_sha256: []const u8,
+    container_digest: []const u8,
+};
+pub const Metadata = struct {
+    source: enum { private_bundle, imported_product },
+    reader: ReaderContext,
+    scope: Scope,
+    candidate: Artifact,
+    provenance: Provenance,
+};
+pub const ReaderContext = struct {
+    io: std.Io,
+    repository: []const u8,
+    git: *const files.RetainedFile,
+    controller: *const files.RetainedFile,
+    supervisor: *const files.RetainedFile,
+    validator: *const files.RetainedFile,
+    reader_revision: []const u8,
+    reader_tree: []const u8,
+    validation_output: []const u8,
+    validation_record: Artifact,
+    validation_log: Artifact,
+};
+
 // Only successful construction yields this boundary. The borrowed source must
 // outlive it; authority consumers revalidate it instead of re-parsing metadata.
 pub const Finalized = opaque {
@@ -103,6 +143,35 @@ pub const Finalized = opaque {
     pub fn artifact(self: *Finalized, signal: ?*core.process.SignalCancellation) !Artifact {
         try self.revalidate(signal);
         return self.state().candidate.?.artifact();
+    }
+    /// Borrowed typed metadata from the retained, validated v2 source. This
+    /// view does not reconstruct archive/download custody from a JSON receipt.
+    pub fn metadata(self: *Finalized, signal: ?*core.process.SignalCancellation) !Metadata {
+        try self.revalidate(signal);
+        const owner = self.state();
+        const bundle = try owner.inv.source.bundle();
+        return .{
+            .source = switch (owner.inv.source) {
+                .private_bundle => .private_bundle,
+                .imported_product => .imported_product,
+            },
+            .reader = .{
+                .io = owner.inv.io,
+                .repository = bundle.evidence.repository orelse return error.InvalidContext,
+                .git = &bundle.tools.git,
+                .controller = &bundle.tools.controller,
+                .supervisor = &bundle.tools.supervisor.supervisor,
+                .validator = &bundle.tools.validator,
+                .reader_revision = bundle.tools.before.revision,
+                .reader_tree = bundle.tools.before.tree,
+                .validation_output = owner.inv.validation_output,
+                .validation_record = owner.held.items[0].artifact(),
+                .validation_log = owner.held.items[1].artifact(),
+            },
+            .scope = owner.scope,
+            .candidate = owner.candidate.?.artifact(),
+            .provenance = owner.provenance orelse return error.Version2Required,
+        };
     }
     pub fn result(
         self: *Finalized,
@@ -151,6 +220,7 @@ const State = struct {
     candidate: ?Held = null,
     admission: ?Held = null,
     scope: Scope = undefined,
+    provenance: ?Provenance = null,
     phase: Phase = .inputs,
     publication: files.CommitStatus = .not_committed,
     reserved: bool = false,
@@ -278,6 +348,7 @@ fn finish(owner: *State, existing: bool) !void {
         inline for (.{ "source_revision", "source_tree" }) |key|
             if (!std.mem.eql(u8, try core.contracts.string(receipt.get(key).?), try core.contracts.string(fields.get(key).?)))
                 return error.TransportMismatch;
+        owner.provenance = try provenance(a, value, receipt, manifest.artifact(), transport.artifact());
         admission_bytes = try canonical(a, .{
             .schema = "uk.wamr.direct-compute-admission",
             .version = @as(u8, 2),
@@ -339,6 +410,27 @@ fn finish(owner: *State, existing: bool) !void {
         return error.CandidateBindingChanged;
     owner.phase = .final_revalidation;
     try owner.revalidate(inv.signal);
+}
+
+fn provenance(a: std.mem.Allocator, bundle: std.json.Value, receipt: std.json.ObjectMap, manifest: Artifact, transport: Artifact) !Provenance {
+    var qcow2: ?Artifact = null;
+    for (contracts.layout.artifactNames(.tiny_qcow2_derived_vhd_v2), bundle.object.get("artifacts").?.array.items) |name, item| {
+        if (std.mem.eql(u8, name, "qcow2"))
+            qcow2 = try std.json.parseFromValueLeaky(Artifact, a, item, .{ .allocate = .alloc_always });
+    }
+    return .{
+        .public_bundle = try ownedArtifact(a, manifest),
+        .transport = try ownedArtifact(a, transport),
+        .qcow2 = qcow2 orelse return error.MissingQcow2,
+        .run = try std.json.parseFromValueLeaky(@TypeOf(@as(Provenance, undefined).run), a, bundle.object.get("run").?, .{ .allocate = .alloc_always }),
+        .lineage = try std.json.parseFromValueLeaky(@TypeOf(@as(Provenance, undefined).lineage), a, bundle.object.get("lineage").?, .{ .allocate = .alloc_always }),
+        .artifact_id = try a.dupe(u8, try core.contracts.string(receipt.get("artifact_id").?)),
+        .inner_zip_sha256 = try a.dupe(u8, try core.contracts.string(receipt.get("inner_zip_sha256").?)),
+        .container_digest = try a.dupe(u8, try core.contracts.string(receipt.get("container_digest").?)),
+    };
+}
+fn ownedArtifact(a: std.mem.Allocator, value: Artifact) !Artifact {
+    return .{ .path = try a.dupe(u8, value.path), .sha256 = try a.dupe(u8, value.sha256), .size = value.size };
 }
 
 fn encode(a: std.mem.Allocator, bundle: std.json.Value, scope_bundle: Artifact, settings: Settings) ![]const u8 {
@@ -418,6 +510,27 @@ test "candidate encoding preserves frozen selectors and refuses authorizing edit
         defer changed_document.deinit();
         try std.testing.expectError(error.AuthorityNotAllowed, contracts.validateDirectComputeCandidate(changed_document.value()));
     }
+}
+
+test "candidate typed provenance preserves the validated v2 public and transport bindings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var document = try contracts.parseCanonical(a, @embedFile("goldens/root-bound-v2.json"));
+    defer document.deinit();
+    _ = try contracts.validateLocalImageHandoffWithRoot(document.value(), "/opt/wamr-handoff-golden-stage");
+    var receipt: std.json.ObjectMap = .empty;
+    try receipt.put(a, "artifact_id", .{ .string = "123" });
+    try receipt.put(a, "inner_zip_sha256", .{ .string = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
+    try receipt.put(a, "container_digest", .{ .string = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" });
+    const manifest: Artifact = .{ .path = "/private/bundle.json", .size = 1, .sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" };
+    const transport: Artifact = .{ .path = "/private/transport.json", .size = 2, .sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" };
+    const view = try provenance(a, document.value(), receipt, manifest, transport);
+    try std.testing.expectEqualStrings(view.qcow2.sha256, view.lineage.accepted_qcow2_sha256);
+    try std.testing.expectEqualStrings(document.value().object.get("run").?.object.get("run_id").?.string, view.run.run_id);
+    try std.testing.expectEqualStrings(manifest.sha256, view.public_bundle.sha256);
+    try std.testing.expectEqualStrings(transport.sha256, view.transport.sha256);
+    try std.testing.expectEqualStrings("123", view.artifact_id);
 }
 
 test "candidate cumulative result requires the exact original prefix with Azure NUL padding" {

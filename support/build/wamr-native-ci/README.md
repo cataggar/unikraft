@@ -89,9 +89,9 @@ candidate execution, Python fallback, or production caller changes.
 
 ## Authority contract freeze (#189 PR1; no caller cutover)
 
-`authority/root.zig` is a contract/test surface importing only `hyperv_core`;
-it does not install an authority executable or change the four Python operator
-commands. The goldens call the existing `handoff.py` runtime, plan, decision and
+`authority/root.zig` exports the frozen contracts and native source foundations
+below; it does not install an authority executable or change the four Python
+operator commands. The goldens call the existing `handoff.py` runtime, plan, decision and
 admission constructors. Only external candidate/ledger inputs, executable/ELF
 and process boundaries, time/UUID generation, and physical metadata are stubbed.
 The runtime tree, canonical publication, manifest scan, and content/metadata/
@@ -153,6 +153,96 @@ python3 -B support/build/wamr-native-ci/tests/test_authority_contract_goldens.py
 The native compute and integration runtime jobs run this check before tool
 acquisition and native builds. The full native/Python authority gate remains
 unchanged.
+
+### Native authority foundations (source only)
+
+The exported `wamr_authority` module provides:
+
+* `cli.parse(allocator, argv)` with exactly the four frozen commands, required
+  and repeated options, typed signed integers and approved/denied decisions.
+  It returns help or a typed command without executing anything. Argument
+  strings remain borrowed; `Parsed.deinit` releases repeated-option storage.
+  Unknown options, singleton duplicates and missing inputs are parse errors.
+  Filesystem, finite integer bounds and authority policy are owner checks,
+  not executable discovery.
+* `types` aliases the existing direct-compute/runtime schema types rather than
+  copying their validators. `Command`, `Context`, `Transition`, `Diagnostic`
+  and `Outcome(T)` are the common handler surface. `RuntimeLayout` and borrowed
+  `LoaderInventory` are the copy/probe handoff; no runtime is prepared here.
+* `records` supplies strict canonical typed parsing, UUID normalization and
+  generation, validated plan/template/authorization/admission construction,
+  and their UTF-8 byte-sorted, compact, exact-LF encoders. Parsed records still
+  require their contextual validators; decoding is not custody. A current
+  denial is recordable via `decisionCurrent`, but `admission` additionally
+  requires the existing approved-only `Authorization.current`.
+* `transaction.Record` retains the full private path walk, metadata and fresh
+  content hash. `Transaction` retains its output parent through the immutable
+  writer-lock inode, publishes create-only with file/parent durability, then
+  rechecks the borrowed owner/freshness `Barrier` and retained output. Each
+  output gets one attempt; uncertain and late-failing outputs stay on disk.
+  Multiple-output handlers must retain earlier records between transactions
+  and include every prior output in their final barrier. Large runtime members
+  and the 32-MiB manifest need the runtime-copy streaming writer, not this
+  bounded JSON transaction.
+* `transaction.supervise` delegates to the existing descriptor-based process
+  supervisor with explicit executable/cwd, environment, capture bounds and
+  independent primary/cleanup deadlines. The caller initializes the shared
+  subreaper. Post-run freshness/cancellation failure remains separate from the
+  original primary, stderr and descendant cleanup result. `combineFailures`
+  keeps the first primary, cleanup and recording failures independently.
+
+`handoff.candidate.Finalized.metadata(signal)` is a borrowed typed v2 view
+behind the existing opaque owner. It revalidates the real source and retained
+candidate/sidecar/captures before exposing candidate scope, public-bundle and
+transport artifacts, run, lineage, QCOW2 and transport identifiers. It preserves
+the real `private_bundle` versus `imported_product` source tag and exposes the
+actual retained reader Git/controller/supervisor/validator descriptors,
+repository/current reader revision/tree, and fresh validation output/captures.
+The plan constructor checks its validator/supervisor artifacts against those
+retained descriptors rather than discovering another reader. The plan
+constructor requires `imported_product`; a private bundle plus a syntactically
+valid transport receipt is not archive/download custody. Candidate record
+bytes still have six false approval flags and two zero timestamps, and candidate
+code does not import authority code.
+
+**Unresolved executable context seam:** the library consumes an already live
+`ImportedProduct`-based `Finalized` in the same owning process. This is not an
+adapter from the frozen standalone authority arguments. Reopening the current
+private owner needs independently supplied Git/repository and fresh validation
+output, and authenticates the supplied supervisor to the executing controller.
+The frozen authority flags do not supply those inputs; the sealed Azure runtime
+is not a Git/controller reader context. No PATH lookup, JSON receipt trust,
+new flag, source-identity relaxation or reconstructed former download custody
+has been introduced. Executable integration needs a reviewed owner/context
+acquisition decision, not a success-shaped or refuse-only placeholder binary.
+
+Disjoint next source-module ownership is:
+
+| Todo / file | Interface and responsibility |
+| --- | --- |
+| `authority-runtime-copy` / `authority/runtime_copy.zig` | A retained copy owner exposes `RuntimeLayout` and retained native members, accepts `LoaderInventory`, seals/scans the tree and streams the D/F/L/P manifest and runtime contract. Owns copy budgets, reserved outputs and retained failure evidence. |
+| `authority-runtime-probes` / `authority/runtime_probes.zig` | A retained inventory owner discovers ELF interpreter/DSOs from explicit members/dependencies and exposes `LoaderInventory`. Its verification entry consumes layout/contract plus `Barrier` for the contained loader listing and all sixteen isolated probes. It does not own copy/schema publication. |
+| `authority-native-plan` / `authority/plan.zig` | `run(Context, PlanCommand, *Finalized)` consumes the live imported owner, binds retained runtime/tools/ledger proposal, uses `records.plan` and `approvalTemplate`, independently validates and publishes multiple outputs with final barriers. Context acquisition remains the seam above. |
+| `authority-native-authorization` / `authority/authorization.zig` | `run(Context, AuthorizationCommand)` retains and validates seeded plan/template/runtime/tool records, constructs current approved or denied decisions, validates privately and publishes durably. |
+| `authority-native-admission` / `authority/admission.zig` | `run(Context, AdmitCommand)` retains and validates exact plan/approved current decision/runtime/tool evidence, uses `records.admission`, performs final private validation and publishes durably. No ledger claim, approval consumption or Azure operations. |
+
+Each owner supplies `revalidate`/`deinit` and a typed `Outcome`; its files and
+focused tests are separate. Shared root/build exports and aggregate test wiring
+remain a single integration-owner responsibility. All five source modules can
+start against these foundations and existing validators/seeded records; complete
+runtime preparation joins copy and probes. `authority-executable-integration`
+depends on all five real modules and the reviewed context seam before installing
+anything. Genuine runtime/policy acceptance, caller cutover and Python deletion
+remain separately gated; source tests do not claim those gates passed.
+
+`authority.build.zig test-native` runs the contract and foundation tests and
+compiles a non-test object to check real owner/transaction entry points without
+installing a tool. `test` also runs the unchanged Python goldens. The package
+`test-authority-contracts` includes both checks. Use `-Dtest-root=ABS -j1` with
+an existing owner-private fixture root, and repeat with
+`-Doptimize=ReleaseSafe`; `handoff.build.zig test-candidate` covers the narrow
+typed provenance addition. The test-only private-file cleanup fault works for
+both named atomic files and Linux unnamed atomic files.
 
 ## Native package and boot chain (production caller)
 
