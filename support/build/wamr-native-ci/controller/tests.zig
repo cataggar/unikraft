@@ -95,10 +95,16 @@ test "public product CLI separates trusted and selected transport identities and
         "--container-digest",          digest,
         "--selected-artifact-id",      "11449019167",
         "--selected-container-digest", digest,
+        "--selected-source",           revision,
+        "--selected-tree",             revision,
+        "--selected-run-id",           "37527403296",
+        "--selected-run-attempt",      "2",
     };
     const parsed = try cli.parse(&valid);
     try std.testing.expectEqualStrings("11449019166", parsed.artifact_id.?);
     try std.testing.expectEqualStrings("11449019167", parsed.selected_artifact_id.?);
+    try std.testing.expectEqualStrings("37527403296", parsed.selected_run_id.?);
+    try std.testing.expectEqualStrings("2", parsed.selected_run_attempt.?);
     try std.testing.expectError(error.InvalidUsage, cli.parse(valid[0 .. valid.len - 2]));
     var changed = valid;
     changed[28] = "--artifact-id";
@@ -149,6 +155,46 @@ test "public product CLI refuses missing inputs without a success receipt or out
     try std.testing.expectEqualStrings("", result.stdout);
     try std.testing.expect(std.mem.indexOf(u8, result.stderr, "import-public-source-bundle/inputs") != null);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.openDirAbsolute(std.testing.io, output, .{}));
+}
+
+test "public product CLI publication adapters refuse without output or success text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const revision = "0123456789012345678901234567890123456789";
+    const digest = "0123456789012345678901234567890123456789012345678901234567890123";
+    for ([_]bool{ false, true }) |sealing| {
+        const output = try std.fs.path.join(a, &.{ options.fixture_root, if (sealing) "refused-public-seal" else "refused-public-retention" });
+        const missing = try std.fs.path.join(a, &.{ options.fixture_root, "absent-public-container.zip" });
+        const result = try std.process.run(a, std.testing.io, .{
+            .argv = if (sealing) &.{
+                options.host_controller_cli, "seal-public-source-upload", "--archive",       missing,
+                "--output",                  output,                      "--source-uid",    "1000",
+                "--source-gid",              "1000",                      "--upload-gid",    "1000",
+                "--expected-source",         revision,                    "--expected-tree", revision,
+                "--run-id",                  "1",                         "--run-attempt",   "1",
+                "--expected-archive-sha256", digest,
+            } else &.{
+                options.host_controller_cli, "retain-public-source-download", "--container-archive",         missing,
+                "--output",                  output,                          "--expected-source",           revision,
+                "--expected-tree",           revision,                        "--run-id",                    "1",
+                "--run-attempt",             "1",                             "--expected-archive-sha256",   digest,
+                "--artifact-id",             "123",                           "--container-digest",          digest,
+                "--selected-artifact-id",    "123",                           "--selected-container-digest", digest,
+                "--selected-source",         revision,                        "--selected-tree",             revision,
+                "--selected-run-id",         "1",                             "--selected-run-attempt",      "1",
+            },
+            .cwd = .{ .path = options.repository_root },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, result.term);
+        try std.testing.expectEqualStrings("", result.stdout);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, if (sealing) "seal-public-source-upload/inputs" else "retain-public-source-download/inputs") != null);
+        if (sealing and std.os.linux.geteuid() != 0)
+            try std.testing.expect(std.mem.indexOf(u8, result.stderr, "PrivilegeRequired") != null);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.openDirAbsolute(std.testing.io, output, .{}));
+    }
 }
 
 test "private product CLI closes arguments and refuses unavailable custody without output" {

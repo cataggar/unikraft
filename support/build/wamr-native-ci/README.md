@@ -23,7 +23,8 @@ Every public command requires `--expected-source COMMIT --expected-tree TREE
 --run-id ID --run-attempt ID`. These are independently supplied identities,
 not values inferred from the archive. Source means the actual producer commit
 (including a genuine synthetic PR merge), not another commit with its tree.
-All paths below must be canonical absolute paths with private existing parents.
+All paths below must be canonical absolute paths with private existing parents,
+except the privileged upload seal's root-owned destination parent.
 
 * `public-export --runtime ABS --stage-root ABS --validation-output ABS
   --output ARCHIVE_DIR --git ABS --supervisor ABS --validator ABS` creates the
@@ -39,10 +40,40 @@ All paths below must be canonical absolute paths with private existing parents.
 * `stage-public-source-upload --archive ABS --expected-archive-sha256 HEX
   --output ABS` creates one private standalone upload containing exactly
   `tiny-aot-public-source.zip`; no metadata file or success receipt is added.
+  This `0700`/`0600` product is **not** the workflow's privileged upload seal.
+* `seal-public-source-upload --archive ABS --expected-archive-sha256 HEX
+  --output ABS --source-uid UID --source-gid GID --upload-gid GID` is a narrowly
+  scoped, initial-namespace root operation. It verifies a single-link `0600`
+  source belonging to the expressly supplied source UID/GID, including retained
+  no-follow ancestor custody. It creates a fresh destination only, streams,
+  hashes, reopens and durably publishes the same fixed filename, then seals the
+  directory as root:`upload-gid` `0550` and the file as root:`upload-gid` `0440`.
+  It never changes a pre-existing path, invokes sudo, or relaxes private-file
+  policy. The existing privileged shell caller must explicitly invoke the
+  adapter; unprivileged and user-namespace invocations refuse.
+* `retain-public-source-download --container-archive ABS --output ABS
+  --expected-archive-sha256 INNER_HEX --artifact-id EXPECTED_ID
+  --container-digest EXPECTED_CONTAINER_HEX --selected-artifact-id ACTUAL_ID
+  --selected-container-digest ACTUAL_CONTAINER_HEX --selected-source COMMIT
+  --selected-tree TREE --selected-run-id ID --selected-run-attempt ID` retains
+  an existing owner-private, single-link `0600` raw Actions container and
+  extracts exactly one `tiny-aot-public-source.zip` into a create-only
+  `0700`/`0600` directory. The raw input is not deleted, replaced, rewritten or
+  placed beside the one-file product. Read-only artifact API retrieval and
+  authenticated selection remain the caller's shell/gh responsibility.
+  `download-artifact`'s extracted inner file alone is not a raw-container input.
+  The separate outer codec accepts ZIP32 stored or raw-deflate members and
+  optional signed ZIP32 data descriptors, with a 512 MiB inner limit and a
+  512 MiB + 128 KiB raw-container limit. It refuses duplicate/extra members,
+  alternate names/paths, links, encryption, ZIP64, comments, extra fields,
+  unsupported codecs, CRC/header/descriptor mismatches and trailing data.
+  The inner archive still uses its unchanged strict canonical stored-ZIP codec.
 * `import-public-source-download --download-root ABS --container-archive ABS
   --expected-archive-sha256 INNER_HEX --artifact-id EXPECTED_ID
   --container-digest EXPECTED_CONTAINER_HEX --selected-artifact-id ACTUAL_ID
-  --selected-container-digest ACTUAL_CONTAINER_HEX --output ABS --git ABS
+  --selected-container-digest ACTUAL_CONTAINER_HEX --selected-source COMMIT
+  --selected-tree TREE --selected-run-id ID --selected-run-attempt ID
+  --output ABS --git ABS
   --supervisor ABS --validator ABS` consumes an exact-ID redownload containing
   exactly that one regular, single-link filename. The expected upload metadata
   and actual selection are separate trusted caller inputs. It hashes the
@@ -50,9 +81,12 @@ All paths below must be canonical absolute paths with private existing parents.
   the artifact ID, container digest and inner digest are different types and
   are never interchangeable. This is a local consumer, not a network downloader
   or remote artifact authenticator.
-  The raw container is an opaque authenticated transport input, not a native
-  ZIP extraction API; the exact extracted member is independently authenticated
-  against the trusted inner digest.
+  Compose `retain-public-source-download` with this importer, passing its
+  one-file output directory and the original retained container path. The
+  importer treats the container as opaque authenticated bytes and independently
+  verifies the extracted inner file; it does not infer expected metadata from
+  selected metadata, filenames or a receipt. Selected source/run arguments are
+  mandatory separate inputs, not aliases of their expected counterparts.
 * `import-public-source-bundle --archive ABS --output ABS --git ABS
   --supervisor ABS --validator ABS [--expected-archive-sha256 HEX]` preserves
   the frozen historical v1 import. Digest omission remains confined to the
@@ -86,6 +120,11 @@ Failures are explicit refused/poisoned outcomes with phase and publication
 durability; partially created state is non-resumable and retained.
 Authority stays `not_admitted`; there are no cloud operations, approvals,
 candidate execution, Python fallback, or production caller changes.
+The additive seal/extraction commands are source-tested adapters only.
+Actual privileged workflow ownership parity, genuine Actions container/profile
+parity, private-runtime product acceptance, workflow cutover and Python deletion
+remain separately gated. Tests simulate privilege only in fresh fixture roots;
+they do not substitute user-writable products for root-owned production custody.
 
 ## Authority contract freeze (#189 PR1; no caller cutover)
 

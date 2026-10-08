@@ -4,7 +4,7 @@ const core = @import("hyperv_core");
 const files = core.private_files;
 const contracts = core.contracts;
 
-pub const Action = enum { build, boot, diagnostics, describe, @"--identity", @"supervisor-source-closure", @"reader-source-closure", records, @"readonly-records", @"local-consumer-custody", @"handoff-inspect", @"handoff-inspect-legacy", @"public-validator-build", @"local-handoff-revalidation", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation", @"import-handoff-revalidation", @"private-export", @"private-validate", @"public-export", @"public-archive", @"verify-public-source-bundle", @"stage-public-source-upload", @"import-public-source-bundle", @"import-public-source-download", candidate, @"candidate-inspect", @"candidate-result" };
+pub const Action = enum { build, boot, diagnostics, describe, @"--identity", @"supervisor-source-closure", @"reader-source-closure", records, @"readonly-records", @"local-consumer-custody", @"handoff-inspect", @"handoff-inspect-legacy", @"public-validator-build", @"local-handoff-revalidation", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation", @"import-handoff-revalidation", @"private-export", @"private-validate", @"public-export", @"public-archive", @"verify-public-source-bundle", @"stage-public-source-upload", @"seal-public-source-upload", @"retain-public-source-download", @"import-public-source-bundle", @"import-public-source-download", candidate, @"candidate-inspect", @"candidate-result" };
 pub const Command = struct {
     action: Action,
     runtime: ?[]const u8 = null,
@@ -29,6 +29,13 @@ pub const Command = struct {
     container_digest: ?contracts.Sha256 = null,
     selected_artifact_id: ?[]const u8 = null,
     selected_container_digest: ?contracts.Sha256 = null,
+    selected_source_revision: ?[]const u8 = null,
+    selected_source_tree: ?[]const u8 = null,
+    selected_run_id: ?[]const u8 = null,
+    selected_run_attempt: ?[]const u8 = null,
+    source_uid: ?u32 = null,
+    source_gid: ?u32 = null,
+    upload_gid: ?u32 = null,
     bundle: ?[]const u8 = null,
     candidate: ?[]const u8 = null,
     attempt_id: ?[]const u8 = null,
@@ -111,7 +118,7 @@ fn parseCandidate(args: []const []const u8, action: Action) !Command {
 
 pub fn isPublic(action: Action) bool {
     return switch (action) {
-        .@"public-export", .@"public-archive", .@"verify-public-source-bundle", .@"stage-public-source-upload", .@"import-public-source-bundle", .@"import-public-source-download" => true,
+        .@"public-export", .@"public-archive", .@"verify-public-source-bundle", .@"stage-public-source-upload", .@"seal-public-source-upload", .@"retain-public-source-download", .@"import-public-source-bundle", .@"import-public-source-download" => true,
         else => false,
     };
 }
@@ -121,8 +128,9 @@ fn parsePublic(args: []const []const u8, action: Action) !Command {
     var result: Command = .{ .action = action };
     const packing = action == .@"public-export" or action == .@"public-archive";
     const importing = action == .@"import-public-source-bundle" or action == .@"import-public-source-download";
-    const download = action == .@"import-public-source-download";
-    const reading = action == .@"verify-public-source-bundle" or action == .@"stage-public-source-upload" or action == .@"import-public-source-bundle";
+    const download = action == .@"import-public-source-download" or action == .@"retain-public-source-download";
+    const sealing = action == .@"seal-public-source-upload";
+    const reading = action == .@"verify-public-source-bundle" or action == .@"stage-public-source-upload" or sealing or action == .@"import-public-source-bundle";
     var i: usize = 2;
     while (i < args.len) : (i += 2) {
         const flag = args[i];
@@ -156,7 +164,7 @@ fn parsePublic(args: []const []const u8, action: Action) !Command {
         } else if (std.mem.eql(u8, flag, "--archive") and result.archive == null and reading) {
             files.absoluteFilePath(value) catch return error.InvalidUsage;
             result.archive = value;
-        } else if (std.mem.eql(u8, flag, "--download-root") and result.download_root == null and download) {
+        } else if (std.mem.eql(u8, flag, "--download-root") and result.download_root == null and action == .@"import-public-source-download") {
             files.absoluteFilePath(value) catch return error.InvalidUsage;
             result.download_root = value;
         } else if (std.mem.eql(u8, flag, "--container-archive") and result.container_archive == null and download) {
@@ -172,6 +180,24 @@ fn parsePublic(args: []const []const u8, action: Action) !Command {
             result.container_digest = contracts.parseSha256(value) catch return error.InvalidUsage;
         } else if (std.mem.eql(u8, flag, "--selected-container-digest") and result.selected_container_digest == null and download) {
             result.selected_container_digest = contracts.parseSha256(value) catch return error.InvalidUsage;
+        } else if (std.mem.eql(u8, flag, "--selected-source") and result.selected_source_revision == null and download) {
+            try sourceIdentity(value);
+            result.selected_source_revision = value;
+        } else if (std.mem.eql(u8, flag, "--selected-tree") and result.selected_source_tree == null and download) {
+            try sourceIdentity(value);
+            result.selected_source_tree = value;
+        } else if (std.mem.eql(u8, flag, "--selected-run-id") and result.selected_run_id == null and download) {
+            try identifier(value);
+            result.selected_run_id = value;
+        } else if (std.mem.eql(u8, flag, "--selected-run-attempt") and result.selected_run_attempt == null and download) {
+            try identifier(value);
+            result.selected_run_attempt = value;
+        } else if (std.mem.eql(u8, flag, "--source-uid") and result.source_uid == null and sealing) {
+            result.source_uid = try ownerId(value);
+        } else if (std.mem.eql(u8, flag, "--source-gid") and result.source_gid == null and sealing) {
+            result.source_gid = try ownerId(value);
+        } else if (std.mem.eql(u8, flag, "--upload-gid") and result.upload_gid == null and sealing) {
+            result.upload_gid = try ownerId(value);
         } else if (std.mem.eql(u8, flag, "--git") and result.git == null and (packing or importing)) {
             files.absoluteFilePath(value) catch return error.InvalidUsage;
             result.git = value;
@@ -192,11 +218,24 @@ fn parsePublic(args: []const []const u8, action: Action) !Command {
     if (action == .@"public-export" and result.runtime == null) return error.InvalidUsage;
     if (reading and result.archive == null) return error.InvalidUsage;
     if (!packing and action != .@"import-public-source-bundle" and result.inner_digest == null) return error.InvalidUsage;
-    if (download and (result.download_root == null or result.container_archive == null or
+    if (action == .@"import-public-source-download" and result.download_root == null) return error.InvalidUsage;
+    if (sealing and (result.source_uid == null or result.source_gid == null or result.upload_gid == null))
+        return error.InvalidUsage;
+    if (download and (result.container_archive == null or
         result.artifact_id == null or result.container_digest == null or
-        result.selected_artifact_id == null or result.selected_container_digest == null))
+        result.selected_artifact_id == null or result.selected_container_digest == null or
+        result.selected_source_revision == null or result.selected_source_tree == null or
+        result.selected_run_id == null or result.selected_run_attempt == null))
         return error.InvalidUsage;
     return result;
+}
+
+fn ownerId(value: []const u8) !u32 {
+    if (value.len == 0 or value.len > 10 or (value.len > 1 and value[0] == '0')) return error.InvalidUsage;
+    for (value) |digit| if (!std.ascii.isDigit(digit)) return error.InvalidUsage;
+    const id = std.fmt.parseInt(u32, value, 10) catch return error.InvalidUsage;
+    if (id == std.math.maxInt(u32)) return error.InvalidUsage;
+    return id;
 }
 
 fn identifier(value: []const u8) !void {

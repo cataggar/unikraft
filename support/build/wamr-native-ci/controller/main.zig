@@ -352,7 +352,7 @@ pub fn main(init: std.process.Init) void {
         .@"import-native-revalidation" => unreachable,
         .@"import-handoff-revalidation" => unreachable,
         .@"private-export", .@"private-validate" => unreachable,
-        .@"public-export", .@"public-archive", .@"verify-public-source-bundle", .@"stage-public-source-upload", .@"import-public-source-bundle", .@"import-public-source-download" => unreachable,
+        .@"public-export", .@"public-archive", .@"verify-public-source-bundle", .@"stage-public-source-upload", .@"seal-public-source-upload", .@"retain-public-source-download", .@"import-public-source-bundle", .@"import-public-source-download" => unreachable,
     }
 }
 
@@ -437,6 +437,49 @@ fn publicCommand(init: std.process.Init, command: controller.cli.Command) void {
         .run_id = command.run_id.?,
         .run_attempt = command.run_attempt.?,
     };
+    if (command.action == .@"seal-public-source-upload") {
+        const result = transport.publication.sealUpload(.{
+            .allocator = allocator,
+            .io = init.io,
+            .source_path = command.archive.?,
+            .source_uid = command.source_uid.?,
+            .source_gid = command.source_gid.?,
+            .upload_gid = command.upload_gid.?,
+            .output_path = command.output.?,
+            .context = context,
+            .inner_digest = .{ .bytes = command.inner_digest.? },
+            .cancel = signal.flag(),
+        });
+        var sealed = switch (result) {
+            .success => |value| value,
+            .refused, .poisoned => |diagnostic| publicFailed(init.io, stage, diagnostic),
+        };
+        defer sealed.deinit(init.io);
+        sealed.revalidate(init.io, signal.flag()) catch |err| failed(init.io, stage, "", err);
+        var stdout = std.Io.File.stdout().writerStreaming(init.io, &.{});
+        stdout.interface.print("Public source archive SHA-256: {s}\n", .{std.fmt.bytesToHex(sealed.digest, .lower)}) catch refused(init.io);
+        return;
+    }
+    if (command.action == .@"retain-public-source-download") {
+        const identities = publicDownloadIdentities(command, context);
+        const result = transport.actions_container.retainDownload(.{
+            .allocator = allocator,
+            .io = init.io,
+            .container_path = command.container_archive.?,
+            .output_path = command.output.?,
+            .expected = identities.expected,
+            .selection = identities.selection,
+            .cancel = signal.flag(),
+        });
+        var retained = switch (result) {
+            .success => |value| value,
+            .refused, .poisoned => |diagnostic| publicFailed(init.io, stage, diagnostic),
+        };
+        defer retained.deinit(init.io);
+        retained.revalidate(init.io, signal.flag()) catch |err| failed(init.io, stage, "", err);
+        std.Io.File.stdout().writeStreamingAll(init.io, "Raw public source container retained and inner ZIP verified; authority=not_admitted.\n") catch refused(init.io);
+        return;
+    }
     if (command.action == .@"public-export" or command.action == .@"public-archive") {
         const result = product.exportArchive(.{
             .allocator = allocator,
@@ -500,23 +543,12 @@ fn publicCommand(init: std.process.Init, command: controller.cli.Command) void {
             .digest = if (command.inner_digest) |digest| .{ .bytes = digest } else null,
         } }
     else blk: {
-        const expected: transport.Expected = .{
-            .upload = .{
-                .context = context,
-                .artifact_id = transport.ArtifactId.parse(command.artifact_id.?) catch refused(init.io),
-                .container_digest = .{ .bytes = command.container_digest.? },
-            },
-            .inner_digest = .{ .bytes = command.inner_digest.? },
-        };
+        const identities = publicDownloadIdentities(command, context);
         break :blk .{ .exact_download = .{
             .path = command.download_root.?,
             .container_path = command.container_archive.?,
-            .expected = expected,
-            .selection = .{ .upload = .{
-                .context = context,
-                .artifact_id = transport.ArtifactId.parse(command.selected_artifact_id.?) catch refused(init.io),
-                .container_digest = .{ .bytes = command.selected_container_digest.? },
-            } },
+            .expected = identities.expected,
+            .selection = identities.selection,
         } };
     };
     const result = product.importBundle(.{
@@ -535,6 +567,33 @@ fn publicCommand(init: std.process.Init, command: controller.cli.Command) void {
     defer imported.deinit();
     imported.revalidate(&signal) catch |err| failed(init.io, stage, "", err);
     std.Io.File.stdout().writeStreamingAll(init.io, "Public source handoff imported; authority=not_admitted.\n") catch refused(init.io);
+}
+
+fn publicDownloadIdentities(command: controller.cli.Command, context: handoff.public_archive.Context) struct {
+    expected: handoff.public_transport.Expected,
+    selection: handoff.public_transport.DownloadSelection,
+} {
+    const transport = handoff.public_transport;
+    return .{
+        .expected = .{
+            .upload = .{
+                .context = context,
+                .artifact_id = transport.ArtifactId.parse(command.artifact_id.?) catch unreachable,
+                .container_digest = .{ .bytes = command.container_digest.? },
+            },
+            .inner_digest = .{ .bytes = command.inner_digest.? },
+        },
+        .selection = .{ .upload = .{
+            .context = .{
+                .source_revision = command.selected_source_revision.?,
+                .source_tree = command.selected_source_tree.?,
+                .run_id = command.selected_run_id.?,
+                .run_attempt = command.selected_run_attempt.?,
+            },
+            .artifact_id = transport.ArtifactId.parse(command.selected_artifact_id.?) catch unreachable,
+            .container_digest = .{ .bytes = command.selected_container_digest.? },
+        } },
+    };
 }
 
 fn publicFailed(io: std.Io, stage: []const u8, diagnostic: anytype) noreturn {
@@ -565,8 +624,10 @@ fn usage(io: std.Io) noreturn {
             "       uk-wamr-native-ci candidate-result --bundle ABS/bundle.json --candidate ABS --validation-output ABS --git ABS --supervisor ABS --validator ABS --serial-first ABS [--serial-second ABS]\n" ++
             "       uk-wamr-native-ci public-export|public-archive --stage-root ABS --validation-output ABS --output ABS --git ABS --supervisor ABS --validator ABS --expected-source COMMIT --expected-tree TREE --run-id ID --run-attempt ID [--runtime ABS for public-export]\n" ++
             "       uk-wamr-native-ci verify-public-source-bundle|stage-public-source-upload --archive ABS --expected-source COMMIT --expected-tree TREE --run-id ID --run-attempt ID --expected-archive-sha256 HEX [--output ABS for upload]\n" ++
+            "       uk-wamr-native-ci seal-public-source-upload --archive ABS --output ABS --source-uid UID --source-gid GID --upload-gid GID --expected-source COMMIT --expected-tree TREE --run-id ID --run-attempt ID --expected-archive-sha256 HEX (initial-namespace root only)\n" ++
+            "       uk-wamr-native-ci retain-public-source-download --container-archive ABS --output ABS --expected-source COMMIT --expected-tree TREE --run-id ID --run-attempt ID --expected-archive-sha256 HEX --artifact-id ID --container-digest HEX --selected-artifact-id ID --selected-container-digest HEX --selected-source COMMIT --selected-tree TREE --selected-run-id ID --selected-run-attempt ID\n" ++
             "       uk-wamr-native-ci import-public-source-bundle --archive ABS --output ABS --git ABS --supervisor ABS --validator ABS --expected-source COMMIT --expected-tree TREE --run-id ID --run-attempt ID [--expected-archive-sha256 HEX] (historical v1 only)\n" ++
-            "       uk-wamr-native-ci import-public-source-download --download-root ABS --container-archive ABS --output ABS --git ABS --supervisor ABS --validator ABS --expected-source COMMIT --expected-tree TREE --run-id ID --run-attempt ID --expected-archive-sha256 HEX --artifact-id ID --container-digest HEX --selected-artifact-id ID --selected-container-digest HEX\n" ++
+            "       uk-wamr-native-ci import-public-source-download --download-root ABS --container-archive ABS --output ABS --git ABS --supervisor ABS --validator ABS --expected-source COMMIT --expected-tree TREE --run-id ID --run-attempt ID --expected-archive-sha256 HEX --artifact-id ID --container-digest HEX --selected-artifact-id ID --selected-container-digest HEX --selected-source COMMIT --selected-tree TREE --selected-run-id ID --selected-run-attempt ID\n" ++
             "       uk-wamr-native-ci local-consumer-custody --runtime ABS --expected-build-start-sha256 HEX --expected-boot-inputs-sha256 HEX\n" ++
             "       uk-wamr-native-ci handoff-inspect --runtime ABS --output ABS\n" ++
             "       uk-wamr-native-ci handoff-inspect-legacy --runtime ABS --output ABS\n" ++
