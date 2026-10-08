@@ -152,7 +152,7 @@ pub fn historical(
         .context = context,
         .digest = .{ .bytes = digest },
     } };
-    const Fault = enum { foreign_output, materialization, copy_sync, native_identity, publication_unknown, publication_sync, final_collision, final_revalidation };
+    const Fault = enum { foreign_output, materialization, copy_sync, native_identity, native_command, publication_unknown, publication_sync, final_collision, final_revalidation };
     for (std.enums.values(Fault)) |fault| {
         const name = @tagName(fault);
         const output = try work.join(name);
@@ -178,6 +178,7 @@ pub fn historical(
                 else => null,
             },
             .publication_collision = fault == .final_collision,
+            .native_command_refusal = fault == .native_command,
             .change_before_final_revalidation = fault == .final_revalidation,
         });
         std.debug.print("historical composition {s}: {any}\n", .{ name, result });
@@ -191,13 +192,14 @@ pub fn historical(
             .foreign_output => products.Phase.reserved,
             .materialization => .materialized,
             .copy_sync => .copied,
-            .native_identity => .native_validation,
+            .native_identity, .native_command => .native_validation,
             .final_revalidation => .final_revalidation,
             else => .publication,
         }, diagnostic.phase);
         try std.testing.expectEqual(switch (fault) {
             .foreign_output, .materialization => error.OutputExists,
             .native_identity => error.InvalidValidator,
+            .native_command => error.StageRefused,
             .final_collision => error.PathAlreadyExists,
             .final_revalidation => error.FileChanged,
             else => error.AmbiguousWrite,
@@ -226,6 +228,17 @@ pub fn historical(
             defer copied.close(io);
             try std.testing.expectEqual(metadata.selected[0].size, (try copied.stat(io)).size);
         }
+        if (fault == .native_command) {
+            const record = try work.read("native_command/private/native-validation/evidence/command-import-native-revalidation.json");
+            var document = try handoff.contracts.parseCanonical(a, record);
+            defer document.deinit();
+            try std.testing.expectEqual(@as(i32, 1), try core.contracts.integer(i32, document.value().object.get("exit_code").?));
+            const changed = try work.read("native_command/candidate-bundle.json");
+            try std.testing.expectEqual(@as(u8, '!'), changed[0]);
+            const log = try work.root.openFile(io, "native_command/private/native-validation/private/import-native-revalidation.log", .{});
+            defer log.close(io);
+            try std.testing.expect((try log.stat(io)).size > 0);
+        }
     }
     const imported = products.importBundle(.{ .allocator = a, .io = io, .repository = repository, .input = input, .output = try work.join("success"), .tools = tools });
     if (imported != .success) std.debug.print("historical import: {any}\n", .{imported});
@@ -244,7 +257,7 @@ pub fn historical(
     if (finalized != .success) std.debug.print("historical candidate: {any}\n", .{finalized});
     try std.testing.expect(finalized == .success);
     defer finalized.success.deinit();
-    try serialCases(work, finalized.success, owner.bundle.?.evidence.root);
+    _ = try finalized.success.result(try std.fs.path.join(a, &.{ owner.bundle.?.evidence.root, "boots/raw-x2apic/serial" }), null, null);
     try rehashedPayload(work, stage, repository, tools, context, &metadata);
 }
 
@@ -286,7 +299,7 @@ fn rehashedPayload(work: Workspace, stage: []const u8, repository: []const u8, t
     }
     try std.testing.expect(result == .poisoned);
     try std.testing.expectEqual(products.Phase.materialized, result.poisoned.phase);
-    try std.testing.expectEqual(error.EvidenceChanged, result.poisoned.err);
+    try std.testing.expectEqual(error.SerialChanged, result.poisoned.err);
     try std.testing.expectEqual(files.CommitStatus.not_committed, result.poisoned.publication);
     try work.absent("rehashed-payload/bundle.json");
     try std.testing.expectEqualSlices(u8, &before, &try work.digest("rehashed-payload.zip"));
@@ -377,6 +390,7 @@ pub fn local(a: std.mem.Allocator, io: std.Io, stage: []const u8, repository: []
     defer finalized.success.deinit();
     try std.testing.expect((try finalized.success.inspect(null)).authority == .not_admitted);
     try serialCases(work, finalized.success, stage);
+    try privateLineage(work, &bundle, repository, tools);
     try cliCollision(work, stage, repository, tools);
     try changedInputs(work, finalized.success, &bundle, repository, tools);
 }
@@ -436,6 +450,112 @@ fn localReceipt(work: Workspace, bundle: *controller.accepted_run.PrivateBundle)
     defer file.close(work.io);
     try file.writePositionalAll(work.io, receipt, 0);
     try file.sync(work.io);
+}
+
+fn overwrite(io: std.Io, path: []const u8, bytes: []const u8) !void {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write, .follow_symlinks = false });
+    defer file.close(io);
+    try file.setLength(io, bytes.len);
+    try file.writePositionalAll(io, bytes, 0);
+    try file.sync(io);
+}
+
+fn rehashRecord(work: Workspace, stage: []const u8, manifest: std.json.Value, filename: []const u8, role: []const u8, record: std.json.Value) ![]const u8 {
+    const bytes = try canonical(work.a, record);
+    const digest = try work.a.dupe(u8, &std.fmt.bytesToHex(zip.sha256(bytes), .lower));
+    const evidence = try std.fs.path.join(work.a, &.{ stage, "evidence", filename });
+    const artifact = try std.fs.path.join(work.a, &.{ stage, "artifacts", role });
+    try overwrite(work.io, evidence, bytes);
+    try overwrite(work.io, artifact, bytes);
+    for ([_][]const u8{ "artifacts", "evidence" }) |key| {
+        for (manifest.object.get(key).?.array.items) |item| {
+            const path = item.object.get("path").?.string;
+            if (std.mem.eql(u8, path, artifact) or std.mem.eql(u8, path, evidence)) {
+                item.object.getPtr("size").?.* = .{ .integer = @intCast(bytes.len) };
+                item.object.getPtr("sha256").?.* = .{ .string = digest };
+            }
+        }
+    }
+    return digest;
+}
+
+fn privateLineage(work: Workspace, source: *controller.accepted_run.PrivateBundle, repository: []const u8, tools: controller.import_validator_build.LocalTools) !void {
+    var raw = try files.readSensitiveFile(work.io, work.a, source.manifest.file, handoff.layout.max_json_bytes, .private);
+    defer raw.deinit();
+    var document = try handoff.contracts.parseCanonical(work.a, raw.bytes());
+    defer document.deinit();
+    const value = document.value().object;
+    const run = value.get("run").?.object;
+    var metadata = try archive.Metadata.fromRootBound(work.a, raw.bytes(), source.evidence.root, .{
+        .repository = run.get("repository").?.string,
+        .run_id = run.get("run_id").?.string,
+        .run_attempt = run.get("run_attempt").?.string,
+        .source_revision = source.evidence.source.revision,
+        .source_tree = source.evidence.source.tree,
+        .wamr_revision = controller.custody_limits.wamr_revision,
+    });
+    defer metadata.deinit();
+    try work.root.createDir(work.io, "lineage-stage", .fromMode(0o700));
+    const stage = try work.join("lineage-stage");
+    const directory = try files.Directory.open(work.io, stage);
+    defer directory.close(work.io);
+    var budget: copy.Budget = .{};
+    for (metadata.selected) |member| {
+        var input = try files.RetainedFile.open(work.io, try std.fs.path.join(work.a, &.{ source.evidence.root, member.name }), .private);
+        defer input.close(work.io);
+        const copied = try copy.copyRetained(work.a, work.io, &input, directory.dir, stage, member.name, member.limit, &budget, .{});
+        try std.testing.expectEqualSlices(u8, &std.fmt.bytesToHex(member.sha256, .lower), &copied.sha256);
+    }
+    const original = try metadata.rootBoundBundle(work.a, stage);
+    try work.put("lineage-stage/bundle.json", original);
+    {
+        var accepted = try controller.accepted_run.PrivateBundle.open(work.a, work.io, &directory, stage, repository, tools, null);
+        defer accepted.deinit();
+        try accepted.revalidate(null);
+    }
+    var manifest = try handoff.contracts.parseCanonical(work.a, original);
+    defer manifest.deinit();
+    var acceptance = try handoff.contracts.parseCanonical(work.a, try work.read("lineage-stage/evidence/qcow2-acceptance.json"));
+    defer acceptance.deinit();
+    acceptance.value().object.get("accepted_qcow2").?.object.getPtr("sha256").?.* =
+        .{ .string = "0000000000000000000000000000000000000000000000000000000000000000" };
+    const acceptance_hash = try rehashRecord(work, stage, manifest.value(), "qcow2-acceptance.json", "qcow2_acceptance", acceptance.value());
+    var gate = try handoff.contracts.parseCanonical(work.a, try work.read("lineage-stage/evidence/fixed-vhd-derivation-gate.json"));
+    defer gate.deinit();
+    gate.value().object.getPtr("qcow2_acceptance_sha256").?.* = .{ .string = acceptance_hash };
+    const gate_hash = try rehashRecord(work, stage, manifest.value(), "fixed-vhd-derivation-gate.json", "fixed_vhd_derivation_gate", gate.value());
+    var inspection = try handoff.contracts.parseCanonical(work.a, try work.read("lineage-stage/evidence/final-inspection.json"));
+    defer inspection.deinit();
+    const inspection_records = inspection.value().object.get("records").?.object;
+    inspection_records.getPtr("qcow2-acceptance.json").?.* = .{ .string = acceptance_hash };
+    inspection_records.getPtr("fixed-vhd-derivation-gate.json").?.* = .{ .string = gate_hash };
+    const inspection_hash = try rehashRecord(work, stage, manifest.value(), "final-inspection.json", "final_inspection", inspection.value());
+    var result = try handoff.contracts.parseCanonical(work.a, try work.read("lineage-stage/artifacts/local_result"));
+    defer result.deinit();
+    const records = result.value().object.get("records").?.object;
+    records.getPtr("qcow2-acceptance.json").?.* = .{ .string = acceptance_hash };
+    records.getPtr("fixed-vhd-derivation-gate.json").?.* = .{ .string = gate_hash };
+    records.getPtr("final-inspection.json").?.* = .{ .string = inspection_hash };
+    const result_bytes = try canonical(work.a, result.value());
+    try overwrite(work.io, try work.join("lineage-stage/artifacts/local_result"), result_bytes);
+    for (manifest.value().object.get("artifacts").?.array.items) |item| {
+        if (std.mem.eql(u8, std.fs.path.basename(item.object.get("path").?.string), "local_result")) {
+            item.object.getPtr("size").?.* = .{ .integer = @intCast(result_bytes.len) };
+            item.object.getPtr("sha256").?.* = .{ .string = try work.a.dupe(u8, &std.fmt.bytesToHex(zip.sha256(result_bytes), .lower)) };
+        }
+    }
+    const lineage = manifest.value().object.get("lineage").?.object;
+    lineage.getPtr("qcow2_acceptance_sha256").?.* = .{ .string = acceptance_hash };
+    lineage.getPtr("fixed_vhd_derivation_gate_sha256").?.* = .{ .string = gate_hash };
+    lineage.getPtr("final_inspection_sha256").?.* = .{ .string = inspection_hash };
+    const rehashed = try canonical(work.a, manifest.value());
+    try overwrite(work.io, try work.join("lineage-stage/bundle.json"), rehashed);
+    var envelope = try handoff.contracts.parseCanonical(work.a, rehashed);
+    defer envelope.deinit();
+    _ = try handoff.contracts.validateLocalImageHandoffWithRoot(envelope.value(), stage);
+    try std.testing.expectError(error.InvalidImageChain, controller.accepted_run.PrivateBundle.open(work.a, work.io, &directory, stage, repository, tools, null));
+    try std.testing.expectEqualStrings(rehashed, try work.read("lineage-stage/bundle.json"));
+    try source.revalidate(null);
 }
 
 fn serialCases(work: Workspace, owner: *candidate.Finalized, stage: []const u8) !void {

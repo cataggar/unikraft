@@ -3604,7 +3604,7 @@ fn trustedHistoricalFixture(comptime composition: bool) !void {
     try writeFixtureFile(io, root, "bundle.json", private_bytes);
     if (composition) {
         try @import("handoff_composition_tests").historical(a, io, &accepted, stage_root_path, reader_repository, local_tools);
-        try @import("local_acceptance_tests.zig").composition(a, io, stage_root_path);
+        try @import("local_acceptance_tests.zig").composition(a, io, stage_root_path, reader_repository);
         return;
     }
     try writeFixtureFile(io, root, "evidence/private-inspection-diagnostic.json", "{}\n");

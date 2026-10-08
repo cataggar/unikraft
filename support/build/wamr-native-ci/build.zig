@@ -185,7 +185,7 @@ pub fn build(b: *std.Build) void {
     controller_options.addOption([]const u8, "python_executable", b.findProgram(&.{"python3"}, &.{}) catch @panic("Python required for handoff compatibility fixtures"));
     controller_options.addOptionPath("miz_package", b.dependency("public_image", .{ .target = target, .optimize = optimize }).builder.dependency("miz_source", .{ .target = target, .optimize = optimize }).path("."));
     controller_options.addOption([]const u8, "fixture_root", std.fs.path.resolve(b.allocator, &.{
-        b.graph.cache.cwd, b.cache_root.path orelse ".",
+        b.graph.cache.cwd, b.option([]const u8, "controller-fixture-root", "Existing absolute owner-private source fixture root") orelse b.cache_root.path orelse ".",
     }) catch @panic("cannot resolve private controller test root"));
     const host_core = b.createModule(.{
         .root_source_file = b.path("../../tools/hyperv/core.zig"),

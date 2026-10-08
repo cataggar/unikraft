@@ -464,7 +464,7 @@ pub fn qualify(a: std.mem.Allocator, io: std.Io, stage: []const u8) !void {
     try together(io, fixtures.items, Fixture.qualifyProcess);
 }
 
-pub fn composition(a: std.mem.Allocator, io: std.Io, stage: []const u8) !void {
+pub fn composition(a: std.mem.Allocator, io: std.Io, stage: []const u8, reader_repository: []const u8) !void {
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{});
     defer parent.close(io);
     const name = try std.fmt.allocPrint(a, "private-composition-{d}", .{std.os.linux.getpid()});
@@ -479,6 +479,12 @@ pub fn composition(a: std.mem.Allocator, io: std.Io, stage: []const u8) !void {
         .stage = stage,
     };
     try fixture.prepare(io);
+    const historical = try std.process.run(a, io, .{
+        .argv = &.{ options.git_executable, "-C", reader_repository, "-c", "gc.auto=0", "-c", "maintenance.auto=false", "fetch", "-q", "--depth=1", "--no-tags", options.repository_root, fixture.revision },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, historical.term);
     const exported = try std.fs.path.join(a, &.{ work, "private-products/native-export" });
     var env = std.process.Environ.Map.init(a);
     defer env.deinit();
@@ -497,7 +503,7 @@ pub fn composition(a: std.mem.Allocator, io: std.Io, stage: []const u8) !void {
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("Private handoff exported; authority=not_admitted.\n", result.stdout);
     try std.testing.expectEqualStrings("", result.stderr);
-    try @import("handoff_composition_tests").local(a, io, exported, fixture.repository, .{
+    try @import("handoff_composition_tests").local(a, io, exported, reader_repository, .{
         .git = try std.fs.path.join(a, &.{ fixture.runtime, "host-tools/git" }),
         .supervisor = try std.process.executablePathAlloc(io, a),
         .validator = options.import_validator,

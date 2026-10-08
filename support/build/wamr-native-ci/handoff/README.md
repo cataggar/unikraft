@@ -166,17 +166,26 @@ parity or an accepted public CI producer:
 zig build --build-file support/build/wamr-native-ci/build.zig \
   test-handoff-composition --system /absolute/system \
   --cache-dir /absolute/private-cache --global-cache-dir /absolute/global \
+  -Dcontroller-fixture-root=/absolute/private-fixtures \
   -Doptimize=Debug -j1
 ```
 
+Precreate the owner-private fixture/cache roots and their ancestors before
+capturing inputs; avoid a live controller/session metadata directory as a fixture
+ancestor. The local fixture uses synthetic guest artifacts and real owner
+constructors, not guest or hardware qualification. Its current reader checkout
+is separate from the historical producer, whose genuine Git objects are retained.
 Repeat with `ReleaseSafe`. Fixed test-only faults exercise materialization and
-copy failures, wrong-role native validator identity, immutable final collisions,
+copy failures, wrong-role native validator identity, genuine supervised-command
+refusal with retained records/logs, immutable final collisions,
 uncertain/visible-not-durable publication and final retained-owner revalidation.
 Candidate cases cover admission-first collisions/sync, final collision after the
 sidecar, cancellation between publications, retained source/parent/executable
 changes, and serial incomplete/prefix/padding/overflow/replacement boundaries.
 A fully rehashed historical ZIP payload passes envelope verification but fails
-native evidence acceptance. Refusals retain input/foreign bytes and private
+native evidence acceptance. A copied real private v2 owner also refuses an
+image-lineage substitution after every changed record, artifact, result,
+manifest descriptor and lineage reference has been rehashed. Refusals retain input/foreign bytes and private
 state; the CLI collision case also checks its original status and empty stdout.
 The local v2 fixture receipt binds actual fixture ZIP/container hashes, but
 confers neither a `Download` owner nor public producer acceptance. Genuine

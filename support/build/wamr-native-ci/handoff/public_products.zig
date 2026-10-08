@@ -278,6 +278,7 @@ const ImportFaults = struct {
     copy: copy.TestFault = .none,
     publication: ?files.TestFault = null,
     publication_collision: bool = false,
+    native_command_refusal: bool = false,
     change_before_final_revalidation: bool = false,
 };
 
@@ -404,16 +405,30 @@ fn importRun(owner: *ImportedProduct, inv: ImportInvocation, faults: ImportFault
     }
     try owner.verifyInputs(inv.signal);
     owner.phase = .native_validation;
-    owner.native = try validation.runImportedReader(
-        inv.allocator,
-        inv.io,
-        &owner.stage().accepted,
-        owner.repository,
-        &owner.candidate.?.file,
-        try std.fs.path.join(a, &.{ owner.output, "private/native-validation" }),
-        inv.tools,
-        inv.signal,
-    );
+    const native_output = try std.fs.path.join(a, &.{ owner.output, "private/native-validation" });
+    owner.native = if (builtin.is_test and faults.native_command_refusal)
+        try validation.Test.runImportedReader(
+            inv.allocator,
+            inv.io,
+            &owner.stage().accepted,
+            owner.repository,
+            &owner.candidate.?.file,
+            native_output,
+            inv.tools,
+            inv.signal,
+            .change_candidate_before_command,
+        )
+    else
+        try validation.runImportedReader(
+            inv.allocator,
+            inv.io,
+            &owner.stage().accepted,
+            owner.repository,
+            &owner.candidate.?.file,
+            native_output,
+            inv.tools,
+            inv.signal,
+        );
     try owner.verifyInputs(inv.signal);
     owner.phase = .publication;
     try copy.checkCancellation(cancel);
