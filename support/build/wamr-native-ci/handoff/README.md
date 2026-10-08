@@ -8,6 +8,58 @@ Python's public bundle producer, transport, workflows and callers remain live.
 “Public-source” here means the public lane's image outputs and evidence, not a
 source-code archive.
 
+## No-authority candidate boundary
+
+`root.zig.candidate.create` and `open` yield an opaque `Finalized` only after
+the merged private owner, genuine supervised native private validation, and all
+candidate bindings have been rechecked. The source is a borrowed
+`PrivateBundle` or durable `ImportedProduct`; it must outlive the candidate.
+An imported product retains its original archive/container, transport, native
+command evidence and immutable copies through that borrowed owner. A CLI
+reader reconstructs a private owner and runs a **fresh** native validation;
+it does not pretend that a receipt proves an independent GitHub download.
+Portable metadata cannot construct `Finalized`.
+
+`Finalized.inspect`, `artifact`, `result`, and `revalidate` are the explicit
+boundary for later authority consumers. Those consumers must revalidate this
+owner at their acceptance boundaries, not duplicate candidate parsing or
+custody. The product imports no authority-producing module. Its typed authority
+has only `not_admitted`; the frozen six approval flags remain false and both
+approval times remain zero. No approvals are read or consumed.
+
+All CLI paths are canonical absolute paths with existing private parents.
+Each invocation requires a fresh `--validation-output ABS` outside the input
+and source checkout, plus explicit `--git ABS --supervisor ABS --validator ABS`.
+
+* `candidate --bundle ABS/bundle.json --output ABS` additionally accepts
+  `--attempt-id UUID --subscription TEXT --prefix NAME`. Omitted attempt IDs
+  are freshly generated UUIDv4s. V1 retains the frozen placeholder subscription
+  and prefix, four modes, and direct bundle binding. V2 retains the current
+  profile, six modes and exact lineage; it requires a matching canonical
+  `transport.json`, publishes `OUTPUT.admission.json`, then the candidate last.
+  V2 defaults remain subscription `00000000-0000-0000-0000-000000000001`
+  and prefix `not-admitted-candidate`.
+* `candidate-inspect --bundle ABS/bundle.json --candidate ABS` retains and
+  compares the complete canonical candidate and v2 admission against the
+  freshly validated source. It does not rewrite either document.
+* `candidate-result --bundle ABS/bundle.json --candidate ABS
+  --serial-first ABS [--serial-second ABS]` additionally runs the shared tiny
+  native log validator in direct scope. With two captures the second must
+  extend the exact first Azure cumulative prefix, ignoring only its trailing
+  NUL padding. The result has the existing direct serial result shape, not an
+  admission or execution receipt. Incomplete evidence exits 2 with a diagnostic;
+  other refusals exit 1.
+
+Candidate/admission publication is create-only, private and durable. Refusals
+report their exact phase/cause and retain partial state without resume or
+destructive cleanup. Native command records/logs, transport, source, candidate,
+admission and serial captures are physically retained and freshly hashed at
+their boundaries. The compiler source closure now includes this product and
+its public-product dependencies, while the earlier export closure remains an
+explicit read-only historical selector; closure schema and guarded pins are
+unchanged. Python/workflow callers and the frozen differential witnesses remain
+live until a separately qualified cutover.
+
 ## Ownership and API boundaries
 
 * `Context.fromCI` binds the fixed public pull-request job, checkout, producer

@@ -1,5 +1,16 @@
 # Credential-free tiny native WAMR PR gate
 
+## Native no-authority candidates (additive)
+
+The native CLI provides `candidate`, `candidate-inspect`, and
+`candidate-result`. They do not replace the Python `handoff.py candidate`
+caller, change the default backend, or grant execution authority. See
+[`handoff/README.md`](handoff/README.md#no-authority-candidate-boundary) for
+the closed arguments, retained native validation, and typed consumer boundary.
+The frozen Python candidate and direct serial validators remain differential
+oracles. This product has no Azure launch, approval consumption, deployment,
+or cleanup operation.
+
 ## Native public products (additive; no caller cutover)
 
 The public product commands compose the merged private owners and the native
@@ -126,6 +137,22 @@ The full package build's `test-authority-contracts`, `test-controller`, and
 and removes only its fresh child below the scratch parent, preserving existing
 parent contents. `--write` intentionally regenerates checked-in goldens for
 review; it is not part of verification.
+
+The scenario inventory tracks every test in its three named Python sources.
+After adding or removing tests there, regenerate and review
+`authority/goldens/python-scenarios.json` and update the native inventory count
+in `authority/tests.zig`; unrelated additions must leave
+`authority/goldens/contracts.json` unchanged. Check inventory synchronization
+without restoring tools or running the full oracle:
+
+```sh
+python3 -B support/build/wamr-native-ci/tests/test_authority_contract_goldens.py \
+  AuthorityContractGoldens.test_python_scenario_inventory_matches_current_tests
+```
+
+The native compute and integration runtime jobs run this check before tool
+acquisition and native builds. The full native/Python authority gate remains
+unchanged.
 
 ## Native package and boot chain (production caller)
 
@@ -314,6 +341,10 @@ The relocated producer-import fixture uses the genuine native controller in
 its installable ReleaseSafe profile, including its imported modules, even when
 the test runner uses Debug. Its supervisor must fit the separate unchanged
 16 MiB import-runtime bound; stripping a Debug CLI alone is insufficient.
+ReleaseSafe controllers and the forced ReleaseSafe import fixture omit debug
+sections so the candidate/public-product implementation fits that unchanged
+bound on the host CPU as well as the portable target. The relocated-tool test
+measures the actual supervisor before binding and reports any excess directly.
 Other CLI fixtures and native test modules retain the selected optimization
 profile. ReleaseSafe reuses the existing CLI artifact; Debug adds one genuine
 ReleaseSafe CLI build, not a mock identity executable.
@@ -1594,6 +1625,63 @@ digest, size, archive and package checks remain unchanged. Downloader failures
 retain their evidence, print the failed acquisition phase and original
 diagnostic, and preserve the original nonzero exit status; no failed download
 is accepted or converted into a fault-qualification result.
+
+Native LLVM acquisition explicitly passes the same read-only `GH_TOKEN` to
+the pinned downloader, rather than only to its setup action. The shared
+`hyperv-native-llvm-acquire.sh` retains separate private staging/logs for up to
+three attempts (180 seconds each, 5-second kill grace, 5/10-second backoff).
+Only ghr 0.8.0's exact attestation-lookup `UnexpectedHttpStatus` failure is
+retried; that CLI does not
+expose the underlying status. Every attempt repeats the existing checksum and
+attestation checks. Cryptographic rejections, extraction failures and exhausted
+lookups preserve their nonzero status. Only a fully verified/extracted attempt
+is moved create-only into the final LLVM destination. No skip-verification
+flags or cached-success fallback are used.
+
+The destination-collision fixture covers the host `mv` and both GNU
+`--no-clobber` behaviors: a successful skip and a nonzero refusal. In either
+case, acquisition must refuse explicitly, preserve the occupied destination
+and retain verified staging; it does not require a version-specific exit code.
+
+Controller dependency restoration uses `hyperv-native-zig-restore.sh` before
+installation, never a retried build. It copies the unchanged pinned local-boot
+dependency graph outside the source tree and runs Zig's hash-verifying
+`--fetch=all` in up to three isolated stages/caches, each bounded to 180 seconds
+with five-second kill grace and 5/10-second backoff. Only exit 1 with exclusively
+`HttpConnectionClosing` transport errors permits another attempt; mixed,
+hash/extraction, timeout and exhausted failures retain their original nonzero
+status and evidence. Only a successful verified package directory is published.
+Both portable controller installations then use `--system` with those packages,
+so compilation cannot silently fetch dependencies or replay an installation.
+The primary's existing fixture restore is reused instead of fetched again.
+
+LLVM acquisition and synthetic cold-setup/refusal fixtures precede the long
+controller fixtures. The four required native fault jobs independently build
+their own inputs and now run alongside the producer, without changing their
+context names, job inventory, permissions or budgets. Setup failures therefore
+do not wait for the producer's full build/boot/publication chain.
+
+Both x86/KVM prerequisite steps have a ten-minute ceiling and command tracing,
+retain the same host/resource checks, and recheck every prerequisite after
+installation. Privileged operations use noninteractive `sudo -n`.
+The shared `hyperv-native-apt-prerequisites.sh` reports metadata/install phases
+and preserves failures, uses only the existing Ubuntu sources, and bounds each
+APT invocation to 240 seconds with five-second kill grace, 30-second HTTP/HTTPS
+timeouts, two acquisition retries and a 60-second lock wait. A failed metadata
+refresh cannot silently use stale indexes; installation is noninteractive.
+Cleanup runs only after QEMU acquisition was attempted, and controller
+diagnostic/publication steps require its successful installation, so an early
+prerequisite refusal does not manufacture missing-runtime secondary failures.
+
+Local CI monitors use `github-read-retry.sh` for read-only `gh api`, `pr view`,
+`pr list` and `run view` requests. It enforces GET for API requests, rejects
+method/body overrides and mutating commands, and retries timeouts, 429, selected
+5xx responses or explicit rate-limit errors up to three times with 5/10-second
+backoff, a 120-second attempt cap and 5-second kill grace. Authorization
+failures and exhausted reads remain errors; failed output is never returned as
+successful JSON.
+Mutation calls are never replayed, and retrying reads does not extend an
+acceptance deadline or authorize auto-merge.
 
 Artifact name:
 `wamr-public-source-tiny-RUN_ID-RUN_ATTEMPT-SOURCE_SHA`.

@@ -56,6 +56,290 @@ def reset_command_bindings():
 reset_command_bindings()
 
 
+class NativeAcquisitionFixtures(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="native-acquisition-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.bin = self.root / "bin"
+        self.bin.mkdir(mode=0o700)
+        self.calls = self.root / "calls.jsonl"
+        self.scripts = HERE.parents[2] / ".github/scripts"
+        fixture = f"#!{Path(sys.executable).resolve(strict=True)}\n" + """
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import time
+
+name = Path(sys.argv[0]).name
+if name == "sleep":
+    raise SystemExit(0)
+if name == "sudo":
+    if sys.argv[1] != "-n":
+        raise SystemExit(9)
+    os.execvp(sys.argv[2], sys.argv[2:])
+if name == "timeout":
+    if os.environ["FIXTURE_SCENARIO"].startswith("apt-"):
+        if sys.argv[1:3] != ["--kill-after=5", "240"]:
+            raise SystemExit(9)
+        os.execv("/usr/bin/timeout", ["timeout", "--kill-after=0.1", "1"]
+                 + sys.argv[3:])
+    os.execv("/usr/bin/timeout", ["timeout"] + sys.argv[1:])
+calls = Path(os.environ["FIXTURE_CALLS"])
+previous = calls.read_text().splitlines() if calls.exists() else []
+with calls.open("a") as output:
+    output.write(json.dumps({"argv": [name] + sys.argv[1:],
+                             "authenticated": bool(os.environ.get("GH_TOKEN")),
+                             "noninteractive": os.environ.get("DEBIAN_FRONTEND") == "noninteractive"}) + "\\n")
+attempt = len(previous) + 1
+scenario = os.environ["FIXTURE_SCENARIO"]
+if name == "apt-get":
+    phase = "update" if "update" in sys.argv else "install"
+    if scenario == "apt-" + phase + "-timeout":
+        time.sleep(60)
+    if scenario == "apt-" + phase + "-failure":
+        sys.stderr.write("APT " + phase + " refused\\n")
+        raise SystemExit(100)
+    raise SystemExit(0)
+if name == "ghr":
+    args = sys.argv[1:]
+    if not os.environ.get("GH_TOKEN") or any(
+            arg.startswith("--skip-") or arg == "--no-auth" for arg in args):
+        raise SystemExit(9)
+    stage = Path(args[args.index("--extract") + 1])
+    stage.mkdir(parents=True)
+    if scenario == "lookup-always" or scenario == "lookup-twice" and attempt < 3:
+        (stage / "unverified").write_text("must never be published")
+        sys.stderr.write("error: GitHub attestation lookup failed for 'cataggar/llvm-project': UnexpectedHttpStatus\\n")
+        raise SystemExit(2)
+    if scenario in ("checksum", "signature", "extraction"):
+        sys.stderr.write("error: " + scenario + " rejected\\n")
+        raise SystemExit(1 if scenario == "extraction" else 3)
+    if scenario != "missing-tools":
+        (stage / "bin").mkdir()
+        for tool in ("llvm-readelf", "llvm-strip"):
+            path = stage / "bin" / tool
+            path.write_text("#!/bin/sh\\nexit 0\\n")
+            path.chmod(0o755)
+    if scenario == "collision":
+        destination = Path(os.environ["FIXTURE_DESTINATION"])
+        destination.mkdir()
+        (destination / "foreign").write_text("unchanged")
+    raise SystemExit(0)
+if name == "zig":
+    args = sys.argv[1:]
+    if args[:1] != ["build"] or "--fetch=all" not in args or "--system" in args:
+        raise SystemExit(9)
+    stage = Path(args[args.index("--build-file") + 1]).parent
+    temporary = Path(args[args.index("--global-cache-dir") + 1]) / "tmp"
+    if not temporary.is_dir() or temporary.stat().st_mode & 0o777 != 0o700:
+        raise SystemExit(9)
+    if scenario == "zig-closing-always" or scenario == "zig-closing-twice" and attempt < 3:
+        (stage / "partial").write_text("failed acquisition must remain staged")
+        sys.stderr.write("build.zig.zon:8:20: error: invalid HTTP response: HttpConnectionClosing\\n")
+        raise SystemExit(1)
+    if scenario in ("zig-hash", "zig-extraction", "zig-mixed"):
+        if scenario == "zig-mixed":
+            sys.stderr.write("build.zig.zon:8:20: error: invalid HTTP response: HttpConnectionClosing\\n")
+        sys.stderr.write("error: package " + scenario + " rejected\\n")
+        raise SystemExit(1)
+    if scenario == "zig-timeout":
+        raise SystemExit(124)
+    if scenario != "zig-missing-packages":
+        (stage / "zig-pkg").mkdir()
+        (stage / "zig-pkg/verified").write_text("verified package bytes")
+    raise SystemExit(0)
+match = re.fullmatch(r"read-(\\d+)-(once|always)", scenario)
+if match and (match[2] == "always" or attempt == 1):
+    sys.stdout.write("incomplete failed response")
+    sys.stderr.write("gh: HTTP " + match[1] + "\\n")
+    raise SystemExit(1)
+if scenario == "read-timeout-once" and attempt == 1:
+    raise SystemExit(124)
+sys.stdout.write('{"verified_read":true}\\n')
+"""
+        for name in ("gh", "ghr", "sleep", "zig", "sudo", "timeout", "apt-get"):
+            path = self.bin / name
+            path.write_text(fixture, encoding="utf-8")
+            path.chmod(0o700)
+
+    def invoke(self, script, scenario, *arguments, token="synthetic"):
+        self.calls.unlink(missing_ok=True)
+        environment = dict(os.environ, PATH=str(self.bin) + os.pathsep
+                           + os.environ["PATH"], GH_TOKEN=token,
+                           FIXTURE_CALLS=str(self.calls),
+                           FIXTURE_SCENARIO=scenario,
+                           FIXTURE_DESTINATION=str(arguments[0]) if arguments else "")
+        return subprocess.run(
+            ["bash", str(self.scripts / script), *map(str, arguments)],
+            env=environment, capture_output=True, text=True, timeout=15)
+
+    def recorded(self):
+        return [json.loads(line) for line in self.calls.read_text().splitlines()
+                ] if self.calls.exists() else []
+
+    def test_llvm_lookup_retries_only_publish_the_verified_attempt(self):
+        destination = self.root / "llvm"
+        result = self.invoke(
+            "hyperv-native-llvm-acquire.sh", "lookup-twice", destination)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.recorded()), 3)
+        self.assertTrue(all(call["authenticated"] for call in self.recorded()))
+        self.assertTrue((destination / "bin/llvm-readelf").is_file())
+        self.assertFalse((destination / "unverified").exists())
+        evidence = self.root / "llvm.acquisition"
+        for attempt in (1, 2):
+            self.assertTrue(
+                (evidence / f"attempt-{attempt}/extracted/unverified").is_file())
+            self.assertIn("UnexpectedHttpStatus",
+                          (evidence / f"attempt-{attempt}/download.log").read_text())
+        self.assertEqual(len({call["argv"][call["argv"].index("--extract") + 1]
+                              for call in self.recorded()}), 3)
+
+    def test_llvm_exhaustion_and_verification_failures_never_publish(self):
+        for scenario, status, attempts in (
+                ("lookup-always", 2, 3), ("checksum", 3, 1),
+                ("signature", 3, 1), ("extraction", 1, 1),
+                ("missing-tools", 1, 1)):
+            with self.subTest(scenario=scenario):
+                destination = self.root / scenario
+                result = self.invoke(
+                    "hyperv-native-llvm-acquire.sh", scenario, destination)
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual(len(self.recorded()), attempts)
+                self.assertFalse(destination.exists())
+
+    def test_llvm_requires_authentication_and_preserves_occupied_destination(self):
+        destination = self.root / "llvm"
+        result = self.invoke(
+            "hyperv-native-llvm-acquire.sh", "success", destination, token="")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.recorded(), [])
+        # GNU mv variants either skip successfully or refuse with a nonzero exit.
+        for move_status in (None, 0, 1):
+            with self.subTest(move_status=move_status):
+                destination = self.root / f"llvm-{move_status}"
+                if move_status is not None:
+                    move = self.bin / "mv"
+                    move.write_text(
+                        "#!/bin/sh\n"
+                        f"if [ {move_status} -ne 0 ]; then\n"
+                        "  printf 'mv: refusing occupied destination\\n' >&2\n"
+                        "fi\n"
+                        f"exit {move_status}\n", encoding="utf-8")
+                    move.chmod(0o700)
+                result = self.invoke(
+                    "hyperv-native-llvm-acquire.sh", "collision", destination)
+                self.assertNotEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(result.stderr)
+                self.assertEqual((destination / "foreign").read_text(), "unchanged")
+                self.assertTrue(
+                    (self.root / f"llvm-{move_status}.acquisition"
+                     / "attempt-1/extracted/bin/llvm-readelf").is_file())
+                result = self.invoke(
+                    "hyperv-native-llvm-acquire.sh", "success", destination)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(self.recorded(), [])
+
+    def test_monitor_retries_transport_errors_without_returning_failed_output(self):
+        for scenario in ("read-500-once", "read-503-once",
+                         "read-429-once", "read-timeout-once"):
+            with self.subTest(scenario=scenario):
+                result = self.invoke(
+                    "github-read-retry.sh", scenario, "api", "repos/example/checks")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), {"verified_read": True})
+                self.assertEqual(len(self.recorded()), 2)
+                self.assertTrue(all(call["argv"][1:4] == ["api", "--method", "GET"]
+                                    for call in self.recorded()))
+
+    def test_monitor_preserves_exhausted_and_authorization_failures(self):
+        for code, attempts in ((503, 3), (401, 1), (403, 1)):
+            with self.subTest(code=code):
+                result = self.invoke(
+                    "github-read-retry.sh", f"read-{code}-always",
+                    "pr", "view", "263", "--repo", "cataggar/unikraft")
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(len(self.recorded()), attempts)
+                self.assertIn(f"HTTP {code}", result.stderr)
+
+    def test_monitor_refuses_mutations_and_api_body_overrides(self):
+        for arguments in (
+                ("pr", "merge", "263", "--auto"),
+                ("api", "repos/example", "--method", "POST"),
+                ("api", "repos/example", "-f", "body=value"),
+                ("api", "repos/example", "--input=body.json")):
+            with self.subTest(arguments=arguments):
+                result = self.invoke(
+                    "github-read-retry.sh", "success", *arguments)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(self.recorded(), [])
+
+    def test_zig_restore_retries_only_transport_failures(self):
+        destination = self.root / "packages"
+        result = self.invoke(
+            "hyperv-native-zig-restore.sh", "zig-closing-twice", destination)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.recorded()), 3)
+        self.assertEqual((destination / "zig-pkg/verified").read_text(),
+                         "verified package bytes")
+        for attempt in (1, 2):
+            self.assertTrue((destination / f"attempt-{attempt}/partial").is_file())
+            self.assertFalse((destination / f"attempt-{attempt}/zig-pkg").exists())
+        self.assertEqual(len({
+            call["argv"][call["argv"].index("--global-cache-dir") + 1]
+            for call in self.recorded()}), 3)
+        result = self.invoke(
+            "hyperv-native-zig-restore.sh", "zig-success", destination)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.recorded(), [])
+
+    def test_zig_restore_exhaustion_and_permanent_errors_never_publish(self):
+        for scenario, status, attempts in (
+                ("zig-closing-always", 1, 3), ("zig-hash", 1, 1),
+                ("zig-extraction", 1, 1), ("zig-mixed", 1, 1),
+                ("zig-timeout", 124, 1), ("zig-missing-packages", 1, 1)):
+            with self.subTest(scenario=scenario):
+                destination = self.root / scenario
+                result = self.invoke(
+                    "hyperv-native-zig-restore.sh", scenario, destination)
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual(len(self.recorded()), attempts)
+                self.assertFalse((destination / "zig-pkg").exists())
+
+    def test_apt_prerequisites_bound_noninteractive_installation(self):
+        result = self.invoke(
+            "hyperv-native-apt-prerequisites.sh", "apt-success")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.recorded()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("update", calls[0]["argv"])
+        self.assertIn("install", calls[1]["argv"])
+        for call in calls:
+            self.assertTrue(call["noninteractive"])
+            for option in ("Acquire::http::Timeout=30", "Acquire::https::Timeout=30",
+                           "DPkg::Lock::Timeout=60", "APT::Update::Error-Mode=any"):
+                self.assertIn(option, call["argv"])
+        self.assertIn("metadata", result.stderr)
+        self.assertIn("installation", result.stderr)
+
+    def test_apt_prerequisites_preserve_failure_and_timeout_phases(self):
+        for scenario, status, calls, phase in (
+                ("apt-update-failure", 100, 1, "metadata"),
+                ("apt-install-failure", 100, 2, "installation"),
+                ("apt-update-timeout", 124, 1, "metadata"),
+                ("apt-install-timeout", 124, 2, "installation")):
+            with self.subTest(scenario=scenario):
+                result = self.invoke(
+                    "hyperv-native-apt-prerequisites.sh", scenario)
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual(len(self.recorded()), calls)
+                self.assertIn(f"refused at {phase}", result.stderr)
+
+
 class NativeRecordBridge(unittest.TestCase):
     def test_publication_timings_preserve_transport_and_redact_refusals(self):
         bridge = public_bundle.accepted_records

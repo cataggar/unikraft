@@ -83,7 +83,7 @@ pub const previous_private_entries = blk: {
     break :blk all;
 };
 
-pub const entries = blk: {
+pub const previous_export_entries = blk: {
     @setEvalBranchQuota(100_000);
     var all = previous_private_entries ++ private_export_entries;
     @import("std").mem.sort(Entry, &all, {}, struct {
@@ -92,6 +92,24 @@ pub const entries = blk: {
         }
     }.less);
     break :blk all;
+};
+
+pub const entries = blk: {
+    @setEvalBranchQuota(100_000);
+    var all = previous_export_entries ++ candidate_consumer_entries;
+    @import("std").mem.sort(Entry, &all, {}, struct {
+        fn less(_: void, first: Entry, second: Entry) bool {
+            return @import("std").mem.lessThan(u8, first.name, second.name);
+        }
+    }.less);
+    break :blk all;
+};
+
+const candidate_consumer_entries = [_]Entry{
+    .{ .name = "support/build/wamr-native-ci/handoff/candidate.zig", .content = @embedFile("build/wamr-native-ci/handoff/candidate.zig") },
+    .{ .name = "support/build/wamr-native-ci/handoff/public_archive.zig", .content = @embedFile("build/wamr-native-ci/handoff/public_archive.zig") },
+    .{ .name = "support/build/wamr-native-ci/handoff/public_products.zig", .content = @embedFile("build/wamr-native-ci/handoff/public_products.zig") },
+    .{ .name = "support/build/wamr-native-ci/handoff/public_transport.zig", .content = @embedFile("build/wamr-native-ci/handoff/public_transport.zig") },
 };
 
 const private_export_entries = [_]Entry{

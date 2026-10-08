@@ -150,6 +150,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("controller/portable_main.zig"),
             .target = portable_target,
             .optimize = optimize,
+            .strip = optimize != .Debug,
             .imports = &.{
                 .{ .name = "wamr_controller", .module = controller_module },
                 .{ .name = "wamr_handoff", .module = handoffModule(b, portable_target, optimize, portable_core, controller_module) },
@@ -256,6 +257,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("controller/main.zig"),
             .target = b.graph.host,
             .optimize = optimize,
+            .strip = optimize != .Debug,
             .imports = &.{
                 .{ .name = "wamr_controller", .module = host_controller },
                 .{ .name = "wamr_handoff", .module = handoffModule(b, b.graph.host, optimize, host_core, host_controller) },
@@ -309,6 +311,7 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("controller/main.zig"),
                 .target = b.graph.host,
                 .optimize = .ReleaseSafe,
+                .strip = true,
                 .imports = &.{
                     .{ .name = "wamr_controller", .module = import_controller },
                     .{ .name = "wamr_handoff", .module = handoffModule(b, b.graph.host, .ReleaseSafe, import_core, import_controller) },

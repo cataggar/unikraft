@@ -12,6 +12,10 @@ const retained_copy = handoff.retained_copy;
 const zip = handoff.zip;
 const test_options = @import("test_options");
 
+test "candidate product boundary is available without authority operations" {
+    std.testing.refAllDecls(handoff.candidate);
+}
+
 const golden = @embedFile("goldens/contracts-profile-layout.json");
 const zip_multi_golden = @embedFile("goldens/zip-stored-multi.zip");
 const zip_empty_golden = @embedFile("goldens/zip-stored-empty.zip");

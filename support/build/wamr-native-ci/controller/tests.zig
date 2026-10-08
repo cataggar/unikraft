@@ -4,6 +4,64 @@ const controller = @import("wamr_controller");
 const core = @import("hyperv_core");
 const options = @import("test_options");
 
+test "candidate CLI closes planning inspection and result inputs without authority flags" {
+    const cli = controller.cli;
+    const plan = [_][]const u8{
+        "uk-wamr-native-ci",   "candidate",               "--bundle",     "/private/source/bundle.json",
+        "--output",            "/private/candidate.json", "--git",        "/private/git",
+        "--supervisor",        "/private/controller",     "--validator",  "/private/validator",
+        "--validation-output", "/private/validation",     "--attempt-id", "00000000-0000-4000-8000-000000000001",
+    };
+    _ = try cli.parse(&plan);
+    try std.testing.expectError(error.InvalidUsage, cli.parse(plan[0..12]));
+    var changed = plan;
+    changed[12] = "--approval";
+    try std.testing.expectError(error.InvalidUsage, cli.parse(&changed));
+    changed = plan;
+    changed[12] = "--git";
+    try std.testing.expectError(error.InvalidUsage, cli.parse(&changed));
+    changed = plan;
+    changed[3] = "/private/source/portable-bundle.json";
+    try std.testing.expectError(error.InvalidUsage, cli.parse(&changed));
+    const result = [_][]const u8{
+        "uk-wamr-native-ci",   "candidate-result",        "--bundle",       "/private/source/bundle.json",
+        "--candidate",         "/private/candidate.json", "--git",          "/private/git",
+        "--supervisor",        "/private/controller",     "--validator",    "/private/validator",
+        "--validation-output", "/private/validation",     "--serial-first", "/private/serial-first",
+        "--serial-second",     "/private/serial-second",
+    };
+    _ = try cli.parse(&result);
+    try std.testing.expectError(error.InvalidUsage, cli.parse(result[0..14]));
+    var inspect = result;
+    inspect[1] = "candidate-inspect";
+    _ = try cli.parse(inspect[0..14]);
+    try std.testing.expectError(error.InvalidUsage, cli.parse(&inspect));
+}
+
+test "candidate CLI logs missing source refusal without candidate or validation publication" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const missing = try std.fs.path.join(a, &.{ options.fixture_root, "absent-candidate-source/bundle.json" });
+    const output = try std.fs.path.join(a, &.{ options.fixture_root, "refused-candidate.json" });
+    const validation_output = try std.fs.path.join(a, &.{ options.fixture_root, "refused-candidate-validation" });
+    const result = try std.process.run(a, std.testing.io, .{
+        .argv = &.{
+            options.host_controller_cli, "candidate",       "--bundle",     missing,               "--output",    output,
+            "--git",                     "/private/git",    "--supervisor", "/private/controller", "--validator", "/private/validator",
+            "--validation-output",       validation_output,
+        },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, result.term);
+    try std.testing.expectEqualStrings("", result.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "candidate/inputs") != null);
+    try std.testing.expectError(error.FileNotFound, core.private_files.openAbsolute(std.testing.io, output, .private));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.openDirAbsolute(std.testing.io, validation_output, .{}));
+}
+
 test "complete local fixture workers drain before I/O failure cleanup" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -1536,6 +1594,9 @@ test "trusted import authenticates relocated native tools without producer files
     const producer_git = try std.fs.path.join(a, &.{ path, "producer/git" });
     const producer_zig = try std.fs.path.join(a, &.{ path, "producer/zig" });
     const producer_identity = try controller.custody_files.readFile(io, producer_controller, 64 * 1024 * 1024, false);
+    if (producer_identity.bytes > 16 * 1024 * 1024)
+        std.debug.print("ReleaseSafe supervisor exceeds frozen import bound: {d} bytes\n", .{producer_identity.bytes});
+    try std.testing.expect(producer_identity.bytes <= 16 * 1024 * 1024);
     const relocated_identity = try controller.custody_files.readFile(io, supervisor, 64 * 1024 * 1024, false);
     try std.testing.expectEqualSlices(u8, &producer_identity.sha256, &relocated_identity.sha256);
     try std.testing.expect(producer_identity.metadata[1] != relocated_identity.metadata[1]);

@@ -793,6 +793,12 @@ jobs:
         persist-credentials: false
         fetch-depth: 0
 
+    - name: Check the frozen Python scenario inventory
+      timeout-minutes: 2
+      run: |
+        python3 -B support/build/wamr-native-ci/tests/test_authority_contract_goldens.py \
+          AuthorityContractGoldens.test_python_scenario_inventory_matches_current_tests
+
     - name: Restore independent fixture tools
       uses: ./.github/actions/hyperv-fixture-setup
 
