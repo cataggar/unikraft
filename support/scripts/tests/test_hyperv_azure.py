@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -31,6 +32,9 @@ uploader = importlib.import_module("hyperv-azure-upload")
 persistence = importlib.import_module("hyperv_persistence_controller")
 preflight_tests = importlib.import_module(
     "support.scripts.tests.test_hyperv_private_preflight"
+)
+historical_owner = importlib.import_module(
+    "support.tools.hyperv.direct.tests.historical_owner"
 )
 
 
@@ -2161,7 +2165,751 @@ class HypervAzureControllerTest(unittest.TestCase):
         constructor.assert_not_called()
 
 
+class HistoricalFixtureOwnerTest(unittest.TestCase):
+
+    def setUp(self):
+        parent = Path(
+            os.environ.get("WAMR_HISTORICAL_TEST_ROOT", SUPPORT.parent.parent)
+        ).resolve()
+        self.root = parent / ("fixture-owner-test-" + uuid.uuid4().hex)
+        self.root.mkdir(mode=0o700)
+        self.addCleanup(shutil.rmtree, self.root)
+        self.git = Path(shutil.which("git")).resolve(strict=True)
+        self.owner = self.root / historical_owner.CHECKOUT
+        with mock.patch.dict(os.environ, {"PYTHONDONTWRITEBYTECODE": "1"}):
+            historical_owner.materialize(SUPPORT.parent, self.owner, self.git)
+        self.owner.chmod(0o700)
+
+    def prepared_result(self):
+        handoff, public = historical_owner.modules(self.owner, self.git)
+        supervisor = self.root / "supervisor/bin/wamr-ci-supervisor"
+        supervisor.parent.mkdir(parents=True, mode=0o700)
+        shutil.copyfile(Path(shutil.which("true")).resolve(), supervisor)
+        supervisor.chmod(0o700)
+        expected_identity = historical_owner.identity(
+            handoff.ci.supervisor_source_map()["content_closure_sha256"]
+        )
+        result = {
+            "schema": historical_owner.SCHEMA,
+            "version": 1,
+            "status": "ready",
+            "commit": historical_owner.COMMIT,
+            "tree": historical_owner.TREE,
+            "tools": {
+                "git": historical_owner.file_record(self.git, executable=True)
+            },
+            "identity": expected_identity,
+            "supervisor": historical_owner.supervisor_record(supervisor),
+        }
+        historical_owner.write_json(self.root / "result.json", result)
+        return handoff, public, supervisor, expected_identity
+
+    def test_import_and_closure_belong_only_to_pinned_consumer(self):
+        handoff, public = historical_owner.modules(self.owner, self.git)
+        self.assertEqual(handoff.ci.REPO, self.owner)
+        self.assertEqual(
+            Path(handoff.__file__),
+            self.owner / historical_owner.CI / "handoff.py",
+        )
+        self.assertEqual(
+            Path(public.__file__),
+            self.owner / historical_owner.CI / "public_bundle.py",
+        )
+        self.assertEqual(handoff.ci.COMMAND_TOOL_PATHS["git"], str(self.git))
+        source_map = handoff.ci.supervisor_source_map()
+        self.assertEqual(source_map["count"], 13)
+        self.assertIn(
+            "support/build/wamr-native-ci/run.py", source_map["records"]
+        )
+        historical_owner.verify_checkout(self.owner, self.git)
+
+    def test_mutated_missing_extra_and_mode_changed_source_refused(self):
+        path = self.owner / historical_owner.CI / "run.py"
+        original = path.read_bytes()
+        path.write_bytes(original + b"\nraise RuntimeError('not executed')\n")
+        with mock.patch.object(historical_owner, "module") as execute:
+            with self.assertRaisesRegex(ValueError, "mutated owner blob"):
+                historical_owner.modules(self.owner, self.git)
+            execute.assert_not_called()
+        path.write_bytes(original)
+        path.unlink()
+        with self.assertRaises(FileNotFoundError):
+            historical_owner.modules(self.owner, self.git)
+        path.write_bytes(original)
+        path.chmod(0o700)
+        with self.assertRaisesRegex(ValueError, "wrong source file mode"):
+            historical_owner.modules(self.owner, self.git)
+        path.chmod(0o600)
+        extra = self.owner / "unexpected-source"
+        extra.write_bytes(b"not committed")
+        with self.assertRaisesRegex(ValueError, "extra owner source"):
+            historical_owner.modules(self.owner, self.git)
+
+    def test_wrong_checkout_and_missing_git_objects_refused(self):
+        historical_owner.git_output(
+            self.git, self.owner, "checkout", "--detach", "HEAD^"
+        )
+        with self.assertRaisesRegex(ValueError, "wrong owner commit"):
+            historical_owner.modules(self.owner, self.git)
+        historical_owner.git_output(
+            self.git,
+            self.owner,
+            "checkout",
+            "--detach",
+            historical_owner.COMMIT,
+        )
+        objects = self.owner / ".git/objects"
+        retained = self.owner / ".git/retained-objects"
+        objects.rename(retained)
+        try:
+            with self.assertRaises(
+                (subprocess.CalledProcessError, FileNotFoundError)
+            ):
+                historical_owner.modules(self.owner, self.git)
+        finally:
+            retained.rename(objects)
+
+    def test_current_schema_and_wrong_historical_identity_refused(self):
+        _, _, supervisor, expected = self.prepared_result()
+        old_identity = json.dumps(expected).encode()
+        completed = subprocess.CompletedProcess(
+            [supervisor, "--identity"], 0, old_identity, b""
+        )
+        real_output = historical_owner.command_output
+
+        def output(command, *args):
+            if command == [supervisor, "--identity"]:
+                return completed
+            return real_output(command, *args)
+
+        with mock.patch.object(
+            historical_owner, "command_output", side_effect=output
+        ):
+            loaded, _, selected = historical_owner.load(self.root)
+            self.assertEqual(loaded.ci.REPO, self.owner)
+            self.assertEqual(selected, supervisor)
+            for changed in (
+                {**expected, "schema": "uk.wamr.native-supervisor-identity"},
+                {**expected, "source_content_closure_sha256": "a" * 64},
+                {**expected, "version": 2},
+                {**expected, "version": True},
+                {**expected, "version": 1.0},
+            ):
+                completed.stdout = json.dumps(changed).encode()
+                with self.assertRaisesRegex(ValueError, "wrong supervisor"):
+                    historical_owner.load(self.root)
+
+    def test_changed_or_missing_executable_refused_before_execution(self):
+        _, _, supervisor, _ = self.prepared_result()
+        original = supervisor.read_bytes()
+        supervisor.write_bytes(original + b"changed")
+        with self.assertRaisesRegex(ValueError, "executable changed"):
+            historical_owner.load(self.root)
+        supervisor.unlink()
+        with self.assertRaises(FileNotFoundError):
+            historical_owner.load(self.root)
+
+    def test_unsafe_executable_ancestor_refused_before_invocation(self):
+        directory = self.root / "unsafe-tool"
+        directory.mkdir(mode=0o700)
+        tool = directory / "true"
+        shutil.copyfile(Path(shutil.which("true")).resolve(), tool)
+        tool.chmod(0o700)
+        directory.chmod(0o777)
+        with mock.patch.object(
+            historical_owner.subprocess, "Popen"
+        ) as execute, self.assertRaisesRegex(ValueError, "unsafe.*ancestor"):
+            historical_owner.run_stage(
+                self.root, "unsafe", [tool], self.root, {}
+            )
+        execute.assert_not_called()
+        self.assertFalse((self.root / "unsafe.stdout").exists())
+        directory.chmod(0o700)
+        self.assertEqual(
+            historical_owner.file_record(tool, True)["ancestors"][-1]["path"],
+            str(directory),
+        )
+        self.assertEqual(
+            historical_owner.git_output(self.git, SUPPORT.parent, "--version"),
+            subprocess.check_output([self.git, "--version"]),
+        )
+
+    def test_executable_path_and_permission_changes_refused(self):
+        for change in ("directory", "permissions", "symlink", "file"):
+            with self.subTest(change=change):
+                directory = self.root / ("tool-" + change)
+                directory.mkdir(mode=0o700)
+                tool = directory / "true"
+                shutil.copyfile(Path(shutil.which("true")).resolve(), tool)
+                tool.chmod(0o700)
+                before = historical_owner.file_record(tool, True)
+
+                def replace(change=change, directory=directory, tool=tool):
+                    if change in ("directory", "symlink"):
+                        saved = directory.with_name(directory.name + "-old")
+                        directory.rename(saved)
+                        if change == "symlink":
+                            directory.symlink_to(
+                                saved, target_is_directory=True
+                            )
+                        else:
+                            directory.mkdir(mode=0o700)
+                            shutil.copyfile(saved / tool.name, tool)
+                            tool.chmod(0o700)
+                    elif change == "permissions":
+                        directory.chmod(0o755)
+                    else:
+                        saved = tool.with_suffix(".old")
+                        tool.rename(saved)
+                        shutil.copyfile(saved, tool)
+                        tool.chmod(0o700)
+
+                with self.assertRaisesRegex(
+                    ValueError, "binding changed"
+                ), historical_owner.bound_file(tool, True) as (fd, _):
+                    replace()
+                    self.assertEqual(
+                        os.pread(fd, before["bytes"], 0),
+                        tool.read_bytes(),
+                    )
+                if change != "symlink":
+                    self.assertNotEqual(
+                        historical_owner.file_record(tool, True), before
+                    )
+
+    def test_executable_ancestor_syscall_failure_is_not_safe(self):
+        original = historical_owner.os.stat
+
+        def refuse(path, **kwargs):
+            if kwargs.get("follow_symlinks") is False:
+                raise PermissionError("synthetic ancestor stat failure")
+            return original(path, **kwargs)
+
+        with mock.patch.object(
+            historical_owner.os, "stat", side_effect=refuse
+        ), mock.patch.object(
+            historical_owner.subprocess, "Popen"
+        ) as execute, self.assertRaisesRegex(
+            PermissionError, "ancestor stat failure"
+        ):
+            historical_owner.run_stage(
+                self.root,
+                "stat-failure",
+                [self.git, "--version"],
+                self.root,
+                {},
+            )
+        execute.assert_not_called()
+
+    def test_wrong_owner_record_or_retained_git_refused_before_import(self):
+        self.prepared_result()
+        path = self.root / "result.json"
+        original = json.loads(path.read_bytes())
+        for field, wrong in (
+            ("tree", "a" * 40),
+            ("commit", "b" * 40),
+            ("status", "failed"),
+            ("version", True),
+            ("version", 1.0),
+        ):
+            path.write_bytes(json.dumps({**original, field: wrong}).encode())
+            with mock.patch.object(
+                historical_owner, "module"
+            ) as execute, self.assertRaisesRegex(
+                ValueError, "incomplete or wrong"
+            ):
+                historical_owner.load(self.root)
+            execute.assert_not_called()
+        original["tools"]["git"]["sha256"] = "c" * 64
+        path.write_bytes(json.dumps(original).encode())
+        with mock.patch.object(
+            historical_owner, "module"
+        ) as execute, self.assertRaisesRegex(
+            ValueError, "retained Git changed"
+        ):
+            historical_owner.load(self.root)
+        execute.assert_not_called()
+
+    def test_failed_stages_remove_only_owned_checkout_and_keep_inputs(self):
+        packages = self.root / "packages"
+        packages.mkdir(mode=0o700)
+        zig = Path(shutil.which("true")).resolve()
+        for failing_stage in (
+            "materialize",
+            "closure",
+            "supervisor",
+            "identity",
+        ):
+            with self.subTest(stage=failing_stage):
+                work = self.root / ("failure-" + failing_stage)
+                real_materialize = historical_owner.materialize
+
+                def materialize(
+                    *args, materializer=real_materialize, fail=failing_stage
+                ):
+                    materializer(*args)
+                    if fail == "materialize":
+                        raise ValueError("injected materialization failure")
+
+                def run_stage(
+                    root,
+                    stage,
+                    command,
+                    owner,
+                    environment,
+                    fail=failing_stage,
+                ):
+                    del environment
+                    (root / (stage + ".stderr")).write_bytes(
+                        b"retained synthetic failure diagnostic\n"
+                    )
+                    if stage == fail:
+                        raise ValueError("injected stage failure")
+                    if stage == "closure":
+                        handoff, _ = historical_owner.modules(owner, self.git)
+                        return (
+                            handoff.ci.supervisor_source_map()[
+                                "content_closure_sha256"
+                            ]
+                            + "\n"
+                        ).encode()
+                    if stage == "supervisor":
+                        output = root / "supervisor/bin/wamr-ci-supervisor"
+                        output.parent.mkdir(mode=0o700)
+                        shutil.copyfile(zig, output)
+                        output.chmod(0o700)
+                    return b""
+
+                with mock.patch.object(
+                    historical_owner, "materialize", side_effect=materialize
+                ), mock.patch.object(
+                    historical_owner, "run_stage", side_effect=run_stage
+                ), self.assertRaisesRegex(
+                    ValueError, "injected"
+                ):
+                    historical_owner.prepare(
+                        SUPPORT.parent, work, self.git, zig, packages
+                    )
+                result = json.loads((work / "result.json").read_bytes())
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["stage"], failing_stage)
+                self.assertFalse((work / historical_owner.CHECKOUT).exists())
+                inputs = (work / "inputs.json").read_bytes()
+                self.assertEqual(
+                    json.loads(inputs)["commit"], historical_owner.COMMIT
+                )
+                with self.assertRaisesRegex(ValueError, "incomplete"):
+                    historical_owner.load(work)
+                with self.assertRaises(FileExistsError):
+                    historical_owner.prepare(
+                        SUPPORT.parent, work, self.git, zig, packages
+                    )
+                self.assertEqual((work / "inputs.json").read_bytes(), inputs)
+                self.assertTrue(
+                    (self.owner / historical_owner.CI / "run.py").exists()
+                )
+
+    def test_overflow_preparation_never_publishes_ready_result(self):
+        packages = self.root / "overflow-packages"
+        packages.mkdir(mode=0o700)
+        work = self.root / "overflow-owner"
+        python = Path(sys.executable).resolve(strict=True)
+        real_stage = historical_owner.run_stage
+
+        def overflow(root, stage, command, cwd, environment):
+            return real_stage(
+                root,
+                stage,
+                [python, "-c", "import os;os.write(2,b'x'*1025)"],
+                cwd,
+                environment,
+            )
+
+        with mock.patch.object(
+            historical_owner, "run_stage", side_effect=overflow
+        ), mock.patch.object(
+            historical_owner, "STDERR_LIMIT", 1024
+        ), self.assertRaisesRegex(
+            ValueError, "stderr overflow"
+        ):
+            historical_owner.prepare(
+                SUPPORT.parent, work, self.git, python, packages
+            )
+        result = json.loads((work / "result.json").read_bytes())
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["stage"], "closure")
+        self.assertIn("stderr overflow", result["failure"])
+        self.assertFalse((work / historical_owner.CHECKOUT).exists())
+        self.assertTrue((self.owner / historical_owner.CI / "run.py").is_file())
+        retained = {
+            path.name: path.read_bytes()
+            for path in work.iterdir()
+            if path.is_file()
+        }
+        with self.assertRaises(FileExistsError):
+            historical_owner.prepare(
+                SUPPORT.parent, work, self.git, python, packages
+            )
+        self.assertEqual(
+            retained,
+            {
+                path.name: path.read_bytes()
+                for path in work.iterdir()
+                if path.is_file()
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            historical_owner.load(work)
+
+    def test_no_implicit_current_import_or_existing_input_overwrite(self):
+        with mock.patch.dict(
+            os.environ, {}, clear=True
+        ), self.assertRaisesRegex(ValueError, "explicit historical"):
+            historical_owner.load()
+        with self.assertRaisesRegex(ValueError, "create-only"):
+            historical_owner.materialize(SUPPORT.parent, self.owner, self.git)
+        marker = self.root / "immutable.json"
+        historical_owner.write_json(marker, {"first": True})
+        with self.assertRaises(FileExistsError):
+            historical_owner.write_json(marker, {"second": True})
+        self.assertEqual(json.loads(marker.read_bytes()), {"first": True})
+
+
+class HistoricalFixtureCaptureTest(unittest.TestCase):
+
+    def setUp(self):
+        parent = Path(
+            os.environ.get("WAMR_HISTORICAL_TEST_ROOT", SUPPORT.parent.parent)
+        ).resolve()
+        self.root = parent / ("fixture-capture-test-" + uuid.uuid4().hex)
+        self.root.mkdir(mode=0o700)
+        self.addCleanup(shutil.rmtree, self.root)
+        self.python = Path(sys.executable).resolve(strict=True)
+
+    def run_stage(self, stage, code):
+        return historical_owner.run_stage(
+            self.root, stage, [self.python, "-c", code], self.root, {}
+        )
+
+    def receipt(self, stage):
+        return json.loads((self.root / (stage + ".capture.json")).read_bytes())
+
+    def test_both_streams_overflow_on_successful_and_failing_exits(self):
+        for stream, descriptor, limit in (
+            ("stdout", 1, historical_owner.STDOUT_LIMIT),
+            ("stderr", 2, historical_owner.STDERR_LIMIT),
+        ):
+            for exit_code in (0, 3):
+                stage = stream + "-" + str(exit_code)
+                with self.subTest(stage=stage), self.assertRaisesRegex(
+                    ValueError, stream + " overflow"
+                ):
+                    self.run_stage(
+                        stage,
+                        f"import os,sys;os.write({descriptor},"
+                        f"b'x'*{limit + 1});sys.exit({exit_code})",
+                    )
+                receipt = self.receipt(stage)
+                self.assertEqual(receipt["overflow"], [stream])
+                self.assertEqual(receipt["captured"][stream], limit)
+                self.assertEqual(
+                    (self.root / (stage + "." + stream)).stat().st_size, limit
+                )
+                self.assertTrue(receipt["cleanup"]["complete"])
+                self.assertEqual(receipt["cleanup"]["failures"], [])
+                self.assertTrue(
+                    all(
+                        value["reaped"]
+                        for value in receipt["cleanup"]["processes"]
+                    )
+                )
+
+    def test_exact_stream_bounds_preserve_success_and_nonzero_diagnostics(self):
+        for exit_code in (0, 3):
+            stage = "bounded-" + str(exit_code)
+            code = (
+                f"import os,sys;os.write(1,b'o'*{historical_owner.STDOUT_LIMIT});"
+                f"os.write(2,b'e'*{historical_owner.STDERR_LIMIT});"
+                f"sys.exit({exit_code})"
+            )
+            if exit_code:
+                with self.assertRaisesRegex(ValueError, "failed; retained"):
+                    self.run_stage(stage, code)
+            else:
+                self.assertEqual(
+                    self.run_stage(stage, code),
+                    b"o" * historical_owner.STDOUT_LIMIT,
+                )
+            receipt = self.receipt(stage)
+            self.assertEqual(receipt["returncode"], exit_code)
+            self.assertEqual(receipt["overflow"], [])
+            self.assertIsNone(receipt["failure"])
+            self.assertTrue(receipt["cleanup"]["complete"])
+            self.assertEqual(receipt["cleanup"]["failures"], [])
+
+    def test_executing_stage_revalidates_unchanged_executable_path_binding(
+        self,
+    ):
+        for change in ("directory", "permissions", "file"):
+            directory = self.root / ("tool-" + change)
+            directory.mkdir(mode=0o700)
+            tool = directory / "tool"
+            script = (
+                f"#!{self.python}\n"
+                "import pathlib,shutil,sys\n"
+                "tool=pathlib.Path(sys.argv[1]);d=tool.parent\n"
+                "change=sys.argv[2]\n"
+                "if change=='permissions': d.chmod(0o755)\n"
+                "elif change=='directory':\n"
+                " old=d.with_name(d.name+'-old');d.rename(old)\n"
+                " d.mkdir(mode=0o700);shutil.copyfile(old/tool.name,tool)\n"
+                " tool.chmod(0o700)\n"
+                "else:\n"
+                " old=tool.with_suffix('.old');tool.rename(old)\n"
+                " shutil.copyfile(old,tool);tool.chmod(0o700)\n"
+            ).encode()
+            tool.write_bytes(script)
+            tool.chmod(0o700)
+            stage = "binding-" + change
+            with self.subTest(change=change), self.assertRaisesRegex(
+                ValueError, "binding changed"
+            ):
+                historical_owner.run_stage(
+                    self.root, stage, [tool, str(tool), change], self.root, {}
+                )
+            self.assertEqual(tool.read_bytes(), script)
+            receipt = self.receipt(stage)
+            self.assertEqual(receipt["returncode"], 0)
+            self.assertIn("binding changed", receipt["failure"])
+            self.assertTrue(receipt["cleanup"]["complete"])
+
+    def test_timeout_and_exited_parent_new_session_descendants_are_reaped(self):
+        foreign = subprocess.Popen(
+            [self.python, "-c", "import time;time.sleep(60)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            for stage, child, expected, seconds, cap in (
+                (
+                    "timeout",
+                    "import time;time.sleep(60)",
+                    "timed out",
+                    0.3,
+                    historical_owner.STDERR_LIMIT,
+                ),
+                (
+                    "overflow",
+                    (
+                        "import os,time;time.sleep(.1);"
+                        "os.write(2,b'x'*1025);time.sleep(60)"
+                    ),
+                    "stderr overflow",
+                    2,
+                    1024,
+                ),
+                (
+                    "closed-pipes",
+                    "import os,time;os.close(1);os.close(2);time.sleep(60)",
+                    "left descendant",
+                    2,
+                    historical_owner.STDERR_LIMIT,
+                ),
+            ):
+                code = (
+                    "import subprocess,sys;"
+                    f"p=subprocess.Popen([sys.executable,'-c',{child!r}],"
+                    "start_new_session=True);print(p.pid,flush=True);sys.exit(0)"
+                )
+                with self.subTest(stage=stage), mock.patch.object(
+                    historical_owner, "STAGE_TIMEOUT", seconds
+                ), mock.patch.object(
+                    historical_owner, "STDERR_LIMIT", cap
+                ), self.assertRaisesRegex(
+                    ValueError, expected
+                ):
+                    self.run_stage(stage, code)
+                receipt = self.receipt(stage)
+                descendant = int(
+                    (self.root / (stage + ".stdout")).read_bytes().strip()
+                )
+                self.assertEqual(receipt["returncode"], 0)
+                self.assertTrue(receipt["cleanup"]["complete"])
+                self.assertEqual(receipt["cleanup"]["failures"], [])
+                event = next(
+                    value
+                    for value in receipt["cleanup"]["processes"]
+                    if value["pid"] == descendant
+                )
+                self.assertTrue(event["reaped"])
+                self.assertEqual(event["exit_status"], -9)
+                self.assertFalse(Path(f"/proc/{descendant}").exists())
+                self.assertIsNone(
+                    foreign.poll(), "foreign process was signaled"
+                )
+        finally:
+            foreign.terminate()
+            foreign.wait(timeout=5)
+
+    def test_closed_capture_timeout_and_cleanup_failure_refuse_success(self):
+        helper = historical_owner.bounded_process
+        original = helper.signal.pidfd_send_signal
+        refused = False
+
+        def refuse_stop(descriptor, sig):
+            nonlocal refused
+            if sig == helper.signal.SIGSTOP and not refused:
+                refused = True
+                raise PermissionError("synthetic stop refusal")
+            return original(descriptor, sig)
+
+        with mock.patch.object(
+            helper.signal, "pidfd_send_signal", side_effect=refuse_stop
+        ), mock.patch.object(
+            historical_owner, "STAGE_TIMEOUT", 0.2
+        ), self.assertRaisesRegex(
+            ValueError, "timed out"
+        ):
+            self.run_stage(
+                "cleanup-failure",
+                "import os,time;os.close(1);os.close(2);time.sleep(60)",
+            )
+        receipt = self.receipt("cleanup-failure")
+        self.assertTrue(receipt["timeout"])
+        self.assertTrue(receipt["cleanup"]["complete"])
+        self.assertTrue(
+            any(
+                "synthetic stop refusal" in value["error"]
+                for value in receipt["cleanup"]["failures"]
+            )
+        )
+
+    def test_capture_syscall_failure_reaps_owned_process(self):
+        helper = historical_owner.bounded_process
+        original = helper.selectors.DefaultSelector.select
+        caller = os.getpid()
+        failed = False
+
+        def refuse(selector, seconds):
+            nonlocal failed
+            if os.getpid() != caller and not failed:
+                failed = True
+                raise OSError("synthetic capture read failure")
+            return original(selector, seconds)
+
+        with mock.patch.object(
+            helper.selectors.DefaultSelector, "select", new=refuse
+        ), self.assertRaisesRegex(ValueError, "capture read failure"):
+            self.run_stage(
+                "capture-failure",
+                "import os,time;os.write(1,b'start');time.sleep(60)",
+            )
+        receipt = self.receipt("capture-failure")
+        self.assertTrue(receipt["cleanup"]["complete"])
+        self.assertEqual(receipt["cleanup"]["failures"], [])
+        self.assertTrue(
+            all(value["reaped"] for value in receipt["cleanup"]["processes"])
+        )
+
+    def test_exclusive_private_captures_and_receipt_cannot_be_reused(self):
+        self.assertEqual(self.run_stage("success", "print('ok')"), b"ok\n")
+        for suffix in ("stdout", "stderr", "capture.json"):
+            path = self.root / ("success." + suffix)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        original = {
+            path.name: path.read_bytes() for path in self.root.iterdir()
+        }
+        with self.assertRaisesRegex(ValueError, "capture reuse"):
+            self.run_stage("success", "print('changed')")
+        self.assertEqual(
+            original,
+            {path.name: path.read_bytes() for path in self.root.iterdir()},
+        )
+        for suffix in ("stdout", "stderr"):
+            stage = "existing-" + suffix
+            path = self.root / (stage + "." + suffix)
+            path.write_bytes(b"immutable")
+            with mock.patch.object(
+                historical_owner.subprocess, "Popen"
+            ) as execute, self.assertRaises(FileExistsError):
+                self.run_stage(stage, "print('not invoked')")
+            execute.assert_not_called()
+            self.assertEqual(path.read_bytes(), b"immutable")
+
+    def test_other_direct_child_queries_have_both_bounds(self):
+        for stream, descriptor in (("stdout", 1), ("stderr", 2)):
+            with self.subTest(stream=stream), self.assertRaisesRegex(
+                ValueError, stream + " overflow"
+            ):
+                historical_owner.command_output(
+                    [
+                        self.python,
+                        "-c",
+                        f"import os;os.write({descriptor},b'x'*1025)",
+                    ],
+                    self.root,
+                    {},
+                    2,
+                    1024,
+                    1024,
+                )
+
+
 class HypervWorkflowTest(unittest.TestCase):
+    def test_historical_fixture_owner_is_separate_from_current_compute(self):
+        workflow = (
+            SUPPORT.parent / ".github/workflows/integration.yaml"
+        ).read_text()
+        job = workflow.split("  zig-hyperv-runtime:\n", 1)[1].split(
+            "\n  zig-hyperv", 1
+        )[0]
+        step = job.split(
+            "    - name: Exercise WAMR compute only after persistence source custody ends\n",
+            1,
+        )[1].split("\n    - name:", 1)[0]
+        script = step.split("      run: |\n", 1)[1]
+        parsed = subprocess.run(
+            ["bash", "-n"],
+            input=script,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(parsed.returncode, 0, parsed.stderr)
+        for required in (
+            "support/build/wamr-native-ci/build.zig",
+            "python3 -B support/tools/hyperv/direct/tests/historical_owner.py",
+            '--repository "$(readlink -f "${GITHUB_WORKSPACE}")"',
+            '--root "${historical_fixture_root}"',
+            '--git "$(readlink -f "$(command -v git)")"',
+            '--zig "$(readlink -f "$(command -v zig)")"',
+            '--packages "${root}/restore/zig-pkg"',
+            'WAMR_HISTORICAL_FIXTURE_ROOT="${historical_fixture_root}"',
+            'WAMR_CI_SUPERVISOR="${historical_fixture_root}/supervisor/bin/wamr-ci-supervisor"',
+            "python3 -m unittest discover -s support/tools/hyperv/direct/tests",
+        ):
+            self.assertIn(required, step)
+        for forbidden in (
+            "supervisor-source-closure --git",
+            "support/build/wamr-native-ci/supervisor.build.zig",
+            "-Dnative-source-owner",
+            "git reset",
+            "git clean",
+        ):
+            self.assertNotIn(forbidden, step)
+        self.assertLess(
+            step.index("test install"), step.index("historical_owner.py")
+        )
+        for name in (
+            "inputs.json",
+            "result.json",
+            "closure.stdout",
+            "identity.stdout",
+        ):
+            self.assertIn("/historical-fixture/" + name, job)
+
     def test_persistence_build_evidence_exact_roles_and_post_test_retention(self):
         workflow = (SUPPORT.parent / ".github/workflows/integration.yaml").read_text()
         job = workflow.split("  zig-hyperv-runtime:\n", 1)[1].split("\n  zig-hyperv", 1)[0]
@@ -2679,13 +3427,14 @@ class HypervWorkflowTest(unittest.TestCase):
             'test "$(stat -c \'%a\' -- "${compute_fixture_root}")" = 700',
             '-Dtest-root="${compute_fixture_root}"',
             "-Doptimize=ReleaseSafe test install",
-            '"${root}/compute-tools/bin/uk-wamr-native-ci"',
-            "supervisor-source-closure --git /usr/bin/git --output sha256-v1",
+            "python3 -B support/tools/hyperv/direct/tests/historical_owner.py",
+            'WAMR_HISTORICAL_FIXTURE_ROOT="${historical_fixture_root}"',
         ):
             self.assertIn(required, step)
         for forbidden in (
             "|| true", "continue-on-error:", "-Dtest-filter=",
             "import run", "supervisor_source_map()",
+            "supervisor-source-closure --git /usr/bin/git",
         ):
             self.assertNotIn(forbidden, step)
 

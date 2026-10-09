@@ -2398,6 +2398,130 @@ test "current native reader authenticates its closure without historical Python 
     try std.testing.expectError(error.UnsafeSource, controller.import_supervisor_identity.currentReaderSourceContentClosure(a, io, path, reader_git));
 }
 
+test "native executable boundary closes workflow target and local records commands" {
+    const cli = controller.cli;
+    _ = try cli.parse(&.{ "controller", "describe", "--output", "target-v1" });
+    _ = try cli.parse(&.{ "controller", "check-local-records", "--runtime", "/private/runtime" });
+    const bad = [_][]const []const u8{
+        &.{ "controller", "describe", "--output", "target-v2" },
+        &.{ "controller", "describe", "--output", "target-v1", "--profile", "legacy" },
+        &.{ "controller", "check-local-records", "--runtime", "/private/../runtime" },
+        &.{ "controller", "check-local-records", "--stage-root", "/private/stage" },
+        &.{ "controller", "check-local-records", "--runtime", "/private/runtime", "--runtime", "/other" },
+        &.{ "controller", "check-local-records", "--runtime", "/private/runtime", "--output", "count" },
+        &.{ "controller", "check-local-records", "--runtime", "/private/runtime", "--profile", "legacy" },
+    };
+    for (bad) |args| try std.testing.expectError(error.InvalidUsage, cli.parse(args));
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const json = try std.process.run(a, io, .{
+        .argv = &.{ options.host_controller_cli, "describe", "--output", "json-v1" },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    const target = try std.process.run(a, io, .{
+        .argv = &.{ options.host_controller_cli, "describe", "--output", "target-v1" },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, json.term);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, target.term);
+    try std.testing.expectEqualStrings("", target.stderr);
+    const document = try core.contracts.Document.parse(a, json.stdout, .{});
+    defer document.deinit();
+    try document.requireCanonical(a, json.stdout);
+    const arguments = document.value().object.get("recorded_executable_target").?.array.items;
+    var joined: std.Io.Writer.Allocating = .init(a);
+    for (arguments, 0..) |argument, i| {
+        if (i != 0) try joined.writer.writeByte(' ');
+        try joined.writer.writeAll(argument.string);
+    }
+    try joined.writer.writeByte('\n');
+    try std.testing.expectEqualStrings(joined.written(), target.stdout);
+}
+
+test "native executable boundary standalone owner needs no physical Python and refuses wrong identity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const identity = controller.import_supervisor_identity;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "native-standalone-source-{d}", .{std.os.linux.getpid()});
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("native standalone fixture cleanup failed");
+    const root = try parent.openDir(io, name, .{ .iterate = true });
+    defer root.close(io);
+    const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    const tools_name = try std.fmt.allocPrint(a, "{s}-tools", .{name});
+    const git = try std.fs.path.join(a, &.{ options.fixture_root, tools_name, "bin/git" });
+    try @import("local_acceptance_tests.zig").stageGit(a, io, git);
+    defer parent.deleteTree(io, tools_name) catch @panic("native standalone tools cleanup failed");
+    for (identity.standalone_supervisor_sources) |entry|
+        try writeRelativeFixtureFile(io, root, entry.name, entry.content);
+    for (controller.custody_limits.roles) |role|
+        if (std.fs.path.dirname(role)) |parent_path| try root.createDirPath(io, parent_path);
+    try fixtureGit(a, path, &.{ options.git_executable, "init", "-q" });
+    try fixtureGit(a, path, &.{ options.git_executable, "add", "-A" });
+    try fixtureGit(a, path, &.{ options.git_executable, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "native standalone fixture" });
+    const expected = try identity.nativeStandaloneSourceContentClosure(a);
+    const observed = try identity.currentStandaloneSourceContentClosure(a, io, path, git);
+    try std.testing.expectEqualStrings(&expected, &observed);
+    try std.testing.expectError(error.FileNotFound, root.openFile(io, "support/build/wamr-native-ci/run.py", .{}));
+    try std.testing.expectError(error.UntrackedManifest, identity.supervisorSourceContentClosure(a, io, path, options.git_executable));
+    const response = try std.process.run(a, io, .{
+        .argv = &.{ options.host_controller_cli, "standalone-supervisor-source-closure", "--git", git, "--output", "sha256-v1" },
+        .cwd = .{ .path = path },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, response.term);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}\n", .{expected}), response.stdout);
+    const native = try std.process.run(a, io, .{
+        .argv = &.{ options.native_standalone_supervisor, "--identity" },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, native.term);
+    try std.testing.expectEqualStrings("", native.stderr);
+    try identity.validateNativeStandaloneIdentity(a, native.stdout);
+    try std.testing.expectError(error.ImportIdentityChanged, identity.validateNativeStandaloneIdentity(a, native.stdout[0 .. native.stdout.len - 1]));
+    const historic = try std.process.run(a, io, .{
+        .argv = &.{ options.historical_standalone_supervisor, "--identity" },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, historic.term);
+    try std.testing.expectEqualStrings(try identity.identityBytes(a, "a" ** 64), historic.stdout);
+    try std.testing.expectError(error.ImportIdentityChanged, identity.validateNativeStandaloneIdentity(a, historic.stdout));
+    var forged = try core.contracts.Document.parse(a, native.stdout, .{});
+    defer forged.deinit();
+    forged.value().object.getPtr("source_content_closure_sha256").?.* = .{ .string = "0" ** 64 };
+    const mutated = try forged.canonicalAlloc(a);
+    try std.testing.expectError(error.ImportIdentityChanged, identity.validateNativeStandaloneIdentity(a, mutated));
+    try appendRelativeFixtureFile(io, root, "support/build/wamr-native-ci/supervisor.zig", "\n");
+    try std.testing.expectError(error.DirtySource, identity.currentStandaloneSourceContentClosure(a, io, path, git));
+    try fixtureGit(a, path, &.{ options.git_executable, "add", "-A" });
+    try fixtureGit(a, path, &.{ options.git_executable, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "mutated standalone fixture" });
+    try std.testing.expectError(error.UnsafeSource, identity.currentStandaloneSourceContentClosure(a, io, path, git));
+}
+
+test "native executable boundary retains the prior candidate source-name contract" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var map = std.json.Value{ .object = .empty };
+    for (controller.source_custody.previous_candidate_closure) |entry|
+        try map.object.put(a, entry.name, .null);
+    try controller.import_supervisor_identity.validateSourceNames(map);
+    _ = map.object.swapRemove("support/build/wamr-native-ci/handoff/candidate.zig");
+    try map.object.put(a, "support/build/wamr-native-ci/handoff/not-candidate.zig", .null);
+    try std.testing.expectError(error.UnsupportedSupervisorSource, controller.import_supervisor_identity.validateSourceNames(map));
+}
+
 test "supervisor source closure requires tracked clean Git blobs" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -3035,6 +3159,15 @@ test "python-produced local runtimes stay outside records and validator-build ac
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, local_refusal.term);
     try std.testing.expectEqualStrings("", local_refusal.stdout);
     try std.testing.expect(std.mem.indexOf(u8, local_refusal.stderr, "cause: UnsupportedLocalProducer") != null);
+    const checked = try std.process.run(a, io, .{
+        .argv = &.{ options.host_controller_cli, "check-local-records", "--runtime", path },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(256),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, checked.term);
+    try std.testing.expectEqualStrings("", checked.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, checked.stderr, "check-local-records; cause: UnsupportedLocalProducer") != null);
     const validation_path = try std.fs.path.join(a, &.{ path, "validator" });
     defer a.free(validation_path);
     const validator_build = try std.process.run(a, io, .{
@@ -3126,6 +3259,17 @@ test "accepted run requires complete local and trusted-inner-zip evidence before
     defer a.free(local_refusal.stderr);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, local_refusal.term);
     try std.testing.expectEqualStrings("", local_refusal.stdout);
+    const checked = try std.process.run(a, io, .{
+        .argv = &.{ options.host_controller_cli, "check-local-records", "--runtime", path },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(256),
+        .stderr_limit = .limited(4096),
+    });
+    defer a.free(checked.stdout);
+    defer a.free(checked.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, checked.term);
+    try std.testing.expectEqualStrings("", checked.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, checked.stderr, "check-local-records; cause: MissingEvidence") != null);
     const inspection_path = try std.fs.path.join(a, &.{ path, "inspection" });
     defer a.free(inspection_path);
     const inspection = try std.process.run(a, io, .{

@@ -24,6 +24,15 @@ pub fn main(init: std.process.Init) void {
         return;
     }
     if (command.action == .describe) {
+        if (std.mem.eql(u8, command.output.?, "target-v1")) {
+            var stdout = std.Io.File.stdout().writerStreaming(init.io, &.{});
+            for (controller.profile.executable_target, 0..) |argument, i| {
+                if (i != 0) stdout.interface.writeByte(' ') catch refused(init.io);
+                stdout.interface.writeAll(argument) catch refused(init.io);
+            }
+            stdout.interface.writeByte('\n') catch refused(init.io);
+            return;
+        }
         const closure = std.fmt.bytesToHex(controller.source_custody.contentClosure(), .lower);
         const raw = std.json.Stringify.valueAlloc(allocator, .{
             .schema = "uk.wamr.native-ci-describe",
@@ -36,10 +45,17 @@ pub fn main(init: std.process.Init) void {
         stdout.interface.writeAll(encoded) catch refused(init.io);
         return;
     }
-    if (command.action == .@"supervisor-source-closure" or command.action == .@"reader-source-closure") {
+    if (command.action == .@"supervisor-source-closure" or command.action == .@"reader-source-closure" or command.action == .@"standalone-supervisor-source-closure") {
         const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
         const closure = (if (command.action == .@"reader-source-closure")
             controller.import_supervisor_identity.currentReaderSourceContentClosure(
+                allocator,
+                init.io,
+                repository,
+                command.git.?,
+            )
+        else if (command.action == .@"standalone-supervisor-source-closure")
+            controller.import_supervisor_identity.currentStandaloneSourceContentClosure(
                 allocator,
                 init.io,
                 repository,
@@ -56,10 +72,14 @@ pub fn main(init: std.process.Init) void {
         stdout.interface.print("{s}\n", .{closure[0..]}) catch refused(init.io);
         return;
     }
-    if (command.action == .records or command.action == .@"readonly-records") {
+    if (command.action == .records or command.action == .@"readonly-records" or command.action == .@"check-local-records") {
+        const stage = if (command.action == .@"check-local-records") "check-local-records" else "records";
         const repository = std.process.currentPathAlloc(init.io, allocator) catch refused(init.io);
         const root = command.runtime orelse command.stage_root.?;
-        const directory = controller.layout.runtime(init.io, root) catch refused(init.io);
+        const directory = controller.layout.runtime(init.io, root) catch |err| {
+            if (command.action == .@"check-local-records") failed(init.io, stage, "", err);
+            refused(init.io);
+        };
         defer directory.close(init.io);
         var accepted = if (command.action == .@"readonly-records" and command.git != null)
             controller.accepted_run.openAndValidateReadOnlyWithGit(
@@ -90,17 +110,21 @@ pub fn main(init: std.process.Init) void {
                 &directory,
                 root,
                 repository,
-            ) catch |err| failed(init.io, "records", "", err)
+            ) catch |err| failed(init.io, stage, "", err)
         else
             controller.accepted_run.openImportedStage(
                 allocator,
                 init.io,
                 &directory,
                 root,
-            ) catch |err| failed(init.io, "records", "", err);
+            ) catch |err| failed(init.io, stage, "", err);
         defer accepted.deinit();
-        accepted.revalidate() catch |err| failed(init.io, "records", "", err);
-        const encoded = accepted.handoffV1() catch |err| failed(init.io, "records", "", err);
+        accepted.revalidate() catch |err| failed(init.io, stage, "", err);
+        if (command.action == .@"check-local-records") {
+            std.Io.File.stdout().writeStreamingAll(init.io, "Completed native local records authenticated; authority=not_admitted.\n") catch refused(init.io);
+            return;
+        }
+        const encoded = accepted.handoffV1() catch |err| failed(init.io, stage, "", err);
         var stdout = std.Io.File.stdout().writerStreaming(init.io, &.{});
         stdout.interface.writeAll(encoded) catch refused(init.io);
         return;
@@ -339,8 +363,10 @@ pub fn main(init: std.process.Init) void {
         .describe => unreachable,
         .candidate, .@"candidate-inspect", .@"candidate-result" => unreachable,
         .@"supervisor-source-closure" => unreachable,
+        .@"standalone-supervisor-source-closure" => unreachable,
         .@"reader-source-closure" => unreachable,
         .records => unreachable,
+        .@"check-local-records" => unreachable,
         .@"readonly-records" => unreachable,
         .@"local-consumer-custody" => unreachable,
         .@"handoff-inspect" => unreachable,
@@ -551,8 +577,10 @@ fn usage(io: std.Io) noreturn {
     stderr.interface.writeAll(
         "usage: uk-wamr-native-ci build --runtime ABS --wamr-source ABS\n" ++
             "       uk-wamr-native-ci boot|diagnostics --runtime ABS\n" ++
-            "       uk-wamr-native-ci describe --output json-v1\n" ++
+            "       uk-wamr-native-ci describe --output json-v1|target-v1\n" ++
+            "       uk-wamr-native-ci check-local-records --runtime ABS\n" ++
             "       uk-wamr-native-ci supervisor-source-closure --git /usr/bin/git --output sha256-v1\n" ++
+            "       uk-wamr-native-ci standalone-supervisor-source-closure --git ABS --output sha256-v1\n" ++
             "       uk-wamr-native-ci reader-source-closure --git /usr/bin/git --output sha256-v1\n" ++
             "       uk-wamr-native-ci readonly-records --runtime /private/runtime --output handoff-v1\n" ++
             "       uk-wamr-native-ci records --runtime ABS --output handoff-v1\n" ++

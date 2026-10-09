@@ -528,6 +528,31 @@ query and historical source-name/Git-blob admission sets remain unchanged for
 the standalone supervisor and archived producers. Adding the private contract
 dependency preserves both prior native source-name sets.
 
+The current standalone native supervisor has a separate compiled source owner.
+Build `supervisor.build.zig` with `-Dnative-source-owner=true`, without
+`-Dsource-closure-sha256`. Its closed source set includes its build file,
+`supervisor.zig`, the source-closure owner and the shared process implementation;
+it does not include or physically read `run.py`. The build refuses a caller's
+substituted digest in this mode. Its `--identity` emits
+`uk.wamr.native-standalone-supervisor-identity` with a separately domain-bound
+closure, not the historical `uk.wamr.command-supervisor-identity` or the current
+controller reader's closure. `standalone-supervisor-source-closure --git ABS
+--output sha256-v1` independently checks those compiled bytes against a clean,
+unchanged tracked checkout while retaining the explicitly supplied Git tool.
+The native identity consumer refuses historical, noncanonical or altered
+identity bytes. The prior candidate/controller source-name set remains
+admissible independently of the two newly included standalone supervisor inputs.
+
+The default standalone build and historical supervisor identity remain
+unchanged. In particular, the integration direct/public Python fixture lane
+still asks for that historical owner: its pre-supervisor archive fallback
+constructs the frozen historical source map. Switching this lane to the new
+native standalone identity, or compiling the standalone executable with a
+controller-reader digest, would not preserve that contract. This source change
+does not migrate that retained caller, change archived v1/v2 admission, or remove
+the live Python implementation. The current standalone owner is available
+without claiming completion of the historical integration-lane migration.
+
 `local-consumer-custody --runtime ABS --expected-build-start-sha256 HEX
 --expected-boot-inputs-sha256 HEX` is the production owner for a completed
 v2 runtime's local checkout/source and build/boot consumer-input
@@ -560,6 +585,17 @@ the explicit GNU/v2 and `ReleaseSafe` flags and refuses musl, v3, or an
 unspecified target before creating a slot. `describe --output json-v1`
 reports that fixed target and the embedded source-content closure without
 accessing a runtime or granting boot authority.
+`describe --output target-v1` prints the same closed target arguments as one
+space-separated line, removing the selected workflow's Python JSON parser.
+`check-local-records --runtime ABS` performs the same full native-local
+`AcceptedRun` admission and revalidation as `records --runtime`, then emits a
+bounded success line rather than the handoff document. It accepts only a
+completed native v2 run on the recorded controller path, with exact source/tool
+custody, all 33 required records, their bytes, six boot transcripts and the
+image chain. It never trusts a record count as evidence, accepts a Python or
+historical local producer, or consumes an imported stage. Failure identifies
+`check-local-records` and its cause and emits no success output. The selected
+local workflow uses this native check; handoff/public callers are unchanged.
 
 The protected native-compute workflow installs this same portable controller
 from the checked-out source after pinned Zig setup at
