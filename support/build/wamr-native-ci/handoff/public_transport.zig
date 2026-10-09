@@ -8,6 +8,8 @@ const archive = @import("public_archive.zig");
 const copy = @import("retained_copy.zig");
 
 pub const filename = "tiny-aot-public-source.zip";
+pub const publication = @import("publication.zig");
+pub const actions_container = @import("actions_container.zig");
 
 pub const ArtifactId = struct {
     storage: [20]u8,
@@ -60,7 +62,7 @@ pub const DownloadSelection = struct {
     upload: UploadMetadata,
 };
 
-fn matchUpload(expected: UploadMetadata, selected: UploadMetadata) !void {
+pub fn matchUpload(expected: UploadMetadata, selected: UploadMetadata) !void {
     try expected.context.validate();
     try selected.context.validate();
     if (expected.artifact_id.len > 20 or selected.artifact_id.len > 20)
@@ -133,7 +135,7 @@ pub const Standalone = struct {
     }
 };
 
-fn exactMember(io: std.Io, directory: std.Io.Dir) !void {
+pub fn exactMember(io: std.Io, directory: std.Io.Dir) !void {
     var iterator = directory.iterate();
     const entry = (try iterator.next(io)) orelse return error.InvalidDownloadMembers;
     if (!std.mem.eql(u8, entry.name, filename) or entry.kind != .file or

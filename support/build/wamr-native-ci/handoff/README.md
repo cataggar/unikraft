@@ -128,11 +128,11 @@ digest; `DownloadSelection` records the exact Actions selection. Both artifact
 IDs, container digests and source/run contexts must agree, and the archive
 verifier independently checks the inner digest and context. `ArtifactId`,
 `ContainerDigest` and `InnerDigest` are distinct types: the container SHA is
-**not** the inner SHA. The engine does not download anything, hash container
-bytes, or authenticate remote metadata from filenames or receipt equality.
-The existing exact `artifact-ids` `download-artifact` action remains the network
-owner. Callers must provide trusted upload metadata, not data discovered beside
-the downloaded ZIP.
+**not** the inner SHA. `Download` alone does not hash container bytes or authenticate remote metadata
+from filenames or receipt equality. Callers must provide independently trusted
+upload metadata, not data discovered beside the downloaded ZIP. An exact-ID
+`download-artifact` extraction does not retain the raw Actions container needed
+by the composed importer.
 
 The owner copies its context and retains both the directory snapshot and genuine
 `Archive`. Each revalidation rechecks exact membership, physical identities and
@@ -153,6 +153,35 @@ records and publication-last final bundle belong to `public_products`, not
 these library-only owners.
 There is no synthetic identity wrapper, fallback, arbitrary command runner,
 network process or authority admission API here.
+
+`public_transport.publication.sealUpload` supplies the separate privileged
+publication boundary: initial-namespace root, explicit source UID/GID and upload
+GID, one create-only root-owned `0550` directory and `0440` single-link file.
+Its scoped source descriptor walk accepts only root and the expressly named
+source owner; it does not weaken global `private_files` policies. Success owns
+retained source, destination and ancestor descriptors, independently rehashes
+both files and rechecks exact destination membership. Failures preserve partial
+evidence and report uncertain versus durable publication. `sealUploadForTest`
+simulates only the destination root identity in fresh fixture roots and is
+unavailable to production callers.
+
+`public_transport.actions_container.retainDownload` retains a private raw
+container descriptor and creates an independently verified one-file `Download`.
+Its separate outer ZIP32 profile permits stored/raw-deflate data and optional
+signed 16-byte ZIP32 descriptors, Unix/DOS creator systems, version-needed
+10/20, and only descriptor/UTF-8 flags. It rejects names other than the fixed
+ASCII filename, nonregular member attributes, extras, duplicate members,
+encryption, comments, ZIP64, unsupported codecs, bad headers/CRC/descriptors,
+truncation and trailing compressed data. Bounds are 512 MiB for the inner ZIP
+and 512 MiB + 128 KiB for the raw container; decode and publication check
+cancellation in bounded chunks. No network/authentication library is added.
+Destroy borrowed materialized consumers before this owner; its raw bytes and
+one-file output remain on disk after `deinit`.
+
+The CLI's expected and selected artifact/container/source/run arguments are
+independent mandatory inputs. Compose the raw-retention command's output and
+original container path with `import-public-source-download`; no local Python
+extraction is required by that composition. No live caller is switched here.
 
 ## Qualification
 
@@ -190,6 +219,12 @@ ID/context/digest mismatches, links/extras, actual sparse-file size limits,
 same-byte replacement, cancellation, create-only collisions and partial/sync
 durability. Only explicit test faults replace syscall failures; genuine
 acceptance is not replaced with a test-only trusted owner.
+The same focused selector tests source-only sealing and raw-container adapters:
+exact bytes/digests/modes, privilege refusal, independent selection, stored and
+level-zero deflate/descriptor handling, path/type/codec refusals, live mutation,
+replacement, hard links, cancellation, collisions and uncertain sync.
+The optional genuine transport test remains skipped without authorized genuine
+inputs; a passing source-only run is not privileged or product acceptance.
 
 Golden/fault packing substitutes only the expensive producer CI/private-tool
 process boundary with an explicit test-only API. Genuine repacking additionally

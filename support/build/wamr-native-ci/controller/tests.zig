@@ -95,10 +95,16 @@ test "public product CLI separates trusted and selected transport identities and
         "--container-digest",          digest,
         "--selected-artifact-id",      "11449019167",
         "--selected-container-digest", digest,
+        "--selected-source",           revision,
+        "--selected-tree",             revision,
+        "--selected-run-id",           "37527403296",
+        "--selected-run-attempt",      "2",
     };
     const parsed = try cli.parse(&valid);
     try std.testing.expectEqualStrings("11449019166", parsed.artifact_id.?);
     try std.testing.expectEqualStrings("11449019167", parsed.selected_artifact_id.?);
+    try std.testing.expectEqualStrings("37527403296", parsed.selected_run_id.?);
+    try std.testing.expectEqualStrings("2", parsed.selected_run_attempt.?);
     try std.testing.expectError(error.InvalidUsage, cli.parse(valid[0 .. valid.len - 2]));
     var changed = valid;
     changed[28] = "--artifact-id";
@@ -149,6 +155,46 @@ test "public product CLI refuses missing inputs without a success receipt or out
     try std.testing.expectEqualStrings("", result.stdout);
     try std.testing.expect(std.mem.indexOf(u8, result.stderr, "import-public-source-bundle/inputs") != null);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.openDirAbsolute(std.testing.io, output, .{}));
+}
+
+test "public product CLI publication adapters refuse without output or success text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const revision = "0123456789012345678901234567890123456789";
+    const digest = "0123456789012345678901234567890123456789012345678901234567890123";
+    for ([_]bool{ false, true }) |sealing| {
+        const output = try std.fs.path.join(a, &.{ options.fixture_root, if (sealing) "refused-public-seal" else "refused-public-retention" });
+        const missing = try std.fs.path.join(a, &.{ options.fixture_root, "absent-public-container.zip" });
+        const result = try std.process.run(a, std.testing.io, .{
+            .argv = if (sealing) &.{
+                options.host_controller_cli, "seal-public-source-upload", "--archive",       missing,
+                "--output",                  output,                      "--source-uid",    "1000",
+                "--source-gid",              "1000",                      "--upload-gid",    "1000",
+                "--expected-source",         revision,                    "--expected-tree", revision,
+                "--run-id",                  "1",                         "--run-attempt",   "1",
+                "--expected-archive-sha256", digest,
+            } else &.{
+                options.host_controller_cli, "retain-public-source-download", "--container-archive",         missing,
+                "--output",                  output,                          "--expected-source",           revision,
+                "--expected-tree",           revision,                        "--run-id",                    "1",
+                "--run-attempt",             "1",                             "--expected-archive-sha256",   digest,
+                "--artifact-id",             "123",                           "--container-digest",          digest,
+                "--selected-artifact-id",    "123",                           "--selected-container-digest", digest,
+                "--selected-source",         revision,                        "--selected-tree",             revision,
+                "--selected-run-id",         "1",                             "--selected-run-attempt",      "1",
+            },
+            .cwd = .{ .path = options.repository_root },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, result.term);
+        try std.testing.expectEqualStrings("", result.stdout);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, if (sealing) "seal-public-source-upload/inputs" else "retain-public-source-download/inputs") != null);
+        if (sealing and std.os.linux.geteuid() != 0)
+            try std.testing.expect(std.mem.indexOf(u8, result.stderr, "PrivilegeRequired") != null);
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.openDirAbsolute(std.testing.io, output, .{}));
+    }
 }
 
 test "private product CLI closes arguments and refuses unavailable custody without output" {
@@ -2507,6 +2553,78 @@ test "native executable boundary standalone owner needs no physical Python and r
     try fixtureGit(a, path, &.{ options.git_executable, "add", "-A" });
     try fixtureGit(a, path, &.{ options.git_executable, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "mutated standalone fixture" });
     try std.testing.expectError(error.UnsafeSource, identity.currentStandaloneSourceContentClosure(a, io, path, git));
+}
+
+test "native publication historical profile authenticates actual #263 Git source map" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const revision = "3599c9a5602f037e9d6c8113067b77b2451cccee";
+    const tree = "d5292215bf661afaf3bc018b2a44db8cc8521987";
+    const script =
+        \\import hashlib, json, os, re, subprocess, sys, types
+        \\git, revision, repository = sys.argv[1:]
+        \\environment = os.environ.copy()
+        \\environment.update(GIT_NO_REPLACE_OBJECTS="1",
+        \\    GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_NOSYSTEM="1")
+        \\def blob(name):
+        \\    return subprocess.run([git, "--no-pager", "-c", "core.hooksPath=/dev/null",
+        \\        "-c", "core.fsmonitor=false", "cat-file", "blob", revision + ":" + name],
+        \\        cwd=repository, env=environment, check=True,
+        \\        stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+        \\owner = blob("support/controller_source_closure.zig")
+        \\assert len(owner) == 15152
+        \\assert hashlib.sha256(owner).hexdigest() == "82ea7647cb97eb7583f76af234d61004ae8adb99fb6cb3f490c9ca51d1e06f87"
+        \\closure = owner.decode("utf-8")
+        \\names = re.findall(r'\.\{ \.name = "([^"]+)"', closure)
+        \\assert len(names) == len(set(names)) == 97
+        \\ci = types.ModuleType("original_263_ci")
+        \\ci.__file__ = repository + "/support/build/wamr-native-ci/run.py"
+        \\exec(compile(blob("support/build/wamr-native-ci/run.py"),
+        \\    revision + ":run.py", "exec"), ci.__dict__)
+        \\records = {}
+        \\for name in sorted(names):
+        \\    raw = blob(name)
+        \\    assert 0 < len(raw) <= 8 * 1024 * 1024
+        \\    records[name] = {"bytes":len(raw),
+        \\        "sha256":hashlib.sha256(raw).hexdigest(), "metadata":[]}
+        \\sys.stdout.buffer.write(ci.canonical_json(ci.guarded_record_map(
+        \\    "uk.wamr.command-supervisor-source-v1", records)))
+    ;
+    const oracle = try std.process.run(a, io, .{
+        .argv = &.{ options.python_executable, "-B", "-c", script, options.git_executable, revision, options.repository_root },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, oracle.term);
+    try std.testing.expectEqualStrings("", oracle.stderr);
+    const genuine = try std.json.parseFromSliceLeaky(std.json.Value, a, oracle.stdout, .{ .parse_numbers = false });
+    try std.testing.expectEqualStrings("7781ee8b7977e28398dab74815f665c40ea97c5f93021d88058ad1ea8e3d354a", genuine.object.get("content_closure_sha256").?.string);
+    const genuine_records = genuine.object.get("records").?;
+    const identity = controller.import_supervisor_identity;
+    try identity.validateSourceNames(genuine_records);
+    try std.testing.expectEqual(genuine_records.object.count(), controller.source_custody.previous_candidate_closure.len);
+    for (controller.source_custody.previous_candidate_closure) |entry|
+        try std.testing.expect(genuine_records.object.contains(entry.name));
+    const source: controller.accepted_run.SourceIdentity = .{ .revision = revision, .tree = tree };
+    const authenticated = try identity.verifyGitSource(a, io, source, options.repository_root, options.git_executable, genuine, null);
+    try std.testing.expectEqualStrings(genuine.object.get("content_closure_sha256").?.string, authenticated);
+
+    var wrong_tree = source;
+    wrong_tree.tree = "0" ** 40;
+    try std.testing.expectError(error.ImportIdentityChanged, identity.verifyGitSource(a, io, wrong_tree, options.repository_root, options.git_executable, genuine, null));
+    const changed = try std.json.parseFromSliceLeaky(std.json.Value, a, oracle.stdout, .{ .parse_numbers = false });
+    changed.object.get("records").?.object.get("support/build/wamr-native-ci/controller/cli.zig").?.object.getPtr("sha256").?.* = .{ .string = "0" ** 64 };
+    try std.testing.expectError(error.ImportIdentityChanged, identity.verifyGitSource(a, io, source, options.repository_root, options.git_executable, changed, null));
+    const resized = try std.json.parseFromSliceLeaky(std.json.Value, a, oracle.stdout, .{ .parse_numbers = false });
+    resized.object.get("records").?.object.get("support/build/wamr-native-ci/controller/cli.zig").?.object.getPtr("bytes").?.* = .{ .number_string = "1" };
+    try std.testing.expectError(error.ImportSourceChanged, identity.verifyGitSource(a, io, source, options.repository_root, options.git_executable, resized, null));
+    var unsupported = genuine_records;
+    _ = unsupported.object.swapRemove("support/build/wamr-native-ci/handoff/candidate.zig");
+    try unsupported.object.put(a, "support/build/wamr-native-ci/handoff/actions_container.zig", .null);
+    try std.testing.expectError(error.UnsupportedSupervisorSource, identity.validateSourceNames(unsupported));
 }
 
 test "native executable boundary retains the prior candidate source-name contract" {

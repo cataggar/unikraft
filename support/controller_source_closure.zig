@@ -123,7 +123,7 @@ pub const previous_candidate_entries = blk: {
 
 pub const entries = blk: {
     @setEvalBranchQuota(100_000);
-    var all = previous_candidate_entries ++ executable_boundary_entries;
+    var all = previous_candidate_entries ++ executable_boundary_entries ++ publication_adapter_entries;
     @import("std").mem.sort(Entry, &all, {}, struct {
         fn less(_: void, first: Entry, second: Entry) bool {
             return @import("std").mem.lessThan(u8, first.name, second.name);
@@ -142,6 +142,11 @@ const candidate_consumer_entries = [_]Entry{
     .{ .name = "support/build/wamr-native-ci/handoff/public_archive.zig", .content = @embedFile("build/wamr-native-ci/handoff/public_archive.zig") },
     .{ .name = "support/build/wamr-native-ci/handoff/public_products.zig", .content = @embedFile("build/wamr-native-ci/handoff/public_products.zig") },
     .{ .name = "support/build/wamr-native-ci/handoff/public_transport.zig", .content = @embedFile("build/wamr-native-ci/handoff/public_transport.zig") },
+};
+
+const publication_adapter_entries = [_]Entry{
+    .{ .name = "support/build/wamr-native-ci/handoff/actions_container.zig", .content = @embedFile("build/wamr-native-ci/handoff/actions_container.zig") },
+    .{ .name = "support/build/wamr-native-ci/handoff/publication.zig", .content = @embedFile("build/wamr-native-ci/handoff/publication.zig") },
 };
 
 const private_export_entries = [_]Entry{
