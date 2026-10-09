@@ -2,18 +2,14 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """TEST ONLY: bounded stagewise handoff witness. Never an acceptance/cutover gate."""
 import argparse
-import ctypes
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 import re
-import selectors
 import shutil
-import signal
 import stat
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -25,6 +21,10 @@ MAX_RECORD = 2 * 1024 * 1024
 MAX_LOG = 8 * 1024 * 1024
 TIMEOUT = 2400
 HERE = Path(__file__).resolve().parent
+BOUNDED_PROCESS_PATH = HERE.parents[3] / "support/tools/hyperv/direct/tests/bounded_process.py"
+_bounded_spec = importlib.util.spec_from_file_location("wamr_shadow_bounded_process", BOUNDED_PROCESS_PATH)
+bounded_process = importlib.util.module_from_spec(_bounded_spec)
+_bounded_spec.loader.exec_module(bounded_process)
 FLAGS = {
     "direct_specialized_gen2", "os_only_private", "two_boots_only",
     "cleanup_owned_group", "exact_image_and_local_bundle_reviewed",
@@ -313,155 +313,6 @@ def native_import_command(tools, paths, download, output, source, upload, select
     )
 
 
-class ProcessCustody:
-    """Kernel-owned adoption retains descendants even after their parent exits."""
-    def __init__(self):
-        self.libc = ctypes.CDLL(None, use_errno=True)
-        previous = ctypes.c_int()
-        if self.libc.prctl(37, ctypes.byref(previous), 0, 0, 0) != 0:
-            raise OSError(ctypes.get_errno(), "PR_GET_CHILD_SUBREAPER")
-        self.previous = previous.value
-        self.baseline = self.children(os.getpid())
-        self.held = {}
-        self.events = {}
-        self.failures = []
-        self.root = None
-        self.complete = False
-        if self.libc.prctl(36, 1, 0, 0, 0) != 0:
-            raise OSError(ctypes.get_errno(), "PR_SET_CHILD_SUBREAPER")
-
-    @staticmethod
-    def children(pid):
-        return {int(value) for value in Path(
-            f"/proc/{pid}/task/{pid}/children").read_text().split()}
-
-    def error(self, operation, err):
-        self.failures.append({"operation": operation, "error": str(err)})
-
-    def track(self, pid, parent):
-        if pid in self.held:
-            return True
-        descriptor = None
-        try:
-            require(len(self.held) < 512, "owned process bound")
-            descriptor = os.pidfd_open(pid)
-            signal.pidfd_send_signal(descriptor, 0)
-            fields_ = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-            require(int(fields_[1]) in (parent, os.getpid()), "process ownership changed")
-            signal.pidfd_send_signal(descriptor, 0)
-            self.held[pid] = descriptor
-            self.events[pid] = {"pid": pid, "start_ticks": int(fields_[19]),
-                                "signals": [], "reaped": False, "exit_status": None}
-            return True
-        except (ProcessLookupError, FileNotFoundError):
-            return False
-        except (OSError, ValueError) as err:
-            self.error("track:" + str(pid), err)
-            return False
-        finally:
-            if descriptor is not None and pid not in self.held:
-                os.close(descriptor)
-
-    def attach(self, process):
-        self.root = process.pid
-        require(self.track(process.pid, os.getpid()), "cannot retain original process ownership")
-
-    def send(self, pid, sig):
-        try:
-            signal.pidfd_send_signal(self.held[pid], sig)
-            self.events[pid]["signals"].append(sig)
-            return True
-        except ProcessLookupError:
-            return False
-        except OSError as err:
-            self.error("signal:" + str(pid) + ":" + str(sig), err)
-            return False
-
-    def collect_and_kill(self):
-        try:
-            pending = [(pid, os.getpid()) for pid in self.children(os.getpid()) - self.baseline]
-        except OSError as err:
-            self.error("enumerate-owned-children", err)
-            pending = []
-        seen = set()
-        while pending:
-            pid, parent = pending.pop()
-            if pid in seen:
-                continue
-            seen.add(pid)
-            if not self.track(pid, parent) or not self.send(pid, signal.SIGSTOP):
-                continue
-            try:
-                pending.extend((child, pid) for child in self.children(pid))
-            except (FileNotFoundError, ProcessLookupError):
-                pass
-            except OSError as err:
-                self.error("enumerate:" + str(pid), err)
-        for pid in reversed(tuple(self.held)):
-            if not self.events[pid]["reaped"]:
-                self.send(pid, signal.SIGKILL)
-
-    def finish(self, process):
-        deadline = time.monotonic() + 5
-        try:
-            self.collect_and_kill()
-            if process is not None:
-                try:
-                    status = process.wait(timeout=max(0.001, deadline - time.monotonic()))
-                    if process.pid in self.events:
-                        self.events[process.pid].update(reaped=True, exit_status=status)
-                except (OSError, subprocess.SubprocessError) as err:
-                    self.error("wait-original-process", err)
-            while True:
-                # Killed parents reparent their descendants to this subreaper,
-                # including children that have started independent sessions.
-                self.collect_and_kill()
-                remaining = False
-                for pid in self.held:
-                    if self.events[pid]["reaped"]:
-                        continue
-                    try:
-                        waited, status = os.waitpid(pid, os.WNOHANG)
-                        if waited == pid:
-                            self.events[pid].update(
-                                reaped=True, exit_status=os.waitstatus_to_exitcode(status))
-                        else:
-                            remaining = True
-                    except ChildProcessError:
-                        try:
-                            stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-                            remaining |= int(stat[19]) == self.events[pid]["start_ticks"]
-                            if int(stat[19]) != self.events[pid]["start_ticks"]:
-                                self.events[pid]["reaped"] = True
-                        except FileNotFoundError:
-                            self.events[pid]["reaped"] = True
-                        except OSError as err:
-                            self.error("observe-reaping:" + str(pid), err)
-                            remaining = True
-                    except OSError as err:
-                        self.error("reap:" + str(pid), err)
-                        remaining = True
-                if not remaining and not self.children(os.getpid()) - self.baseline:
-                    self.complete = True
-                    break
-                if time.monotonic() >= deadline:
-                    self.error("cleanup-deadline", Refusal("owned descendants not reaped"))
-                    break
-                time.sleep(0.01)
-        except (OSError, ValueError) as err:
-            self.error("cleanup", err)
-        finally:
-            if self.libc.prctl(36, self.previous, 0, 0, 0) != 0:
-                self.error("restore-subreaper", OSError(ctypes.get_errno(), "prctl"))
-            for descriptor in self.held.values():
-                try:
-                    os.close(descriptor)
-                except OSError as err:
-                    self.error("close-pidfd", err)
-        return {"complete": self.complete, "failures": self.failures,
-                "processes": list(self.events.values())}
-
-
 def execute(command, output, environment):
     """Retain exact command, bounded streams and status even on failed partial execution."""
     require(re.fullmatch("[a-z-]+", command.stage), "invalid stage")
@@ -478,57 +329,34 @@ def execute(command, output, environment):
     started = time.monotonic_ns()
     term = None
     failure = None
-    logs = {}
-    process = None
-    custody = None
+    executable = None
     cleanup = {"complete": False, "failures": [], "processes": []}
     try:
         with (directory / "stdout").open("xb") as stdout, \
                 (directory / "stderr").open("xb") as stderr:
             os.chmod(directory / "stdout", 0o600)
             os.chmod(directory / "stderr", 0o600)
-            custody = ProcessCustody()
-            process = subprocess.Popen(
-                command.argv, cwd=command.cwd, env=environment,
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, start_new_session=True)
-            custody.attach(process)
-            deadline = time.monotonic() + command.timeout_seconds
-            with selectors.DefaultSelector() as selector:
-                for pipe, target in ((process.stdout, stdout), (process.stderr, stderr)):
-                    selector.register(pipe, selectors.EVENT_READ, target)
-                    logs[target] = 0
-                while selector.get_map():
-                    remaining = deadline - time.monotonic()
-                    require(remaining > 0, "command timed out")
-                    ready = selector.select(remaining)
-                    require(ready, "command timed out")
-                    for key, _ in ready:
-                        chunk = os.read(key.fileobj.fileno(), 65536)
-                        if not chunk:
-                            selector.unregister(key.fileobj)
-                        else:
-                            logs[key.data] += len(chunk)
-                            require(logs[key.data] <= MAX_LOG, "command output bound")
-                            key.data.write(chunk)
-                term = process.wait(timeout=max(0.001, deadline - time.monotonic()))
-            require(not custody.children(os.getpid()) - custody.baseline,
-                    "command left descendant processes")
-            for target in (stdout, stderr):
-                target.flush()
-                os.fsync(target.fileno())
-    except (OSError, ValueError, subprocess.SubprocessError) as err:
-        failure = str(err)
+            path = Path(command.argv[0]).resolve(strict=True)
+            executable_pin = hash_file(path)
+            executable = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            require(physical(os.fstat(executable)) == executable_pin["metadata"],
+                    "executable custody changed")
+            result = bounded_process.execute(
+                command.argv, command.cwd, environment, executable,
+                command.timeout_seconds, MAX_LOG, MAX_LOG, stdout, stderr)
+            term, failure, cleanup = result["returncode"], result["failure"], result["cleanup"]
+            record["capture"] = {name: result[name] for name in ("timeout", "overflow", "captured")}
+            require(hash_file(path) == executable_pin, "executable custody changed")
+    except (OSError, ValueError, RuntimeError) as err:
+        if failure is None:
+            failure = str(err)
+        cleanup["failures"].append({"operation": "capture-wrapper", "error": str(err)})
     finally:
-        if custody is not None:
-            cleanup = custody.finish(process)
-        if process is not None:
-            term = process.returncode
-            for pipe in (process.stdout, process.stderr):
-                try:
-                    pipe.close()
-                except OSError as err:
-                    cleanup["failures"].append({"operation": "close-capture", "error": str(err)})
+        if executable is not None:
+            try:
+                os.close(executable)
+            except OSError as err:
+                cleanup["failures"].append({"operation": "close-executable", "error": str(err)})
         record.update(
             exit_status=term, failure=failure,
             elapsed_ns=time.monotonic_ns() - started,
@@ -808,6 +636,7 @@ def run_stagewise(manifest_path, output_path):
             == b"primary=0 cleanup=0\n", "genuine result/cleanup missing")
     require(all(path in before for path in tools.values()), "incomplete tool closure")
     require(str(HERE / "handoff_shadow.py") in before, "unbound test driver")
+    require(str(BOUNDED_PROCESS_PATH) in before, "unbound shared capture helper")
     for repository in (producer, reader):
         for name in ("handoff.py", "public_bundle.py", "accepted_records.py", "run.py"):
             require(str(repository / "support/build/wamr-native-ci" / name) in before,

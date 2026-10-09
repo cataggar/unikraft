@@ -3,11 +3,14 @@
 """Synthetic comparator/driver refusals ONLY; no producer or live parity claim."""
 import argparse
 import copy
+import ctypes
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
+import time
 import unittest
 import uuid
 from unittest import mock
@@ -44,6 +47,26 @@ class ShadowWitness(unittest.TestCase):
             "comparator": str(COMPARATOR),
         }
         return runtime, tools
+
+    @staticmethod
+    def cleanup_python_child(pid, code):
+        try:
+            descriptor = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return
+        try:
+            command_line = Path(f"/proc/{pid}/cmdline").read_bytes()
+            expected = os.fsencode(sys.executable) + b"\0-c\0" + code.encode() + b"\0"
+            if command_line == expected:
+                signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                try:
+                    os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+        finally:
+            os.close(descriptor)
 
     def fixture(self):
         golden = shadow.decode(shadow.read(
@@ -398,47 +421,118 @@ class ShadowWitness(unittest.TestCase):
                 receipt = shadow.decode(shadow.read(self.root / stage / "receipt.json"))
                 self.assertEqual(receipt["exit_status"], 0, "original parent status changed")
                 self.assertEqual(receipt["failure"],
-                                 "command output bound" if bound else "command timed out")
+                                 "stderr overflow" if bound else "command timed out")
+                self.assertEqual(receipt["capture"]["timeout"], not bool(bound))
+                self.assertEqual(receipt["capture"]["overflow"], ["stderr"] if bound else [])
                 descendant = int(shadow.read(self.root / stage / "stdout").strip())
                 self.assertTrue(receipt["cleanup"]["complete"])
                 self.assertEqual(receipt["cleanup"]["failures"], [])
                 child_record = next(value for value in receipt["cleanup"]["processes"]
                                     if value["pid"] == descendant)
                 self.assertTrue(child_record["reaped"])
-                self.assertEqual(child_record["exit_status"], -shadow.signal.SIGKILL)
+                self.assertEqual(child_record["exit_status"], -signal.SIGKILL)
                 self.assertFalse(Path(f"/proc/{descendant}").exists())
             finally:
                 # Precise emergency cleanup also applies when running this
                 # regression against the old, leaking implementation.
                 captured = self.root / stage / "stdout"
                 if captured.exists() and captured.read_bytes().strip().isdigit():
-                    pid = int(captured.read_bytes().strip())
-                    try:
-                        descriptor = os.pidfd_open(pid)
-                    except ProcessLookupError:
-                        descriptor = None
-                    if descriptor is not None:
-                        try:
-                            command_line = Path(f"/proc/{pid}/cmdline").read_bytes()
-                            expected = os.fsencode(sys.executable) + b"\0-c\0" + child.encode() + b"\0"
-                            if command_line == expected:
-                                shadow.signal.pidfd_send_signal(descriptor, shadow.signal.SIGKILL)
-                                try:
-                                    os.waitpid(pid, 0)
-                                except ChildProcessError:
-                                    pass
-                        except (FileNotFoundError, ProcessLookupError):
-                            pass
-                        finally:
-                            os.close(descriptor)
+                    self.cleanup_python_child(int(captured.read_bytes().strip()), child)
+
+    def test_synthetic_preexisting_family_orphan_stays_alive_and_unreaped(self):
+        # A caller may already be a subreaper. This controlled family is NOT a
+        # descendant of the capture worker, even when it forks after capture starts.
+        libc = ctypes.CDLL(None, use_errno=True)
+        previous = ctypes.c_int()
+        self.assertEqual(libc.prctl(37, ctypes.byref(previous), 0, 0, 0), 0)
+        self.assertEqual(libc.prctl(36, 1, 0, 0, 0), 0)
+        ready = self.root / "foreign-ready"
+        started = self.root / "stage-started"
+        orphan = self.root / "foreign-orphan"
+        foreign_code = (
+            "import os,time;from pathlib import Path;"
+            f"Path({str(ready)!r}).write_text('ready');"
+            f"gate=Path({str(started)!r});deadline=time.monotonic()+10\n"
+            "while not gate.exists():\n"
+            " if time.monotonic()>deadline: raise RuntimeError('stage did not start')\n"
+            " time.sleep(.01)\n"
+            "pid=os.fork()\n"
+            "if pid==0:\n"
+            " os.setsid();time.sleep(60);os._exit(0)\n"
+            f"Path({str(orphan)!r}).write_text(str(pid));os._exit(0)"
+        )
+        owned_code = "import time;time.sleep(60)"
+        stage = "foreign-family"
+        stdout = self.root / stage / "stdout"
+        foreign = None
+        try:
+            foreign = subprocess.Popen(
+                (sys.executable, "-c", foreign_code), stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(ready.exists(), "pre-existing family did not start")
+            self.assertIsNone(foreign.poll())
+            code = (
+                "import time,subprocess,sys;from pathlib import Path;"
+                f"Path({str(started)!r}).write_text('started');"
+                f"orphan=Path({str(orphan)!r});deadline=time.monotonic()+5\n"
+                "while not orphan.exists():\n"
+                " if time.monotonic()>deadline: raise RuntimeError('foreign child not created')\n"
+                " time.sleep(.01)\n"
+                "pid=int(orphan.read_text())\n"
+                f"while int(Path(f'/proc/{{pid}}/stat').read_text().rsplit(')',1)[1].split()[1])!={os.getpid()}:\n"
+                " if time.monotonic()>deadline: raise RuntimeError('foreign child not orphaned')\n"
+                " time.sleep(.01)\n"
+                f"p=subprocess.Popen([sys.executable,'-c',{owned_code!r}],start_new_session=True);"
+                "print(p.pid,flush=True);sys.exit(0)"
+            )
+            command = shadow.Command(stage, (sys.executable, "-c", code),
+                                     str(self.root), timeout_seconds=3)
+            with self.assertRaisesRegex(shadow.Refusal, "failed stage"):
+                shadow.execute(command, self.root, {"PATH": os.environ["PATH"]})
+            receipt = shadow.decode(shadow.read(self.root / stage / "receipt.json"))
+            self.assertEqual(receipt["failure"], "command timed out")
+            self.assertEqual(receipt["exit_status"], 0)
+            self.assertTrue(receipt["cleanup"]["complete"])
+            self.assertEqual(receipt["cleanup"]["failures"], [])
+            self.assertEqual(foreign.wait(timeout=5), 0, "foreign parent status changed")
+            foreign_pid = int(orphan.read_text())
+            self.assertEqual(os.waitpid(foreign_pid, os.WNOHANG), (0, 0),
+                             "foreign orphan terminated or was reaped by capture")
+            fields = Path(f"/proc/{foreign_pid}/stat").read_text().rsplit(")", 1)[1].split()
+            self.assertEqual(int(fields[1]), os.getpid())
+            self.assertNotIn(fields[0], ("T", "t", "Z"), "foreign orphan was stopped or killed")
+            self.assertNotIn(foreign_pid, [event["pid"] for event in receipt["cleanup"]["processes"]])
+            own_pid = int(shadow.read(stdout).strip())
+            event = next(value for value in receipt["cleanup"]["processes"] if value["pid"] == own_pid)
+            self.assertTrue(event["reaped"])
+            self.assertEqual(event["exit_status"], -signal.SIGKILL)
+            self.assertFalse(Path(f"/proc/{own_pid}").exists())
+            current = ctypes.c_int()
+            self.assertEqual(libc.prctl(37, ctypes.byref(current), 0, 0, 0), 0)
+            self.assertEqual(current.value, 1, "capture changed caller subreaper state")
+        finally:
+            try:
+                if foreign is not None:
+                    if foreign.poll() is None:
+                        foreign.kill()
+                    foreign.wait(timeout=5)
+                if orphan.exists():
+                    self.cleanup_python_child(int(orphan.read_text()), foreign_code)
+                if stdout.exists() and stdout.read_bytes().strip().isdigit():
+                    self.cleanup_python_child(int(stdout.read_bytes().strip()), owned_code)
+            finally:
+                self.assertEqual(libc.prctl(36, previous.value, 0, 0, 0), 0)
 
     def test_synthetic_cleanup_failure_preserves_primary_failure_and_refuses_success(self):
-        original = shadow.signal.pidfd_send_signal
+        original = signal.pidfd_send_signal
         refused_once = False
 
         def refuse_stop(descriptor, sig):
             nonlocal refused_once
-            if sig == shadow.signal.SIGSTOP and not refused_once:
+            if sig == signal.SIGSTOP and not refused_once:
                 refused_once = True
                 raise PermissionError("synthetic stop refusal")
             return original(descriptor, sig)
@@ -446,7 +540,7 @@ class ShadowWitness(unittest.TestCase):
         command = shadow.Command(
             "cleanup-failure", (sys.executable, "-c", "import time;time.sleep(60)"),
             str(self.root), timeout_seconds=1)
-        with mock.patch.object(shadow.signal, "pidfd_send_signal", side_effect=refuse_stop):
+        with mock.patch.object(shadow.bounded_process.signal, "pidfd_send_signal", side_effect=refuse_stop):
             with self.assertRaisesRegex(shadow.Refusal, "failed stage"):
                 shadow.execute(command, self.root, {"PATH": os.environ["PATH"]})
         receipt = shadow.decode(shadow.read(self.root / "cleanup-failure/receipt.json"))
@@ -455,6 +549,23 @@ class ShadowWitness(unittest.TestCase):
         self.assertTrue(any("synthetic stop refusal" in entry["error"]
                             for entry in receipt["cleanup"]["failures"]))
         self.assertTrue(all(entry["reaped"] for entry in receipt["cleanup"]["processes"]))
+
+    def test_synthetic_worker_failure_retains_unconfirmed_cleanup_and_refuses_success(self):
+        command = shadow.Command(
+            "worker-failure", (sys.executable, "-c", "pass"), str(self.root), timeout_seconds=1)
+        with mock.patch.object(shadow.bounded_process, "worker",
+                               side_effect=lambda *args: os._exit(9)):
+            with self.assertRaisesRegex(shadow.Refusal, "failed stage"):
+                shadow.execute(command, self.root, {"PATH": os.environ["PATH"]})
+        receipt = shadow.decode(shadow.read(self.root / "worker-failure/receipt.json"))
+        self.assertEqual(receipt["failure"], "capture worker failed; cleanup unconfirmed")
+        self.assertIsNone(receipt["exit_status"], "unexecuted command cannot claim original status")
+        self.assertFalse(receipt["cleanup"]["complete"])
+        self.assertEqual(receipt["cleanup"]["failures"], [{
+            "operation": "capture-wrapper", "error": "capture worker failed; cleanup unconfirmed",
+        }])
+        self.assertEqual(receipt["stdout"]["size"], 0)
+        self.assertEqual(receipt["stderr"]["size"], 0)
 
 
 def main():

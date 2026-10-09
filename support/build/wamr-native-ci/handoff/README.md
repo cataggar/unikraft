@@ -386,14 +386,19 @@ publishing result stdout.
 Each of the 17 ordered stages retains its exact argv/cwd, allowlisted original
 environment (no credentials), timeout, original status, stdout/stderr hashes
 and physical custody in create-only command/receipt files. Captures are bounded
-to 8 MiB each; stages to 2,400 seconds. A scoped Linux subreaper retains kernel
-ownership of descendants after their original parent exits, including processes
-in new sessions holding capture pipes. Timeout/capture failures kill by retained
-pidfds and reap owned descendants independently of parent liveness. The original
-parent status, descendant termination/reaping records and separate cleanup
+to 8 MiB each; stages to 2,400 seconds. The shared test-only
+`support/tools/hyperv/direct/tests/bounded_process.py` executes each command
+through a retained executable descriptor in a dedicated fork worker. Only that
+worker becomes a Linux subreaper, retaining kernel ownership of its descendants
+after their original parent exits, including new sessions holding capture pipes.
+Pre-existing caller families and their later orphaned descendants cannot enter
+the worker's family; the caller's subreaper setting is never changed.
+Timeout/capture failures kill by retained pidfds and reap owned descendants
+independently of parent liveness. Original parent status, bounded captures,
+overflow/timeout details, descendant termination/reaping and separate cleanup
 failures are retained; any cleanup failure or unfinished cleanup refuses success.
-Pre-existing child processes are excluded and the prior subreaper setting is
-restored. Existing native private command receipts/partial products
+The helper source must be included in approved immutable input custody.
+Existing native private command receipts/partial products
 are retained too. Inventories, canonical records, requests, before/after custody,
 output pins and failed partial executions are durable external evidence.
 Missing, skipped, changed or failed stages refuse; no retry/resume or destructive
