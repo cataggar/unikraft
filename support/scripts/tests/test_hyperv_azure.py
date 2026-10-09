@@ -3464,6 +3464,11 @@ class HypervWorkflowTest(unittest.TestCase):
         for required in (
             "git worktree add --detach",
             "test-controller-limits",
+            "for mode in Debug ReleaseSafe; do",
+            '-Dpublication-cli="${source_root}/support/build/wamr-native-ci/controller/cli.zig"',
+            'shadow_root="${RUNNER_TEMP}/wamr-handoff-shadow-fixtures"',
+            '-Dtest-root="${shadow_root}" -Doptimize="${mode}"',
+            "-j2 test-shadow install",
         ):
             self.assertIn(required, source_limits)
         self.assertNotIn("source_custody_production_limits.py", source_limits)
