@@ -29,31 +29,45 @@ GIT = os.environ.get("WAMR_CI_GIT", "git")
 SUPERVISOR = os.environ.get("WAMR_CI_SUPERVISOR")
 SUPERVISOR_FIXTURE = os.environ.get("WAMR_CI_SUPERVISOR_FIXTURE")
 LOG_VALIDATE = os.environ.get("WAMR_CI_LOG_VALIDATE")
-spec = importlib.util.spec_from_file_location("wamr_ci", HERE / "run.py")
-ci = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(ci)
 SUPERVISOR_PATH = (
     str(Path(SUPERVISOR).resolve(strict=True))
     if SUPERVISOR is not None else None)
-bundle_spec = importlib.util.spec_from_file_location(
-    "wamr_public_bundle", HERE / "public_bundle.py")
-public_bundle = importlib.util.module_from_spec(bundle_spec)
-bundle_spec.loader.exec_module(public_bundle)
-ENV_COMMAND_TOOL_PATHS = {
-    name: os.environ["WAMR_CI_TOOL_" + name.upper().replace("-", "_")]
-    for name in ci.HOST_TOOLS
-    if "WAMR_CI_TOOL_" + name.upper().replace("-", "_") in os.environ
-}
+
+
+def load_legacy_oracles():
+    """Keep native acquisition collection independent of the mixed owner lane."""
+    global ci, public_bundle, ENV_COMMAND_TOOL_PATHS
+    if "ci" in globals():
+        return
+    spec = importlib.util.spec_from_file_location("wamr_ci", HERE / "run.py")
+    controller = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(controller)
+    bundle_spec = importlib.util.spec_from_file_location(
+        "wamr_public_bundle", HERE / "public_bundle.py")
+    bundle = importlib.util.module_from_spec(bundle_spec)
+    bundle_spec.loader.exec_module(bundle)
+    ci, public_bundle = controller, bundle
+    ENV_COMMAND_TOOL_PATHS = {
+        name: os.environ["WAMR_CI_TOOL_" + name.upper().replace("-", "_")]
+        for name in ci.HOST_TOOLS
+        if "WAMR_CI_TOOL_" + name.upper().replace("-", "_") in os.environ
+    }
+    reset_command_bindings()
+
+
+def __getattr__(name):
+    if name in ("ci", "public_bundle", "ENV_COMMAND_TOOL_PATHS"):
+        load_legacy_oracles()
+        return globals()[name]
+    raise AttributeError(name)
 
 
 def reset_command_bindings():
+    load_legacy_oracles()
     ci.COMMAND_SUPERVISOR_PATH = SUPERVISOR_PATH
     ci.COMMAND_TOOL_PATHS.clear()
     ci.COMMAND_TOOL_PATHS.update(ENV_COMMAND_TOOL_PATHS)
     ci.COMMAND_ENVIRONMENT.clear()
-
-
-reset_command_bindings()
 
 
 class NativeAcquisitionFixtures(unittest.TestCase):
@@ -341,6 +355,9 @@ sys.stdout.write('{"verified_read":true}\\n')
 
 
 class NativeRecordBridge(unittest.TestCase):
+    def setUp(self):
+        load_legacy_oracles()
+
     def test_publication_timings_preserve_transport_and_redact_refusals(self):
         bridge = public_bundle.accepted_records
         private = "/private/runtime/token"
@@ -2347,6 +2364,7 @@ class NativeRecordBridge(unittest.TestCase):
 
 class Contract(unittest.TestCase):
     def setUp(self):
+        load_legacy_oracles()
         self.identity = {
             "wamr_revision": "f" * 40, "minimal_wasi": False,
             "files": {"tiny.wasm": "0" * 64, "tiny.cwasm": "1" * 64,
@@ -2669,7 +2687,10 @@ class Evidence(unittest.TestCase):
             config, identity, consumer_inputs={"files": {}},
             identity_path=self.root / "private/identity.json")
 
-    def supervised_binding(self, stage, profile=ci.CURRENT_PROFILE):
+    def supervised_binding(self, stage, profile=None):
+        load_legacy_oracles()
+        if profile is None:
+            profile = ci.CURRENT_PROFILE
         contract = ci.production_command_contract(stage, profile)
         roles = {
             "command-supervisor",
@@ -2840,6 +2861,7 @@ class Evidence(unittest.TestCase):
         return record, identities
 
     def rehash_supervised_binding(self, record):
+        load_legacy_oracles()
         request = record["supervisor"]["request"]
         for name, value in (
                 ("argv_sha256", request["argv"]),

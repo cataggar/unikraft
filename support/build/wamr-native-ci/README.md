@@ -284,7 +284,8 @@ Read-only local cleanup proof retains its collected physical artifact snapshot;
 the production-native owner's wrapper cleanup remains export-owned custody.
 The complete local constructor fixture covers all three later v1
 source/tree pairs and a separate historical Python-v2 checkout. It uses real
-Git objects and physical Python scans, real native packaging/QCOW2/VHD
+Git objects and authenticated immutable historical Python scans, real native
+packaging/QCOW2/VHD
 production, and actual constructor/recheck/CLI routes. Its command/serial
 fixtures are synthetic and do not claim guest or hardware acceptance.
 The separate direct-Azure physical image/copy fixture has mocked producer
@@ -739,9 +740,9 @@ The protected x86 job exercises `test-controller-limits` and then
 and cache outside the production source checkout; this reports fixture failures
 without exposing private supervised-command output. On failure it runs the
 host test binary directly for diagnostic errors while keeping the original
-gate failed. The Python
-`tests/source_custody_production_limits.py` remains paired with the native
-limit fixture while production `build` uses the installed native controller.
+gate failed. The compatibility
+`tests/source_custody_production_limits.py` launcher invokes only the native
+limit fixture; production `build` uses the installed native controller.
 
 `build --runtime ABS --wamr-source ABS`, `boot --runtime ABS`, and
 `diagnostics --runtime ABS` are available only through the installed
@@ -1274,6 +1275,42 @@ is only a compatibility import of their neutral byte tests, not a controller
 comparison or an executable `local`/`full` harness. No acceptance is inferred
 from these synthetic records. The handoff/public-bundle and authority oracles
 remain in their owners until those migrations; `run.py` is not deleted here.
+
+The controller-only oracle split is recorded in
+`tests/controller_coverage.py`: five production-limit scenarios have native
+exact/excess successors; five native command/source-identity cases no longer
+execute Python. Their neutral command vectors come from the immutable
+`e98623f780fa23d05b5797004e4b88160404eb1b` Git blobs, authenticated separately
+by SHA256, not the current physical `run.py` or mixed `test_adapter.py`.
+Native tests apply and fully rehash mutations themselves. Fixture records
+remain diagnostics, not owner/admission or genuine guest evidence.
+
+The complete four-producer local fixture's prepare/mutation functions use the
+same authenticated historical controller and only its extracted neutral binding
+helpers; its native constructors, rechecks, CLI refusals and mutation matrix
+are unchanged. Live private-export parity still calls the current handoff
+owner and is deliberately retained. All 150 adapter scenarios remain collected:
+the 10 native acquisition cases now import neither current controller nor
+PUBLIC oracle; the other 140 explicitly load their retained mixed owners on
+execution. The 196-scenario inventory and authority behavior golden do not
+change. `tests/native_fault_qualification.py` is a retained native-only driver,
+not an obsolete Python controller oracle; all four genuine fault gates remain
+mandatory. Source-only validation cannot satisfy their x86 KVM qualification.
+
+Verify the historical source/vector authentication and successor ledger with:
+
+```sh
+python3 -B support/build/wamr-native-ci/tests/test_historical_controller_fixture.py
+```
+
+`tests/historical_controller_fixture.py --write` intentionally regenerates
+only the reviewed neutral historical native input. It refuses missing or
+changed historical blobs before executing anything and imports no current
+PUBLIC/handoff implementation. It is not a production fallback.
+The module's original top-level protocol-schema read is bound to the
+authenticated historical `process-command-v1.json` blob because the older
+v1 producer checkouts predate it. All original schema checks and controller
+functions remain intact; no current physical schema is substituted.
 
 The credential-free KVM workflow runs the real native build and six-mode tiny
 chain once, then reopens its accepted native records and exercises the existing
@@ -1874,6 +1911,8 @@ script's frozen ignored-output constants, exact/excess 131,072-entry and
 8-GiB sparse-file limits, exact/excess 8-MiB Git ignored inventories,
 1,024-byte path, 64-component depth and 128-root diagnostic boundaries, and
 adds tracked-source entry, byte, file-size and unsafe-type boundaries. The
-Python `tests/source_custody_production_limits.py` remains intentionally
-excluded from default discovery and runs explicitly in protected CI as long
-as production `run.py build` still owns the build path.
+compatibility `tests/source_custody_production_limits.py` entry point remains
+excluded from default discovery but now invokes only that native gate.
+It accepts the existing Zig build cache/system/optimization arguments and
+checks no Python controller constants or inventory. Prefer the direct native
+`test-controller-limits` target for protected CI.

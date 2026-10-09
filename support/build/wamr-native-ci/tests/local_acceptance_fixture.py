@@ -13,6 +13,8 @@ import struct
 import subprocess
 import sys
 
+from historical_controller_fixture import load_bindings, load_controller
+
 
 def load(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
@@ -111,9 +113,8 @@ def prepare(args):
     source, stage, work, miz = map(Path, (source, stage, work, miz))
     repository, runtime = work / "producer", work / ".d/wamr-native-runtime"
     v2 = revision == "e98623f780fa23d05b5797004e4b88160404eb1b"
-    package = source / "support/build/wamr-native-ci"
-    ci = load("local_ci", package / "run.py")
-    witness = load("local_witness", package / "tests/test_adapter.py")
+    ci = load_controller(source, git, producer=repository)
+    witness = load_bindings(source, git, ci)
     subprocess.run([git, "init", "-q", str(repository)], check=True)
     subprocess.run([git, "-C", str(repository), "-c", "gc.auto=0",
                     "-c", "maintenance.auto=false", "fetch", "-q", "--depth=1",
@@ -371,7 +372,7 @@ def prepare(args):
     stages += ["vpc-x2apic", "vpc-legacy-apic", "inspect"]
     for stage_name in stages:
         if v2:
-            record, unused = witness.Evidence().supervised_binding(stage_name)
+            record, unused = witness.supervised_binding(stage_name)
             request = record["supervisor"]["request"]
             identities = {}
             for binding in [request[key] for key in ("supervisor", "native_executable", "command_executable", "interpreter")] + request["retained_executables"]:
@@ -384,7 +385,7 @@ def prepare(args):
             command = record["supervisor"]["result"]["command"]
             command["executable"] = copy.deepcopy(request["native_executable"]["identity"])
             command["retained_executables"] = copy.deepcopy(request["retained_executables"])
-            witness.Evidence().rehash_supervised_binding(record)
+            witness.rehash_supervised_binding(record)
             ci.validate_supervised_command_binding(record, stage_name, identities,
                                                    transport_context="trusted_inner_zip")
         else:
@@ -608,7 +609,7 @@ def private_cli(source, work, controller, validator):
           "tamper, replay and real file-size I/O faults passed", file=sys.stderr)
 
 
-def mutate(work, case):
+def mutate(work, case, git):
     work = Path(work)
     repository, runtime = work / "producer", work / ".d/wamr-native-runtime"
     evidence = runtime / "compute/evidence"
@@ -650,7 +651,8 @@ def mutate(work, case):
         return json.loads((evidence / name).read_bytes())
     if case == "input-runtime":
         start = json.loads((evidence / "build-start.json").read_bytes())
-        ci = load("runtime_oracle", Path(__file__).parents[1] / "run.py")
+        ci = load_controller(Path(__file__).resolve().parents[4], git,
+                             producer=repository)
         libraries = [(role, Path(value["path"])) for role, value in
                      start["consumer_inputs"]["files"].items()
                      if role.startswith("runtime:") and
@@ -665,10 +667,11 @@ def mutate(work, case):
         except ci.Refusal:
             pass
         else:
-            raise AssertionError("real Python runtime oracle accepted mutation")
+            raise AssertionError("historical physical scan accepted mutation")
         return
     if case in ("runtime-path-build", "runtime-path-boot"):
-        ci = load("runtime_path_oracle", Path(__file__).parents[1] / "run.py")
+        ci = load_controller(Path(__file__).resolve().parents[4], git,
+                             producer=repository)
         name = "build-start.json" if case == "runtime-path-build" else "boot-inputs.json"
         record = document(name)
         custody = record["consumer_inputs"] if case == "runtime-path-build" else record
@@ -702,7 +705,8 @@ def mutate(work, case):
         elif case == "bison-custody":
             start["bison_data"]["sha256"] = "0" * 64
         elif case in ("supervisor-source", "supervisor-runtime"):
-            ci = load("supervisor_oracle", Path(__file__).parents[1] / "run.py")
+            ci = load_controller(Path(__file__).resolve().parents[4], git,
+                                 producer=repository)
             ci.REPO = repository
             ci.COMMAND_TOOL_PATHS["git"] = start["consumer_inputs"]["files"]["tool:git"]["path"]
             key = "source_map" if case == "supervisor-source" else "runtime_map"
@@ -741,20 +745,21 @@ def mutate(work, case):
         record["request_sha256"] = digest(request_path)
         put("raw-x2apic-compute.json", record)
     elif case == "command-identity":
-        package = Path(__file__).parents[1]
-        witness = load("mutation_witness", package / "tests/test_adapter.py")
+        ci = load_controller(Path(__file__).resolve().parents[4], git,
+                             producer=repository)
+        witness = load_bindings(Path(__file__).resolve().parents[4], git, ci)
         record = document("command-config.json")
         record["supervisor"]["request"]["supervisor"]["identity"]["inode"] += 1
-        witness.Evidence().rehash_supervised_binding(record)
+        witness.rehash_supervised_binding(record)
         start = document("build-start.json")
         identities = {role: identity(value) for role, value in start["consumer_inputs"]["files"].items()}
         try:
-            witness.ci.validate_supervised_command_binding(
+            ci.validate_supervised_command_binding(
                 record, "config", identities, transport_context="trusted_inner_zip")
-        except witness.ci.Refusal:
+        except ci.Refusal:
             pass
         else:
-            raise AssertionError("real Python identity oracle accepted mutation")
+            raise AssertionError("historical identity oracle accepted mutation")
         put("command-config.json", record)
     elif case == "image-chain":
         gate = document("fixed-vhd-derivation-gate.json")
