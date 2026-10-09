@@ -538,7 +538,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const authority_handoff = handoffModule(b, b.graph.host, optimize, host_core, host_controller);
-    const authority_options = authority_build.testOptions(b, b.graph.host, optimize, handoff_fixture_root);
+    const authority_fixture_root = b.pathJoin(&.{ handoff_fixture_root, "authority-contract-work" });
+    const authority_options = authority_build.testOptions(b, b.graph.host, optimize, authority_fixture_root);
     const authority_options_module = authority_options.createModule();
     authority_handoff.addImport("test_options", authority_options_module);
     authority_contracts.root_module.addImport("test_options", authority_options_module);
@@ -551,6 +552,8 @@ pub fn build(b: *std.Build) void {
     authority_build.addImports(b, authority_module, portable_target, optimize, portable_core, portable_serial, portable_validator, handoffModule(b, portable_target, optimize, portable_core, controller_module));
     const authority_source_check = authority_build.sourceCheck(b, portable_target, optimize, authority_module);
     const authority_contracts_run = b.addRunArtifact(authority_contracts);
+    source_limits_run.step.dependOn(&authority_source_check.step);
+    authority_contracts_run.step.dependOn(&authority_source_check.step);
     const authority_direct = b.addSystemCommand(&.{"/usr/bin/env"});
     authority_direct.addFileArg(authority_contracts.getEmittedBin());
     b.step("test-authority-direct", "Run authority fixtures with direct failure output").dependOn(&authority_direct.step);
