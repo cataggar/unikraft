@@ -142,6 +142,19 @@ is available for focused native checks. The package build's
 options module with the retained handoff module.
 `-Dtest-filter='joined namespace'` selects the real namespace bootstrap/refusal
 cases; even a passing bootstrap is not genuine runtime-probe qualification.
+Namespace and second-fork fixtures report typed acquisition/refusal errors,
+mapped identities, owned PIDs and explicit cleanup status before assertions.
+The cancellation fixture also reports its actual cancellation checkpoint count.
+These diagnostics do not broaden capability refusals or replace positive checks.
+An emulated ABI check is not a namespace qualification when the emulator cannot
+preserve the required namespace syscalls.
+
+Synthetic authorization and admission constructors use the shared golden-record
+fixture helper. It rebinds only the executing ledger owner and dependent exact
+SHA-256/size commitments; checked-in golden bytes are unchanged. A genuinely
+different executing UID must still reject the original frozen owner's plan,
+and changing the rebound owner must still refuse `InvalidLedgerIdentity`.
+This fixture-only adaptation never authorizes a foreign production ledger.
 Cleanup fault selectors use the shared test-only real named atomic fixture:
 an unnamed `O_TMPFILE` has no named cleanup operation to fail. All original
 cleanup/failure/publication assertions and guarded production bytes are retained.

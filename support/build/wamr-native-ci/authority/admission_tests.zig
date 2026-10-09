@@ -14,9 +14,7 @@ const io = t.io;
 const ctx: types.Context = .{ .allocator = a, .io = io };
 
 fn golden(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-    var document = try @import("contracts.zig").parseCanonical(allocator, @embedFile("goldens/contracts.json"));
-    defer document.deinit();
-    return allocator.dupe(u8, document.value().object.get("canonical_records").?.object.get(name).?.string);
+    return @import("test_fixtures.zig").goldenRecord(allocator, name);
 }
 fn paths(plan: types.Plan) types.ToolPaths {
     return .{

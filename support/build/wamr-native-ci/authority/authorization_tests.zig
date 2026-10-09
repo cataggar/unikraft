@@ -48,16 +48,26 @@ test "authorization frozen current decisions bind exact template and denied cann
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var document = try contracts.parseCanonical(allocator, @embedFile("goldens/contracts.json"));
-    defer document.deinit();
-    const golden = document.value().object.get("canonical_records").?.object;
-    const plan_bytes = golden.get("plan").?.string;
+    const plan_bytes = try @import("test_fixtures.zig").goldenRecord(allocator, "plan");
     const plan = try records.parse(types.Plan, allocator, plan_bytes);
     defer plan.deinit();
     const digest = std.fmt.bytesToHex(tx.hash(plan_bytes), .lower);
     const template = try records.approvalTemplate(plan.value, &digest);
+    var original_document = try contracts.parseCanonical(allocator, @embedFile("goldens/contracts.json"));
+    defer original_document.deinit();
+    const original_bytes = original_document.value().object.get("canonical_records").?.object.get("plan").?.string;
+    const original = try records.parse(types.Plan, allocator, original_bytes);
+    defer original.deinit();
+    if (original.value.ledger.directory.uid != plan.value.ledger.directory.uid) {
+        const original_digest = std.fmt.bytesToHex(tx.hash(original_bytes), .lower);
+        try std.testing.expectError(error.InvalidLedgerIdentity, records.approvalTemplate(original.value, &original_digest));
+    }
+    var foreign = plan.value;
+    foreign.ledger.directory.uid +%= 1;
+    try std.testing.expectError(error.InvalidLedgerIdentity, records.approvalTemplate(foreign, &digest));
     inline for (.{ "authorization_approved", "authorization_denied" }) |name| {
-        const fixture = try records.parse(types.Authorization, allocator, golden.get(name).?.string);
+        const expected_bytes = try @import("test_fixtures.zig").goldenRecord(allocator, name);
+        const fixture = try records.parse(types.Authorization, allocator, expected_bytes);
         defer fixture.deinit();
         const value = fixture.value;
         const decision = try records.authorization(plan.value, &digest, template, .{
@@ -68,7 +78,7 @@ test "authorization frozen current decisions bind exact template and denied cann
             .expires_unix = value.expires_unix,
             .now = value.recorded_unix,
         });
-        try std.testing.expectEqualStrings(golden.get(name).?.string, try records.authorizationBytes(allocator, plan.value, &digest, decision, value.recorded_unix));
+        try std.testing.expectEqualStrings(expected_bytes, try records.authorizationBytes(allocator, plan.value, &digest, decision, value.recorded_unix));
         try records.decisionCurrent(decision, value.expires_unix - 1);
         try std.testing.expectError(error.ApprovalExpired, records.decisionCurrent(decision, value.expires_unix));
         if (value.decision == .denied) try std.testing.expectError(error.NotAuthorized, decision.current(value.recorded_unix));

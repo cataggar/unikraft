@@ -30,12 +30,18 @@ fn attempt(path: []const u8, wrong_parent: bool) !Report {
         const io = threaded.io();
         const uid = linux.geteuid();
         const gid = linux.getegid();
-        const before = namespaceIdentity() catch linux.exit_group(123);
+        const before = namespaceIdentity() catch |err| {
+            std.debug.print("namespace fixture pre-transition identity failed: {s}\n", .{@errorName(err)});
+            linux.exit_group(123);
+        };
         var failure: ?anyerror = null;
         child(io, path, if (wrong_parent) 1 else parent) catch |err| {
             failure = err;
         };
-        const after = namespaceIdentity() catch linux.exit_group(123);
+        const after = namespaceIdentity() catch |err| {
+            std.debug.print("namespace fixture post-transition identity failed: {s}\n", .{@errorName(err)});
+            linux.exit_group(123);
+        };
         var report: Report = .{
             .err = if (failure) |err| @intFromError(err) else 0,
             .unchanged = @intFromBool(uid == linux.geteuid() and gid == linux.getegid() and std.mem.eql(u64, &before, &after)),
@@ -108,10 +114,38 @@ test "joined namespace rejects a nonparent before changing identity or mappings"
 }
 
 test "joined namespace authenticates actual mapped owner and retained file or remains explicitly unqualified" {
-    var fixture = try Fixture.init();
+    var fixture = Fixture.init() catch |err| {
+        std.debug.print(
+            "preparation namespace fixture acquisition failed: {s}; " ++
+                "uid={d} gid={d}\n",
+            .{ @errorName(err), linux.geteuid(), linux.getegid() },
+        );
+        return err;
+    };
     defer fixture.deinit();
     const path = try std.fs.path.join(fixture.arena.allocator(), &.{ fixture.request.stdlib, "os.py" });
-    const report = try attempt(path, false);
+    const report = attempt(path, false) catch |err| {
+        std.debug.print(
+            "preparation namespace fixture failed: {s}; " ++
+                "uid={d} gid={d} parent={d}\n",
+            .{ @errorName(err), linux.geteuid(), linux.getegid(), linux.getpid() },
+        );
+        return err;
+    };
+    std.debug.print(
+        "preparation namespace result: {s}; mapped_uid={d} mapped_gid={d} " ++
+            "parent={d} unchanged={d}\n",
+        .{
+            if (report.err == 0)
+                "authenticated"
+            else
+                @errorName(@errorFromInt(report.err)),
+            report.uid,
+            report.gid,
+            report.parent,
+            report.unchanged,
+        },
+    );
     if (report.err != 0) {
         const err: anyerror = @errorFromInt(report.err);
         switch (err) {

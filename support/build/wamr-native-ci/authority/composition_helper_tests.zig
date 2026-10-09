@@ -60,9 +60,19 @@ fn namespaceUnavailable(err: anyerror) !void {
 }
 
 test "joined helper second fork initializes actual PID worker before real native supervision" {
-    var fixture = try Fixture.init();
+    var fixture = Fixture.init() catch |err| {
+        std.debug.print(
+            "second-fork helper fixture acquisition failed: {s}; " ++
+                "uid={d} gid={d}\n",
+            .{ @errorName(err), linux.geteuid(), linux.getegid() },
+        );
+        return err;
+    };
     defer fixture.deinit();
-    const executable = try std.Io.Dir.cwd().realPathFileAlloc(io, @import("test_options").process_fixture, a);
+    const executable = std.Io.Dir.cwd().realPathFileAlloc(io, @import("test_options").process_fixture, a) catch |err| {
+        std.debug.print("second-fork helper executable acquisition failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
     defer a.free(executable);
     var witness: Witness = .{};
     const hooks: helper.Test.Hooks = .{ .context = &witness, .after_worker = Witness.observed };
@@ -71,8 +81,21 @@ test "joined helper second fork initializes actual PID worker before real native
         .executable = executable,
         .barrier = witness.barrier(),
     }, try core.process.Deadline.afterMilliseconds(5_000), &hooks);
-    if (outcome.result.refused.cause != error.SourceOnlyWorkerFinished)
+    std.debug.print(
+        "second-fork helper result: {s}; cleanup={any} leader={d} worker={d} " ++
+            "uid={d} gid={d}\n",
+        .{
+            @errorName(outcome.result.refused.cause),
+            outcome.cleanup_complete,
+            witness.leader,
+            witness.worker,
+            linux.geteuid(),
+            linux.getegid(),
+        },
+    );
+    if (outcome.result.refused.cause != error.SourceOnlyWorkerFinished) {
         try namespaceUnavailable(outcome.result.refused.cause);
+    }
     try std.testing.expect(outcome.cleanup_complete);
     try assertReaped(witness.leader);
     try assertReaped(witness.worker);
@@ -155,7 +178,14 @@ fn waitOwned(pid: linux.pid_t, milliseconds: u64) !u32 {
 }
 
 test "joined helper IO cancellation after worker fork reaps only owned family and leaves dynamically orphaned foreign children" {
-    var fixture = try Fixture.init();
+    var fixture = Fixture.init() catch |err| {
+        std.debug.print(
+            "afterfork IO-cancel helper fixture acquisition failed: {s}; " ++
+                "uid={d} gid={d}\n",
+            .{ @errorName(err), linux.geteuid(), linux.getegid() },
+        );
+        return err;
+    };
     defer fixture.deinit();
     var foreign = try Foreign.init();
     defer foreign.close();
@@ -176,6 +206,19 @@ test "joined helper IO cancellation after worker fork reaps only owned family an
         .barrier = witness.barrier(),
         .hold = true,
     }, try core.process.Deadline.afterMilliseconds(5_000), &hooks);
+    std.debug.print(
+        "afterfork IO-cancel helper result: {s}; cleanup={any} " ++
+            "leader={d} worker={d} canceled_calls={d} uid={d} gid={d}\n",
+        .{
+            @errorName(outcome.result.refused.cause),
+            outcome.cleanup_complete,
+            witness.leader,
+            witness.worker,
+            witness.canceled_calls,
+            linux.geteuid(),
+            linux.getegid(),
+        },
+    );
     if (witness.worker == 0) try namespaceUnavailable(outcome.result.refused.cause);
     try std.testing.expectEqual(error.Canceled, outcome.result.refused.cause);
     try std.testing.expect(witness.canceled_calls > 0);
