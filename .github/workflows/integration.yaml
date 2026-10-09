@@ -967,17 +967,15 @@ jobs:
           --prefix "${root}/compute-tools" \
           -Dtest-root="${compute_fixture_root}" \
           -Doptimize=ReleaseSafe test install
-        supervisor_source_closure="$(
-          "${root}/compute-tools/bin/uk-wamr-native-ci" \
-            supervisor-source-closure --git /usr/bin/git --output sha256-v1
-        )"
-        zig build \
-          --build-file support/build/wamr-native-ci/supervisor.build.zig -j2 \
-          --cache-dir "${root}/supervisor-cache" \
-          --global-cache-dir "${root}/global" \
-          --prefix "${root}/compute-supervisor" \
-          -Doptimize=ReleaseSafe \
-          -Dsource-closure-sha256="${supervisor_source_closure}"
+        # The retained Python fixture consumer is not the current controller
+        # owner, nor an older archive's producer. Build/query its exact owner.
+        historical_fixture_root="${root}/historical-fixture"
+        python3 -B support/tools/hyperv/direct/tests/historical_owner.py \
+          --repository "$(readlink -f "${GITHUB_WORKSPACE}")" \
+          --root "${historical_fixture_root}" \
+          --git "$(readlink -f "$(command -v git)")" \
+          --zig "$(readlink -f "$(command -v zig)")" \
+          --packages "${root}/restore/zig-pkg"
         userns_restriction=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
         if test -e "${userns_restriction}" &&
             test "$(cat "${userns_restriction}")" != 0; then
@@ -993,7 +991,8 @@ jobs:
         unshare --user --map-root-user --mount true
         WAMR_DIRECT_TOOLS="${root}/tools/bin" \
         WAMR_CI_PACKAGE="${root}/compute-tools/bin/wamr-ci-package" \
-        WAMR_CI_SUPERVISOR="${root}/compute-supervisor/bin/wamr-ci-supervisor" \
+        WAMR_HISTORICAL_FIXTURE_ROOT="${historical_fixture_root}" \
+        WAMR_CI_SUPERVISOR="${historical_fixture_root}/supervisor/bin/wamr-ci-supervisor" \
           python3 -m unittest discover -s support/tools/hyperv/direct/tests -v
 
     - name: Retain bounded runtime fixture evidence
@@ -1002,6 +1001,10 @@ jobs:
       with:
         name: zig-hyperv-runtime-evidence
         path: |
+          ${{ runner.temp }}/hyperv-ci/direct/historical-fixture/inputs.json
+          ${{ runner.temp }}/hyperv-ci/direct/historical-fixture/result.json
+          ${{ runner.temp }}/hyperv-ci/direct/historical-fixture/closure.stdout
+          ${{ runner.temp }}/hyperv-ci/direct/historical-fixture/identity.stdout
           ${{ runner.temp }}/hyperv-ci/native-operator-guard/baseline.log
           ${{ runner.temp }}/hyperv-ci/native-operator-guard/namespace-denial.log
           ${{ runner.temp }}/hyperv-ci/native-operator-guard/fixture-sha256.txt
@@ -1043,6 +1046,7 @@ jobs:
       with:
         submodules: recursive
         persist-credentials: false
+        fetch-depth: 0
 
     - name: Restore independent fixture tools
       uses: ./.github/actions/hyperv-fixture-setup

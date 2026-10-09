@@ -126,6 +126,23 @@ const Envelope = struct {
     version: u8 = version,
 };
 
+fn nativeSourceContentClosure(allocator: std.mem.Allocator) ![64]u8 {
+    var hash = core.Sha256.init(.{});
+    hash.update("uk.wamr.native-standalone-supervisor-source-v1-content\x00");
+    for (@import("supervisor_source_closure").standalone_supervisor_entries) |entry| {
+        var digest: [core.Sha256.digest_length]u8 = undefined;
+        core.Sha256.hash(entry.content, &digest, .{});
+        const hex = std.fmt.bytesToHex(digest, .lower);
+        const bytes = try std.json.Stringify.valueAlloc(allocator, .{ entry.name, entry.content.len, hex[0..] }, .{});
+        defer allocator.free(bytes);
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, bytes.len, .big);
+        hash.update(&length);
+        hash.update(bytes);
+    }
+    return std.fmt.bytesToHex(hash.finalResult(), .lower);
+}
+
 pub fn main(init: std.process.Init) void {
     run(init) catch {
         var writer = std.Io.File.stderr().writer(init.io, &.{});
@@ -146,6 +163,16 @@ fn run(init: std.process.Init) !void {
     }
     if (args.len == 2 and std.mem.eql(u8, args[1], "--identity")) {
         var writer = std.Io.File.stdout().writer(init.io, &.{});
+        if (build_options.native_source_owner) {
+            const closure = try nativeSourceContentClosure(allocator);
+            try writer.interface.print(
+                "{{\"protocol\":\"uk.wamr.command-supervisor/1 process-command/1\"," ++
+                    "\"schema\":\"uk.wamr.native-standalone-supervisor-identity\"," ++
+                    "\"source_content_closure_sha256\":\"{s}\",\"version\":1}}\n",
+                .{closure},
+            );
+            return;
+        }
         try writer.interface.print(
             "{{\"protocol\":\"uk.wamr.command-supervisor/1 process-command/1\"," ++
                 "\"schema\":\"uk.wamr.command-supervisor-identity\"," ++

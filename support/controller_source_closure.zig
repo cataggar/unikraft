@@ -4,6 +4,22 @@ pub const Entry = struct {
     content: []const u8,
 };
 
+pub const standalone_supervisor_entries = [_]Entry{
+    .{ .name = "support/build/wamr-native-ci/build.zig.zon", .content = @embedFile("build/wamr-native-ci/build.zig.zon") },
+    .{ .name = "support/build/wamr-native-ci/supervisor.build.zig", .content = @embedFile("build/wamr-native-ci/supervisor.build.zig") },
+    .{ .name = "support/build/wamr-native-ci/supervisor.zig", .content = @embedFile("build/wamr-native-ci/supervisor.zig") },
+    .{ .name = "support/controller_source_closure.zig", .content = @embedFile("controller_source_closure.zig") },
+    .{ .name = "support/tools/hyperv/contracts.zig", .content = @embedFile("tools/hyperv/contracts.zig") },
+    .{ .name = "support/tools/hyperv/core.zig", .content = @embedFile("tools/hyperv/core.zig") },
+    .{ .name = "support/tools/hyperv/diagnostics.zig", .content = @embedFile("tools/hyperv/diagnostics.zig") },
+    .{ .name = "support/tools/hyperv/private_files.zig", .content = @embedFile("tools/hyperv/private_files.zig") },
+    .{ .name = "support/tools/hyperv/process-command-v1.json", .content = @embedFile("tools/hyperv/process-command-v1.json") },
+    .{ .name = "support/tools/hyperv/process.zig", .content = @embedFile("tools/hyperv/process.zig") },
+    .{ .name = "support/tools/hyperv/sensitive.zig", .content = @embedFile("tools/hyperv/sensitive.zig") },
+    .{ .name = "support/tools/hyperv/sha256.zig", .content = @embedFile("tools/hyperv/sha256.zig") },
+    .{ .name = "support/tools/hyperv/sha256_clear_upper.S", .content = @embedFile("tools/hyperv/sha256_clear_upper.S") },
+};
+
 // Compiled-in tracked source inputs; additions to the controller's import
 // graph must be added here before they can be admitted as its source closure.
 pub const previous_entries = [_]Entry{
@@ -94,7 +110,7 @@ pub const previous_export_entries = blk: {
     break :blk all;
 };
 
-pub const entries = blk: {
+pub const previous_candidate_entries = blk: {
     @setEvalBranchQuota(100_000);
     var all = previous_export_entries ++ candidate_consumer_entries;
     @import("std").mem.sort(Entry, &all, {}, struct {
@@ -103,6 +119,22 @@ pub const entries = blk: {
         }
     }.less);
     break :blk all;
+};
+
+pub const entries = blk: {
+    @setEvalBranchQuota(100_000);
+    var all = previous_candidate_entries ++ executable_boundary_entries;
+    @import("std").mem.sort(Entry, &all, {}, struct {
+        fn less(_: void, first: Entry, second: Entry) bool {
+            return @import("std").mem.lessThan(u8, first.name, second.name);
+        }
+    }.less);
+    break :blk all;
+};
+
+const executable_boundary_entries = [_]Entry{
+    .{ .name = "support/build/wamr-native-ci/supervisor.build.zig", .content = @embedFile("build/wamr-native-ci/supervisor.build.zig") },
+    .{ .name = "support/build/wamr-native-ci/supervisor.zig", .content = @embedFile("build/wamr-native-ci/supervisor.zig") },
 };
 
 const candidate_consumer_entries = [_]Entry{

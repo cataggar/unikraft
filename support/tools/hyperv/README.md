@@ -8,6 +8,50 @@ transfer module in the `hyperv` facade. Its only installed executable is
 not a success-shaped stub. Azure execution remains paused. Local fixture
 results do not authorize execution or establish preflight/persistence acceptance.
 
+### Retained historical direct/public fixture owner
+
+The integration runtime lane's Python direct/public fixtures import their
+consumer from the independently pinned #263 checkout
+`3599c9a5602f037e9d6c8113067b77b2451cccee`, tree
+`d5292215bf661afaf3bc018b2a44db8cc8521987`. The test-only adapter
+`direct/tests/historical_owner.py` creates a local non-hardlinked Git clone,
+named `unikraft` for the retained producer request contract, in an exclusive
+external mode-0700 root. It authenticates all tracked blobs and
+modes, queries the unchanged historical native controller's
+`supervisor-source-closure`, and builds the unchanged historical standalone
+supervisor from that **same checkout**. Caches, restored packages, outputs and
+immutable build stage records stay outside both source trees. The synthetic
+physical-handoff test creates only the historical consumer's frozen
+`.d/wamr-native-runtime` output slot, then removes that exact fixture and its
+create-only parent, restoring the pristine authenticated checkout.
+
+Pass explicit `--repository`, `--root`, `--git`, `--zig` and `--packages`
+paths to the adapter with Python `-B`; `--packages` is an already restored
+external package directory. Fixture execution requires
+`WAMR_HISTORICAL_FIXTURE_ROOT` and the exact matching `WAMR_CI_SUPERVISOR`.
+Missing, dirty or wrong owner source, incomplete preparation results, changed
+Git or supervisor executables, and different identity schemas/digests fail closed.
+Failed preparation removes only its own checkout and retains its inputs,
+stage diagnostics and failed result; existing roots are never reused.
+Canonical executable records bind every ancestor's owner, permissions and
+physical identity. Invocation holds no-follow directory/file descriptors,
+executes the authenticated file descriptor, and revalidates pathname bindings;
+group/world-writable ancestors, replacement and permission changes are refused.
+Each build/identity stage caps stdout at 4096 bytes and stderr at 8 MiB while
+running, including failing commands. Create-only mode-0600 captures never exceed
+those bounds; `<stage>.capture.json` records overflow, timeout, exit and precise
+owned-process cleanup evidence. A dedicated fork-local subreaper with pidfds
+kills, drains and reaps descendants even after an exited parent or a new session,
+without adopting the caller's unrelated children. Git and loader identity queries
+use the same bounded runner (Git stdout 4 MiB; loader streams 1024 bytes each).
+
+This separation retains historical `run.py` only as an external test oracle.
+Other current fixture data paths and original archive producer-source arguments
+remain unchanged; production source custody and identity validators are not
+rebound. A current native standalone identity cannot substitute for the frozen
+historical identity. These are synthetic, non-cloud fixtures, not genuine
+runtime parity, controller-retirement approval or authority to run Azure.
+
 ## Build and test
 
 From the repository root, using the already installed Zig 0.16.0 compiler:

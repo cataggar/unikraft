@@ -30,15 +30,14 @@ SUPERVISOR = Path(
 SDK = "a53205d77be3b880eb8f8b96679512ba58e2331a"
 OWNER = "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa"
 SUBSCRIPTION = "bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb"
-spec = importlib.util.spec_from_file_location(
-    "wamr_handoff", REPO / "support/build/wamr-native-ci/handoff.py")
-handoff = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(handoff)
+owner_spec = importlib.util.spec_from_file_location(
+    "historical_owner", Path(__file__).with_name("historical_owner.py"))
+historical_owner = importlib.util.module_from_spec(owner_spec)
+owner_spec.loader.exec_module(historical_owner)
+handoff, public_bundle, owner_supervisor = historical_owner.load()
+if SUPERVISOR != owner_supervisor:
+    raise ValueError("historical fixture supervisor selection differs")
 handoff.ci.COMMAND_SUPERVISOR_PATH = str(SUPERVISOR)
-public_spec = importlib.util.spec_from_file_location(
-    "wamr_public_bundle", REPO / "support/build/wamr-native-ci/public_bundle.py")
-public_bundle = importlib.util.module_from_spec(public_spec)
-public_spec.loader.exec_module(public_bundle)
 
 
 def write(path, value):
@@ -886,11 +885,14 @@ class Compute(unittest.TestCase):
 
     def test_physical_handoff_reopens_full_image_and_all_four_local_records(self):
         package_tool = Path(os.environ["WAMR_CI_PACKAGE"]).resolve(strict=True)
-        runtime = REPO / ".d/wamr-native-runtime"
+        runtime_parent = handoff.ci.REPO / ".d"
+        runtime_parent.mkdir(mode=0o700)
+        self.addCleanup(runtime_parent.rmdir)
+        runtime = runtime_parent / "wamr-native-runtime"
         runtime.mkdir(mode=0o700)
         self.addCleanup(shutil.rmtree, runtime)
         root = runtime / "compute"
-        app = self.root / "app"
+        app = runtime / "app"
         for path in (root, app, app / "build", app / "build/artifacts",
                      root / "evidence", root / "private", root / "tools", root / "tools/bin",
                      root / "tools/consumer-tree", root / "package", runtime / "bin",
@@ -1162,10 +1164,7 @@ class Compute(unittest.TestCase):
         )
         delivered = delivered_public_bundle()
         delivered.verify_archive(handoff, archive, source)
-        # The delivered validator hard-coded the hosted checkout basename.
-        # An alternate worktree cannot satisfy that and today's exact root.
-        if REPO.name == "unikraft":
-            delivered.publication_records(handoff, stage, source)
+        delivered.publication_records(handoff, stage, source)
         refused = self.root / "refused-import"
         with self.assertRaisesRegex(ValueError, "native controller records refused"):
             public_bundle.import_bundle(
@@ -1562,11 +1561,8 @@ class Compute(unittest.TestCase):
         )
         self.assertEqual(
             public_bundle.LEGACY_V1_SOURCES, frozenset(legacy_sources))
-        # These delivered records require the historical hosted basename.
-        compatible_legacy_sources = (
-            legacy_sources if REPO.name == "unikraft" else ())
         for index, (legacy_revision, legacy_tree) in enumerate(
-                compatible_legacy_sources):
+                legacy_sources):
             old_stage, old_bundle = copied_stage(
                 f"old-v1-stage-{index}")
             old_source = dict(
