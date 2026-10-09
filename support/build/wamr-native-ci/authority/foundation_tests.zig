@@ -8,18 +8,14 @@ const types = authority.types;
 const tx = authority.transaction;
 const a = std.testing.allocator;
 const io = std.testing.io;
-const golden = @embedFile("goldens/contracts.json");
+const fixtures = @import("test_fixtures.zig");
+const goldenRecord = fixtures.goldenRecord;
 
 test "shared producer and owner entry points typecheck without installing handlers" {
     std.testing.refAllDecls(records);
     std.testing.refAllDecls(tx);
 }
 
-fn goldenRecord(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
-    var document = try authority.contracts.parseCanonical(allocator, golden);
-    defer document.deinit();
-    return allocator.dupe(u8, document.value().object.get("canonical_records").?.object.get(name).?.string);
-}
 fn arguments(allocator: std.mem.Allocator, command: []const u8, flags: []const []const u8) ![][]const u8 {
     var result: std.ArrayList([]const u8) = .empty;
     try result.append(allocator, command);
@@ -145,6 +141,9 @@ test "decision construction enforces exact binding UTF8 controls and freshness w
     defer plan.deinit();
     var template = try records.parse(types.ApprovalTemplate, allocator, try goldenRecord(allocator, "approval_template"));
     defer template.deinit();
+    var foreign = plan.value;
+    foreign.ledger.directory.uid ^= 1;
+    try std.testing.expectError(error.InvalidLedgerIdentity, records.approvalTemplate(foreign, template.value.plan_sha256));
     const inputs: types.AuthorizationInputs = .{
         .decision = .denied,
         .approver = "réview",
@@ -236,7 +235,7 @@ test "retained transaction publishes durably once preserves evidence and refuses
     defer transaction.deinit();
     try std.testing.expect(transaction.publish("{\"key\":\"value\"}\n", checks.barrier()) == .success);
     try std.testing.expectEqual(core.private_files.CommitStatus.durable, transaction.publication);
-    try std.testing.expectEqual(@as(usize, 2), checks.count);
+    try std.testing.expectEqual(@as(usize, 6), checks.count);
     try std.testing.expectEqual(error.TransactionSpent, transaction.publish("{\"key\":\"other\"}\n", checks.barrier()).poisoned.err);
     try std.testing.expectError(error.PathAlreadyExists, tx.Transaction.init(.{ .allocator = a, .io = io }, output));
     var bytes = try transaction.published.?.read(a, null);
@@ -249,7 +248,7 @@ test "retained transaction publishes durably once preserves evidence and refuses
 }
 
 test "transaction freshness failures bracket publication and keep late durable output poisoned" {
-    for ([_]usize{ 1, 2 }) |fail_at| {
+    for ([_]usize{ 1, 6 }) |fail_at| {
         const fixture = try Fixture.init();
         defer fixture.deinit();
         const output = try fixture.output();
@@ -285,6 +284,12 @@ test "transaction refuses earlier failures replaced parents and cancellation wit
         try std.testing.expectEqual(core.diagnostics.Category.child_failed, failure.failures.primary.?.category);
     }
     {
+        var transaction = try tx.Transaction.init(.{ .allocator = a, .io = io }, output);
+        defer transaction.deinit();
+        transaction.lock.close(io);
+        try std.testing.expectEqual(error.LockNotHeld, transaction.publish("{}\n", checks.barrier()).poisoned.err);
+    }
+    {
         var signal = try core.process.SignalCancellation.install();
         defer signal.deinit();
         var transaction = try tx.Transaction.init(.{ .allocator = a, .io = io, .signal = &signal }, output);
@@ -314,7 +319,10 @@ test "transaction fault seam retains publication uncertainty and independent rec
         const output = try fixture.output();
         defer a.free(output);
         var checks: Checks = .{};
-        var transaction = try tx.Transaction.init(.{ .allocator = a, .io = io }, output);
+        var named_vtable = io.vtable.*;
+        named_vtable.dirCreateFileAtomic = fixtures.namedAtomic;
+        const fault_io: std.Io = if (fault == .cleanup) .{ .userdata = io.userdata, .vtable = &named_vtable } else io;
+        var transaction = try tx.Transaction.init(.{ .allocator = a, .io = fault_io }, output);
         defer transaction.deinit();
         const diagnostic = transaction.publishFault("{}\n", checks.barrier(), fault).poisoned;
         try std.testing.expectEqual(error.PublicationUncertain, diagnostic.err);
@@ -325,8 +333,303 @@ test "transaction fault seam retains publication uncertainty and independent rec
             const combined = tx.combineFailures(.{ .primary = primary }, diagnostic.failures);
             try std.testing.expectEqualDeep(primary, combined.primary.?);
             try std.testing.expect(combined.cleanup != null and combined.recording != null);
+            const partial = try (core.private_files.Directory{ .dir = fixture.root }).read(io, a, &std.fmt.hex(@as(u64, 0xa170c)), 32, null);
+            defer a.free(partial);
+            try std.testing.expectEqualStrings("{}\n", partial);
         }
         try std.testing.expectEqual(if (fault == .publication) core.private_files.CommitStatus.publication_unknown else if (fault == .after_rename) core.private_files.CommitStatus.visible_not_durable else core.private_files.CommitStatus.not_committed, diagnostic.publication);
+    }
+}
+
+const ShortWrite = struct {
+    mode: enum { zero, io_zero, invalid_count, short, cancel, io_cancel, deadline, freshness },
+    transaction: ?*tx.Transaction = null,
+    count: usize = 0,
+    var active: ?*ShortWrite = null;
+
+    fn write(userdata: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) std.Io.File.WritePositionalError!usize {
+        const self = active.?;
+        self.count += 1;
+        std.debug.assert(header.len == 0 and data.len == 1 and data[0].len != 0 and splat == 1);
+        if (self.mode == .zero or self.mode == .io_zero) return 0;
+        if (self.mode == .invalid_count) return data[0].len + 1;
+        const count = try io.vtable.fileWritePositional(userdata, file, header, &.{data[0][0..1]}, splat, offset);
+        if (self.count == 1) switch (self.mode) {
+            .cancel => @constCast(self.transaction.?.ctx.signal.?.flag()).store(true, .release),
+            .deadline => self.transaction.?.deadline.expires_ns = 0,
+            else => {},
+        };
+        return count;
+    }
+
+    fn checkCancel(userdata: ?*anyopaque) std.Io.Cancelable!void {
+        const self = active.?;
+        if (self.count != 0 and (self.mode == .io_cancel or self.mode == .io_zero)) return error.Canceled;
+        return io.vtable.checkCancel(userdata);
+    }
+};
+
+test "publication rejects zero progress and checks cancellation deadline and custody between short writes" {
+    for (std.enums.values(@TypeOf(@as(ShortWrite, undefined).mode))) |mode| {
+        const fixture = try Fixture.init();
+        defer fixture.deinit();
+        const output = try fixture.output();
+        defer a.free(output);
+        var checks: Checks = .{ .fail_at = if (mode == .freshness) 3 else null };
+        var signal = try core.process.SignalCancellation.install();
+        defer signal.deinit();
+        var state: ShortWrite = .{ .mode = mode };
+        ShortWrite.active = &state;
+        defer ShortWrite.active = null;
+        var vtable = io.vtable.*;
+        vtable.fileWritePositional = ShortWrite.write;
+        vtable.checkCancel = ShortWrite.checkCancel;
+        const short_io: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+        {
+            var transaction = try tx.Transaction.init(.{
+                .allocator = a,
+                .io = short_io,
+                .signal = &signal,
+                .publication_deadline = try core.process.Deadline.afterMilliseconds(5000),
+            }, output);
+            defer transaction.deinit();
+            state.transaction = &transaction;
+            const outcome = transaction.publish("{}\n", checks.barrier());
+            if (mode == .short) {
+                try std.testing.expect(outcome == .success);
+                try std.testing.expectEqual(@as(usize, 3), state.count);
+                var bytes = try transaction.published.?.read(a, null);
+                defer bytes.deinit();
+                try std.testing.expectEqualStrings("{}\n", bytes.bytes());
+            } else {
+                try std.testing.expect(outcome == .poisoned);
+                try std.testing.expectEqual(switch (mode) {
+                    .zero, .io_zero => error.WriteNoProgress,
+                    .invalid_count => error.InvalidWriteCount,
+                    .cancel => error.Cancelled,
+                    .io_cancel => error.Canceled,
+                    .deadline => error.DeadlineExceeded,
+                    .freshness => error.FreshnessChanged,
+                    .short => unreachable,
+                }, outcome.poisoned.err);
+                try std.testing.expectEqual(@as(usize, 1), state.count);
+                try std.testing.expectEqual(core.private_files.CommitStatus.not_committed, outcome.poisoned.publication);
+                try std.testing.expect(outcome.poisoned.failures.recording != null);
+                try std.testing.expectError(error.FileNotFound, fixture.root.openFile(io, "record.json", .{}));
+            }
+        }
+        const directory = try core.private_files.Directory.open(io, fixture.path);
+        defer directory.close(io);
+        var released = try directory.lock(io);
+        released.close(io);
+    }
+}
+
+const CleanupFailure = struct {
+    count: usize = 0,
+    file: ?std.Io.File = null,
+    var active: ?*CleanupFailure = null;
+
+    fn create(userdata: ?*anyopaque, dir: std.Io.Dir, destination: []const u8, options: std.Io.Dir.CreateFileAtomicOptions) std.Io.Dir.CreateFileAtomicError!std.Io.File.Atomic {
+        const atomic = try fixtures.namedAtomic(userdata, dir, destination, options);
+        active.?.file = atomic.file;
+        return atomic;
+    }
+    fn delete(userdata: ?*anyopaque, dir: std.Io.Dir, name: []const u8) std.Io.Dir.DeleteFileError!void {
+        const self = active.?;
+        self.count += 1;
+        if (self.count == 1) return error.AccessDenied;
+        return io.vtable.dirDeleteFile(userdata, dir, name);
+    }
+};
+
+test "named cleanup failure preserves bytes without deferred deletion retry or descriptor leak" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    const output = try fixture.output();
+    defer a.free(output);
+    var checks: Checks = .{};
+    var state: CleanupFailure = .{};
+    CleanupFailure.active = &state;
+    defer CleanupFailure.active = null;
+    var vtable = io.vtable.*;
+    vtable.dirCreateFileAtomic = CleanupFailure.create;
+    vtable.dirDeleteFile = CleanupFailure.delete;
+    const fault_io: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+    {
+        var transaction = try tx.Transaction.init(.{ .allocator = a, .io = fault_io }, output);
+        defer transaction.deinit();
+        const diagnostic = transaction.publishFault("{}\n", checks.barrier(), .before_file_sync).poisoned;
+        try std.testing.expectEqual(error.PublicationUncertain, diagnostic.err);
+        try std.testing.expectEqual(core.private_files.CommitStatus.not_committed, diagnostic.publication);
+        try std.testing.expect(diagnostic.failures.cleanup != null and diagnostic.failures.recording != null);
+        try std.testing.expectEqual(@as(usize, 1), state.count);
+        try std.testing.expectEqual(std.os.linux.E.BADF, std.os.linux.errno(std.os.linux.fcntl(state.file.?.handle, std.os.linux.F.GETFD, 0)));
+    }
+    const partial = try (core.private_files.Directory{ .dir = fixture.root }).read(io, a, &std.fmt.hex(@as(u64, 0xa170c)), 32, null);
+    defer a.free(partial);
+    try std.testing.expectEqualStrings("{}\n", partial);
+    try std.testing.expectEqual(@as(usize, 1), state.count);
+    try std.testing.expectError(error.FileNotFound, fixture.root.openFile(io, "record.json", .{}));
+}
+
+const NamedSwap = struct {
+    root: std.Io.Dir,
+    at: ?usize,
+    count: usize = 0,
+    var active: ?*NamedSwap = null;
+
+    fn replace(self: *NamedSwap) !void {
+        const name = std.fmt.hex(@as(u64, 0xa170c));
+        const bytes = try (core.private_files.Directory{ .dir = self.root }).read(io, a, &name, 32, null);
+        defer a.free(bytes);
+        try self.root.rename(&name, self.root, "retained-partial", io);
+        const replacement = try self.root.createFile(io, &name, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+        defer replacement.close(io);
+        try replacement.writeStreamingAll(io, bytes);
+    }
+    fn check(raw: *anyopaque) !void {
+        const self: *NamedSwap = @ptrCast(@alignCast(raw));
+        self.count += 1;
+        if (self.count == self.at) try self.replace();
+    }
+    fn rename(userdata: ?*anyopaque, old_dir: std.Io.Dir, old_name: []const u8, new_dir: std.Io.Dir, new_name: []const u8) std.Io.Dir.RenamePreserveError!void {
+        active.?.replace() catch |err| std.debug.panic("named replacement fixture failed: {s}", .{@errorName(err)});
+        return io.vtable.dirRenamePreserve(userdata, old_dir, old_name, new_dir, new_name);
+    }
+    fn barrier(self: *NamedSwap) tx.Barrier {
+        return .{ .context = self, .check = check };
+    }
+};
+
+test "named atomic custody rejects same-byte replacement during writes before link and in the link window" {
+    for ([_]?usize{ 3, 4, null }) |at| {
+        const fixture = try Fixture.init();
+        defer fixture.deinit();
+        const output = try fixture.output();
+        defer a.free(output);
+        var checks: NamedSwap = .{ .root = fixture.root, .at = at };
+        NamedSwap.active = &checks;
+        defer NamedSwap.active = null;
+        var writer: ShortWrite = .{ .mode = .short };
+        ShortWrite.active = &writer;
+        defer ShortWrite.active = null;
+        var vtable = io.vtable.*;
+        vtable.dirCreateFileAtomic = fixtures.namedAtomic;
+        if (at == 3) vtable.fileWritePositional = ShortWrite.write;
+        if (at == null) vtable.dirRenamePreserve = NamedSwap.rename;
+        const fault_io: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+        var transaction = try tx.Transaction.init(.{
+            .allocator = a,
+            .io = fault_io,
+            .publication_deadline = try core.process.Deadline.afterMilliseconds(5000),
+        }, output);
+        defer transaction.deinit();
+        const outcome = transaction.publish("{}\n", checks.barrier());
+        try std.testing.expect(outcome == .poisoned);
+        const diagnostic = outcome.poisoned;
+        try std.testing.expectEqual(error.FileChanged, diagnostic.err);
+        try std.testing.expectEqual(if (at == null) core.private_files.CommitStatus.durable else core.private_files.CommitStatus.not_committed, diagnostic.publication);
+        const partial = try (core.private_files.Directory{ .dir = fixture.root }).read(io, a, "retained-partial", 32, null);
+        defer a.free(partial);
+        try std.testing.expectEqualStrings(if (at == 3) "{" else "{}\n", partial);
+        if (at != null) {
+            const replacement = try (core.private_files.Directory{ .dir = fixture.root }).read(io, a, &std.fmt.hex(@as(u64, 0xa170c)), 32, null);
+            defer a.free(replacement);
+            try std.testing.expectEqualStrings(partial, replacement);
+            try std.testing.expect(diagnostic.failures.recording != null and diagnostic.failures.cleanup != null);
+            try std.testing.expectError(error.FileNotFound, fixture.root.openFile(io, "record.json", .{}));
+            if (at == 3) try std.testing.expectEqual(@as(usize, 1), writer.count);
+        } else {
+            var published = try transaction.published.?.read(a, null);
+            defer published.deinit();
+            try std.testing.expectEqualStrings("{}\n", published.bytes());
+        }
+    }
+}
+
+const Collision = struct {
+    root: std.Io.Dir,
+    mode: enum { production, named, ambiguous },
+    count: usize = 0,
+    named: bool = false,
+    foreign: ?core.private_files.Snapshot = null,
+    var active: ?*Collision = null;
+
+    fn create(userdata: ?*anyopaque, dir: std.Io.Dir, destination: []const u8, options: std.Io.Dir.CreateFileAtomicOptions) std.Io.Dir.CreateFileAtomicError!std.Io.File.Atomic {
+        const self = active.?;
+        const atomic = if (self.mode == .production)
+            try io.vtable.dirCreateFileAtomic(userdata, dir, destination, options)
+        else
+            try fixtures.namedAtomic(userdata, dir, destination, options);
+        self.named = atomic.file_exists;
+        return atomic;
+    }
+    fn check(raw: *anyopaque) !void {
+        const self: *Collision = @ptrCast(@alignCast(raw));
+        self.count += 1;
+        if (self.count == 4 and self.mode != .ambiguous) {
+            const file = try self.root.createFile(io, "record.json", .{ .exclusive = true, .permissions = .fromMode(0o600) });
+            defer file.close(io);
+            try file.writeStreamingAll(io, "{\"foreign\":true}\n");
+            self.foreign = try core.private_files.snapshot(file);
+        }
+    }
+    fn rename(userdata: ?*anyopaque, old_dir: std.Io.Dir, old_name: []const u8, new_dir: std.Io.Dir, new_name: []const u8) std.Io.Dir.RenamePreserveError!void {
+        try io.vtable.dirRenamePreserve(userdata, old_dir, old_name, new_dir, new_name);
+        return error.HardwareFailure;
+    }
+    fn barrier(self: *Collision) tx.Barrier {
+        return .{ .context = self, .check = check };
+    }
+};
+
+test "kernel create-only collisions preserve foreign custody and distinguish visible link ambiguity" {
+    for (std.enums.values(@TypeOf(@as(Collision, undefined).mode))) |mode| {
+        const fixture = try Fixture.init();
+        defer fixture.deinit();
+        const output = try fixture.output();
+        defer a.free(output);
+        var state: Collision = .{ .root = fixture.root, .mode = mode };
+        Collision.active = &state;
+        defer Collision.active = null;
+        var vtable = io.vtable.*;
+        vtable.dirCreateFileAtomic = Collision.create;
+        if (mode == .ambiguous) vtable.dirRenamePreserve = Collision.rename;
+        const fault_io: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
+        {
+            var transaction = try tx.Transaction.init(.{
+                .allocator = a,
+                .io = fault_io,
+                .publication_deadline = try core.process.Deadline.afterMilliseconds(5000),
+            }, output);
+            defer transaction.deinit();
+            const outcome = transaction.publish("{}\n", state.barrier());
+            try std.testing.expect(outcome == .poisoned);
+            const diagnostic = outcome.poisoned;
+            try std.testing.expectEqual(if (mode == .ambiguous) error.HardwareFailure else error.PathAlreadyExists, diagnostic.err);
+            try std.testing.expectEqual(if (mode == .ambiguous) core.private_files.CommitStatus.publication_unknown else core.private_files.CommitStatus.not_committed, diagnostic.publication);
+            try std.testing.expectEqual(core.diagnostics.Category.local_io, diagnostic.failures.recording.?.category);
+            try std.testing.expectEqual(state.named, diagnostic.failures.cleanup != null);
+            try std.testing.expect(transaction.published == null);
+            try std.testing.expectEqual(error.TransactionSpent, transaction.publish("{}\n", state.barrier()).poisoned.err);
+        }
+        const file = try (core.private_files.Directory{ .dir = fixture.root }).openFile(io, "record.json");
+        defer file.close(io);
+        const observed = try core.private_files.snapshot(file);
+        if (state.foreign) |foreign| try std.testing.expect(core.private_files.sameSnapshot(foreign, observed));
+        const bytes = try (core.private_files.Directory{ .dir = fixture.root }).read(io, a, "record.json", 32, null);
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings(if (mode == .ambiguous) "{}\n" else "{\"foreign\":true}\n", bytes);
+        if (mode == .named) {
+            const partial = try (core.private_files.Directory{ .dir = fixture.root }).read(io, a, &std.fmt.hex(@as(u64, 0xa170c)), 32, null);
+            defer a.free(partial);
+            try std.testing.expectEqualStrings("{}\n", partial);
+        }
+        const directory = try core.private_files.Directory.open(io, fixture.path);
+        defer directory.close(io);
+        var released = try directory.lock(io);
+        released.close(io);
     }
 }
 

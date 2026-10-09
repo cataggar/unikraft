@@ -247,9 +247,7 @@ test "plan projection uses typed provenance without reparsing candidate authorit
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var document = try contracts.parseCanonical(a, @embedFile("goldens/contracts.json"));
-    defer document.deinit();
-    const bytes = document.value().object.get("canonical_records").?.object.get("plan").?.string;
+    const bytes = try @import("test_fixtures.zig").goldenRecord(a, "plan");
     var fixture = try parse(types.Plan, a, bytes);
     defer fixture.deinit();
     const value = fixture.value;

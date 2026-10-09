@@ -529,8 +529,9 @@ pub fn build(b: *std.Build) void {
     controller_step.dependOn(&handoff_contracts_run.step);
     controller_step.dependOn(&handoff_python_goldens.step);
     const authority_contracts = b.addTest(.{
+        .filters = b.option([]const []const u8, "authority-test-filter", "Select bounded authority fixtures") orelse &.{},
         .root_module = b.createModule(.{
-            .root_source_file = b.path("authority/tests.zig"),
+            .root_source_file = b.path("authority/library_tests.zig"),
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{.{ .name = "hyperv_core", .module = host_core }},
@@ -550,12 +551,19 @@ pub fn build(b: *std.Build) void {
     authority_build.addImports(b, authority_module, portable_target, optimize, portable_core, portable_serial, portable_validator, handoffModule(b, portable_target, optimize, portable_core, controller_module));
     const authority_source_check = authority_build.sourceCheck(b, portable_target, optimize, authority_module);
     const authority_contracts_run = b.addRunArtifact(authority_contracts);
+    const authority_direct = b.addSystemCommand(&.{"/usr/bin/env"});
+    authority_direct.addFileArg(authority_contracts.getEmittedBin());
+    b.step("test-authority-direct", "Run authority fixtures with direct failure output").dependOn(&authority_direct.step);
     const authority_python_goldens = b.addSystemCommand(&.{ "python3", "-B" });
     authority_python_goldens.addFileArg(b.path("tests/test_authority_contract_goldens.py"));
     const authority_step = b.step("test-authority-contracts", "Run native/Python authority contract goldens");
     authority_step.dependOn(&authority_contracts_run.step);
     authority_step.dependOn(&authority_source_check.step);
     authority_step.dependOn(&authority_python_goldens.step);
+    const authority_libraries_step = b.step("test-authority-libraries", "Run complete source-only authority library composition");
+    authority_libraries_step.dependOn(&authority_contracts_run.step);
+    authority_libraries_step.dependOn(&authority_source_check.step);
+    authority_libraries_step.dependOn(&authority_python_goldens.step);
     controller_step.dependOn(&authority_contracts_run.step);
     controller_step.dependOn(&authority_source_check.step);
     controller_step.dependOn(&authority_python_goldens.step);
@@ -658,6 +666,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&handoff_contracts_run.step);
     test_step.dependOn(&handoff_python_goldens.step);
     test_step.dependOn(&authority_contracts_run.step);
+    test_step.dependOn(&authority_source_check.step);
     test_step.dependOn(&authority_python_goldens.step);
 }
 

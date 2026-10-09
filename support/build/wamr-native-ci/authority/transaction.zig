@@ -63,6 +63,7 @@ pub const Transaction = struct {
     parent: files.FileParent,
     lock: files.Locked,
     anchor: files.RetainedFile,
+    deadline: core.process.Deadline,
     attempted: bool = false,
     published: ?Record = null,
     publication: files.CommitStatus = .not_committed,
@@ -70,6 +71,8 @@ pub const Transaction = struct {
 
     pub fn init(ctx: types.Context, path: []const u8) !Transaction {
         try copy.checkCancellation(if (ctx.signal) |s| s.flag() else null);
+        var deadline = try core.process.Deadline.afterMilliseconds(contracts.policy.operation_seconds * 1000);
+        if (ctx.publication_deadline) |outer| deadline.expires_ns = @min(deadline.expires_ns, outer.expires_ns);
         const owned = try ctx.allocator.dupe(u8, path);
         errdefer ctx.allocator.free(owned);
         const parent = try files.FileParent.open(ctx.io, owned, .private);
@@ -89,7 +92,7 @@ pub const Transaction = struct {
         var anchor = try files.RetainedFile.open(ctx.io, anchor_path, .private);
         errdefer anchor.close(ctx.io);
         if (!files.sameSnapshot(try files.snapshot(lock.file.?), anchor.file_snapshot)) return error.OutputParentChanged;
-        return .{ .ctx = ctx, .path = owned, .parent = parent, .lock = lock, .anchor = anchor };
+        return .{ .ctx = ctx, .path = owned, .parent = parent, .lock = lock, .anchor = anchor, .deadline = deadline };
     }
     pub fn revalidate(self: *Transaction, barrier: Barrier) !void {
         try copy.checkCancellation(if (self.ctx.signal) |s| s.flag() else null);
@@ -113,24 +116,135 @@ pub const Transaction = struct {
             return .{ .refused = self.diagnostic(.validation, error.PreviousFailure) };
         var document = contracts.parseCanonical(self.ctx.allocator, bytes) catch |err| return .{ .refused = self.diagnostic(.construction, err) };
         document.deinit();
-        self.revalidate(barrier) catch |err| return .{ .refused = self.diagnostic(.freshness, err) };
-        const committed = (if (comptime @import("builtin").is_test)
-            (if (fault) |selected|
-                self.lock.createImmutableFault(self.ctx.io, self.parent.name, bytes, selected)
-            else
-                self.lock.createImmutable(self.ctx.io, self.parent.name, bytes))
-        else
-            self.lock.createImmutable(self.ctx.io, self.parent.name, bytes)) catch |err| return .{ .poisoned = self.diagnostic(.publication, err) };
-        self.publication = committed.status;
-        self.failures = combineFailures(self.failures, committed.failures);
-        if (committed.status != .durable or self.failures.primary != null or self.failures.cleanup != null or self.failures.recording != null)
+        self.progressCheck(barrier) catch |err| return .{ .refused = self.diagnostic(.freshness, err) };
+        const original = self.publishAtomic(bytes, barrier, fault) catch |err| return .{ .poisoned = self.diagnostic(.publication, err) };
+        if (self.publication != .durable or self.failures.primary != null or self.failures.cleanup != null or self.failures.recording != null)
             return .{ .poisoned = self.diagnostic(.publication, error.PublicationUncertain) };
         self.published = Record.open(self.ctx, self.path, contracts.json_limits.bytes) catch |err| return .{ .poisoned = self.diagnostic(.final_revalidation, err) };
+        var expected_snapshot = original;
+        const published_snapshot = self.published.?.file.file_snapshot;
+        expected_snapshot.size = published_snapshot.size;
+        expected_snapshot.nlink = 1;
+        expected_snapshot.mtime = published_snapshot.mtime;
+        expected_snapshot.ctime = published_snapshot.ctime;
+        if (!files.sameSnapshot(expected_snapshot, published_snapshot))
+            return .{ .poisoned = self.diagnostic(.final_revalidation, error.FileChanged) };
         const expected = std.fmt.bytesToHex(hash(bytes), .lower);
         if (self.published.?.file.file_snapshot.size != bytes.len or !std.mem.eql(u8, &expected, &self.published.?.sha256))
             return .{ .poisoned = self.diagnostic(.final_revalidation, error.RecordChanged) };
-        self.revalidate(barrier) catch |err| return .{ .poisoned = self.diagnostic(.final_revalidation, err) };
+        self.progressCheck(barrier) catch |err| return .{ .poisoned = self.diagnostic(.final_revalidation, err) };
         return .{ .success = {} };
+    }
+    fn progressCheck(self: *Transaction, barrier: Barrier) !void {
+        try self.ctx.io.checkCancel();
+        try self.revalidate(barrier);
+        if (try self.deadline.expired()) return error.DeadlineExceeded;
+    }
+    fn publishAtomic(self: *Transaction, bytes: []const u8, barrier: Barrier, fault: ?files.TestFault) !files.Snapshot {
+        if (self.lock.file == null) return error.LockNotHeld;
+        if (self.parent.name[0] == '.') return error.InvalidState;
+        var atomic = self.parent.directory.createFileAtomic(self.ctx.io, self.parent.name, .{
+            .permissions = .fromMode(0o600),
+            .replace = false,
+        }) catch |err| {
+            self.failures.recording = .{ .stage = .state_record, .category = .local_io };
+            return err;
+        };
+        defer {
+            // Explicit cleanup is the only deletion attempt. Failed or
+            // ambiguous named evidence must survive Atomic.deinit.
+            atomic.file_exists = false;
+            atomic.deinit(self.ctx.io);
+        }
+        var failure: ?anyerror = null;
+        const original: ?files.Snapshot = self.writeAndPublish(&atomic, bytes, barrier, fault) catch |err| blk: {
+            self.failures.recording = .{ .stage = .state_record, .category = .local_io };
+            failure = err;
+            break :blk null;
+        };
+        if (atomic.file_exists) {
+            if (fault == .cleanup) {
+                self.failures.cleanup = .{ .stage = .state_record, .category = .cleanup_failed };
+            } else {
+                if (!atomic.file_open) {
+                    self.failures.cleanup = .{ .stage = .state_record, .category = .cleanup_failed };
+                    return failure orelse error.InvalidState;
+                }
+                self.verifyAtomic(&atomic, files.snapshot(atomic.file) catch |err| {
+                    self.failures.cleanup = .{ .stage = .state_record, .category = .cleanup_failed };
+                    return failure orelse err;
+                }) catch |err| {
+                    self.failures.cleanup = .{ .stage = .state_record, .category = .cleanup_failed };
+                    return failure orelse err;
+                };
+                self.parent.directory.deleteFile(self.ctx.io, &std.fmt.hex(atomic.file_basename_hex)) catch |err| {
+                    self.failures.cleanup = .{ .stage = .state_record, .category = .cleanup_failed };
+                    return failure orelse err;
+                };
+                atomic.file_exists = false;
+                self.parent.sync(self.ctx.io) catch |err| {
+                    self.failures.cleanup = .{ .stage = .state_record, .category = .cleanup_failed };
+                    return failure orelse err;
+                };
+            }
+        }
+        if (failure) |err| return err;
+        return original.?;
+    }
+    fn verifyAtomic(self: *Transaction, atomic: *std.Io.File.Atomic, expected: files.Snapshot) !void {
+        if (!files.sameSnapshot(expected, try files.snapshot(atomic.file))) return error.FileChanged;
+        if (atomic.file_exists) {
+            const named = try (files.Directory{ .dir = atomic.dir }).openFile(self.ctx.io, &std.fmt.hex(atomic.file_basename_hex));
+            defer named.close(self.ctx.io);
+            if (!files.sameSnapshot(expected, try files.snapshot(named)) or
+                !files.sameSnapshot(expected, try files.snapshot(atomic.file)))
+                return error.FileChanged;
+        }
+    }
+    fn writeAndPublish(self: *Transaction, atomic: *std.Io.File.Atomic, bytes: []const u8, barrier: Barrier, fault: ?files.TestFault) !files.Snapshot {
+        const snapshot = try files.snapshot(atomic.file);
+        if (snapshot.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG or
+            snapshot.mode & 0o7777 != 0o600 or snapshot.uid != std.os.linux.geteuid() or
+            snapshot.nlink > 1 or snapshot.size != 0)
+            return error.UnsafeFile;
+        var retained = snapshot;
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            try self.progressCheck(barrier);
+            try self.verifyAtomic(atomic, retained);
+            const chunk = bytes[offset..@min(bytes.len, offset + 64 * 1024)];
+            const count = try atomic.file.writePositional(self.ctx.io, &.{chunk}, offset);
+            if (count == 0) return error.WriteNoProgress;
+            if (count > chunk.len) return error.InvalidWriteCount;
+            offset += count;
+            const written = try files.snapshot(atomic.file);
+            var expected = retained;
+            expected.size = offset;
+            expected.mtime = written.mtime;
+            expected.ctime = written.ctime;
+            if (!files.sameSnapshot(expected, written)) return error.FileChanged;
+            retained = written;
+            try self.verifyAtomic(atomic, retained);
+        }
+        try self.progressCheck(barrier);
+        try self.verifyAtomic(atomic, retained);
+        if (fault == .before_file_sync or fault == .cleanup) return error.PublicationUncertain;
+        try atomic.file.sync(self.ctx.io);
+        try self.progressCheck(barrier);
+        try self.verifyAtomic(atomic, retained);
+        if (fault == .before_rename) return error.PublicationUncertain;
+        self.publication = .publication_unknown;
+        if (fault == .publication) return error.PublicationUncertain;
+        atomic.link(self.ctx.io) catch |err| {
+            if (err == error.PathAlreadyExists) self.publication = .not_committed;
+            return err;
+        };
+        self.publication = .visible_not_durable;
+        if (fault == .after_rename) return error.PublicationUncertain;
+        try self.progressCheck(barrier);
+        try self.parent.sync(self.ctx.io);
+        self.publication = .durable;
+        return snapshot;
     }
     fn diagnostic(self: *const Transaction, phase: types.Phase, err: anyerror) types.Diagnostic {
         return .{ .phase = phase, .err = err, .publication = self.publication, .failures = self.failures };

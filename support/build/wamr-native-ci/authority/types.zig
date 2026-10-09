@@ -88,6 +88,7 @@ pub const Context = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     signal: ?*core.process.SignalCancellation = null,
+    publication_deadline: ?core.process.Deadline = null,
 };
 pub const RuntimeLayout = struct {
     output: []const u8,

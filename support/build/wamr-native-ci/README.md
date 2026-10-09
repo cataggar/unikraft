@@ -216,33 +216,63 @@ new flag, source-identity relaxation or reconstructed former download custody
 has been introduced. Executable integration needs a reviewed owner/context
 acquisition decision, not a success-shaped or refuse-only placeholder binary.
 
-Disjoint next source-module ownership is:
+The source library operations are composed without standalone owner acquisition:
 
 | Todo / file | Interface and responsibility |
 | --- | --- |
-| `authority-runtime-copy` / `authority/runtime_copy.zig` | A retained copy owner exposes `RuntimeLayout` and retained native members, accepts `LoaderInventory`, seals/scans the tree and streams the D/F/L/P manifest and runtime contract. Owns copy budgets, reserved outputs and retained failure evidence. |
-| `authority-runtime-probes` / `authority/runtime_probes.zig` | A retained inventory owner discovers ELF interpreter/DSOs from explicit members/dependencies and exposes `LoaderInventory`. Its verification entry consumes layout/contract plus `Barrier` for the contained loader listing and all sixteen isolated probes. It does not own copy/schema publication. |
+| `authority-runtime-copy` / `authority/runtime_copy.zig` | A retained copy owner exposes `RuntimeLayout` and retained native members, takes its own named `LoaderInventory` custody, freezes/scans the tree and streams D/F/L/P manifest inputs. Owns copy budgets, reserved outputs and retained failure evidence, not probe acceptance. |
+| `authority-runtime-probes` / `authority/runtime_probes.zig` | A retained inventory owner discovers ELF interpreter/DSOs from explicit members/dependencies and exposes `LoaderInventory`. Copied inspection and sealed verification consume layout/contract plus `Barrier`: sixteen Azure command probes and separate loader/version/import checks. It does not own copy/schema publication. |
 | `authority-native-plan` / `authority/plan.zig` | `run(Context, PlanCommand, *Finalized)` consumes the live imported owner, binds retained runtime/tools/ledger proposal, uses `records.plan` and `approvalTemplate`, independently validates and publishes multiple outputs with final barriers. Context acquisition remains the seam above. |
 | `authority-native-authorization` / `authority/authorization.zig` | `run(Context, AuthorizationCommand)` retains and validates seeded plan/template/runtime/tool records, constructs current approved or denied decisions, validates privately and publishes durably. |
-| `authority-native-admission` / `authority/admission.zig` | `run(Context, AdmitCommand)` retains and validates exact plan/approved current decision/runtime/tool evidence, uses `records.admission`, performs final private validation and publishes durably. No ledger claim, approval consumption or Azure operations. |
+| `authority-native-admission` / `authority/admission.zig` | `run(Context, AdmitCommand)` requires a live imported `Finalized` and independent plan/authorization commitments, validates exact current approved decision/runtime/tool evidence and publishes durably. No ledger claim, approval consumption or Azure operations. |
+| `authority-library-composition` / `authority/prepare.zig`, `handlers.zig` | Actual retained handler dispatch and COPY → physical manifest → isolated seal/probes → canonical runtime publication. No owner acquisition, CLI cutover or installed executable. |
 
 Each owner supplies `revalidate`/`deinit` and a typed `Outcome`; its files and
 focused tests are separate. Shared root/build exports and aggregate test wiring
-remain a single integration-owner responsibility. All five source modules can
-start against these foundations and existing validators/seeded records; complete
-runtime preparation joins copy and probes. `authority-executable-integration`
+now exercise all five operations through one options-module identity; complete
+runtime preparation joins copy and probes with typed retained ownership and
+non-resumable failures. See [`authority/composition.md`](authority/composition.md)
+for physical manifest ordering, closed helper containment and caller lifetimes.
+`authority-executable-integration`
 depends on all five real modules and the reviewed context seam before installing
 anything. Genuine runtime/policy acceptance, caller cutover and Python deletion
 remain separately gated; source tests do not claim those gates passed.
 
-`authority.build.zig test-native` runs the contract and foundation tests and
-compiles a non-test object to check real owner/transaction entry points without
+`authority.build.zig test-native` runs the unchanged contract/foundation tests,
+all focused library tests and joined preparation refusals. It compiles a non-test
+object to check every complete handler and retained owner API without
 installing a tool. `test` also runs the unchanged Python goldens. The package
-`test-authority-contracts` includes both checks. Use `-Dtest-root=ABS -j1` with
+`test-authority-libraries` and `test-authority-contracts` include both checks.
+Use `-Dtest-root=ABS -j1` with
 an existing owner-private fixture root, and repeat with
 `-Doptimize=ReleaseSafe`; `handoff.build.zig test-candidate` covers the narrow
-typed provenance addition. The test-only private-file cleanup fault works for
-both named atomic files and Linux unnamed atomic files.
+typed provenance addition. Constructor fixtures rebind the frozen synthetic
+ledger UID to the executing owner and recompute dependent exact hashes/sizes;
+the checked-in golden bytes and production foreign-owner refusal are unchanged.
+The cleanup-failure fixture supplies a real named atomic file through the test
+I/O interface, exercising the authority publisher's explicit cleanup without
+changing guarded private-file source bytes. Other publication faults use the
+ordinary I/O path.
+Use `-Dauthority-test-filter=TEXT` to select bounded fixtures in either build.
+`authority.build.zig test-native-direct` and the package's
+`test-authority-direct` print actual error names without the test-server protocol.
+Publication uses progress-checked positional writes through `std.Io.File.Atomic`,
+with cancellation, retained freshness and a monotonic deadline checked between
+short writes and before sync/link barriers. `Context.publication_deadline` can
+supply an earlier finite deadline; its default is the frozen 600-second
+operation budget measured from transaction initialization. Zero progress is a
+`WriteNoProgress` refusal, not a retry loop. Both signal and I/O cancellation
+are checked. Temporary descriptor/name identity is retained through short writes
+and checked before linking; the final record must retain the original inode.
+Failed or ambiguous named cleanup is never silently retried; the descriptor is
+closed while the partial evidence remains. Published evidence is never removed,
+and primary, cleanup and recording failures remain independent. This bounded
+authority publisher does not modify the guarded shared private-file source.
+A kernel create-only `PathAlreadyExists` collision is poisoned but
+`not_committed`: the foreign output is never replaced, and the attempt cannot
+resume. Other link/rename errors remain `publication_unknown`, including an I/O
+error after actual visibility; retained evidence and independent cleanup
+failures must still be inspected.
 
 ## Native package and boot chain (production caller)
 

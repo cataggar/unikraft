@@ -445,6 +445,30 @@ fn childNamespace(uid_map: []const u8, gid_map: []const u8) ?NamespaceStage {
     return null;
 }
 
+/// Only in the closed preparation fork, never in the retained caller process.
+pub fn enterPreparationNamespace(io: std.Io, parent: linux.pid_t) !void {
+    const actual_parent = linux.getppid();
+    if (parent <= 1 or parent != actual_parent) return error.InvalidNamespaceParent;
+    try files.verifyInitialNamespace(io);
+    const uid = linux.geteuid();
+    const gid = linux.getegid();
+    var uid_buffer: [64]u8 = undefined;
+    var gid_buffer: [64]u8 = undefined;
+    const uid_map = try std.fmt.bufPrint(&uid_buffer, "0 {d} 1\n", .{uid});
+    const gid_map = try std.fmt.bufPrint(&gid_buffer, "0 {d} 1\n", .{gid});
+    if (childNamespace(uid_map, gid_map)) |stage| return stage.refusal();
+    // Bridge only actual fork/map facts into the existing kernel verifier.
+    // Authentication precedes the private PID namespace/procfs transition.
+    var environment = std.process.Environ.Map.init(std.heap.page_allocator);
+    defer environment.deinit();
+    var buffer: [32]u8 = undefined;
+    try environment.put(files.namespace_marker, files.namespace_controller);
+    try environment.put(files.namespace_uid, try std.fmt.bufPrint(&buffer, "{d}", .{uid}));
+    try environment.put(files.namespace_gid, try std.fmt.bufPrint(&buffer, "{d}", .{gid}));
+    try environment.put(files.namespace_parent, try std.fmt.bufPrint(&buffer, "{d}", .{actual_parent}));
+    try files.enterUserNamespaceFromEnvironment(io, &environment);
+}
+
 pub fn load(
     allocator: std.mem.Allocator,
     io: std.Io,
