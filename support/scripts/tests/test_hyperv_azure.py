@@ -3297,7 +3297,7 @@ class HypervWorkflowTest(unittest.TestCase):
                     header,
                 )
                 self.assertIn("        persist-credentials: false\n", job)
-                if lane == "runtime":
+                if lane in ("runtime", "build-protocol"):
                     self.assertIn("        fetch-depth: 0\n", job)
                 self.assertIn("uses: ./.github/actions/hyperv-fixture-setup", job)
                 for forbidden in ("    if:", "    needs:", "    strategy:",
@@ -3613,12 +3613,9 @@ class HypervWorkflowTest(unittest.TestCase):
             controller.write_text(
                 '#!/bin/sh\n'
                 'test "$1" = describe && test "$2" = --output && '
-                'test "$3" = json-v1 || exit 1\n'
+                'test "$3" = target-v1 || exit 1\n'
                 'printf "%s\\n" '
-                '\'{"recorded_executable_target":["-Dtarget=x86_64-linux-gnu",'
-                '"-Dcpu=x86_64_v2"],"schema":"uk.wamr.native-ci-describe",'
-                '"schema_version":1,"source_closure_sha256":"'
-                '0000000000000000000000000000000000000000000000000000000000000000"}\'\n'
+                '\'-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2\'\n'
             )
             controller.chmod(0o700)
             runner = root / "runner"
