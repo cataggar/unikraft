@@ -8,6 +8,10 @@ const contracts = authority.contracts;
 const golden = @embedFile("goldens/contracts.json");
 const scenarios = @embedFile("goldens/python-scenarios.json");
 
+test {
+    _ = @import("foundation_tests.zig");
+}
+
 const golden_fields = struct {
     pub const root = [_][]const u8{ "schema", "schema_version", "authority_domain", "canonicalization", "cli", "limits", "policy", "azure_runtime", "schemas", "canonical_records", "uuid_normalization", "uuid_rejection", "generated_ids", "live_success_scenarios", "live_refusal_scenarios", "runtime_bound_scenarios" };
     pub const cli_root = [_][]const u8{ "commands", "exit_contract" };
