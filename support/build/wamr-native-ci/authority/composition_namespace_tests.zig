@@ -7,13 +7,19 @@ const linux = std.os.linux;
 
 const Report = extern struct {
     err: u16,
+    identity_err: u16,
+    identity_errno: u16,
     unchanged: u16,
     uid: u32,
     gid: u32,
     parent: linux.pid_t,
 };
 
-fn attempt(path: []const u8, wrong_parent: bool) !Report {
+const Options = struct {
+    after_identity_path: [*:0]const u8 = "/proc/self/ns/user",
+};
+
+fn attempt(path: []const u8, wrong_parent: bool, options: Options) !Report {
     var descriptors: [2]linux.fd_t = undefined;
     if (linux.errno(linux.pipe2(&descriptors, .{ .CLOEXEC = true })) != .SUCCESS)
         return error.NamespaceTestPipe;
@@ -30,21 +36,30 @@ fn attempt(path: []const u8, wrong_parent: bool) !Report {
         const io = threaded.io();
         const uid = linux.geteuid();
         const gid = linux.getegid();
-        const before = namespaceIdentity() catch |err| {
-            std.debug.print("namespace fixture pre-transition identity failed: {s}\n", .{@errorName(err)});
-            linux.exit_group(123);
-        };
         var failure: ?anyerror = null;
-        child(io, path, if (wrong_parent) 1 else parent) catch |err| {
+        var identity_errno: linux.E = .SUCCESS;
+        const before = namespaceIdentity("/proc/self/ns/user", &identity_errno) catch |err| blk: {
+            failure = err;
+            break :blk null;
+        };
+        if (failure == null) child(io, path, if (wrong_parent) 1 else parent) catch |err| {
             failure = err;
         };
-        const after = namespaceIdentity() catch |err| {
-            std.debug.print("namespace fixture post-transition identity failed: {s}\n", .{@errorName(err)});
-            linux.exit_group(123);
+        var identity_failure: ?anyerror = null;
+        const after = namespaceIdentity(options.after_identity_path, &identity_errno) catch |err| blk: {
+            identity_failure = err;
+            break :blk null;
         };
+        if (failure == null) failure = identity_failure;
         var report: Report = .{
             .err = if (failure) |err| @intFromError(err) else 0,
-            .unchanged = @intFromBool(uid == linux.geteuid() and gid == linux.getegid() and std.mem.eql(u64, &before, &after)),
+            .identity_err = if (identity_failure) |err| @intFromError(err) else 0,
+            .identity_errno = @intFromEnum(identity_errno),
+            .unchanged = if (before != null and after != null)
+                @intFromBool(uid == linux.geteuid() and gid == linux.getegid() and
+                    std.mem.eql(u64, &before.?, &after.?))
+            else
+                2,
             .uid = linux.geteuid(),
             .gid = linux.getegid(),
             .parent = linux.getppid(),
@@ -95,9 +110,15 @@ fn child(io: std.Io, path: []const u8, parent: linux.pid_t) !void {
     try retained.verify(io);
 }
 
-fn namespaceIdentity() ![3]u64 {
-    const opened = linux.openat(linux.AT.FDCWD, "/proc/self/ns/user", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
-    if (linux.errno(opened) != .SUCCESS) return error.NamespaceTestIdentity;
+fn namespaceIdentity(path: [*:0]const u8, errno: *linux.E) ![3]u64 {
+    const opened = linux.openat(linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    errno.* = linux.errno(opened);
+    switch (errno.*) {
+        .SUCCESS => {},
+        .ACCES, .PERM => return error.NamespaceTestIdentityAccessDenied,
+        .NOENT => return error.NamespaceTestIdentityNotFound,
+        else => return error.NamespaceTestIdentityUnavailable,
+    }
     const file: std.Io.File = .{ .handle = @intCast(opened), .flags = .{ .nonblocking = false } };
     defer _ = linux.close(file.handle);
     const snapshot = try core.private_files.snapshot(file);
@@ -105,9 +126,30 @@ fn namespaceIdentity() ![3]u64 {
 }
 
 test "joined namespace rejects a nonparent before changing identity or mappings" {
-    const report = try attempt("/not-opened", true);
+    const report = try attempt("/not-opened", true, .{});
     try std.testing.expectEqual(@as(u16, @intFromError(error.InvalidNamespaceParent)), report.err);
     try std.testing.expectEqual(@as(u16, 1), report.unchanged);
+    try std.testing.expectEqual(linux.geteuid(), report.uid);
+    try std.testing.expectEqual(linux.getegid(), report.gid);
+    try std.testing.expectEqual(linux.getpid(), report.parent);
+}
+
+test "joined namespace reports original refusal and actual identity syscall error without false timeout" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    const inaccessible = try fixture.dir.createFile(std.testing.io, "identity-denied", .{
+        .exclusive = true,
+        .permissions = .fromMode(0),
+    });
+    inaccessible.close(std.testing.io);
+    const path = try std.fs.path.join(fixture.arena.allocator(), &.{ fixture.path, "identity-denied" });
+    const report = try attempt("/not-opened", true, .{
+        .after_identity_path = try fixture.arena.allocator().dupeZ(u8, path),
+    });
+    try std.testing.expectEqual(@as(u16, @intFromError(error.InvalidNamespaceParent)), report.err);
+    try std.testing.expectEqual(@as(u16, @intFromError(error.NamespaceTestIdentityAccessDenied)), report.identity_err);
+    try std.testing.expectEqual(@as(u16, @intFromEnum(linux.E.ACCES)), report.identity_errno);
+    try std.testing.expectEqual(@as(u16, 2), report.unchanged);
     try std.testing.expectEqual(linux.geteuid(), report.uid);
     try std.testing.expectEqual(linux.getegid(), report.gid);
     try std.testing.expectEqual(linux.getpid(), report.parent);
@@ -124,7 +166,7 @@ test "joined namespace authenticates actual mapped owner and retained file or re
     };
     defer fixture.deinit();
     const path = try std.fs.path.join(fixture.arena.allocator(), &.{ fixture.request.stdlib, "os.py" });
-    const report = attempt(path, false) catch |err| {
+    const report = attempt(path, false, .{}) catch |err| {
         std.debug.print(
             "preparation namespace fixture failed: {s}; " ++
                 "uid={d} gid={d} parent={d}\n",
@@ -134,7 +176,7 @@ test "joined namespace authenticates actual mapped owner and retained file or re
     };
     std.debug.print(
         "preparation namespace result: {s}; mapped_uid={d} mapped_gid={d} " ++
-            "parent={d} unchanged={d}\n",
+            "parent={d} unchanged={d} identity={s} identity_errno={d}\n",
         .{
             if (report.err == 0)
                 "authenticated"
@@ -144,6 +186,11 @@ test "joined namespace authenticates actual mapped owner and retained file or re
             report.gid,
             report.parent,
             report.unchanged,
+            if (report.identity_err == 0)
+                "retained"
+            else
+                @errorName(@errorFromInt(report.identity_err)),
+            report.identity_errno,
         },
     );
     if (report.err != 0) {

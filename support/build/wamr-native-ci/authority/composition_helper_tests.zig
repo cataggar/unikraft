@@ -25,6 +25,10 @@ const Witness = struct {
         self.worker = worker;
         if (self.foreign) |foreign| try foreign.spawn();
     }
+    fn leaderObserved(raw: *anyopaque, leader: linux.pid_t) !void {
+        const self: *Witness = @ptrCast(@alignCast(raw));
+        self.leader = leader;
+    }
 };
 
 fn checkCancel(userdata: ?*anyopaque) std.Io.Cancelable!void {
@@ -75,7 +79,11 @@ test "joined helper second fork initializes actual PID worker before real native
     };
     defer a.free(executable);
     var witness: Witness = .{};
-    const hooks: helper.Test.Hooks = .{ .context = &witness, .after_worker = Witness.observed };
+    const hooks: helper.Test.Hooks = .{
+        .context = &witness,
+        .after_leader = Witness.leaderObserved,
+        .after_worker = Witness.observed,
+    };
     const outcome = helper.Test.run(.{ .allocator = a, .io = io }, .{
         .cwd = fixture.dir,
         .executable = executable,
@@ -99,6 +107,34 @@ test "joined helper second fork initializes actual PID worker before real native
     try std.testing.expect(outcome.cleanup_complete);
     try assertReaped(witness.leader);
     try assertReaped(witness.worker);
+}
+
+test "joined helper retains actual early refusal across terminal frame EOF before leader reaping" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    for ([_]bool{ false, true }) |empty_after_report| {
+        var witness: Witness = .{};
+        const hooks: helper.Test.Hooks = .{
+            .context = &witness,
+            .after_leader = Witness.leaderObserved,
+            .after_worker = Witness.observed,
+        };
+        const outcome = helper.Test.run(.{ .allocator = a, .io = io }, .{
+            .cwd = fixture.dir,
+            .executable = "",
+            .barrier = witness.barrier(),
+            .refuse_before_namespace = error.InputOutput,
+            .after_report_ms = if (empty_after_report) 1000 else 80,
+            .empty_after_report = empty_after_report,
+        }, try core.process.Deadline.afterMilliseconds(5_000), &hooks);
+        try std.testing.expectEqual(
+            if (empty_after_report) error.InvalidHelperReport else error.InputOutput,
+            outcome.result.refused.cause,
+        );
+        try std.testing.expect(outcome.cleanup_complete);
+        try std.testing.expectEqual(@as(linux.pid_t, 0), witness.worker);
+        try assertReaped(witness.leader);
+    }
 }
 
 const Foreign = struct {
@@ -197,6 +233,7 @@ test "joined helper IO cancellation after worker fork reaps only owned family an
     const injected: std.Io = .{ .userdata = io.userdata, .vtable = &table };
     const hooks: helper.Test.Hooks = .{
         .context = &witness,
+        .after_leader = Witness.leaderObserved,
         .after_worker = Witness.observed,
         .cleanup_ms = 600,
     };

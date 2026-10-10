@@ -250,12 +250,24 @@ fn send(fd: linux.fd_t, frame: *const Frame) !void {
         }
     }
 }
-fn receive(fd: linux.fd_t, frame: *Frame) !void {
+fn receive(fd: linux.fd_t, frame: *Frame) !bool {
     const bytes = std.mem.asBytes(frame);
     while (true) {
         const received = linux.recvfrom(fd, bytes.ptr, bytes.len, linux.MSG.TRUNC, null, null);
         switch (linux.errno(received)) {
-            .SUCCESS => if (received == bytes.len and frame.marker == magic) return else return error.InvalidHelperReport,
+            .SUCCESS => {
+                if (received == 0) {
+                    // An open peer's zero-length packet is not channel EOF.
+                    var state = [_]linux.pollfd{.{ .fd = fd, .events = 0, .revents = 0 }};
+                    const polled = linux.poll(&state, state.len, 0);
+                    if (linux.errno(polled) == .SUCCESS and polled == 1 and
+                        state[0].revents & linux.POLL.HUP != 0)
+                        return false;
+                    return error.InvalidHelperReport;
+                }
+                if (received == bytes.len and frame.marker == magic) return true;
+                return error.InvalidHelperReport;
+            },
             .INTR => continue,
             else => return error.HelperChannelFailed,
         }
@@ -268,7 +280,7 @@ const Peer = struct {
         const request = Frame.init(.barrier);
         try send(self.fd, &request);
         var response: Frame = undefined;
-        try receive(self.fd, &response);
+        if (!try receive(self.fd, &response)) return error.HelperChannelClosed;
         if (response.kind != .acknowledgment) return error.InvalidHelperReport;
         if (response.error_code != 0) return @errorFromInt(response.error_code);
     }
@@ -301,6 +313,16 @@ fn child(fd: linux.fd_t, parent: linux.pid_t, job: Job, cwd: std.Io.Dir, slot: *
     var frame = Frame.encode(outcome);
     // No process address, borrowed slice or path crosses the inherited channel.
     send(fd, &frame) catch linux.exit_group(125);
+    if (builtin.is_test and job == .process_test and
+        job.process_test.after_report_ms != 0)
+    {
+        if (job.process_test.empty_after_report) {
+            const empty: [0]u8 = .{};
+            _ = linux.sendto(fd, &empty, 0, linux.MSG.NOSIGNAL, null, 0);
+        } else _ = linux.close(fd);
+        var pause: [0]linux.pollfd = .{};
+        _ = linux.poll(&pause, 0, job.process_test.after_report_ms);
+    }
     linux.exit_group(0);
 }
 fn childRun(ctx_: types.Context, parent: linux.pid_t, job: Job, cwd: std.Io.Dir, slot: *linux.pid_t, peer: *Peer) !probes.Result {
@@ -316,6 +338,8 @@ fn childRun(ctx_: types.Context, parent: linux.pid_t, job: Job, cwd: std.Io.Dir,
         ctx.signal = &cancellation;
     }
     try core.process.initialize();
+    if (builtin.is_test and job == .process_test)
+        if (job.process_test.refuse_before_namespace) |err| return err;
     try runtime.enterPreparationNamespace(ctx.io, parent);
     return runPidWorker(ctx, job, cwd, slot, peer);
 }
@@ -411,11 +435,17 @@ fn runImpl(ctx: types.Context, job: Job, cwd: std.Io.Dir, deadline: core.process
     if (linux.errno(opened) != .SUCCESS) {
         failure = error.HelperPidfdUnavailable;
     } else family.leader_fd = @intCast(opened);
+    if (builtin.is_test and hooks != null)
+        if (hooks.?.after_leader) |action|
+            action(hooks.?.context, family.leader) catch |err| {
+                failure = failure orelse err;
+            };
     return supervise(ctx, job, sockets[0], &family, deadline, hooks, failure);
 }
 
 fn supervise(ctx: types.Context, job: Job, socket: linux.fd_t, family: *Family, deadline: core.process.Deadline, hooks: ?*const Test.Hooks, initial_failure: ?anyerror) Result {
     var received: ?Frame = null;
+    var channel_closed = false;
     var failure = initial_failure;
     var cleanup_failed = false;
     var cleanup_deadline: ?core.process.Deadline = null;
@@ -478,7 +508,7 @@ fn supervise(ctx: types.Context, job: Job, socket: linux.fd_t, family: *Family, 
             }
         }
         var pollfds = [_]linux.pollfd{
-            .{ .fd = socket, .events = linux.POLL.IN, .revents = 0 },
+            .{ .fd = if (channel_closed) -1 else socket, .events = linux.POLL.IN, .revents = 0 },
             .{ .fd = family.leader_fd orelse -1, .events = linux.POLL.IN, .revents = 0 },
             .{ .fd = family.worker_fd orelse -1, .events = linux.POLL.IN, .revents = 0 },
         };
@@ -487,8 +517,12 @@ fn supervise(ctx: types.Context, job: Job, socket: linux.fd_t, family: *Family, 
             failure = failure orelse error.HelperChannelFailed;
         if (pollfds[0].revents & linux.POLL.IN != 0) {
             var frame: Frame = undefined;
-            if (receive(socket, &frame)) |_| {
-                if (frame.kind == .barrier and received == null) {
+            if (receive(socket, &frame)) |present| {
+                if (!present) {
+                    channel_closed = true;
+                    if (received == null)
+                        failure = failure orelse error.HelperExitedWithoutEvidence;
+                } else if (frame.kind == .barrier and received == null) {
                     var acknowledgment = Frame.init(.acknowledgment);
                     job.barrier().revalidate() catch |err| {
                         failure = failure orelse err;
@@ -513,7 +547,8 @@ fn supervise(ctx: types.Context, job: Job, socket: linux.fd_t, family: *Family, 
         var final_poll = [_]linux.pollfd{.{ .fd = socket, .events = linux.POLL.IN, .revents = 0 }};
         if (linux.errno(linux.poll(&final_poll, 1, 0)) == .SUCCESS and final_poll[0].revents & linux.POLL.IN != 0) {
             var frame: Frame = undefined;
-            receive(socket, &frame) catch |err| return refusal(err, true);
+            const present = receive(socket, &frame) catch |err| return refusal(err, true);
+            if (!present) return refusal(error.HelperExitedWithoutEvidence, true);
             if (frame.kind == .complete or frame.kind == .refused) received = frame;
         }
     }
@@ -534,14 +569,20 @@ pub const Test = struct {
         executable: []const u8,
         barrier: tx.Barrier,
         hold: bool = false,
+        refuse_before_namespace: ?anyerror = null,
+        after_report_ms: i32 = 0,
+        empty_after_report: bool = false,
     };
     pub const Hooks = struct {
         context: *anyopaque,
+        after_leader: ?*const fn (*anyopaque, linux.pid_t) anyerror!void = null,
         after_worker: ?*const fn (*anyopaque, linux.pid_t, linux.pid_t) anyerror!void = null,
         cleanup_ms: u64 = 15_000,
     };
     pub fn run(ctx: types.Context, command: Command, deadline: core.process.Deadline, hooks: ?*const Hooks) Result {
         if (!builtin.is_test) @compileError("Helper process fixtures are test-only");
+        if (command.after_report_ms < 0 or command.after_report_ms > 1000)
+            return refusal(error.InvalidDeadline, true);
         if (hooks) |selected| if (selected.cleanup_ms < 60 or selected.cleanup_ms > 15_000)
             return refusal(error.InvalidDeadline, true);
         core.process.initialize() catch |err| return refusal(err, true);

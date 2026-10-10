@@ -146,6 +146,16 @@ Namespace and second-fork fixtures report typed acquisition/refusal errors,
 mapped identities, owned PIDs and explicit cleanup status before assertions.
 The cancellation fixture also reports its actual cancellation checkpoint count.
 These diagnostics do not broaden capability refusals or replace positive checks.
+Identity-observation failure is now a separate typed report lane with the
+actual `openat` errno. It never replaces an earlier namespace refusal with a
+misleading pipe timeout. Missing identity evidence remains unknown, never an
+unchanged or successfully authenticated namespace.
+The helper distinguishes a closed sequenced-packet channel from a malformed
+frame. EOF after a complete terminal frame preserves that frame's original
+refusal and still requires specific owned-family reaping and clean exit.
+EOF without a terminal frame and malformed or repeated frames still refuse.
+Regressions exercise a real mode-000 identity-open denial and a real terminal
+frame followed by socket EOF while its specifically owned leader is alive.
 An emulated ABI check is not a namespace qualification when the emulator cannot
 preserve the required namespace syscalls.
 
