@@ -6,6 +6,7 @@ const base = @import("main.zig");
 const serial = @import("local_serial");
 const log_validator = @import("wamr_log_validator");
 const azure_runtime = @import("azure_runtime.zig");
+pub const azure_runtime_contract = azure_runtime;
 const c = core.contracts;
 const files = core.private_files;
 pub const Artifact = base.Artifact;
