@@ -141,7 +141,7 @@ jobs:
           retain_source=true
 
       - name: Exercise native controller, custody limits, and package-boot fixtures in an isolated x86 worktree
-        timeout-minutes: 15
+        timeout-minutes: 30
         run: |
           set -euo pipefail
           source_root="${RUNNER_TEMP}/wamr-controller-fixtures"

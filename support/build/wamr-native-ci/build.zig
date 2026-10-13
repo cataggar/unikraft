@@ -1,5 +1,6 @@
 const std = @import("std");
 const controller_target = @import("controller/target.zig");
+const authority_build = @import("authority.build.zig");
 
 fn handoffContracts(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, core: *std.Build.Module) *std.Build.Module {
     return b.createModule(.{
@@ -528,20 +529,46 @@ pub fn build(b: *std.Build) void {
     controller_step.dependOn(&handoff_contracts_run.step);
     controller_step.dependOn(&handoff_python_goldens.step);
     const authority_contracts = b.addTest(.{
+        .filters = b.option([]const []const u8, "authority-test-filter", "Select bounded authority fixtures") orelse &.{},
         .root_module = b.createModule(.{
-            .root_source_file = b.path("authority/tests.zig"),
+            .root_source_file = b.path("authority/library_tests.zig"),
             .target = b.graph.host,
             .optimize = optimize,
             .imports = &.{.{ .name = "hyperv_core", .module = host_core }},
         }),
     });
+    const authority_handoff = handoffModule(b, b.graph.host, optimize, host_core, host_controller);
+    const authority_fixture_root = b.pathJoin(&.{ handoff_fixture_root, "authority-contract-work" });
+    const authority_options = authority_build.testOptions(b, b.graph.host, optimize, authority_fixture_root);
+    const authority_options_module = authority_options.createModule();
+    authority_handoff.addImport("test_options", authority_options_module);
+    authority_contracts.root_module.addImport("test_options", authority_options_module);
+    authority_build.addImports(b, authority_contracts.root_module, b.graph.host, optimize, host_core, host_serial, host_validator, authority_handoff);
+    const authority_module = b.addModule("wamr_authority", .{
+        .root_source_file = b.path("authority/root.zig"),
+        .target = portable_target,
+        .optimize = optimize,
+    });
+    authority_build.addImports(b, authority_module, portable_target, optimize, portable_core, portable_serial, portable_validator, handoffModule(b, portable_target, optimize, portable_core, controller_module));
+    const authority_source_check = authority_build.sourceCheck(b, portable_target, optimize, authority_module);
     const authority_contracts_run = b.addRunArtifact(authority_contracts);
+    source_limits_run.step.dependOn(&authority_source_check.step);
+    authority_contracts_run.step.dependOn(&authority_source_check.step);
+    const authority_direct = b.addSystemCommand(&.{"/usr/bin/env"});
+    authority_direct.addFileArg(authority_contracts.getEmittedBin());
+    b.step("test-authority-direct", "Run authority fixtures with direct failure output").dependOn(&authority_direct.step);
     const authority_python_goldens = b.addSystemCommand(&.{ "python3", "-B" });
     authority_python_goldens.addFileArg(b.path("tests/test_authority_contract_goldens.py"));
     const authority_step = b.step("test-authority-contracts", "Run native/Python authority contract goldens");
     authority_step.dependOn(&authority_contracts_run.step);
+    authority_step.dependOn(&authority_source_check.step);
     authority_step.dependOn(&authority_python_goldens.step);
+    const authority_libraries_step = b.step("test-authority-libraries", "Run complete source-only authority library composition");
+    authority_libraries_step.dependOn(&authority_contracts_run.step);
+    authority_libraries_step.dependOn(&authority_source_check.step);
+    authority_libraries_step.dependOn(&authority_python_goldens.step);
     controller_step.dependOn(&authority_contracts_run.step);
+    controller_step.dependOn(&authority_source_check.step);
     controller_step.dependOn(&authority_python_goldens.step);
     // Parallel goldens must not create ancestors of recorded controller tools.
     const contract_fixture_dirs = b.addSystemCommand(&.{ "mkdir", "-p", "-m", "0700", "--" });
@@ -642,6 +669,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&handoff_contracts_run.step);
     test_step.dependOn(&handoff_python_goldens.step);
     test_step.dependOn(&authority_contracts_run.step);
+    test_step.dependOn(&authority_source_check.step);
     test_step.dependOn(&authority_python_goldens.step);
 }
 
