@@ -592,7 +592,7 @@ pub fn build(b: *std.Build) void {
     // Parallel goldens must not create ancestors of recorded controller tools.
     const contract_fixture_dirs = b.addSystemCommand(&.{ "mkdir", "-p", "-m", "0700", "--" });
     contract_fixture_dirs.has_side_effects = true;
-    for ([_][]const u8{ "tmp", "handoff-export-tests", "handoff-python-goldens", "authority-contract-work" }) |name|
+    for ([_][]const u8{ "tmp", "handoff-export-tests", "handoff-python-goldens", "authority-contract-work", "install-target-work" }) |name|
         contract_fixture_dirs.addArg(b.pathJoin(&.{ handoff_fixture_root, name }));
     for ([_]*std.Build.Step{
         &controller_run.step,
@@ -602,6 +602,7 @@ pub fn build(b: *std.Build) void {
         &handoff_python_goldens.step,
         &authority_contracts_run.step,
         &authority_python_goldens.step,
+        &install_target_run.step,
     }) |step| step.dependOn(&contract_fixture_dirs.step);
     const tests = b.addTest(.{ .root_module = root });
     const unit_tests = b.addRunArtifact(tests);
