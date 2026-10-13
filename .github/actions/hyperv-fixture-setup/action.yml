@@ -15,8 +15,15 @@ runs:
         -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources
         -o Dir::Etc::sourceparts=-
       )
-      sudo apt-get "${ubuntu_apt[@]}" update
-      sudo apt-get "${ubuntu_apt[@]}" install -y --no-install-recommends \
+      if [ "$(id -u)" -eq 0 ]; then
+        apt=(apt-get)
+        cleanup=(rm)
+      else
+        apt=(sudo apt-get)
+        cleanup=(sudo rm)
+      fi
+      "${apt[@]}" "${ubuntu_apt[@]}" update
+      "${apt[@]}" "${ubuntu_apt[@]}" install -y --no-install-recommends \
         bison \
         ca-certificates \
         curl \
@@ -33,7 +40,7 @@ runs:
         unzip \
         wget \
         xz-utils
-      sudo rm -rf /var/lib/apt/lists/*
+      "${cleanup[@]}" -rf /var/lib/apt/lists/*
 
   - name: Load configuration
     uses: ./.github/actions/ci-versions
