@@ -2560,7 +2560,9 @@ test "native publication historical profile authenticates actual #263 Git source
     for (controller.source_custody.previous_candidate_closure) |entry|
         try std.testing.expect(genuine_records.object.contains(entry.name));
     const source: controller.accepted_run.SourceIdentity = .{ .revision = revision, .tree = tree };
+    const before_queries = controller.source_custody.Fixture.gitQueries();
     const authenticated = try identity.verifyGitSource(a, io, source, options.repository_root, options.git_executable, genuine, null);
+    try std.testing.expect(controller.source_custody.Fixture.gitQueries() - before_queries <= 4);
     try std.testing.expectEqualStrings(genuine.object.get("content_closure_sha256").?.string, authenticated);
 
     var wrong_tree = source;
@@ -2576,6 +2578,63 @@ test "native publication historical profile authenticates actual #263 Git source
     _ = unsupported.object.swapRemove("support/build/wamr-native-ci/handoff/candidate.zig");
     try unsupported.object.put(a, "support/build/wamr-native-ci/handoff/actions_container.zig", .null);
     try std.testing.expectError(error.UnsupportedSupervisorSource, identity.validateSourceNames(unsupported));
+}
+
+test "native source batches preserve duplicate binary blobs across the eight MiB boundary" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{});
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "source-batches-{d}", .{std.os.linux.getpid()});
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("source batch fixture cleanup failed");
+    const root = try parent.openDir(io, name, .{});
+    defer root.close(io);
+    const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    const large = try a.alloc(u8, 4 * 1024 * 1024);
+    @memset(large, 0xa5);
+    large[11] = 0;
+    var source_map = std.json.Value{ .object = .empty };
+    var mapped = std.json.Value{ .object = .empty };
+    const closure = controller.source_custody.closure;
+    for (0..closure.len) |index| {
+        const entry = closure[closure.len - index - 1];
+        const bytes = if (index < 3) large else entry.content;
+        try writeRelativeFixtureFile(io, root, entry.name, bytes);
+        const metadata = try std.json.Stringify.valueAlloc(a, .{
+            .bytes = bytes.len,
+            .sha256 = std.fmt.bytesToHex(controller.records.fileIdentity(bytes), .lower),
+        }, .{});
+        try mapped.object.put(a, entry.name, try std.json.parseFromSliceLeaky(std.json.Value, a, metadata, .{ .parse_numbers = false }));
+    }
+    try source_map.object.put(a, "records", mapped);
+    try source_map.object.put(a, "content_closure_sha256", .{ .string = "0" ** 64 });
+    try fixtureGit(a, path, &.{ options.git_executable, "init", "-q" });
+    try fixtureGit(a, path, &.{ options.git_executable, "add", "-A" });
+    try fixtureGit(a, path, &.{ options.git_executable, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "source batches" });
+    const refs = try std.process.run(a, io, .{
+        .argv = &.{ options.git_executable, "-C", path, "rev-parse", "HEAD", "HEAD^{tree}" },
+        .stdout_limit = .limited(256),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, refs.term);
+    var lines = std.mem.tokenizeScalar(u8, refs.stdout, '\n');
+    const selected: controller.accepted_run.SourceIdentity = .{ .revision = lines.next().?, .tree = lines.next().? };
+    const identity = controller.import_supervisor_identity;
+    const before_queries = controller.source_custody.Fixture.gitQueries();
+    const authenticated = try identity.verifyGitSource(a, io, selected, path, options.git_executable, source_map, null);
+    try std.testing.expectEqualStrings("0" ** 64, authenticated);
+    try std.testing.expect(controller.source_custody.Fixture.gitQueries() - before_queries <= 5);
+    const digest = mapped.object.values()[0].object.getPtr("sha256").?;
+    const saved = digest.*;
+    digest.* = .{ .string = "f" ** 64 };
+    try std.testing.expectError(error.ImportIdentityChanged, identity.verifyGitSource(a, io, selected, path, options.git_executable, source_map, null));
+    digest.* = saved;
+    const size = mapped.object.values()[0].object.getPtr("bytes").?;
+    size.* = .{ .number_string = "8388609" };
+    try std.testing.expectError(error.InvalidImportIdentity, identity.verifyGitSource(a, io, selected, path, options.git_executable, source_map, null));
 }
 
 test "native executable boundary retains the prior candidate source-name contract" {

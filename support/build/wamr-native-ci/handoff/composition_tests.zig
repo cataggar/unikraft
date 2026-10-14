@@ -583,7 +583,10 @@ fn serialCases(work: Workspace, owner: *candidate.Finalized, stage: []const u8) 
         .{ .first = "first", .second = "unchanged", .err = error.EvidenceIncomplete },
         .{ .first = "overflow", .err = error.UnsafeSource },
         .{ .first = "first", .second = "overflow", .err = error.UnsafeSource },
-    }) |case| try std.testing.expectError(case.err, owner.result(try work.join(case.first), if (case.second) |second| try work.join(second) else null, null));
+    }) |case| {
+        std.debug.print("private serial refusal {s}/{s}: {s}\n", .{ case.first, case.second orelse "-", @errorName(case.err) });
+        try std.testing.expectError(case.err, owner.result(try work.join(case.first), if (case.second) |second| try work.join(second) else null, null));
+    }
     inline for (.{ .change_first, .replace_first, .change_second, .replace_second }) |fault| {
         const first = try std.fmt.allocPrint(work.a, "{s}-first", .{@tagName(fault)});
         const second = try std.fmt.allocPrint(work.a, "{s}-second", .{@tagName(fault)});

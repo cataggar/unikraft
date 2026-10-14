@@ -233,14 +233,12 @@ pub const PortableTools = struct {
     pub fn verifyWithSignal(self: *PortableTools, io: std.Io, repository: []const u8, git: []const u8, signal: ?*core.process.SignalCancellation) !void {
         if (signal) |active|
             if (active.flag().load(.acquire)) return error.Cancelled;
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
         try self.verifyExecutables(io);
-        if (self.producer_source) |proof| try proof.verify(self.allocator, io, repository, git, signal);
-        const after = try source.portableSource(self.allocator, io, repository, git);
-        defer {
-            self.allocator.free(after.revision);
-            self.allocator.free(after.tree);
-            self.allocator.free(after.custody.object_format);
-        }
+        if (self.producer_source) |proof| try proof.verify(a, io, repository, git, signal);
+        const after = try source.portableSource(a, io, repository, git);
         if (!self.before.same(after)) return error.SourceChanged;
         try self.verifyExecutables(io);
         if (signal) |active|

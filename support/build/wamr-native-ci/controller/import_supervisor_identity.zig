@@ -225,44 +225,74 @@ pub fn verifyGitSource(
     source_map: std.json.Value,
     signal: ?*core.process.SignalCancellation,
 ) ![]const u8 {
-    const a = allocator;
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
     const records_map = try get(source_map, "records");
     try validateSourceNames(records_map);
     try verifyGitIdentity(a, io, identity, repository, git, signal);
-    for (records_map.object.keys(), records_map.object.values()) |name, value| {
+    const Blob = struct { oid: []const u8 = "", size: usize, digest: []const u8 };
+    const blobs = try a.alloc(Blob, records_map.object.count());
+    var args: std.ArrayList([]const u8) = .empty;
+    try args.appendSlice(a, &.{ "--literal-pathspecs", "ls-tree", "-zl", identity.tree, "--" });
+    for (records_map.object.keys(), records_map.object.values(), blobs) |name, value, *blob| {
         try notCancelled(signal);
         try @import("custody_limits.zig").relative(name, 256, 8);
         const size = try number(try get(value, "bytes"));
         if (size == 0 or size > 8 * 1024 * 1024) return error.InvalidImportIdentity;
-        const digest = try text(try get(value, "sha256"));
-        const listing = try source.gitOutput(a, io, repository, git, &.{
-            "ls-tree", "-z", identity.tree, "--", name,
-        }, 512, null);
-        defer a.free(listing);
-        if (listing.len == 0 or listing[listing.len - 1] != 0 or
-            std.mem.indexOfScalar(u8, listing[0 .. listing.len - 1], 0) != null)
+        blob.* = .{ .size = @intCast(size), .digest = try text(try get(value, "sha256")) };
+        try args.append(a, name);
+    }
+    const listing = try source.gitOutput(a, io, repository, git, args.items, 512 * blobs.len, null);
+    if (listing.len == 0 or listing[listing.len - 1] != 0) return error.ImportSourceChanged;
+    var entries = std.mem.splitScalar(u8, listing[0 .. listing.len - 1], 0);
+    var found: usize = 0;
+    while (entries.next()) |entry| {
+        try notCancelled(signal);
+        const separator = std.mem.indexOfScalar(u8, entry, '\t') orelse return error.ImportSourceChanged;
+        const index = records_map.object.getIndex(entry[separator + 1 ..]) orelse return error.ImportSourceChanged;
+        const blob = &blobs[index];
+        if (blob.oid.len != 0) return error.ImportSourceChanged;
+        const header = entry[0..separator];
+        const prefix = "100644 blob ";
+        if (!std.mem.startsWith(u8, header, prefix) or header.len <= prefix.len + 41 or header[prefix.len + 40] != ' ')
             return error.ImportSourceChanged;
-        const separator = std.mem.indexOfScalar(u8, listing, '\t') orelse return error.ImportSourceChanged;
-        try same(listing[separator + 1 .. listing.len - 1], name);
-        const header = listing[0..separator];
-        if (!std.mem.startsWith(u8, header, "100644 blob ") or header.len != "100644 blob ".len + 40)
-            return error.ImportSourceChanged;
-        const oid = header["100644 blob ".len..];
+        const oid = header[prefix.len..][0..40];
         for (oid) |char|
             if (!std.ascii.isDigit(char) and !(char >= 'a' and char <= 'f'))
                 return error.ImportSourceChanged;
-        try notCancelled(signal);
-        const size_raw = try source.gitOutput(a, io, repository, git, &.{ "cat-file", "-s", oid }, 32, null);
-        defer a.free(size_raw);
-        if (size_raw.len < 2 or size_raw[size_raw.len - 1] != '\n' or
-            try std.fmt.parseInt(u64, size_raw[0 .. size_raw.len - 1], 10) != size)
+        const size = std.fmt.parseInt(u64, std.mem.trim(u8, header[prefix.len + 41 ..], " "), 10) catch
             return error.ImportSourceChanged;
+        if (size != blob.size) return error.ImportSourceChanged;
+        blob.oid = oid;
+        found += 1;
+    }
+    if (found != blobs.len) return error.ImportSourceChanged;
+
+    var first: usize = 0;
+    while (first < blobs.len) {
+        args.clearRetainingCapacity();
+        // Raw blob IDs avoid attributes/text conversion; bound every fresh read.
+        try args.appendSlice(a, &.{ "show", "--no-ext-diff", "--no-textconv", "--no-color", "--format=", "--no-patch" });
+        var end = first;
+        var bytes: usize = 0;
+        while (end < blobs.len and blobs[end].size <= 8 * 1024 * 1024 - bytes) : (end += 1) {
+            bytes += blobs[end].size;
+            try args.append(a, blobs[end].oid);
+        }
         try notCancelled(signal);
-        const blob = try source.gitOutput(a, io, repository, git, &.{ "cat-file", "blob", oid }, @intCast(size), null);
-        defer a.free(blob);
-        const hash = std.fmt.bytesToHex(records.fileIdentity(blob), .lower);
-        if (blob.len != size) return error.ImportSourceChanged;
-        try same(&hash, digest);
+        var batch = std.heap.ArenaAllocator.init(a);
+        defer batch.deinit();
+        const contents = try source.gitOutput(batch.allocator(), io, repository, git, args.items, bytes, null);
+        if (contents.len != bytes) return error.ImportSourceChanged;
+        var offset: usize = 0;
+        for (blobs[first..end]) |blob| {
+            try notCancelled(signal);
+            const hash = std.fmt.bytesToHex(records.fileIdentity(contents[offset..][0..blob.size]), .lower);
+            try same(&hash, blob.digest);
+            offset += blob.size;
+        }
+        first = end;
     }
     return text(try get(source_map, "content_closure_sha256"));
 }
