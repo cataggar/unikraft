@@ -132,6 +132,18 @@ jobs:
           mkdir -m 0700 -- "${ZIG_GLOBAL_CACHE_DIR}" "${ZIG_GLOBAL_CACHE_DIR}/tmp"
           restore_root="${RUNNER_TEMP}/wamr-controller-dependency-restore"
           bash .github/scripts/hyperv-native-zig-restore.sh "${restore_root}"
+          shadow_root="${RUNNER_TEMP}/wamr-handoff-shadow-fixtures"
+          mkdir -m 0700 -- "${shadow_root}"
+          for mode in Debug ReleaseSafe; do
+            zig build \
+              --build-file "${source_root}/support/build/wamr-native-ci/handoff/shadow/build.zig" \
+              --cache-dir "${RUNNER_TEMP}/wamr-handoff-shadow-${mode}-cache" \
+              --global-cache-dir "${ZIG_GLOBAL_CACHE_DIR}" \
+              --prefix "${RUNNER_TEMP}/wamr-handoff-shadow-${mode}-tools" \
+              -Dpublication-cli="${source_root}/support/build/wamr-native-ci/controller/cli.zig" \
+              -Dtest-root="${shadow_root}" -Doptimize="${mode}" \
+              -j2 test-shadow install
+          done
           ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
             zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
               --system "${restore_root}/zig-pkg" \
@@ -141,7 +153,7 @@ jobs:
           retain_source=true
 
       - name: Exercise native controller, custody limits, and package-boot fixtures in an isolated x86 worktree
-        timeout-minutes: 30
+        timeout-minutes: 60
         run: |
           set -euo pipefail
           source_root="${RUNNER_TEMP}/wamr-controller-fixtures"

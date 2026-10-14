@@ -101,6 +101,7 @@ const git_prefix = [_][]const u8{
 };
 
 pub const git_probe_deadline_ms = 120_000;
+var test_git_queries: usize = 0;
 
 pub fn gitOutput(
     allocator: std.mem.Allocator,
@@ -111,6 +112,7 @@ pub fn gitOutput(
     limit: usize,
     output: ?std.Io.File,
 ) ![]u8 {
+    if (@import("builtin").is_test) test_git_queries += 1;
     if (output != null and (limit == 0 or limit > limits.tracked_file))
         return error.InvalidGitBound;
     try process.initialize();
@@ -166,7 +168,15 @@ pub fn gitOutput(
         .limits = .{ .stdout_bytes = if (output != null) 1024 else @max(1, @min(limit, 8 * limits.mib)), .stderr_bytes = 4096 },
     });
     defer result.deinit(allocator);
-    try requireGitOutcome(result, limit);
+    requireGitOutcome(result, limit) catch |err| {
+        if (@import("builtin").is_test)
+            std.debug.print("Git refusal {s}: primary={s} cleanup={s} events={d}/{d} reaps={d} streams={s}/{s}\n", .{
+                @errorName(err),                @tagName(result.primary),       @tagName(result.cleanup),
+                result.primary_events,          result.cleanup_events,          result.reap_events,
+                @tagName(result.stdout_status), @tagName(result.stderr_status),
+            });
+        return err;
+    };
     if (bounded_fd) |fd| {
         const length = linux.lseek(fd, 0, 1);
         if (linux.errno(length) != .SUCCESS or length == 0 or length > limit)
@@ -704,6 +714,9 @@ pub fn sealWamr(allocator: std.mem.Allocator, io: std.Io, checkout: []const u8, 
 }
 
 pub const Fixture = if (@import("builtin").is_test) struct {
+    pub fn gitQueries() usize {
+        return test_git_queries;
+    }
     pub fn ignoredQueries(allocator: std.mem.Allocator, io: std.Io, repository: []const u8, git: []const u8) !usize {
         return (try ignoredState(allocator, io, repository, git, false)).tracked_queries;
     }

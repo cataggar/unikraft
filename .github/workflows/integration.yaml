@@ -789,7 +789,7 @@ jobs:
   zig-hyperv-runtime:
     name: zig-hyperv-runtime
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 120
     permissions:
       attestations: read
       contents: read

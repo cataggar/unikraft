@@ -178,6 +178,8 @@ pub fn build(b: *std.Build) void {
         "Existing absolute owner-only runtime directory for create-only controller install",
     ) orelse "";
     const controller_options = b.addOptions();
+    const CompositionGroup = enum { all, faults, retention };
+    controller_options.addOption(CompositionGroup, "handoff_composition_group", b.option(CompositionGroup, "handoff-composition-group", "Select a focused real-owner handoff composition group") orelse .all);
     controller_options.addOption([]const u8, "local_fixture_source", b.option([]const u8, "local-fixture-source", "Select one complete historical local fixture revision for diagnosis") orelse "");
     controller_options.addOption([]const u8, "repository_root", std.fs.path.resolve(b.allocator, &.{ b.graph.cache.cwd, b.build_root.path orelse ".", "../../.." }) catch
         @panic("cannot resolve source root"));
@@ -186,7 +188,7 @@ pub fn build(b: *std.Build) void {
     controller_options.addOption([]const u8, "python_executable", b.findProgram(&.{"python3"}, &.{}) catch @panic("Python required for handoff compatibility fixtures"));
     controller_options.addOptionPath("miz_package", b.dependency("public_image", .{ .target = target, .optimize = optimize }).builder.dependency("miz_source", .{ .target = target, .optimize = optimize }).path("."));
     controller_options.addOption([]const u8, "fixture_root", std.fs.path.resolve(b.allocator, &.{
-        b.graph.cache.cwd, b.cache_root.path orelse ".",
+        b.graph.cache.cwd, b.option([]const u8, "controller-fixture-root", "Existing absolute owner-private source fixture root") orelse b.cache_root.path orelse ".",
     }) catch @panic("cannot resolve private controller test root"));
     const host_core = b.createModule(.{
         .root_source_file = b.path("../../tools/hyperv/core.zig"),
@@ -368,6 +370,7 @@ pub fn build(b: *std.Build) void {
         ).step);
     const controller_tests = b.addTest(.{
         .filters = b.option([]const []const u8, "test-filter", "Select bounded controller fixtures") orelse &.{},
+        .test_runner = .{ .path = b.path("controller/composition_runner.zig"), .mode = .server },
         .use_llvm = if (optimize == .ReleaseSafe) true else null,
         .root_module = b.createModule(.{
             .root_source_file = b.path("controller/tests.zig"),
@@ -382,6 +385,26 @@ pub fn build(b: *std.Build) void {
         }),
     });
     controller_tests.root_module.addOptions("test_options", controller_options);
+    const composition_module = b.createModule(.{
+        .root_source_file = b.path("handoff/composition_tests.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "wamr_controller", .module = host_controller },
+            .{ .name = "hyperv_core", .module = host_core },
+            .{ .name = "wamr_handoff", .module = handoffModule(b, b.graph.host, optimize, host_core, host_controller) },
+        },
+    });
+    const controller_test_options = controller_tests.root_module.import_table.get("test_options").?;
+    composition_module.addImport("test_options", controller_test_options);
+    controller_tests.root_module.addImport("handoff_composition_tests", composition_module);
+    const default_test_runner = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = b.pathJoin(&.{ b.graph.zig_lib_directory.path.?, "compiler/test_runner.zig" }) },
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    controller_tests.root_module.addImport("default_test_runner", default_test_runner);
+    controller_tests.root_module.addImport("wamr_handoff", composition_module.import_table.get("wamr_handoff").?);
     controller_options.addOptionPath("host_controller_cli", host_cli.getEmittedBin());
     controller_options.addOptionPath("host_import_controller_cli", host_import_cli.getEmittedBin());
     controller_options.addOptionPath("import_validator", host_direct.getEmittedBin());
@@ -442,6 +465,32 @@ pub fn build(b: *std.Build) void {
     const local_worker_options = b.addOptions();
     local_worker_options.addOptionPath("executable", local_worker.getEmittedBin());
     controller_tests.root_module.addOptions("local_worker_options", local_worker_options);
+    const composition_tests = b.addTest(.{
+        .filters = &.{"handoff composition"},
+        .test_runner = .{ .path = b.path("controller/composition_runner.zig"), .mode = .server },
+        .use_llvm = if (optimize == .ReleaseSafe) true else null,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("controller/tests.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .strip = true,
+            .imports = &.{
+                .{ .name = "wamr_controller", .module = host_controller },
+                .{ .name = "hyperv_core", .module = host_core },
+                .{ .name = "handoff_composition_tests", .module = composition_module },
+                .{ .name = "wamr_handoff", .module = composition_module.import_table.get("wamr_handoff").? },
+                .{ .name = "default_test_runner", .module = default_test_runner },
+            },
+        }),
+    });
+    composition_tests.root_module.addImport("test_options", controller_test_options);
+    composition_tests.root_module.addOptions("local_worker_options", local_worker_options);
+    b.step("build-handoff-composition", "Build the exact retained native composition fixture runner")
+        .dependOn(&composition_tests.step);
+    const composition_run = b.addSystemCommand(&.{"/usr/bin/env"});
+    composition_run.addFileArg(composition_tests.getEmittedBin());
+    b.step("test-handoff-composition", "Run retained native import/candidate composition faults without live qualification")
+        .dependOn(&composition_run.step);
     const controller_run = b.addRunArtifact(controller_tests);
     const controller_direct = b.addSystemCommand(&.{"/usr/bin/env"});
     controller_direct.addFileArg(controller_tests.getEmittedBin());

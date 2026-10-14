@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 const std = @import("std");
+const builtin = @import("builtin");
 const core = @import("hyperv_core");
 const files = core.private_files;
 const controller = @import("wamr_controller");
@@ -269,6 +270,19 @@ pub const ImportedProduct = struct {
 };
 
 pub fn importBundle(inv: ImportInvocation) Outcome(*ImportedProduct) {
+    return importWithFaults(inv, .{});
+}
+
+const ImportFaults = struct {
+    materialization_collision: bool = false,
+    copy: copy.TestFault = .none,
+    publication: ?files.TestFault = null,
+    publication_collision: bool = false,
+    native_command_refusal: bool = false,
+    change_before_final_revalidation: bool = false,
+};
+
+fn importWithFaults(inv: ImportInvocation, faults: ImportFaults) Outcome(*ImportedProduct) {
     var scoped: ?core.process.SignalCancellation = null;
     defer if (scoped) |*signal| signal.deinit();
     var actual = inv;
@@ -280,7 +294,7 @@ pub fn importBundle(inv: ImportInvocation) Outcome(*ImportedProduct) {
     const owner = inv.allocator.create(ImportedProduct) catch |err|
         return .{ .refused = .{ .phase = .inputs, .err = err } };
     owner.* = .{ .allocator = inv.allocator, .io = inv.io, .arena = std.heap.ArenaAllocator.init(inv.allocator) };
-    importRun(owner, actual) catch |err| {
+    importRun(owner, actual, faults) catch |err| {
         const diagnostic: Diagnostic = .{ .phase = owner.phase, .err = err, .publication = owner.publication };
         const reserved = owner.reserved;
         owner.deinit();
@@ -289,7 +303,7 @@ pub fn importBundle(inv: ImportInvocation) Outcome(*ImportedProduct) {
     return .{ .success = owner };
 }
 
-fn importRun(owner: *ImportedProduct, inv: ImportInvocation) !void {
+fn importRun(owner: *ImportedProduct, inv: ImportInvocation, faults: ImportFaults) !void {
     const a = owner.arena.allocator();
     const cancel = if (inv.signal) |signal| signal.flag() else null;
     try copy.checkCancellation(cancel);
@@ -335,6 +349,10 @@ fn importRun(owner: *ImportedProduct, inv: ImportInvocation) !void {
     try owner.directory.?.dir.createDir(inv.io, "private", .fromMode(0o700));
     const stage_path = try std.fs.path.join(a, &.{ owner.output, "private/materialized" });
     owner.phase = .materialized;
+    if (builtin.is_test and faults.materialization_collision) {
+        try owner.directory.?.dir.createDir(inv.io, "private/materialized", .fromMode(0o700));
+        try writeImmutable(inv.io, owner.directory.?.dir, "private/materialized/foreign", "foreign materialization\n");
+    }
     if (owner.download) |*download|
         owner.downloaded = try download.materialize(inv.io, stage_path, cancel)
     else
@@ -342,13 +360,14 @@ fn importRun(owner: *ImportedProduct, inv: ImportInvocation) !void {
     try owner.verifyInputs(inv.signal);
     owner.phase = .copied;
     var budget: copy.Budget = .{};
-    for (owner.metadata().selected) |member| {
+    for (owner.metadata().selected, 0..) |member, index| {
         const source_path = try std.fs.path.join(a, &.{ stage_path, member.name });
         var source = try files.RetainedFile.open(inv.io, source_path, .private);
         defer source.close(inv.io);
         const copied = try copy.copyRetained(inv.allocator, inv.io, &source, owner.directory.?.dir, owner.output, member.name, member.limit, &budget, .{
             .scan = .public_bundle,
             .cancel = cancel,
+            .fault = if (builtin.is_test and index == 0) faults.copy else .none,
         });
         defer inv.allocator.free(copied.path);
         if (copied.size != member.size or !std.mem.eql(u8, &copied.sha256, &std.fmt.bytesToHex(member.sha256, .lower)))
@@ -386,20 +405,39 @@ fn importRun(owner: *ImportedProduct, inv: ImportInvocation) !void {
     }
     try owner.verifyInputs(inv.signal);
     owner.phase = .native_validation;
-    owner.native = try validation.runImportedReader(
-        inv.allocator,
-        inv.io,
-        &owner.stage().accepted,
-        owner.repository,
-        &owner.candidate.?.file,
-        try std.fs.path.join(a, &.{ owner.output, "private/native-validation" }),
-        inv.tools,
-        inv.signal,
-    );
+    const native_output = try std.fs.path.join(a, &.{ owner.output, "private/native-validation" });
+    owner.native = if (builtin.is_test and faults.native_command_refusal)
+        try validation.Test.runImportedReader(
+            inv.allocator,
+            inv.io,
+            &owner.stage().accepted,
+            owner.repository,
+            &owner.candidate.?.file,
+            native_output,
+            inv.tools,
+            inv.signal,
+            .change_candidate_before_command,
+        )
+    else
+        try validation.runImportedReader(
+            inv.allocator,
+            inv.io,
+            &owner.stage().accepted,
+            owner.repository,
+            &owner.candidate.?.file,
+            native_output,
+            inv.tools,
+            inv.signal,
+        );
     try owner.verifyInputs(inv.signal);
     owner.phase = .publication;
     try copy.checkCancellation(cancel);
-    const commit = try owner.lock.?.createImmutable(inv.io, "bundle.json", candidate);
+    if (builtin.is_test and faults.publication_collision)
+        try writeImmutable(inv.io, owner.directory.?.dir, "bundle.json", "foreign final bundle\n");
+    const commit = if (builtin.is_test and faults.publication != null)
+        try owner.lock.?.createImmutableFault(inv.io, "bundle.json", candidate, faults.publication.?)
+    else
+        try owner.lock.?.createImmutable(inv.io, "bundle.json", candidate);
     owner.publication = commit.status;
     if (commit.status != .durable) return error.AmbiguousWrite;
     owner.phase = .final_revalidation;
@@ -414,8 +452,20 @@ fn importRun(owner: *ImportedProduct, inv: ImportInvocation) !void {
         inv.tools,
         inv.signal,
     );
+    if (builtin.is_test and faults.change_before_final_revalidation) {
+        const changed = try owner.directory.?.dir.openFile(inv.io, "bundle.json", .{ .mode = .read_write, .follow_symlinks = false });
+        defer changed.close(inv.io);
+        try changed.writePositionalAll(inv.io, "!", 0);
+        try changed.sync(inv.io);
+    }
     try owner.revalidate(inv.signal);
 }
+
+pub const Test = if (builtin.is_test) struct {
+    pub fn importBundle(inv: ImportInvocation, faults: ImportFaults) Outcome(*ImportedProduct) {
+        return importWithFaults(inv, faults);
+    }
+} else struct {};
 
 fn inside(path: []const u8, root: []const u8) bool {
     return std.mem.eql(u8, path, root) or
