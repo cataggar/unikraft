@@ -3283,13 +3283,25 @@ class HypervWorkflowTest(unittest.TestCase):
                 "native-preparation-and-authority-binding-required",
             )),
         )
+        trusted_container = (
+            "    runs-on: ${{ (github.event_name != 'pull_request' || "
+            "github.event.pull_request.head.repo.full_name == "
+            "github.repository) && fromJSON('[\"self-hosted\",\"Linux\","
+            "\"X64\",\"ubuntu2604\"]') || 'ubuntu-24.04' }}\n"
+            "    container:\n"
+            "      image: ubuntu:24.04\n"
+        )
         for lane, targets in inventory:
             job = workflow.split(f"  zig-hyperv-{lane}:\n", 1)[1].split(
                 "\n  zig-hyperv", 1
             )[0]
             header = job.split("    steps:\n", 1)[0]
             with self.subTest(lane=lane):
-                self.assertIn("    runs-on: ubuntu-24.04\n", header)
+                if lane == "runtime":
+                    self.assertIn("    runs-on: ubuntu-24.04\n", header)
+                    self.assertNotIn("    container:", header)
+                else:
+                    self.assertIn(trusted_container, header)
                 self.assertIn(
                     "    permissions:\n"
                     "      attestations: read\n"
@@ -3905,7 +3917,18 @@ class HypervWorkflowTest(unittest.TestCase):
         self.assertTrue(all(not line or line.startswith(" " * 6)
                             for line in lines))
         fixture_script = "\n".join(line[6:] for line in lines)
-        for script in (script, fixture_script):
+        self.assertIn(
+            'if [ "$(id -u)" -eq 0 ]; then\n'
+            "  apt=(apt-get)\n"
+            "  cleanup=(rm)\n"
+            "else\n"
+            "  apt=(sudo apt-get)\n"
+            "  cleanup=(sudo rm)\n"
+            "fi\n",
+            fixture_script,
+        )
+        for script, apt in ((script, "sudo apt-get"),
+                            (fixture_script, '"${apt[@]}"')):
             self.assertIn(
                 "test -s /etc/apt/sources.list.d/ubuntu.sources", script
             )
@@ -3914,9 +3937,9 @@ class HypervWorkflowTest(unittest.TestCase):
                 script,
             )
             self.assertIn("-o Dir::Etc::sourceparts=-", script)
-            self.assertIn('sudo apt-get "${ubuntu_apt[@]}" update', script)
+            self.assertIn(apt + ' "${ubuntu_apt[@]}" update', script)
             self.assertIn(
-                'sudo apt-get "${ubuntu_apt[@]}" install -y '
+                apt + ' "${ubuntu_apt[@]}" install -y '
                 "--no-install-recommends", script,
             )
             for bypass in ("--allow-unauthenticated", "AllowInsecureRepositories",
