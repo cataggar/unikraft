@@ -20,20 +20,17 @@ SPEC = importlib.util.spec_from_file_location(
     "wamr_v2_fixture", Path(__file__).with_name("v2_fixture.py"))
 fixture = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(fixture)
-HANDOFF_SPEC = importlib.util.spec_from_file_location(
-    "wamr_v2_handoff",
-    REPO / "support/build/wamr-native-ci/handoff.py")
-handoff = importlib.util.module_from_spec(HANDOFF_SPEC)
-HANDOFF_SPEC.loader.exec_module(handoff)
-PUBLIC_SPEC = importlib.util.spec_from_file_location(
-    "wamr_v2_public_bundle",
-    REPO / "support/build/wamr-native-ci/public_bundle.py")
-public_bundle = importlib.util.module_from_spec(PUBLIC_SPEC)
-PUBLIC_SPEC.loader.exec_module(public_bundle)
+OWNER_SPEC = importlib.util.spec_from_file_location(
+    "historical_owner", Path(__file__).with_name("historical_owner.py"))
+historical_owner = importlib.util.module_from_spec(OWNER_SPEC)
+OWNER_SPEC.loader.exec_module(historical_owner)
+handoff, public_bundle, owner_supervisor = historical_owner.load()
 TOOLS = Path(os.environ["WAMR_DIRECT_TOOLS"]).resolve(strict=True)
 VALIDATOR = TOOLS / "uk-wamr-direct-validate"
 PACKAGE = Path(os.environ["WAMR_CI_PACKAGE"]).resolve(strict=True)
 SUPERVISOR = Path(os.environ["WAMR_CI_SUPERVISOR"]).resolve(strict=True)
+if SUPERVISOR != owner_supervisor:
+    raise ValueError("historical fixture supervisor selection differs")
 
 
 def remove_sealed_tree(path):
@@ -307,7 +304,7 @@ class LineageV2(unittest.TestCase):
         transport_path = self.write_transport()
         output = self.root / "candidate.json"
         completed = subprocess.run([
-            "python3", REPO / "support/build/wamr-native-ci/handoff.py",
+            "python3", handoff.__file__,
             "candidate", "--bundle", self.root / "bundle.json",
             "--output", output,
         ], env={"PYTHONDONTWRITEBYTECODE": "1"},
@@ -700,7 +697,7 @@ class LineageV2(unittest.TestCase):
             "--output", paths["admission"],
             *tool_args,
         ])
-        script = REPO / "support/build/wamr-native-ci/handoff.py"
+        script = handoff.__file__
         for command in commands:
             completed = subprocess.run(
                 [sys.executable, script, *map(str, command)],
@@ -1296,7 +1293,7 @@ class LineageV2(unittest.TestCase):
         self.assertFalse((self.root / "omitted-attempt").exists())
         ambient_admission = self.root / "ambient-admission.json"
         ambient = subprocess.run([
-            "python3", REPO / "support/build/wamr-native-ci/handoff.py",
+            "python3", handoff.__file__,
             "admit", "--plan", paths["plan"],
             "--authorization", paths["authorization"],
             "--output", ambient_admission,

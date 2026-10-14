@@ -178,7 +178,11 @@ const Fixture = struct {
         const directory = try controller.layout.runtime(io, runtime);
         defer directory.close(io);
         const v2 = std.mem.eql(u8, revision, "e98623f780fa23d05b5797004e4b88160404eb1b");
-        var accepted = try open(a, io, &directory, runtime, repository);
+        var accepted = open(a, io, &directory, runtime, repository) catch |err| {
+            std.debug.print("complete local open {s}: {s}\n", .{ revision, @errorName(err) });
+            try diagnoseInputs(a, io, runtime);
+            return err;
+        };
         defer accepted.deinit();
         {
             try std.testing.expectEqual(controller.accepted_run.EvidenceContext.local_runtime, accepted.context);

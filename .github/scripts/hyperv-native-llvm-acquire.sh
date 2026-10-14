@@ -22,6 +22,9 @@ spec=cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
 printf -v lookup_error '%s%s' \
   'error: GitHub attestation lookup failed for ' \
   "'cataggar/llvm-project': UnexpectedHttpStatus"
+printf -v release_error '%s%s' \
+  'error: release not found for ' \
+  'cataggar/llvm-project@llvm-zig-22.1.8'
 for attempt in 1 2 3; do
   stage="${evidence}/attempt-${attempt}"
   mkdir -m 700 -- "${stage}"
@@ -49,10 +52,14 @@ for attempt in 1 2 3; do
   printf 'Native LLVM acquisition attempt %d/3 failed (exit %d).\n' \
     "${attempt}" "${status}" >&2
   cat -- "${stage}/download.log" >&2
-  # ghr 0.8.0 does not expose the lookup's HTTP status. Never retry a
-  # cryptographic rejection or extraction failure as a lookup failure.
+  # ghr 0.8.0 also calls non-JSON API errors "release not found".
+  # Retry only opaque lookup errors, never explicit API or verification errors.
   if [[ "${status}" != 2 || "${attempt}" == 3 ]] ||
-      ! grep -Fxq -- "${lookup_error}" "${stage}/download.log"; then
+      ! grep -Fxq -e "${lookup_error}" -e "${release_error}" \
+        -- "${stage}/download.log" ||
+      grep -E '(^|: )error:' "${stage}/download.log" |
+        grep -Fvx -e "${lookup_error}" -e "${release_error}" \
+          > "${stage}/nonlookup-errors.log"; then
     exit "${status}"
   fi
   sleep "$((attempt * 5))"

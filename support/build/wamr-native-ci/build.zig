@@ -200,6 +200,25 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     });
+    for ([_]bool{ false, true }) |native_owner| {
+        const supervisor_options = b.addOptions();
+        supervisor_options.addOption(bool, "native_source_owner", native_owner);
+        supervisor_options.addOption([]const u8, "source_closure_sha256", "a" ** 64);
+        const supervisor = b.addExecutable(.{
+            .name = if (native_owner) "wamr-ci-native-supervisor-host-test" else "wamr-ci-historical-supervisor-host-test",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("supervisor.zig"),
+                .target = b.graph.host,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "hyperv_core", .module = host_core },
+                    .{ .name = "build_options", .module = supervisor_options.createModule() },
+                    .{ .name = "supervisor_source_closure", .module = host_closure },
+                },
+            }),
+        });
+        controller_options.addOptionPath(if (native_owner) "native_standalone_supervisor" else "historical_standalone_supervisor", supervisor.getEmittedBin());
+    }
     const host_serial = b.createModule(.{
         .root_source_file = b.path("../../tools/hyperv/local_boot/serial.zig"),
         .target = b.graph.host,
@@ -573,7 +592,7 @@ pub fn build(b: *std.Build) void {
     // Parallel goldens must not create ancestors of recorded controller tools.
     const contract_fixture_dirs = b.addSystemCommand(&.{ "mkdir", "-p", "-m", "0700", "--" });
     contract_fixture_dirs.has_side_effects = true;
-    for ([_][]const u8{ "tmp", "handoff-export-tests", "handoff-python-goldens", "authority-contract-work" }) |name|
+    for ([_][]const u8{ "tmp", "handoff-export-tests", "handoff-python-goldens", "authority-contract-work", "install-target-work" }) |name|
         contract_fixture_dirs.addArg(b.pathJoin(&.{ handoff_fixture_root, name }));
     for ([_]*std.Build.Step{
         &controller_run.step,
@@ -583,6 +602,7 @@ pub fn build(b: *std.Build) void {
         &handoff_python_goldens.step,
         &authority_contracts_run.step,
         &authority_python_goldens.step,
+        &install_target_run.step,
     }) |step| step.dependOn(&contract_fixture_dirs.step);
     const tests = b.addTest(.{ .root_module = root });
     const unit_tests = b.addRunArtifact(tests);
