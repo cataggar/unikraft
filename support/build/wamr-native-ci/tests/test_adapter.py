@@ -114,6 +114,15 @@ if name == "ghr":
         (stage / "unverified").write_text("must never be published")
         sys.stderr.write("error: GitHub attestation lookup failed for 'cataggar/llvm-project': UnexpectedHttpStatus\\n")
         raise SystemExit(2)
+    if (scenario in ("release-always", "release-404", "release-mixed")
+            or scenario == "release-twice" and attempt < 3):
+        (stage / "unverified").write_text("must never be published")
+        if scenario == "release-404":
+            sys.stderr.write("error: GitHub API HTTP 404: Not Found\\n")
+        sys.stderr.write("error: release not found for cataggar/llvm-project@llvm-zig-22.1.8\\n")
+        if scenario == "release-mixed":
+            sys.stderr.write("error: checksum rejected\\n")
+        raise SystemExit(2)
     if scenario in ("checksum", "signature", "extraction"):
         sys.stderr.write("error: " + scenario + " rejected\\n")
         raise SystemExit(1 if scenario == "extraction" else 3)
@@ -181,28 +190,35 @@ sys.stdout.write('{"verified_read":true}\\n')
                 ] if self.calls.exists() else []
 
     def test_llvm_lookup_retries_only_publish_the_verified_attempt(self):
-        destination = self.root / "llvm"
-        result = self.invoke(
-            "hyperv-native-llvm-acquire.sh", "lookup-twice", destination)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(self.recorded()), 3)
-        self.assertTrue(all(call["authenticated"] for call in self.recorded()))
-        self.assertTrue((destination / "bin/llvm-readelf").is_file())
-        self.assertFalse((destination / "unverified").exists())
-        evidence = self.root / "llvm.acquisition"
-        for attempt in (1, 2):
-            self.assertTrue(
-                (evidence / f"attempt-{attempt}/extracted/unverified").is_file())
-            self.assertIn("UnexpectedHttpStatus",
-                          (evidence / f"attempt-{attempt}/download.log").read_text())
-        self.assertEqual(len({call["argv"][call["argv"].index("--extract") + 1]
-                              for call in self.recorded()}), 3)
+        for scenario, diagnostic in (
+                ("lookup-twice", "UnexpectedHttpStatus"),
+                ("release-twice", "release not found")):
+            with self.subTest(scenario=scenario):
+                destination = self.root / scenario
+                result = self.invoke(
+                    "hyperv-native-llvm-acquire.sh", scenario, destination)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(self.recorded()), 3)
+                self.assertTrue(all(
+                    call["authenticated"] for call in self.recorded()))
+                self.assertTrue((destination / "bin/llvm-readelf").is_file())
+                self.assertFalse((destination / "unverified").exists())
+                evidence = self.root / f"{scenario}.acquisition"
+                for attempt in (1, 2):
+                    stage = evidence / f"attempt-{attempt}"
+                    self.assertTrue((stage / "extracted/unverified").is_file())
+                    self.assertIn(
+                        diagnostic, (stage / "download.log").read_text())
+                self.assertEqual(len({
+                    call["argv"][call["argv"].index("--extract") + 1]
+                    for call in self.recorded()}), 3)
 
     def test_llvm_exhaustion_and_verification_failures_never_publish(self):
         for scenario, status, attempts in (
                 ("lookup-always", 2, 3), ("checksum", 3, 1),
                 ("signature", 3, 1), ("extraction", 1, 1),
-                ("missing-tools", 1, 1)):
+                ("missing-tools", 1, 1), ("release-always", 2, 3),
+                ("release-404", 2, 1), ("release-mixed", 2, 1)):
             with self.subTest(scenario=scenario):
                 destination = self.root / scenario
                 result = self.invoke(
