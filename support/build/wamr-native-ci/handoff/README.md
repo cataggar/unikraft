@@ -128,11 +128,11 @@ digest; `DownloadSelection` records the exact Actions selection. Both artifact
 IDs, container digests and source/run contexts must agree, and the archive
 verifier independently checks the inner digest and context. `ArtifactId`,
 `ContainerDigest` and `InnerDigest` are distinct types: the container SHA is
-**not** the inner SHA. The engine does not download anything, hash container
-bytes, or authenticate remote metadata from filenames or receipt equality.
-The existing exact `artifact-ids` `download-artifact` action remains the network
-owner. Callers must provide trusted upload metadata, not data discovered beside
-the downloaded ZIP.
+**not** the inner SHA. `Download` alone does not hash container bytes or authenticate remote metadata
+from filenames or receipt equality. Callers must provide independently trusted
+upload metadata, not data discovered beside the downloaded ZIP. An exact-ID
+`download-artifact` extraction does not retain the raw Actions container needed
+by the composed importer.
 
 The owner copies its context and retains both the directory snapshot and genuine
 `Archive`. Each revalidation rechecks exact membership, physical identities and
@@ -154,7 +154,75 @@ these library-only owners.
 There is no synthetic identity wrapper, fallback, arbitrary command runner,
 network process or authority admission API here.
 
+`public_transport.publication.sealUpload` supplies the separate privileged
+publication boundary: initial-namespace root, explicit source UID/GID and upload
+GID, one create-only root-owned `0550` directory and `0440` single-link file.
+Its scoped source descriptor walk accepts only root and the expressly named
+source owner; it does not weaken global `private_files` policies. Success owns
+retained source, destination and ancestor descriptors, independently rehashes
+both files and rechecks exact destination membership. Failures preserve partial
+evidence and report uncertain versus durable publication. `sealUploadForTest`
+simulates only the destination root identity in fresh fixture roots and is
+unavailable to production callers.
+
+`public_transport.actions_container.retainDownload` retains a private raw
+container descriptor and creates an independently verified one-file `Download`.
+Its separate outer ZIP32 profile permits stored/raw-deflate data and optional
+signed 16-byte ZIP32 descriptors, Unix/DOS creator systems, version-needed
+10/20, and only descriptor/UTF-8 flags. It rejects names other than the fixed
+ASCII filename, nonregular member attributes, extras, duplicate members,
+encryption, comments, ZIP64, unsupported codecs, bad headers/CRC/descriptors,
+truncation and trailing compressed data. Bounds are 512 MiB for the inner ZIP
+and 512 MiB + 128 KiB for the raw container; decode and publication check
+cancellation in bounded chunks. No network/authentication library is added.
+Destroy borrowed materialized consumers before this owner; its raw bytes and
+one-file output remain on disk after `deinit`.
+
+The CLI's expected and selected artifact/container/source/run arguments are
+independent mandatory inputs. Compose the raw-retention command's output and
+original container path with `import-public-source-download`; no local Python
+extraction is required by that composition. No live caller is switched here.
+
 ## Qualification
+
+The bounded source-only `test-handoff-composition` selector uses the existing
+complete historical inner-stage fixture and local v2 private-export fixture.
+It reconstructs real `ImportedProduct` and `PrivateBundle` owners and executes
+the genuine supervised native validator; it does not run guests, KVM, remote
+parity or an accepted public CI producer:
+
+```sh
+zig build --build-file support/build/wamr-native-ci/build.zig \
+  test-handoff-composition --system /absolute/system \
+  --cache-dir /absolute/private-cache --global-cache-dir /absolute/global \
+  -Dcontroller-fixture-root=/absolute/private-fixtures \
+  -Doptimize=Debug -j1
+```
+
+Precreate the owner-private fixture/cache roots and their ancestors before
+capturing inputs; avoid a live controller/session metadata directory as a fixture
+ancestor. The local fixture uses synthetic guest artifacts and real owner
+constructors, not guest or hardware qualification. Its current reader checkout
+is separate from the historical producer, whose genuine Git objects are retained.
+Repeat with `ReleaseSafe`. Fixed test-only faults exercise materialization and
+copy failures, wrong-role native validator identity, genuine supervised-command
+refusal with retained records/logs, immutable final collisions,
+uncertain/visible-not-durable publication and final retained-owner revalidation.
+Candidate cases cover admission-first collisions/sync, final collision after the
+sidecar, cancellation between publications, retained source/parent/executable
+changes, and serial incomplete/prefix/padding/overflow/replacement boundaries.
+A fully rehashed historical ZIP payload passes envelope verification but fails
+native evidence acceptance. A copied real private v2 owner also refuses an
+image-lineage substitution after every changed record, artifact, result,
+manifest descriptor and lineage reference has been rehashed. Refusals retain input/foreign bytes and private
+state; the CLI collision case also checks its original status and empty stdout.
+The local v2 fixture receipt binds actual fixture ZIP/container hashes, but
+confers neither a `Download` owner nor public producer acceptance. Genuine
+current public import/transport/lineage qualification remains a separate gate.
+The default runs both groups. `-Dhandoff-composition-group=faults` selects
+import/candidate publication and serial boundaries; `retention` selects
+fully rehashed private lineage, CLI collision and changed retained inputs.
+Both use the same real owner fixtures, and neither changes native admission.
 
 Use an existing external system dependency forest, caches, temporary root and
 private fixture root; hold the fleet qualification lease during sensitive tests:
@@ -190,6 +258,12 @@ ID/context/digest mismatches, links/extras, actual sparse-file size limits,
 same-byte replacement, cancellation, create-only collisions and partial/sync
 durability. Only explicit test faults replace syscall failures; genuine
 acceptance is not replaced with a test-only trusted owner.
+The same focused selector tests source-only sealing and raw-container adapters:
+exact bytes/digests/modes, privilege refusal, independent selection, stored and
+level-zero deflate/descriptor handling, path/type/codec refusals, live mutation,
+replacement, hard links, cancellation, collisions and uncertain sync.
+The optional genuine transport test remains skipped without authorized genuine
+inputs; a passing source-only run is not privileged or product acceptance.
 
 Golden/fault packing substitutes only the expensive producer CI/private-tool
 process boundary with an explicit test-only API. Genuine repacking additionally
@@ -200,3 +274,214 @@ real supervised validation and durable final publication. See the controller
 README for the complete CLI and ownership/trust boundaries. Protected product
 acceptance, production workflow/local caller cutover and Python removal remain
 separate milestones.
+
+## Test-only stagewise shadow witness (#187)
+
+`tests/handoff_shadow.py` is a bounded driver, not a production caller,
+qualification service, network downloader, or authority consumer. It executes
+the actual native commands and unmodified Python `export`, `verify_archive`,
+`import_bundle`, and `candidate_plan` implementations in separate processes.
+There are no accepted-owner stubs or Python fallback after native refusal.
+`handoff/shadow_compare.zig` performs the canonical-record comparison using
+the shared native handoff contracts and the existing typed tiny result.
+The Python process driver/filesystem witness remains test-only until its
+separate native coverage/deletion gate; production Python is unchanged.
+
+### Source-only validation
+
+The independent build avoids the production package's dependency restoration
+and does not modify root/authority builds or install production commands.
+Use Zig 0.16, `-j1`, existing owner-private external scratch/caches, and both
+Debug and ReleaseSafe:
+
+```sh
+SHADOW=/absolute/owner-private/shadow
+zig build --build-file \
+  support/build/wamr-native-ci/handoff/shadow/build.zig \
+  --cache-dir "$SHADOW/cache-debug" \
+  --global-cache-dir "$SHADOW/global-debug" \
+  --prefix "$SHADOW/tools-debug" -Dtest-root="$SHADOW/scratch" \
+  -Doptimize=Debug -j1 test-shadow install
+zig build --build-file \
+  support/build/wamr-native-ci/handoff/shadow/build.zig \
+  --cache-dir "$SHADOW/cache-safe" \
+  --global-cache-dir "$SHADOW/global-safe" \
+  --prefix "$SHADOW/tools-safe" -Dtest-root="$SHADOW/scratch" \
+  -Doptimize=ReleaseSafe -j1 test-shadow install
+```
+
+`test-shadow` runs **synthetic comparator/driver tests only**, including
+dependent-commitment, source/run/attempt/transport, authority, selected-payload,
+extra-member, command timeout/status/custody, exited-parent descendant cleanup,
+distinct producer/reader tool bindings, partial-report and scope refusals.
+It neither needs nor runs private producer resources, and a passing result
+does not count missing/skipped genuine tests as parity.
+
+To exercise the actual integrated publication parser, additionally pass
+`-Dpublication-cli=/absolute/actual/controller/cli.zig` to both builds.
+The parse-only executable receives the driver's real constructed import argv;
+it opens no runtime and executes no product. It checks separate expected and
+selected source/tree/run/attempt values and refuses missing selection flags.
+On a source-only branch preceding publication commit `c534ea6d`, retain its
+exact Git-object bytes in an owner-private external path:
+
+```sh
+git show c534ea6d:support/build/wamr-native-ci/controller/cli.zig \
+  > "$SHADOW/cli-c534ea6d.zig"
+test "$(git hash-object "$SHADOW/cli-c534ea6d.zig")" = \
+  "$(git rev-parse \
+    c534ea6d:support/build/wamr-native-ci/controller/cli.zig)"
+# Add -Dpublication-cli="$SHADOW/cli-c534ea6d.zig" to both build commands.
+```
+
+### Required externally qualified inputs (not provisioned by this driver)
+
+The only live entry point is:
+
+```sh
+python3 -B support/build/wamr-native-ci/tests/handoff_shadow.py \
+  run-stagewise --inputs /absolute/approved-inputs.json \
+  --output /absolute/fresh-external-shadow
+```
+
+This invocation is blocked until an owner has independently qualified and
+immutably staged the **complete** genuine native-produced v2 run. Source-only
+PR tests do not run it, request private inputs, or supply synthetic replacements.
+The canonical UTF-8 sorted-key compact-LF input document has exactly:
+
+* `schema: "uk.wamr.handoff-shadow-inputs"`, integer `version: 1`;
+ `context`: the frozen public context's six exact fields (`repository`,
+  `run_id`, `run_attempt`, `source_revision`, `source_tree`, `wamr_revision`);
+* canonical absolute `producer_repository`, `reader_repository`, `runtime`,
+  `handoff`, `download_root`, and an explicitly supplied UUIDv4 `attempt_id`;
+* `tools`: pinned artifacts for `producer_controller`, `producer_supervisor`,
+  `producer_validator`, `reader_controller`, `reader_supervisor`,
+  `reader_validator`, `python`, `git`, `comparator`;
+* `inputs`: pinned artifacts for `approved_stage`, `consumer_proof`,
+  `custody`, `producer_records`, `upload_metadata`, `selection_metadata`,
+  `transport_authentication`, `container`, `inner`, `serial_first`,
+  `serial_second`, `serial_incomplete`. Only `serial_second` may be null.
+
+Each pin has exactly `path`, integer `size`, and lowercase SHA-256 `sha256`.
+The accepted #263 consumer proof and approved-stage/transport provenance are
+mandatory nonempty **external prerequisites**. Their pin equality is not a
+new acceptance, remote authentication, or producer proof. Never put credentials
+in them. `producer_records` is the original canonical genuine
+`records --runtime ... --output handoff-v1` output; the driver runs that command
+again and compares its exact bytes and source identity before exporting.
+The original runtime, source checkout/objects, result, cleanup, six boots,
+images, dependencies and every runtime input/tool closure must remain available.
+No private owner is reconstructed from metadata by the witness.
+
+The producer/oracle controller and supervisor must both be the authenticated
+original `runtime/controller/bin/uk-wamr-native-ci`. Its validator must be the
+original runtime-installed public validator at
+`compute/public-source/validator-build/public-source/tools/bin/uk-wamr-direct-validate`.
+Those identities and the producer checkout serve private export, public archive,
+and every frozen Python oracle stage, including import's unchanged
+`native_import_revalidation=True` policy. Native import/candidate stages instead
+use the separately authenticated reader controller/supervisor pair, reader
+validator and reader checkout. The reader supervisor must match its executing
+controller; no old/new executable identity is substituted or normalized.
+Old input manifests with one ambiguous `supervisor`/`validator` pin refuse.
+
+`upload_metadata` has exactly `context`, `artifact_id`, `container_digest`,
+`inner_sha256`. `selection_metadata` has exactly `context`, `artifact_id`,
+`container_digest`, `artifact_ids`. Both contexts must equal the independently
+approved producer context. `artifact_ids` must be exactly the singleton trusted
+upload ID. Digests are lowercase 64-character hex, without `sha256:` prefixes.
+Native import forwards `--selected-source`, `--selected-tree`,
+`--selected-run-id`, and `--selected-run-attempt` from the independently pinned
+`selection_metadata.context`, never from the expected producer context.
+`container` is the retained raw Actions artifact container, while `inner` is
+the exact `download_root/tiny-aot-public-source.zip` single regular member.
+The IDs, container SHA and inner SHA are separately checked; equal receipts or
+sidecars inside the download cannot authenticate it. The separately pinned
+`transport_authentication` must come from the owner's independent upload and
+exact-ID download authentication. The harness performs no remote authentication
+and must not be treated as evidence of it.
+
+`custody` is a canonical `uk.wamr.handoff-shadow-custody` document, integer
+version 1, with exactly `roots` and `entries` in addition to schema/version.
+`roots` has nonempty arrays of canonical immutable paths for
+`producer_source`, `reader_source`, `producer_objects`, `runtime`,
+`tool_closure`. `entries` is their complete union of `snapshot(path)` inventories,
+independently staged and approved: files contain `path`, `size`, `sha256`,
+`metadata`; directories contain `path`, `kind: "directory"`, `metadata`.
+Approved original source/tool links contain `path`, `kind: "symlink"`,
+`metadata`, and their exact `target`. They are recorded without following them;
+their actual target closures must be independently pinned too. Original file
+link counts are preserved, not rewritten to impersonate private assets.
+Metadata is `[dev, ino, mode, uid, gid, nlink, size, mtime_ns, ctime_ns]`.
+The driver re-enumerates/re-hashes these live trees before and after; extras,
+removals, link/target changes, same-byte replacement and metadata changes refuse.
+Downloads, selected assets and witness product trees still forbid links.
+All producer `runtime_inputs`, result/cleanup, executable pins, test driver,
+and both original frozen Python oracle closures must be covered.
+Use immutable source/object/input subtrees, not mutable validation/cache/output
+parents. Each inventory is bounded to 65,536 entries, depth 32, 8 GiB total
+and 2 GiB per file. Input JSON records (including custody) are also bounded to
+2 MiB; product canonical records to 64 KiB and native comparison requests to
+1 MiB. Oversized staging refuses rather than partially comparing.
+
+### Fixed public scope and retained evidence
+
+The original inherited public pull-request job environment must already match
+the producer/run/attempt/workspace. The driver never manufactures GitHub CI
+variables or copies/relabels a runtime. `runtime` must be that checkout's
+`.d/wamr-native-runtime` or `/d/wamr-ci/wamr-native-runtime`; `handoff` must be
+its existing genuine `compute/public-source/handoff`.
+All witness products/validation roots are fresh external children of the
+exclusive owner-private output. A completed genuine Python publication has
+already occupied its create-only
+`compute/public-source/handoff-revalidation` slot. The driver does **not**
+re-run `pack`, reuse that slot, move it, or substitute another sibling.
+Instead the separately authenticated original production inner ZIP is the
+Python archive byte oracle; the driver runs the frozen Python verifier again.
+The original publication/validation evidence remains immutable staged input.
+The inherited PATH must select the pinned Git executable.
+
+The driver compares both fresh private exports, then a freshly packed native
+archive **over the existing genuine fixed-scope handoff**, not over either
+arbitrary sibling shadow export. The native archive must byte-match the retained
+original production Python archive, freshly verified from the separately
+authenticated exact-ID redownload, before import. This is explicitly not fresh
+Python archive production or a composed public-export run. Imported selected bytes,
+portable metadata, transport, candidate/admission, inspection stdout and serial
+result bytes are compared. The witness checks all 83 selected v2 assets and
+85 ZIP members/metadata; only enumerated selected output paths, admission
+bundle/transport paths, and candidate VHD/admission paths may rebase.
+Each original dependent size/SHA commitment is checked before recomputing its
+rebased counterpart. Run/source/identity/transport/failure differences are
+never normalized. The six candidate approval flags must be false, the two
+timestamps zero, and both incomplete-serial commands must exit 2 without
+publishing result stdout.
+
+Each of the 17 ordered stages retains its exact argv/cwd, allowlisted original
+environment (no credentials), timeout, original status, stdout/stderr hashes
+and physical custody in create-only command/receipt files. Captures are bounded
+to 8 MiB each; stages to 2,400 seconds. The shared test-only
+`support/tools/hyperv/direct/tests/bounded_process.py` executes each command
+through a retained executable descriptor in a dedicated fork worker. Only that
+worker becomes a Linux subreaper, retaining kernel ownership of its descendants
+after their original parent exits, including new sessions holding capture pipes.
+Pre-existing caller families and their later orphaned descendants cannot enter
+the worker's family; the caller's subreaper setting is never changed.
+Timeout/capture failures kill by retained pidfds and reap owned descendants
+independently of parent liveness. Original parent status, bounded captures,
+overflow/timeout details, descendant termination/reaping and separate cleanup
+failures are retained; any cleanup failure or unfinished cleanup refuses success.
+The helper source must be included in approved immutable input custody.
+Existing native private command receipts/partial products
+are retained too. Inventories, canonical records, requests, before/after custody,
+output pins and failed partial executions are durable external evidence.
+Missing, skipped, changed or failed stages refuse; no retry/resume or destructive
+cleanup is performed.
+
+`report.json` always states `acceptance: false` and
+`genuine_producer_parity: false`. Its strongest outcome is
+`stagewise_shadow_equal`, labeled `stagewise-existing-fixed-handoff`.
+An authentic, fresh native `public-export` composition run, separate protected
+product acceptance/review and caller-cutover/deletion gates remain required.
+Neither #263 consumer proof, this source PR, synthetic comparator tests, nor a
+stagewise equality report substitutes for that genuine producer composition.

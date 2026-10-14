@@ -528,6 +528,22 @@ pub fn runImportedReader(
     supplied: LocalTools,
     signal: ?*core.process.SignalCancellation,
 ) !RetainedValidation {
+    return runImportedReaderWithFault(allocator, io, accepted, repository, candidate, output, supplied, signal, .none);
+}
+
+const ImportedReaderFault = enum { none, change_candidate_before_command };
+
+fn runImportedReaderWithFault(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    accepted: *accepted_run.AcceptedRun,
+    repository: []const u8,
+    candidate: *files.RetainedFile,
+    output: []const u8,
+    supplied: LocalTools,
+    signal: ?*core.process.SignalCancellation,
+    fault: ImportedReaderFault,
+) !RetainedValidation {
     if (accepted.context != .trusted_inner_zip) return error.InvalidContext;
     try files.absoluteFilePath(output);
     if (contained(output, accepted.root) or contained(output, repository) or
@@ -630,6 +646,12 @@ pub fn runImportedReader(
     try authenticated.verifyWithSignal(io, repository, local.git, signal);
     try accepted.revalidateWithSignal(signal);
     try candidate.verify(io);
+    if (@import("builtin").is_test and fault == .change_candidate_before_command) {
+        const changed = try std.Io.Dir.cwd().openFile(io, candidate.path, .{ .mode = .read_write, .follow_symlinks = false });
+        defer changed.close(io);
+        try changed.writePositionalAll(io, "!", 0);
+        try changed.sync(io);
+    }
     _ = try revalidateHandoffCommand(allocator, io, roots, private, evidence, signal);
     try authenticated.verifyWithSignal(io, repository, local.git, signal);
     try accepted.revalidateWithSignal(signal);
@@ -655,6 +677,22 @@ pub fn runImportedReader(
     try result.revalidate(io, repository, signal);
     return result;
 }
+
+pub const Test = if (@import("builtin").is_test) struct {
+    pub fn runImportedReader(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        accepted: *accepted_run.AcceptedRun,
+        repository: []const u8,
+        candidate: *files.RetainedFile,
+        output: []const u8,
+        supplied: LocalTools,
+        signal: ?*core.process.SignalCancellation,
+        fault: ImportedReaderFault,
+    ) !RetainedValidation {
+        return runImportedReaderWithFault(allocator, io, accepted, repository, candidate, output, supplied, signal, fault);
+    }
+} else struct {};
 
 fn pinValidationOutput(allocator: std.mem.Allocator, io: std.Io, output: []const u8, relative: []const u8) !struct { file: files.RetainedFile, sha256: [64]u8 } {
     const path = try std.fs.path.join(allocator, &.{ output, relative });

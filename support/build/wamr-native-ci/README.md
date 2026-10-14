@@ -23,7 +23,8 @@ Every public command requires `--expected-source COMMIT --expected-tree TREE
 --run-id ID --run-attempt ID`. These are independently supplied identities,
 not values inferred from the archive. Source means the actual producer commit
 (including a genuine synthetic PR merge), not another commit with its tree.
-All paths below must be canonical absolute paths with private existing parents.
+All paths below must be canonical absolute paths with private existing parents,
+except the privileged upload seal's root-owned destination parent.
 
 * `public-export --runtime ABS --stage-root ABS --validation-output ABS
   --output ARCHIVE_DIR --git ABS --supervisor ABS --validator ABS` creates the
@@ -39,10 +40,40 @@ All paths below must be canonical absolute paths with private existing parents.
 * `stage-public-source-upload --archive ABS --expected-archive-sha256 HEX
   --output ABS` creates one private standalone upload containing exactly
   `tiny-aot-public-source.zip`; no metadata file or success receipt is added.
+  This `0700`/`0600` product is **not** the workflow's privileged upload seal.
+* `seal-public-source-upload --archive ABS --expected-archive-sha256 HEX
+  --output ABS --source-uid UID --source-gid GID --upload-gid GID` is a narrowly
+  scoped, initial-namespace root operation. It verifies a single-link `0600`
+  source belonging to the expressly supplied source UID/GID, including retained
+  no-follow ancestor custody. It creates a fresh destination only, streams,
+  hashes, reopens and durably publishes the same fixed filename, then seals the
+  directory as root:`upload-gid` `0550` and the file as root:`upload-gid` `0440`.
+  It never changes a pre-existing path, invokes sudo, or relaxes private-file
+  policy. The existing privileged shell caller must explicitly invoke the
+  adapter; unprivileged and user-namespace invocations refuse.
+* `retain-public-source-download --container-archive ABS --output ABS
+  --expected-archive-sha256 INNER_HEX --artifact-id EXPECTED_ID
+  --container-digest EXPECTED_CONTAINER_HEX --selected-artifact-id ACTUAL_ID
+  --selected-container-digest ACTUAL_CONTAINER_HEX --selected-source COMMIT
+  --selected-tree TREE --selected-run-id ID --selected-run-attempt ID` retains
+  an existing owner-private, single-link `0600` raw Actions container and
+  extracts exactly one `tiny-aot-public-source.zip` into a create-only
+  `0700`/`0600` directory. The raw input is not deleted, replaced, rewritten or
+  placed beside the one-file product. Read-only artifact API retrieval and
+  authenticated selection remain the caller's shell/gh responsibility.
+  `download-artifact`'s extracted inner file alone is not a raw-container input.
+  The separate outer codec accepts ZIP32 stored or raw-deflate members and
+  optional signed ZIP32 data descriptors, with a 512 MiB inner limit and a
+  512 MiB + 128 KiB raw-container limit. It refuses duplicate/extra members,
+  alternate names/paths, links, encryption, ZIP64, comments, extra fields,
+  unsupported codecs, CRC/header/descriptor mismatches and trailing data.
+  The inner archive still uses its unchanged strict canonical stored-ZIP codec.
 * `import-public-source-download --download-root ABS --container-archive ABS
   --expected-archive-sha256 INNER_HEX --artifact-id EXPECTED_ID
   --container-digest EXPECTED_CONTAINER_HEX --selected-artifact-id ACTUAL_ID
-  --selected-container-digest ACTUAL_CONTAINER_HEX --output ABS --git ABS
+  --selected-container-digest ACTUAL_CONTAINER_HEX --selected-source COMMIT
+  --selected-tree TREE --selected-run-id ID --selected-run-attempt ID
+  --output ABS --git ABS
   --supervisor ABS --validator ABS` consumes an exact-ID redownload containing
   exactly that one regular, single-link filename. The expected upload metadata
   and actual selection are separate trusted caller inputs. It hashes the
@@ -50,9 +81,12 @@ All paths below must be canonical absolute paths with private existing parents.
   the artifact ID, container digest and inner digest are different types and
   are never interchangeable. This is a local consumer, not a network downloader
   or remote artifact authenticator.
-  The raw container is an opaque authenticated transport input, not a native
-  ZIP extraction API; the exact extracted member is independently authenticated
-  against the trusted inner digest.
+  Compose `retain-public-source-download` with this importer, passing its
+  one-file output directory and the original retained container path. The
+  importer treats the container as opaque authenticated bytes and independently
+  verifies the extracted inner file; it does not infer expected metadata from
+  selected metadata, filenames or a receipt. Selected source/run arguments are
+  mandatory separate inputs, not aliases of their expected counterparts.
 * `import-public-source-bundle --archive ABS --output ABS --git ABS
   --supervisor ABS --validator ABS [--expected-archive-sha256 HEX]` preserves
   the frozen historical v1 import. Digest omission remains confined to the
@@ -86,6 +120,19 @@ Failures are explicit refused/poisoned outcomes with phase and publication
 durability; partially created state is non-resumable and retained.
 Authority stays `not_admitted`; there are no cloud operations, approvals,
 candidate execution, Python fallback, or production caller changes.
+The additive seal/extraction commands are source-tested adapters only.
+Their source graph preserves the exact #263 97-entry historical candidate
+profile. Standalone-supervisor and publication-adapter inputs extend only the
+current graph. Source-name admission remains paired with pinned producer
+revision/tree and every source blob's recorded size and SHA-256 verification.
+The historical regression derives its map from actual #263 Git objects using
+the original guarded-map serializer and an independently pinned content digest;
+it tests source-contract compatibility, not original physical/runtime metadata
+or genuine archive acceptance.
+Actual privileged workflow ownership parity, genuine Actions container/profile
+parity, private-runtime product acceptance, workflow cutover and Python deletion
+remain separately gated. Tests simulate privilege only in fresh fixture roots;
+they do not substitute user-writable products for root-owned production custody.
 
 ## Authority contract freeze (#189 PR1; no caller cutover)
 
@@ -357,7 +404,8 @@ Read-only local cleanup proof retains its collected physical artifact snapshot;
 the production-native owner's wrapper cleanup remains export-owned custody.
 The complete local constructor fixture covers all three later v1
 source/tree pairs and a separate historical Python-v2 checkout. It uses real
-Git objects and physical Python scans, real native packaging/QCOW2/VHD
+Git objects and authenticated immutable historical Python scans, real native
+packaging/QCOW2/VHD
 production, and actual constructor/recheck/CLI routes. Its command/serial
 fixtures are synthetic and do not claim guest or hardware acceptance.
 The separate direct-Azure physical image/copy fixture has mocked producer
@@ -812,9 +860,9 @@ The protected x86 job exercises `test-controller-limits` and then
 and cache outside the production source checkout; this reports fixture failures
 without exposing private supervised-command output. On failure it runs the
 host test binary directly for diagnostic errors while keeping the original
-gate failed. The Python
-`tests/source_custody_production_limits.py` remains paired with the native
-limit fixture while production `build` uses the installed native controller.
+gate failed. The compatibility
+`tests/source_custody_production_limits.py` launcher invokes only the native
+limit fixture; production `build` uses the installed native controller.
 
 `build --runtime ABS --wamr-source ABS`, `boot --runtime ABS`, and
 `diagnostics --runtime ABS` are available only through the installed
@@ -1347,6 +1395,42 @@ is only a compatibility import of their neutral byte tests, not a controller
 comparison or an executable `local`/`full` harness. No acceptance is inferred
 from these synthetic records. The handoff/public-bundle and authority oracles
 remain in their owners until those migrations; `run.py` is not deleted here.
+
+The controller-only oracle split is recorded in
+`tests/controller_coverage.py`: five production-limit scenarios have native
+exact/excess successors; five native command/source-identity cases no longer
+execute Python. Their neutral command vectors come from the immutable
+`e98623f780fa23d05b5797004e4b88160404eb1b` Git blobs, authenticated separately
+by SHA256, not the current physical `run.py` or mixed `test_adapter.py`.
+Native tests apply and fully rehash mutations themselves. Fixture records
+remain diagnostics, not owner/admission or genuine guest evidence.
+
+The complete four-producer local fixture's prepare/mutation functions use the
+same authenticated historical controller and only its extracted neutral binding
+helpers; its native constructors, rechecks, CLI refusals and mutation matrix
+are unchanged. Live private-export parity still calls the current handoff
+owner and is deliberately retained. All 150 adapter scenarios remain collected:
+the 10 native acquisition cases now import neither current controller nor
+PUBLIC oracle; the other 140 explicitly load their retained mixed owners on
+execution. The 196-scenario inventory and authority behavior golden do not
+change. `tests/native_fault_qualification.py` is a retained native-only driver,
+not an obsolete Python controller oracle; all four genuine fault gates remain
+mandatory. Source-only validation cannot satisfy their x86 KVM qualification.
+
+Verify the historical source/vector authentication and successor ledger with:
+
+```sh
+python3 -B support/build/wamr-native-ci/tests/test_historical_controller_fixture.py
+```
+
+`tests/historical_controller_fixture.py --write` intentionally regenerates
+only the reviewed neutral historical native input. It refuses missing or
+changed historical blobs before executing anything and imports no current
+PUBLIC/handoff implementation. It is not a production fallback.
+The module's original top-level protocol-schema read is bound to the
+authenticated historical `process-command-v1.json` blob because the older
+v1 producer checkouts predate it. All original schema checks and controller
+functions remain intact; no current physical schema is substituted.
 
 The credential-free KVM workflow runs the real native build and six-mode tiny
 chain once, then reopens its accepted native records and exercises the existing
@@ -1947,6 +2031,8 @@ script's frozen ignored-output constants, exact/excess 131,072-entry and
 8-GiB sparse-file limits, exact/excess 8-MiB Git ignored inventories,
 1,024-byte path, 64-component depth and 128-root diagnostic boundaries, and
 adds tracked-source entry, byte, file-size and unsafe-type boundaries. The
-Python `tests/source_custody_production_limits.py` remains intentionally
-excluded from default discovery and runs explicitly in protected CI as long
-as production `run.py build` still owns the build path.
+compatibility `tests/source_custody_production_limits.py` entry point remains
+excluded from default discovery but now invokes only that native gate.
+It accepts the existing Zig build cache/system/optimization arguments and
+checks no Python controller constants or inventory. Prefer the direct native
+`test-controller-limits` target for protected CI.

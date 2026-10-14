@@ -270,7 +270,7 @@ const Fixture = struct {
         for (cases) |case| {
             if (case.v2_only and !v2) continue;
             const expected = if (!v2 and std.mem.eql(u8, case.name, "source-custody")) error.EvidenceChanged else case.expected;
-            try python(a, io, &.{ "mutate", work, case.name });
+            try python(a, io, &.{ "mutate", work, case.name, options.git_executable });
             std.debug.print("local refusal {s} {s}: {s}\n", .{ revision, case.name, @errorName(expected) });
             const outcome = open(a, io, &directory, runtime, repository);
             if (outcome) |value| {
@@ -466,4 +466,50 @@ pub fn qualify(a: std.mem.Allocator, io: std.Io, stage: []const u8) !void {
     // Signal dispositions belong to the process, not the concurrent workers.
     for (fixtures.items) |fixture| try fixture.cancellation(io);
     try together(io, fixtures.items, Fixture.qualifyProcess);
+}
+
+pub fn composition(a: std.mem.Allocator, io: std.Io, stage: []const u8, reader_repository: []const u8) !void {
+    const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{});
+    defer parent.close(io);
+    const name = try std.fmt.allocPrint(a, "private-composition-{d}", .{std.os.linux.getpid()});
+    try parent.createDir(io, name, .fromMode(0o700));
+    defer parent.deleteTree(io, name) catch @panic("private composition fixture cleanup failed");
+    const work = try std.fs.path.join(a, &.{ options.fixture_root, name });
+    const fixture: Fixture = .{
+        .revision = "e98623f780fa23d05b5797004e4b88160404eb1b",
+        .work = work,
+        .repository = try std.fs.path.join(a, &.{ work, "producer" }),
+        .runtime = try std.fs.path.join(a, &.{ work, ".d/wamr-native-runtime" }),
+        .stage = stage,
+    };
+    try fixture.prepare(io);
+    const historical = try std.process.run(a, io, .{
+        .argv = &.{ options.git_executable, "-C", reader_repository, "-c", "gc.auto=0", "-c", "maintenance.auto=false", "fetch", "-q", "--depth=1", "--no-tags", options.repository_root, fixture.revision },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, historical.term);
+    const exported = try std.fs.path.join(a, &.{ work, "private-products/native-export" });
+    var env = std.process.Environ.Map.init(a);
+    defer env.deinit();
+    try env.put("GITHUB_REPOSITORY", "cataggar/unikraft");
+    try env.put("GITHUB_RUN_ID", "1");
+    try env.put("GITHUB_RUN_ATTEMPT", "1");
+    const result = try std.process.run(a, io, .{
+        .argv = &.{ options.host_controller_cli, "private-export", "--runtime", fixture.runtime, "--output", exported },
+        .cwd = .{ .path = fixture.repository },
+        .environ_map = &env,
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(8192),
+    });
+    if (result.term != .exited or result.term.exited != 0)
+        std.debug.print("private composition export: {s}\n", .{result.stderr});
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("Private handoff exported; authority=not_admitted.\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+    try @import("handoff_composition_tests").local(a, io, exported, reader_repository, .{
+        .git = try std.fs.path.join(a, &.{ fixture.runtime, "host-tools/git" }),
+        .supervisor = try std.process.executablePathAlloc(io, a),
+        .validator = options.import_validator,
+    });
 }
