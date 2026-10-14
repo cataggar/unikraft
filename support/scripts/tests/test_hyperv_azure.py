@@ -3449,6 +3449,10 @@ class HypervWorkflowTest(unittest.TestCase):
             "supervisor-source-closure --git /usr/bin/git",
         ):
             self.assertNotIn(forbidden, step)
+        self.assertLess(
+            step.index('mkdir -m 0700 "${root}/compute-tools"'),
+            step.index('--prefix "${root}/compute-tools"'),
+        )
 
         build = (
             SUPPORT / "build/wamr-native-ci/build.zig"

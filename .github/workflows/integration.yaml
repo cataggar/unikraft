@@ -965,6 +965,8 @@ jobs:
         mkdir -p "${root}/restore"
         compute_fixture_root="${root}/compute-fixtures"
         mkdir -m 0700 "${compute_fixture_root}"
+        # Parallel install must not create an ancestor sibling after input capture.
+        mkdir -m 0700 "${root}/compute-tools"
         compute_fixture_root="$(readlink -f "${compute_fixture_root}")"
         test "$(stat -c '%a' -- "${compute_fixture_root}")" = 700
         cp support/tools/hyperv/local_boot/build.zig \
