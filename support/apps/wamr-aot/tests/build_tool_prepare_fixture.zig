@@ -26,7 +26,7 @@ fn run(init: std.process.Init) !void {
             std.fs.path.basename(target);
         if (!std.mem.eql(u8, name, build_tool.translate_c_hash) and
             !std.mem.eql(u8, name, build_tool.aro_hash) and
-            !std.mem.eql(u8, name, "miz-0.2.0-Z3lHlLgL2wDiGxutMJMDy9Qy4CLNCwOptwgQLp1ZDSiv") and
+            !std.mem.eql(u8, name, "tls-0.1.0-ER2e0jFWBgCrVPpTRsqUiILFT0yFB4uykyvXg1Xbeqk3") and
             !std.mem.eql(u8, name, build_tool.wabt_hash) and
             !std.mem.eql(u8, name, build_tool.wasip2_hash))
             return error.UnpinnedPackage;

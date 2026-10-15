@@ -79,7 +79,7 @@ test "native prepare refuses unbound or incorrectly hashed offline packages" {
     defer miz_packages.close(io);
     try miz_packages.dir.deleteTree(io, build_tool.wabt_hash);
     try miz_packages.dir.deleteTree(io, build_tool.wasip2_hash);
-    const miz_pkg = try build_tool.files.ensurePrivateDirectory(io, miz_packages.dir, "miz-0.2.0-Z3lHlLgL2wDiGxutMJMDy9Qy4CLNCwOptwgQLp1ZDSiv");
+    const miz_pkg = try build_tool.files.ensurePrivateDirectory(io, miz_packages.dir, "tls-0.1.0-ER2e0jFWBgCrVPpTRsqUiILFT0yFB4uykyvXg1Xbeqk3");
     defer miz_pkg.close(io);
     try build_tool.files.writePrivateAtomicReplace(io, miz_pkg, "build.zig", "fixture package\n");
     const miz_result = try runCli(cli, &.{ cli, "prepare", "--repository", miz_repository, "--source-archive", archive }, &environment);

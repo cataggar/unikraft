@@ -710,7 +710,7 @@ fn stageRecord(selected: observations.Fixture, stage: FixtureStage, wall: u64, c
         .sample = .{
             .backend = .stage2_llvm,
             .arch = .aarch64,
-            .optimize = .debug,
+            .optimize = .Debug,
             .aarch64_sha2 = true,
             .x86_sha = false,
             .x86_avx2 = false,
@@ -731,7 +731,7 @@ test "namespace observations bounded canonical format and maximum log" {
             if (stage.appliesTo(selected)) {
                 var record = stageRecord(selected, stage, std.math.maxInt(u64), std.math.maxInt(u64));
                 record.self_executable_bytes = std.math.maxInt(u64);
-                record.sample.optimize = .safe;
+                record.sample.optimize = .ReleaseSafe;
                 record.sample.aarch64_sha2 = false;
                 const bytes = try record.encode(allocator);
                 try std.testing.expectEqual(@as(usize, 512), bytes.len);
@@ -899,7 +899,7 @@ test "namespace observations native sampling uses the current test process" {
     const second = try observations.Record.observe(std.testing.io, .timeout, .payload_copy);
     try std.testing.expectEqual(builtin.zig_backend, first.sample.backend);
     try std.testing.expectEqual(builtin.target.cpu.arch, first.sample.arch);
-    try std.testing.expectEqual(builtin.mode, first.sample.optimize);
+    try std.testing.expectEqual(@import("synthetic_measurement").Optimize.fromCompiler(builtin.mode), first.sample.optimize);
     try std.testing.expect(first.sample.monotonic_ns <= second.sample.monotonic_ns);
     try std.testing.expect(first.sample.process_cpu_ns <= second.sample.process_cpu_ns);
     try std.testing.expect(first.self_executable_bytes > 0);
@@ -990,7 +990,7 @@ test "namespace observations internal fixed format and maximum log exclude autho
         record.self_bytes = std.math.maxInt(u64);
         record.sample.monotonic_ns = std.math.maxInt(u64);
         record.sample.process_cpu_ns = std.math.maxInt(u64);
-        record.sample.optimize = .safe;
+        record.sample.optimize = .ReleaseSafe;
         const bytes = try record.encode(a);
         try std.testing.expectEqualDeep(record, try internal.decode(a, &bytes));
         maximum.records[index] = record;

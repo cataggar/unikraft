@@ -115,10 +115,11 @@ pub const RootPackages = struct {
 
     pub const root_names = [_][]const u8{ contract.translate_c_hash, contract.aro_hash };
     pub const sdk_names = [_][]const u8{ contract.translate_c_hash, contract.aro_hash, contract.wabt_hash, contract.wasip2_hash };
+    pub const tls_hash = "tls-0.1.0-ER2e0jFWBgCrVPpTRsqUiILFT0yFB4uykyvXg1Xbeqk3";
     pub const miz_custody_names = [_][]const u8{
         contract.translate_c_hash,
         contract.aro_hash,
-        "miz-0.2.0-Z3lHlLgL2wDiGxutMJMDy9Qy4CLNCwOptwgQLp1ZDSiv",
+        tls_hash,
     };
 
     pub fn open(
@@ -204,11 +205,13 @@ pub const RootPackages = struct {
             defer allocator.free(expected);
             if (!std.mem.eql(u8, result.stdout, expected))
                 return error.UnpinnedRootPackage;
+            if (self.fetch_sdk_urls)
+                try stageFetchedPackage(io, state, hashes, name, null);
         }
         if (self.fetch_sdk_urls) {
             inline for (.{
-                .{ contract.wabt_url, contract.wabt_hash },
-                .{ contract.wasip2_url, contract.wasip2_hash },
+                .{ contract.wabt_url, contract.wabt_hash, "wabt-840ea5be8eaf17935bc901a265feae62aad2fa8d" },
+                .{ contract.wasip2_url, contract.wasip2_hash, "wabt-de1b26f7e721aba18f6472437d8d6cde14bfec16" },
             }) |entry| {
                 var result = try runner.runSuccess(zig, .root_dependency_hash, &.{
                     zig.path, "fetch", "--pkg-dir", hashes_path, entry[0],
@@ -216,10 +219,46 @@ pub const RootPackages = struct {
                 defer result.deinit(allocator);
                 if (!std.mem.eql(u8, result.stdout, entry[1] ++ "\n"))
                     return error.UnpinnedRootPackage;
+                try stageFetchedPackage(io, state, hashes, entry[1], entry[2]);
             }
             try environment.put("ZIG_LOCAL_PKG_DIR", hashes_path);
         }
         try self.verify(allocator, io);
+    }
+
+    fn stageFetchedPackage(
+        io: std.Io,
+        state: std.Io.Dir,
+        hashes: std.Io.Dir,
+        name: []const u8,
+        subdir: ?[]const u8,
+    ) !void {
+        if (hashes.access(io, name, .{})) |_| return else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+        var tmp_dir = state.openDir(io, "zig_global_cache/tmp", .{
+            .follow_symlinks = false,
+            .iterate = true,
+        }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer tmp_dir.close(io);
+        var iterator = tmp_dir.iterate();
+        while (try iterator.next(io)) |entry| {
+            if (entry.kind != .directory or !std.mem.startsWith(u8, entry.name, ".tmp-"))
+                continue;
+            if (subdir) |inner| {
+                var outer = try tmp_dir.openDir(io, entry.name, .{ .follow_symlinks = false });
+                defer outer.close(io);
+                try std.Io.Dir.rename(outer, inner, hashes, name, io);
+                try tmp_dir.deleteDir(io, entry.name);
+            } else {
+                try std.Io.Dir.rename(tmp_dir, entry.name, hashes, name, io);
+            }
+            return;
+        }
     }
 
     fn fingerprint(allocator: std.mem.Allocator, io: std.Io, directory: std.Io.Dir, names: []const []const u8) ![32]u8 {
