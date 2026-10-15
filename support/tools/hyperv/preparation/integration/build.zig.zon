@@ -2,7 +2,7 @@
     .name = .hyperv_preparation_integration,
     .version = "0.2.0",
     .fingerprint = 0xa2ff479a009e73a2,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .preparation = .{ .path = ".." },
     },

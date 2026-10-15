@@ -94,7 +94,7 @@ test "Origin exact tagged payload roundtrip and legacy rejection" {
     defer a.free(encoded);
     const parsed = try c.parse(o.Origin, a, encoded);
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("1" ** 40, parsed.value.payload.local_build.source_revision);
+    try std.testing.expectEqualStrings(&@as([40]u8, @splat('1')), parsed.value.payload.local_build.source_revision);
     for ([_][]const u8{
         "{\"payload\":{},\"schema\":\"hyperv_runtime_origin_v2\"}\n",
         "{\"payload\":null,\"schema\":\"hyperv_runtime_origin_v2\"}\n",
@@ -107,7 +107,7 @@ test "declared prefix relocation binary padding and literal text are exact" {
     const a = std.testing.allocator;
     const result = try o.relocate(a, "a/placeholder/lib:/placeholder/x\x00tail", "/placeholder", "/new", .binary);
     defer a.free(result);
-    try std.testing.expectEqualStrings("a/new/lib:/new/x" ++ "\x00" ** 17 ++ "tail", result);
+    try std.testing.expectEqualStrings("a/new/lib:/new/x" ++ @as([17]u8, @splat(0)) ++ "tail", result);
     const text = try o.relocate(a, "/placeholder/lib", "/placeholder", "/new", .text);
     defer a.free(text);
     try std.testing.expectEqualStrings("/new/lib", text);
@@ -140,8 +140,10 @@ test "Origin rejects wrong null extra payload fields legacy epoch and data disgu
         try std.testing.expectError(error.InvalidOrigin, o.validate(fixture.shapePackage(), role, @FieldType(rt.Tool, "target").data));
     var compiler = fixture.shapeDistribution();
     try o.validate(compiler, rt.Role.zig, @FieldType(rt.Tool, "target").aarch64_linux);
-    compiler.payload.distribution.runtime_revision = "0.15.2";
-    try std.testing.expectError(error.CompilerMismatch, o.validate(compiler, rt.Role.zig, @FieldType(rt.Tool, "target").aarch64_linux));
+    for ([_][]const u8{ "0.15.2", "0.16.0" }) |historical| {
+        compiler.payload.distribution.runtime_revision = historical;
+        try std.testing.expectError(error.CompilerMismatch, o.validate(compiler, rt.Role.zig, @FieldType(rt.Tool, "target").aarch64_linux));
+    }
     compiler.payload.distribution.runtime_revision = c.compiler_version;
     try std.testing.expectError(error.CompilerMismatch, o.validate(compiler, rt.Role.zig, @FieldType(rt.Tool, "target").data));
 }
@@ -149,8 +151,8 @@ test "Origin rejects wrong null extra payload fields legacy epoch and data disgu
 test "Origin local actor and helper require the actual source HEAD snapshot and compiler kind" {
     const source: c.Source = .{
         .scheme = .git_physical_native_v1,
-        .head = "1" ** 40,
-        .tree = "2" ** 40,
+        .head = &@as([40]u8, @splat('1')),
+        .tree = &@as([40]u8, @splat('2')),
         .tree_sha256 = c.digest("tree"),
         .physical = .{ .sha256 = c.digest("physical"), .files = 1, .bytes = 1 },
     };
@@ -164,7 +166,7 @@ test "Origin local actor and helper require the actual source HEAD snapshot and 
     for (0..3) |i| {
         var wrong = local;
         switch (i) {
-            0 => wrong.payload.local_build.source_revision = "3" ** 40,
+            0 => wrong.payload.local_build.source_revision = &@as([40]u8, @splat('3')),
             1 => wrong.payload.local_build.source_physical_sha256 = source.tree_sha256,
             2 => wrong.payload.local_build.compiler_executable_sha256 = c.digest("archive not compiler"),
             else => unreachable,
@@ -198,7 +200,7 @@ test "Origin mixed Git DSO and non ELF scopes cover selected bytes exactly once 
     components[2].scope = .{ .selected = &.{ .{ .subtree = "lib" }, .{ .file = "absent" } } };
     try std.testing.expectError(error.OriginExtra, o.requireCoverage(entries[2..4], components[2..]));
     const zig_files = try a.alloc(c.File, 19546);
-    for (zig_files, 0..) |*file, i| file.* = .{ .path = try std.fmt.allocPrint(a, "lib/file-{d}.zig", .{i}), .size = 1, .mode = 0o644, .sha256 = c.digest("synthetic Zig support") };
+    for (zig_files, 0..) |*file, i| file.* = .{ .path = try a.print("lib/file-{d}.zig", .{i}), .size = 1, .mode = 0o644, .sha256 = c.digest("synthetic Zig support") };
     const zig = [_]o.Component{.{ .artifact_id = "zig-release", .scope = .{ .whole = .{} }, .selected_tree = .{ .sha256 = c.digest("synthetic complete tree"), .files = 19546, .bytes = 19546 } }};
     try o.requireCoverage(zig_files, &zig);
     try std.testing.expect((try c.canonical(a, zig)).len < 1024);
@@ -271,7 +273,7 @@ test "Origin pinned signature binds exact signature bytes key verification and f
         var wrong_verification = verification;
         wrong_verification.signed_bytes_sha256 = wrong_digest;
         var wrong_artifact = artifact;
-        wrong_artifact.authentication.pinned_key_signature.verification = try fixture.write(a, std.testing.io, evidence, try std.fmt.allocPrint(a, "wrong-signed-input-{d}.json", .{i}), try c.canonical(a, wrong_verification));
+        wrong_artifact.authentication.pinned_key_signature.verification = try fixture.write(a, std.testing.io, evidence, try a.print("wrong-signed-input-{d}.json", .{i}), try c.canonical(a, wrong_verification));
         data.policy().authentication_sha256 = try o.hash(a, wrong_artifact.authentication);
         try data.rebind(&.{wrong_artifact});
         try std.testing.expectError(error.WrongSubject, data.validate());
@@ -386,7 +388,7 @@ test "Origin exact authenticated conda paths declaration original and result byt
             7 => relocations[0].mode = .text,
             else => unreachable,
         }
-        try data.realization(changed, try std.fmt.allocPrint(a, "bad-prefix-{d}.json", .{i}));
+        try data.realization(changed, try a.print("bad-prefix-{d}.json", .{i}));
         try std.testing.expectError(error.InvalidRelocation, data.validate());
     }
 }
@@ -462,6 +464,7 @@ test "Origin package declarations require literal ZON throughout without duplica
     const manifest = ".{ .dependencies = " ++ dependencies ++ " }";
     try o.requirePackageDeclaration(a, manifest, package);
     try o.requirePackageDeclaration(a, ".{ .name = .example, .dependencies = .{ .@\"data\" = .{ .@\"url\" = \"https://synthetic.invalid/archive/r\", .hash = \"pkg-pinned\", .lazy = false } }, .paths = .{ \"src\", \"build.zig.zon\" } }", package);
+    try o.requirePackageDeclaration(a, ".{ .dependencies = .{ .data = .{ .url = \"https://synthetic.invalid/archive/\\x72\", .hash = \"pkg-\\u{70}inned\", .lazy = true } } }", package);
     for ([_][]const u8{
         "ignored(" ++ manifest ++ ")",
         ".{ .dependencies = ignored(" ++ dependencies ++ ") }",
@@ -469,6 +472,8 @@ test "Origin package declarations require literal ZON throughout without duplica
         ".{ .dependencies = .{ .data = .{ .url = \"https://synthetic.invalid/archive/r\" ++ \"suffix\", .hash = \"pkg-pinned\" } } }",
         ".{ .dependencies = .{ .data = .{ .url = \"https://synthetic.invalid/archive/r\", .hash = ignored(\"pkg-pinned\") } } }",
         ".{ .dependencies = .{ .data = .{ .url = \"https://synthetic.invalid/archive/r\", .hash = \"pkg-pinned\", .lazy = true and false } } }",
+        ".{ .dependencies = .{ .data = .{ .url = \"https://synthetic.invalid/archive/r\", .hash = \"pkg-pinned\", .unknown = false } } }",
+        ".{ .dependencies = .{ .data = .{ .url = \"https://synthetic.invalid/archive/r\", .hash = \"pkg-pinned\", .lazy = \"false\" } } }",
         ".{ .dependencies = " ++ dependencies ++ ", .dependencies = " ++ dependencies ++ " }",
         ".{ .dependencies = .{ .data = " ++ pin ++ ", .data = " ++ pin ++ " } }",
         ".{ .dependencies = .{ .data = " ++ pin ++ ", .other = .{ .path = \"one\" }, .other = .{ .path = \"two\" } } }",
@@ -545,13 +550,13 @@ test "Origin firmware named asset held roots and every evidence copy are mandato
     for (evidence) |directory| {
         const inventory = try fs.inventory(a, io, directory, 256, c.control_cap);
         for (inventory.entries) |file| {
-            const id = try std.fmt.allocPrint(a, "evidence-{d}", .{assets.items.len});
+            const id = try a.print("evidence-{d}", .{assets.items.len});
             try assets.append(a, .{ .id = id, .role = .publication_control, .source = file, .destination = id, .placement = .staged });
             try bindings.append(a, .{ .id = id, .directory = directory });
         }
     }
     for (0..inputs.firmware_copy_count) |i| {
-        const id = try std.fmt.allocPrint(a, "vars-copy-{d}", .{i});
+        const id = try a.print("vars-copy-{d}", .{i});
         try assets.append(a, .{ .id = id, .role = .firmware_working_copy, .source = vars_file, .destination = id, .placement = .future_copy });
         try bindings.append(a, .{ .id = id, .directory = vars.root });
     }

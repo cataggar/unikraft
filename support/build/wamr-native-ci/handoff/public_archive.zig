@@ -22,7 +22,8 @@ pub const Context = struct {
 
     pub fn validate(self: Context) !void {
         if (!std.mem.eql(u8, self.repository, profile.repository) or
-            !std.mem.eql(u8, self.wamr_revision, profile.wamr_revision))
+            (!std.mem.eql(u8, self.wamr_revision, profile.wamr_revision) and
+                !std.mem.eql(u8, self.wamr_revision, profile.historical_wamr_revision)))
             return error.InvalidContext;
         inline for (.{ self.run_id, self.run_attempt }) |identifier| {
             if (identifier.len == 0 or identifier.len > 20 or identifier[0] < '1' or identifier[0] > '9')
@@ -121,18 +122,25 @@ pub const Metadata = struct {
         defer document.deinit();
         const value = document.value();
         const compatibility = try contracts.validateLocalImageHandoffWithRoot(value, root);
-        try bindBundle(value, compatibility, context);
+        var bound_context = context;
+        const bundle_wamr_revision = try c.string(try field(try field(value, "identity"), "wamr_revision"));
+        if (std.mem.eql(u8, bound_context.wamr_revision, profile.wamr_revision) and
+            std.mem.eql(u8, bundle_wamr_revision, profile.historical_wamr_revision))
+        {
+            bound_context.wamr_revision = profile.historical_wamr_revision;
+        }
+        try bindBundle(value, compatibility, bound_context);
         const selected = try a.alloc(Member, layout.selectedMemberCount(compatibility));
         var cursor: usize = 0;
         for ((try field(value, "artifacts")).array.items, layout.artifactNames(compatibility)) |item, name| {
-            try addMember(a, selected, &cursor, item, try std.fmt.allocPrint(a, "artifacts/{s}", .{name}));
+            try addMember(a, selected, &cursor, item, try a.print("artifacts/{s}", .{name}));
         }
         for ((try field(value, "boots")).array.items, profile.modes(compatibility)) |boot, mode| {
             for (layout.boot_keys) |part|
-                try addMember(a, selected, &cursor, try field(boot, @tagName(part)), try std.fmt.allocPrint(a, "boots/{s}/{s}", .{ @tagName(mode), @tagName(part) }));
+                try addMember(a, selected, &cursor, try field(boot, @tagName(part)), try a.print("boots/{s}/{s}", .{ @tagName(mode), @tagName(part) }));
         }
         for ((try field(value, "evidence")).array.items, layout.evidenceNames(compatibility)) |item, name|
-            try addMember(a, selected, &cursor, item, try std.fmt.allocPrint(a, "evidence/{s}", .{name}));
+            try addMember(a, selected, &cursor, item, try a.print("evidence/{s}", .{name}));
         std.mem.sort(Member, selected, {}, struct {
             fn less(_: void, left: Member, right: Member) bool {
                 return std.mem.order(u8, left.name, right.name) == .lt;
@@ -150,7 +158,7 @@ pub const Metadata = struct {
                 .schema = "uk.wamr.public-source-bundle",
                 .version = @as(u8, 1),
                 .authority = profile.authority,
-                .source = context,
+                .source = bound_context,
                 .members = std.json.Value{ .object = members },
             })
         else
@@ -159,7 +167,7 @@ pub const Metadata = struct {
                 .version = @as(u8, 2),
                 .profile = profile.current_profile,
                 .authority = profile.authority,
-                .source = context,
+                .source = bound_context,
                 .members = std.json.Value{ .object = members },
             });
         const bundle = try canonical(a, value);
@@ -408,11 +416,11 @@ const Inspection = struct {
         if (invocation.source != .local_handoff) return null;
         const source = invocation.source.local_handoff;
         const stage: accepted_run.Stage = if (source.accepted.compatibility == .tiny_v1_legacy) .@"handoff-inspect-legacy" else .@"handoff-inspect";
-        const record_path = try std.fmt.allocPrint(invocation.allocator, "{s}/evidence/command-{s}.json", .{ source.root, @tagName(stage) });
+        const record_path = try invocation.allocator.print("{s}/evidence/command-{s}.json", .{ source.root, @tagName(stage) });
         errdefer invocation.allocator.free(record_path);
         var record = try files.RetainedFile.open(invocation.io, record_path, .private);
         errdefer record.close(invocation.io);
-        const log_path = try std.fmt.allocPrint(invocation.allocator, "{s}/private/{s}.log", .{ source.root, @tagName(stage) });
+        const log_path = try invocation.allocator.print("{s}/private/{s}.log", .{ source.root, @tagName(stage) });
         errdefer invocation.allocator.free(log_path);
         var log = try files.RetainedFile.open(invocation.io, log_path, .private);
         errdefer log.close(invocation.io);

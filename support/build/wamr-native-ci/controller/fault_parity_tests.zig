@@ -27,7 +27,7 @@ const Fixture = struct {
             return error.UnsafeFixtureRoot;
         const parent = try core.private_files.openDirectory(io, base, .private);
         errdefer parent.close(io);
-        const name = try std.fmt.allocPrint(a, "controller-fault-parity-{s}-{d}", .{ label, linux.getpid() });
+        const name = try a.print("controller-fault-parity-{s}-{d}", .{ label, linux.getpid() });
         errdefer a.free(name);
         try parent.createDir(io, name, .fromMode(0o700));
         errdefer parent.deleteTree(io, name) catch {};
@@ -186,7 +186,7 @@ test "consumer retains the original executable but rejects same-byte inode repla
     const data = try fixture.root.openDir(io, "data", .{ .iterate = true });
     defer data.close(io);
     try write(data, "input", "same bytes", 0o600);
-    const source_path = try std.fs.path.resolve(a, &.{ options.repository_root, options.command_fixture });
+    const source_path = try std.Io.Dir.realPathFileAbsoluteAlloc(io, options.command_fixture, a);
     defer a.free(source_path);
     const original = try std.Io.Dir.openFileAbsolute(io, source_path, .{ .follow_symlinks = false });
     defer original.close(io);
@@ -438,7 +438,7 @@ test "dependency record refuses same-byte restore manifest copy replacement" {
     defer entry.close(io);
     try package(entry);
     try write(private, "dependency-restore.log", "restored\n", 0o600);
-    const hash = try std.fmt.allocPrint(a, "{s}\n", .{miz});
+    const hash = try a.print("{s}\n", .{miz});
     defer a.free(hash);
     try write(private, "dependency-hash-000.log", hash, 0o600);
     const compute_path = try fixture.child("compute");
@@ -496,7 +496,7 @@ test "transient in later package directory changes physical custody without chan
 test "pre-spawn timeout and cancellation leave no command or cleanup events" {
     var fixture = try Fixture.init("pre-spawn");
     defer fixture.deinit();
-    const executable_path = try std.fs.path.resolve(a, &.{ options.repository_root, options.command_fixture });
+    const executable_path = try std.Io.Dir.realPathFileAbsoluteAlloc(io, options.command_fixture, a);
     defer a.free(executable_path);
     const executable = try core.process.Executable.open(io, executable_path);
     defer executable.close(io);
@@ -506,7 +506,7 @@ test "pre-spawn timeout and cancellation leave no command or cleanup events" {
     defer environment.deinit();
     const cancelled = std.atomic.Value(bool).init(true);
     try core.process.initialize();
-    for ([_]struct { kind: std.meta.Tag(core.process.CommandPrimary), cancel: bool }{
+    for ([_]struct { kind: @typeInfo(core.process.CommandPrimary).@"union".tag_type.?, cancel: bool }{
         .{ .kind = .timeout, .cancel = false },
         .{ .kind = .cancelled, .cancel = true },
     }) |scenario| {
@@ -538,7 +538,7 @@ test "pre-spawn timeout and cancellation leave no command or cleanup events" {
 }
 
 fn descendantFixture(fixture: Fixture) ![]u8 {
-    const source_path = try std.fs.path.resolve(a, &.{ options.repository_root, options.descendant_fixture });
+    const source_path = try std.Io.Dir.realPathFileAbsoluteAlloc(io, options.descendant_fixture, a);
     defer a.free(source_path);
     var source = try core.private_files.RetainedFile.open(io, source_path, .artifact);
     defer source.close(io);
@@ -587,11 +587,11 @@ fn expectGone(bytes: []const u8, allow_partial: bool, minimum: usize) !void {
         if (line.len == 0) continue;
         const pid = try std.fmt.parseInt(linux.pid_t, line, 10);
         if (pid <= 1) return error.InvalidDescendantPid;
-        try std.testing.expectEqual(linux.E.SRCH, linux.errno(linux.kill(pid, @enumFromInt(0))));
+        try std.testing.expectEqual(linux.E.SRCH, linux.errno(linux.kill(pid, @fromBackingInt(@intCast(0)))));
         count += 1;
     }
     try std.testing.expect(count >= minimum);
-    var status: u32 = 0;
+    var status: i32 = 0;
     try std.testing.expectEqual(linux.E.CHILD, linux.errno(linux.waitpid(-1, &status, linux.W.NOHANG)));
 }
 

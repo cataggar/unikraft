@@ -262,7 +262,7 @@ test "budget rejects duplicate ids artifacts zero records and excessive entries"
     entries[1].source = null;
     try std.testing.expectError(error.MissingByteBinding, compute(&entries));
     try std.testing.expectError(error.InvalidLedgerCount, compute(&.{}));
-    const excessive = [_]Entry{fixture("one", .raw, 1)} ** (maximum_entries + 1);
+    const excessive = @as([(maximum_entries + 1)]Entry, @splat(fixture("one", .raw, 1)));
     try std.testing.expectError(error.InvalidLedgerCount, compute(&excessive));
     try std.testing.expectError(error.InvalidLedgerEntry, reserve("evidence", "evidence", 0));
 }

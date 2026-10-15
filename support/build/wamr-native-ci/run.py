@@ -27,7 +27,8 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 APP = REPO / "support/apps/wamr-aot"
 LOCAL_BOOT = REPO / "support/tools/hyperv/local_boot"
-REVISION = "a53205d77be3b880eb8f8b96679512ba58e2331a"
+REVISION = "bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20"
+HISTORICAL_WAMR_REVISION = "a53205d77be3b880eb8f8b96679512ba58e2331a"
 MARKER = "WAMR_NATIVE_AOT_OK answer=42 teardown=0"
 LEGACY = "Using legacy xAPIC MMIO"
 MODES = ("raw-x2apic", "raw-legacy-apic", "vpc-x2apic", "vpc-legacy-apic")
@@ -50,6 +51,7 @@ PRODUCTION_COMMAND_STAGES = frozenset({
     "derive-fixed-vhd", "inspect",
     "public-validator-build", "handoff-inspect", "handoff-inspect-legacy",
     "supervisor-import-identity", "native-revalidation",
+    "historical-native-revalidation",
 })
 LOG_VALIDATOR_STAGES = {
     "log-validator-x2apic": "forbidden",
@@ -61,9 +63,12 @@ FORBIDDEN = ("HYPERV_ACCEPTANCE", "UK_HYPERV_IO_READY",
              "WAMR_NATIVE_WASI=", "WAMR_NATIVE_AOT_FAIL")
 EFI = "wamr_hyperv-x86_64-efi"
 MIB = 1024 * 1024
-MIZ_REVISION = "669a27982b376311f558e820b69e9a692735b0cd"
-MIZ_PACKAGE_HASH = "miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx"
+MIZ_REVISION = "66ea6701cf0e1b6d31e5f30fade00b7a546d4b44"
+MIZ_PACKAGE_HASH = "miz-0.2.0-Z3lHlLgL2wDiGxutMJMDy9Qy4CLNCwOptwgQLp1ZDSiv"
 MIZ_URL = "git+https://github.com/cataggar/miz.git#" + MIZ_REVISION
+HISTORICAL_MIZ_REVISION = "669a27982b376311f558e820b69e9a692735b0cd"
+HISTORICAL_MIZ_PACKAGE_HASH = "miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx"
+HISTORICAL_MIZ_URL = "git+https://github.com/cataggar/miz.git#" + HISTORICAL_MIZ_REVISION
 SOURCE_MAX_ENTRIES = 40_000
 SOURCE_MAX_BYTES = 2 * 1024 * MIB
 SOURCE_MAX_FILE = 256 * MIB
@@ -513,6 +518,14 @@ def command_environment(root, input_records=None, extra=None, *, stage=None):
     }
     if extra is not None:
         environment.update(extra)
+    if stage == "dependency-restore":
+        environment["ZIG_LOCAL_PKG_DIR"] = str(
+            Path(root) / "dependencies/zig-pkg")
+    if stage in {"prepare", "config", "native-image"}:
+        environment["ZIG_LOCAL_PKG_DIR"] = str(
+            Path(root) / "dependencies/zig-pkg")
+    if stage not in {"dependency-restore", "prepare", "config", "native-image"}:
+        environment.pop("ZIG_LOCAL_PKG_DIR", None)
     return environment
 
 
@@ -2548,6 +2561,9 @@ def command_environment_contract(kind):
             "WAMR_CI_LOG_VALIDATE": command_path(
                 WAMR_LOG_VALIDATOR_ROLE),
         })
+    if kind == "build-native":
+        environment["ZIG_LOCAL_PKG_DIR"] = command_path(
+            "work", "dependencies/zig-pkg")
     if kind in {"build-base", "public-validator"}:
         environment["WAMR_CI_LAUNCH_EXECUTABLE"] = command_path("tool:zig")
     return [
@@ -2649,7 +2665,7 @@ def production_command_contract(stage, profile=CURRENT_PROFILE):
                 command_path("work", "dependencies/zig-pkg"),
                 command_literal("--prefix"),
                 command_path("work", "tools"),
-                command_literal("-Doptimize=ReleaseSafe"),
+                command_literal("-Doptimize=safe"),
                 command_literal("-j2"),
                 command_literal("test-unit"),
                 command_literal("install"),
@@ -2673,7 +2689,7 @@ def production_command_contract(stage, profile=CURRENT_PROFILE):
                 command_path("work", "dependencies/zig-pkg"),
                 command_literal("--prefix"),
                 command_path("work", "tools"),
-                command_literal("-Doptimize=ReleaseSafe"),
+                command_literal("-Doptimize=safe"),
                 command_literal("-j2"),
                 command_literal("install"),
             ],
@@ -2806,13 +2822,11 @@ def production_command_contract(stage, profile=CURRENT_PROFILE):
                     "source", "support/tools/hyperv/direct/build.zig"),
                 command_literal("--cache-dir"),
                 command_path("work", "cache"),
-                command_literal("--global-cache-dir"),
-                command_path("work", "global-cache"),
                 command_literal("--prefix"),
                 command_path("work", "public-source/tools"),
                 *(command_literal(value)
                   for value in RECORDED_EXECUTABLE_TARGET),
-                command_literal("-Doptimize=ReleaseSafe"),
+                command_literal("-Doptimize=safe"),
                 command_literal("-j2"),
                 command_literal("install"),
             ],
@@ -2867,6 +2881,14 @@ def production_command_contract(stage, profile=CURRENT_PROFILE):
             ],
         },
     }
+    contracts["historical-native-revalidation"] = {
+        **contracts["native-revalidation"],
+        "argv": [
+            command_path("input:validator"),
+            command_literal("historical-handoff"),
+            command_path("input:bundle"),
+        ],
+    }
     for mode in (SIX_MODES if profile == CURRENT_PROFILE else MODES):
         contracts[mode] = {
             "kind": "bound-tools", "seconds": 90,
@@ -2916,10 +2938,20 @@ def production_command_contract(stage, profile=CURRENT_PROFILE):
 
 def validate_supervised_command_binding(
         value, stage, role_identities=None,
-        transport_context="producer_direct", profile=CURRENT_PROFILE):
+        transport_context="producer_direct", profile=CURRENT_PROFILE,
+        *, historical_generation=False):
     require(transport_context in {"producer_direct", "trusted_inner_zip"},
             "invalid supervised command transport context")
+    require(type(historical_generation) is bool,
+            "invalid supervised command generation")
     contract = production_command_contract(stage, profile)
+    if historical_generation:
+        require(transport_context == "trusted_inner_zip",
+                "historical command requires authenticated import transport")
+        contract = {**contract, "environment": [
+            item for item in contract["environment"]
+            if item["name"] != "ZIG_LOCAL_PKG_DIR"
+        ]}
     require(isinstance(value, dict) and set(value) == {
         "scope", "stage", "exit_code", "bytes", "sha256", "sha256_scope",
         "over_limit", "known_error_markers", "supervisor",
@@ -2946,6 +2978,20 @@ def validate_supervised_command_binding(
       and supervisor["bootstrap"] is False,
       "invalid supervised command binding")
     request = supervisor["request"]
+    if transport_context == "trusted_inner_zip" and isinstance(request, dict):
+        historical_argv = []
+        for item in contract["argv"]:
+            if (stage == "public-validator-build"
+                    and item == command_literal("--prefix")):
+                historical_argv.extend([
+                    command_literal("--global-cache-dir"),
+                    command_path("work", "global-cache"),
+                ])
+            historical_argv.append(
+                command_literal("-Doptimize=ReleaseSafe")
+                if item == command_literal("-Doptimize=safe") else item)
+        if request.get("argv") == historical_argv:
+            contract = {**contract, "argv": historical_argv}
     digest_fields = {
         "canonical_sha256", "argv_sha256",
         "environment_sha256", "cwd_sha256",
@@ -3548,7 +3594,7 @@ def bootstrap_execute(root, stage, args, seconds, limit, cwd, evidence,
             "bootstrap command output exceeded",
             "bootstrap command timed out",
             "bootstrap command failed",
-            env=command_environment(root, input_records),
+            env=command_environment(root, input_records, stage=stage),
             pass_fds=pass_fds,
         )
     with output.open("xb") as stream:
@@ -4390,7 +4436,7 @@ def dependency_custody(root):
                 "sha256": manifest_digest.hexdigest(),
             },
             "hash_verification": {
-                "algorithm": "zig-0.16.0-fetch-path",
+                "algorithm": "zig-0.17.0-fetch-path",
                 "count": len(hash_records),
                 "sha256": hashlib.sha256(
                     compact_json(hash_records)).hexdigest(),
@@ -4451,7 +4497,7 @@ def verify_package_hashes(runtime, root, packages, expected_inputs):
             require_consumer_inputs(runtime, expected_inputs)
             output, _ = execute(
                 root, f"dependency-hash-{index:03d}",
-                [tool("zig"), "fetch", "--global-cache-dir", cache, packages / name],
+                [tool("zig"), "fetch", "--pkg-dir", cache, packages / name],
                 300, 511, cwd=work, evidence=False,
                 input_records=consumer_file_records(expected_inputs),
                 allow_bootstrap=True)
@@ -4486,8 +4532,9 @@ def restore_dependencies(runtime, root, expected_inputs):
         _, command = execute(root, "dependency-restore", [
             tool("zig"), "build", "--build-file", restore / "build.zig",
             "--fetch=all", "--cache-dir", root / "cache",
-            "--global-cache-dir", root / "global-cache", "-j2",
+            "-j2",
         ], 900, evidence=False,
+            cwd=restore,
             input_records=consumer_file_records(expected_inputs),
             allow_bootstrap=True)
         require_consumer_inputs(runtime, expected_inputs)
@@ -4521,7 +4568,7 @@ def build_command_supervisor(runtime, root, packages, expected_inputs):
         "--system", packages, "--prefix", root / "supervisor",
         "-Dsource-closure-sha256=" + source_map["content_closure_sha256"],
         *RECORDED_EXECUTABLE_TARGET,
-        "-Doptimize=ReleaseSafe", "-j2", "install",
+        "-Doptimize=safe", "-j2", "install",
     ], 900, evidence=False, input_records=records, allow_bootstrap=True)
     require(command["known_error_markers"] == [],
             "command supervisor build reported an error")
@@ -4669,7 +4716,7 @@ def check_build():
             and identity.get("variant", "tiny") == "tiny"
             and identity.get("jit_mode") is None
             and identity["compiler_profile"] == "unikraft-x86_64"
-            and identity["zig_version"] == "0.16.0"
+            and identity["zig_version"] == "0.17.0"
             and identity["minimal_wasi"] is False, "not the pinned tiny producer")
     names = {"embedded.c", "identity.h", "libwamr-aot.a", "tiny.cwasm",
              "tiny.wasm", "wamr_aot.h", "wamrc"}
@@ -5074,15 +5121,15 @@ def build(runtime, wamr):
         evidence=False, input_records=consumer_records)
     del unused_record
     version = read(version_path, 65)
-    require(version.strip() == b"0.16.0", "Zig 0.16.0 required")
+    require(version.strip() == b"0.17.0", "Zig 0.17.0 required")
     run_custodied(runtime, bootstrap, root, "adapter", [
         tool("zig"), "build", "--build-file", HERE / "build.zig",
         "--system", packages, "--prefix", root / "tools",
-        "-Doptimize=ReleaseSafe", "-j2", "test-unit", "install"], 900)
+        "-Doptimize=safe", "-j2", "test-unit", "install"], 900)
     run_custodied(runtime, bootstrap, root, "local-boot-tool", [
         tool("zig"), "build", "--build-file", LOCAL_BOOT / "build.zig",
         "--system", packages, "--prefix", root / "tools",
-        "-Doptimize=ReleaseSafe", "-j2", "install"], 900)
+        "-Doptimize=safe", "-j2", "install"], 900)
     consumer_inputs = consumer_input_state(runtime)
     COMMAND_ENVIRONMENT.update(bind_command_tools(consumer_inputs))
     os.environ.update(COMMAND_ENVIRONMENT)
@@ -5629,12 +5676,19 @@ def diagnostics(runtime):
                 and info.st_uid == os.getuid()
                 and stat.S_IMODE(info.st_mode) == 0o700,
                 "invalid diagnostic directory")
-        backend = document(entries[0] / "000-root-olddefconfig.json")
+        backends = [
+            Path(item.path) for item in bounded_scandir(
+                entries[0], 128, "invalid diagnostic",
+                "invalid diagnostic")
+            if re.fullmatch(r"[0-9]{3}-root-olddefconfig\.json", item.name)
+        ]
+        require(len(backends) == 1, "invalid diagnostic")
+        backend = document(backends[0])
         code = backend["primary"]["exited"]
         require(backend["stage"] == "root-olddefconfig"
                 and type(code) is int and 0 <= code <= 255,
                 "invalid diagnostic")
-        output = read(entries[0] / "000-root-olddefconfig.stderr", 64 * 1024)
+        output = read(backends[0].with_suffix(".stderr"), 64 * 1024)
         build_failures["config"].update({
             "backend_exit_code": code,
             "known_error_markers": command_error_markers(output),

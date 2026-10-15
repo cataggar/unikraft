@@ -106,6 +106,7 @@ previous = calls.read_text().splitlines() if calls.exists() else []
 with calls.open("a") as output:
     output.write(json.dumps({"argv": [name] + sys.argv[1:],
                              "authenticated": bool(os.environ.get("GH_TOKEN")),
+                             "global_cache_dir": os.environ.get("ZIG_GLOBAL_CACHE_DIR"),
                              "noninteractive": os.environ.get("DEBIAN_FRONTEND") == "noninteractive"}) + "\\n")
 attempt = len(previous) + 1
 scenario = os.environ["FIXTURE_SCENARIO"]
@@ -156,7 +157,7 @@ if name == "zig":
     if args[:1] != ["build"] or "--fetch=all" not in args or "--system" in args:
         raise SystemExit(9)
     stage = Path(args[args.index("--build-file") + 1]).parent
-    temporary = Path(args[args.index("--global-cache-dir") + 1]) / "tmp"
+    temporary = Path(os.environ["ZIG_GLOBAL_CACHE_DIR"]) / "tmp"
     if not temporary.is_dir() or temporary.stat().st_mode & 0o777 != 0o700:
         raise SystemExit(9)
     if scenario == "zig-closing-always" or scenario == "zig-closing-twice" and attempt < 3:
@@ -320,7 +321,7 @@ sys.stdout.write('{"verified_read":true}\\n')
             self.assertTrue((destination / f"attempt-{attempt}/partial").is_file())
             self.assertFalse((destination / f"attempt-{attempt}/zig-pkg").exists())
         self.assertEqual(len({
-            call["argv"][call["argv"].index("--global-cache-dir") + 1]
+            call["global_cache_dir"]
             for call in self.recorded()}), 3)
         result = self.invoke(
             "hyperv-native-zig-restore.sh", "zig-success", destination)
@@ -572,6 +573,11 @@ class NativeRecordBridge(unittest.TestCase):
             "  'evidence/command-import-validator-build.json': b'{}',\n"
             "  'evidence/command-import-native-revalidation.json': b'{}',\n"
             "}\n"
+            "if mode == 'historical':\n"
+            "    del files['private/import-native-revalidation.log']\n"
+            "    del files['evidence/command-import-native-revalidation.json']\n"
+            "    files['private/import-historical-native-revalidation.log'] = b'Historical compute handoff revalidated; authority=not_admitted.\\n'\n"
+            "    files['evidence/command-import-historical-native-revalidation.json'] = b'{}'\n"
             "for name, data in files.items():\n"
             "    path = output / name\n"
             "    path.write_bytes(data)\n"
@@ -580,6 +586,12 @@ class NativeRecordBridge(unittest.TestCase):
             "if mode == 'stderr': os.write(2, b'unexpected')\n")
         stage = root / "stage"
         stage.mkdir(mode=0o700)
+        tools = {}
+        for role in ("git", "supervisor", "validator"):
+            path = root / role
+            path.write_bytes(b"local tool")
+            path.chmod(0o500)
+            tools[role] = path
         with mock.patch.dict(os.environ, {
                 bridge.CONTROLLER_ENV: str(controller),
                 "WAMR_CI_TEST_MODE": "accepted"}):
@@ -590,6 +602,21 @@ class NativeRecordBridge(unittest.TestCase):
                     self.assertRaisesRegex(ValueError, "revalidation refused"):
                 bridge.import_native_revalidation(stage, output)
             spawn.assert_not_called()
+            with self.assertRaisesRegex(ValueError, "revalidation refused"):
+                bridge.import_native_revalidation(
+                    stage, root / "wrong-historical-marker",
+                    historical=True, **tools)
+            with mock.patch.object(bridge.subprocess, "Popen") as spawn, \
+                    self.assertRaisesRegex(ValueError, "revalidation refused"):
+                bridge.import_native_revalidation(
+                    stage, root / "no-historical-tools", historical=True)
+            spawn.assert_not_called()
+        with mock.patch.dict(os.environ, {
+                bridge.CONTROLLER_ENV: str(controller),
+                "WAMR_CI_TEST_MODE": "historical"}):
+            output = root / "historical"
+            self.assertEqual(bridge.import_native_revalidation(
+                stage, output, historical=True, **tools), output)
         for mode in ("failed", "missing", "public", "stdout", "stderr"):
             with self.subTest(mode=mode), mock.patch.dict(os.environ, {
                     bridge.CONTROLLER_ENV: str(controller),
@@ -1738,9 +1765,11 @@ class NativeRecordBridge(unittest.TestCase):
             return root / ("identity-output" if stage ==
                            "supervisor-import-identity" else "native-output"), {}
 
+        native_marker = b"Compute handoff revalidated; authority=not_admitted.\n"
+
         def read(path, unused_limit):
             return (b"{}\n" if path == root / "identity-output"
-                    else b"Compute handoff revalidated; authority=not_admitted.\n")
+                    else native_marker)
 
         handoff = types.SimpleNamespace(ci=ci, private=mock.Mock())
         with mock.patch.object(public_bundle, "validate_local_supervisor",
@@ -1781,6 +1810,29 @@ class NativeRecordBridge(unittest.TestCase):
             self.assertEqual(
                 [call.args[1] for call in run.call_args_list],
                 ["supervisor-import-identity", "native-revalidation"])
+            with self.assertRaisesRegex(ValueError, "bundle refused"):
+                public_bundle.native(
+                    handoff, validator, supervisor, bundle, {},
+                    native_identity=identity, historical=True)
+            native_marker = (
+                b"Historical compute handoff revalidated; authority=not_admitted.\n")
+            run.reset_mock()
+            checked.reset_mock()
+            public_bundle.native(
+                handoff, validator, supervisor, bundle, {},
+                native_identity=identity, historical=True)
+            self.assertEqual(
+                [call.args[1] for call in run.call_args_list],
+                ["historical-native-revalidation"])
+            self.assertEqual(
+                run.call_args.args[2], [validator, "historical-handoff", bundle])
+            self.assertEqual(
+                [call.args[2] for call in checked.call_args_list],
+                ["historical-native-revalidation"])
+            with self.assertRaisesRegex(ValueError, "bundle refused"):
+                public_bundle.native(
+                    handoff, validator, supervisor, bundle, {},
+                    native_identity=identity)
 
     def test_trusted_v2_import_revalidation_selection_is_explicit(self):
         root, unused_controller = self.controller_fixture("")
@@ -1920,7 +1972,8 @@ class NativeRecordBridge(unittest.TestCase):
 
         def python_revalidation(
                 unused_handoff, validator, supervisor, candidate, expected_arg,
-                native_identity=None):
+                native_identity=None, *, historical=False):
+            self.assertFalse(historical)
             self.assertEqual(validator, root / "validator")
             self.assertEqual(supervisor, root / "supervisor")
             self.assertEqual(candidate, output / "candidate-bundle.json")
@@ -2127,6 +2180,7 @@ class NativeRecordBridge(unittest.TestCase):
             **source,
             "source_revision": "993e4d0d394c08202c0d0c57ea97450a19a4f394",
             "source_tree": "54f8e118146c78c24e7c802657c6ec62b268a5de",
+            "wamr_revision": ci.HISTORICAL_WAMR_REVISION,
         }
         handoff.NAMES = self.handoff_module().NAMES
         legacy_artifacts = [
@@ -2139,7 +2193,10 @@ class NativeRecordBridge(unittest.TestCase):
             "authority": "not_admitted",
             "source_revision": legacy_source["source_revision"],
             "source_tree": legacy_source["source_tree"],
-            "identity": bundle["identity"],
+            "identity": {
+                **bundle["identity"],
+                "wamr_revision": ci.HISTORICAL_WAMR_REVISION,
+            },
             "artifacts": legacy_artifacts,
             "evidence": legacy_evidence,
             "boots": [{
@@ -2449,7 +2506,7 @@ class Contract(unittest.TestCase):
     def test_build_refuses_development_and_optional_images(self):
         identity = {
             "wamr_revision": ci.REVISION, "minimal_wasi": False,
-            "compiler_profile": "unikraft-x86_64", "zig_version": "0.16.0",
+            "compiler_profile": "unikraft-x86_64", "zig_version": "0.17.0",
             "variant": "tiny", "development_only": False, "jit_mode": None,
         }
         for key, value in (("development_only", True), ("variant", "snapshot"),
@@ -3560,6 +3617,25 @@ class Evidence(unittest.TestCase):
             })
         self.assertEqual(owner.FAILURE_STAGE, "public-context-binding")
 
+    def test_public_context_retains_frozen_sdk_without_accepting_unknown_revision(self):
+        source = {
+            "repository": "cataggar/unikraft",
+            "run_id": "123", "run_attempt": "1",
+            "source_revision": "1" * 40, "source_tree": "2" * 40,
+            "wamr_revision": ci.REVISION,
+        }
+        self.assertEqual(public_bundle.context(source), source)
+        self.assertEqual(public_bundle.context(source, version=2), source)
+        with self.assertRaises(ValueError):
+            public_bundle.context(source, version=1)
+        source["wamr_revision"] = ci.HISTORICAL_WAMR_REVISION
+        self.assertEqual(public_bundle.context(source), source)
+        self.assertEqual(public_bundle.context(source, version=1), source)
+        self.assertEqual(public_bundle.context(source, version=2), source)
+        source["wamr_revision"] = "f" * 40
+        with self.assertRaises(ValueError):
+            public_bundle.context(source)
+
     def test_precreated_parity_slots_preserve_recorded_runtime_ancestor(self):
         parent = self.root / "paired-parent"
         runtime = parent / "runtime"
@@ -4419,7 +4495,7 @@ class Evidence(unittest.TestCase):
         def execute_direct(root, stage, args, *unused, **unused_keywords):
             self.assertEqual(stage, "zig-version")
             path = root / "private/zig-version.log"
-            path.write_bytes(b"0.16.0\n")
+            path.write_bytes(b"0.17.0\n")
             return path, {}
 
         original_supervisor = ci.COMMAND_SUPERVISOR_PATH
@@ -4461,13 +4537,13 @@ class Evidence(unittest.TestCase):
                         ({"/tools/zig": "/tools/zig"}, ())),
                 }),
                 ("bounded_subprocess_output", {
-                    "return_value": b"0.16.0\n"}),
+                    "return_value": b"0.17.0\n"}),
                 ("tool", {
                     "side_effect": lambda name: "/tools/" + name}),
             ):
                 stack.enter_context(mock.patch.object(ci, name, **kwargs))
             stack.enter_context(mock.patch.object(
-                ci.subprocess, "check_output", return_value=b"0.16.0\n"))
+                ci.subprocess, "check_output", return_value=b"0.17.0\n"))
             ci.build(runtime, self.root)
         ci.COMMAND_TOOL_PATHS.clear()
         ci.COMMAND_TOOL_PATHS.update(original_tools)
@@ -4536,6 +4612,30 @@ class Evidence(unittest.TestCase):
                     ci.Refusal, "private pinned dependency restore required"):
                 ci.restore_dependencies(
                     root.parent, root, {"schema": "fixture"})
+
+    def test_restore_depot_is_per_restore_without_global_environment_changes(self):
+        original = dict(ci.COMMAND_ENVIRONMENT)
+        for name in ("restore-one", "restore-two"):
+            root = self.root / name
+            for stage in ("dependency-restore", "prepare", "config", "native-image"):
+                environment = ci.command_environment(root, stage=stage)
+                self.assertEqual(environment["ZIG_LOCAL_PKG_DIR"],
+                                 str(root / "dependencies/zig-pkg"))
+        self.assertEqual(ci.COMMAND_ENVIRONMENT, original)
+        self.assertNotIn(
+            "ZIG_LOCAL_PKG_DIR",
+            ci.command_environment(self.root, stage="adapter"))
+        with mock.patch.dict(os.environ, {"ZIG_LOCAL_PKG_DIR": "/untrusted/ambient"}):
+            for stage in ("adapter", "local-boot-tool", "supervisor-build"):
+                self.assertNotIn("ZIG_LOCAL_PKG_DIR", ci.command_environment(
+                    self.root, extra={"ZIG_LOCAL_PKG_DIR": "/untrusted/extra"},
+                    stage=stage))
+            for stage in ("dependency-restore", "prepare", "config", "native-image"):
+                self.assertEqual(
+                    ci.command_environment(
+                        self.root, extra={"ZIG_LOCAL_PKG_DIR": "/untrusted/extra"},
+                        stage=stage)["ZIG_LOCAL_PKG_DIR"],
+                    str(self.root / "dependencies/zig-pkg"))
 
     def test_dependency_paths_refuse_outside_or_missing_repository_without_leak(self):
         manifests = {
@@ -4668,8 +4768,8 @@ class Evidence(unittest.TestCase):
                 "support/tools/hyperv/local_boot/build.zig", repository)
         self.assertTrue(raced)
 
-    def dependency_fixture(self):
-        root = self.root / "dependency-fixture"
+    def dependency_fixture(self, name="dependency-fixture"):
+        root = self.root / name
         root.mkdir(mode=0o700)
         private = root / "private"
         private.mkdir(mode=0o700)
@@ -4708,6 +4808,53 @@ class Evidence(unittest.TestCase):
 
         return root, packages, mock.patch.object(
             ci, "tracked_manifest", side_effect=manifest_record)
+
+    def test_historical_dependency_import_keeps_its_producer_pin(self):
+        root, _, tracked = self.dependency_fixture()
+        with tracked:
+            current = ci.dependency_custody(root)
+        current_sources = {
+            name: item["source"]
+            for name, item in current["source_manifests"].items()
+        }
+        with mock.patch.object(
+                public_bundle, "trusted_source_manifests", return_value=current_sources):
+            public_bundle.dependency_record(ci, current, {})
+        with (mock.patch.object(ci, "MIZ_REVISION", ci.HISTORICAL_MIZ_REVISION),
+              mock.patch.object(ci, "MIZ_PACKAGE_HASH", ci.HISTORICAL_MIZ_PACKAGE_HASH),
+              mock.patch.object(ci, "MIZ_URL", ci.HISTORICAL_MIZ_URL)):
+            historical_root, _, historical_tracked = self.dependency_fixture(
+                "historical-dependency-fixture")
+            with historical_tracked:
+                historical = ci.dependency_custody(historical_root)
+        historical["packages"]["hash_verification"]["algorithm"] = (
+            "zig-0.16.0-fetch-path")
+        sources = {
+            name: item["source"]
+            for name, item in historical["source_manifests"].items()
+        }
+        with (mock.patch.object(
+                public_bundle, "trusted_source_manifests", return_value=sources),
+              mock.patch.object(ci, "MIZ_REVISION", "b" * 40),
+              mock.patch.object(ci, "MIZ_PACKAGE_HASH", "miz-0.2.0-new-current"),
+              mock.patch.object(ci, "MIZ_URL", "git+https://example.invalid#new")):
+            public_bundle.dependency_record(ci, historical, {})
+            with self.assertRaises(ValueError):
+                public_bundle.dependency_record(ci, current, {})
+            altered = copy.deepcopy(historical)
+            altered["request"]["package_hash"] = ci.MIZ_PACKAGE_HASH
+            with self.assertRaises(ValueError):
+                public_bundle.dependency_record(ci, altered, {})
+            relabeled = copy.deepcopy(current)
+            relabeled["packages"]["hash_verification"]["algorithm"] = (
+                "zig-0.16.0-fetch-path")
+            with self.assertRaises(ValueError):
+                public_bundle.dependency_record(ci, relabeled, {})
+            for algorithm in ("zig-0.15.2-fetch-path", [], {"unexpected": True}):
+                altered = copy.deepcopy(historical)
+                altered["packages"]["hash_verification"]["algorithm"] = algorithm
+                with self.assertRaises(ValueError):
+                    public_bundle.dependency_record(ci, altered, {})
 
     def test_restore_manifest_requires_exact_miz_revision_hash_and_one_pin(self):
         valid = (
@@ -4797,6 +4944,8 @@ class Evidence(unittest.TestCase):
 
         def wrong(*args, **kwargs):
             work = root / "dependency-hash-work"
+            self.assertEqual(args[2][1:4], [
+                "fetch", "--pkg-dir", root / "dependency-hash-cache"])
             self.assertEqual(kwargs["cwd"], work)
             self.assertEqual((work / "build.zig").read_bytes(),
                              (root / "dependencies/build.zig").read_bytes())
@@ -4825,7 +4974,7 @@ class Evidence(unittest.TestCase):
     .name = .fixture,
     .version = "0.0.0",
     .fingerprint = 0x5e540eeabebe342,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{},
     .paths = .{""},
 }
@@ -5334,11 +5483,25 @@ source/generated/
                     ci.execute(
                         self.root, "public-validator-build",
                         [PYTHON, "-c", "print('must not run')"])
-            output, record = ci.execute(
-                self.root, "dependency-restore",
-                [PYTHON, "-c", "print('bootstrap')"],
-                allow_bootstrap=True)
-            self.assertEqual(output.read_bytes(), b"bootstrap\n")
+            with mock.patch.dict(
+                    os.environ, {"ZIG_LOCAL_PKG_DIR": "/untrusted/ambient"}), \
+                    mock.patch.dict(
+                        ci.COMMAND_ENVIRONMENT,
+                        {"ZIG_LOCAL_PKG_DIR": "/untrusted/global"}):
+                output, record = ci.execute(
+                    self.root, "dependency-restore",
+                    [PYTHON, "-c",
+                     "import os; print(os.environ['ZIG_LOCAL_PKG_DIR'])"],
+                    allow_bootstrap=True)
+                self.assertEqual(
+                    output.read_bytes(),
+                    (str(self.root / "dependencies/zig-pkg") + "\n").encode())
+                clean_output, _ = ci.execute(
+                    self.root, "supervisor-build",
+                    [PYTHON, "-c",
+                     "import os; print('ZIG_LOCAL_PKG_DIR' in os.environ)"],
+                    allow_bootstrap=True)
+                self.assertEqual(clean_output.read_bytes(), b"False\n")
             self.assertTrue(record["supervisor"]["bootstrap"])
             for stage in (
                     "dependency-restore-extra", "dependency-hash",
@@ -5433,7 +5596,7 @@ source/generated/
             [arg for arg in args if str(arg).startswith(("-Dtarget=", "-Dcpu="))],
             list(target),
         )
-        self.assertIn("-Doptimize=ReleaseSafe", args)
+        self.assertIn("-Doptimize=safe", args)
 
     def test_public_validator_build_and_contract_pin_portable_target(self):
         target = ("-Dtarget=x86_64-linux-gnu", "-Dcpu=x86_64_v2")
@@ -5465,7 +5628,7 @@ source/generated/
             [arg for arg in args if str(arg).startswith(("-Dtarget=", "-Dcpu="))],
             list(target),
         )
-        self.assertIn("-Doptimize=ReleaseSafe", args)
+        self.assertIn("-Doptimize=safe", args)
         record, identities = self.supervised_binding("public-validator-build")
         argv = record["supervisor"]["request"]["argv"]
         for flag in target:
@@ -5485,6 +5648,37 @@ source/generated/
                         public_bundle.supervised_command_record(
                             ci, changed, "public-validator-build", identities,
                             "trusted_inner_zip")
+
+    def test_historical_optimize_flags_are_import_only(self):
+        for stage in ("adapter", "local-boot-tool", "public-validator-build"):
+            with self.subTest(stage=stage):
+                record, identities = self.supervised_binding(stage)
+                request = record["supervisor"]["request"]
+                current = ci.command_literal("-Doptimize=safe")
+                index = request["argv"].index(current)
+                request["argv"][index] = ci.command_literal(
+                    "-Doptimize=ReleaseSafe")
+                if stage == "public-validator-build":
+                    prefix = request["argv"].index(ci.command_literal("--prefix"))
+                    request["argv"][prefix:prefix] = [
+                        ci.command_literal("--global-cache-dir"),
+                        ci.command_path("work", "global-cache"),
+                    ]
+                    index = request["argv"].index(
+                        ci.command_literal("-Doptimize=ReleaseSafe"))
+                self.rehash_supervised_binding(record)
+                ci.validate_supervised_command_binding(
+                    record, stage, identities,
+                    transport_context="trusted_inner_zip")
+                with self.assertRaises(ci.Refusal):
+                    ci.validate_supervised_command_binding(
+                        record, stage, identities)
+                request["argv"][index] = ci.command_literal("-Doptimize=fast")
+                self.rehash_supervised_binding(record)
+                with self.assertRaises(ci.Refusal):
+                    ci.validate_supervised_command_binding(
+                        record, stage, identities,
+                        transport_context="trusted_inner_zip")
 
     def test_native_wamr_command_binding_refuses_rehashed_tamper(self):
         for stage in ("prepare", "config", "native-image"):
@@ -5517,6 +5711,34 @@ source/generated/
                 with self.assertRaises(ci.Refusal):
                     ci.validate_supervised_command_binding(
                         record, stage, changed_identities)
+
+    def test_root_depot_binding_is_current_and_historical_imports_remain_explicit(self):
+        for stage in ("prepare", "config", "native-image"):
+            with self.subTest(stage=stage):
+                record, identities = self.supervised_binding(stage)
+                environment = record["supervisor"]["request"]["environment"]
+                selected = next(item for item in environment
+                                if item["name"] == "ZIG_LOCAL_PKG_DIR")
+                self.assertEqual(selected["value"],
+                                 ci.command_path("work", "dependencies/zig-pkg"))
+                legacy = copy.deepcopy(record)
+                legacy["supervisor"]["request"]["environment"] = [
+                    item for item in environment
+                    if item["name"] != "ZIG_LOCAL_PKG_DIR"
+                ]
+                self.rehash_supervised_binding(legacy)
+                for transport in ("producer_direct", "trusted_inner_zip"):
+                    with self.assertRaises(ci.Refusal):
+                        ci.validate_supervised_command_binding(
+                            legacy, stage, identities,
+                            transport_context=transport)
+                ci.validate_supervised_command_binding(
+                    legacy, stage, identities,
+                    transport_context="trusted_inner_zip",
+                    historical_generation=True)
+                with self.assertRaises(ci.Refusal):
+                    ci.validate_supervised_command_binding(
+                        legacy, stage, identities, historical_generation=True)
 
     def test_handoff_inspect_accepts_distinct_native_controller_supervisor_role(self):
         record, identities = self.supervised_binding("handoff-inspect")
@@ -7327,11 +7549,11 @@ source/generated/
         self.put(backend.parent.parent / "failure-error-name.txt",
                  b"InvalidToolOverride")
         self.put(backend.parent.parent / "failure-tool-role.txt", b"make")
-        ci.save(backend / "000-root-olddefconfig.json", {
+        ci.save(backend / "002-root-olddefconfig.json", {
             "stage": "root-olddefconfig",
             "primary": {"exited": 1},
         })
-        self.put(backend / "000-root-olddefconfig.stderr",
+        self.put(backend / "002-root-olddefconfig.stderr",
                  b"error: InvalidNativeMakePath\nPRIVATE_SYNTHETIC_STATE\n")
         ci.save(work / "report.json", {
             "passed": False, "cleanup_complete": True, "input_unchanged": True,

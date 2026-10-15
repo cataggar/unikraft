@@ -102,26 +102,32 @@ Fixture-only native fake tools are never selected by production code.
 Each successful fixture run records its case count in its generated
 `hyperv-object-fixtures/result.txt`.
 
-Pinned local invocation (Linux, Zig 0.16.0, existing LLVM 22.1.8):
+Pinned local invocation (Linux, Zig 0.17.0, existing LLVM 22.1.8):
 
 ```sh
+umask 077
 cd /d/unikraft-worktrees/fleet-network
-work="$PWD/.d/zig-migration-object-proofs"
+work="$HOME/unikraft-zig17-object-proofs"
 export HOME="$work/home" TMPDIR="$work/tmp"
 export ZIG_LOCAL_CACHE_DIR="$work/cache"
 export ZIG_GLOBAL_CACHE_DIR="$work/global-cache"
+export ZIG_LOCAL_PKG_DIR="$work/packages"
 export PATH="/home/g/.local/bin:/d/unikraft-worktrees/fleet-ci/.d/tools/llvm-tools-22.1.8-aarch64-linux/bin:$PATH"
-mkdir -p "$HOME" "$TMPDIR" "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR"
+mkdir -p "$HOME" "$TMPDIR" "$ZIG_LOCAL_CACHE_DIR" "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_PKG_DIR"
+/home/g/.local/bin/zig build --fetch=all --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
+  --prefix "$work/outputs/restore"
 /home/g/.local/bin/zig build hyperv-object-proofs test-hyperv-object-proofs \
-  -Doptimize=Debug -j2 --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
-  --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" --prefix "$work/outputs/debug"
+  --system "$ZIG_LOCAL_PKG_DIR" \
+  -Doptimize=debug -j2 --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
+  --prefix "$work/outputs/debug"
 /home/g/.local/bin/zig build hyperv-object-proofs test-hyperv-object-proofs \
-  -Doptimize=ReleaseSafe -j2 --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
-  --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" --prefix "$work/outputs/release-safe"
+  --system "$ZIG_LOCAL_PKG_DIR" \
+  -Doptimize=safe -j2 --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
+  --prefix "$work/outputs/safe"
 ```
 
-The existing protocol/C suites retain their existing Debug mode and the
-freestanding producers retain ReleaseFast; the new verifier, parser tests,
+The existing protocol/C suites retain their existing debug mode and the
+freestanding producers retain fast; the new verifier, parser tests,
 CLI fixture driver and fake tool use the selected optimization mode.
 `-Dhyperv-object-nm=PATH`, `-Dhyperv-object-readelf=PATH` and
 `-Dhyperv-object-objcopy=PATH` select explicit native tool executables.
@@ -131,8 +137,13 @@ Producer-closure additions for parent integration: the six
 `tests/hyperv-object-undefined.c`, existing `elf-common-validator.zig`, and
 the shared `support/tools/hyperv/process.zig` / `diagnostics.zig` modules and
 their transitive `contracts.zig` / `sensitive.zig` dependencies.
-There are no new package dependencies or package restores. Required CI runs the
-focused selector in Debug and ReleaseSafe. Both guarded producer maps bind the
+The verifier adds no packages beyond the root's immutable translator/Aro
+closure, but root selectors require that depot too. The restore command above
+is an explicit developer bootstrap, not part of guarded source/admission
+custody. Required CI must authenticate and bind compiler/package inputs first,
+then retain `--system` with the qualified depot; it must not fetch implicitly or
+substitute an empty package tree. Required CI runs the
+focused selector in debug and safe. Both guarded producer maps bind the
 complete guarded build closure outside the separate `wamr-native-ci` controller
 subtree and the shared core dependencies.
 

@@ -63,7 +63,7 @@ fn readerTool(actual: types.Artifact, retained: *const core.private_files.Retain
 
 fn project(comptime T: type, value: anytype) T {
     var result: T = undefined;
-    inline for (std.meta.fields(T)) |field| @field(result, field.name) = @field(value, field.name);
+    inline for (@typeInfo(T).@"struct".field_names) |field_name| @field(result, field_name) = @field(value, field_name);
     return result;
 }
 fn fromMetadata(inputs: types.PlanInputs, metadata: candidate.Metadata) !types.Plan {
@@ -203,9 +203,9 @@ pub fn admission(value: types.Plan, plan_artifact: types.Artifact, decision: typ
     try decision.validate(value, plan_artifact.sha256);
     try decision.current(now);
     var result: types.Admission = undefined;
-    inline for (std.meta.fields(types.Plan)) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "schema") and !std.mem.eql(u8, field.name, "version") and !std.mem.eql(u8, field.name, "authority"))
-            @field(result, field.name) = @field(value, field.name);
+    inline for (@typeInfo(types.Plan).@"struct".field_names) |field_name| {
+        if (comptime !std.mem.eql(u8, field_name, "schema") and !std.mem.eql(u8, field_name, "version") and !std.mem.eql(u8, field_name, "authority"))
+            @field(result, field_name) = @field(value, field_name);
     }
     result.schema = "uk.wamr.azure-execution-admission";
     result.version = 2;
@@ -233,7 +233,7 @@ pub fn normalizeUuid(a: std.mem.Allocator, input: []const u8) ![]u8 {
         at += 1;
     }
     if (at != digits.len) return error.InvalidUuid;
-    return std.fmt.allocPrint(a, "{s}-{s}-{s}-{s}-{s}", .{ digits[0..8], digits[8..12], digits[12..16], digits[16..20], digits[20..32] });
+    return a.print("{s}-{s}-{s}-{s}-{s}", .{ digits[0..8], digits[8..12], digits[12..16], digits[16..20], digits[20..32] });
 }
 pub fn freshUuid(a: std.mem.Allocator, io: std.Io) ![]u8 {
     var bytes: [16]u8 = undefined;
@@ -304,7 +304,7 @@ test "plan reader-tool binding requires the retained path size and fresh digest"
     const io = std.testing.io;
     const directory = try std.Io.Dir.openDirAbsolute(io, @import("test_options").fixture_root, .{});
     defer directory.close(io);
-    const name = try std.fmt.allocPrint(a, "authority-reader-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("authority-reader-{d}", .{std.os.linux.getpid()});
     defer a.free(name);
     const file = try directory.createFile(io, name, .{ .exclusive = true, .permissions = .fromMode(0o600) });
     defer file.close(io);

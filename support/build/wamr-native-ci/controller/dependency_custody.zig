@@ -53,21 +53,21 @@ fn dependencyNode(allocator: std.mem.Allocator, bytes: []const u8) !struct {
     node: ?std.zig.Zoir.Node,
 } {
     if (bytes.len > 4 * limits.mib or bytes.len == 0) return error.InvalidManifest;
-    const zero = try allocator.dupeZ(u8, bytes);
+    const zero = try allocator.dupeSentinel(u8, bytes, 0);
     errdefer allocator.free(zero);
-    var ast = try std.zig.Ast.parse(allocator, zero, .zon);
+    var ast = try std.zig.Ast.parse(allocator, zero, .{ .mode = .zon });
     errdefer ast.deinit(allocator);
     if (ast.errors.len != 0) return error.InvalidManifest;
     const zoir = try std.zig.ZonGen.generate(allocator, ast, .{});
     errdefer zoir.deinit(allocator);
     if (zoir.hasCompileErrors() or zoir.nodes.len > 4096) return error.InvalidManifest;
-    const root = std.zig.Zoir.Node.Index.root.get(zoir);
+    const root = std.zig.Zoir.Node.Index.root.get(&zoir);
     if (root != .struct_literal) return error.InvalidManifest;
     var found: ?std.zig.Zoir.Node = null;
     for (root.struct_literal.names, 0..) |name, i| {
-        if (!std.mem.eql(u8, name.get(zoir), "dependencies")) continue;
+        if (!std.mem.eql(u8, name.get(&zoir), "dependencies")) continue;
         if (found != null) return error.InvalidManifest;
-        found = root.struct_literal.vals.at(@intCast(i)).get(zoir);
+        found = root.struct_literal.vals.at(@intCast(i)).get(&zoir);
     }
     if (found) |node| switch (node) {
         .struct_literal, .empty_literal => {},
@@ -76,24 +76,41 @@ fn dependencyNode(allocator: std.mem.Allocator, bytes: []const u8) !struct {
     return .{ .source_bytes = zero, .ast = ast, .zoir = zoir, .node = found };
 }
 
-pub fn pinnedManifest(allocator: std.mem.Allocator, bytes: []const u8) !void {
+const Generation = enum { current, historical };
+
+fn pinnedManifestGeneration(allocator: std.mem.Allocator, bytes: []const u8, allow_historical: bool) !Generation {
     var parsed = try dependencyNode(allocator, bytes);
     defer allocator.free(parsed.source_bytes);
     defer parsed.ast.deinit(allocator);
     defer parsed.zoir.deinit(allocator);
     const dependencies = parsed.node orelse return error.UnpinnedDependency;
     if (dependencies != .struct_literal or dependencies.struct_literal.names.len != 1 or
-        !std.mem.eql(u8, dependencies.struct_literal.names[0].get(parsed.zoir), "miz_source"))
+        !std.mem.eql(u8, dependencies.struct_literal.names[0].get(&parsed.zoir), "miz_source"))
         return error.UnpinnedDependency;
     const index = dependencies.struct_literal.vals.at(0);
-    const pin = try std.zon.parse.fromZoirNodeAlloc(Pin, allocator, parsed.ast, parsed.zoir, index, null, .{});
-    defer {
-        allocator.free(pin.url);
-        allocator.free(pin.hash);
-    }
-    if (!std.mem.eql(u8, pin.url, limits.miz_url) or
-        !std.mem.eql(u8, pin.hash, limits.miz_package_hash))
-        return error.UnpinnedDependency;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    // Zig 0.17 fromZoir does not forward its node option to the parser.
+    const pin_source = try arena.allocator().dupeSentinel(u8, parsed.ast.getNodeSource(index.getAstNode(&parsed.zoir)), 0);
+    const pin = try std.zon.parse.fromSlice(Pin, .{
+        .gpa = allocator,
+        .arena = arena.allocator(),
+        .source = pin_source,
+        .diagnostics = &diagnostics,
+    });
+    if (std.mem.eql(u8, pin.url, limits.miz_url) and
+        std.mem.eql(u8, pin.hash, limits.miz_package_hash))
+        return .current;
+    if (allow_historical and
+        std.mem.eql(u8, pin.url, limits.historical_miz_url) and
+        std.mem.eql(u8, pin.hash, limits.historical_miz_package_hash))
+        return .historical;
+    return error.UnpinnedDependency;
+}
+
+pub fn pinnedManifest(allocator: std.mem.Allocator, bytes: []const u8) !void {
+    _ = try pinnedManifestGeneration(allocator, bytes, false);
 }
 
 pub fn packageDependencies(allocator: std.mem.Allocator, bytes: []const u8) ![][]const u8 {
@@ -105,18 +122,31 @@ pub fn packageDependencies(allocator: std.mem.Allocator, bytes: []const u8) ![][
     if (dependencies == .empty_literal) return allocator.alloc([]const u8, 0);
     const result = try allocator.alloc([]const u8, dependencies.struct_literal.names.len);
     errdefer allocator.free(result);
+    var initialized: usize = 0;
+    errdefer for (result[0..initialized]) |pin| allocator.free(pin);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
     for (dependencies.struct_literal.names, 0..) |_, i| {
-        const node = dependencies.struct_literal.vals.at(@intCast(i)).get(parsed.zoir);
+        const node = dependencies.struct_literal.vals.at(@intCast(i)).get(&parsed.zoir);
         if (node != .struct_literal) return error.InvalidManifest;
         var found: ?[]const u8 = null;
         for (node.struct_literal.names, 0..) |name, j| {
-            if (std.mem.eql(u8, name.get(parsed.zoir), "hash")) {
+            if (std.mem.eql(u8, name.get(&parsed.zoir), "hash")) {
                 if (found != null) return error.InvalidManifest;
-                const pin = try std.zon.parse.fromZoirNodeAlloc([]const u8, allocator, parsed.ast, parsed.zoir, node.struct_literal.vals.at(@intCast(j)), null, .{});
+                const index = node.struct_literal.vals.at(@intCast(j));
+                const pin_source = try arena.allocator().dupeSentinel(u8, parsed.ast.getNodeSource(index.getAstNode(&parsed.zoir)), 0);
+                const pin = try std.zon.parse.fromSlice([]const u8, .{
+                    .gpa = allocator,
+                    .arena = arena.allocator(),
+                    .source = pin_source,
+                    .diagnostics = &diagnostics,
+                });
                 found = pin;
             }
         }
-        result[i] = found orelse return error.InvalidManifest;
+        result[i] = try allocator.dupe(u8, found orelse return error.InvalidManifest);
+        initialized += 1;
         try limits.packageName(result[i]);
         for (result[0..i]) |prior|
             if (std.mem.eql(u8, prior, result[i])) return error.InvalidManifest;
@@ -127,6 +157,51 @@ pub fn packageDependencies(allocator: std.mem.Allocator, bytes: []const u8) ![][
         }
     }.less);
     return result;
+}
+
+test "current restore manifest refuses historical and mismatched pin generations" {
+    const allocator = std.testing.allocator;
+    const current = ".{ .dependencies = .{ .miz_source = .{ .url = \"" ++
+        limits.miz_url ++ "\", .hash = \"" ++ limits.miz_package_hash ++ "\" } } }";
+    try pinnedManifest(allocator, current);
+    const historical = ".{ .dependencies = .{ .miz_source = .{ .url = \"" ++
+        limits.historical_miz_url ++ "\", .hash = \"" ++ limits.historical_miz_package_hash ++ "\" } } }";
+    try std.testing.expectError(error.UnpinnedDependency, pinnedManifest(allocator, historical));
+    const mismatched = ".{ .dependencies = .{ .miz_source = .{ .url = \"" ++
+        limits.miz_url ++ "\", .hash = \"" ++ limits.historical_miz_package_hash ++ "\" } } }";
+    try std.testing.expectError(error.UnpinnedDependency, pinnedManifest(allocator, mismatched));
+    const alias = ".{ .dependencies = .{ .alias = .{ .url = \"" ++
+        limits.miz_url ++ "\", .hash = \"" ++ limits.miz_package_hash ++ "\" } } }";
+    try std.testing.expectError(error.UnpinnedDependency, pinnedManifest(allocator, alias));
+}
+
+test "arena ZON extraction retains independent pins and rolls back invalid later entries" {
+    const allocator = std.testing.allocator;
+    const pins = try packageDependencies(allocator,
+        \\.{ .dependencies = .{
+        \\    .first = .{ .hash = "package-b" },
+        \\    .second = .{ .hash = "package-a" },
+        \\} }
+    );
+    defer {
+        for (pins) |pin| allocator.free(pin);
+        allocator.free(pins);
+    }
+    try std.testing.expectEqual(@as(usize, 2), pins.len);
+    try std.testing.expectEqualStrings("package-a", pins[0]);
+    try std.testing.expectEqualStrings("package-b", pins[1]);
+    try std.testing.expectError(error.InvalidManifest, packageDependencies(allocator,
+        \\.{ .dependencies = .{
+        \\    .first = .{ .hash = "package-a" },
+        \\    .second = .{ .hash = "package-a" },
+        \\} }
+    ));
+    try std.testing.expectError(error.InvalidManifest, packageDependencies(allocator,
+        \\.{ .dependencies = .{
+        \\    .first = .{ .hash = "package-a" },
+        \\    .second = .{ .url = "https://invalid.test" },
+        \\} }
+    ));
 }
 
 const Stats = struct {
@@ -196,7 +271,7 @@ fn scan(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, prefix: []con
         }
     }.less);
     for (entries.items) |name| {
-        const relative = if (prefix.len == 0) try allocator.dupe(u8, name) else try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, name });
+        const relative = if (prefix.len == 0) try allocator.dupe(u8, name) else try allocator.print("{s}/{s}", .{ prefix, name });
         defer allocator.free(relative);
         try limits.relative(relative, 1024, 64);
         const member = try dir.openFile(io, name, .{ .path_only = true, .follow_symlinks = false });
@@ -271,6 +346,10 @@ fn inventory(allocator: std.mem.Allocator, io: std.Io, packages: std.Io.Dir, nam
 }
 
 pub fn packageSet(allocator: std.mem.Allocator, io: std.Io, packages: []const u8) !PackageSet {
+    return packageSetForRoot(allocator, io, packages, limits.miz_package_hash);
+}
+
+fn packageSetForRoot(allocator: std.mem.Allocator, io: std.Io, packages: []const u8, root_hash: []const u8) !PackageSet {
     const before = try physical.directory(io, packages, true);
     const dir = try files.openDirectory(io, packages, .private);
     defer dir.close(io);
@@ -345,7 +424,7 @@ pub fn packageSet(allocator: std.mem.Allocator, io: std.Io, packages: []const u8
         }
     }
     var found_miz = false;
-    for (collected) |package| if (std.mem.eql(u8, package.name, limits.miz_package_hash)) {
+    for (collected) |package| if (std.mem.eql(u8, package.name, root_hash)) {
         found_miz = true;
         break;
     };
@@ -355,7 +434,7 @@ pub fn packageSet(allocator: std.mem.Allocator, io: std.Io, packages: []const u8
         @memset(seen, false);
         var changed = true;
         for (collected, 0..) |package, index| {
-            if (std.mem.eql(u8, package.name, limits.miz_package_hash)) seen[index] = true;
+            if (std.mem.eql(u8, package.name, root_hash)) seen[index] = true;
         }
         while (changed) {
             changed = false;
@@ -457,7 +536,7 @@ pub const Document = struct {
         root_metadata: [9]i128,
         root_metadata_sha256: [64]u8,
         manifests: struct { count: usize, bytes: usize, sha256: [64]u8 },
-        hash_verification: struct { algorithm: []const u8 = "zig-0.16.0-fetch-path", count: usize, sha256: [64]u8 },
+        hash_verification: struct { algorithm: []const u8 = "zig-0.17.0-fetch-path", count: usize, sha256: [64]u8 },
         records: []PackageRecord,
     },
     hash_records: []HashRecord,
@@ -524,8 +603,33 @@ pub fn capture(
     git: []const u8,
     compute: []const u8,
 ) !Document {
-    const source_manifests = try sourceManifests(allocator, io, repository, git);
-    errdefer for (source_manifests) |item| item.deinit(allocator);
+    return captureWithPolicy(allocator, io, repository, git, compute, false);
+}
+
+pub fn captureRecorded(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repository: []const u8,
+    git: []const u8,
+    compute: []const u8,
+) !Document {
+    return captureWithPolicy(allocator, io, repository, git, compute, true);
+}
+
+fn captureWithPolicy(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repository: []const u8,
+    git: []const u8,
+    compute: []const u8,
+    allow_historical: bool,
+) !Document {
+    const build_manifest = try source.trackedManifest(allocator, io, repository, git, manifest_paths[0]);
+    errdefer build_manifest.deinit(allocator);
+    const zon_manifest = try source.trackedManifest(allocator, io, repository, git, manifest_paths[1]);
+    errdefer zon_manifest.deinit(allocator);
+    const generation = try pinnedManifestGeneration(allocator, zon_manifest.content, allow_historical);
+    const source_manifests = [2]source.TrackedManifest{ build_manifest, zon_manifest };
     const restore = try std.fs.path.join(allocator, &.{ compute, "dependencies" });
     defer allocator.free(restore);
     const restore_info = try physical.directory(io, restore, true);
@@ -542,11 +646,12 @@ pub fn capture(
     if (count != 3) return error.MissingRestoreEntry;
     const copied_build = try copy(allocator, io, restore, "build.zig", source_manifests[0]);
     const copied_zon = try copy(allocator, io, restore, "build.zig.zon", source_manifests[1]);
-    try pinnedManifest(allocator, source_manifests[1].content);
+    _ = try pinnedManifestGeneration(allocator, source_manifests[1].content, allow_historical);
     const packages_path = try std.fs.path.join(allocator, &.{ restore, "zig-pkg" });
     defer allocator.free(packages_path);
     const root_info = try physical.directory(io, packages_path, true);
-    var packages = try packageSet(allocator, io, packages_path);
+    const root_hash = if (generation == .historical) limits.historical_miz_package_hash else limits.miz_package_hash;
+    var packages = try packageSetForRoot(allocator, io, packages_path, root_hash);
     errdefer packages.deinit(allocator);
     var package_records = try allocator.alloc(PackageRecord, packages.packages.len);
     errdefer allocator.free(package_records);
@@ -584,7 +689,7 @@ pub fn capture(
         };
         try physical.bind(allocator, &closure, package_records[i]);
         try physical.bind(allocator, &physical_hash, .{ item.name, item.physical_sha256 });
-        const log_name = try std.fmt.allocPrint(allocator, "dependency-hash-{d:0>3}.log", .{i});
+        const log_name = try allocator.print("dependency-hash-{d:0>3}.log", .{i});
         defer allocator.free(log_name);
         const log_path = try std.fs.path.join(allocator, &.{ compute, "private", log_name });
         defer allocator.free(log_path);
@@ -617,6 +722,10 @@ pub fn capture(
         !files.sameSnapshot(root_info, try physical.directory(io, packages_path, true)))
         return error.DependencyChanged;
     return .{
+        .request = if (generation == .historical)
+            .{ .url = limits.historical_miz_url, .revision = limits.historical_miz_revision, .package_hash = limits.historical_miz_package_hash }
+        else
+            .{},
         .source_manifests = .{
             .@"build.zig" = .{ .source = sourceRecord(source_manifests[0]), .copy = copied_build },
             .@"build.zig.zon" = .{ .source = sourceRecord(source_manifests[1]), .copy = copied_zon },
@@ -633,7 +742,11 @@ pub fn capture(
             .root_metadata = root_metadata,
             .root_metadata_sha256 = std.fmt.bytesToHex(root_metadata_hash, .lower),
             .manifests = .{ .count = manifest_count, .bytes = manifest_bytes, .sha256 = physical.hex(&manifests_hash) },
-            .hash_verification = .{ .count = hashes.len, .sha256 = std.fmt.bytesToHex(verified, .lower) },
+            .hash_verification = .{
+                .algorithm = if (generation == .historical) "zig-0.16.0-fetch-path" else "zig-0.17.0-fetch-path",
+                .count = hashes.len,
+                .sha256 = std.fmt.bytesToHex(verified, .lower),
+            },
             .records = package_records,
         },
         .hash_records = hashes,
@@ -713,7 +826,7 @@ pub fn verifyZigPackageHashes(
         const deadline = try process.Deadline.afterMilliseconds(300_000);
         var result = try process.runCommand(allocator, io, .{
             .executable = executable,
-            .argv = &.{ zig, "fetch", "--global-cache-dir", cache_path, package_path },
+            .argv = &.{ zig, "fetch", "--pkg-dir", cache_path, package_path },
             .environment = &env,
             .cwd = work,
             .primary_deadline = deadline,

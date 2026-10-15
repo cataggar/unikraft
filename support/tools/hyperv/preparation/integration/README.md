@@ -14,12 +14,17 @@ phases. Build/Make execution is reserved for the parent integrator.
 
 ## Build
 
-Use Zig 0.16.0 and the parent's pinned local preparation/miz dependency. All
+Use Zig 0.17.0 and the parent's pinned local preparation/miz dependency. All
 outputs and caches belong below the scoped private scratch root. The executable
 and `preparation-namespace` are installed together; keep their physical files
 unchanged during the run. The importing mode uses the same physical executable
 by default. A separately selected engine copy is separately inventoried and
 charged, and must itself execute importer mode.
+
+Historical Zig 0.16 installation tables, artifact hashes and measurements in
+this document describe their original qualification only; they are not current
+0.17 prepared-image provenance. Obtain a fresh physical producer/source/compiler
+review before using newly built integration material.
 
 Choose a Git-coherence setup below before material generation. This build
 example uses the owned, clean, committed worktree. A private clone instead
@@ -33,21 +38,21 @@ cd /d/unikraft-worktrees/fleet-origin
 umask 077
 export S="$PWD/.d/zig-migration-preparation/integration-parent-v2"
 test ! -e "$S"
-mkdir -p "$S"/{tmp,home,xdg-cache,xdg-config,zig-global,zig-local,run/requests}
+mkdir -p "$S"/{tmp,home,xdg-cache,xdg-config,zig-global,integration-cache,run/requests}
 export HOME="$S/home" TMPDIR="$S/tmp"
 export XDG_CACHE_HOME="$S/xdg-cache" XDG_CONFIG_HOME="$S/xdg-config"
-export ZIG_GLOBAL_CACHE_DIR="$S/zig-global" ZIG_LOCAL_CACHE_DIR="$S/zig-local"
+export ZIG_GLOBAL_CACHE_DIR="$S/zig-global" ZIG_LOCAL_CACHE_DIR="$S/integration-cache"
 /home/g/.local/bin/zig build \
   --build-file support/tools/hyperv/preparation/integration/build.zig \
   --system /d/unikraft-worktrees/fleet-ci/.d/zig-migration-preparation/restore/zig-pkg \
-  --prefix "$S/install" -Doptimize=ReleaseSafe -j2 test install --summary all
+  --prefix "$S/install" -Doptimize=safe -j2 test install --summary all
 export DRIVER="$S/install/bin/uk-hyperv-prepare-integration"
 export WORK="$S/run"
 ```
 
 The local dependency is `..`, module `hyperv_preparation`; its manifest pins
-`miz_source` revision `669a27982b376311f558e820b69e9a692735b0cd`, package hash
-`miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx`.
+`miz_source` revision `66ea6701cf0e1b6d31e5f30fade00b7a546d4b44`, package hash
+`miz-0.2.0-Z3lHlLgL2wDiGxutMJMDy9Qy4CLNCwOptwgQLp1ZDSiv`.
 Core, native ELF and Kconfig helpers are its existing explicit imports.
 There is no root build dependency. No dependencies are downloaded by these
 commands. An absent declared package is a failure, not a restore authorization.
@@ -545,8 +550,8 @@ is parent-owned and is not reimplemented in this harness.
 ## Earlier bounded execution records (historical)
 
 Only the standalone driver and its non-executing fixtures were compiled/run.
-Both `-Doptimize=Debug -j2 test install --summary all` and
-`-Doptimize=ReleaseSafe -j2 test install --summary all` completed **8/8 build
+Both `-Doptimize=debug -j2 test install --summary all` and
+`-Doptimize=safe -j2 test install --summary all` completed **8/8 build
 steps and 12/12 fixtures**, with no skips. The complete commands are the Build
 command above with scratch root
 `.d/zig-migration-preparation/integration-driver-v1`, prefix

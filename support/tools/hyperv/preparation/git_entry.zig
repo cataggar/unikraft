@@ -74,14 +74,14 @@ fn operation(args: []const []const u8) !Operation {
 }
 
 fn requireDroppedPrivileges() !void {
-    if (linux.prctl(@intFromEnum(linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0) != 1)
+    if (linux.prctl(@backingInt(linux.PR.GET_NO_NEW_PRIVS), 0, 0, 0, 0) != 1)
         return error.PrivilegeDropUnavailable;
     const header: extern struct { version: u32, pid: i32 } = .{ .version = 0x20080522, .pid = 0 };
-    var data = [_]linux.cap_user_data_t{std.mem.zeroes(linux.cap_user_data_t)} ** 2;
+    var data = @as([2]linux.cap_user_data_t, @splat(std.mem.zeroes(linux.cap_user_data_t)));
     if (linux.errno(linux.syscall2(.capget, @intFromPtr(&header), @intFromPtr(&data))) != .SUCCESS or
         !std.mem.allEqual(u8, std.mem.asBytes(&data), 0)) return error.PrivilegeDropUnavailable;
     for (0..64) |cap| {
-        const bounding = linux.prctl(@intFromEnum(linux.PR.CAPBSET_READ), cap, 0, 0, 0);
+        const bounding = linux.prctl(@backingInt(linux.PR.CAPBSET_READ), cap, 0, 0, 0);
         if (linux.errno(bounding) == .INVAL) break;
         if (bounding != 0 or linux.prctl(47, 1, cap, 0, 0) != 0) return error.PrivilegeDropUnavailable;
     }
@@ -124,7 +124,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !
     var map = try record.environment.create(allocator, account.home);
     const block = try map.createPosixBlock(allocator, .{ .zig_progress_fd = -1 });
     const pointers = try allocator.allocSentinel(?[*:0]const u8, argv.items.len, null);
-    for (argv.items, 0..) |arg, i| pointers[i] = (try allocator.dupeZ(u8, arg)).ptr;
+    for (argv.items, 0..) |arg, i| pointers[i] = (try allocator.dupeSentinel(u8, arg, 0)).ptr;
     if (linux.errno(linux.fchdir(repository.dir.handle)) != .SUCCESS) return error.UnsafePath;
     try closeDescriptors();
     // Keep only a CLOEXEC copy for a bounded wrapper diagnostic if exec fails.

@@ -307,7 +307,7 @@ fn header(action: *Action, kind: MessageType, len: usize) void {
     action.generation = context.generation;
     action.connection_id = context.message_connection_id;
     action.tx_len = @intCast(len);
-    putU32(action.tx[0..], 0, @intFromEnum(kind));
+    putU32(action.tx[0..], 0, @backingInt(kind));
 }
 
 fn initiate(now: u64, action: *Action) void {
@@ -631,15 +631,15 @@ export fn vmbus_post_message(
     if (status_code) |status|
         status.* = 0xffff;
     if (has_post_messages == 0)
-        return @intFromEnum(PostResult.missing_privilege);
+        return @backingInt(PostResult.missing_privilege);
     if (connection_id == 0 or (connection_id & 0xff000000) != 0)
-        return @intFromEnum(PostResult.invalid_connection);
+        return @backingInt(PostResult.invalid_connection);
     if (message_type == 0 or (message_type & 0x80000000) != 0)
-        return @intFromEnum(PostResult.bad_message_type);
+        return @backingInt(PostResult.bad_message_type);
     if (payload_len > max_payload_size)
-        return @intFromEnum(PostResult.bad_payload);
+        return @backingInt(PostResult.bad_payload);
     if ((input_gpa & 0xff) != 0)
-        return @intFromEnum(PostResult.bad_alignment);
+        return @backingInt(PostResult.bad_alignment);
 
     zeroObject(&post_input);
     post_input.connection_id = connection_id;
@@ -655,9 +655,9 @@ export fn vmbus_post_message(
             status.* = raw_status;
         const result = statusToResult(raw_status);
         if (result != .insufficient_buffers)
-            return @intFromEnum(result);
+            return @backingInt(result);
         if (attempt >= retry_limit)
-            return @intFromEnum(PostResult.insufficient_buffers);
+            return @backingInt(PostResult.insufficient_buffers);
         const shift: u5 = @intCast(@min(attempt, 10));
         backoff(user_context, @as(u32, 10) << shift);
         attempt += 1;
@@ -714,12 +714,14 @@ export fn vmbus_protocol_offer_matches_class(
     if (payload_len < class_end)
         return 0;
     const bytes = payload[0..payload_len];
-    if (readU32(bytes, 0) != @intFromEnum(MessageType.offer_channel))
+    if (readU32(bytes, 0) != @backingInt(MessageType.offer_channel))
         return 0;
     const decoded = decodeGuid(bytes[class_offset..class_end]) orelse
         return 0;
     return @intFromBool(std.mem.eql(
-        u8, decoded.bytes[0..], class_id[0..16],
+        u8,
+        decoded.bytes[0..],
+        class_id[0..16],
     ));
 }
 
@@ -743,7 +745,7 @@ export fn vmbus_protocol_reset() callconv(.c) void {
 }
 
 export fn vmbus_protocol_state() callconv(.c) c_int {
-    return @intFromEnum(context.state);
+    return @backingInt(context.state);
 }
 
 export fn vmbus_protocol_generation() callconv(.c) u32 {
@@ -759,8 +761,8 @@ export fn vmbus_protocol_connection_id() callconv(.c) u32 {
 }
 
 fn makeMessage(kind: MessageType, len: usize) [240]u8 {
-    var bytes = [_]u8{0} ** 240;
-    putU32(bytes[0..], 0, @intFromEnum(kind));
+    var bytes = @as([240]u8, @splat(0));
+    putU32(bytes[0..], 0, @backingInt(kind));
     _ = len;
     return bytes;
 }
@@ -808,7 +810,7 @@ test "PostMessage validates input, retries boundedly, and preserves failures" {
     Fake.delays = 0;
     Fake.status = 0x0013;
     try std.testing.expectEqual(
-        @intFromEnum(PostResult.ok),
+        @backingInt(PostResult.ok),
         vmbus_post_message(7, 1, &payload, payload.len, 0x1000, &status_code, 1, 4, Fake.call, Fake.delay, null),
     );
     try std.testing.expectEqual(@as(u16, 0), status_code);
@@ -818,29 +820,29 @@ test "PostMessage validates input, retries boundedly, and preserves failures" {
     Fake.calls = 0;
     Fake.delays = 0;
     try std.testing.expectEqual(
-        @intFromEnum(PostResult.insufficient_buffers),
+        @backingInt(PostResult.insufficient_buffers),
         vmbus_post_message(7, 1, &payload, payload.len, 0x1000, &status_code, 1, 1, Fake.call, Fake.delay, null),
     );
     try std.testing.expectEqual(@as(u16, 0x0013), status_code);
     try std.testing.expectEqual(@as(u32, 2), Fake.calls);
     Fake.status = 0x0012;
     try std.testing.expectEqual(
-        @intFromEnum(PostResult.invalid_connection),
+        @backingInt(PostResult.invalid_connection),
         vmbus_post_message(7, 1, &payload, payload.len, 0x1000, &status_code, 1, 2, Fake.call, Fake.delay, null),
     );
     try std.testing.expectEqual(@as(u16, 0x0012), status_code);
     try std.testing.expectEqual(
-        @intFromEnum(PostResult.missing_privilege),
+        @backingInt(PostResult.missing_privilege),
         vmbus_post_message(7, 1, &payload, payload.len, 0x1000, &status_code, 0, 2, Fake.call, Fake.delay, null),
     );
     try std.testing.expectEqual(@as(u16, 0xffff), status_code);
     try std.testing.expectEqual(
-        @intFromEnum(PostResult.bad_alignment),
+        @backingInt(PostResult.bad_alignment),
         vmbus_post_message(7, 1, &payload, payload.len, 0x1008, &status_code, 1, 2, Fake.call, Fake.delay, null),
     );
     try std.testing.expectEqual(@as(u16, 0xffff), status_code);
     try std.testing.expectEqual(
-        @intFromEnum(PostResult.invalid_connection),
+        @backingInt(PostResult.invalid_connection),
         vmbus_post_message(0, 1, &payload, payload.len, 0x1000, &status_code, 1, 2, Fake.call, Fake.delay, null),
     );
     try std.testing.expectEqual(@as(u16, 0xffff), status_code);
@@ -975,13 +977,13 @@ test "modern negotiation switches to the returned message connection ID" {
 
     vmbus_protocol_release(9, &action);
     try std.testing.expectEqual(ActionKind.transmit, action.kind);
-    try std.testing.expectEqual(@intFromEnum(MessageType.relid_released), readU32(action.tx[0..], 0));
+    try std.testing.expectEqual(@backingInt(MessageType.relid_released), readU32(action.tx[0..], 0));
     try std.testing.expectEqual(@as(u32, 9), readU32(action.tx[0..], 8));
     try std.testing.expectEqual(@as(u32, 0x1234), action.connection_id);
 
     vmbus_protocol_unload(2, &action);
     try std.testing.expectEqual(ActionKind.transmit, action.kind);
-    try std.testing.expectEqual(@intFromEnum(MessageType.unload), readU32(action.tx[0..], 0));
+    try std.testing.expectEqual(@backingInt(MessageType.unload), readU32(action.tx[0..], 0));
     try std.testing.expectEqual(@as(u32, 0x1234), action.connection_id);
 }
 
@@ -1059,14 +1061,14 @@ test "malformed lengths fields and message types are rejected" {
     response[8] = 1;
     putU32(response[0..], 12, 0x44);
     vmbus_protocol_receive(&response, 16, context.generation, 1, &action);
-    var offer = makeOffer(.{0} ** 16, 1);
+    var offer = makeOffer(@splat(0), 1);
     vmbus_protocol_receive(&offer, 187, context.generation, 2, &action);
     try std.testing.expectEqual(ActionKind.malformed, action.kind);
     offer[189] = 2;
     vmbus_protocol_receive(&offer, offer_size, context.generation, 2, &action);
     try std.testing.expectEqual(ActionKind.reject_offer, action.kind);
     try std.testing.expectEqual(@as(u32, 1), action.channel_id);
-    var unknown = [_]u8{0} ** 8;
+    var unknown = @as([8]u8, @splat(0));
     putU32(unknown[0..], 0, 0xffff);
     vmbus_protocol_receive(&unknown, unknown.len, context.generation, 2, &action);
     try std.testing.expectEqual(ActionKind.malformed, action.kind);
@@ -1102,7 +1104,7 @@ test "offer class recognition precedes offer field validation" {
         vmbus_protocol_offer_matches_class(&offer, offer_size, &class),
     );
     offer[8] ^= 1;
-    offer[0] = @intFromEnum(MessageType.rescind_channel_offer);
+    offer[0] = @backingInt(MessageType.rescind_channel_offer);
     try std.testing.expectEqual(
         @as(c_int, 0),
         vmbus_protocol_offer_matches_class(&offer, offer_size, &class),

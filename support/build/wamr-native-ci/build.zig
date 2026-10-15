@@ -2,7 +2,7 @@ const std = @import("std");
 const controller_target = @import("controller/target.zig");
 const authority_build = @import("authority.build.zig");
 
-fn handoffContracts(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, core: *std.Build.Module) *std.Build.Module {
+fn handoffContracts(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, core: *std.Build.Module) *std.Build.Module {
     return b.createModule(.{
         .root_source_file = b.path("handoff/contracts.zig"),
         .target = target,
@@ -11,7 +11,7 @@ fn handoffContracts(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
     });
 }
 
-fn handoffModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, core: *std.Build.Module, controller: *std.Build.Module) *std.Build.Module {
+fn handoffModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, core: *std.Build.Module, controller: *std.Build.Module) *std.Build.Module {
     return b.createModule(.{
         .root_source_file = b.path("handoff/root.zig"),
         .target = target,
@@ -23,11 +23,16 @@ fn handoffModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     });
 }
 
-fn wamrAotBuild(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Dependency {
+fn wamrAotBuild(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize) *std.Build.Dependency {
     return b.dependency("wamr_aot_build", .{ .target = target, .optimize = optimize });
 }
 
 pub fn build(b: *std.Build) void {
+    const repository_root = std.Io.Dir.cwd().realPathFileAlloc(
+        b.graph.io,
+        b.root.joinString(b.allocator, "../../..") catch @panic("OOM"),
+        b.allocator,
+    ) catch |err| std.debug.panic("resolve controller repository root: {s}", .{@errorName(err)});
     const requested_target = b.standardTargetOptionsQueryOnly(.{});
     const target = b.resolveTargetQuery(requested_target);
     const optimize = b.standardOptimizeOption(.{});
@@ -38,17 +43,17 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("build.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
         }),
     });
     const portable_direct = b.dependency("direct_validator", .{
         .target = portable_target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     }).artifact("uk-wamr-direct-validate");
     const portable_identity = validatorIdentity(b, identity_writer, portable_direct, portable_target);
     const host_direct = b.dependency("direct_validator", .{
         .target = b.graph.host,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     }).artifact("uk-wamr-direct-validate");
     const host_identity = validatorIdentity(b, identity_writer, host_direct, b.graph.host);
     const core = b.createModule(.{
@@ -77,7 +82,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("../../apps/wamr-aot/validator/main.zig"),
         .target = target,
         .optimize = optimize,
-        .strip = optimize != .Debug,
+        .strip = optimize != .debug,
         .imports = &.{
             .{ .name = "wamr_log_validator", .module = log_validator },
             .{ .name = "hyperv_core", .module = core },
@@ -97,13 +102,19 @@ pub fn build(b: *std.Build) void {
 
     const image = b.dependency("public_image", .{ .target = target, .optimize = optimize }).module("hyperv_public_image");
     const wamr_aot_build = wamrAotBuild(b, target, optimize);
-    b.installArtifact(wamr_aot_build.artifact("uk-wamr-aot-build"));
+    const aot_build_cli = wamr_aot_build.artifact("uk-wamr-aot-build");
+    b.installArtifact(aot_build_cli);
+    const package_options = b.addOptions();
+    package_options.addOption([]const u8, "miz_revision", "66ea6701cf0e1b6d31e5f30fade00b7a546d4b44");
     const root = b.createModule(.{
         .root_source_file = b.path("package.zig"),
         .target = target,
         .optimize = optimize,
-        .strip = optimize != .Debug,
-        .imports = &.{.{ .name = "public_image", .module = image }},
+        .strip = optimize != .debug,
+        .imports = &.{
+            .{ .name = "public_image", .module = image },
+            .{ .name = "package_options", .module = package_options.createModule() },
+        },
     });
     const cli = b.addExecutable(.{ .name = "wamr-ci-package", .root_module = root });
     b.installArtifact(cli);
@@ -128,11 +139,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "local_boot_serial", .module = portable_serial },
         },
     });
-    const source_closure_module = b.createModule(.{
-        .root_source_file = b.path("../../controller_source_closure.zig"),
-        .target = portable_target,
-        .optimize = optimize,
-    });
+    const source_closure_module = sourceClosureModule(b, portable_target, optimize);
     const controller_module = b.addModule("wamr_controller", .{
         .root_source_file = b.path("controller/root.zig"),
         .target = portable_target,
@@ -151,7 +158,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("controller/portable_main.zig"),
             .target = portable_target,
             .optimize = optimize,
-            .strip = optimize != .Debug,
+            .strip = optimize != .debug,
             .imports = &.{
                 .{ .name = "wamr_controller", .module = controller_module },
                 .{ .name = "wamr_handoff", .module = handoffModule(b, portable_target, optimize, portable_core, controller_module) },
@@ -178,21 +185,32 @@ pub fn build(b: *std.Build) void {
         "Existing absolute owner-only runtime directory for create-only controller install",
     ) orelse "";
     const controller_options = b.addOptions();
-    const CompositionGroup = enum { all, faults, retention };
+    const CompositionGroup = enum { all, faults, retention, local_qualify };
     controller_options.addOption(CompositionGroup, "handoff_composition_group", b.option(CompositionGroup, "handoff-composition-group", "Select a focused real-owner handoff composition group") orelse .all);
     controller_options.addOption([]const u8, "local_fixture_source", b.option([]const u8, "local-fixture-source", "Select one complete historical local fixture revision for diagnosis") orelse "");
-    const repository_root = std.fs.path.resolve(b.allocator, &.{ b.graph.cache.cwd, b.build_root.path orelse ".", "../../.." }) catch
-        @panic("cannot resolve source root");
-    controller_options.addOption([]const u8, "repository_root", repository_root);
+    controller_options.addOptionPathDirectory("repository_root", b.graph.cwdRelativePath(repository_root));
     controller_options.addOption([]const u8, "zig_executable", b.graph.zig_exe);
-    controller_options.addOption([]const u8, "git_executable", b.findProgram(&.{"git"}, &.{}) catch @panic("Git required for controller custody tests"));
-    controller_options.addOption([]const u8, "python_executable", b.findProgram(&.{"python3"}, &.{}) catch @panic("Python required for handoff compatibility fixtures"));
-    controller_options.addOptionPath("miz_package", b.dependency("public_image", .{ .target = target, .optimize = optimize }).builder.dependency("miz_source", .{ .target = target, .optimize = optimize }).path("."));
+    controller_options.addOptionPath("git_executable", b.findProgramLazy(.{ .names = &.{"git"} }));
+    controller_options.addOptionPath("python_executable", b.findProgramLazy(.{ .names = &.{"python3"} }));
+    const miz_dep = b.dependency("public_image", .{ .target = target, .optimize = optimize }).builder.dependency("miz_source", .{ .target = target, .optimize = optimize });
+    const miz_package_abs = std.Io.Dir.cwd().realPathFileAlloc(
+        b.graph.io,
+        miz_dep.builder.root.joinString(b.allocator, ".") catch @panic("OOM"),
+        b.allocator,
+    ) catch @panic("cannot resolve miz package root");
+    controller_options.addOption([]const u8, "miz_package", miz_package_abs);
     const explicit_controller_fixture_root = b.option([]const u8, "controller-fixture-root", "Existing absolute owner-private source fixture root");
-    const controller_fixture_root = std.fs.path.resolve(b.allocator, &.{
-        b.graph.cache.cwd, explicit_controller_fixture_root orelse b.cache_root.path orelse ".",
-    }) catch @panic("cannot resolve private controller test root");
-    controller_options.addOption([]const u8, "fixture_root", controller_fixture_root);
+    const env_cache_fixture_root: ?[]const u8 = if (b.graph.environ_map.get("ZIG_LOCAL_CACHE_DIR")) |cache_dir| blk: {
+        const cwd = std.Io.Dir.cwd().realPathFileAlloc(b.graph.io, ".", b.allocator) catch @panic("OOM");
+        break :blk std.fs.path.resolve(b.allocator, &.{ cwd, cache_dir }) catch @panic("OOM");
+    } else null;
+    if (explicit_controller_fixture_root) |custom_fixture_root| {
+        if (!std.fs.path.isAbsolute(custom_fixture_root)) @panic("controller-fixture-root must be absolute");
+        controller_options.addOption([]const u8, "fixture_root", custom_fixture_root);
+    } else if (env_cache_fixture_root) |cache_root| {
+        controller_options.addOption([]const u8, "fixture_root", cache_root);
+    } else
+        controller_options.addOptionPathUntracked("fixture_root", .cache_root);
     const host_core = b.createModule(.{
         .root_source_file = b.path("../../tools/hyperv/core.zig"),
         .target = b.graph.host,
@@ -200,15 +218,11 @@ pub fn build(b: *std.Build) void {
     });
     if (b.graph.host.result.cpu.arch == .x86_64)
         host_core.addAssemblyFile(b.path("../../tools/hyperv/sha256_clear_upper.S"));
-    const host_closure = b.createModule(.{
-        .root_source_file = b.path("../../controller_source_closure.zig"),
-        .target = b.graph.host,
-        .optimize = optimize,
-    });
+    const host_closure = sourceClosureModule(b, b.graph.host, optimize);
     for ([_]bool{ false, true }) |native_owner| {
         const supervisor_options = b.addOptions();
         supervisor_options.addOption(bool, "native_source_owner", native_owner);
-        supervisor_options.addOption([]const u8, "source_closure_sha256", "a" ** 64);
+        supervisor_options.addOption([]const u8, "source_closure_sha256", &@as([64]u8, @splat('a')));
         const supervisor = b.addExecutable(.{
             .name = if (native_owner) "wamr-ci-native-supervisor-host-test" else "wamr-ci-historical-supervisor-host-test",
             .root_module = b.createModule(.{
@@ -239,13 +253,18 @@ pub fn build(b: *std.Build) void {
             .{ .name = "local_boot_serial", .module = host_serial },
         },
     });
+    const historical_package_options = b.addOptions();
+    historical_package_options.addOption([]const u8, "miz_revision", "669a27982b376311f558e820b69e9a692735b0cd");
     const host_package = b.addExecutable(.{
         .name = "wamr-ci-package-host-local-test",
         .root_module = b.createModule(.{
             .root_source_file = b.path("package.zig"),
             .target = b.graph.host,
             .optimize = optimize,
-            .imports = &.{.{ .name = "public_image", .module = b.dependency("public_image", .{ .target = b.graph.host, .optimize = optimize }).module("hyperv_public_image") }},
+            .imports = &.{
+                .{ .name = "public_image", .module = b.dependency("public_image", .{ .target = b.graph.host, .optimize = optimize }).module("hyperv_public_image") },
+                .{ .name = "package_options", .module = historical_package_options.createModule() },
+            },
         }),
     });
     controller_options.addOptionPath("host_package_cli", host_package.getEmittedBin());
@@ -277,38 +296,39 @@ pub fn build(b: *std.Build) void {
     });
     const host_cli = b.addExecutable(.{
         .name = "uk-wamr-native-ci-host-fixture",
-        .use_llvm = if (optimize == .ReleaseSafe) true else null,
+        .use_llvm = true,
+        .use_lld = if (optimize == .debug) true else null,
         .root_module = b.createModule(.{
             .root_source_file = b.path("controller/main.zig"),
             .target = b.graph.host,
             .optimize = optimize,
-            .strip = optimize != .Debug,
+            .strip = true,
             .imports = &.{
                 .{ .name = "wamr_controller", .module = host_controller },
                 .{ .name = "wamr_handoff", .module = handoffModule(b, b.graph.host, optimize, host_core, host_controller) },
             },
         }),
     });
-    // Producer import requires an installable ReleaseSafe supervisor.
+    // Producer import requires an installable safe supervisor.
     // Keep the selected profile for the other CLI fixtures and test modules.
-    const host_import_cli = if (optimize == .ReleaseSafe) host_cli else blk: {
+    const host_import_cli = if (optimize == .safe) host_cli else blk: {
         const import_core = b.createModule(.{
             .root_source_file = b.path("../../tools/hyperv/core.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
         });
         if (b.graph.host.result.cpu.arch == .x86_64)
             import_core.addAssemblyFile(b.path("../../tools/hyperv/sha256_clear_upper.S"));
         const import_serial = b.createModule(.{
             .root_source_file = b.path("../../tools/hyperv/local_boot/serial.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .imports = &.{.{ .name = "hyperv_core", .module = import_core }},
         });
         const import_validator = b.createModule(.{
             .root_source_file = b.path("../../apps/wamr-aot/validator/root.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .imports = &.{
                 .{ .name = "hyperv_core", .module = import_core },
                 .{ .name = "local_boot_serial", .module = import_serial },
@@ -317,35 +337,32 @@ pub fn build(b: *std.Build) void {
         const import_controller = b.createModule(.{
             .root_source_file = b.path("controller/root.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .imports = &.{
                 .{ .name = "hyperv_core", .module = import_core },
                 .{ .name = "wamr_log_validator", .module = import_validator },
-                .{ .name = "controller_source_closure", .module = b.createModule(.{
-                    .root_source_file = b.path("../../controller_source_closure.zig"),
-                    .target = b.graph.host,
-                    .optimize = .ReleaseSafe,
-                }) },
+                .{ .name = "controller_source_closure", .module = sourceClosureModule(b, b.graph.host, .safe) },
                 .{ .name = "import_validator_identity", .module = host_identity },
-                .{ .name = "handoff_contracts", .module = handoffContracts(b, b.graph.host, .ReleaseSafe, import_core) },
+                .{ .name = "handoff_contracts", .module = handoffContracts(b, b.graph.host, .safe, import_core) },
             },
         });
         break :blk b.addExecutable(.{
             .name = "uk-wamr-native-ci-host-import-fixture",
+            .use_llvm = true,
             .root_module = b.createModule(.{
                 .root_source_file = b.path("controller/main.zig"),
                 .target = b.graph.host,
-                .optimize = .ReleaseSafe,
+                .optimize = .safe,
                 .strip = true,
                 .imports = &.{
                     .{ .name = "wamr_controller", .module = import_controller },
-                    .{ .name = "wamr_handoff", .module = handoffModule(b, b.graph.host, .ReleaseSafe, import_core, import_controller) },
+                    .{ .name = "wamr_handoff", .module = handoffModule(b, b.graph.host, .safe, import_core, import_controller) },
                 },
             }),
         });
     };
     const host_cli_run = b.addRunArtifact(host_cli);
-    if (b.args) |args| host_cli_run.addArgs(args);
+    host_cli_run.addPassthruArgs();
     b.step("run-controller-fixture", "Run host controller CLI for bounded CLI fixtures")
         .dependOn(&host_cli_run.step);
     const installer = b.addExecutable(.{
@@ -362,19 +379,20 @@ pub fn build(b: *std.Build) void {
     });
     const install_run = b.addRunArtifact(installer);
     install_run.addArg(controller_runtime);
-    install_run.addArg(b.graph.cache.cwd);
+    install_run.addDirectoryArg(b.graph.cwdRelativePath("."));
     install_run.addFileArg(controller_cli.getEmittedBin());
     const install_step = b.step("install-controller", "Create-only portable controller install in the private runtime");
     if (controller_target.permitsInstall(requested_target, optimize))
         install_step.dependOn(&install_run.step)
     else
         install_step.dependOn(&b.addFail(
-            "install-controller requires -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=ReleaseSafe",
+            "install-controller requires -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=safe",
         ).step);
     const controller_tests = b.addTest(.{
         .filters = b.option([]const []const u8, "test-filter", "Select bounded controller fixtures") orelse &.{},
         .test_runner = .{ .path = b.path("controller/composition_runner.zig"), .mode = .server },
-        .use_llvm = if (optimize == .ReleaseSafe) true else null,
+        .use_llvm = true,
+        .use_lld = if (optimize == .debug) true else null,
         .root_module = b.createModule(.{
             .root_source_file = b.path("controller/tests.zig"),
             .target = b.graph.host,
@@ -401,8 +419,10 @@ pub fn build(b: *std.Build) void {
     const controller_test_options = controller_tests.root_module.import_table.get("test_options").?;
     composition_module.addImport("test_options", controller_test_options);
     controller_tests.root_module.addImport("handoff_composition_tests", composition_module);
+    const zig_real_exe = std.Io.Dir.cwd().realPathFileAlloc(b.graph.io, b.graph.zig_exe, b.allocator) catch
+        @panic("cannot resolve zig executable path");
     const default_test_runner = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = b.pathJoin(&.{ b.graph.zig_lib_directory.path.?, "compiler/test_runner.zig" }) },
+        .root_source_file = b.graph.cwdRelativePath(b.pathJoin(&.{ std.fs.path.dirname(zig_real_exe).?, "lib/compiler/test_runner.zig" })),
         .target = b.graph.host,
         .optimize = optimize,
     });
@@ -411,6 +431,7 @@ pub fn build(b: *std.Build) void {
     controller_options.addOptionPath("host_controller_cli", host_cli.getEmittedBin());
     controller_options.addOptionPath("host_import_controller_cli", host_import_cli.getEmittedBin());
     controller_options.addOptionPath("import_validator", host_direct.getEmittedBin());
+    controller_options.addOptionPath("native_validator_cli", host_direct.getEmittedBin());
     const fixture_host = b.addExecutable(.{
         .name = "wamr-native-ci-fixtures-host-test",
         .root_module = b.createModule(.{
@@ -436,7 +457,7 @@ pub fn build(b: *std.Build) void {
     const descendant_core = b.createModule(.{
         .root_source_file = b.path("../../tools/hyperv/core.zig"),
         .target = b.graph.host,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     });
     if (b.graph.host.result.cpu.arch == .x86_64)
         descendant_core.addAssemblyFile(b.path("../../tools/hyperv/sha256_clear_upper.S"));
@@ -445,14 +466,14 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("../../tools/hyperv/direct/runtime_fixture.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .imports = &.{.{ .name = "hyperv_core", .module = descendant_core }},
         }),
     });
     controller_options.addOptionPath("descendant_fixture", descendant_fixture.getEmittedBin());
     const local_worker = b.addExecutable(.{
         .name = "wamr-ci-local-acceptance-worker",
-        .use_llvm = if (optimize == .ReleaseSafe) true else null,
+        .use_llvm = if (optimize == .safe) true else null,
         .root_module = b.createModule(.{
             .root_source_file = b.path("controller/local_acceptance_worker.zig"),
             .target = b.graph.host,
@@ -471,7 +492,7 @@ pub fn build(b: *std.Build) void {
     const composition_tests = b.addTest(.{
         .filters = &.{"handoff composition"},
         .test_runner = .{ .path = b.path("controller/composition_runner.zig"), .mode = .server },
-        .use_llvm = if (optimize == .ReleaseSafe) true else null,
+        .use_llvm = if (optimize == .safe) true else null,
         .root_module = b.createModule(.{
             .root_source_file = b.path("controller/tests.zig"),
             .target = b.graph.host,
@@ -494,10 +515,20 @@ pub fn build(b: *std.Build) void {
     composition_run.addFileArg(composition_tests.getEmittedBin());
     b.step("test-handoff-composition", "Run retained native import/candidate composition faults without live qualification")
         .dependOn(&composition_run.step);
+    const noop_fixture = b.addExecutable(.{
+        .name = "wamr-ci-noop-test-command",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("controller/noop_fixture.zig"),
+            .target = b.graph.host,
+            .optimize = .safe,
+            .strip = true,
+        }),
+    });
+    controller_options.addOptionPath("noop_fixture", noop_fixture.getEmittedBin());
     const controller_run = b.addRunArtifact(controller_tests);
     const controller_direct = b.addSystemCommand(&.{"/usr/bin/env"});
     controller_direct.addFileArg(controller_tests.getEmittedBin());
-    if (b.args) |args| controller_direct.addArgs(args);
+    controller_direct.addPassthruArgs();
     b.step("test-controller-direct", "Run host controller tests with direct failure output")
         .dependOn(&controller_direct.step);
     const install_target_tests = b.addTest(.{
@@ -524,15 +555,13 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const source_limits_options = b.addOptions();
-    source_limits_options.addOption([]const u8, "repository_root", repository_root);
-    source_limits_options.addOption(
-        []const u8,
-        "fixture_root",
-        if (explicit_controller_fixture_root != null)
-            controller_fixture_root
-        else
-            b.pathJoin(&.{ controller_fixture_root, "source-limits-work" }),
-    );
+    source_limits_options.addOptionPathDirectory("repository_root", b.graph.cwdRelativePath(repository_root));
+    if (explicit_controller_fixture_root) |custom_fixture_root| {
+        source_limits_options.addOption([]const u8, "fixture_root", custom_fixture_root);
+    } else if (env_cache_fixture_root) |cache_root| {
+        source_limits_options.addOption([]const u8, "fixture_root", b.pathJoin(&.{ cache_root, "source-limits-work" }));
+    } else
+        source_limits_options.addOptionPathUntracked("fixture_root", std.Build.LazyPath.cache_root.path(b, "source-limits-work"));
     source_limits_tests.root_module.addOptions("test_options", source_limits_options);
     const source_limits_run = b.addRunArtifact(source_limits_tests);
     b.step("test-controller-limits", "Run native source-custody production boundary fixtures")
@@ -582,26 +611,21 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    const handoff_fixture_root = std.fs.path.resolve(b.allocator, &.{
-        b.graph.cache.cwd, b.cache_root.path orelse ".",
-    }) catch @panic("cannot resolve private handoff test root");
     const handoff_options = b.addOptions();
-    handoff_options.addOption([]const u8, "fixture_root", handoff_fixture_root);
-    // Nested --build-file invocations can render source LazyPaths relatively.
-    handoff_options.addOptionPath("python_oracle", .{
-        .cwd_relative = std.fs.path.resolve(b.allocator, &.{
-            b.graph.cache.cwd, b.path("tests/test_handoff_contract_goldens.py").getPath(b),
-        }) catch @panic("cannot resolve handoff Python oracle"),
-    });
-    handoff_options.addOptionPath("accepted_result_fixture", .{
-        .cwd_relative = std.fs.path.resolve(b.allocator, &.{
-            b.graph.cache.cwd, b.path("tests/fixtures/differential/accepted-v2.json").getPath(b),
-        }) catch @panic("cannot resolve accepted handoff fixture"),
-    });
+    handoff_options.addOptionPathUntracked("fixture_root", .cache_root);
+    handoff_options.addOptionPath("python_oracle", b.graph.cwdRelativePath(b.fmt(
+        "{s}/support/build/wamr-native-ci/tests/test_handoff_contract_goldens.py",
+        .{repository_root},
+    )));
+    handoff_options.addOptionPath("accepted_result_fixture", b.graph.cwdRelativePath(b.fmt(
+        "{s}/support/build/wamr-native-ci/tests/fixtures/differential/accepted-v2.json",
+        .{repository_root},
+    )));
     handoff_contracts.root_module.addOptions("test_options", handoff_options);
     const handoff_contracts_run = b.addRunArtifact(handoff_contracts);
-    const handoff_python_goldens = b.addSystemCommand(&.{ "python3", "-B" });
-    handoff_python_goldens.setEnvironmentVariable("WAMR_HANDOFF_GOLDEN_ROOT", handoff_fixture_root);
+    const handoff_python_goldens = b.addSystemCommand(&.{"env"});
+    handoff_python_goldens.addPrefixedDirectoryArg("WAMR_HANDOFF_GOLDEN_ROOT=", .cache_root);
+    handoff_python_goldens.addArgs(&.{ "python3", "-B" });
     handoff_python_goldens.addFileArg(b.path("tests/test_handoff_contract_goldens.py"));
     const handoff_step = b.step("test-handoff-contracts", "Run native/Python handoff contract goldens");
     handoff_step.dependOn(&handoff_contracts_run.step);
@@ -618,8 +642,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const authority_handoff = handoffModule(b, b.graph.host, optimize, host_core, host_controller);
-    const authority_fixture_root = b.pathJoin(&.{ handoff_fixture_root, "authority-contract-work" });
-    const authority_options = authority_build.testOptions(b, b.graph.host, optimize, authority_fixture_root);
+    const authority_options = authority_build.testOptions(b, b.graph.host, optimize, std.Build.LazyPath.cache_root.path(b, "authority-contract-work"));
     const authority_options_module = authority_options.createModule();
     authority_handoff.addImport("test_options", authority_options_module);
     authority_contracts.root_module.addImport("test_options", authority_options_module);
@@ -637,8 +660,9 @@ pub fn build(b: *std.Build) void {
     const authority_direct = b.addSystemCommand(&.{"/usr/bin/env"});
     authority_direct.addFileArg(authority_contracts.getEmittedBin());
     b.step("test-authority-direct", "Run authority fixtures with direct failure output").dependOn(&authority_direct.step);
-    const authority_python_goldens = b.addSystemCommand(&.{ "python3", "-B" });
-    authority_python_goldens.setEnvironmentVariable("WAMR_AUTHORITY_CONTRACT_SCRATCH", authority_fixture_root);
+    const authority_python_goldens = b.addSystemCommand(&.{"env"});
+    authority_python_goldens.addPrefixedDirectoryArg("WAMR_AUTHORITY_CONTRACT_SCRATCH=", std.Build.LazyPath.cache_root.path(b, "authority-contract-work"));
+    authority_python_goldens.addArgs(&.{ "python3", "-B" });
     authority_python_goldens.addFileArg(b.path("tests/test_authority_contract_goldens.py"));
     const authority_step = b.step("test-authority-contracts", "Run native/Python authority contract goldens");
     authority_step.dependOn(&authority_contracts_run.step);
@@ -655,9 +679,11 @@ pub fn build(b: *std.Build) void {
     const contract_fixture_dirs = b.addSystemCommand(&.{ "mkdir", "-p", "-m", "0700", "--" });
     contract_fixture_dirs.has_side_effects = true;
     for ([_][]const u8{ "tmp", "h", "o", "z", "handoff-export-tests", "handoff-python-goldens", "authority-contract-work", "install-target-work", "source-limits-work" }) |name|
-        contract_fixture_dirs.addArg(b.pathJoin(&.{ handoff_fixture_root, name }));
-    if (explicit_controller_fixture_root == null)
-        contract_fixture_dirs.addArg(b.pathJoin(&.{ controller_fixture_root, "source-limits-work" }));
+        contract_fixture_dirs.addDirectoryArg2(std.Build.LazyPath.cache_root.path(b, name), .{ .make_absolute = true });
+    if (explicit_controller_fixture_root == null) {
+        if (env_cache_fixture_root) |cache_root|
+            contract_fixture_dirs.addArg(b.pathJoin(&.{ cache_root, "source-limits-work" }));
+    }
     for ([_]*std.Build.Step{
         &controller_run.step,
         &controller_direct.step,
@@ -684,11 +710,7 @@ pub fn build(b: *std.Build) void {
         "test_root",
         b.option([]const u8, "test-root", "Existing absolute private compute fixture directory"),
     );
-    const proof_closure = b.createModule(.{
-        .root_source_file = b.path("../../controller_source_closure.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const proof_closure = sourceClosureModule(b, target, optimize);
     const proof_serial = b.createModule(.{
         .root_source_file = b.path("controller/public_image_serial.zig"),
         .target = target,
@@ -715,7 +737,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "handoff_contracts", .module = handoffContracts(b, target, optimize, image.import_table.get("hyperv_core").?) },
             .{ .name = "import_validator_identity", .module = validatorIdentity(b, identity_writer, b.dependency("direct_validator", .{
                 .target = target,
-                .optimize = .ReleaseSafe,
+                .optimize = .safe,
             }).artifact("uk-wamr-direct-validate"), target) },
         },
     });
@@ -736,7 +758,7 @@ pub fn build(b: *std.Build) void {
     for ([_]*std.Build.Step.Compile{
         log_cli,
         supervisor_fixture,
-        wamr_aot_build.artifact("uk-wamr-aot-build"),
+        aot_build_cli,
         cli,
         controller_cli,
         native_fixtures,
@@ -767,6 +789,63 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&authority_contracts_run.step);
     test_step.dependOn(&authority_source_check.step);
     test_step.dependOn(&authority_python_goldens.step);
+    for (b.graph.configure_dependencies.items) |*dep| switch (dep.lazy_path) {
+        .src_path => |sp| if (sp.owner != b) {
+            dep.lazy_path = b.graph.cwdRelativePath(
+                sp.owner.root.joinString(b.allocator, sp.sub_path) catch @panic("OOM"),
+            );
+        },
+        else => {},
+    };
+}
+
+fn sourceClosureModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+) *std.Build.Module {
+    const source_file = b.path("../../controller_source_closure.zig");
+    b.dependOnFileContents(source_file);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(
+        b.graph.io,
+        b.root.joinString(b.allocator, "../../controller_source_closure.zig") catch @panic("OOM"),
+        b.allocator,
+        .limited(1024 * 1024),
+    ) catch |err| std.debug.panic("read controller source closure: {s}", .{@errorName(err)});
+    const text = b.allocator.dupeSentinel(u8, bytes, 0) catch @panic("OOM");
+    const module = b.createModule(.{
+        .root_source_file = source_file,
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Zig 0.17 interns nested build-root files separately from this module's
+    // root. Bind their existing embed names to explicit source dependencies.
+    var tokenizer = std.zig.Tokenizer.init(text);
+    while (true) {
+        const token = tokenizer.next();
+        if (token.tag == .eof) break;
+        if (token.tag == .invalid)
+            @panic("invalid controller source inventory");
+        if (token.tag != .builtin or
+            !std.mem.eql(u8, text[token.loc.start..token.loc.end], "@embedFile"))
+            continue;
+        if (tokenizer.next().tag != .l_paren)
+            @panic("invalid controller source embed");
+        const literal = tokenizer.next();
+        if (literal.tag != .string_literal or tokenizer.next().tag != .r_paren)
+            @panic("controller source embeds must name literal files");
+        const name = std.zig.string_literal.parseAlloc(b.allocator, text[literal.loc.start..literal.loc.end]) catch
+            @panic("invalid controller source embed name");
+        if (module.import_table.contains(name))
+            continue;
+        module.addImport(name, b.createModule(.{
+            .root_source_file = b.path(b.fmt("../../{s}", .{name})),
+            .target = target,
+            .optimize = optimize,
+        }));
+    }
+    return module;
 }
 
 fn validatorIdentity(
@@ -781,7 +860,7 @@ fn validatorIdentity(
     return b.createModule(.{
         .root_source_file = generated,
         .target = target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     });
 }
 

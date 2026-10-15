@@ -1,6 +1,6 @@
 # Native preflight execution and cleanup engine
 
-This Zig 0.16 module implements the #120 platform-only controller engine using
+This Zig 0.17.0 module implements the #120 platform-only controller engine using
 the merged native core, ARM/auth, transfer worker, and signed host protocol.
 It does not implement artifact preparation and does not supersede its receipt
 schema. Storage remains **UNAVAILABLE**, not a #89 persistence PASS.
@@ -343,7 +343,7 @@ not invent that approval or claim a deployable Python-free host image.
 
 ## Focused offline validation
 
-Use the existing Zig 0.16 executable, explicit owned scratch/cache/output paths,
+Use the existing Zig 0.17.0 executable, explicit owned scratch/cache/output paths,
 restored pinned packages, and `-j2`. Restore missing packages using copied
 manifests in scratch with `--fetch=all`; subsequent builds use that directory
 with `--system`. Do not create source-tree `zig-pkg`.
@@ -355,10 +355,9 @@ export ZIG_GLOBAL_CACHE_DIR="$root/global-cache"
 export ZIG_LOCAL_CACHE_DIR="$root/local-cache/Debug"
 /home/g/.local/bin/zig build \
   --build-file support/tools/hyperv/preflight/build.zig test install \
-  -Doptimize=Debug -Dtest-root="$root/out/Debug/fixtures" -j2 \
+  -Doptimize=debug -Dtest-root="$root/out/Debug/fixtures" -j2 \
   --system "$root/packages/restore/zig-pkg" \
   --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
-  --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
   --prefix "$root/out/Debug/install" --summary all
 ```
 

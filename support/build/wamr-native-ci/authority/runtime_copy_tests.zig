@@ -34,7 +34,7 @@ const Fixture = struct {
         const alloc = arena.allocator();
         const parent = try files.openDirectory(io, @import("test_options").fixture_root, .private);
         errdefer parent.close(io);
-        const name = try std.fmt.allocPrint(alloc, "copy-{d}-{d}", .{ linux.getpid(), next_fixture });
+        const name = try alloc.print("copy-{d}-{d}", .{ linux.getpid(), next_fixture });
         try parent.createDir(io, name, .fromMode(0o700));
         const directory = try parent.openDir(io, name, .{ .iterate = true, .follow_symlinks = false });
         errdefer directory.close(io);
@@ -489,7 +489,7 @@ test "synthetic COPY preserves explicit SONAME placements and exact loader entry
     names[0] = "ld-synthetic.so";
     for (dependencies[1..], names[1..], 0..) |*dependency, *name, index| {
         dependency.* = .{ .file = &library, .executable = false };
-        name.* = try std.fmt.allocPrint(alloc, "libsynthetic-{d:0>3}.so.1", .{index});
+        name.* = try alloc.print("libsynthetic-{d:0>3}.so.1", .{index});
     }
     const inventory: types.LoaderInventory = .{ .dynamic_loader = &fixture.loader, .dependencies = dependencies[0..runtime.max_loader_files] };
     var stage = try runtime_copy.Stage.initNamed(.{ .allocator = a, .io = io }, fixture.request, inventory, names[0..runtime.max_loader_files]);

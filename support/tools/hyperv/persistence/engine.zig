@@ -104,7 +104,7 @@ pub fn loadState(allocator: std.mem.Allocator, io: std.Io, directory: core.priva
     defer input.deinit();
     if (!std.mem.eql(u8, &input.binding, &binding)) return error.ContractSubstitution;
     for ([_]m.Step{ .os_upload, .data_upload }) |step| {
-        const record = state.records[@intFromEnum(step)];
+        const record = state.records[@backingInt(step)];
         const source = if (step == .os_upload) input.value.guest else input.value.data;
         if (record.page_report) |page| if (page.plan.bytes != source.size) return error.InvalidTransfer;
         if (record.progress == .done) {
@@ -175,7 +175,7 @@ pub fn execute(allocator: std.mem.Allocator, io: std.Io, directory: core.private
 fn run(store: *Store, input: contract.Contract, options: Options) !void {
     try store.persist();
     for (0..m.execution_count) |index| {
-        const step: m.Step = @enumFromInt(index);
+        const step: m.Step = @fromBackingInt(@intCast(index));
         try perform(store, input, options, step);
     }
     store.state.phase = .two_boots_verified;
@@ -326,7 +326,7 @@ fn cleanup(store: *Store, input: contract.Contract, options: Options) !void {
     // Interrupted main jobs are never resumed. Only new cleanup actions and
     // bounded read-only reconciliation are eligible under cleanup authority.
     for (m.execution_count..m.step_count) |index| {
-        const step: m.Step = @enumFromInt(index);
+        const step: m.Step = @fromBackingInt(@intCast(index));
         const record = store.state.record(step);
         if (step == .cleanup_dispose and (store.state.os_access_pending or store.state.data_access_pending)) {
             recordFailure(store, .cleanup, error.AccessUnresolved);
@@ -344,17 +344,17 @@ fn cleanup(store: *Store, input: contract.Contract, options: Options) !void {
         }
         const skip = switch (step) {
             .cleanup_os_revoke => !store.state.os_access_pending or store.state.originals.os == null or
-                store.state.records[@intFromEnum(m.Step.os_revoke)].progress != .unissued,
+                store.state.records[@backingInt(m.Step.os_revoke)].progress != .unissued,
             .cleanup_data_revoke => !store.state.data_access_pending or store.state.originals.data == null or
-                store.state.records[@intFromEnum(m.Step.data_revoke)].progress != .unissued,
+                store.state.records[@backingInt(m.Step.data_revoke)].progress != .unissued,
             .cleanup_deallocate => store.state.originals.vm == null or store.state.isDone(.observe_final_deallocated) or
                 (store.state.isDone(.observe_deallocated) and
-                    (store.state.records[@intFromEnum(m.Step.start_boot2)].progress == .unissued or
-                        store.state.records[@intFromEnum(m.Step.start_boot2)].effect == .not_started)) or
-                store.state.records[@intFromEnum(m.Step.deallocate_boot1)].progress == .intent or
-                store.state.records[@intFromEnum(m.Step.deallocate_boot1)].progress == .failed or
-                store.state.records[@intFromEnum(m.Step.deallocate_boot2)].progress == .intent or
-                store.state.records[@intFromEnum(m.Step.deallocate_boot2)].progress == .failed,
+                    (store.state.records[@backingInt(m.Step.start_boot2)].progress == .unissued or
+                        store.state.records[@backingInt(m.Step.start_boot2)].effect == .not_started)) or
+                store.state.records[@backingInt(m.Step.deallocate_boot1)].progress == .intent or
+                store.state.records[@backingInt(m.Step.deallocate_boot1)].progress == .failed or
+                store.state.records[@backingInt(m.Step.deallocate_boot2)].progress == .intent or
+                store.state.records[@backingInt(m.Step.deallocate_boot2)].progress == .failed,
             .cleanup_os_access => !store.state.os_access_pending,
             .cleanup_data_access => !store.state.data_access_pending,
             else => false,

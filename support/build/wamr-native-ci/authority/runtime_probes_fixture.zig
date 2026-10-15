@@ -31,7 +31,7 @@ pub fn main(init: std.process.Init) !void {
         try emit(2, "private-fault?sig=never-publish\n");
         std.process.exit(29);
     } else if (std.mem.eql(u8, mode, "overflow")) {
-        const bytes = [_]u8{'x'} ** 4096;
+        const bytes = @as([4096]u8, @splat('x'));
         while (true) {
             try emit(1, &bytes);
             try emit(2, &bytes);

@@ -173,6 +173,7 @@ pub const AcceptedRun = struct {
     compatibility: profile.CompatibleRecordSet,
     production_profile: ?profile.ProductionProfile,
     source: SourceIdentity,
+    imported_wamr_revision: []const u8 = limits.wamr_revision,
     result: ResultRecord,
     records: []const PinnedRecord,
     artifacts: []const PinnedArtifact,
@@ -678,7 +679,7 @@ fn openAndValidateWithPolicy(
         try appendCurrentToolInput(&accepted, readonly_git_role, accepted.readonly_git.?.path);
         const paths = try inputs.executableRuntimePaths(accepted.allocator(), io, accepted.readonly_git.?.path);
         for (paths) |path|
-            try appendCurrentInput(&accepted, try std.fmt.allocPrint(p, "{s}{s}", .{ readonly_runtime_prefix, path }), try p.dupe(u8, path), false);
+            try appendCurrentInput(&accepted, try p.print("{s}{s}", .{ readonly_runtime_prefix, path }), try p.dupe(u8, path), false);
     }
     if (accepted.compatibility != .tiny_v2_qcow2_derived_vhd and policy == .native_only)
         return error.UnsupportedLocalLegacyRun;
@@ -908,6 +909,27 @@ fn loadResult(self: *AcceptedRun) !void {
     self.records = try pinned.toOwnedSlice(p);
     self.record_snapshots = try snapshots.toOwnedSlice(p);
     const build_value = try canonicalFile(self, try recordPath(self, "build.json"), records.max_record_bytes);
+    if (self.context == .local_runtime) {
+        if (self.compatibility == .tiny_v1_legacy)
+            self.imported_wamr_revision = limits.historical_wamr_revision;
+        if (build_value == .object) {
+            if (build_value.object.get("runtime")) |runtime_value| {
+                if (runtime_value == .object) {
+                    if (runtime_value.object.get("wamr_revision")) |revision_value| {
+                        const wamr_revision = try text(revision_value);
+                        if (self.compatibility == .tiny_v1_legacy)
+                            try equal(wamr_revision, limits.historical_wamr_revision);
+                        self.imported_wamr_revision = if (std.mem.eql(u8, wamr_revision, limits.historical_wamr_revision))
+                            limits.historical_wamr_revision
+                        else if (std.mem.eql(u8, wamr_revision, limits.wamr_revision))
+                            limits.wamr_revision
+                        else
+                            return error.InvalidEvidence;
+                    }
+                }
+            }
+        }
+    }
     const start_value = try canonicalFile(self, try recordPath(self, "build-start.json"), records.max_record_bytes);
     const source = try get(build_value, "source");
     const start_source = try get(start_value, "source");
@@ -1213,7 +1235,7 @@ fn collectCustodyInputs(
             @memcpy(&content_sha, content_text);
             @memcpy(&physical_sha, physical_text);
             try result.append(p, .{
-                .role = try std.fmt.allocPrint(p, "tree:{s}", .{role}),
+                .role = try p.print("tree:{s}", .{role}),
                 .path = try p.dupe(u8, path),
                 .snapshot = .{
                     .bytes = try number(u64, try get(tree, "bytes")),
@@ -1259,7 +1281,7 @@ fn collectCustodyInputs(
     for (current.trees) |tree| {
         const root = physical.metadata(try physical.directory(self.io, tree.path, false));
         try result.append(p, .{
-            .role = try std.fmt.allocPrint(p, "tree:{s}", .{tree.role}),
+            .role = try p.print("tree:{s}", .{tree.role}),
             .path = try p.dupe(u8, tree.path),
             .snapshot = .{
                 .bytes = @intCast(tree.bytes),
@@ -1348,6 +1370,8 @@ pub fn validateLocalPostRunCommand(self: *AcceptedRun, raw: []const u8, stage: S
 fn validateCommands(self: *AcceptedRun, legacy: bool, allow_historical_local: bool) !void {
     const start = if (legacy) std.json.Value.null else try canonicalFile(self, try recordPath(self, "build-start.json"), records.max_record_bytes);
     const boot_inputs = if (legacy) std.json.Value.null else try canonicalFile(self, try recordPath(self, "boot-inputs.json"), records.max_record_bytes);
+    const historical_generation = (self.context == .trusted_inner_zip or self.context == .private_bundle) and
+        std.mem.eql(u8, self.imported_wamr_revision, limits.historical_wamr_revision);
     for (self.records) |item| {
         if (!std.mem.startsWith(u8, item.name, "command-")) continue;
         const stage_name = item.name["command-".len .. item.name.len - ".json".len];
@@ -1368,14 +1392,16 @@ fn validateCommands(self: *AcceptedRun, legacy: bool, allow_historical_local: bo
         } else {
             const validated = if (self.compatibility == .tiny_v1_legacy)
                 command.validateLegacyV1(self.allocator(), value, stage, self.context)
+            else if (historical_generation)
+                command.validateHistoricalGeneration(self.allocator(), value, stage, self.context)
             else
                 command.validate(self.allocator(), value, stage, self.context);
             if (validated) |_| {} else |err| {
                 if (!allow_historical_local or err == error.OutOfMemory) return err;
-                _ = try command.validate(self.allocator(), value, stage, .trusted_inner_zip);
+                _ = try command.validateHistoricalGeneration(self.allocator(), value, stage, .trusted_inner_zip);
             }
             if (self.context == .local_runtime) {
-                const log = try join(self.allocator(), &.{ self.root, "compute/private", try std.fmt.allocPrint(self.allocator(), "{s}.log", .{stage_name}) });
+                const log = try join(self.allocator(), &.{ self.root, "compute/private", try self.allocator().print("{s}.log", .{stage_name}) });
                 const observed = try self.readFileInPass(log, plan.spec(stage).output_limit + 1, true);
                 if (observed.bytes != try number(u64, try get(value, "bytes")))
                     return error.CommandOutputChanged;
@@ -1500,7 +1526,7 @@ fn collectRuntimeInputs(self: *AcceptedRun, context: *build.Context, boot_contex
         for (custody.trees) |tree| {
             const root = physical.metadata(try physical.directory(self.io, tree.path, false));
             try result.append(p, .{
-                .role = try std.fmt.allocPrint(p, "tree:{s}", .{tree.role}),
+                .role = try p.print("tree:{s}", .{tree.role}),
                 .path = try p.dupe(u8, tree.path),
                 .snapshot = .{
                     .bytes = tree.bytes,
@@ -1527,7 +1553,7 @@ fn collectArtifacts(self: *AcceptedRun) !void {
         if (self.context == .local_runtime and spec.role == .cleanup and !self.local_read_only) continue;
         if (self.compatibility == .tiny_v1_legacy and
             (spec.role == .qcow2 or spec.role == .cleanup or
-                @intFromEnum(spec.role) >= @intFromEnum(ArtifactRole.qcow2_finalization_intent)))
+                @backingInt(spec.role) >= @backingInt(ArtifactRole.qcow2_finalization_intent)))
             continue;
         const path_name = try self.artifactPath(spec.role);
         const observed = try self.readFileInPass(path_name, max_artifact_bytes, self.context != .local_runtime or !spec.source);
@@ -1546,12 +1572,12 @@ fn collectArtifacts(self: *AcceptedRun) !void {
         for ([_]BootRole{ .serial, .request, .report, .compute }) |part| {
             const path_name = try bootPath(self, mode, part);
             const observed = try self.readFileInPass(path_name, if (part == .serial) 4 * 1024 * 1024 else records.max_record_bytes, true);
-            const role = try std.fmt.allocPrint(p, "boot:{s}:{s}", .{ @tagName(mode), @tagName(part) });
+            const role = try p.print("boot:{s}:{s}", .{ @tagName(mode), @tagName(part) });
             const relative_path = if (self.context == .local_runtime)
                 (if (part == .compute)
-                    try join(p, &.{ "runtime/compute/evidence", try std.fmt.allocPrint(p, "{s}-compute.json", .{@tagName(mode)}) })
+                    try join(p, &.{ "runtime/compute/evidence", try p.print("{s}-compute.json", .{@tagName(mode)}) })
                 else
-                    try join(p, &.{ "runtime/compute", try std.fmt.allocPrint(p, "boot-{s}", .{@tagName(mode)}), switch (part) {
+                    try join(p, &.{ "runtime/compute", try p.print("boot-{s}", .{@tagName(mode)}), switch (part) {
                         .serial => "hyperv-efi-boot.log",
                         .request => "request.json",
                         .report => "report.json",
@@ -1571,8 +1597,8 @@ fn bootPath(self: *AcceptedRun, mode: profile.Mode, part: BootRole) ![]const u8 
     if (self.context != .local_runtime)
         return join(a, &.{ self.root, "boots", @tagName(mode), @tagName(part) });
     if (part == .compute)
-        return recordPath(self, try std.fmt.allocPrint(a, "{s}-compute.json", .{@tagName(mode)}));
-    return join(a, &.{ self.root, "compute", try std.fmt.allocPrint(a, "boot-{s}", .{@tagName(mode)}), switch (part) {
+        return recordPath(self, try a.print("{s}-compute.json", .{@tagName(mode)}));
+    return join(a, &.{ self.root, "compute", try a.print("boot-{s}", .{@tagName(mode)}), switch (part) {
         .serial => "hyperv-efi-boot.log",
         .request => "request.json",
         .report => "report.json",
@@ -1601,7 +1627,15 @@ fn revalidateImported(self: *AcceptedRun) !void {
     try equal(try text(try get(source, "repository")), "cataggar/unikraft");
     try equal(try text(try get(source, "source_revision")), self.source.revision);
     try equal(try text(try get(source, "source_tree")), self.source.tree);
-    try equal(try text(try get(source, "wamr_revision")), @import("custody_limits.zig").wamr_revision);
+    const wamr_revision = try text(try get(source, "wamr_revision"));
+    if (version == 1)
+        try equal(wamr_revision, limits.historical_wamr_revision);
+    self.imported_wamr_revision = if (std.mem.eql(u8, wamr_revision, limits.historical_wamr_revision))
+        limits.historical_wamr_revision
+    else if (std.mem.eql(u8, wamr_revision, limits.wamr_revision))
+        limits.wamr_revision
+    else
+        return error.InvalidImportedBundle;
     for ([_][]const u8{ "run_id", "run_attempt" }) |key| {
         const identifier = try text(try get(source, key));
         if (identifier.len == 0 or identifier.len > 20 or identifier[0] < '1' or identifier[0] > '9')
@@ -1657,6 +1691,17 @@ fn validateBundleHeader(self: *AcceptedRun, portable: std.json.Value) !void {
     try equal(try text(try get(portable, "source_tree")), self.source.tree);
     if (version == 2)
         try equal(try text(try get(portable, "profile")), "qcow2-derived-vhd");
+    if (self.context == .private_bundle) {
+        const wamr_revision = try text(try get(try get(portable, "identity"), "wamr_revision"));
+        if (version == 1)
+            try equal(wamr_revision, limits.historical_wamr_revision);
+        self.imported_wamr_revision = if (std.mem.eql(u8, wamr_revision, limits.historical_wamr_revision))
+            limits.historical_wamr_revision
+        else if (std.mem.eql(u8, wamr_revision, limits.wamr_revision))
+            limits.wamr_revision
+        else
+            return error.InvalidImportedBundle;
+    }
     const legacy = version == 1 and preSupervisorSource(self.source);
     if (version == 1 and !legacy) return error.UnsupportedLegacySource;
 }
@@ -1680,7 +1725,7 @@ fn validateSelectedBundle(self: *AcceptedRun, portable: std.json.Value, members:
     var cursor: usize = 0;
     for (artifact_specs) |spec| {
         if (version == 1 and (spec.role == .qcow2 or spec.role == .cleanup or
-            @intFromEnum(spec.role) >= @intFromEnum(ArtifactRole.qcow2_finalization_intent)))
+            @backingInt(spec.role) >= @backingInt(ArtifactRole.qcow2_finalization_intent)))
             continue;
         const name = stageRole(spec.role);
         const relative = try join(a, &.{ "artifacts", name });
@@ -1833,7 +1878,8 @@ fn verifyImportedEvidence(self: *AcceptedRun, portable: ?std.json.Value) !void {
     try compareCopy(self, "package.json", .package);
     // Producer identity artifacts are not canonical JSON; archive member hashes pin their exact bytes.
     const identity = try documentArtifact(self, .runtime_identity, 64 * 1024);
-    if (v2) try build.admitPreparedIdentity(identity);
+    if (v2) try build.admitImportedIdentity(identity);
+    try equal(try text(try get(identity, "wamr_revision")), self.imported_wamr_revision);
     try sameJson(a, try get(built, "runtime"), identity);
     const image = try documentArtifact(self, .image_identity, 1024 * 1024);
     try sameJson(a, try get(built, "image"), image);
@@ -1867,7 +1913,7 @@ fn verifyImportedEvidence(self: *AcceptedRun, portable: ?std.json.Value) !void {
         const consumer_files = try get(consumer, "files");
         const host_tools: []const []const u8 = if (v2) &inputs.host_tools else &legacy_host_tools;
         for (host_tools) |name| {
-            const tool = try get(consumer_files, try std.fmt.allocPrint(a, "tool:{s}", .{name}));
+            const tool = try get(consumer_files, try a.print("tool:{s}", .{name}));
             try equal(try text(try get(try get(start, "tools"), name)), try text(try get(tool, "sha256")));
         }
         _ = try get(consumer_files, "wamr-source-archive");
@@ -1900,6 +1946,10 @@ fn verifyImportedEvidence(self: *AcceptedRun, portable: ?std.json.Value) !void {
     try equal(try text(try get(package, "scope")), "public_local_compute_packaging_only");
     try equal(try text(try get(package, "acceptance")), "not_established");
     const packaged = try get(package, "image");
+    const requested_miz = if (old)
+        limits.historical_miz_revision
+    else
+        try text(try get(try get(try get(start, "dependencies"), "request"), "revision"));
     if (v2) {
         _ = try contracts.exactFields(packaged, &.{
             "schema_version", "miz_revision", "efi", "raw", "vhd",
@@ -1907,7 +1957,7 @@ fn verifyImportedEvidence(self: *AcceptedRun, portable: ?std.json.Value) !void {
         });
         if (try number(u8, try get(packaged, "schema_version")) != 1)
             return error.PackageChanged;
-        try equal(try text(try get(packaged, "miz_revision")), limits.miz_revision);
+        try equal(try text(try get(packaged, "miz_revision")), requested_miz);
         _ = try contracts.parseSha256(try text(try get(packaged, "footer_sha256")));
     }
     for ([_]struct { name: []const u8, role: ArtifactRole }{
@@ -1996,7 +2046,7 @@ fn verifyImportedEvidence(self: *AcceptedRun, portable: ?std.json.Value) !void {
                 .footer_sha256 = footer_sha,
             };
         }
-        try equal(try text(try get(packaged, "miz_revision")), limits.miz_revision);
+        try equal(try text(try get(packaged, "miz_revision")), requested_miz);
         try sameJson(a, try get(packaged, "packaging"), try valueOf(a, .{
             .architecture = "x86_64",
             .@"boot-file-sha256" = efi_file.sha256,
@@ -2019,7 +2069,7 @@ fn verifyImportedEvidence(self: *AcceptedRun, portable: ?std.json.Value) !void {
             "wamr_revision",  "wasm_sha256",     "cwasm_sha256",
             "runtime_sha256", "compiler_sha256", "config_sha256",
         });
-        try equal(try text(try get(hashes, "wamr_revision")), @import("custody_limits.zig").wamr_revision);
+        try equal(try text(try get(hashes, "wamr_revision")), self.imported_wamr_revision);
         for ([_]struct { name: []const u8, role: ArtifactRole }{
             .{ .name = "wasm_sha256", .role = .wasm },
             .{ .name = "cwasm_sha256", .role = .cwasm },
@@ -2086,9 +2136,13 @@ fn verifyImportedStart(a: std.mem.Allocator, start: std.json.Value, supervised: 
         return error.InvalidDependency;
     const request = try get(dependencies, "request");
     _ = try contracts.exactFields(request, &.{ "url", "revision", "package_hash" });
-    try equal(try text(try get(request, "url")), limits.miz_url);
-    try equal(try text(try get(request, "revision")), limits.miz_revision);
-    try equal(try text(try get(request, "package_hash")), limits.miz_package_hash);
+    const algorithm = try text(try get(try get(try get(dependencies, "packages"), "hash_verification"), "algorithm"));
+    const historical = std.mem.eql(u8, algorithm, "zig-0.16.0-fetch-path");
+    if (!historical and !std.mem.eql(u8, algorithm, "zig-0.17.0-fetch-path"))
+        return error.InvalidDependency;
+    try equal(try text(try get(request, "url")), if (historical) limits.historical_miz_url else limits.miz_url);
+    try equal(try text(try get(request, "revision")), if (historical) limits.historical_miz_revision else limits.miz_revision);
+    try equal(try text(try get(request, "package_hash")), if (historical) limits.historical_miz_package_hash else limits.miz_package_hash);
     try verifyImportedDependencies(a, dependencies);
     if (!supervised) return;
     const supervisor = try get(start, "command_supervisor");
@@ -2154,6 +2208,7 @@ fn recordedMetadata(value: std.json.Value, kind: u32, permissions: ?u32, size: ?
 }
 
 fn verifyImportedDependencies(a: std.mem.Allocator, dependencies: std.json.Value) !void {
+    const root_package = try text(try get(try get(dependencies, "request"), "package_hash"));
     const source_manifests = try get(dependencies, "source_manifests");
     _ = try contracts.exactFields(source_manifests, &.{ "build.zig", "build.zig.zon" });
     for ([_][]const u8{ "build.zig", "build.zig.zon" }, [_][]const u8{
@@ -2280,11 +2335,11 @@ fn verifyImportedDependencies(a: std.mem.Allocator, dependencies: std.json.Value
         }
         try physical.bind(a, &closure, entry);
         try physical.bind(a, &physical_hash, .{ name, content_hash });
-        const name_line = try std.fmt.allocPrint(a, "{s}\n", .{name});
+        const name_line = try a.print("{s}\n", .{name});
         const verification_hash = std.fmt.bytesToHex(records.fileIdentity(name_line), .lower);
         try hash_records.array.append(try valueOf(a, .{ .package_hash = name, .sha256 = verification_hash }));
     }
-    if (!names.contains(limits.miz_package_hash) or
+    if (!names.contains(root_package) or
         counts[0] != try number(u64, try get(packages, "files")) or
         counts[1] != try number(u64, try get(packages, "directories")) or
         counts[1] < entries.array.items.len or
@@ -2303,14 +2358,17 @@ fn verifyImportedDependencies(a: std.mem.Allocator, dependencies: std.json.Value
     try equal(try text(try get(summary, "sha256")), &manifests_digest);
     const hash_verification = try get(packages, "hash_verification");
     _ = try contracts.exactFields(hash_verification, &.{ "algorithm", "count", "sha256" });
-    try equal(try text(try get(hash_verification, "algorithm")), "zig-0.16.0-fetch-path");
+    const algorithm = try text(try get(hash_verification, "algorithm"));
+    if (!std.mem.eql(u8, algorithm, "zig-0.17.0-fetch-path") and
+        !std.mem.eql(u8, algorithm, "zig-0.16.0-fetch-path"))
+        return error.InvalidDependency;
     if (try number(u64, try get(hash_verification, "count")) != entries.array.items.len)
         return error.InvalidDependency;
     const hash_digest = std.fmt.bytesToHex(try records.identity(a, try std.json.Stringify.valueAlloc(a, hash_records, .{})), .lower);
     try equal(try text(try get(hash_verification, "sha256")), &hash_digest);
     var reached = std.StringHashMap(void).init(a);
     var pending: std.ArrayList([]const u8) = .empty;
-    try pending.append(a, limits.miz_package_hash);
+    try pending.append(a, root_package);
     while (pending.pop()) |name| {
         if (reached.contains(name)) continue;
         const entry = names.get(name) orelse return error.InvalidDependency;
@@ -2333,9 +2391,9 @@ fn guardedMap(a: std.mem.Allocator, value: std.json.Value, domain: []const u8) !
         try number(u64, try get(value, "count")) != map.object.count())
         return error.InvalidCommand;
     var content = core.Sha256.init(.{});
-    content.update(try std.fmt.allocPrint(a, "{s}-content\x00", .{domain}));
+    content.update(try a.print("{s}-content\x00", .{domain}));
     var physical_hash = core.Sha256.init(.{});
-    physical_hash.update(try std.fmt.allocPrint(a, "{s}-physical\x00", .{domain}));
+    physical_hash.update(try a.print("{s}-physical\x00", .{domain}));
     const names = try a.dupe([]const u8, map.object.keys());
     std.mem.sort([]const u8, names, {}, struct {
         fn less(_: void, first: []const u8, second: []const u8) bool {
@@ -2450,7 +2508,7 @@ fn verifyImportedBoot(self: *AcceptedRun, mode: profile.Mode, boot_inputs: std.j
     const serial_path = try bootPath(self, mode, .serial);
     const request = try canonicalFile(self, request_path, records.max_record_bytes);
     const report = try canonicalFile(self, report_path, records.max_record_bytes);
-    const name = try std.fmt.allocPrint(a, "{s}-compute.json", .{@tagName(mode)});
+    const name = try a.print("{s}-compute.json", .{@tagName(mode)});
     const compute = try canonicalFile(self, try recordPath(self, name), records.max_record_bytes);
     try compareBootCopy(self, mode, name);
     _ = try contracts.exactFields(request, &.{ "schema_version", "supervisor_pid", "config", "pins" });
@@ -2467,7 +2525,7 @@ fn verifyImportedBoot(self: *AcceptedRun, mode: profile.Mode, boot_inputs: std.j
     };
     const work_dir = try text(try get(config, "work_dir"));
     try files.absoluteFilePath(work_dir);
-    const mode_suffix = try std.fmt.allocPrint(a, "/compute/boot-{s}", .{@tagName(mode)});
+    const mode_suffix = try a.print("/compute/boot-{s}", .{@tagName(mode)});
     if (!std.mem.endsWith(u8, work_dir, mode_suffix))
         return error.InvalidBootRequest;
     const runtime = work_dir[0 .. work_dir.len - mode_suffix.len];

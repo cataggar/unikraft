@@ -22,8 +22,8 @@ pub const Publications = struct {
     failure_record: files.CommitStatus = .not_committed,
 
     fn started(self: Publications) bool {
-        inline for (std.meta.fields(Publications)) |field|
-            if (@field(self, field.name) != .not_committed) return true;
+        inline for (@typeInfo(Publications).@"struct".field_names) |field_name|
+            if (@field(self, field_name) != .not_committed) return true;
         return false;
     }
 };
@@ -94,22 +94,22 @@ const Paths = struct {
         const value: Paths = .{
             .plan = try a.dupe(u8, command.output),
             .template = try a.dupe(u8, command.approval_template),
-            .pending_plan = try std.fmt.allocPrint(a, "{s}.pending-plan.json", .{command.output}),
-            .pending_template = try std.fmt.allocPrint(a, "{s}.pending-template.json", .{command.approval_template}),
-            .validation = try std.fmt.allocPrint(a, "{s}.validation.json", .{command.output}),
-            .failure_record = try std.fmt.allocPrint(a, "{s}.failure.json", .{command.output}),
+            .pending_plan = try a.print("{s}.pending-plan.json", .{command.output}),
+            .pending_template = try a.print("{s}.pending-template.json", .{command.approval_template}),
+            .validation = try a.print("{s}.validation.json", .{command.output}),
+            .failure_record = try a.print("{s}.failure.json", .{command.output}),
         };
-        inline for (std.meta.fields(Paths), 0..) |field, index| {
-            const path = @field(value, field.name);
+        inline for (@typeInfo(Paths).@"struct".field_names, 0..) |field_name, index| {
+            const path = @field(value, field_name);
             try files.absoluteFilePath(path);
             if (equal(std.fs.path.basename(path), ".writer.lock")) return error.OutputCollision;
-            inline for (std.meta.fields(Paths)[0..index]) |previous|
-                if (equal(path, @field(value, previous.name))) return error.OutputCollision;
+            inline for (@typeInfo(Paths).@"struct".field_names[0..index]) |previous_name|
+                if (equal(path, @field(value, previous_name))) return error.OutputCollision;
         }
         return value;
     }
     fn fresh(self: Paths, io: std.Io) !void {
-        inline for (std.meta.fields(Paths)) |field| try absent(io, @field(self, field.name));
+        inline for (@typeInfo(Paths).@"struct".field_names) |field_name| try absent(io, @field(self, field_name));
     }
 };
 
@@ -501,8 +501,8 @@ const State = struct {
         self.paths = try Paths.init(a, command);
         self.paths_ready = true;
         try self.paths.fresh(self.ctx.io);
-        inline for (std.meta.fields(Paths)) |field| {
-            self.parents[self.parent_count] = try Parent.open(self.ctx.io, @field(self.paths, field.name));
+        inline for (@typeInfo(Paths).@"struct".field_names) |field_name| {
+            self.parents[self.parent_count] = try Parent.open(self.ctx.io, @field(self.paths, field_name));
             self.parent_count += 1;
         }
         for (self.parents[0..self.parent_count], 0..) |parent, index|
@@ -523,8 +523,8 @@ const State = struct {
             self.tool_count += 1;
         }
         var tools: compute.Tools = undefined;
-        inline for (std.meta.fields(compute.Tools), 0..) |field, index|
-            @field(tools, field.name) = self.tools[index].artifact();
+        inline for (@typeInfo(compute.Tools).@"struct".field_names, 0..) |field_name, index|
+            @field(tools, field_name) = self.tools[index].artifact();
         if (!equal(tools.validator.path, metadata.reader.validator.path) or
             !equal(tools.supervisor.path, metadata.reader.supervisor.path))
             return error.ReaderToolMismatch;
@@ -650,10 +650,10 @@ fn bindCommand(a: std.mem.Allocator, io: std.Io, command: types.PlanCommand, met
     if (metadata.source != .imported_product) return error.ImportedProductRequired;
     const scope = metadata.scope;
     if (scope.version != 2 or !equal(scope.purpose, contracts.policy.profile)) return error.Version2Required;
-    inline for (std.meta.fields(@TypeOf(scope.approval))) |field| {
-        if (comptime field.type == bool) {
-            if (@field(scope.approval, field.name)) return error.AuthorityNotAllowed;
-        } else if (@field(scope.approval, field.name) != 0) return error.AuthorityNotAllowed;
+    inline for (@typeInfo(@TypeOf(scope.approval)).@"struct".field_names, @typeInfo(@TypeOf(scope.approval)).@"struct".field_types) |field_name, FieldType| {
+        if (comptime FieldType == bool) {
+            if (@field(scope.approval, field_name)) return error.AuthorityNotAllowed;
+        } else if (@field(scope.approval, field_name) != 0) return error.AuthorityNotAllowed;
     }
     if (!equal(scope.location, contracts.policy.location) or !equal(scope.vm_size, contracts.policy.vm_size) or
         scope.runtime_seconds != contracts.policy.runtime_seconds or scope.cleanup_seconds != contracts.policy.cleanup_seconds or
@@ -689,8 +689,8 @@ fn outputSeparation(paths: Paths, command: types.PlanCommand, metadata: candidat
         command.tools.azure,                    command.tools.uploader,              command.tools.validator,
         command.tools.supervisor,               command.tools.az_python,
     };
-    inline for (std.meta.fields(Paths)) |field| {
-        const path = @field(paths, field.name);
+    inline for (@typeInfo(Paths).@"struct".field_names) |field_name| {
+        const path = @field(paths, field_name);
         for (roots) |root| if (inside(path, root)) return error.OutputInsideInput;
         for (inputs) |input| if (equal(path, input)) return error.OutputCollision;
     }
@@ -716,8 +716,8 @@ fn physicalSeparation(ctx: types.Context, paths: Paths, roots: []const []const u
         defer directory.close(ctx.io);
         snapshots[index] = try files.snapshot(.{ .handle = directory.handle, .flags = .{ .nonblocking = false } });
     }
-    inline for (std.meta.fields(Paths)) |field| {
-        var parent = std.fs.path.dirname(@field(paths, field.name)).?;
+    inline for (@typeInfo(Paths).@"struct".field_names) |field_name| {
+        var parent = std.fs.path.dirname(@field(paths, field_name)).?;
         while (parent.len > 1) {
             const directory = try files.openDirectory(ctx.io, parent, .artifact);
             defer directory.close(ctx.io);
@@ -785,7 +785,7 @@ const TestFixture = struct {
     fn init(a: std.mem.Allocator, io: std.Io) !TestFixture {
         const parent = try std.Io.Dir.openDirAbsolute(io, @import("test_options").fixture_root, .{});
         errdefer parent.close(io);
-        const name = try std.fmt.allocPrint(a, "plan-guards-{d}", .{std.os.linux.getpid()});
+        const name = try a.print("plan-guards-{d}", .{std.os.linux.getpid()});
         errdefer a.free(name);
         try parent.createDir(io, name, .fromMode(0o700));
         errdefer parent.deleteTree(io, name) catch @panic("plan guard fixture cleanup failed");
@@ -810,7 +810,7 @@ const TestFixture = struct {
 };
 fn project(comptime T: type, value: anytype) T {
     var result: T = undefined;
-    inline for (std.meta.fields(T)) |field| @field(result, field.name) = @field(value, field.name);
+    inline for (@typeInfo(T).@"struct".field_names) |field_name| @field(result, field_name) = @field(value, field_name);
     return result;
 }
 fn testMetadata(value: types.Plan) candidate.Metadata {
@@ -874,9 +874,9 @@ test "plan command binds exact imported selectors and frozen no-authority policy
     metadata = testMetadata(value);
     metadata.scope.version = 1;
     try std.testing.expectError(error.Version2Required, bindCommand(a, std.testing.io, command, metadata));
-    inline for (std.meta.fields(@TypeOf(metadata.scope.approval))) |field| {
+    inline for (@typeInfo(@TypeOf(metadata.scope.approval)).@"struct".field_names, @typeInfo(@TypeOf(metadata.scope.approval)).@"struct".field_types) |field_name, FieldType| {
         metadata = testMetadata(value);
-        @field(metadata.scope.approval, field.name) = if (comptime field.type == bool) true else 1;
+        @field(metadata.scope.approval, field_name) = if (comptime FieldType == bool) true else 1;
         try std.testing.expectError(error.AuthorityNotAllowed, bindCommand(a, std.testing.io, command, metadata));
     }
     inline for (.{ "runtime_seconds", "cleanup_seconds", "operation_seconds", "poll_seconds" }) |field| {
@@ -994,7 +994,7 @@ test "plan pins output parents before slow custody and refuses replacement witho
     const parent = try Parent.open(io, path);
     defer parent.retained.close(io);
     try parent.verify(io);
-    const moved = try std.fmt.allocPrint(a, "{s}-moved", .{fixture.name});
+    const moved = try a.print("{s}-moved", .{fixture.name});
     defer a.free(moved);
     try fixture.parent.rename(fixture.name, fixture.parent, moved, io);
     defer fixture.parent.deleteTree(io, moved) catch @panic("replaced plan parent fixture cleanup failed");

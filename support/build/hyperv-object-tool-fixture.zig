@@ -20,7 +20,7 @@ fn run(init: std.process.Init) !void {
     const flood = std.mem.eql(u8, mode, "stdout-limit") or std.mem.eql(u8, mode, "stderr-limit");
     var writer = (if (std.mem.eql(u8, mode, "stderr-limit")) std.Io.File.stderr() else std.Io.File.stdout()).writer(init.io, &.{});
     if (flood) {
-        const bytes = [_]u8{'x'} ** 8192;
+        const bytes = @as([8192]u8, @splat('x'));
         while (true) try writer.interface.writeAll(&bytes);
     }
     try writer.interface.writeAll("SYNTHETIC_SECRET invalid tool output\n");

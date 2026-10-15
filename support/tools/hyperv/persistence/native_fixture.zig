@@ -55,7 +55,7 @@ pub fn probes(a: std.mem.Allocator, io: std.Io, root: []const u8) !void {
         var wire: Wire = .{ .mock = .init(a, 403, switch (mode) {
             .malformed => "<Error><Code>AuthenticationFailed",
             .conflicting => "<Error><Code>AuthorizationFailure</Code></Error>",
-            .excess => "X" ** 8193,
+            .excess => &@as([8193:0]u8, @splat('X')),
             else => "<Error><Code>AuthenticationFailed</Code></Error>",
         }), .cancel_on_open = mode == .cancelled };
         defer wire.mock.deinit();

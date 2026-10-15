@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
-//! LTO link execution for Zig 0.16 native QEMU builds.
+//! LTO link execution for Zig 0.17 native QEMU builds.
 //!
 //! When `CONFIG_OPTIMIZE_LTO=y`, compilation emits LLVM IR bitcode. The
 //! standard per-library pipeline (`zig cc -r` then `objcopy --keep-global-
@@ -144,7 +144,7 @@ pub fn executeLtoFinalLink(
         .root_module = b.createModule(.{
             .root_source_file = b.path("support/build/lto-symbol-policy.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
         }),
     });
     const policy = b.addRunArtifact(policy_tool);

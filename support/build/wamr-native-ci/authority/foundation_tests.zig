@@ -193,7 +193,7 @@ const Fixture = struct {
     fn init() !Fixture {
         const parent = try std.Io.Dir.openDirAbsolute(io, @import("test_options").fixture_root, .{});
         errdefer parent.close(io);
-        const name = try std.fmt.allocPrint(a, "authority-{d}", .{std.os.linux.getpid()});
+        const name = try a.print("authority-{d}", .{std.os.linux.getpid()});
         errdefer a.free(name);
         try parent.createDir(io, name, .fromMode(0o700));
         errdefer parent.deleteTree(io, name) catch @panic("authority fixture cleanup failed");
@@ -300,7 +300,7 @@ test "transaction refuses earlier failures replaced parents and cancellation wit
     {
         var transaction = try tx.Transaction.init(.{ .allocator = a, .io = io }, output);
         defer transaction.deinit();
-        const moved = try std.fmt.allocPrint(a, "{s}-moved", .{fixture.name});
+        const moved = try a.print("{s}-moved", .{fixture.name});
         defer a.free(moved);
         try fixture.parent.rename(fixture.name, fixture.parent, moved, io);
         defer fixture.parent.deleteTree(io, moved) catch @panic("moved authority fixture cleanup failed");

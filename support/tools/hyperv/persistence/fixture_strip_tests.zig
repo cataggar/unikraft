@@ -2,6 +2,9 @@ const std = @import("std");
 const qualification = @import("qualification");
 const gate = qualification.gate;
 const options = @import("strip_options");
+const paths = @import("test_artifact_paths");
+const raw = paths.resolve(options.build_cwd, options.raw);
+const candidate = paths.resolve(options.build_cwd, options.candidate);
 const t = std.testing;
 const a = t.allocator;
 const io = t.io;
@@ -9,8 +12,8 @@ const io = t.io;
 fn selected(report: ?[]const u8) !qualification.Options {
     if (!options.qualified) return error.QualificationRequired;
     return .{
-        .raw = options.raw,
-        .candidate = options.candidate,
+        .raw = raw,
+        .candidate = candidate,
         .layout_policy = if (options.file_relayout) .file_offset_relayout else .identical_program_headers,
         .report = report,
     };
@@ -59,13 +62,13 @@ test "persistence stripping proof names exactly one worker and retains literal p
     try t.expect(object.get("passed").?.bool and object.get("synthetic").?.bool and object.get("qualification_only").?.bool);
     try t.expect(!object.get("admitted").?.bool);
     try t.expect(object.get("pairs") == null and object.get("external_fixture") == null);
-    try t.expectEqual(@as(usize, 2), std.meta.fields(gate.Role).len);
+    try t.expectEqual(@as(usize, 2), @typeInfo(gate.Role).@"enum".field_names.len);
     const worker = object.get("worker").?.object;
     try t.expectEqual(@as(usize, 4), worker.count());
     try t.expectEqualStrings("persistence_worker", worker.get("role").?.string);
     const policy = (try selected(null)).layout_policy;
     try t.expectEqualStrings(@tagName(policy), object.get("layout_policy").?.string);
-    const pair = try gate.Pair.openWithPolicy(a, io, options.raw, options.candidate, policy);
+    const pair = try gate.Pair.openWithPolicy(a, io, raw, candidate, policy);
     defer pair.close(a, io);
     for ([_][]const u8{ "raw", "candidate" }, [_]gate.Pinned{ pair.raw, pair.candidate }) |field, input| {
         const pin = worker.get(field).?.object;
@@ -90,13 +93,13 @@ test "persistence stripping is checked without a report and cannot overwrite rep
     defer a.free(directory);
     const path = try std.fs.path.join(a, &.{ directory, "proof.json" });
     defer a.free(path);
-    const pair = try gate.Pair.openWithPolicy(a, io, options.raw, options.candidate, (try selected(null)).layout_policy);
+    const pair = try gate.Pair.openWithPolicy(a, io, raw, candidate, (try selected(null)).layout_policy);
     defer pair.close(a, io);
     try qualification.qualify(a, io, try selected(null));
     try qualification.qualify(a, io, try selected(path));
     try t.expectError(error.PathAlreadyExists, qualification.qualify(a, io, try selected(path)));
-    try t.expectError(error.PathAlreadyExists, qualification.qualify(a, io, try selected(options.raw)));
-    try t.expectError(error.PathAlreadyExists, qualification.qualify(a, io, try selected(options.candidate)));
+    try t.expectError(error.PathAlreadyExists, qualification.qualify(a, io, try selected(raw)));
+    try t.expectError(error.PathAlreadyExists, qualification.qualify(a, io, try selected(candidate)));
     var alias = try selected(null);
     alias.candidate = alias.raw;
     try t.expectError(error.NotDistinctFiles, qualification.qualify(a, io, alias));
@@ -135,7 +138,7 @@ test "persistence stripping rejects changed loaded bytes before publishing" {
     var changed = false;
     for (pair.content.program_mappings.slice()) |mapping| {
         const logical = mapping.logical_mapping;
-        if (logical.type != std.elf.PT_LOAD or pair.content.entry < logical.virtual_address) continue;
+        if (logical.type != @backingInt(std.elf.PT.LOAD) or pair.content.entry < logical.virtual_address) continue;
         const delta = pair.content.entry - logical.virtual_address;
         if (delta >= logical.file_bytes) continue;
         bytes[@intCast(mapping.candidate_offset + delta)] ^= 1;

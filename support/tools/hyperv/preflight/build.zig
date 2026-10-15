@@ -1,6 +1,6 @@
 const std = @import("std");
 
-fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Module {
     const core = b.createModule(.{ .root_source_file = b.path("../core.zig"), .target = target, .optimize = optimize });
     if (target.result.cpu.arch == .x86_64)
         core.addAssemblyFile(b.path("../sha256_clear_upper.S"));
@@ -35,7 +35,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("main.zig"),
         .target = target,
         .optimize = optimize,
-        .strip = optimize != .Debug,
+        .strip = optimize != .debug,
         .imports = &.{.{ .name = "preflight", .module = engine }},
     }) });
     b.installArtifact(cli);

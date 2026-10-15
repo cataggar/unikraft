@@ -36,7 +36,7 @@ fn mark(io: std.Io, phase: Phase, bytes: u64) !void {
         .phase = phase,
         .bytes = bytes,
         .self_bytes = try measurement.selfExecutableBytes(io),
-        .cpu_model = builtin.cpu.model.name,
+        .cpu_model = builtin.target.cpu.model.name,
         .sample = try measurement.capture(),
     }, .{}, &writer);
     std.debug.print("public-image synthetic cost: {s}\n", .{writer.buffered()});
@@ -65,7 +65,7 @@ fn standardDigest(io: std.Io, path: []const u8, expected: [32]u8, comptime clear
     while (position < before.size) {
         const length: usize = @intCast(@min(buffer.len, before.size - position));
         if (try file.readPositionalAll(io, buffer[0..length], position) != length) return error.ArtifactChanged;
-        if (comptime builtin.cpu.arch == .x86_64 and builtin.cpu.hasAll(.x86, &.{ .sha, .avx2 })) {
+        if (comptime builtin.target.cpu.arch == .x86_64 and builtin.target.cpu.hasAll(.x86, &.{ .sha, .avx2 })) {
             asm volatile ("vpcmpeqd %%ymm0, %%ymm0, %%ymm0" ::: .{ .ymm0 = true });
             if (clear_upper) hyperv_public_cost_clear_upper();
         }

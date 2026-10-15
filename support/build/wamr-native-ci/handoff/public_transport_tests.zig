@@ -412,7 +412,7 @@ test "publication sealing preserves exact bytes and owner group read-only one-fi
 
 test "publication refuses unprivileged invocation unsafe source custody and wrong commitments before reservation" {
     for ([_][]const u8{ "privilege", "uid", "gid", "mode", "hardlink", "symlink", "digest", "context", "cancel" }) |kind| {
-        const name = try std.fmt.allocPrint(a, "seal-input-{s}", .{kind});
+        const name = try a.print("seal-input-{s}", .{kind});
         defer a.free(name);
         var fixture = try Fixture.init(name);
         defer fixture.deinit();
@@ -446,7 +446,7 @@ test "publication faults retain evidence and refuse source destination replaceme
         .partial_write,         .source_mutation,    .source_replacement, .destination_replacement,
         .publication_collision, .cancel_during_copy, .before_file_sync,   .after_publication,
     }) |fault| {
-        const name = try std.fmt.allocPrint(a, "seal-fault-{s}", .{@tagName(fault)});
+        const name = try a.print("seal-fault-{s}", .{@tagName(fault)});
         defer a.free(name);
         var fixture = try Fixture.init(name);
         defer fixture.deinit();
@@ -479,7 +479,7 @@ test "publication faults retain evidence and refuse source destination replaceme
 
 test "sealed upload live custody refuses same-byte replacement directory replacement links and extra members" {
     for ([_][]const u8{ "source-replace", "output-replace", "root-replace", "ancestor-mode", "extra", "transient", "output-link" }) |kind| {
-        const name = try std.fmt.allocPrint(a, "seal-live-{s}", .{kind});
+        const name = try a.print("seal-live-{s}", .{kind});
         defer a.free(name);
         var fixture = try Fixture.init(name);
         defer fixture.deinit();
@@ -548,7 +548,7 @@ test "Actions raw container independently binds commitments and extracts stored 
 
 test "Actions extraction refuses wrong selection missing raw and independently wrong inner digest" {
     for ([_][]const u8{ "artifact", "attempt", "selected-container", "container", "inner", "missing", "cancel" }) |kind| {
-        const name = try std.fmt.allocPrint(a, "actions-input-{s}", .{kind});
+        const name = try a.print("actions-input-{s}", .{kind});
         defer a.free(name);
         var fixture = try Fixture.init(name);
         defer fixture.deinit();
@@ -602,7 +602,7 @@ test "publication adapters refuse sparse oversized and empty inputs before readi
 
 test "Actions outer profile refuses duplicate extra path encrypted link zip64 truncated bad deflate and trailing codecs" {
     for ([_][]const u8{ "duplicate", "extra", "path", "encrypted", "link", "zip64", "truncated", "codec", "deflate", "crc", "descriptor", "deflate-trailing", "comment" }) |kind| {
-        const name = try std.fmt.allocPrint(a, "actions-format-{s}", .{kind});
+        const name = try a.print("actions-format-{s}", .{kind});
         defer a.free(name);
         var fixture = try Fixture.init(name);
         defer fixture.deinit();
@@ -649,7 +649,7 @@ test "Actions outer profile refuses duplicate extra path encrypted link zip64 tr
 
 test "Actions extraction retains partial collision cancellation and uncertain publication evidence" {
     for ([_]actions.Fault{ .partial_write, .replace_partial, .raw_mutation, .raw_replacement, .publication_collision, .cancel_during_copy, .before_file_sync, .after_publication }) |fault| {
-        const name = try std.fmt.allocPrint(a, "actions-fault-{s}", .{@tagName(fault)});
+        const name = try a.print("actions-fault-{s}", .{@tagName(fault)});
         defer a.free(name);
         var fixture = try Fixture.init(name);
         defer fixture.deinit();
@@ -680,7 +680,7 @@ test "Actions extraction retains partial collision cancellation and uncertain pu
 
 test "Actions retained raw owner refuses replacement mutation links and independently changed output" {
     for ([_][]const u8{ "raw-replace", "raw-mutate", "raw-link", "output-replace" }) |kind| {
-        const name = try std.fmt.allocPrint(a, "actions-live-{s}", .{kind});
+        const name = try a.print("actions-live-{s}", .{kind});
         defer a.free(name);
         var fixture = try Fixture.init(name);
         defer fixture.deinit();
@@ -861,7 +861,7 @@ const Fixture = struct {
     imported: []const u8,
 
     fn init(name: []const u8) !Fixture {
-        const path = try std.fmt.allocPrint(a, "{s}/transport-{s}", .{ options.fixture_root, name });
+        const path = try a.print("{s}/transport-{s}", .{ options.fixture_root, name });
         errdefer a.free(path);
         if (std.Io.Dir.openDirAbsolute(io, path, .{ .follow_symlinks = false })) |previous| {
             defer previous.close(io);

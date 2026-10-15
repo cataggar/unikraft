@@ -192,11 +192,12 @@ the genuine supervised native validator; it does not run guests, KVM, remote
 parity or an accepted public CI producer:
 
 ```sh
-zig build --build-file support/build/wamr-native-ci/build.zig \
+ZIG_GLOBAL_CACHE_DIR=/absolute/global \
+  zig build --build-file support/build/wamr-native-ci/build.zig \
   test-handoff-composition --system /absolute/system \
-  --cache-dir /absolute/private-cache --global-cache-dir /absolute/global \
+  --cache-dir /absolute/private-cache \
   -Dcontroller-fixture-root=/absolute/private-fixtures \
-  -Doptimize=Debug -j1
+  -Doptimize=debug -j1
 ```
 
 Precreate the owner-private fixture/cache roots and their ancestors before
@@ -204,7 +205,7 @@ capturing inputs; avoid a live controller/session metadata directory as a fixtur
 ancestor. The local fixture uses synthetic guest artifacts and real owner
 constructors, not guest or hardware qualification. Its current reader checkout
 is separate from the historical producer, whose genuine Git objects are retained.
-Repeat with `ReleaseSafe`. Fixed test-only faults exercise materialization and
+Repeat with `-Doptimize=safe`. Fixed test-only faults exercise materialization and
 copy failures, wrong-role native validator identity, genuine supervised-command
 refusal with retained records/logs, immutable final collisions,
 uncertain/visible-not-durable publication and final retained-owner revalidation.
@@ -228,10 +229,11 @@ Use an existing external system dependency forest, caches, temporary root and
 private fixture root; hold the fleet qualification lease during sensitive tests:
 
 ```sh
-zig build --build-file support/build/wamr-native-ci/handoff.build.zig \
+ZIG_GLOBAL_CACHE_DIR=/absolute/global \
+  zig build --build-file support/build/wamr-native-ci/handoff.build.zig \
   --system /absolute/system --cache-dir /absolute/cache \
-  --global-cache-dir /absolute/global -Dtest-root=/absolute/private-scratch \
-  -Doptimize=ReleaseSafe test
+  -Dtest-root=/absolute/private-scratch \
+  -Doptimize=safe test
 ```
 
 `test-public-archive` selects the archive engine. Optional
@@ -291,23 +293,23 @@ separate native coverage/deletion gate; production Python is unchanged.
 
 The independent build avoids the production package's dependency restoration
 and does not modify root/authority builds or install production commands.
-Use Zig 0.16, `-j1`, existing owner-private external scratch/caches, and both
-Debug and ReleaseSafe:
+Use Zig 0.17, `-j1`, existing owner-private external scratch/caches, and both
+`debug` and `safe`:
 
 ```sh
 SHADOW=/absolute/owner-private/shadow
-zig build --build-file \
+ZIG_GLOBAL_CACHE_DIR="$SHADOW/global-debug" \
+  zig build --build-file \
   support/build/wamr-native-ci/handoff/shadow/build.zig \
   --cache-dir "$SHADOW/cache-debug" \
-  --global-cache-dir "$SHADOW/global-debug" \
   --prefix "$SHADOW/tools-debug" -Dtest-root="$SHADOW/scratch" \
-  -Doptimize=Debug -j1 test-shadow install
-zig build --build-file \
+  -Doptimize=debug -j1 test-shadow install
+ZIG_GLOBAL_CACHE_DIR="$SHADOW/global-safe" \
+  zig build --build-file \
   support/build/wamr-native-ci/handoff/shadow/build.zig \
   --cache-dir "$SHADOW/cache-safe" \
-  --global-cache-dir "$SHADOW/global-safe" \
   --prefix "$SHADOW/tools-safe" -Dtest-root="$SHADOW/scratch" \
-  -Doptimize=ReleaseSafe -j1 test-shadow install
+  -Doptimize=safe -j1 test-shadow install
 ```
 
 `test-shadow` runs **synthetic comparator/driver tests only**, including

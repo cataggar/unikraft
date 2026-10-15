@@ -143,11 +143,11 @@ pub fn run(
     // Rebuilding every operation into existing distinct regular outputs is
     // legitimate, including using one ELF as both read-only EFI inputs.
     for (std.enums.values(Action)) |action| {
-        const good_output = try join(allocator, root, try std.fmt.allocPrint(allocator, "rebuilt-{s}", .{@tagName(action)}));
-        const good_side = try std.fmt.allocPrint(allocator, "{s}.side", .{good_output});
+        const good_output = try join(allocator, root, try allocator.print("rebuilt-{s}", .{@tagName(action)}));
+        const good_side = try allocator.print("{s}.side", .{good_output});
         try runner.write(io, good_output, old_output);
         try runner.write(io, good_side, old_output);
-        const backup = try std.fmt.allocPrint(allocator, "{s}.backup", .{good_output});
+        const backup = try allocator.print("{s}.backup", .{good_output});
         try std.Io.Dir.cwd().hardLink(good_output, .cwd(), backup, io, .{});
         var rebuild = case;
         if (action == .efi) rebuild.debug = input_aliases[4].path;
@@ -162,8 +162,8 @@ pub fn run(
 
         if (action == .strip or action == .binary or action == .reloc or action == .bootinfo) {
             var failing = case;
-            failing.objcopy = try std.fmt.allocPrint(allocator, "{s} --invalid-fixture-option", .{objcopy});
-            failing.strip = try std.fmt.allocPrint(allocator, "{s} --invalid-fixture-option", .{strip});
+            failing.objcopy = try allocator.print("{s} --invalid-fixture-option", .{objcopy});
+            failing.strip = try allocator.print("{s} --invalid-fixture-option", .{strip});
             try failing.reject(action, good_side, good_output, "ToolFailed");
             try equal(allocator, io, good_output, expected_output);
             try equal(allocator, io, good_side, expected_side);
@@ -182,24 +182,24 @@ pub fn run(
 
 fn aliases(allocator: std.mem.Allocator, io: std.Io, root: []const u8, basename: []const u8) ![6]Alias {
     const source = try join(allocator, root, basename);
-    const hard = try std.fmt.allocPrint(allocator, "{s}/hard-{s}", .{ root, basename });
-    const sym = try std.fmt.allocPrint(allocator, "{s}/symbolic-{s}", .{ root, basename });
+    const hard = try allocator.print("{s}/hard-{s}", .{ root, basename });
+    const sym = try allocator.print("{s}/symbolic-{s}", .{ root, basename });
     try std.Io.Dir.cwd().hardLink(source, .cwd(), hard, io, .{});
     try std.Io.Dir.cwd().symLink(io, source, sym, .{});
     return .{
         .{ .path = source, .err = "InPlaceMutation" },
-        .{ .path = try std.fmt.allocPrint(allocator, "{s}/./{s}", .{ root, basename }), .err = "InPlaceMutation" },
-        .{ .path = try std.fmt.allocPrint(allocator, "{s}/sub/../{s}", .{ root, basename }), .err = "InPlaceMutation" },
+        .{ .path = try allocator.print("{s}/./{s}", .{ root, basename }), .err = "InPlaceMutation" },
+        .{ .path = try allocator.print("{s}/sub/../{s}", .{ root, basename }), .err = "InPlaceMutation" },
         .{ .path = hard, .err = "InPlaceMutation" },
         .{ .path = sym, .err = "OutputSymlink" },
-        .{ .path = try std.fmt.allocPrint(allocator, "{s}/via-directory/{s}", .{ root, basename }), .err = "InPlaceMutation" },
+        .{ .path = try allocator.print("{s}/via-directory/{s}", .{ root, basename }), .err = "InPlaceMutation" },
     };
 }
 
 fn publicationAliases(allocator: std.mem.Allocator, io: std.Io, input: []const u8, bytes: []const u8, root: []const u8) !void {
     for ([_]bool{ false, true }) |symlink| {
         const output = try join(allocator, root, if (symlink) "changed symlink" else "changed hardlink");
-        const side = try std.fmt.allocPrint(allocator, "{s}.side", .{output});
+        const side = try allocator.print("{s}.side", .{output});
         try runner.write(io, output, old_output);
         try runner.write(io, side, old_output);
         {
@@ -232,8 +232,8 @@ fn emptySymbols(allocator: std.mem.Allocator, io: std.Io, case: Case, root: []co
             std.mem.writeInt(u32, bytes[header + 4 ..][0..4], kind, endian);
             std.mem.writeInt(u64, bytes[header + 32 ..][0..8], 0, endian);
             std.mem.writeInt(u32, bytes[header + 44 ..][0..4], 0, endian);
-            const input = try join(allocator, root, try std.fmt.allocPrint(allocator, "empty-{s}-{d}.elf", .{ @tagName(endian), kind }));
-            const output = try std.fmt.allocPrint(allocator, "{s}.out", .{input});
+            const input = try join(allocator, root, try allocator.print("empty-{s}-{d}.elf", .{ @tagName(endian), kind }));
+            const output = try allocator.print("{s}.out", .{input});
             try runner.write(io, input, &bytes);
             try runner.write(io, output, old_output);
             var invalid = case;

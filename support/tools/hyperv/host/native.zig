@@ -60,7 +60,7 @@ pub const Image = struct {
 fn requireSupervisor(allocator: std.mem.Allocator, io: std.Io, image: *const Image) !void {
     const parent = linux.getppid();
     if (parent <= 1 or linux.getpgid(0) != @as(usize, @intCast(linux.getpid()))) return error.SupervisorRequired;
-    const path = try std.fmt.allocPrint(allocator, "/proc/{d}/exe", .{parent});
+    const path = try allocator.print("/proc/{d}/exe", .{parent});
     defer allocator.free(path);
     const file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_only });
     defer file.close(io);
@@ -76,7 +76,7 @@ pub fn validateBootState(record: state.Record, index: u8, boot_id: p.Uuid) !void
 }
 
 pub fn authorizeBootChild(init: std.process.Init, comptime key: [32]u8) !void {
-    if (builtin.cpu.arch != .x86_64) return error.UnsupportedArchitecture;
+    if (builtin.target.cpu.arch != .x86_64) return error.UnsupportedArchitecture;
     var image = try Image.load(init.gpa, init.io, key);
     defer image.deinit();
     try requireSupervisor(init.gpa, init.io, &image);
@@ -213,7 +213,7 @@ pub const Supervised = struct {
         }
         if (timing_enabled) timing.mark(.state_ready);
         var name_buffer: [32]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buffer, "wire-{d}", .{call_index});
+        const name = try std.mem.print(&name_buffer, "wire-{d}", .{call_index});
         try self.locked.directory.dir.createDir(self.io, name, .fromMode(0o700));
         if (self.last_directory) |previous| self.allocator.free(previous);
         self.last_directory = try std.fs.path.join(self.allocator, &.{ self.directory_path, name });
@@ -437,7 +437,7 @@ fn executeJob(init: std.process.Init, key: [32]u8, admission: *const p.Admission
 }
 
 pub fn run(init: std.process.Init, comptime key: [32]u8) !void {
-    if (builtin.cpu.arch != .x86_64) return error.UnsupportedArchitecture;
+    if (builtin.target.cpu.arch != .x86_64) return error.UnsupportedArchitecture;
     var image = try Image.load(init.gpa, init.io, key);
     defer image.deinit();
     const policy = try core.private_files.Directory.open(init.io, policy_root);

@@ -2,10 +2,10 @@
 set -euo pipefail
 umask 077
 
-modes=(Debug ReleaseSafe)
+modes=(debug safe)
 if [[ $# != 0 ]]; then
-  if [[ $# != 1 || ( "$1" != Debug && "$1" != ReleaseSafe ) ]]; then
-    echo "usage: hyperv-native-public-fixtures.sh [Debug|ReleaseSafe]" >&2
+  if [[ $# != 1 || ( "$1" != debug && "$1" != safe ) ]]; then
+    echo "usage: hyperv-native-public-fixtures.sh [debug|safe]" >&2
     exit 2
   fi
   modes=("$1")
@@ -18,6 +18,7 @@ time (
   # A standalone restore can unpack SQLite before any compilation creates tmp.
   mkdir -p "${ZIG_GLOBAL_CACHE_DIR:?}/tmp"
   mkdir -p "${root}/restore"
+  export ZIG_LOCAL_PKG_DIR="${root}/restore/zig-pkg"
   cp support/tools/hyperv/public_image/build.zig \
     support/tools/hyperv/public_image/build.zig.zon "${root}/restore/"
   (

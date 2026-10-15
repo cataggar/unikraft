@@ -14,7 +14,7 @@ const names = "\x00.shstrtab\x00.strtab\x00.symtab\x00.text\x00.data\x00.dynamic
 const symbol_names = "\x00_base_addr\x00_uk_reloc_start\x00_uk_reloc_end\x00__bss_start\x00uk_efi_entry64\x00target\x00target_uk_reloc_data8_phys_0\x00target_uk_reloc_pte_attr0_0\x00negative\x00negative_uk_reloc_imm4_0\x00_start16_uk_reloc_data8_0\x00";
 
 pub fn fixture(endian: std.builtin.Endian, machine: std.elf.EM) [0x7400]u8 {
-    var bytes = [_]u8{0} ** 0x7400;
+    var bytes = @as([0x7400]u8, @splat(0));
     @memset(bytes[280..0x1000], 0x5a);
     @memset(bytes[0x1000..0x2200], 0xcc);
     @memcpy(bytes[0..4], "\x7fELF");
@@ -22,7 +22,7 @@ pub fn fixture(endian: std.builtin.Endian, machine: std.elf.EM) [0x7400]u8 {
     bytes[5] = if (endian == .little) 1 else 2;
     bytes[6] = 1;
     put(u16, &bytes, 16, 3, endian);
-    put(u16, &bytes, 18, @intFromEnum(machine), endian);
+    put(u16, &bytes, 18, @backingInt(machine), endian);
     put(u32, &bytes, 20, 1, endian);
     put(u64, &bytes, 24, base + 0x1010, endian);
     put(u64, &bytes, 32, 64, endian);
@@ -193,7 +193,7 @@ test "relocation blob is byte exact including override ordering PTE flags signed
             defer image.deinit();
             const actual = try transform.relocations(testing.allocator, image);
             defer testing.allocator.free(actual);
-            var expected = [_]u8{0} ** 100;
+            var expected = @as([100]u8, @splat(0));
             put(u32, &expected, 0, 0x0badb0b0, endian);
             for ([_]u64{ 0x2018, 0x2010, 0x1020 }, [_]i64{ 0x1110, 0x2103, -8 }, [_]u32{ 8, 8, 4 }, [_]u32{ 0, 1, 0 }, 0..) |offset, value, size, flags, index| {
                 put(u64, &expected, 4 + index * 24, offset, endian);
@@ -272,7 +272,7 @@ test "bootinfo exact header region layout byte order names and zero fill" {
             defer image.deinit();
             const actual = try transform.bootinfo(testing.allocator, image, "/build/guest.name.elf", with_names);
             defer testing.allocator.free(actual);
-            var expected = [_]u8{0} ** 0x300;
+            var expected = @as([0x300]u8, @splat(0));
             put(u32, &expected, 0, 0xb007b0b0, endian);
             expected[4] = 1;
             put(u32, &expected, 72, if (with_names) 8 else 14, endian);
@@ -319,7 +319,7 @@ test "EFI wrapper matches every byte including historical size fields and preser
         defer image.deinit();
         const actual = try transform.efi(testing.allocator, image, image);
         defer testing.allocator.free(actual);
-        var expected = [_]u8{0} ** 0x8400;
+        var expected = @as([0x8400]u8, @splat(0));
         @memcpy(expected[0..bytes.len], &bytes);
         @memset(expected[0..280], 0);
         @memcpy(expected[4096..], &bytes);
@@ -374,9 +374,9 @@ test "EFI rejects wrong endian missing entry architecture mismatch and overflowi
     for (image.symbols) |*sym| {
         if (std.mem.eql(u8, sym.name, "uk_efi_entry64")) sym.header.st_value = base + 0x1010;
     }
-    image.programs[1].p_memsz = 0x100000000;
+    image.programs[1].memsz = 0x100000000;
     try testing.expectError(error.PeFieldOverflow, transform.efi(testing.allocator, image, image));
-    for (image.programs) |*ph| ph.p_type = std.elf.PT_NULL;
+    for (image.programs) |*ph| ph.type = .NULL;
     try testing.expectError(error.MissingLoadSegments, transform.efi(testing.allocator, image, image));
 }
 

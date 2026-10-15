@@ -172,7 +172,7 @@ pub const Expectations = struct {
     /// discovery occurs here. Identifier spelling is preserved, not normalized.
     pub fn init(allocator: std.mem.Allocator, scope: direct.Scope) !Expectations {
         try scope.validate();
-        const group_id = try std.fmt.allocPrint(allocator, "/subscriptions/{s}/resourceGroups/{s}-rg", .{ scope.subscription, scope.prefix });
+        const group_id = try allocator.print("/subscriptions/{s}/resourceGroups/{s}-rg", .{ scope.subscription, scope.prefix });
         errdefer allocator.free(group_id);
         const vm_id = try resourceId(allocator, group_id, "Microsoft.Compute/virtualMachines", scope.prefix, "vm");
         errdefer allocator.free(vm_id);
@@ -203,7 +203,7 @@ pub const Expectations = struct {
 };
 
 fn resourceId(a: std.mem.Allocator, group_id: []const u8, kind: []const u8, prefix: []const u8, suffix: []const u8) ![]u8 {
-    return std.fmt.allocPrint(a, "{s}/providers/{s}/{s}-{s}", .{ group_id, kind, prefix, suffix });
+    return a.print("{s}/providers/{s}/{s}-{s}", .{ group_id, kind, prefix, suffix });
 }
 
 /// JSON number tokens may use decimal/exponent syntax; JSON strings may not.

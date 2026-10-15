@@ -19,7 +19,7 @@ const source: c.Source = .{
     .head_sha = "0123456789abcdef0123456789abcdef01234567",
 };
 fn efi() [512]u8 {
-    var bytes = [_]u8{0} ** 512;
+    var bytes = @as([512]u8, @splat(0));
     bytes[0..2].* = "MZ".*;
     std.mem.writeInt(u32, bytes[0x3c..0x40], 0x80, .little);
     bytes[0x80..0x84].* = "PE\x00\x00".*;
@@ -47,7 +47,7 @@ const Fixture = struct {
         const root = try image.core.private_files.Directory.open(io, root_path);
         var nonce: [8]u8 = undefined;
         io.random(&nonce);
-        const name = try std.fmt.allocPrint(alloc, "public,case-{s}", .{std.fmt.bytesToHex(nonce, .lower)});
+        const name = try alloc.print("public,case-{s}", .{std.fmt.bytesToHex(nonce, .lower)});
         const path = try image.files.path(alloc, root_path, name);
         const dir = try image.files.create(io, path);
         try dir.dir.writeFile(io, .{ .sub_path = "public,image.efi", .data = &efi(), .flags = .{ .exclusive = true, .permissions = .fromMode(0o644) } });
@@ -418,7 +418,7 @@ test "compute attempts reserve every publication slot and clean only retained id
             const state_path = try image.files.path(
                 alloc,
                 fixture.path,
-                try std.fmt.allocPrint(alloc, "collision-{d}-{d}", .{ case_index, target_index }),
+                try alloc.print("collision-{d}-{d}", .{ case_index, target_index }),
             );
             const state = try image.files.create(io, state_path);
             defer state.close(io);
@@ -854,9 +854,9 @@ test "compute-only raw to native zstd QCOW2 to digest-bound fixed VHD" {
         canonical,
     };
     mutations[0].output.allocated = .{ .state = .unavailable, .bytes = null };
-    mutations[1].identity.workload_sha256 = "0" ** 64;
-    mutations[2].provenance.config_sha256 = "0" ** 64;
-    mutations[3].output.sha256 = "0" ** 64;
+    mutations[1].identity.workload_sha256 = &@as([64]u8, @splat('0'));
+    mutations[2].provenance.config_sha256 = &@as([64]u8, @splat('0'));
+    mutations[3].output.sha256 = &@as([64]u8, @splat('0'));
     for (mutations) |mutation| {
         try rewritePrivateFile(
             verification_state,
@@ -1043,7 +1043,7 @@ test "compute-only raw to native zstd QCOW2 to digest-bound fixed VHD" {
         ),
     );
     bad_derivation = derived;
-    bad_derivation.output_identity.workload_sha256 = "0" ** 64;
+    bad_derivation.output_identity.workload_sha256 = &@as([64]u8, @splat('0'));
     try t.expectError(
         error.InvalidRecord,
         image.compute_artifacts.readDerivationRecord(
@@ -1702,12 +1702,12 @@ test "fixed VHD derivation permits only documented GPT relocation deltas" {
         canonical,
         canonical,
     };
-    record_mutations[0].accepted_qcow2_decoded_sha256 = "0" ** 64;
+    record_mutations[0].accepted_qcow2_decoded_sha256 = &@as([64]u8, @splat('0'));
     record_mutations[1].accepted_qcow2.allocated = .{ .state = .unavailable, .bytes = null };
-    record_mutations[2].source_identity.workload_sha256 = "0" ** 64;
-    record_mutations[2].output_identity.workload_sha256 = "0" ** 64;
+    record_mutations[2].source_identity.workload_sha256 = &@as([64]u8, @splat('0'));
+    record_mutations[2].output_identity.workload_sha256 = &@as([64]u8, @splat('0'));
     record_mutations[3].output.allocated = .{ .state = .unavailable, .bytes = null };
-    record_mutations[4].provenance.config_sha256 = "0" ** 64;
+    record_mutations[4].provenance.config_sha256 = &@as([64]u8, @splat('0'));
     for (record_mutations) |mutation| {
         try rewritePrivateFile(
             root,
@@ -1997,16 +1997,16 @@ test "public serial rejects colliding return APIC mismatch live IO and duplicate
         if (image.network.serial(alloc, bad, config, raw)) |_| return error.AcceptedBadSerial else |_| {}
     }
     for ([_][]const u8{ "UK_HYPERV_IO_READY", "UK_HYPERV_NETWORK_APP_READY", c.legacy_marker, "HYPERV_ACCEPTANCE NETWORK_APP_FINAL PASS" }) |extra| {
-        const bad = try std.fmt.allocPrint(alloc, "{s}{s}\n", .{ good, extra });
+        const bad = try alloc.print("{s}{s}\n", .{ good, extra });
         if (image.network.serial(alloc, bad, config, raw)) |_| return error.AcceptedBadSerial else |_| {}
     }
     const net = try image.network.fromConfig(alloc, config_text);
     const marker = try image.network.marker(alloc, (try image.network.parse(net)).?);
-    const network_good = try std.fmt.allocPrint(alloc, "{s}{s}{s}\n{s}", .{ serial_fixture.prefix, serial_fixture.application, marker, serial_fixture.terminal });
+    const network_good = try alloc.print("{s}{s}{s}\n{s}", .{ serial_fixture.prefix, serial_fixture.application, marker, serial_fixture.terminal });
     try image.network.serial(alloc, network_good, config, net);
     for ([_][]const u8{
-        try std.fmt.allocPrint(alloc, "{s}{s}\n", .{ good, marker }),
-        try std.fmt.allocPrint(alloc, "{s}{s}{s}\n{s}\n{s}", .{ serial_fixture.prefix, serial_fixture.application, marker, marker, serial_fixture.terminal }),
+        try alloc.print("{s}{s}\n", .{ good, marker }),
+        try alloc.print("{s}{s}{s}\n{s}\n{s}", .{ serial_fixture.prefix, serial_fixture.application, marker, marker, serial_fixture.terminal }),
         try std.mem.replaceOwned(u8, alloc, network_good, "nonce=0123456789abcdef", "nonce=1123456789abcdef"),
         good,
     }) |bad| if (image.network.serial(alloc, bad, config, net)) |_| return error.AcceptedBadNetwork else |_| {};
@@ -2025,7 +2025,7 @@ test "pinned QAPI vpc opening accepts generic format and rejects creation size c
         "\"offset\":0",
         "\"subformat\":\"fixed\"",
     }) |creation_field| {
-        const invalid = try std.fmt.allocPrint(a, "{{{s},{s}", .{ creation_field, opening[1..] });
+        const invalid = try a.print("{{{s},{s}", .{ creation_field, opening[1..] });
         defer a.free(invalid);
         try t.expectError(error.UnknownField, serial_fixture.checkVpcOpening(a, invalid));
     }
@@ -2061,9 +2061,9 @@ test "exact platform marker is unique between application start and anchored ret
     try image.network.serial(alloc, decorated, config, raw);
     const network = try image.network.fromConfig(alloc, config_text);
     const marker = try image.network.marker(alloc, (try image.network.parse(network)).?);
-    const configured = try std.fmt.allocPrint(alloc, "{s}{s}\n{s}", .{ good[0 .. good.len - serial_fixture.terminal.len], marker, serial_fixture.terminal });
+    const configured = try alloc.print("{s}{s}\n{s}", .{ good[0 .. good.len - serial_fixture.terminal.len], marker, serial_fixture.terminal });
     try image.network.serial(alloc, configured, config, network);
-    const late_with_config = try std.fmt.allocPrint(alloc, "{s}{s}{s}\n{s}{s}\n", .{ serial_fixture.prefix, serial_fixture.prefixed_application, marker, serial_fixture.terminal, c.platform_marker });
+    const late_with_config = try alloc.print("{s}{s}{s}\n{s}{s}\n", .{ serial_fixture.prefix, serial_fixture.prefixed_application, marker, serial_fixture.terminal, c.platform_marker });
     try t.expectError(error.InvalidPublicSerial, image.network.serial(alloc, late_with_config, config, network));
 }
 
@@ -2091,7 +2091,7 @@ test "source provenance exact canonical integers repository workflow revision jo
     bad.run_attempt = 0;
     try t.expectError(error.InvalidSource, bad.validate());
     bad = source;
-    bad.head_sha = "A" ** 40;
+    bad.head_sha = &@as([40]u8, @splat('A'));
     try t.expectError(error.InvalidSource, bad.validate());
 }
 test "solved config missing duplicate typed noncanonical network settings refuse" {
@@ -2224,10 +2224,10 @@ test "physical loader rejects incomplete tampered matrix requests logs packages 
     }
     _ = try image.engine.load(alloc, io, &lock, f.cli);
     const valid = try c.encode(alloc, state);
-    const duplicate = try std.fmt.allocPrint(alloc, "{{\"phase\":\"prepared\",{s}", .{valid[1..]});
+    const duplicate = try alloc.print("{{\"phase\":\"prepared\",{s}", .{valid[1..]});
     try image.files.durable(try lock.commit(io, "state.json", duplicate));
     if (image.engine.load(alloc, io, &lock, f.cli)) |_| return error.AcceptedDuplicate else |_| {}
-    const azure = try std.fmt.allocPrint(alloc, "{{\"resource_group\":\"not-authorized\",{s}", .{valid[1..]});
+    const azure = try alloc.print("{{\"resource_group\":\"not-authorized\",{s}", .{valid[1..]});
     try image.files.durable(try lock.commit(io, "state.json", azure));
     if (image.engine.load(alloc, io, &lock, f.cli)) |_| return error.AcceptedUnknownFields else |_| {}
 }

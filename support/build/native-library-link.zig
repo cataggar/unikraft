@@ -313,7 +313,7 @@ pub fn execute(
         .root_module = b.createModule(.{
             .root_source_file = b.path("support/build/elf-common-validator.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
         }),
     });
     const states = try b.allocator.alloc(Materializer.State, pipeline_plan.libraries.len);

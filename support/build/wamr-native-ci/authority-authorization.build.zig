@@ -29,11 +29,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "hyperv_core", .module = core },
             .{ .name = "wamr_log_validator", .module = validator },
-            .{ .name = "controller_source_closure", .module = b.createModule(.{
-                .root_source_file = b.path("../../controller_source_closure.zig"),
-                .target = target,
-                .optimize = optimize,
-            }) },
+            .{ .name = "controller_source_closure", .module = foundation.sourceClosureModule(b, target, optimize) },
             .{ .name = "handoff_contracts", .module = b.createModule(.{
                 .root_source_file = b.path("handoff/contracts.zig"),
                 .target = target,
@@ -53,7 +49,7 @@ pub fn build(b: *std.Build) void {
     });
     const module = b.createModule(.{ .root_source_file = b.path("authority/authorization.zig"), .target = target, .optimize = optimize });
     foundation.addImports(b, module, target, optimize, core, serial, validator, handoff);
-    const root = b.option([]const u8, "test-root", "Existing private absolute fixture root") orelse @panic("-Dtest-root is required");
+    const root = foundation.defaultFixtureRoot(b);
     const options_step = foundation.testOptions(b, target, optimize, root);
     const options = options_step.createModule();
     module.addImport("test_options", options);

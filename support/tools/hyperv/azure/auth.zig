@@ -136,11 +136,11 @@ const Gateway = struct {
         if (self.used or request.getHeader("Authorization") != null) return error.InvalidCredentialRequest;
         self.used = true;
         const expected = switch (self.config.provider) {
-            .client_assertion => try std.fmt.allocPrint(self.allocator, "{s}/{s}/oauth2/v2.0/token", .{ scope.login_host, self.config.authority.tenant }),
+            .client_assertion => try self.allocator.print("{s}/{s}/oauth2/v2.0/token", .{ scope.login_host, self.config.authority.tenant }),
             .managed_identity => |selection| if (selection == .user_assigned)
-                try std.fmt.allocPrint(self.allocator, "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource={s}&client_id={s}", .{ scope.arm_resource, self.config.authority.client })
+                try self.allocator.print("http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource={s}&client_id={s}", .{ scope.arm_resource, self.config.authority.client })
             else
-                try std.fmt.allocPrint(self.allocator, "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource={s}", .{scope.arm_resource}),
+                try self.allocator.print("http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource={s}", .{scope.arm_resource}),
         };
         if (!std.mem.eql(u8, expected, request.url)) return error.UnsafeCredentialAuthority;
         switch (self.config.provider) {

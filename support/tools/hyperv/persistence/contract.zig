@@ -60,7 +60,7 @@ pub const Contract = struct {
         if (self.data.size != data_bytes + 512 or self.guest.size < 1024 * 1024 + 512 or
             self.guest.size > stage_limit or (self.guest.size - 512) % (1024 * 1024) != 0 or
             std.mem.eql(u8, self.guest.path, self.data.path)) return error.InvalidGeometry;
-        inline for (std.meta.fields(Bindings)) |field| try local.hex(&@field(self.bindings, field.name), true);
+        inline for (@typeInfo(Bindings).@"struct".field_names) |field| try local.hex(&@field(self.bindings, field), true);
     }
 };
 

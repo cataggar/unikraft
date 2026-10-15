@@ -27,7 +27,7 @@ fn unitPin(seed: u8, size: u64, mode: u16) boot.files.Pin {
         .mtime_nanoseconds = 100 + @as(u32, seed),
         .ctime_seconds = 1_700_000_100 + @as(i64, seed),
         .ctime_nanoseconds = 200 + @as(u32, seed),
-        .sha256 = [_]u8{seed} ** 32,
+        .sha256 = @as([32]u8, @splat(seed)),
     };
 }
 
@@ -68,7 +68,7 @@ test "terminal exact signed value anchored envelope and feature combinations" {
     for ([_]i32{ -2147483648, -1, 2, 2147483647 }) |value| {
         var config = unitConfig();
         config.expect_main_return = value;
-        const replacement = try std.fmt.allocPrint(a, "main returned {d}", .{value});
+        const replacement = try a.print("main returned {d}", .{value});
         defer a.free(replacement);
         const text = try std.mem.replaceOwned(u8, a, fixture_log, "main returned 0", replacement);
         defer a.free(text);
@@ -113,7 +113,7 @@ test "milestone and repeated required-marker order forbidden markers and bounds"
         defer a.free(invalid);
         try t.expectError(error.InvalidSerial, boot.serial.validate(a, invalid, unitConfig()));
     }
-    const long = try std.mem.concat(a, u8, &.{ "x" ** 8193, "\n", fixture_log });
+    const long = try std.mem.concat(a, u8, &.{ &@as([8193:0]u8, @splat('x')), "\n", fixture_log });
     defer a.free(long);
     try t.expectError(error.SerialLineLimit, boot.serial.validate(a, long, unitConfig()));
 }
@@ -165,10 +165,10 @@ test "CLI rejects invalid source counts paths markers repetitions and unknown co
         if (config.validate()) |_| return error.AcceptedUnsafePath else |_| {}
     }
     config = unitConfig();
-    config.required = &([_][]const u8{"marker"} ** 33);
+    config.required = &(@as([33][]const u8, @splat("marker")));
     try t.expectError(error.TooManyMarkers, config.validate());
     config = unitConfig();
-    config.expect = "x" ** 513;
+    config.expect = &@as([513:0]u8, @splat('x'));
     try t.expectError(error.InvalidMarker, config.validate());
     const args = base_args ++ [_][]const u8{ "--require-marker", "first", "--require-marker", "second", "--forbid-marker", "third" };
     const parsed = try boot.config.parse(a, &args);
@@ -259,10 +259,10 @@ test "canonical request serializes and validates the typed qcow2 source tag" {
         .supervisor_pid = 123,
         .config = config,
         .pins = .{
-            .{ .size = 64 * 1024, .sha256 = [_]u8{1} ** 32 },
-            .{ .size = 4096, .sha256 = [_]u8{2} ** 32 },
-            .{ .size = 4096, .sha256 = [_]u8{3} ** 32 },
-            .{ .size = 4096, .sha256 = [_]u8{4} ** 32 },
+            .{ .size = 64 * 1024, .sha256 = @as([32]u8, @splat(1)) },
+            .{ .size = 4096, .sha256 = @as([32]u8, @splat(2)) },
+            .{ .size = 4096, .sha256 = @as([32]u8, @splat(3)) },
+            .{ .size = 4096, .sha256 = @as([32]u8, @splat(4)) },
         },
     });
     defer a.free(legacy);
@@ -299,16 +299,16 @@ const Fixture = struct {
         errdefer root.close(io);
         var nonce: [8]u8 = undefined;
         io.random(&nonce);
-        const name = try std.fmt.allocPrint(alloc, "case-{s}", .{std.fmt.bytesToHex(nonce, .lower)});
+        const name = try alloc.print("case-{s}", .{std.fmt.bytesToHex(nonce, .lower)});
         try root.dir.createDir(io, name, .fromMode(0o700));
         const path = try std.fs.path.join(alloc, &.{ root_path, name });
         const dir = try core.private_files.Directory.open(io, path);
         errdefer dir.close(io);
-        var bytes = [_]u8{0x43} ** 2048;
+        var bytes = @as([2048]u8, @splat(0x43));
         bytes[0] = mode;
         try dir.dir.writeFile(io, .{ .sub_path = "public,source.raw", .data = &bytes, .flags = .{ .exclusive = true, .permissions = .fromMode(0o644) } });
         try dir.dir.writeFile(io, .{ .sub_path = "code,template.fd", .data = "synthetic OVMF code", .flags = .{ .exclusive = true, .permissions = .fromMode(0o644) } });
-        try dir.dir.writeFile(io, .{ .sub_path = "vars,template.fd", .data = &([_]u8{0xa5} ** 128), .flags = .{ .exclusive = true, .permissions = .fromMode(0o644) } });
+        try dir.dir.writeFile(io, .{ .sub_path = "vars,template.fd", .data = &(@as([128]u8, @splat(0xa5))), .flags = .{ .exclusive = true, .permissions = .fromMode(0o644) } });
         try dir.dir.createDir(io, "work", .fromMode(0o700));
         const source_name = if (source_kind == .qcow2) "public,source.qcow2" else "public,source.raw";
         if (source_kind == .qcow2) {
@@ -413,7 +413,7 @@ const Fixture = struct {
             "--ovmf-code",         self.config.ovmf_code,           "--ovmf-vars",
             self.config.ovmf_vars, "--qemu",                        self.config.qemu,
             "--work-dir",          self.config.work_dir,            "--expect",
-            self.config.expect,    "--cpus",                        try std.fmt.allocPrint(self.arena.allocator(), "{d}", .{self.config.cpus}),
+            self.config.expect,    "--cpus",                        try self.arena.allocator().print("{d}", .{self.config.cpus}),
             "--timeout",           "3",
         });
     }
@@ -601,7 +601,7 @@ test "qcow2 bounded admission rejects sparse 512-byte-cluster amplification befo
         const file = try std.Io.Dir.openFileAbsolute(io, f.config.source.path, .{ .mode = .read_write });
         defer file.close(io);
         try file.setLength(io, boot.config.max_input);
-        var header = [_]u8{0} ** 112;
+        var header = @as([112]u8, @splat(0));
         header[0..4].* = .{ 0x51, 0x46, 0x49, 0xfb };
         std.mem.writeInt(u32, header[4..8], 3, .big);
         std.mem.writeInt(u32, header[20..24], 9, .big);
@@ -666,7 +666,7 @@ test "qcow2 aggregate metadata work stops extension amplification before table r
     defer f.deinit();
     try writeQcowInt(f, u32, 112, 0x1234_5678);
     try writeQcowInt(f, u32, 116, 0);
-    try writeQcowBytes(f, 120, &([_]u8{0} ** 8));
+    try writeQcowBytes(f, 120, &(@as([8]u8, @splat(0))));
 
     const retained = try std.Io.Dir.openFileAbsolute(io, f.config.source.path, .{ .mode = .read_only });
     defer retained.close(io);
@@ -861,7 +861,7 @@ test "qcow2 preserves serial cap timeout descendant cleanup and post-exec mutati
 }
 
 fn fixedFooter() [512]u8 {
-    var bytes = [_]u8{0} ** 512;
+    var bytes = @as([512]u8, @splat(0));
     bytes[0..8].* = "conectix".*;
     std.mem.writeInt(u32, bytes[8..12], 2, .big);
     std.mem.writeInt(u32, bytes[12..16], 0x10000, .big);
@@ -1169,7 +1169,7 @@ test "artifact snapshots reject shrinking growing replacement empty and over-lim
         defer original.close(io);
         if (mode == 2) {
             try t.expectEqual(.SUCCESS, std.os.linux.errno(std.os.linux.renameat(f.directory.dir.handle, "public,source.raw", f.directory.dir.handle, "old.raw")));
-            var bytes = [_]u8{0x43} ** 2048;
+            var bytes = @as([2048]u8, @splat(0x43));
             bytes[0] = 0;
             try f.directory.dir.writeFile(io, .{ .sub_path = "public,source.raw", .data = &bytes, .flags = .{ .exclusive = true, .permissions = .fromMode(0o644) } });
         } else {
@@ -1496,8 +1496,8 @@ test "actual CLI rejects invalid CPU conflicting sources and legacy SMP before w
 
 test "synthetic phase codec bounds partial writes malformed records and authority" {
     var bytes: [diagnostics.max_bytes]u8 = undefined;
-    inline for (@typeInfo(diagnostics.Phase).@"enum".fields, 0..) |field, index| {
-        const record = try diagnostics.Record.observe(@enumFromInt(field.value), std.math.maxInt(u64));
+    inline for (@typeInfo(diagnostics.Phase).@"enum".field_names, 0..) |name, index| {
+        const record = try diagnostics.Record.observe(@field(diagnostics.Phase, name), std.math.maxInt(u64));
         @memcpy(bytes[index * diagnostics.slot_size ..][0..diagnostics.slot_size], &try record.encode());
     }
     const complete = try diagnostics.decode(a, &bytes);
@@ -1507,7 +1507,7 @@ test "synthetic phase codec bounds partial writes malformed records and authorit
     try t.expectEqual(@as(usize, 2), partial.count);
     try t.expectEqual(.partial_slot, partial.tail);
     try t.expectEqual(@as(usize, 0), (try diagnostics.decode(a, &.{})).count);
-    try t.expectError(error.DiagnosticTooLarge, diagnostics.decode(a, &([_]u8{0} ** (diagnostics.max_bytes + 1))));
+    try t.expectError(error.DiagnosticTooLarge, diagnostics.decode(a, &(@as([(diagnostics.max_bytes + 1)]u8, @splat(0)))));
     bytes[2 * diagnostics.slot_size] = '!';
     const malformed = try diagnostics.decode(a, &bytes);
     try t.expectEqual(@as(usize, 2), malformed.count);
@@ -1516,7 +1516,7 @@ test "synthetic phase codec bounds partial writes malformed records and authorit
     if (boot.runner.Report.decode(a, json)) |_| return error.DiagnosticGrantedAuthority else |_| {}
     const injected = try std.mem.replaceOwned(u8, a, json, "\"none\"", "\"SYNTHETIC_SECRET\"");
     defer a.free(injected);
-    var invalid = [_]u8{0} ** diagnostics.slot_size;
+    var invalid = @as([diagnostics.slot_size]u8, @splat(0));
     @memcpy(invalid[0..injected.len], injected);
     const rejected = try diagnostics.decode(a, &invalid);
     try t.expectEqual(@as(usize, 0), rejected.count);
@@ -1548,7 +1548,7 @@ test "synthetic sampling preserves the exact local boot flat v1 wire and bounds"
     try t.expectEqual(@as(usize, 4096), diagnostics.max_bytes);
     try t.expectEqual(@as(usize, 4352), diagnostics.max_log_bytes);
     const phases = [_]diagnostics.Phase{ .artifact_hash_begin, .artifact_hash_end, .firmware_copy_begin, .firmware_copy_end, .final_verify_begin, .final_verify_end, .exec_handoff, .mock_entry };
-    for (phases, 0..) |phase, index| try t.expectEqual(index, @intFromEnum(phase));
+    for (phases, 0..) |phase, index| try t.expectEqual(index, @backingInt(phase));
 }
 
 fn expectBeforeDeadline(observed: diagnostics.Observation, timeout_ms: u64) !void {
@@ -1616,8 +1616,8 @@ test "synthetic writers refuse reuse phase overflow and oversized metadata never
     defer trace.close(io);
     try t.expectError(error.PathAlreadyExists, diagnostics.Trace.create(io, work, 1234));
     try t.expectError(error.DiagnosticPhaseOrder, trace.mark(io, .artifact_hash_end));
-    inline for (@typeInfo(diagnostics.Phase).@"enum".fields[0 .. diagnostics.slot_count - 1]) |field|
-        try trace.mark(io, @enumFromInt(field.value));
+    inline for (@typeInfo(diagnostics.Phase).@"enum".field_names[0 .. diagnostics.slot_count - 1]) |name|
+        try trace.mark(io, @field(diagnostics.Phase, name));
     try t.expectError(error.DiagnosticPhaseOrder, trace.mark(io, .exec_handoff));
     try trace.file.writePositionalAll(io, "!", diagnostics.max_bytes);
     try t.expectError(error.FileTooLarge, diagnostics.read(a, io, work));

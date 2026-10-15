@@ -42,7 +42,7 @@ const Builder = struct {
 
     fn add(self: *Builder, directory: fs.Directory, file: c.File, role: p.budget.Role, destination: []const u8, placement: @FieldType(p.inputs.Asset, "placement")) !void {
         if (self.assets.items.len >= 240) return error.LimitExceeded;
-        const id = try std.fmt.allocPrint(self.world.allocator, "asset-{d}", .{self.assets.items.len});
+        const id = try self.world.allocator.print("asset-{d}", .{self.assets.items.len});
         try self.assets.append(self.world.allocator, .{ .id = id, .role = role, .source = file, .destination = destination, .placement = placement });
         try self.bindings.append(self.world.allocator, .{ .id = id, .directory = directory });
     }
@@ -95,7 +95,7 @@ const Builder = struct {
                 try fs.requireFile(asset.source, file);
                 return;
             };
-        try self.add(directory, file, .publication_control, try std.fmt.allocPrint(self.world.allocator, "{s}/{d}/{s}", .{ prefix, self.assets.items.len, file.path }), .staged);
+        try self.add(directory, file, .publication_control, try self.world.allocator.print("{s}/{d}/{s}", .{ prefix, self.assets.items.len, file.path }), .staged);
     }
     fn firmware(self: *Builder, spec: DataSpec, role: p.budget.Role, destination: []const u8) !p.inputs.FirmwareOrigin {
         const bound = try self.world.tool(spec.tool);
@@ -152,7 +152,7 @@ pub fn create(world: *x.World, workspace: fs.Directory) !c.File {
         for (inventory.entries) |file| try builder.support(directory, file, "controls/firmware-support");
     }
     for (0..p.inputs.firmware_copy_count) |i|
-        try builder.add(try world.open(spec.firmware_vars.tool.directory), vars, .firmware_working_copy, try std.fmt.allocPrint(world.allocator, "firmware/working-{d}.fd", .{i}), .future_copy);
+        try builder.add(try world.open(spec.firmware_vars.tool.directory), vars, .firmware_working_copy, try world.allocator.print("firmware/working-{d}.fd", .{i}), .future_copy);
     const qemu = try world.tool(spec.qemu);
     try builder.evidence(qemu.contract.evidence);
     try builder.provenanceEvidence(root.value.provenance);
@@ -177,9 +177,9 @@ pub fn create(world: *x.World, workspace: fs.Directory) !c.File {
         _ = try builder.addFile(.{ .directory = workspace.path, .path = name }, .publication_control, try std.fs.path.join(world.allocator, &.{ "controls", name }));
     const metadata = try builder.addFile(.{ .directory = output.path, .path = "native-config/metadata.tsv" }, .publication_control, "controls/metadata.tsv");
     for (spec.baked_controls, 0..) |file, i|
-        _ = try builder.addFile(file, .baked_control, try std.fmt.allocPrint(world.allocator, "baked/control-{d}", .{i}));
+        _ = try builder.addFile(file, .baked_control, try world.allocator.print("baked/control-{d}", .{i}));
     for (spec.extra_controls, 0..) |file, i|
-        _ = try builder.addFile(file, .publication_control, try std.fmt.allocPrint(world.allocator, "controls/extra-{d}", .{i}));
+        _ = try builder.addFile(file, .publication_control, try world.allocator.print("controls/extra-{d}", .{i}));
     var plan: p.inputs.Plan = .{
         .schema = .hyperv_native_input_selection_v3,
         .packaged_receipt_sha256 = packaged.sha256,
@@ -192,10 +192,10 @@ pub fn create(world: *x.World, workspace: fs.Directory) !c.File {
         .assets = builder.assets.items,
     };
     for ([_][]const u8{ "prepared", "configured", "built", "packaged" }, &plan.publication.receipts) |name, *record|
-        record.* = try receipts.record(world.allocator, world.io, try std.fmt.allocPrint(world.allocator, "{s}.receipt.json", .{name}), x.maximum_document, .private);
+        record.* = try receipts.record(world.allocator, world.io, try world.allocator.print("{s}.receipt.json", .{name}), x.maximum_document, .private);
     for ([_][]const u8{ "configured", "built" }, &plan.publication.executions, &plan.publication.inspections) |name, *execution, *inspection| {
-        execution.* = try receipts.record(world.allocator, world.io, try std.fmt.allocPrint(world.allocator, "{s}.binding.json", .{name}), x.maximum_document, .private);
-        inspection.* = try receipts.record(world.allocator, world.io, try std.fmt.allocPrint(world.allocator, "{s}.inspection.binding.json", .{name}), x.maximum_document, .private);
+        execution.* = try receipts.record(world.allocator, world.io, try world.allocator.print("{s}.binding.json", .{name}), x.maximum_document, .private);
+        inspection.* = try receipts.record(world.allocator, world.io, try world.allocator.print("{s}.inspection.binding.json", .{name}), x.maximum_document, .private);
     }
     _ = try p.inputs.ledger(world.allocator, plan, .{ .receipt = packaged.value, .sha256 = packaged.sha256 });
     try p.inputs.validateSolvedConfig(world.allocator, world.io, plan, builder.bindings.items, workspace, packaged.value);

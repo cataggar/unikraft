@@ -164,7 +164,7 @@ pub const Supervisor = struct {
         context: *anyopaque,
         call: *const fn (*anyopaque, m.Job, core.private_files.Directory) anyerror!void,
     },
-    directories: [m.step_count]?[]u8 = [_]?[]u8{null} ** m.step_count,
+    directories: [m.step_count]?[]u8 = @as([m.step_count]?[]u8, @splat(null)),
 
     pub fn driver(self: *Supervisor) engine.Driver {
         return .{ .context = self, .executeFn = execute, .serialFn = readSerial, .recoverFn = recover };
@@ -180,7 +180,7 @@ pub const Supervisor = struct {
             if (record.progress != .intent) continue;
             for (0..8) |generation| {
                 var buffer: [48]u8 = undefined;
-                const name = try std.fmt.bufPrint(&buffer, "worker-{d:0>2}-{d}", .{ index, generation });
+                const name = try std.mem.print(&buffer, "worker-{d:0>2}-{d}", .{ index, generation });
                 const path = try std.fs.path.join(self.allocator, &.{ self.root_path, name });
                 defer self.allocator.free(path);
                 const directory = core.private_files.Directory.open(self.io, path) catch |err| switch (err) {
@@ -195,7 +195,7 @@ pub const Supervisor = struct {
                 const job = try local.Document(m.Job).load(self.allocator, raw_job);
                 defer job.deinit();
                 try job.value.validate();
-                if (@intFromEnum(job.value.step) != index or !std.mem.eql(u8, &job.value.nonce, &state.nonce) or
+                if (@backingInt(job.value.step) != index or !std.mem.eql(u8, &job.value.nonce, &state.nonce) or
                     !std.mem.eql(u8, &job.value.input_sha256, &state.input_sha256)) return error.StaleWorker;
                 // A lock alone is not a terminate/reap proof. Missing parent
                 // supervision evidence requires the outer owner's recovery.
@@ -220,7 +220,7 @@ pub const Supervisor = struct {
                 try state.retainOriginals(job.value.step, fallback.observation.originals);
             }
             record.progress = .failed;
-            state.reconcileUnstartedGrant(@enumFromInt(index));
+            state.reconcileUnstartedGrant(@fromBackingInt(@intCast(index)));
         }
         state.process_cleanup_complete = true;
         state.phase = .failed;
@@ -272,11 +272,11 @@ pub const Supervisor = struct {
         defer binary.close();
         Observer.emit(self.observer, .{ .stage = .seal_end });
         Observer.emit(self.observer, .{ .stage = .job_prepare_begin });
-        const index = @intFromEnum(job.step);
+        const index = @backingInt(job.step);
         var name_buffer: [48]u8 = undefined;
         var selected: ?[]const u8 = null;
         for (0..8) |generation| {
-            const name = try std.fmt.bufPrint(&name_buffer, "worker-{d:0>2}-{d}", .{ index, generation });
+            const name = try std.mem.print(&name_buffer, "worker-{d:0>2}-{d}", .{ index, generation });
             self.directory.dir.createDir(self.io, name, .fromMode(0o700)) catch |err| switch (err) {
                 error.PathAlreadyExists => {
                     if (job.step.mutation()) return error.MutationReplay;
@@ -391,7 +391,7 @@ pub const Supervisor = struct {
     fn readSerial(context: *anyopaque, allocator: std.mem.Allocator, step: m.Step, serial: m.Serial) ![]u8 {
         const self: *Supervisor = @ptrCast(@alignCast(context));
         if (!std.mem.eql(u8, serial.name, "serial.bin")) return error.InvalidSerialResult;
-        const directory = try core.private_files.Directory.open(self.io, self.directories[@intFromEnum(step)] orelse return error.MissingWorker);
+        const directory = try core.private_files.Directory.open(self.io, self.directories[@backingInt(step)] orelse return error.MissingWorker);
         defer directory.close(self.io);
         return directory.read(self.io, allocator, "serial.bin", @import("contract.zig").serial_limit, try core.contracts.parseSha256(&serial.sha256));
     }

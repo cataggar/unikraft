@@ -41,7 +41,7 @@ pub fn bootstrap(world: *x.World, workspace: fs.Directory) !c.File {
     if (spec.initial_config) |name| try c.core.private_files.basename(name);
     if (spec.initial_metadata) |name| try c.core.private_files.basename(name);
     if (spec.initial_config == null and spec.initial_metadata != null) return error.InvalidArguments;
-    if (spec.native.len > std.meta.fields(p.producer.Alias).len or spec.dependencies.len > 128)
+    if (spec.native.len > @typeInfo(p.producer.Alias).@"enum".field_names.len or spec.dependencies.len > 128)
         return error.LimitExceeded;
     const repository = try world.open(spec.repository);
     const prefix = try std.fs.path.join(world.allocator, &.{ repository.path, ".d/zig-migration-preparation/" });
@@ -227,7 +227,7 @@ pub fn stage(world: *x.World, workspace: fs.Directory, phase: @FieldType(x.Stage
     const workspace_state = try world.state(workspace);
     const receipts = try world.child(workspace, "receipts");
     const parent_phase: c.Phase = if (phase == .configure) .prepared else .configured;
-    const parent_name = try std.fmt.allocPrint(world.allocator, "{s}.receipt.json", .{@tagName(parent_phase)});
+    const parent_name = try world.allocator.print("{s}.receipt.json", .{@tagName(parent_phase)});
     const parent = try world.read(p.receipts.Receipt, receipts, parent_name, null);
     try x.requireReceiptPhase(parent.value.phase, parent_phase);
     try p.receipts.validate(parent.value);
@@ -259,5 +259,5 @@ pub fn stage(world: *x.World, workspace: fs.Directory, phase: @FieldType(x.Stage
     const state = try world.state(try world.child(workspace, "controls"));
     var lock = try state.lock(world.io);
     defer lock.close(world.io);
-    return world.publish(&lock, try std.fmt.allocPrint(world.allocator, "{s}.json", .{@tagName(phase)}), value);
+    return world.publish(&lock, try world.allocator.print("{s}.json", .{@tagName(phase)}), value);
 }

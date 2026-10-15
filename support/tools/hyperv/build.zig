@@ -72,9 +72,10 @@ pub fn build(b: *std.Build) void {
     b.step("test-sha256", "Retain standard SHA known-vector and streaming equivalence").dependOn(&run_hash_tests.step);
     core_step.dependOn(&run_hash_tests.step);
     const host_transfer = b.createModule(transferOptions(b, host_core, b.graph.host, optimize));
+    host_transfer.addOptions("test_options", options);
     const transfer_tests = b.addTest(.{ .root_module = host_transfer });
     const transfer_run = b.addRunArtifact(transfer_tests);
-    transfer_run.setCwd(.{ .cwd_relative = test_root orelse b.pathFromRoot("../../../.d/zig-migration-transfer-core/fixtures") });
+    if (test_root) |path| transfer_run.setCwd(.{ .cwd_relative = path });
     const transfer_step = b.step("test-transfer", "Run offline streaming transfer fixtures");
     transfer_step.dependOn(&transfer_run.step);
     const host_aggregate = b.createModule(.{
@@ -128,7 +129,7 @@ pub fn build(b: *std.Build) void {
     all.dependOn(worker_step);
 }
 
-fn transferOptions(b: *std.Build, core: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) std.Build.Module.CreateOptions {
+fn transferOptions(b: *std.Build, core: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) std.Build.Module.CreateOptions {
     const sdk = b.dependency("azure_sdk_core", .{ .target = target, .optimize = optimize });
     const storage = b.dependency("azure_sdk_storage_common", .{ .target = target, .optimize = optimize });
     return .{

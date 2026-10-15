@@ -12,7 +12,7 @@ pub const source: c.Source = .{
     .head_sha = "0123456789abcdef0123456789abcdef01234567",
 };
 pub fn syntheticEfi() [512]u8 {
-    var bytes = [_]u8{0} ** 512;
+    var bytes = @as([512]u8, @splat(0));
     bytes[0..2].* = "MZ".*;
     std.mem.writeInt(u32, bytes[0x3c..0x40], 0x80, .little);
     bytes[0x80..0x84].* = "PE\x00\x00".*;
@@ -48,7 +48,7 @@ pub const Fixture = struct {
         errdefer root.close(io);
         var nonce: [8]u8 = undefined;
         io.random(&nonce);
-        const name = try std.fmt.allocPrint(a, "import,fixture-{s}", .{std.fmt.bytesToHex(nonce, .lower)});
+        const name = try a.print("import,fixture-{s}", .{std.fmt.bytesToHex(nonce, .lower)});
         const path = try image.files.path(a, root_path, name);
         const dir = try image.files.create(io, path);
         errdefer dir.close(io);

@@ -74,7 +74,7 @@ fn attempt(path: []const u8, wrong_parent: bool, options: Options) !Report {
     if (linux.errno(opened) != .SUCCESS) {
         _ = linux.kill(pid, .KILL);
         var status: u32 = 0;
-        _ = linux.waitpid(pid, &status, 0);
+        _ = linux.waitpid(pid, @ptrCast(&status), 0);
         return error.NamespaceTestPidfd;
     }
     const pidfd: linux.fd_t = @intCast(opened);
@@ -83,7 +83,7 @@ fn attempt(path: []const u8, wrong_parent: bool, options: Options) !Report {
     defer if (!reaped) {
         _ = linux.pidfd_send_signal(pidfd, .KILL, null, 0);
         var status: u32 = 0;
-        while (linux.errno(linux.waitpid(pid, &status, 0)) == .INTR) {}
+        while (linux.errno(linux.waitpid(pid, @ptrCast(&status), 0)) == .INTR) {}
     };
     var poll = [_]linux.pollfd{.{ .fd = descriptors[0], .events = linux.POLL.IN, .revents = 0 }};
     const ready = linux.poll(&poll, poll.len, 5_000);
@@ -97,7 +97,7 @@ fn attempt(path: []const u8, wrong_parent: bool, options: Options) !Report {
     const exited = linux.poll(&poll, poll.len, 5_000);
     if (linux.errno(exited) != .SUCCESS or exited != 1) return error.NamespaceTestExitTimeout;
     var status: u32 = 0;
-    if (linux.errno(linux.waitpid(pid, &status, 0)) != .SUCCESS) return error.NamespaceTestWait;
+    if (linux.errno(linux.waitpid(pid, @ptrCast(&status), 0)) != .SUCCESS) return error.NamespaceTestWait;
     reaped = true;
     if (!linux.W.IFEXITED(status) or linux.W.EXITSTATUS(status) != 0) return error.NamespaceTestExit;
     return report;
@@ -144,7 +144,7 @@ test "joined namespace reports original refusal and actual identity syscall erro
     inaccessible.close(std.testing.io);
     const path = try std.fs.path.join(fixture.arena.allocator(), &.{ fixture.path, "identity-denied" });
     const report = try attempt("/not-opened", true, .{
-        .after_identity_path = try fixture.arena.allocator().dupeZ(u8, path),
+        .after_identity_path = try fixture.arena.allocator().dupeSentinel(u8, path, 0),
     });
     try std.testing.expectEqual(@as(u16, @intFromError(error.InvalidNamespaceParent)), report.err);
     try std.testing.expectEqual(@as(u16, @intFromError(error.NamespaceTestIdentityAccessDenied)), report.identity_err);

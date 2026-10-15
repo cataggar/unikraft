@@ -24,7 +24,7 @@ pub const Overflow = struct {
 
     pub fn emit(c: f.Context) !void {
         try c.replaceJson("overflow-start.json", .{ .pid = std.os.linux.getpid(), .monotonic_ns = try f.monotonicNanoseconds() });
-        const chunk = "x" ** 4096;
+        const chunk = &@as([4096:0]u8, @splat('x'));
         for (0..2 * limit / chunk.len) |_| try std.Io.File.stdout().writeStreamingAll(c.io, chunk);
         // Finishing the burst is not evidence of failed termination: a fast
         // reader may drain it before the supervisor's signal arrives. Remain

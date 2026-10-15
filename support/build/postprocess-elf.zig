@@ -21,7 +21,7 @@ pub const Image = struct {
     bytes: []const u8,
     header: elf.Header,
     sections: []Section,
-    programs: []elf.Elf64_Phdr,
+    programs: []elf.Elf64.Phdr,
     symbols: []Symbol,
 
     pub fn deinit(self: *Image) void {
@@ -63,13 +63,13 @@ pub const Image = struct {
             return error.InvalidSectionTable;
         try table(bytes, header.shoff, section_count, @sizeOf(elf.Elf64_Shdr));
         if (program_count != 0) {
-            if (header.phoff == 0 or header.phentsize != @sizeOf(elf.Elf64_Phdr))
+            if (header.phoff == 0 or header.phentsize != @sizeOf(elf.Elf64.Phdr))
                 return error.InvalidProgramTable;
-            try table(bytes, header.phoff, program_count, @sizeOf(elf.Elf64_Phdr));
+            try table(bytes, header.phoff, program_count, @sizeOf(elf.Elf64.Phdr));
         }
         const sections = try allocator.alloc(Section, try asUsize(section_count));
         errdefer allocator.free(sections);
-        const programs = try allocator.alloc(elf.Elf64_Phdr, try asUsize(program_count));
+        const programs = try allocator.alloc(elf.Elf64.Phdr, try asUsize(program_count));
         errdefer allocator.free(programs);
         var symbols: std.ArrayList(Symbol) = .empty;
         errdefer symbols.deinit(allocator);
@@ -92,14 +92,14 @@ pub const Image = struct {
         for (sections) |*item| item.name = try string(name_bytes, item.header.sh_name);
 
         for (programs, 0..) |*program, index| {
-            program.* = try structure(elf.Elf64_Phdr, bytes, header.phoff + index * @sizeOf(elf.Elf64_Phdr), header.endian);
-            _ = try range(bytes, program.p_offset, program.p_filesz);
-            _ = try add(program.p_vaddr, program.p_memsz);
-            if (program.p_type == elf.PT_LOAD) {
-                if (program.p_filesz > program.p_memsz) return error.InvalidLoadSegment;
-                if (program.p_align > 1 and
-                    (!std.math.isPowerOfTwo(program.p_align) or
-                        program.p_vaddr % program.p_align != program.p_offset % program.p_align))
+            program.* = try structure(elf.Elf64.Phdr, bytes, header.phoff + index * @sizeOf(elf.Elf64.Phdr), header.endian);
+            _ = try range(bytes, program.offset, program.filesz);
+            _ = try add(program.vaddr, program.memsz);
+            if (program.type == .LOAD) {
+                if (program.filesz > program.memsz) return error.InvalidLoadSegment;
+                if (program.@"align" > 1 and
+                    (!std.math.isPowerOfTwo(program.@"align") or
+                        program.vaddr % program.@"align" != program.offset % program.@"align"))
                     return error.InvalidLoadAlignment;
             }
         }
@@ -168,20 +168,20 @@ pub const Image = struct {
         if (sh.sh_flags & elf.SHF_ALLOC == 0 or sh.sh_type == elf.SHT_NOBITS)
             return error.SectionNotLoaded;
         for (self.programs) |ph| {
-            if (ph.p_type != elf.PT_LOAD or sh.sh_addr < ph.p_vaddr or sh.sh_offset < ph.p_offset)
+            if (ph.type != .LOAD or sh.sh_addr < ph.vaddr or sh.sh_offset < ph.offset)
                 continue;
-            const delta = sh.sh_addr - ph.p_vaddr;
-            if (delta == sh.sh_offset - ph.p_offset and delta <= ph.p_filesz and
-                sh.sh_size <= ph.p_filesz - delta) return;
+            const delta = sh.sh_addr - ph.vaddr;
+            if (delta == sh.sh_offset - ph.offset and delta <= ph.filesz and
+                sh.sh_size <= ph.filesz - delta) return;
         }
         return error.SectionNotLoaded;
     }
 
     pub fn containsMemory(self: Image, address: u64, size: u64) bool {
         for (self.programs) |ph| {
-            if (ph.p_type != elf.PT_LOAD or address < ph.p_vaddr) continue;
-            const delta = address - ph.p_vaddr;
-            if (delta <= ph.p_memsz and size <= ph.p_memsz - delta) return true;
+            if (ph.type != .LOAD or address < ph.vaddr) continue;
+            const delta = address - ph.vaddr;
+            if (delta <= ph.memsz and size <= ph.memsz - delta) return true;
         }
         return false;
     }

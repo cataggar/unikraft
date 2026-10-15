@@ -24,12 +24,10 @@ pub fn parse(comptime T: type, value: std.json.Value) !T {
     return switch (@typeInfo(T)) {
         .@"struct" => result: {
             if (@hasDecl(T, "parse")) break :result T.parse(value);
-            const fields = std.meta.fields(T);
-            var names: [fields.len][]const u8 = undefined;
-            inline for (fields, 0..) |field, index| names[index] = field.name;
-            const object = try c.exactFields(value, &names);
+            const fields = @typeInfo(T).@"struct".field_names;
+            const object = try c.exactFields(value, fields);
             var out: T = undefined;
-            inline for (fields) |field| @field(out, field.name) = try parse(field.type, object.get(field.name).?);
+            inline for (fields, @typeInfo(T).@"struct".field_types) |field, Field| @field(out, field) = try parse(Field, object.get(field).?);
             break :result out;
         },
         .array => |array| result: {
@@ -68,11 +66,11 @@ fn write(writer: *std.Io.Writer, value: anytype) !void {
             if (@hasDecl(T, "writeValue")) return value.writeValue(writer);
             if (@hasDecl(T, "write")) return value.write(writer);
             try writer.writeByte('{');
-            inline for (std.meta.fields(T), 0..) |field, index| {
+            inline for (@typeInfo(T).@"struct".field_names, 0..) |field, index| {
                 if (index != 0) try writer.writeByte(',');
-                try std.json.Stringify.value(field.name, .{}, writer);
+                try std.json.Stringify.value(field, .{}, writer);
                 try writer.writeByte(':');
-                try write(writer, @field(value, field.name));
+                try write(writer, @field(value, field));
             }
             try writer.writeByte('}');
         },

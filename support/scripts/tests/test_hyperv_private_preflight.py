@@ -1977,6 +1977,10 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 "for arg in \"$@\"; do\n"
                 " case \"$arg\" in -Doutput=*) out=${arg#-Doutput=};; esac\n"
                 "done\n"
+                "test \"$ZIG_LOCAL_PKG_DIR\" = "
+                "\"${ZIG_LOCAL_CACHE_DIR%/zig-local}/zig-packages\"\n"
+                "mkdir -p \"$ZIG_LOCAL_PKG_DIR\"\n"
+                "printf package > \"$ZIG_LOCAL_PKG_DIR/fixture-package\"\n"
                 "marker=\"$ZIG_LOCAL_CACHE_DIR/materialized\"\n"
                 "if test ! -e \"$marker\"; then\n"
                 " input=\"$ZIG_LOCAL_CACHE_DIR/o/111/"
@@ -2052,6 +2056,11 @@ class PrivatePreflightManifestTest(PrivatePreflightFixture):
                 },
             )
             self.assertEqual(validated["receipt"]["result"], "PASS")
+            self.assertEqual(
+                (output / "cache/zig-packages/fixture-package").read_bytes(),
+                b"package",
+            )
+            self.assertFalse((repository / "zig-pkg").exists())
             self.assertEqual(efi_path.read_bytes(), b"efi")
             self.assertEqual(
                 validated["receipt"]["source_before"],

@@ -79,8 +79,8 @@ pub const Recorded = struct {
         self.command = command;
         inline for (.{ "plan", "template", "output", "approver", "reference" }) |name|
             @field(self.command, name) = try self.allocator().dupe(u8, @field(command, name));
-        inline for (std.meta.fields(types.ToolPaths)) |field|
-            @field(self.command.tools, field.name) = try self.allocator().dupe(u8, @field(command.tools, field.name));
+        inline for (@typeInfo(types.ToolPaths).@"struct".field_names) |field_name|
+            @field(self.command.tools, field_name) = try self.allocator().dupe(u8, @field(command.tools, field_name));
         return self;
     }
     fn retain(self: *Recorded, item: types.Artifact, policy: files.FilePolicy) !void {
@@ -115,9 +115,9 @@ pub const Recorded = struct {
         try self.template.?.validate(self.plan.?, &self.plan_record.?.sha256);
         self.phase = .custody;
         const planned = self.plan.?;
-        inline for (std.meta.fields(compute.Tools)) |field| {
-            const item = @field(planned.tools, field.name);
-            if (!std.mem.eql(u8, item.path, @field(self.command.tools, field.name)))
+        inline for (@typeInfo(compute.Tools).@"struct".field_names) |field_name| {
+            const item = @field(planned.tools, field_name);
+            if (!std.mem.eql(u8, item.path, @field(self.command.tools, field_name)))
                 return error.WrongToolBinding;
             try self.retain(item, .tool);
         }
@@ -254,7 +254,7 @@ pub const Recorded = struct {
         self.phase = .freshness;
         try self.transaction.?.revalidate(self.barrier());
         const uuid = try records.freshUuid(self.allocator(), self.ctx.io);
-        const private_path = try std.fmt.allocPrint(self.allocator(), "{s}.partial-{s}", .{ command.output, uuid });
+        const private_path = try self.allocator().print("{s}.partial-{s}", .{ command.output, uuid });
         const transaction = &self.transaction.?;
         self.phase = .publication;
         const private_bytes = if (comptime @import("builtin").is_test)
@@ -392,12 +392,12 @@ fn strict(comptime T: type, value: std.json.Value) anyerror!void {
     switch (@typeInfo(T)) {
         .@"struct" => |info| {
             const names = comptime blk: {
-                var names: [info.fields.len][]const u8 = undefined;
-                for (info.fields, 0..) |field, index| names[index] = field.name;
+                var names: [info.field_names.len][]const u8 = undefined;
+                for (info.field_names, 0..) |field_name, index| names[index] = field_name;
                 break :blk names;
             };
             const object = try c.exactFields(value, &names);
-            inline for (info.fields) |field| try strict(field.type, object.get(field.name).?);
+            inline for (info.field_names, info.field_types) |field_name, FieldType| try strict(FieldType, object.get(field_name).?);
         },
         .int => _ = try c.integer(T, value),
         .bool => if (value != .bool) return error.ExpectedBoolean,

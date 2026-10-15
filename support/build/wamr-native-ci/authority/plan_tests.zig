@@ -15,7 +15,7 @@ test "physical private receipt cannot acquire imported candidate authority" {
     const io = std.testing.io;
     const parent = try std.Io.Dir.openDirAbsolute(io, @import("test_options").fixture_root, .{});
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "plan-receipt-negative-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("plan-receipt-negative-{d}", .{std.os.linux.getpid()});
     defer a.free(name);
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("plan negative fixture cleanup failed");
@@ -58,7 +58,7 @@ test "real descriptor-supervised plan validator preserves malformed-record refus
     const ctx: @import("types.zig").Context = .{ .allocator = a, .io = io };
     const parent = try std.Io.Dir.openDirAbsolute(io, @import("test_options").fixture_root, .{});
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "plan-validator-negative-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("plan-validator-negative-{d}", .{std.os.linux.getpid()});
     defer a.free(name);
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("plan validator fixture cleanup failed");

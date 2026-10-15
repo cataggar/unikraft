@@ -28,27 +28,37 @@ test "install-controller rejects incompatible build flags without creating outpu
     defer allocator.free(global);
     const runtime = try std.fs.path.join(allocator, &.{ options.repository_root, ".d/controller-invalid-target" });
     defer allocator.free(runtime);
-    const runtime_flag = try std.fmt.allocPrint(allocator, "-Dcontroller-runtime={s}", .{runtime});
+    const runtime_flag = try allocator.print("-Dcontroller-runtime={s}", .{runtime});
     defer allocator.free(runtime_flag);
+    const build_file = try std.fs.path.join(allocator, &.{
+        options.repository_root, "support/build/wamr-native-ci/build.zig",
+    });
+    defer allocator.free(build_file);
+    var environ_map = try std.testing.environ.createMap(allocator);
+    defer environ_map.deinit();
+    try environ_map.put("ZIG_GLOBAL_CACHE_DIR", global);
     for ([_]struct { triple: []const u8, cpu: []const u8 }{
         .{ .triple = "-Dtarget=x86_64-linux-musl", .cpu = "-Dcpu=x86_64_v2" },
         .{ .triple = "-Dtarget=x86_64-linux-gnu", .cpu = "-Dcpu=x86_64_v3" },
     }) |bad| {
         const result = try std.process.run(allocator, std.testing.io, .{
             .argv = &.{
-                options.zig_executable,                   "build",                  "--build-file",
-                "support/build/wamr-native-ci/build.zig", "install-controller",     bad.triple,
-                bad.cpu,                                  "-Doptimize=ReleaseSafe", runtime_flag,
-                "--system",                               packages,                 "--cache-dir",
-                cache,                                    "--global-cache-dir",     global,
+                options.zig_executable, "build",              "--build-file",
+                build_file,             "install-controller", bad.triple,
+                bad.cpu,                "-Doptimize=safe",    runtime_flag,
+                "--system",             packages,             "--cache-dir",
+                cache,
             },
             .cwd = .{ .path = options.repository_root },
+            .environ_map = &environ_map,
             .stdout_limit = .limited(32 * 1024),
             .stderr_limit = .limited(32 * 1024),
         });
         defer allocator.free(result.stdout);
         defer allocator.free(result.stderr);
         try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, result.term);
+        if (std.mem.indexOf(u8, result.stderr, "install-controller requires") == null)
+            std.debug.print("incompatible controller install: {s}\n", .{result.stderr});
         try std.testing.expect(std.mem.indexOf(u8, result.stderr, "install-controller requires -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2") != null);
         try std.testing.expectError(error.FileNotFound, std.Io.Dir.openDirAbsolute(std.testing.io, runtime, .{}));
         const after = try ignoredSource(allocator);

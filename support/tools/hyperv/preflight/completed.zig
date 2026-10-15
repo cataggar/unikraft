@@ -37,7 +37,7 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, directory: core.private_fi
         state.observed_at.? >= expected.approved.cleanup_expires_at) return error.NotCompleted;
     for (state.actions) |operation| if (operation.status != .complete or operation.proof == null) return error.CleanupUnproved;
     for ([_]c.Action{ .create_group, .deploy_host, .grant_access, .stage_public, .publish_public, .stage_private, .publish_private, .deallocate, .revoke_roles, .revoke_sas, .delete_group }) |action| {
-        if (state.actions[@intFromEnum(action)].effect != .accepted) return error.MutationNotCompleted;
+        if (state.actions[@backingInt(action)].effect != .accepted) return error.MutationNotCompleted;
     }
     const completion = try directory.read(io, allocator, "completion.json", p.max_command, state.completion_sha256);
     defer allocator.free(completion);
@@ -55,7 +55,7 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, directory: core.private_fi
         .admitted_at = state.admitted_at,
         .public = state.public.?,
         .private = state.private.?,
-        .group_absence = state.actions[@intFromEnum(c.Action.prove_group_absent)].proof.?,
+        .group_absence = state.actions[@backingInt(c.Action.prove_group_absent)].proof.?,
         .scope = "platform-only",
         .storage = "UNAVAILABLE",
     };
@@ -83,7 +83,7 @@ fn phase(a: std.mem.Allocator, io: std.Io, directory: core.private_files.Directo
     var admission = try input.validate(a, now);
     defer admission.deinit();
     const action: c.Action = if (selected == .public) .publish_public else .publish_private;
-    const bytes = try directory.read(io, a, engine.commandName(selected), p.max_command, state.actions[@intFromEnum(action)].proof);
+    const bytes = try directory.read(io, a, engine.commandName(selected), p.max_command, state.actions[@backingInt(action)].proof);
     defer a.free(bytes);
     var command = try p.Command.parse(a, bytes, input.approved.public_key, &admission, try input.scope(&admission), try core.contracts.parseUuid(&(state.vm_id orelse return error.MissingHostIdentity)), now);
     defer command.deinit();
@@ -100,7 +100,7 @@ fn phase(a: std.mem.Allocator, io: std.Io, directory: core.private_files.Directo
         a.free(log);
     };
     for (0..@as(usize, if (selected == .public) 2 else 4)) |i| {
-        const name = try std.fmt.allocPrint(a, "boot-{d}.log", .{i + @as(usize, if (selected == .public) 0 else 2)});
+        const name = try a.print("boot-{d}.log", .{i + @as(usize, if (selected == .public) 0 else 2)});
         defer a.free(name);
         logs[count] = try directory.read(io, a, name, p.max_serial, null);
         count += 1;

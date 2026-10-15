@@ -15,9 +15,9 @@ pub const Contract = struct {
     zig_local_cache: []const u8,
 
     pub fn validate(self: Contract) !void {
-        inline for (std.meta.fields(Contract)) |field| {
-            if (comptime !std.mem.eql(u8, field.name, "schema"))
-                try commandPath(@field(self, field.name));
+        inline for (@typeInfo(Contract).@"struct".field_names) |name| {
+            if (comptime !std.mem.eql(u8, name, "schema"))
+                try commandPath(@field(self, name));
         }
     }
 
@@ -39,7 +39,7 @@ pub const Contract = struct {
         result[0] = try allocator.dupe(u8, "UMASK=0077");
         count = 1;
         inline for (mapping, 1..) |entry, index| {
-            result[index] = try std.fmt.allocPrint(allocator, "{s}={s}", .{ entry[0], @field(self, entry[1]) });
+            result[index] = try allocator.print("{s}={s}", .{ entry[0], @field(self, entry[1]) });
             count += 1;
         }
         return result;
@@ -50,7 +50,7 @@ pub fn encode(allocator: std.mem.Allocator, contract: Contract) ![]u8 {
     try contract.validate();
     const json = try std.json.Stringify.valueAlloc(allocator, contract, .{});
     defer allocator.free(json);
-    return std.fmt.allocPrint(allocator, "{s}\n", .{json});
+    return allocator.print("{s}\n", .{json});
 }
 
 pub fn commandPath(path: []const u8) !void {

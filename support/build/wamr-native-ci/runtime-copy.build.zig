@@ -27,7 +27,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "hyperv_core", .module = core },
             .{ .name = "wamr_log_validator", .module = validator },
-            .{ .name = "controller_source_closure", .module = b.createModule(.{ .root_source_file = b.path("../../controller_source_closure.zig"), .target = target, .optimize = optimize }) },
+            .{ .name = "controller_source_closure", .module = foundation.sourceClosureModule(b, target, optimize) },
             .{ .name = "handoff_contracts", .module = b.createModule(.{ .root_source_file = b.path("handoff/contracts.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "hyperv_core", .module = core }} }) },
         },
     });
@@ -44,7 +44,7 @@ pub fn build(b: *std.Build) void {
     }) });
     foundation.addImports(b, tests.root_module, target, optimize, core, serial, validator, handoff);
     const options = b.addOptions();
-    options.addOption([]const u8, "fixture_root", b.option([]const u8, "test-root", "Private synthetic fixtures") orelse @panic("test-root required"));
+    options.addOption([]const u8, "fixture_root", foundation.defaultFixtureRoot(b));
     options.addOption(bool, "oracle_keep_first", b.option(bool, "oracle-keep-first", "Retain synthetic COPY output for Python oracle") orelse false);
     tests.root_module.addImport("test_options", options.createModule());
     const run = b.addRunArtifact(tests);
@@ -53,8 +53,8 @@ pub fn build(b: *std.Build) void {
     const generated = b.addWriteFiles();
     const source = generated.add("runtime-copy-source-check.zig",
         \\const copy = @import("runtime_copy");
-        \\const parameters = @typeInfo(@TypeOf(copy.Stage.init)).@"fn".params;
-        \\export fn copyCheck(ctx: *const parameters[0].type.?, request: *const parameters[1].type.?, inventory: *const parameters[2].type.?) u16 {
+        \\const parameters = @typeInfo(@TypeOf(copy.Stage.init)).@"fn".param_types;
+        \\export fn copyCheck(ctx: *const parameters[0].?, request: *const parameters[1].?, inventory: *const parameters[2].?) u16 {
         \\    var stage = copy.Stage.init(ctx.*, request.*, inventory.*) catch |err| return @intFromError(err);
         \\    defer stage.deinit();
         \\    return switch (stage.copyStage()) {
@@ -62,8 +62,8 @@ pub fn build(b: *std.Build) void {
         \\        .refused, .poisoned => |failure| @intFromError(failure.err),
         \\    };
         \\}
-        \\const binding = @typeInfo(@TypeOf(copy.ManifestInputs.bindManifest)).@"fn".params;
-        \\export fn bindCheck(stage: *copy.Stage, manifest: binding[2].type.?) u16 {
+        \\const binding = @typeInfo(@TypeOf(copy.ManifestInputs.bindManifest)).@"fn".param_types;
+        \\export fn bindCheck(stage: *copy.Stage, manifest: binding[2].?) u16 {
         \\    _ = stage.root() catch |err| return @intFromError(err);
         \\    _ = stage.layout() catch |err| return @intFromError(err);
         \\    stage.barrier().revalidate() catch |err| return @intFromError(err);

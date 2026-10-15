@@ -1,6 +1,6 @@
 # Typed component metadata API
 
-`component-api.zig` is the internal, experimental Zig 0.16 metadata API for
+`component-api.zig` is the internal, experimental Zig 0.17 metadata API for
 describing Unikraft components and platform image pipelines. It models the
 current `Makefile.uk` contract without compiling or linking anything. The API
 may change until the external component contract is defined.
@@ -17,10 +17,31 @@ ordered partial-link command, provenance of local versus `EACHOLIB` inputs,
 the relocatable intermediate, symbol-localizing objcopy transformation, and
 the final typed library object. `TargetZigObject` separately models Zig source
 compiled for the target, including its logical object output, optimization
-mode, C include roots/macros, generated-file dependencies, PIC setting, and
+mode (`debug`, `safe`, `fast`, or `small`), C include roots/macros,
+generated-file dependencies, PIC setting, and
 frame-pointer policy. `native-target-object.zig` materializes those entries as
 `LazyPath` objects with libc disabled, no red zone, no stack checks or
 unwinding, single-threaded runtime assumptions, and trap-on-panic behavior.
+An optional `c_translation` declares C header names and the Zig import name
+(default `config`). The pinned `translate_c` build dependency translates a
+generated C wrapper before compilation; the same global/object include roots,
+macros, target and generated-file bindings apply to translation. Generated
+headers are tracked inputs of the translator, not configure-time files or
+hand-copied Zig declarations. Initialization follows the typed Hearth pattern,
+`const translated: Translator = .init(b.dependency("translate_c", .{}), options)`;
+the dependency uses its hosted defaults, while the actual guest target and
+object optimization belong to `options`. Every consumer imports
+`translated.mod`, including its helper modules, rather than rebuilding a module
+from `output_file`. Hosted production verifiers retain their safe mode.
+The target-object fixture checks translated
+macro values and a real C/Zig struct-by-value ABI, including a stripped object.
+Root invocations require the explicitly restored translator/Aro depot described
+in the root README; use `--system "$ZIG_LOCAL_PKG_DIR"` to prohibit fetching.
+Run it with `zig build --system "$ZIG_LOCAL_PKG_DIR" test-native-target-object`. The focused
+`zig build --system "$ZIG_LOCAL_PKG_DIR" test-target-config-cache` selector checks same-path configuration
+updates and live executable/application replacements on warm caches.
+Its recursive builds receive the already resolved root depot and retain
+`--system`; an unavailable depot must refuse before the Make recorder executes.
 `LinkStage.sequence` interleaves artifacts,
 literal or driver/raw-translated flags, archive-group markers, and system
 library arguments without regrouping them. Ordered post-processing
@@ -47,7 +68,7 @@ export at graph construction time. Each profile records:
 Production `build.zig` constructs and validates one of these graphs with:
 
 ```sh
-zig build native-link-graph \
+zig build --system "$ZIG_LOCAL_PKG_DIR" native-link-graph \
   -Dapp=/absolute/path/to/app-helloworld \
   -Dnative-profile=qemu-x86_64
 ```
@@ -60,7 +81,7 @@ Make for compile-time inputs, then executes the native library links, linker
 script merge, final link, post-processing, and output publication:
 
 ```sh
-zig build native-images \
+zig build --system "$ZIG_LOCAL_PKG_DIR" native-images \
   -Dapp=/absolute/path/to/app-helloworld \
   -Dconfig=/absolute/path/to/solved.config \
   -Dnative-profile=qemu-x86_64
@@ -99,7 +120,8 @@ and exclusively owned by the build.
 Run the native ELF/image fixtures and actual strip/objcopy transformations:
 
 ```sh
-zig build --build-file support/build/native-postprocess-tests.build.zig integration -j2
+zig build --build-file support/build/native-postprocess-tests.build.zig \
+  --system "$ZIG_LOCAL_PKG_DIR" integration -j2
 ```
 
 The default fixture architecture is x86_64; `-Dfixture-arch=arm64` exercises
@@ -269,7 +291,7 @@ metadata. The ordinary C solver retains its existing optional-source and
 Run the focused native unit and CLI fixtures (no Make or Python execution):
 
 ```sh
-zig build test-build-tools -j2
+zig build --system "$ZIG_LOCAL_PKG_DIR" test-build-tools -j2
 ```
 
 This includes metadata/version/platform negative cases, unchanged solved

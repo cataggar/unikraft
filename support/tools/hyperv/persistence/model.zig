@@ -47,14 +47,14 @@ pub const Step = enum {
         };
     }
     pub fn cleanup(self: Step) bool {
-        return @intFromEnum(self) >= @intFromEnum(Step.cleanup_observe);
+        return @backingInt(self) >= @backingInt(Step.cleanup_observe);
     }
     pub fn upload(self: Step) bool {
         return self == .os_upload or self == .data_upload;
     }
 };
-pub const step_count = std.meta.fields(Step).len;
-pub const execution_count = @intFromEnum(Step.cleanup_observe);
+pub const step_count = @typeInfo(Step).@"enum".field_names.len;
+pub const execution_count = @backingInt(Step.cleanup_observe);
 pub const Presence = enum { unknown, present, absent };
 pub const Power = enum { unknown, running, deallocated };
 pub const Uuid = [36]u8;
@@ -224,7 +224,7 @@ pub const State = struct {
     cleanup_deadline_ns: ?u64 = null,
     boot_count: u8 = 0,
     originals: Originals = .{},
-    records: [step_count]Record = [_]Record{.{}} ** step_count,
+    records: [step_count]Record = @as([step_count]Record, @splat(.{})),
     boot1: ?evidence.Evidence = null,
     boot2: ?evidence.Evidence = null,
     failures: core.diagnostics.Failures = .{},
@@ -236,13 +236,13 @@ pub const State = struct {
     control_bytes: u64 = 0,
 
     pub fn record(self: *State, step: Step) *Record {
-        return &self.records[@intFromEnum(step)];
+        return &self.records[@backingInt(step)];
     }
     pub fn isDone(self: State, step: Step) bool {
-        return self.records[@intFromEnum(step)].progress == .done;
+        return self.records[@backingInt(step)].progress == .done;
     }
     pub fn mayOwn(self: State, step: Step) bool {
-        return switch (self.records[@intFromEnum(step)].effect) {
+        return switch (self.records[@backingInt(step)].effect) {
             .accepted, .unknown, .incomplete => true,
             else => false,
         };
@@ -265,7 +265,7 @@ pub const State = struct {
         self.originals = originals;
     }
     pub fn reconcileUnstartedGrant(self: *State, step: Step) void {
-        const record_ = self.records[@intFromEnum(step)];
+        const record_ = self.records[@backingInt(step)];
         if (record_.effect != .not_started or record_.progress != .failed) return;
         if (step == .os_grant) self.os_access_pending = false;
         if (step == .data_grant) self.data_access_pending = false;
@@ -276,8 +276,8 @@ pub const State = struct {
         try local.hex(&self.nonce, true);
         try originalsValid(self.originals);
         if (self.boot_count > 2 or self.control_bytes > contract.control_limit) return error.InvalidState;
-        const first_intent = self.records[@intFromEnum(Step.deploy_boot1)].progress != .unissued;
-        const second_intent = self.records[@intFromEnum(Step.start_boot2)].progress != .unissued;
+        const first_intent = self.records[@backingInt(Step.deploy_boot1)].progress != .unissued;
+        const second_intent = self.records[@backingInt(Step.start_boot2)].progress != .unissued;
         if (self.boot_count != @as(u8, if (second_intent) 2 else if (first_intent) 1 else 0)) return error.InvalidBootCount;
         if (!self.consumed and (self.phase != .prepared or self.cleanup_required or self.boot_count != 0 or self.attempt_deadline_ns != 0))
             return error.InvalidConsumption;
@@ -300,7 +300,7 @@ pub const State = struct {
                 !std.meta.eql(second.identity, first.identity) or !second_intent or !self.isDone(.serial_boot2)) return error.InvalidEvidence;
         }
         for (self.records, 0..) |record_, index| {
-            const step: Step = @enumFromInt(index);
+            const step: Step = @fromBackingInt(@intCast(index));
             try (core.diagnostics.Diagnostic{ .stage = .arm, .category = .unavailable, .http_status = record_.http_status, .service_code = record_.service_code }).validate();
             if (record_.access_metadata) |metadata| try metadata.validate();
             if (record_.progress == .unissued or record_.progress == .intent or record_.progress == .skipped) {
@@ -334,14 +334,14 @@ pub const State = struct {
                     if (self.isDone(.serial_boot1) != (self.boot1 != null) or self.isDone(.serial_boot2) != (self.boot2 != null))
                         return error.InvalidEvidence;
                     if (self.group_absent and (!self.isDone(.cleanup_absence) or
-                        self.records[@intFromEnum(Step.cleanup_absence)].http_status != 404 or
-                        self.records[@intFromEnum(Step.cleanup_absence)].service_code != .ResourceGroupNotFound)) return error.InvalidAbsence;
+                        self.records[@backingInt(Step.cleanup_absence)].http_status != 404 or
+                        self.records[@backingInt(Step.cleanup_absence)].service_code != .ResourceGroupNotFound)) return error.InvalidAbsence;
                     if (self.secrets_disposed and !self.isDone(.cleanup_dispose)) return error.InvalidCleanup;
-                    if (!self.os_access_pending and self.records[@intFromEnum(Step.os_grant)].progress != .unissued and
-                        self.records[@intFromEnum(Step.os_grant)].effect != .not_started and
+                    if (!self.os_access_pending and self.records[@backingInt(Step.os_grant)].progress != .unissued and
+                        self.records[@backingInt(Step.os_grant)].effect != .not_started and
                         !self.isDone(.os_access_closed) and !self.isDone(.cleanup_os_access)) return error.InvalidAccessProof;
-                    if (!self.data_access_pending and self.records[@intFromEnum(Step.data_grant)].progress != .unissued and
-                        self.records[@intFromEnum(Step.data_grant)].effect != .not_started and
+                    if (!self.data_access_pending and self.records[@backingInt(Step.data_grant)].progress != .unissued and
+                        self.records[@backingInt(Step.data_grant)].effect != .not_started and
                         !self.isDone(.data_access_closed) and !self.isDone(.cleanup_data_access)) return error.InvalidAccessProof;
                     if (record_.page_report) |page| {
                         _ = try page.restore();

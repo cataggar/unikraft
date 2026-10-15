@@ -591,8 +591,16 @@ pub fn requirePackageDeclaration(backing_allocator: std.mem.Allocator, bytes: []
     var arena = std.heap.ArenaAllocator.init(backing_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const terminated = try allocator.dupeZ(u8, bytes);
-    defer allocator.free(terminated);
+    const pin = try packagePin(backing_allocator, allocator, bytes, package.declaration.entry);
+    if (!std.mem.eql(u8, pin.url, package.locator) or
+        !std.mem.eql(u8, pin.hash, package.package_hash)) return error.InvalidPackageDeclaration;
+}
+
+const Pin = struct { url: []const u8, hash: []const u8, lazy: bool = false };
+
+fn packagePin(gpa: std.mem.Allocator, arena: std.mem.Allocator, bytes: []const u8, entry: []const u8) !Pin {
+    const terminated = try gpa.dupeSentinel(u8, bytes, 0);
+    defer gpa.free(terminated);
     // Bound work before parsing; ZonGen then rejects non-ZON expressions and
     // duplicate fields throughout the entire manifest, not just the selected pin.
     var tokenizer = std.zig.Tokenizer.init(terminated);
@@ -615,35 +623,46 @@ pub fn requirePackageDeclaration(backing_allocator: std.mem.Allocator, bytes: []
             else => {},
         }
     }
-    var ast = try std.zig.Ast.parse(allocator, terminated, .zon);
-    defer ast.deinit(allocator);
+    var ast = try std.zig.Ast.parse(gpa, terminated, .{ .mode = .zon });
+    defer ast.deinit(gpa);
     if (ast.errors.len != 0) return error.InvalidPackageDeclaration;
-    const zoir = try std.zig.ZonGen.generate(allocator, ast, .{});
-    defer zoir.deinit(allocator);
+    const zoir = try std.zig.ZonGen.generate(gpa, ast, .{});
+    defer zoir.deinit(gpa);
     if (zoir.hasCompileErrors()) return error.InvalidPackageDeclaration;
     if (zoir.nodes.len > 4096) return error.LimitExceeded;
-    const root = std.zig.Zoir.Node.Index.root.get(zoir);
+    const root = std.zig.Zoir.Node.Index.root.get(&zoir);
     if (root != .struct_literal) return error.InvalidPackageDeclaration;
     var dependencies: ?std.zig.Zoir.Node = null;
     for (root.struct_literal.names, 0..) |name, i| {
-        if (std.mem.eql(u8, name.get(zoir), "dependencies"))
-            dependencies = root.struct_literal.vals.at(@intCast(i)).get(zoir);
+        if (std.mem.eql(u8, name.get(&zoir), "dependencies"))
+            dependencies = root.struct_literal.vals.at(@intCast(i)).get(&zoir);
     }
     const list = dependencies orelse return error.InvalidPackageDeclaration;
     if (list != .struct_literal) return error.InvalidPackageDeclaration;
-    var found = false;
+    var selected: ?Pin = null;
     for (list.struct_literal.names, 0..) |name, i| {
         const node = list.struct_literal.vals.at(@intCast(i));
-        if (node.get(zoir) != .struct_literal) return error.InvalidPackageDeclaration;
-        if (!std.mem.eql(u8, name.get(zoir), package.declaration.entry)) continue;
-        found = true;
-        const Pin = struct { url: []const u8, hash: []const u8, lazy: bool = false };
-        const pin = std.zon.parse.fromZoirNodeAlloc(Pin, allocator, ast, zoir, node, null, .{}) catch |err| switch (err) {
+        if (node.get(&zoir) != .struct_literal) return error.InvalidPackageDeclaration;
+        if (!std.mem.eql(u8, name.get(&zoir), entry)) continue;
+        const ast_node = node.getAstNode(&zoir);
+        const first = ast.firstToken(ast_node);
+        const last = ast.lastToken(ast_node);
+        const source = try gpa.dupeSentinel(u8, terminated[ast.tokenStart(first) .. ast.tokenStart(last) + ast.tokenSlice(last).len], 0);
+        defer gpa.free(source);
+        var diagnostics: std.zon.parse.Diagnostics = undefined;
+        // Zig 0.17 fromZoir ignores its node option. Parse only the selected
+        // literal after the complete manifest has passed ZonGen validation.
+        const pin = std.zon.parse.fromSlice(Pin, .{
+            .gpa = gpa,
+            .arena = arena,
+            .source = source,
+            .diagnostics = &diagnostics,
+            .ignore_unknown_fields = false,
+        }) catch |err| switch (err) {
             error.ParseZon => return error.InvalidPackageDeclaration,
             else => return err,
         };
-        if (!std.mem.eql(u8, pin.url, package.locator) or
-            !std.mem.eql(u8, pin.hash, package.package_hash)) return error.InvalidPackageDeclaration;
+        selected = pin;
     }
-    if (!found) return error.InvalidPackageDeclaration;
+    return selected orelse error.InvalidPackageDeclaration;
 }

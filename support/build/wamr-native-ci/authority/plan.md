@@ -66,14 +66,14 @@ and failed evidence is non-resumable and retained, not silently cleaned away.
 
 ## Focused validation
 
-From `support/build/wamr-native-ci`, run with Zig 0.16, an existing owner-private
+From `support/build/wamr-native-ci`, run with Zig 0.17, an existing owner-private
 absolute external fixture root, private cache/global directories, and the
 complete read-only package directory:
 
 ```sh
 zig build --build-file authority-plan.build.zig test -j1 \
   -Dtest-root=ABS --cache-dir ABS --global-cache-dir ABS --system PACKAGES
-# Repeat with -Doptimize=ReleaseSafe.
+# Repeat with -Doptimize=safe.
 ```
 
 The isolated selector includes foundation transaction/fault/cancellation/process

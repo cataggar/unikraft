@@ -440,7 +440,7 @@ fn importRun(owner: *ImportedProduct, inv: ImportInvocation, faults: ImportFault
         try owner.sealed.append(inv.allocator, .{ .directory = directory, .snapshot = try copy.directorySnapshot(directory.dir) });
     }
     for (controller.handoff_contracts.profile.modes(owner.metadata().compatibility)) |mode| {
-        const relative = try std.fmt.allocPrint(a, "boots/{s}", .{@tagName(mode)});
+        const relative = try a.print("boots/{s}", .{@tagName(mode)});
         const directory = try files.Directory.open(inv.io, try std.fs.path.join(a, &.{ owner.output, relative }));
         errdefer directory.close(inv.io);
         try owner.sealed.append(inv.allocator, .{ .directory = directory, .snapshot = try copy.directorySnapshot(directory.dir) });

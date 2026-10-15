@@ -7,10 +7,17 @@ pub const process = @import("build-tool-process.zig");
 pub const prepare = @import("build-tool-prepare.zig");
 pub const image = @import("build-tool-image.zig");
 
-pub const revision = "a53205d77be3b880eb8f8b96679512ba58e2331a";
+pub const revision = "bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20";
 pub const workload_revision = revision;
 pub const compiler_profile = "unikraft-x86_64";
-pub const zig_version = "0.16.0";
+pub const zig_version = "0.17.0";
+pub const translate_c_url = "git+https://github.com/cataggar/translate-c#62d06a5d3e93c82727544e8113e4762a315ca0ed";
+pub const translate_c_hash = "translate_c-2.0.0-Q_BUWlpOBwBWvgGBM20tJq-GXgPio3v3UD39rXEn70KN";
+pub const aro_hash = "aro-0.0.0-JSD1QtuBNwCASyBtNF3pqTl_W3oAJQGEVyFAtrBSE_Pa";
+pub const wabt_url = "https://github.com/cataggar/wabt/archive/840ea5be8eaf17935bc901a265feae62aad2fa8d.tar.gz";
+pub const wabt_hash = "wabt-3.0.0-eK3F5tYkMgAVdG2-Yz4L4HheKI2mnzqSv4KvbJSRROUQ";
+pub const wasip2_url = "https://github.com/cataggar/wabt/archive/de1b26f7e721aba18f6472437d8d6cde14bfec16.tar.gz";
+pub const wasip2_hash = "wasip2-0.1.0-jlr7LXS8AACl3LA77qOp3ckw6PNrPJ543Cl--WBtRKsg";
 pub const source_identity_recipe = "sorted-compact-json-relative-file-path-to-bytes-and-sha256-v1";
 pub const development_scope = "local-development-build-only-not-supported-lineage";
 pub const supported_scope = "native-build-inputs-not-hardware-qualification";
@@ -19,7 +26,7 @@ pub const native_flags = [_][]const u8{
     "-target",
     "x86_64-freestanding-none",
     "-O",
-    "ReleaseSafe",
+    "safe",
     "-fPIC",
     "-mno-red-zone",
     "-fno-stack-check",

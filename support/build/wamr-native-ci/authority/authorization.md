@@ -44,13 +44,13 @@ Standalone context acquisition and genuine acceptance remain separate gates.
 ## Focused source gate
 
 With an existing owner-private absolute root, fresh per-owner external caches
-and Zig 0.16, run from `support/build/wamr-native-ci`:
+and Zig 0.17, run from `support/build/wamr-native-ci`:
 
 ```sh
 zig build --build-file authority-authorization.build.zig test \
   -Dtest-root=ABS -j1 --summary all
 zig build --build-file authority-authorization.build.zig test \
-  -Dtest-root=ABS -Doptimize=ReleaseSafe -j1 --summary all
+  -Dtest-root=ABS -Doptimize=safe -j1 --summary all
 ```
 
 The selector also compiles the real handler in a non-test object. It does not

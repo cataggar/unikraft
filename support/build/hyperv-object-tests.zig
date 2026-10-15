@@ -31,7 +31,7 @@ test "CLI requires exact options and retains each mapping argument in order" {
 }
 
 test "ELF parsing rejects short bad magic and unsupported object headers" {
-    const short = [_]u8{0} ** 64;
+    const short = @as([64]u8, @splat(0));
     for (0..64) |length| {
         if (format.Object.parse(testing.allocator, short[0..length])) |object| {
             object.deinit();
@@ -58,7 +58,7 @@ test "mapping argument and path bounds reject excess input" {
     try testing.expectEqual(@as(usize, 32), valid.mappings.items.len);
     try args.appendSlice(testing.allocator, &.{ "--mapping-api-object", "mapping.o" });
     try testing.expectError(error.InvalidArguments, proof.Options.parse(testing.allocator, args.items));
-    const too_long = [_]u8{'x'} ** 4097;
+    const too_long = @as([4097]u8, @splat('x'));
     try testing.expectError(error.InvalidArguments, proof.Options.parse(testing.allocator, &.{ "hyperv-runtime", "--object", &too_long }));
 }
 
@@ -152,7 +152,7 @@ const Fixture = struct {
     fn renamed(self: Fixture, object: []const u8, before: []const u8, after: []const u8, output: []const u8) ![]u8 {
         const path_ = try self.path(output);
         errdefer self.allocator.free(path_);
-        const flag = try std.fmt.allocPrint(self.allocator, "--redefine-sym={s}={s}", .{ before, after });
+        const flag = try self.allocator.print("--redefine-sym={s}={s}", .{ before, after });
         defer self.allocator.free(flag);
         try self.command(&.{ self.objcopy, flag, object, path_ });
         return path_;
@@ -213,7 +213,7 @@ fn integration(init: std.process.Init) !void {
     for (profiles, inputs[0..5]) |profile, path_| {
         try fixture.check(profile, path_, 0, "");
         const symbol = proof.required(profile)[proof.required(profile).len - 1];
-        const prefix = try std.fmt.allocPrint(allocator, "{s}_prefix_collision", .{symbol});
+        const prefix = try allocator.print("{s}_prefix_collision", .{symbol});
         defer allocator.free(prefix);
         const renamed = try fixture.renamed(path_, symbol, prefix, "prefix.o");
         defer allocator.free(renamed);
@@ -223,13 +223,13 @@ fn integration(init: std.process.Init) !void {
         try fixture.check(profile, missing, 1, "MissingExport");
         const local = try fixture.path("local.o");
         defer allocator.free(local);
-        const localize = try std.fmt.allocPrint(allocator, "--localize-symbol={s}", .{symbol});
+        const localize = try allocator.print("--localize-symbol={s}", .{symbol});
         defer allocator.free(localize);
         try fixture.command(&.{ objcopy, localize, path_, local });
         try fixture.check(profile, local, 1, "InvalidExport");
         const weak = try fixture.path("weak.o");
         defer allocator.free(weak);
-        const weaken = try std.fmt.allocPrint(allocator, "--weaken-symbol={s}", .{symbol});
+        const weaken = try allocator.print("--weaken-symbol={s}", .{symbol});
         defer allocator.free(weaken);
         try fixture.command(&.{ objcopy, weaken, path_, weak });
         try fixture.check(profile, weak, 1, "InvalidExport");
@@ -252,7 +252,7 @@ fn integration(init: std.process.Init) !void {
     try fixture.expect(&.{"architecture-notice"}, 0, "");
     var out = std.Io.File.stdout().writer(io, &.{});
     try out.interface.print("Object proofs: {d} native CLI cases passed; no boot proof or architecture skip credit.\n", .{fixture.cases});
-    const summary = try std.fmt.allocPrint(allocator, "{d} native CLI cases passed; no boot proof or architecture skip credit.\n", .{fixture.cases});
+    const summary = try allocator.print("{d} native CLI cases passed; no boot proof or architecture skip credit.\n", .{fixture.cases});
     defer allocator.free(summary);
     const result_path = try fixture.write("result.txt", summary);
     defer allocator.free(result_path);
@@ -289,12 +289,12 @@ fn exportFixtures(f: *Fixture, profile: proof.Profile, input: []const u8) !void 
     var nm = try (try proof.tools.Tools.init(f.allocator, f.io, f.environment, 30000)).run(&.{ f.nm, "--format=posix", "--no-demangle", "-n", input });
     defer nm.deinit(f.allocator);
     try proof.checkNm(object, nm.stdout, names, false);
-    const collided = try std.fmt.allocPrint(f.allocator, "{s}_collision", .{name});
+    const collided = try f.allocator.print("{s}_collision", .{name});
     defer f.allocator.free(collided);
     const missing = try std.mem.replaceOwned(u8, f.allocator, nm.stdout, name, collided);
     defer f.allocator.free(missing);
     try testing.expectError(error.MissingNmSymbol, proof.checkNm(object, missing, names, false));
-    const extra = try std.fmt.allocPrint(f.allocator, "{s}\n{s} T 0 0\n", .{ nm.stdout, name });
+    const extra = try f.allocator.print("{s}\n{s} T 0 0\n", .{ nm.stdout, name });
     defer f.allocator.free(extra);
     try testing.expectError(error.DuplicateNmSymbol, proof.checkNm(object, extra, names, false));
 }
@@ -306,7 +306,7 @@ fn pageFixtures(f: *Fixture, input: []const u8) !void {
     defer object.deinit();
     for (proof.pages) |page| {
         const section = try object.section(page.name);
-        const prefix = try std.fmt.allocPrint(f.allocator, "--rename-section={s}={s}_collision", .{ page.name, page.name });
+        const prefix = try f.allocator.print("--rename-section={s}={s}_collision", .{ page.name, page.name });
         defer f.allocator.free(prefix);
         const output = try f.path("page-name.o");
         defer f.allocator.free(output);
@@ -317,7 +317,7 @@ fn pageFixtures(f: *Fixture, input: []const u8) !void {
             .{ .field = 48, .value = 2048 },
             .{ .field = 8, .value = std.elf.SHF_ALLOC | std.elf.SHF_EXECINSTR },
             .{ .field = 8, .value = if (page.nobits) std.elf.SHF_ALLOC else std.elf.SHF_ALLOC | std.elf.SHF_WRITE },
-            .{ .field = 4, .value = @intFromEnum(if (page.nobits) std.elf.SHT.PROGBITS else .NOBITS), .width = 4 },
+            .{ .field = 4, .value = @backingInt(if (page.nobits) std.elf.SHT.PROGBITS else .NOBITS), .width = 4 },
         }) |change| {
             const bad = try f.allocator.dupe(u8, bytes);
             defer f.allocator.free(bad);
@@ -350,7 +350,7 @@ fn mappingFixtures(f: *Fixture, core: []const u8, c: []const u8, cpp: []const u8
     try f.expect(&.{ "storvsc-core", "--object", core, "--nm", f.nm, "--mapping-api-object", c, "--mapping-api-object", cpp }, 0, "");
     try f.expect(&.{ "storvsc-core", "--object", core, "--nm", f.nm, "--mapping-api-object", cpp, "--mapping-api-object", c, "--mapping-api-object", cpp }, 0, "");
     for (proof.mapping_names) |name| {
-        const mangled = try std.fmt.allocPrint(f.allocator, "{s}_mangled", .{name});
+        const mangled = try f.allocator.print("{s}_mangled", .{name});
         defer f.allocator.free(mangled);
         const bad = try f.renamed(cpp, name, mangled, "bad-mapping.o");
         defer f.allocator.free(bad);

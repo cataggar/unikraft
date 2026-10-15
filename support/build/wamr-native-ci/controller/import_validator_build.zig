@@ -15,6 +15,7 @@ const source = @import("source_custody.zig");
 const supervisor_identity = @import("import_supervisor_identity.zig");
 
 const handoff_success = "Compute handoff revalidated; authority=not_admitted.\n";
+const historical_handoff_success = "Historical compute handoff revalidated; authority=not_admitted.\n";
 
 pub const LocalTools = struct {
     git: []const u8,
@@ -375,7 +376,7 @@ pub fn runPortable(
     if (!std.meta.eql(observed.metadata, physical.metadata(pinned_candidate.file_snapshot)))
         return error.CandidateChanged;
     try authenticated.verifyExecutables(io);
-    _ = try revalidateHandoffCommand(allocator, io, .{
+    _ = try revalidateHandoffCommandStage(allocator, io, .{
         .source_root = repository,
         .work = output,
         .runtime = accepted.root,
@@ -386,8 +387,11 @@ pub fn runPortable(
         .validator = "",
         .direct_validator = local.validator,
         .bundle = candidate_path,
-        .tools = @splat(""),
-    }, private, evidence, signal);
+        .tools = @as([inputs.host_tools.len][]const u8, @splat("")),
+    }, private, evidence, signal, if (accepted.compatibility == .tiny_v1_legacy)
+        .@"import-historical-native-revalidation"
+    else
+        .@"import-native-revalidation");
     try authenticated.verifyWithSignal(io, repository, local.git, signal);
     try accepted.revalidateWithSignal(signal);
     try pinned_start.verify(io);
@@ -450,7 +454,8 @@ pub fn runPrivateValidated(
     var anchor = try files.RetainedFile.open(io, try std.fs.path.join(allocator, &.{ output, "private/.writer.lock" }), .private);
     defer anchor.close(io);
     try syncDirectory(io, private);
-    errdefer |err| {
+    var failed_err: ?anyerror = null;
+    errdefer if (failed_err) |err| {
         if (anchor.verify(io)) |_| {
             const raw = std.json.Stringify.valueAlloc(allocator, .{
                 .phase = "private_validation",
@@ -467,10 +472,32 @@ pub fn runPrivateValidated(
                 }
             }
         } else |_| {}
-    }
+    };
+    runPrivateInner(allocator, io, bundle, output, parent, work, private, evidence, &anchor, signal) catch |err| {
+        failed_err = err;
+        return err;
+    };
+}
+
+fn runPrivateInner(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    bundle: *accepted_run.PrivateBundle,
+    output: []const u8,
+    parent: std.Io.Dir,
+    work: std.Io.Dir,
+    private: std.Io.Dir,
+    evidence: std.Io.Dir,
+    anchor: *files.RetainedFile,
+    signal: ?*core.process.SignalCancellation,
+) !void {
     try bundle.tools.verifyExecutables(io);
     try bundle.manifest.verify(io);
-    const checked = try revalidateHandoffCommand(allocator, io, .{
+    const stage: plan.Stage = if (bundle.evidence.compatibility == .tiny_v1_legacy)
+        .@"import-historical-native-revalidation"
+    else
+        .@"import-native-revalidation";
+    const checked = try revalidateHandoffCommandStage(allocator, io, .{
         .source_root = bundle.evidence.repository.?,
         .work = output,
         .runtime = bundle.evidence.root,
@@ -481,18 +508,22 @@ pub fn runPrivateValidated(
         .validator = "",
         .direct_validator = bundle.tools.validator.path,
         .bundle = try std.fs.path.join(allocator, &.{ bundle.evidence.root, "bundle.json" }),
-        .tools = @splat(""),
-    }, private, evidence, signal);
+        .tools = @as([inputs.host_tools.len][]const u8, @splat("")),
+    }, private, evidence, signal, stage);
+    const revalidation_files: [2][]const u8 = if (bundle.evidence.compatibility == .tiny_v1_legacy)
+        .{ "evidence/command-import-historical-native-revalidation.json", "private/import-historical-native-revalidation.log" }
+    else
+        .{ "evidence/command-import-native-revalidation.json", "private/import-native-revalidation.log" };
     var command_record = try files.RetainedFile.open(io, try std.fs.path.join(allocator, &.{
-        output, "evidence/command-import-native-revalidation.json",
+        output, revalidation_files[0],
     }), .private);
     defer command_record.close(io);
     var command_log = try files.RetainedFile.open(io, try std.fs.path.join(allocator, &.{
-        output, "private/import-native-revalidation.log",
+        output, revalidation_files[1],
     }), .private);
     defer command_log.verify(io) catch {};
     defer command_log.close(io);
-    const repeated = try validatedPostRun(allocator, io, output, .@"import-native-revalidation", @intCast(checked.output_bytes));
+    const repeated = try validatedPostRun(allocator, io, output, stage, @intCast(checked.output_bytes));
     if (!std.meta.eql(checked, repeated)) return error.CommandOutputChanged;
     try command_record.verify(io);
     try command_log.verify(io);
@@ -679,12 +710,20 @@ fn runImportedReaderWithFault(
         try changed.writePositionalAll(io, "!", 0);
         try changed.sync(io);
     }
-    _ = try revalidateHandoffCommand(a, io, roots, private, evidence, signal);
+    const stage: plan.Stage = if (accepted.compatibility == .tiny_v1_legacy)
+        .@"import-historical-native-revalidation"
+    else
+        .@"import-native-revalidation";
+    _ = try revalidateHandoffCommandStage(a, io, roots, private, evidence, signal, stage);
     try authenticated.verifyExecutables(io);
     try accepted.revalidateWithSignal(signal);
     try candidate.verify(io);
     try start.verify(io);
-    for ([_][]const u8{ "evidence/command-import-native-revalidation.json", "private/import-native-revalidation.log" }, 2..) |relative, i| {
+    const revalidation_files: [2][]const u8 = if (accepted.compatibility == .tiny_v1_legacy)
+        .{ "evidence/command-import-historical-native-revalidation.json", "private/import-historical-native-revalidation.log" }
+    else
+        .{ "evidence/command-import-native-revalidation.json", "private/import-native-revalidation.log" };
+    for (revalidation_files, 2..) |relative, i| {
         const pinned = try pinValidationOutput(allocator, io, output, relative);
         held[i] = pinned.file;
         digests[i] = pinned.sha256;
@@ -777,7 +816,7 @@ fn tool(
     name: []const u8,
     bound: usize,
 ) !Tool {
-    const role = try std.fmt.allocPrint(allocator, "tool:{s}", .{name});
+    const role = try allocator.print("tool:{s}", .{name});
     defer allocator.free(role);
     const record = try get(try get(try get(start, "consumer_inputs"), "files"), role);
     const path = try contracts.string(try get(record, "path"));
@@ -797,7 +836,7 @@ fn pinRecordedRuntime(
     path: []const u8,
     pinned: *std.ArrayList(RuntimePin),
 ) !void {
-    const role = try std.fmt.allocPrint(allocator, "runtime:{s}", .{path});
+    const role = try allocator.print("runtime:{s}", .{path});
     defer allocator.free(role);
     const identity = try recordedFile(io, start, role, path, 64 * limits.mib);
     const owned_path = try allocator.dupe(u8, path);
@@ -910,7 +949,7 @@ fn handoffCandidate(
         if (boot.* != .object or
             !std.mem.eql(u8, try contracts.string(try get(boot.*, "mode")), @tagName(mode)))
             return error.InvalidImportedBundle;
-        const prefix = try std.fmt.allocPrint(allocator, "boots/{s}/", .{@tagName(mode)});
+        const prefix = try allocator.print("boots/{s}/", .{@tagName(mode)});
         for ([_][]const u8{ "serial", "request", "report", "compute" }) |part| {
             const item = boot.object.getPtr(part) orelse return error.InvalidImportedBundle;
             try rebase(allocator, root, item, prefix);
@@ -965,7 +1004,7 @@ fn validatedPostRun(
     stage: plan.Stage,
     expected_bytes: usize,
 ) !@import("command_validation.zig").ValidatedCommand {
-    const record_path = try std.fmt.allocPrint(allocator, "{s}/evidence/command-{s}.json", .{ output, @tagName(stage) });
+    const record_path = try allocator.print("{s}/evidence/command-{s}.json", .{ output, @tagName(stage) });
     const identity = try physical.readFile(io, record_path, records.max_record_bytes, true);
     var retained = try files.RetainedFile.open(io, record_path, .private);
     defer retained.close(io);
@@ -982,7 +1021,7 @@ fn validatedPostRun(
         stage,
         .trusted_inner_zip,
     );
-    const log_path = try std.fmt.allocPrint(allocator, "{s}/private/{s}.log", .{ output, @tagName(stage) });
+    const log_path = try allocator.print("{s}/private/{s}.log", .{ output, @tagName(stage) });
     const log = try physical.readFile(io, log_path, plan.spec(stage).output_limit + 1, true);
     if (checked.output_bytes != expected_bytes or checked.output_bytes != log.bytes or
         !std.mem.eql(u8, &checked.output_sha256, &log.sha256))
@@ -999,13 +1038,30 @@ pub fn revalidateHandoffCommand(
     evidence: std.Io.Dir,
     signal: ?*core.process.SignalCancellation,
 ) !@import("command_validation.zig").ValidatedCommand {
+    return revalidateHandoffCommandStage(allocator, io, roots, private, evidence, signal, .@"import-native-revalidation");
+}
+
+fn revalidateHandoffCommandStage(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    roots: plan.Roots,
+    private: std.Io.Dir,
+    evidence: std.Io.Dir,
+    signal: ?*core.process.SignalCancellation,
+    stage: plan.Stage,
+) !@import("command_validation.zig").ValidatedCommand {
+    const success = switch (stage) {
+        .@"import-native-revalidation" => handoff_success,
+        .@"import-historical-native-revalidation" => historical_handoff_success,
+        else => unreachable,
+    };
     var validator = try files.RetainedFile.open(io, roots.direct_validator, .tool);
     defer validator.close(io);
     var bundle = try files.RetainedFile.open(io, roots.bundle, .private);
     defer bundle.close(io);
     const outcome = try adapter.execute(allocator, io, .{
         .roots = roots,
-        .stage = .@"import-native-revalidation",
+        .stage = stage,
         .private_dir = private,
         .evidence_dir = evidence,
         .cancel = if (signal) |active| active.flag() else null,
@@ -1014,9 +1070,9 @@ pub fn revalidateHandoffCommand(
     defer allocator.free(outcome.stdout);
     if (outcome.poisoned) return error.CleanupPoisoned;
     if (!outcome.accepted or outcome.stderr_bytes != 0 or
-        !std.mem.eql(u8, outcome.stdout, handoff_success))
+        !std.mem.eql(u8, outcome.stdout, success))
         return error.StageRefused;
-    const checked = try validatedPostRun(allocator, io, roots.work, .@"import-native-revalidation", outcome.bytes);
+    const checked = try validatedPostRun(allocator, io, roots.work, stage, outcome.bytes);
     try validator.verify(io);
     try bundle.verify(io);
     return checked;
@@ -1118,7 +1174,7 @@ pub fn run(
         try file.writeStreamingAll(io, candidate);
         try file.sync(io);
     }
-    var tools: [inputs.host_tools.len][]const u8 = @splat("");
+    var tools: [inputs.host_tools.len][]const u8 = @as([inputs.host_tools.len][]const u8, @splat(""));
     tools[0] = git.path;
     var roots = plan.Roots{
         .source_root = repository,

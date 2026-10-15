@@ -98,7 +98,7 @@ test "every parent gate phase fails before user code and reaps through ECHILD" {
     };
     for (faults, 0..) |fault, index| {
         var marker_buffer: [32:0]u8 = undefined;
-        const marker = try std.fmt.bufPrintZ(&marker_buffer, "gate-failure-{d}", .{index});
+        const marker = try std.mem.printSentinel(&marker_buffer, "gate-failure-{d}", .{index}, 0);
         var gate: process.CommandGateTestState = .{ .fault = fault };
         var result = try process.runCommandTest(
             allocator,
@@ -133,11 +133,7 @@ test "ordinary setsid and double-fork fixtures cannot cross failed gates" {
     for ([_][]const u8{ "ordinary-child", "setsid-child", "double-fork" }) |mode| {
         for ([_]Failure{ .add_leader, .identity, .deadline, .release }) |failure| {
             var marker_buffer: [96:0]u8 = undefined;
-            const marker = try std.fmt.bufPrintZ(
-                &marker_buffer,
-                "{s}-{s}-marker",
-                .{ mode, @tagName(failure) },
-            );
+            const marker = try std.mem.printSentinel(&marker_buffer, "{s}-{s}-marker", .{ mode, @tagName(failure) }, 0);
             var command = try request(
                 executable,
                 &.{ path, mode, marker },
@@ -306,7 +302,7 @@ test "parent death closes the gate and cannot run user code" {
     }
     const parent: linux.pid_t = @intCast(forked);
     var status: u32 = 0;
-    while (true) switch (linux.errno(linux.waitpid(parent, &status, 0))) {
+    while (true) switch (linux.errno(linux.waitpid(parent, @ptrCast(&status), 0))) {
         .SUCCESS => break,
         .INTR => continue,
         else => return error.FixtureReap,
@@ -314,7 +310,7 @@ test "parent death closes the gate and cannot run user code" {
     try testing.expect(linux.W.IFEXITED(status));
     try testing.expectEqual(@as(u8, 123), linux.W.EXITSTATUS(status));
 
-    while (true) switch (linux.errno(linux.waitpid(-1, &status, 0))) {
+    while (true) switch (linux.errno(linux.waitpid(-1, @ptrCast(&status), 0))) {
         .SUCCESS => break,
         .INTR => continue,
         else => return error.FixtureReap,

@@ -45,11 +45,7 @@ fn runCase(mode: []const u8, unwind: bool) !void {
     var environment = std.process.Environ.Map.init(allocator);
     defer environment.deinit();
     var marker_buffer: [96:0]u8 = undefined;
-    const marker = try std.fmt.bufPrintZ(
-        &marker_buffer,
-        "{s}-{s}-poison",
-        .{ mode, if (unwind) "unwind" else "result" },
-    );
+    const marker = try std.mem.printSentinel(&marker_buffer, "{s}-{s}-poison", .{ mode, if (unwind) "unwind" else "result" }, 0);
     var fault: process.CommandPostReleaseTestState = .{
         .fault = if (unwind) .unwind_cleanup_proof else .cleanup_proof,
     };
@@ -109,7 +105,7 @@ test "cleanup proof failure poisons after removing every released tree" {
             }
             const pid: linux.pid_t = @intCast(forked);
             var status: u32 = 0;
-            while (true) switch (linux.errno(linux.waitpid(pid, &status, 0))) {
+            while (true) switch (linux.errno(linux.waitpid(pid, @ptrCast(&status), 0))) {
                 .SUCCESS => break,
                 .INTR => continue,
                 else => return error.FixtureReap,

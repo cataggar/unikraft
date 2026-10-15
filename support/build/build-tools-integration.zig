@@ -152,8 +152,8 @@ fn metadataFixtures(f: Fixture, tool: []const u8, config_tool: []const u8) !void
     var fresh_argv = argv;
     fresh_argv[10] = try f.path("missing-source-new.tsv");
     for ([_][]const u8{ "missing-Kconfig-source", "missing-Kconfig-*.uk" }) |source| {
-        _ = try f.write("base/Config.uk", try std.fmt.allocPrint(f.a, "source \"{s}\"\n", .{source}), false);
-        const diagnostic = try std.fmt.allocPrint(f.a, "metadata source \"{s}\": no matching files", .{source});
+        _ = try f.write("base/Config.uk", try f.a.print("source \"{s}\"\n", .{source}), false);
+        const diagnostic = try f.a.print("metadata source \"{s}\": no matching files", .{source});
         try f.expectDiagnostic(model_argv, 2, diagnostic);
         try std.testing.expectEqualStrings(empty_model, try f.read(metadata_path));
         try f.expectDiagnostic(fresh_argv[0 .. fresh_argv.len - 2], 2, diagnostic);
@@ -209,7 +209,7 @@ fn shellBoundaries(f: Fixture, tool: []const u8) !void {
     };
     const limit = 1024 * 1024;
     for ([_]usize{ 256, limit }) |size| {
-        _ = try f.write("shell-base/Config.uk", try std.fmt.allocPrint(f.a, "config SHELL_VALUE\n string\n default \"$(shell,$(UK_BASE)/emit-output {d})\"\n", .{size}), false);
+        _ = try f.write("shell-base/Config.uk", try f.a.print("config SHELL_VALUE\n string\n default \"$(shell,$(UK_BASE)/emit-output {d})\"\n", .{size}), false);
         try f.expectRun(&argv, 0);
         try std.testing.expectEqualStrings(
             "unikraft-native-config-metadata-v1\nsymbol\tSHELL_VALUE\tstring\n",
@@ -217,7 +217,7 @@ fn shellBoundaries(f: Fixture, tool: []const u8) !void {
         );
     }
     const original_metadata = try f.read(metadata_path);
-    _ = try f.write("shell-base/Config.uk", try std.fmt.allocPrint(f.a, "config SHELL_VALUE\n string\n default \"$(shell,$(UK_BASE)/emit-output {d})\"\n", .{limit + 1}), false);
+    _ = try f.write("shell-base/Config.uk", try f.a.print("config SHELL_VALUE\n string\n default \"$(shell,$(UK_BASE)/emit-output {d})\"\n", .{limit + 1}), false);
     try f.expectDiagnostic(&argv, 2, "metadata shell output exceeds 1048576-byte limit");
     try std.testing.expectEqualStrings(original_metadata, try f.read(metadata_path));
     _ = try f.write("shell-base/Config.uk", "config SHELL_VALUE\n string\n default \"$(shell,printf '\\000')\"\n", false);
@@ -252,7 +252,7 @@ fn legacySolver(f: Fixture, tool: []const u8) !void {
         return error.UnexpectedExitStatus;
     }
     const solved = try f.read(output);
-    const expected = try std.mem.concat(f.a, u8, &.{ "CONFIG_LEGACY_VALUE=\"", "0" ** 255, "\"\n" });
+    const expected = try std.mem.concat(f.a, u8, &.{ "CONFIG_LEGACY_VALUE=\"", &@as([255]u8, @splat('0')), "\"\n" });
     try std.testing.expect(std.mem.indexOf(u8, solved, expected) != null);
 }
 
@@ -310,7 +310,9 @@ fn policyFixtures(f: Fixture, tool: []const u8) !void {
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len != 7) return error.InvalidArguments;
-    const fixture: Fixture = .{ .a = init.arena.allocator(), .io = init.io, .root = args[4] };
+    try std.Io.Dir.cwd().createDirPath(init.io, args[4]);
+    const root = try std.Io.Dir.cwd().realPathFileAlloc(init.io, args[4], init.arena.allocator());
+    const fixture: Fixture = .{ .a = init.arena.allocator(), .io = init.io, .root = root };
     try metadataFixtures(fixture, args[1], args[2]);
     try longRootPaths(fixture, args[1], args[2], args[5]);
     try shellBoundaries(fixture, args[1]);

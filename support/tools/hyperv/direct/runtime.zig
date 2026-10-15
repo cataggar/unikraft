@@ -33,11 +33,11 @@ pub fn processExit(result: process.PrivateResult, cancellation: *const process.S
         if (failure.category == .timeout) return 124;
         // Match the reference's file-size refusal, not the supervisor's TERM.
         // The actual child termination remains independent in process records.
-        if (failure.category == .output_limit) return 128 + @intFromEnum(std.os.linux.SIG.XFSZ);
+        if (failure.category == .output_limit) return 128 + @backingInt(std.os.linux.SIG.XFSZ);
     }
     if (result.execution.termination) |termination| switch (termination) {
         .exited => |code| if (code != 0) return code,
-        .signal => |signal| return @intCast(@min(255, 128 + @intFromEnum(signal))),
+        .signal => |signal| return @intCast(@min(255, 128 + @backingInt(signal))),
         else => {},
     };
     return if (result.succeeded()) 0 else 1;
@@ -256,17 +256,9 @@ pub const Runtime = struct {
             const runtime_custody = self.azure_custody orelse
                 return error.AzureRuntimeNotPinned;
             var root_buffer: [64]u8 = undefined;
-            const root = try std.fmt.bufPrint(
-                &root_buffer,
-                "/proc/self/fd/{d}",
-                .{runtime_custody.root.handle},
-            );
+            const root = try std.mem.print(&root_buffer, "/proc/self/fd/{d}", .{runtime_custody.root.handle});
             var extensions_buffer: [80]u8 = undefined;
-            const extensions = try std.fmt.bufPrint(
-                &extensions_buffer,
-                "{s}/extensions",
-                .{root},
-            );
+            const extensions = try std.mem.print(&extensions_buffer, "{s}/extensions", .{root});
             if (self.programs.azure_runtime == null or
                 !std.mem.eql(
                     u8,
@@ -369,35 +361,19 @@ pub const Runtime = struct {
                 return error.AzureRuntimeNotPinned;
             const retained = self.azure_custody orelse
                 return error.AzureRuntimeNotPinned;
-            const root = try std.fmt.bufPrint(
-                &root_path,
-                "/proc/self/fd/{d}",
-                .{retained.root.handle},
-            );
+            const root = try std.mem.print(&root_path, "/proc/self/fd/{d}", .{retained.root.handle});
             argv[0] = closure.dynamic_loader.path;
             argv[1] = "--inhibit-cache";
             argv[2] = "--inhibit-rpath";
             argv[3] = "";
             argv[4] = "--library-path";
-            argv[5] = try std.fmt.bufPrint(
-                &loader_path,
-                "{s}/loader",
-                .{root},
-            );
-            argv[6] = try std.fmt.bufPrint(
-                &interpreter_path,
-                "{s}/bin/python",
-                .{root},
-            );
+            argv[5] = try std.mem.print(&loader_path, "{s}/loader", .{root});
+            argv[6] = try std.mem.print(&interpreter_path, "{s}/bin/python", .{root});
             argv[7] = "-s";
             argv[8] = "-S";
             argv[9] = "-B";
             argv[10] = "-P";
-            argv[11] = try std.fmt.bufPrint(
-                &launcher_path,
-                "{s}/bootstrap/azure-cli",
-                .{root},
-            );
+            argv[11] = try std.mem.print(&launcher_path, "{s}/bootstrap/azure-cli", .{root});
             argument_offset = 12;
         } else {
             argv[0] = self.programs.path(role);
@@ -418,7 +394,7 @@ pub const Runtime = struct {
                 job.timeout_ms > budget.worker_timeout_ms.?) return error.InsufficientTransferBudget;
         }
         const reference = if (self.tool_references) |references|
-            references[@intFromEnum(role)]
+            references[@backingInt(role)]
         else
             null;
         if (reference) |value| try value.verify(self.io);
@@ -463,8 +439,8 @@ pub const Runtime = struct {
 
 fn publicArgument(value: []const u8) !void {
     if (value.len > 64 * 1024 or std.mem.indexOfAny(u8, value, "?\x00&") != null or
-        std.ascii.indexOfIgnoreCase(value, "sig=") != null or
-        std.ascii.indexOfIgnoreCase(value, "sas-token") != null) return error.SecretArgument;
+        std.ascii.findIgnoreCase(value, "sig=") != null or
+        std.ascii.findIgnoreCase(value, "sas-token") != null) return error.SecretArgument;
 }
 
 fn azureCommand(arguments: []const []const u8) !void {

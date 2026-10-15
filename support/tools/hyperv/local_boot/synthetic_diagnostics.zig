@@ -18,7 +18,7 @@ pub const Phase = enum {
     exec_handoff,
     mock_entry,
 };
-pub const slot_count = @typeInfo(Phase).@"enum".fields.len;
+pub const slot_count = @typeInfo(Phase).@"enum".field_names.len;
 pub const max_bytes = slot_count * slot_size;
 pub const max_log_bytes = max_bytes + 256;
 
@@ -29,7 +29,7 @@ pub const Record = struct {
     phase: Phase,
     backend: std.builtin.CompilerBackend,
     arch: std.Target.Cpu.Arch,
-    optimize: std.builtin.OptimizeMode,
+    optimize: measurement.Optimize,
     aarch64_sha2: bool,
     x86_sha: bool,
     x86_avx2: bool,
@@ -55,7 +55,7 @@ pub const Record = struct {
 
     pub fn encode(self: Record) ![slot_size]u8 {
         if (self.schema_version != 1 or self.fixture_bytes == 0) return error.InvalidDiagnostic;
-        var slot = [_]u8{0} ** slot_size;
+        var slot = @as([slot_size]u8, @splat(0));
         var writer: std.Io.Writer = .fixed(&slot);
         try std.json.Stringify.value(self, .{}, &writer);
         try writer.writeByte('\n');
@@ -83,7 +83,7 @@ pub const Trace = struct {
     pub fn mark(self: *Trace, io: std.Io, comptime phase: Phase) !void {
         if (!enabled) @compileError("Synthetic diagnostics require a dedicated fixture root");
         if (phase == .mock_entry) @compileError("Mock entry is recorded by the separately exec'd fixture");
-        if (@intFromEnum(phase) != self.next) return error.DiagnosticPhaseOrder;
+        if (@backingInt(phase) != self.next) return error.DiagnosticPhaseOrder;
         const slot = try (try Record.observe(phase, self.fixture_bytes)).encode();
         try self.file.writePositionalAll(io, &slot, self.next * slot_size);
         self.next += 1;
@@ -104,7 +104,7 @@ pub fn mockEntry(io: std.Io, work: core.private_files.Directory) !void {
     const checked = try work.openFile(io, file_name);
     defer checked.close(io);
     const before = try core.private_files.snapshot(checked);
-    const offset = @as(usize, @intFromEnum(Phase.mock_entry)) * slot_size;
+    const offset = @as(usize, @backingInt(Phase.mock_entry)) * slot_size;
     if (before.size != offset) return error.DiagnosticPhaseOrder;
     const opened = linux.openat(work.dir.handle, file_name, .{
         .ACCMODE = .WRONLY,
@@ -148,7 +148,7 @@ pub fn decode(a: std.mem.Allocator, bytes: []const u8) !Observation {
             result.tail = .invalid_slot;
             break;
         };
-        if (@intFromEnum(record.phase) != index or !std.mem.eql(u8, slot, &canonical) or
+        if (@backingInt(record.phase) != index or !std.mem.eql(u8, slot, &canonical) or
             (index != 0 and (record.monotonic_ns < result.records[index - 1].monotonic_ns or
                 record.process_cpu_ns < result.records[index - 1].process_cpu_ns or
                 record.fixture_bytes != result.records[0].fixture_bytes)))

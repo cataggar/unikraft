@@ -26,11 +26,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "local_boot_serial", .module = serial },
         },
     });
-    const source_closure = b.createModule(.{
-        .root_source_file = b.path("../../controller_source_closure.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    const source_closure = sourceClosureModule(b, target, optimize);
     const controller = b.createModule(.{
         .root_source_file = b.path("controller/root.zig"),
         .target = target,
@@ -72,35 +68,41 @@ pub fn build(b: *std.Build) void {
     const candidate_run = b.addRunArtifact(candidate_tests);
     b.step("test-candidate", "Run no-authority candidate encoding and result edge cases")
         .dependOn(&candidate_run.step);
-    const fixture_root = b.option([]const u8, "test-root", "Existing absolute private handoff fixture root") orelse std.fs.path.resolve(b.allocator, &.{
-        b.graph.cache.cwd, b.cache_root.path orelse ".",
-    }) catch @panic("cannot resolve private handoff test root");
-    if (!std.fs.path.isAbsolute(fixture_root)) @panic("handoff fixture root must be absolute");
+    const repo_root_abs = std.Io.Dir.cwd().realPathFileAlloc(
+        b.graph.io,
+        b.root.joinString(b.allocator, "../..") catch @panic("OOM"),
+        b.allocator,
+    ) catch @panic("OOM");
+    const default_fixture_root = b.pathJoin(&.{ repo_root_abs, ".zig-cache/handoff-tests" });
+    const fixture_root = if (b.option([]const u8, "test-root", "Existing absolute private handoff fixture root")) |path| blk: {
+        if (!std.fs.path.isAbsolute(path)) @panic("handoff fixture root must be absolute");
+        break :blk path;
+    } else default_fixture_root;
     const options = b.addOptions();
     options.addOption([]const u8, "fixture_root", fixture_root);
     candidate_tests.root_module.addOptions("test_options", options);
     // Nested --build-file invocations can render source LazyPaths relatively.
-    options.addOptionPath("python_oracle", .{
-        .cwd_relative = std.fs.path.resolve(b.allocator, &.{
-            b.graph.cache.cwd, b.path("tests/test_handoff_contract_goldens.py").getPath(b),
-        }) catch @panic("cannot resolve handoff Python oracle"),
-    });
-    options.addOptionPath("accepted_result_fixture", .{
-        .cwd_relative = std.fs.path.resolve(b.allocator, &.{
-            b.graph.cache.cwd, b.path("tests/fixtures/differential/accepted-v2.json").getPath(b),
-        }) catch @panic("cannot resolve accepted handoff fixture"),
-    });
+    options.addOption([]const u8, "python_oracle", std.Io.Dir.cwd().realPathFileAlloc(
+        b.graph.io,
+        b.root.joinString(b.allocator, "tests/test_handoff_contract_goldens.py") catch @panic("OOM"),
+        b.allocator,
+    ) catch @panic("cannot resolve handoff Python oracle"));
+    options.addOption([]const u8, "accepted_result_fixture", std.Io.Dir.cwd().realPathFileAlloc(
+        b.graph.io,
+        b.root.joinString(b.allocator, "tests/fixtures/differential/accepted-v2.json") catch @panic("OOM"),
+        b.allocator,
+    ) catch @panic("cannot resolve accepted handoff fixture"));
     tests.root_module.addOptions("test_options", options);
     const run = b.addRunArtifact(tests);
-    const python = b.addSystemCommand(&.{ "python3", "-B" });
-    python.setEnvironmentVariable("WAMR_HANDOFF_GOLDEN_ROOT", fixture_root);
+    const python = b.addSystemCommand(&.{"env"});
+    python.addArg(b.fmt("WAMR_HANDOFF_GOLDEN_ROOT={s}", .{fixture_root}));
+    python.addArgs(&.{ "python3", "-B" });
     python.addFileArg(b.path("tests/test_handoff_contract_goldens.py"));
     const step = b.step("test", "Run native and Python handoff contract goldens");
     step.dependOn(&run.step);
     step.dependOn(&python.step);
     const archive_options = b.addOptions();
-    const archive_fixture_root = b.pathJoin(&.{ fixture_root, "handoff-public-archive-tests" });
-    archive_options.addOption([]const u8, "fixture_root", archive_fixture_root);
+    archive_options.addOption([]const u8, "fixture_root", b.pathJoin(&.{ fixture_root, "handoff-public-archive-tests" }));
     const genuine_archive = b.option([]const u8, "public-archive", "Read-only genuine public inner ZIP fixture");
     archive_options.addOption(?[]const u8, "genuine_archive", genuine_archive);
     const archive_tests = b.addTest(.{
@@ -151,12 +153,61 @@ pub fn build(b: *std.Build) void {
     const transport_run = b.addRunArtifact(transport_tests);
     const fixture_dirs = b.addSystemCommand(&.{ "mkdir", "-p", "-m", "0700", "--" });
     fixture_dirs.has_side_effects = true;
+    fixture_dirs.addArg(fixture_root);
     inline for (.{ "handoff-export-tests", "handoff-python-goldens", "handoff-public-archive-tests", "handoff-public-transport-tests" }) |name|
         fixture_dirs.addArg(b.pathJoin(&.{ fixture_root, name }));
     inline for (.{ &run.step, &python.step, &archive_run.step, &transport_run.step, &candidate_run.step }) |test_step|
         test_step.dependOn(&fixture_dirs.step);
+    b.step("test-unit", "Run native handoff contract unit tests").dependOn(&run.step);
+    b.step("test-golden", "Run Python handoff contract goldens").dependOn(&python.step);
     b.step("test-public-archive", "Run native public archive engine tests").dependOn(&archive_run.step);
     b.step("test-public-transport", "Run native public transport staging and binding tests").dependOn(&transport_run.step);
     step.dependOn(&archive_run.step);
     step.dependOn(&transport_run.step);
+}
+
+fn sourceClosureModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+) *std.Build.Module {
+    const source_file = b.path("../../controller_source_closure.zig");
+    b.dependOnFileContents(source_file);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(
+        b.graph.io,
+        b.root.joinString(b.allocator, "../../controller_source_closure.zig") catch @panic("OOM"),
+        b.allocator,
+        .limited(1024 * 1024),
+    ) catch |err| std.debug.panic("read controller source closure: {s}", .{@errorName(err)});
+    const text = b.allocator.dupeSentinel(u8, bytes, 0) catch @panic("OOM");
+    const module = b.createModule(.{
+        .root_source_file = source_file,
+        .target = target,
+        .optimize = optimize,
+    });
+    var tokenizer = std.zig.Tokenizer.init(text);
+    while (true) {
+        const token = tokenizer.next();
+        if (token.tag == .eof) break;
+        if (token.tag == .invalid)
+            @panic("invalid controller source inventory");
+        if (token.tag != .builtin or
+            !std.mem.eql(u8, text[token.loc.start..token.loc.end], "@embedFile"))
+            continue;
+        if (tokenizer.next().tag != .l_paren)
+            @panic("invalid controller source embed");
+        const literal = tokenizer.next();
+        if (literal.tag != .string_literal or tokenizer.next().tag != .r_paren)
+            @panic("controller source embeds must name literal files");
+        const name = std.zig.string_literal.parseAlloc(b.allocator, text[literal.loc.start..literal.loc.end]) catch
+            @panic("invalid controller source embed name");
+        if (module.import_table.contains(name))
+            continue;
+        module.addImport(name, b.createModule(.{
+            .root_source_file = b.path(b.fmt("../../{s}", .{name})),
+            .target = target,
+            .optimize = optimize,
+        }));
+    }
+    return module;
 }

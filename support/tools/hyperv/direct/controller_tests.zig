@@ -30,7 +30,7 @@ const StoreFixture = struct {
         try custody.requireDurable(try writer.createImmutable(io, "source.json", bytes));
         const directory = try local.directory(io, backing.directory, "ledger");
         defer directory.close(io);
-        const base = try std.fmt.allocPrint(memory, "{s}/{s}", .{ support.options.test_root.?, backing.name });
+        const base = try memory.print("{s}/{s}", .{ support.options.test_root.?, backing.name });
         const source = try std.fs.path.join(memory, &.{ base, "source.json" });
         const attempt = try std.fs.path.join(memory, &.{ base, "attempt" });
         const ledger = try std.fs.path.join(memory, &.{ base, "ledger" });
@@ -296,7 +296,7 @@ test "directory path binding permits local writes but refuses replacement direct
     defer fixture.deinit();
     const original = try local.directory(io, fixture.directory, "attempt");
     defer original.close(io);
-    const path = try std.fmt.allocPrint(a, "{s}/{s}/attempt", .{ support.options.test_root.?, fixture.name });
+    const path = try a.print("{s}/{s}/attempt", .{ support.options.test_root.?, fixture.name });
     defer a.free(path);
     try local.verifyDirectory(io, original, path);
     var writer = try original.lock(io);

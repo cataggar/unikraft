@@ -133,7 +133,7 @@ fn nowMs(context: *anyopaque) !u64 {
 
 test "native account SAS has exact historical scope and synthetic key only" {
     var encoded: [88]u8 = undefined;
-    const key = [_]u8{0x51} ** 64;
+    const key = @as([64]u8, @splat(0x51));
     _ = std.base64.standard.Encoder.encode(&encoded, &key);
     var sas = try pf.adapters.storage.signSas(a, "fixtureaccount", &encoded, f.now + 3000);
     defer sas.deinit();

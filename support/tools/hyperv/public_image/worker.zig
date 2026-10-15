@@ -40,8 +40,8 @@ pub fn execute(init: std.process.Init) !void {
     const job = try c.read(Job, a, bytes);
     var death: c_int = 0;
     if (job.schema_version != 1 or job.supervisor_pid != linux.getppid() or linux.getpgid(0) != linux.getpid() or
-        linux.errno(linux.prctl(@intFromEnum(linux.PR.GET_PDEATHSIG), @intFromPtr(&death), 0, 0, 0)) != .SUCCESS or
-        death != @intFromEnum(linux.SIG.KILL)) return error.InvalidSupervisor;
+        linux.errno(linux.prctl(@backingInt(linux.PR.GET_PDEATHSIG), @intFromPtr(&death), 0, 0, 0)) != .SUCCESS or
+        death != @backingInt(linux.SIG.KILL)) return error.InvalidSupervisor;
     if (root.lock(io)) |acquired| {
         var lock = acquired;
         lock.close(io);
@@ -142,8 +142,8 @@ fn validateCommon(
     var death: c_int = 0;
     if (schema_version != 2 or supervisor_pid != linux.getppid() or
         linux.getpgid(0) != linux.getpid() or
-        linux.errno(linux.prctl(@intFromEnum(linux.PR.GET_PDEATHSIG), @intFromPtr(&death), 0, 0, 0)) != .SUCCESS or
-        death != @intFromEnum(linux.SIG.KILL)) return error.InvalidSupervisor;
+        linux.errno(linux.prctl(@backingInt(linux.PR.GET_PDEATHSIG), @intFromPtr(&death), 0, 0, 0)) != .SUCCESS or
+        death != @backingInt(linux.SIG.KILL)) return error.InvalidSupervisor;
     if (root.lock(io)) |acquired| {
         var lock = acquired;
         lock.close(io);

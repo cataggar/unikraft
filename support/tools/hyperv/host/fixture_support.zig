@@ -26,7 +26,7 @@ pub fn scope() p.Scope {
 }
 
 pub fn keys() p.Ed25519.KeyPair {
-    return p.Ed25519.KeyPair.generateDeterministic([_]u8{0x5a} ** 32) catch unreachable;
+    return p.Ed25519.KeyPair.generateDeterministic(@as([32]u8, @splat(0x5a))) catch unreachable;
 }
 
 pub fn key() [32]u8 {
@@ -157,7 +157,7 @@ pub const Directory = struct {
         defer root.close(io);
         var nonce: [8]u8 = undefined;
         io.random(&nonce);
-        const name = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ label, p.hex(nonce) });
+        const name = try allocator.print("{s}-{s}", .{ label, p.hex(nonce) });
         defer allocator.free(name);
         try root.dir.createDir(io, name, .fromMode(0o700));
         const path = try std.fs.path.join(allocator, &.{ root_path, name });

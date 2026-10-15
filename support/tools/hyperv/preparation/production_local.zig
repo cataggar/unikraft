@@ -267,7 +267,7 @@ test "production local purpose and independent commitments are required" {
     try requireDigest(provenance_hash, provenance_hash);
     try std.testing.expectError(error.UnreviewedInput, requireDigest(producer_hash, provenance_hash));
     try std.testing.expectError(error.UnreviewedInput, requireDigest(engine_hash, producer_hash));
-    try std.testing.expectError(error.InvalidSha256, requireDigest(engine_hash, ("?" ** 64).*));
+    try std.testing.expectError(error.InvalidSha256, requireDigest(engine_hash, @as([64]u8, @splat('?'))));
 }
 
 test "production local real entrypoints compile without executing a producer" {
@@ -370,8 +370,8 @@ test "production local explicit configuration expectations reject subsets aliase
         "symbol\tLIBSTORVSC_MAX_LUNS\tint\n" ++
         "symbol\tARCH_X86_64\tbool\nsymbol\tPLAT_HYPERV\tbool\n";
     const subset = try config.render(a, guard);
-    const initial = try std.fmt.allocPrint(a, "{s}CONFIG_ARCH_X86_64=y\nCONFIG_PLAT_HYPERV=y\n", .{subset});
-    const solved = try std.fmt.allocPrint(a, "{s}# independently expected solved bytes\n", .{initial});
+    const initial = try a.print("{s}CONFIG_ARCH_X86_64=y\nCONFIG_PLAT_HYPERV=y\n", .{subset});
+    const solved = try a.print("{s}# independently expected solved bytes\n", .{initial});
     try writeConfigurationFixture(fixture.dir, "run.config", initial, 0o600);
     try writeConfigurationFixture(fixture.dir, "expected.config", solved, 0o600);
     try writeConfigurationFixture(fixture.dir, "expected.metadata", metadata, 0o600);

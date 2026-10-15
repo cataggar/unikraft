@@ -16,7 +16,7 @@ pub fn run(allocator: std.mem.Allocator, instructions: []const assembly.Instruct
     defer seen.deinit(allocator);
     var returns: std.ArrayList(flow.State) = .empty;
     errdefer returns.deinit(allocator);
-    try work.append(allocator, .{ .index = 0, .state = initial, .called = .initEmpty() });
+    try work.append(allocator, .{ .index = 0, .state = initial, .called = .empty });
     while (work.pop()) |item| {
         const pc = instructions[item.index];
         var duplicate = false;

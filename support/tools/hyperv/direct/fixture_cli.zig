@@ -158,7 +158,7 @@ const Fake = struct {
                 if (self.is("cache-capture-mutated")) try self.tamper("attempt/boot1-capture.json", " \n");
                 if (self.is("cache-scope-mutated")) try self.tamper("attempt/scope.json", " \n");
                 if (self.is("cache-admission-mutated")) try self.tamper("attempt/boot2-admission.json", " \n");
-                if (self.is("cache-then-wrong-identity")) return self.serial(try self.replace(original, "4" ** 32, "5" ** 32));
+                if (self.is("cache-then-wrong-identity")) return self.serial(try self.replace(original, &@as([32:0]u8, @splat('4')), &@as([32:0]u8, @splat('5'))));
                 if (self.is("cache-then-failure")) return self.serial("UK_HYPERV_ACCEPTANCE_FAIL:fixture\n");
                 if (starts(self.scenario, "cache-")) return self.serial(first);
             }
@@ -181,7 +181,7 @@ const Fake = struct {
         const options = try Options.parse(self.c, args);
         const cmd = options.command;
         const role: []const u8 = if (eq(options.name, f.prefix ++ "-os")) "os" else "data";
-        try self.c.log(try std.fmt.allocPrint(self.c.a, "{s} {s} {s}", .{ args[0], args[1], options.name }));
+        try self.c.log(try self.c.a.print("{s} {s} {s}", .{ args[0], args[1], options.name }));
         if (eq(cmd, "group exists")) return self.emit(self.is("preexisting-group") or self.state.exists);
         if (eq(cmd, "group create")) {
             try f.expect(!self.state.exists and self.state.boots == 0);
@@ -239,7 +239,7 @@ const Fake = struct {
             self.state.power = "running";
             try self.save();
             if (one(self.scenario, &.{ "process-signal-term", "process-output-overflow" })) {
-                try self.c.write("process.pid", try std.fmt.allocPrint(self.c.a, "{d}\n", .{std.os.linux.getpid()}));
+                try self.c.write("process.pid", try self.c.a.print("{d}\n", .{std.os.linux.getpid()}));
                 if (self.is("process-signal-term")) {
                     try std.Io.sleep(self.c.io, .fromSeconds(35), .awake);
                 } else {
@@ -464,7 +464,7 @@ fn run(init: std.process.Init) !void {
         try c.write("cli-version-called", "before-consumption\n");
         if (eq(control, "fail")) std.process.exit(29);
         if (eq(control, "malformed")) return fake.output("{\"azure-cli\":\"2.0.0\"}\n");
-        if (eq(control, "overflow")) return fake.output(try a.dupe(u8, &([_]u8{'x'} ** 8192)));
+        if (eq(control, "overflow")) return fake.output(try a.dupe(u8, &(@as([8192]u8, @splat('x')))));
         if (eq(control, "timeout") or eq(control, "expire"))
             try std.Io.sleep(init.io, .fromSeconds(if (eq(control, "timeout")) 20 else 6), .awake);
         if (eq(control, "stderr")) {

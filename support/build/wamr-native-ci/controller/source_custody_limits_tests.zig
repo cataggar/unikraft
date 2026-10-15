@@ -123,7 +123,7 @@ const Fixture = struct {
         const parent = options.fixture_root;
         const cache = try openFixtureRoot(parent);
         errdefer cache.close(io);
-        const name = try std.fmt.allocPrint(a, "source-custody-limits-{s}-{d}", .{ label, linux.getpid() });
+        const name = try a.print("source-custody-limits-{s}-{d}", .{ label, linux.getpid() });
         errdefer a.free(name);
         try cache.createDir(io, name, .fromMode(0o700));
         errdefer cache.deleteTree(io, name) catch {};
@@ -279,12 +279,12 @@ test "ignored tracked links use bounded fresh Git batches and reject partial mem
     defer repo.deinit();
     try std.testing.expectEqual(@as(usize, 0), try source.Fixture.ignoredQueries(a, io, repo.path, fixture.git));
     for (0..129) |index| {
-        const name = try std.fmt.allocPrint(a, "tracked-{d:0>3}", .{index});
+        const name = try a.print("tracked-{d:0>3}", .{index});
         defer a.free(name);
         try write(repo.dir, name, "tracked\n");
         const target = try std.fs.path.join(a, &.{ repo.path, name });
         defer a.free(target);
-        const link = try std.fmt.allocPrint(a, "support/apps/wamr-aot/build/link-{d:0>3}", .{index});
+        const link = try a.print("support/apps/wamr-aot/build/link-{d:0>3}", .{index});
         defer a.free(link);
         try repo.dir.symLink(io, target, link, .{});
     }
@@ -380,10 +380,10 @@ test "fixture parent rejects missing, noncanonical, source-tree and nonprivate r
     const safe = try openFixtureRoot(options.fixture_root);
     defer safe.close(io);
     try std.testing.expectError(error.UnsafeFixtureRoot, openFixtureRoot(options.repository_root));
-    const noncanonical = try std.fmt.allocPrint(a, "{s}/.", .{options.fixture_root});
+    const noncanonical = try a.print("{s}/.", .{options.fixture_root});
     defer a.free(noncanonical);
     try std.testing.expectError(error.UnsafeFixtureRoot, openFixtureRoot(noncanonical));
-    const name = try std.fmt.allocPrint(a, "source-custody-unsafe-{d}", .{linux.getpid()});
+    const name = try a.print("source-custody-unsafe-{d}", .{linux.getpid()});
     defer a.free(name);
     const missing = try std.fs.path.join(a, &.{ options.fixture_root, name });
     defer a.free(missing);
@@ -391,7 +391,7 @@ test "fixture parent rejects missing, noncanonical, source-tree and nonprivate r
     try safe.createDir(io, name, .fromMode(0o755));
     defer safe.deleteTree(io, name) catch @panic("unsafe fixture cleanup failed");
     // The managed CI umask would otherwise turn the requested 0755 into 0700.
-    const terminated = try a.dupeZ(u8, name);
+    const terminated = try a.dupeSentinel(u8, name, 0);
     defer a.free(terminated);
     if (linux.errno(linux.fchmodat(safe.handle, terminated, 0o755)) != .SUCCESS)
         return error.ChmodFixtureFailed;
@@ -436,7 +436,7 @@ test "real ignored source enumeration accepts 131072 entries and 8 GiB, refuses 
     const sparse_count = limits.ignored_bytes / limits.ignored_file;
     try std.testing.expectEqual(@as(usize, 0), limits.ignored_bytes % limits.ignored_file);
     for (0..limits.ignored_entries - limits.roles.len) |i| {
-        const name = try std.fmt.allocPrint(a, "entry-{x:0>6}", .{i});
+        const name = try a.print("entry-{x:0>6}", .{i});
         defer a.free(name);
         try sparse(build, name, if (i < sparse_count) limits.ignored_file else 0);
     }
@@ -444,7 +444,7 @@ test "real ignored source enumeration accepts 131072 entries and 8 GiB, refuses 
     try resize(build, "entry-000010", 1);
     try refuseSource(repo, error.LimitExceeded);
     try resize(build, "entry-000010", 0);
-    const extra = try std.fmt.allocPrint(a, "entry-{x:0>6}", .{limits.ignored_entries - limits.roles.len});
+    const extra = try a.print("entry-{x:0>6}", .{limits.ignored_entries - limits.roles.len});
     defer a.free(extra);
     try sparse(build, extra, 0);
     try refuseSource(repo, error.LimitExceeded);
@@ -496,7 +496,7 @@ test "real ignored Git inventory accepts eight MiB and refuses the next byte" {
     for (0..full_count) |i| {
         const name = try a.alloc(u8, 255);
         defer a.free(name);
-        const number = try std.fmt.allocPrint(a, "{x:0>4}", .{i});
+        const number = try a.print("{x:0>4}", .{i});
         defer a.free(number);
         @memcpy(name[0..number.len], number);
         @memset(name[number.len .. 255 - ".ignored".len], 'x');
@@ -506,7 +506,7 @@ test "real ignored Git inventory accepts eight MiB and refuses the next byte" {
     var short_names: [2][]u8 = undefined;
     for (&short_names, 0..) |*name, index| {
         name.* = try a.alloc(u8, short_length);
-        const prefix = try std.fmt.allocPrint(a, "short-{d}-", .{index});
+        const prefix = try a.print("short-{d}-", .{index});
         defer a.free(prefix);
         @memcpy(name.*[0..prefix.len], prefix);
         @memset(name.*[prefix.len .. short_length - ".ignored".len], 'y');
@@ -520,7 +520,7 @@ test "real ignored Git inventory accepts eight MiB and refuses the next byte" {
     const exact = try source.gitOutput(a, io, repo.path, fixture.git, inventory_args, limits.ignored_git_output, null);
     defer a.free(exact);
     try std.testing.expectEqualSlices(u8, inventory, exact);
-    const longer = try std.fmt.allocPrint(a, "{s}z.ignored", .{short_names[0][0 .. short_names[0].len - ".ignored".len]});
+    const longer = try a.print("{s}z.ignored", .{short_names[0][0 .. short_names[0].len - ".ignored".len]});
     defer a.free(longer);
     try std.Io.Dir.rename(directory, short_names[0], directory, longer, io);
     const excess = try repo.gitOutput(inventory_args, limits.ignored_git_output + 2);
@@ -566,7 +566,7 @@ test "real root inventory accepts 128 entries and refuses 129" {
     var fixture = try Fixture.init("root-inventory");
     defer fixture.deinit();
     for (0..limits.diagnostic_root) |i| {
-        const name = try std.fmt.allocPrint(a, "entry-{d:0>3}", .{i});
+        const name = try a.print("entry-{d:0>3}", .{i});
         defer a.free(name);
         try write(fixture.root, name, "");
     }
@@ -608,7 +608,7 @@ test "real tracked 40000 entries succeed and 40001 refuse" {
     var repo = try Repo.withOutputs(&fixture, "tracked", output_ignore);
     defer repo.deinit();
     for (0..limits.tracked_entries - 2) |i| {
-        const name = try std.fmt.allocPrint(a, "tracked-{d:0>5}", .{i});
+        const name = try a.print("tracked-{d:0>5}", .{i});
         defer a.free(name);
         try write(repo.dir, name, "");
     }
@@ -628,7 +628,7 @@ test "real tracked 2 GiB in bounded sparse blobs succeeds, first byte refuses" {
     defer repo.deinit();
     var remaining = limits.tracked_bytes - output_ignore.len - "CONFIG_FIXTURE=y\n".len;
     for (0..limits.tracked_bytes / limits.tracked_file) |i| {
-        const name = try std.fmt.allocPrint(a, "blob-{d:0>2}", .{i});
+        const name = try a.print("blob-{d:0>2}", .{i});
         defer a.free(name);
         const size = @min(remaining, limits.tracked_file);
         try sparse(repo.dir, name, size);

@@ -148,7 +148,9 @@ fn execute(init: std.process.Init) !void {
             while (true) try std.Io.sleep(io, .fromSeconds(1), .awake);
         },
         4 => while (true) {
-            try out.interface.writeAll("synthetic serial flood\n" ** 256);
+            const line = "synthetic serial flood\n";
+            const flood: [256][line.len]u8 = @splat(line.*);
+            try out.interface.writeAll(@as(*const [256 * line.len]u8, @ptrCast(&flood)));
         },
         5 => {
             try ignoreTerm();
@@ -158,7 +160,7 @@ fn execute(init: std.process.Init) !void {
                 const duration: linux.timespec = .{ .sec = 1, .nsec = 0 };
                 _ = linux.nanosleep(&duration, null);
             };
-            const pid = try std.fmt.allocPrint(a, "{d}", .{forked});
+            const pid = try a.print("{d}", .{forked});
             try work.dir.writeFile(io, .{ .sub_path = "descendant.pid", .data = pid, .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) } });
         },
         7, 14 => {

@@ -1820,7 +1820,7 @@ fn updateGptHeaderChecksum(sector: *[sector_size]u8) void {
     std.mem.writeInt(
         u32,
         sector[16..20],
-        std.hash.crc.Crc32.hash(sector[0..header_bytes]),
+        std.hash.crc.@"CRC-32/ISO-HDLC".hash(sector[0..header_bytes]),
         .little,
     );
 }

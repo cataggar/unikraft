@@ -352,7 +352,11 @@ fn finish(owner: *State, existing: bool) !void {
     owner.phase = .native_validation;
     owner.reserved = true;
     try validation.runPrivateValidated(inv.allocator, inv.io, bundle, inv.validation_output, inv.signal);
-    for ([_][]const u8{ "evidence/command-import-native-revalidation.json", "private/import-native-revalidation.log" }) |relative| {
+    const revalidation_files: [2][]const u8 = if (bundle.evidence.compatibility == .tiny_v1_legacy)
+        .{ "evidence/command-import-historical-native-revalidation.json", "private/import-historical-native-revalidation.log" }
+    else
+        .{ "evidence/command-import-native-revalidation.json", "private/import-native-revalidation.log" };
+    for (revalidation_files) |relative| {
         var retained = try owner.retain(try std.fs.path.join(a, &.{ inv.validation_output, relative }), contracts.layout.max_json_bytes, inv.signal);
         errdefer retained.file.close(inv.io);
         try owner.held.append(inv.allocator, retained);
@@ -367,7 +371,7 @@ fn finish(owner: *State, existing: bool) !void {
     const version = compatibility.version();
     var scope_bundle = manifest.artifact();
     var admission_bytes: ?[]const u8 = null;
-    const admission_path = try std.fmt.allocPrint(a, "{s}.admission.json", .{inv.output});
+    const admission_path = try a.print("{s}.admission.json", .{inv.output});
     if (version == 2) {
         var transport = try owner.retain(try std.fs.path.join(a, &.{ bundle.evidence.root, "transport.json" }), contracts.layout.max_json_bytes, inv.signal);
         errdefer transport.file.close(inv.io);
@@ -490,7 +494,7 @@ fn changeFile(io: std.Io, path: []const u8) !void {
 
 fn replaceCapture(io: std.Io, a: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
     if (!builtin.is_test) @compileError("Fault injection is only available to native tests");
-    const saved = try std.fmt.allocPrint(a, "{s}.retained-original", .{path});
+    const saved = try a.print("{s}.retained-original", .{path});
     try std.Io.Dir.cwd().renamePreserve(path, .cwd(), saved, io);
     const file = try std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true, .permissions = .fromMode(0o600) });
     defer file.close(io);
@@ -553,7 +557,7 @@ fn freshUuid(a: std.mem.Allocator, io: std.Io) ![]const u8 {
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     const hex = std.fmt.bytesToHex(bytes, .lower);
-    return std.fmt.allocPrint(a, "{s}-{s}-{s}-{s}-{s}", .{ hex[0..8], hex[8..12], hex[12..16], hex[16..20], hex[20..32] });
+    return a.print("{s}-{s}-{s}-{s}-{s}", .{ hex[0..8], hex[8..12], hex[12..16], hex[16..20], hex[20..32] });
 }
 fn inside(path: []const u8, root: []const u8) bool {
     return std.mem.eql(u8, path, root) or (path.len > root.len and std.mem.startsWith(u8, path, root) and path[root.len] == '/');
@@ -629,7 +633,7 @@ test "candidate empty captures retain the frozen incomplete and cumulative prefi
     try fixture_root.createDirPath(io, "handoff-export-tests");
     const directory = try fixture_root.openDir(io, "handoff-export-tests", .{});
     defer directory.close(io);
-    const name = try std.fmt.allocPrint(a, "candidate-empty-serial-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("candidate-empty-serial-{d}", .{std.os.linux.getpid()});
     const file = try directory.createFile(io, name, .{ .exclusive = true, .permissions = .fromMode(0o600) });
     file.close(io);
     defer directory.deleteFile(io, name) catch @panic("empty candidate capture cleanup failed");

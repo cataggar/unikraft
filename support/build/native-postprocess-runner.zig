@@ -181,7 +181,7 @@ pub fn execute(allocator: std.mem.Allocator, io: std.Io, args: []const []const u
     var command: std.ArrayList([]const u8) = .empty;
     defer command.deinit(allocator);
     try command.appendSlice(allocator, tool);
-    const update = try std.fmt.allocPrint(allocator, "--update-section={s}={s}", .{
+    const update = try allocator.print("--update-section={s}={s}", .{
         if (reloc) ".uk_reloc" else ".uk_bootinfo", files.path(0),
     });
     defer allocator.free(update);

@@ -1202,11 +1202,17 @@ def export(runtime, output, *, on_phase=None):
     ci.require(accepted_result_records(root) == records,
                "inputs changed during handoff")
     by_name = dict(zip(names, artifacts))
+    runtime_record = build["runtime"]
+    wamr_revision = (
+        ci.HISTORICAL_WAMR_REVISION if version == 1 else
+        runtime_record.get("wamr_revision", ci.REVISION)
+        if isinstance(runtime_record, dict) else ci.REVISION
+    )
     bundle = {
         "schema": "uk.wamr.local-image-handoff", "version": 1,
         "authority": "not_admitted",
         "source_revision": build["source"]["revision"], "source_tree": build["source"]["tree"],
-        "identity": dict(wamr_revision=ci.REVISION, **{
+        "identity": dict(wamr_revision=wamr_revision, **{
             name + "_sha256": by_name[name]["sha256"]
             for name in ("wasm", "cwasm", "runtime", "compiler", "config")}),
         "artifacts": artifacts, "boots": boots, "evidence": evidence,
@@ -1258,7 +1264,8 @@ def candidate_plan(bundle_path, output, *, attempt_id=None,
     ci.require(bundle["schema"] == "uk.wamr.local-image-handoff"
                and bundle["version"] in (1, 2)
                and bundle["authority"] == "not_admitted"
-               and bundle["identity"]["wamr_revision"] == ci.REVISION,
+               and bundle["identity"]["wamr_revision"] in (
+                   ci.REVISION, ci.HISTORICAL_WAMR_REVISION),
                "not a compute handoff")
     version = bundle["version"]
     names = NAMES if version == 1 else V2_NAMES

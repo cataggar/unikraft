@@ -443,7 +443,7 @@ pub const Stage = struct {
             const share = try self.createDirectory(root_index, "share");
             for (self.request.data_root, 0..) |_, index| {
                 const tree = self.source_trees.items[1 + self.request.package_root.len + index];
-                const name = try std.fmt.allocPrint(self.ctx.allocator, "{d:0>3}-{s}", .{ index, std.fs.path.basename(tree.anchor.path) });
+                const name = try self.ctx.allocator.print("{d:0>3}-{s}", .{ index, std.fs.path.basename(tree.anchor.path) });
                 const target = try self.createDirectory(share, name);
                 try self.copyTree(tree.directory, target);
             }
@@ -721,7 +721,7 @@ pub const Stage = struct {
             if (!builtin.is_test) return error.InvalidFault;
             try destination_parent.rename(name, destination_parent, "replaced-copy", self.ctx.io);
             if (fault == .replace_destination_fifo) {
-                const zname = try self.ctx.allocator.dupeZ(u8, name);
+                const zname = try self.ctx.allocator.dupeSentinel(u8, name, 0);
                 if (linux.errno(linux.mknodat(destination_parent.handle, zname, linux.S.IFIFO | 0o600, 0)) != .SUCCESS)
                     return error.FixtureFifo;
             } else {

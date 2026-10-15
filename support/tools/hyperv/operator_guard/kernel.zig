@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 pub const linux = std.os.linux;
 const r = @import("records.zig");
 comptime {
-    if (builtin.os.tag != .linux or (builtin.cpu.arch != .aarch64 and builtin.cpu.arch != .x86_64))
+    if (builtin.target.os.tag != .linux or (builtin.target.cpu.arch != .aarch64 and builtin.target.cpu.arch != .x86_64))
         @compileError("Operator custody requires Linux AArch64 or x86_64");
 }
 pub fn checked(result: usize) !usize {
@@ -152,13 +152,13 @@ pub fn identity(proc: linux.fd_t, pid: i32) !r.Identity {
     const ticks = try startTicks(proc, pid);
     var path: [80]u8 = undefined;
     var value: linux.Statx = undefined;
-    _ = try checked(linux.statx(proc, try std.fmt.bufPrintZ(&path, "{d}/ns/pid", .{pid}), 0, .BASIC_STATS, &value));
+    _ = try checked(linux.statx(proc, try std.mem.printSentinel(&path, "{d}/ns/pid", .{pid}, 0), 0, .BASIC_STATS, &value));
     return .{ .pid = pid, .start_ticks = ticks, .namespace = .{ .device_major = value.dev_major, .device_minor = value.dev_minor, .inode = value.ino } };
 }
 pub fn startTicks(proc: linux.fd_t, pid: i32) !u64 {
     var path: [80]u8 = undefined;
     var buffer: [4096]u8 = undefined;
-    const stat = try procRead(proc, try std.fmt.bufPrintZ(&path, "{d}/stat", .{pid}), &buffer);
+    const stat = try procRead(proc, try std.mem.printSentinel(&path, "{d}/stat", .{pid}, 0), &buffer);
     const end = std.mem.lastIndexOfScalar(u8, stat, ')') orelse return error.InvalidProcIdentity;
     var fields = std.mem.tokenizeScalar(u8, stat[end + 2 ..], ' ');
     var ticks: ?u64 = null;
@@ -174,7 +174,7 @@ pub fn startTicks(proc: linux.fd_t, pid: i32) !u64 {
 pub fn requirePid1(proc: linux.fd_t, pid: i32) !void {
     var path: [80]u8 = undefined;
     var buffer: [4096]u8 = undefined;
-    const status = try procRead(proc, try std.fmt.bufPrintZ(&path, "{d}/status", .{pid}), &buffer);
+    const status = try procRead(proc, try std.mem.printSentinel(&path, "{d}/status", .{pid}, 0), &buffer);
     var lines = std.mem.splitScalar(u8, status, '\n');
     while (lines.next()) |line| {
         if (std.mem.startsWith(u8, line, "NSpid:")) {
@@ -195,10 +195,10 @@ pub fn mapChild(proc: linux.fd_t, pid: i32) !void {
     const uid = linux.getuid();
     const gid = linux.getgid();
     var path: [80]u8 = undefined;
-    procWrite(proc, try std.fmt.bufPrintZ(&path, "{d}/setgroups", .{pid}), "deny") catch return error.SetgroupsMapUnavailable;
+    procWrite(proc, try std.mem.printSentinel(&path, "{d}/setgroups", .{pid}, 0), "deny") catch return error.SetgroupsMapUnavailable;
     var buffer: [80]u8 = undefined;
-    procWrite(proc, try std.fmt.bufPrintZ(&path, "{d}/uid_map", .{pid}), try std.fmt.bufPrint(&buffer, "0 {d} 1\n", .{uid})) catch return error.UidMapUnavailable;
-    procWrite(proc, try std.fmt.bufPrintZ(&path, "{d}/gid_map", .{pid}), try std.fmt.bufPrint(&buffer, "0 {d} 1\n", .{gid})) catch return error.GidMapUnavailable;
+    procWrite(proc, try std.mem.printSentinel(&path, "{d}/uid_map", .{pid}, 0), try std.mem.print(&buffer, "0 {d} 1\n", .{uid})) catch return error.UidMapUnavailable;
+    procWrite(proc, try std.mem.printSentinel(&path, "{d}/gid_map", .{pid}, 0), try std.mem.print(&buffer, "0 {d} 1\n", .{gid})) catch return error.GidMapUnavailable;
 }
 fn procWrite(proc: linux.fd_t, name: [:0]const u8, bytes: []const u8) !void {
     const descriptor = try fd(linux.openat(proc, name, .{ .ACCMODE = .WRONLY, .CLOEXEC = true, .NOFOLLOW = true }, 0));
@@ -211,21 +211,21 @@ pub fn mountProc() !void {
     if (linux.errno(linux.mount("proc", "/proc", "proc", linux.MS.NOSUID | linux.MS.NODEV | linux.MS.NOEXEC, 0)) != .SUCCESS) return error.NamespaceProcUnavailable;
 }
 pub fn protect() !void {
-    _ = try checked(linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), 0, 0, 0, 0));
+    _ = try checked(linux.prctl(@backingInt(linux.PR.SET_DUMPABLE), 0, 0, 0, 0));
 }
 pub fn dropCapabilities() !void {
-    _ = try checked(linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0));
-    _ = try checked(linux.prctl(@intFromEnum(linux.PR.SET_SECUREBITS), linux.SECBIT_NOROOT | linux.SECBIT_NOROOT_LOCKED, 0, 0, 0));
+    _ = try checked(linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0));
+    _ = try checked(linux.prctl(@backingInt(linux.PR.SET_SECUREBITS), linux.SECBIT_NOROOT | linux.SECBIT_NOROOT_LOCKED, 0, 0, 0));
     // UAPI pid is u32, unlike Zig 0.16's usize declaration.
     const Header = extern struct { version: u32, pid: i32 };
     var header: Header = .{ .version = 0x20080522, .pid = 0 };
-    const data = [_]linux.cap_user_data_t{std.mem.zeroes(linux.cap_user_data_t)} ** 2;
+    const data = @as([2]linux.cap_user_data_t, @splat(std.mem.zeroes(linux.cap_user_data_t)));
     _ = try checked(linux.syscall2(.capset, @intFromPtr(&header), @intFromPtr(&data)));
     try protect();
 }
 pub fn reap(pid: i32) !?u32 {
     var status: u32 = 0;
-    const result = linux.waitpid(pid, &status, linux.W.NOHANG);
+    const result = linux.waitpid(pid, @ptrCast(&status), linux.W.NOHANG);
     if (linux.errno(result) == .INTR) return null;
     if (try checked(result) == 0) return null;
     if (result != @as(usize, @intCast(pid))) return error.WrongReapedProcess;
@@ -258,13 +258,13 @@ fn spawnImpl(namespace: bool, executable: linux.fd_t, mode: [:0]const u8, descri
     const err = try fd(linux.fcntl(if (stdio) |fds| fds[1] else null_fd, linux.F.DUPFD_CLOEXEC, 32));
     defer close(err);
     var retained: i32 = -1;
-    const flags = linux.CLONE.PIDFD | @intFromEnum(linux.SIG.CHLD) |
+    const flags = linux.CLONE.PIDFD | @backingInt(linux.SIG.CHLD) |
         (if (namespace) linux.CLONE.NEWUSER | linux.CLONE.NEWPID else @as(usize, 0));
     const child = checked(linux.syscall5(.clone, flags, 0, @intFromPtr(&retained), 0, 0)) catch
         return if (namespace) error.UserPidNamespaceUnavailable else error.AtomicPidfdUnavailable;
     if (child == 0) {
         // Raw syscalls only in the post-fork child.
-        if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0)) != .SUCCESS) linux.exit_group(126);
+        if (linux.errno(linux.prctl(@backingInt(linux.PR.SET_NO_NEW_PRIVS), 1, 0, 0, 0)) != .SUCCESS) linux.exit_group(126);
         if (linux.errno(linux.dup3(null_fd, 0, 0)) != .SUCCESS) linux.exit_group(126);
         if (linux.errno(linux.dup3(out, 1, 0)) != .SUCCESS) linux.exit_group(126);
         if (linux.errno(linux.dup3(err, 2, 0)) != .SUCCESS) linux.exit_group(126);
@@ -275,8 +275,8 @@ fn spawnImpl(namespace: bool, executable: linux.fd_t, mode: [:0]const u8, descri
         if (namespace) {
             // No key is in this address space or descriptor set. The private
             // signing key is loaded by the custodian only after this child's exec.
-            if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_DUMPABLE), 1, 0, 0, 0)) != .SUCCESS) linux.exit_group(126);
-            if (linux.errno(linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @intFromEnum(linux.SIG.KILL), 0, 0, 0)) != .SUCCESS)
+            if (linux.errno(linux.prctl(@backingInt(linux.PR.SET_DUMPABLE), 1, 0, 0, 0)) != .SUCCESS) linux.exit_group(126);
+            if (linux.errno(linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @backingInt(linux.SIG.KILL), 0, 0, 0)) != .SUCCESS)
                 linux.exit_group(126);
             write(8, &.{0x4d}) catch linux.exit_group(126);
             // Mapping must precede exec, which otherwise drops capabilities

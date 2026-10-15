@@ -425,7 +425,8 @@ def local_consumer_custody(
 
 
 def import_native_revalidation(
-        stage_root, output, *, git=None, supervisor=None, validator=None):
+        stage_root, output, *, git=None, supervisor=None, validator=None,
+        historical=False):
     """Revalidate with authenticated local tools or the strict recorded build."""
     stage_root, output = map(Path, (stage_root, output))
     refusal = "native controller import revalidation refused"
@@ -439,6 +440,8 @@ def import_native_revalidation(
             or os.path.lexists(output)):
         _refuse(refusal)
     portable = any(value is not None for value in (git, supervisor, validator))
+    if historical and not portable:
+        _refuse(refusal)
     if portable:
         if any(value is None for value in (git, supervisor, validator)):
             _refuse(refusal)
@@ -464,9 +467,11 @@ def import_native_revalidation(
             if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
                     or stat.S_IMODE(info.st_mode) != 0o700):
                 _refuse(refusal)
+        stage = ("import-historical-native-revalidation" if historical
+                 else "import-native-revalidation")
         for path, bound in (
-                (output / "private/import-native-revalidation.log", 4096),
-                (output / "evidence/command-import-native-revalidation.json",
+                (output / f"private/{stage}.log", 4096),
+                (output / f"evidence/command-{stage}.json",
                  MAX_RECORDS_BYTES)):
             info = path.lstat()
             if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
@@ -474,8 +479,10 @@ def import_native_revalidation(
                     or stat.S_IMODE(info.st_mode) != 0o600
                     or not 0 < info.st_size <= bound):
                 _refuse(refusal)
-        if (output / "private/import-native-revalidation.log").read_bytes() != (
-                b"Compute handoff revalidated; authority=not_admitted.\n"):
+        success = (b"Historical compute handoff revalidated; authority=not_admitted.\n"
+                   if historical else
+                   b"Compute handoff revalidated; authority=not_admitted.\n")
+        if (output / f"private/{stage}.log").read_bytes() != success:
             _refuse(refusal)
     except OSError as error:
         raise ValueError(refusal) from error

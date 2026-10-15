@@ -189,8 +189,8 @@ fn readable(read: u32, write: u32, size: u32) ?u32 {
 }
 
 fn packetTypeValid(raw: u16) bool {
-    return raw >= @intFromEnum(PacketType.data_inband) and
-        raw <= @intFromEnum(PacketType.additional_data);
+    return raw >= @backingInt(PacketType.data_inband) and
+        raw <= @backingInt(PacketType.additional_data);
 }
 
 fn validateGpaDirectDescriptor(desc: []const u8) bool {
@@ -236,11 +236,11 @@ fn validateTransferPagesDescriptor(desc: []const u8) bool {
 }
 
 export fn vmbus_ring_initialize(base: [*]u8, total_size: usize) callconv(.c) c_int {
-    _ = validateRing(total_size) orelse return @intFromEnum(RingResult.invalid_ring);
+    _ = validateRing(total_size) orelse return @backingInt(RingResult.invalid_ring);
     for (0..total_size) |i|
         @as(*volatile u8, @ptrCast(base + i)).* = 0;
     storeHeader(base, 64, pending_size_feature, .release);
-    return @intFromEnum(RingResult.ok);
+    return @backingInt(RingResult.ok);
 }
 
 const InterleaveHook = ?*const fn ([*]u8, usize) void;
@@ -259,37 +259,37 @@ fn ringWrite(
     interleave: InterleaveHook,
 ) c_int {
     const data_size_usize = validateRing(total_size) orelse
-        return @intFromEnum(RingResult.invalid_ring);
+        return @backingInt(RingResult.invalid_ring);
     const data_size: u32 = @intCast(data_size_usize);
     if (!packetTypeValid(packet_type))
-        return @intFromEnum(RingResult.malformed);
-    if (packet_type == @intFromEnum(PacketType.data_using_gpa_direct) and
+        return @backingInt(RingResult.malformed);
+    if (packet_type == @backingInt(PacketType.data_using_gpa_direct) and
         !validateGpaDirectDescriptor(descriptor[0..descriptor_size]))
-        return @intFromEnum(RingResult.malformed);
-    if (packet_type == @intFromEnum(PacketType.data_using_transfer_pages) and
+        return @backingInt(RingResult.malformed);
+    if (packet_type == @backingInt(PacketType.data_using_transfer_pages) and
         !validateTransferPagesDescriptor(descriptor[0..descriptor_size]))
-        return @intFromEnum(RingResult.malformed);
+        return @backingInt(RingResult.malformed);
     const desc_end = std.math.add(usize, packet_header_size, descriptor_size) catch
-        return @intFromEnum(RingResult.overflow);
+        return @backingInt(RingResult.overflow);
     const payload_off = align8(desc_end) orelse
-        return @intFromEnum(RingResult.overflow);
+        return @backingInt(RingResult.overflow);
     const packet_end = std.math.add(usize, payload_off, payload_size) catch
-        return @intFromEnum(RingResult.overflow);
+        return @backingInt(RingResult.overflow);
     const packet_size = align8(packet_end) orelse
-        return @intFromEnum(RingResult.overflow);
+        return @backingInt(RingResult.overflow);
     const total = std.math.add(usize, packet_size, packet_footer_size) catch
-        return @intFromEnum(RingResult.overflow);
+        return @backingInt(RingResult.overflow);
     if (total >= data_size_usize or packet_size / 8 > std.math.maxInt(u16) or
         payload_off / 8 > std.math.maxInt(u16))
-        return @intFromEnum(RingResult.no_space);
+        return @backingInt(RingResult.no_space);
 
     const old_write = loadHeader(base, 0, .acquire);
     const read = loadHeader(base, 4, .acquire);
     const free = writable(read, old_write, data_size) orelse
-        return @intFromEnum(RingResult.malformed);
+        return @backingInt(RingResult.malformed);
     if (total >= free) {
         storeHeader(base, 12, @intCast(total), .release);
-        return @intFromEnum(RingResult.no_space);
+        return @backingInt(RingResult.no_space);
     }
 
     var header: [packet_header_size]u8 = undefined;
@@ -328,7 +328,7 @@ fn ringWrite(
     const post_read = loadHeader(base, 4, .acquire);
     const masked = loadHeader(base, 8, .acquire);
     need_signal.* = @intFromBool(masked == 0 and old_write == post_read);
-    return @intFromEnum(RingResult.ok);
+    return @backingInt(RingResult.ok);
 }
 
 export fn vmbus_ring_write(
@@ -357,17 +357,17 @@ fn ringRead(
     interleave: InterleaveHook,
 ) c_int {
     const data_size_usize = validateRing(total_size) orelse
-        return @intFromEnum(RingResult.invalid_ring);
+        return @backingInt(RingResult.invalid_ring);
     const data_size: u32 = @intCast(data_size_usize);
     const read = loadHeader(base, 4, .acquire);
     const write = loadHeader(base, 0, .acquire);
     const available = readable(read, write, data_size) orelse
-        return @intFromEnum(RingResult.malformed);
+        return @backingInt(RingResult.malformed);
     if (available == 0)
-        return @intFromEnum(RingResult.empty);
+        return @backingInt(RingResult.empty);
     fullFence();
     if (available < packet_header_size + packet_footer_size)
-        return @intFromEnum(RingResult.malformed);
+        return @backingInt(RingResult.malformed);
 
     var header: [packet_header_size]u8 = undefined;
     _ = ringCopyFrom(base, data_size_usize, read, &header);
@@ -378,25 +378,25 @@ fn ringRead(
     const transaction_id = get64(&header, 8);
     if (!packetTypeValid(raw_type) or payload_off < packet_header_size or
         payload_off > packet_size or packet_size % 8 != 0)
-        return @intFromEnum(RingResult.malformed);
+        return @backingInt(RingResult.malformed);
     const total = packet_size + packet_footer_size;
     if (total > available or total >= data_size_usize)
-        return @intFromEnum(RingResult.malformed);
+        return @backingInt(RingResult.malformed);
     const descriptor_size = payload_off - packet_header_size;
     const payload_size = packet_size - payload_off;
     if (descriptor_size > descriptor_capacity or payload_size > payload_capacity)
-        return @intFromEnum(RingResult.output_small);
+        return @backingInt(RingResult.output_small);
 
     var cursor = (read + packet_header_size) % data_size_usize;
     cursor = ringCopyFrom(base, data_size_usize, cursor, descriptor_out[0..descriptor_size]);
     cursor = (read + payload_off) % data_size_usize;
     _ = ringCopyFrom(base, data_size_usize, cursor, payload_out[0..payload_size]);
-    if (raw_type == @intFromEnum(PacketType.data_using_gpa_direct) and
+    if (raw_type == @backingInt(PacketType.data_using_gpa_direct) and
         !validateGpaDirectDescriptor(descriptor_out[0..descriptor_size]))
-        return @intFromEnum(RingResult.malformed);
-    if (raw_type == @intFromEnum(PacketType.data_using_transfer_pages) and
+        return @backingInt(RingResult.malformed);
+    if (raw_type == @backingInt(PacketType.data_using_transfer_pages) and
         !validateTransferPagesDescriptor(descriptor_out[0..descriptor_size]))
-        return @intFromEnum(RingResult.malformed);
+        return @backingInt(RingResult.malformed);
 
     var footer: [8]u8 = undefined;
     const footer_index = (read + packet_size) % data_size_usize;
@@ -425,7 +425,7 @@ fn ringRead(
     );
     meta.need_signal = @intFromBool((feature & pending_size_feature) != 0 and pending != 0 and
         old_free <= pending and new_free > pending);
-    return @intFromEnum(RingResult.ok);
+    return @backingInt(RingResult.ok);
 }
 
 export fn vmbus_ring_read(
@@ -445,7 +445,7 @@ export fn vmbus_ring_set_interrupt_mask(
     total_size: usize,
     masked: u8,
 ) callconv(.c) c_int {
-    _ = validateRing(total_size) orelse return @intFromEnum(RingResult.invalid_ring);
+    _ = validateRing(total_size) orelse return @backingInt(RingResult.invalid_ring);
     storeHeader(base, 8, @intFromBool(masked != 0), .release);
     return 0;
 }
@@ -491,17 +491,17 @@ export fn vmbus_gpadl_header(
 ) callconv(.c) c_int {
     if (channel_id == 0 or gpadl_id == 0 or pfn_count == 0 or
         byte_count == 0 or byte_count % page_size != 0)
-        return @intFromEnum(RingResult.malformed);
+        return @backingInt(RingResult.malformed);
     if (@as(usize, byte_count / page_size) != pfn_count)
-        return @intFromEnum(RingResult.malformed);
+        return @backingInt(RingResult.malformed);
     const count: usize = @min(pfn_count, gpadl_header_pfns);
     const size = 28 + count * 8;
     const pfn_bytes = std.math.mul(usize, pfn_count, 8) catch
-        return @intFromEnum(RingResult.overflow);
+        return @backingInt(RingResult.overflow);
     const range_len = std.math.add(usize, 8, pfn_bytes) catch
-        return @intFromEnum(RingResult.overflow);
+        return @backingInt(RingResult.overflow);
     if (capacity < size or range_len > std.math.maxInt(u16))
-        return @intFromEnum(RingResult.output_small);
+        return @backingInt(RingResult.output_small);
     const out = output[0..size];
     zeroBytes(out);
     put32(out, 0, 8);
@@ -527,11 +527,11 @@ export fn vmbus_gpadl_body(
     consumed: *usize,
 ) callconv(.c) c_int {
     if (gpadl_id == 0 or pfn_count == 0)
-        return @intFromEnum(RingResult.malformed);
+        return @backingInt(RingResult.malformed);
     const count: usize = @min(pfn_count, gpadl_body_pfns);
     const size = 16 + count * 8;
     if (capacity < size)
-        return @intFromEnum(RingResult.output_small);
+        return @backingInt(RingResult.output_small);
     const out = output[0..size];
     zeroBytes(out);
     put32(out, 0, 9);
@@ -556,7 +556,7 @@ export fn vmbus_open_message(
 ) callconv(.c) c_int {
     if (capacity < 148 or channel_id == 0 or open_id == 0 or gpadl_id == 0 or
         tx_pages < 2 or user_data_size > 120)
-        return @intFromEnum(RingResult.malformed);
+        return @backingInt(RingResult.malformed);
     const out = output[0..148];
     zeroBytes(out);
     put32(out, 0, 5);
@@ -576,7 +576,7 @@ export fn vmbus_close_message(
     channel_id: u32,
 ) callconv(.c) c_int {
     if (capacity < 12 or channel_id == 0)
-        return @intFromEnum(RingResult.malformed);
+        return @backingInt(RingResult.malformed);
     const out = output[0..12];
     zeroBytes(out);
     put32(out, 0, 7);
@@ -591,7 +591,7 @@ export fn vmbus_gpadl_teardown_message(
     gpadl_id: u32,
 ) callconv(.c) c_int {
     if (capacity < 16 or channel_id == 0 or gpadl_id == 0)
-        return @intFromEnum(RingResult.malformed);
+        return @backingInt(RingResult.malformed);
     const out = output[0..16];
     zeroBytes(out);
     put32(out, 0, 11);
@@ -621,7 +621,7 @@ export fn vmbus_signal_event(
 
 fn testRing(pages: usize) []u8 {
     const Holder = struct {
-        var memory: [page_size * 4]u8 align(page_size) = [_]u8{0} ** (page_size * 4);
+        var memory: [page_size * 4]u8 align(page_size) = @as([(page_size * 4)]u8, @splat(0));
     };
     return Holder.memory[0 .. pages * page_size];
 }
@@ -630,9 +630,9 @@ test "ring reserved byte and exact boundary" {
     const ring = testRing(2);
     try std.testing.expectEqual(@as(c_int, 0), vmbus_ring_initialize(ring.ptr, ring.len));
     var signal: u8 = 0;
-    const payload = [_]u8{0xaa} ** 4072;
+    const payload = @as([4072]u8, @splat(0xaa));
     try std.testing.expectEqual(
-        @intFromEnum(RingResult.no_space),
+        @backingInt(RingResult.no_space),
         vmbus_ring_write(ring.ptr, ring.len, 6, 0, 1, payload[0..0].ptr, 0, &payload, payload.len, &signal),
     );
 }
@@ -659,7 +659,7 @@ test "ring empty write read and notification suppression" {
     var meta: PacketMeta = undefined;
     var desc: [32]u8 = undefined;
     var out: [32]u8 = undefined;
-    try std.testing.expectEqual(@intFromEnum(RingResult.output_small), vmbus_ring_read(
+    try std.testing.expectEqual(@backingInt(RingResult.output_small), vmbus_ring_read(
         ring.ptr,
         ring.len,
         &meta,
@@ -682,7 +682,7 @@ test "ring empty write read and notification suppression" {
     try std.testing.expectEqual(@as(u64, 42), meta.transaction_id);
     try std.testing.expectEqualStrings(payload, out[0..payload.len]);
     try std.testing.expectEqual(@as(u32, 0), vmbus_ring_readable(ring.ptr, ring.len));
-    try std.testing.expectEqual(@intFromEnum(RingResult.empty), vmbus_ring_read(
+    try std.testing.expectEqual(@backingInt(RingResult.empty), vmbus_ring_read(
         ring.ptr,
         ring.len,
         &meta,
@@ -723,7 +723,7 @@ test "malformed truncated overflowing packets fail before output" {
     storeHeader(ring.ptr, 0, 8, .release);
     var meta: PacketMeta = undefined;
     var out: [16]u8 = undefined;
-    try std.testing.expectEqual(@intFromEnum(RingResult.malformed), vmbus_ring_read(
+    try std.testing.expectEqual(@backingInt(RingResult.malformed), vmbus_ring_read(
         ring.ptr,
         ring.len,
         &meta,
@@ -732,7 +732,7 @@ test "malformed truncated overflowing packets fail before output" {
         &out,
         out.len,
     ));
-    try std.testing.expectEqual(@intFromEnum(RingResult.overflow), vmbus_ring_write(
+    try std.testing.expectEqual(@backingInt(RingResult.overflow), vmbus_ring_write(
         ring.ptr,
         ring.len,
         6,
@@ -750,7 +750,7 @@ test "pending send threshold requests notification" {
     const ring = testRing(2);
     _ = vmbus_ring_initialize(ring.ptr, ring.len);
     var signal: u8 = 0;
-    const payload = [_]u8{1} ** 128;
+    const payload = @as([128]u8, @splat(1));
     _ = vmbus_ring_write(ring.ptr, ring.len, 6, 0, 1, payload[0..0].ptr, 0, &payload, payload.len, &signal);
     const before = writable(loadHeader(ring.ptr, 4, .acquire), loadHeader(ring.ptr, 0, .acquire), @intCast(ring.len - page_size)).?;
     storeHeader(ring.ptr, 12, before + 64, .release);
@@ -779,7 +779,7 @@ test "write notification rechecks host drain and unmask after publication" {
     };
     const ring = testRing(2);
     _ = vmbus_ring_initialize(ring.ptr, ring.len);
-    const payload = [_]u8{1} ** 16;
+    const payload = @as([16]u8, @splat(1));
     var signal: u8 = 0;
     _ = ringWrite(ring.ptr, ring.len, 6, 0, 1, payload[0..0].ptr, 0, &payload, payload.len, &signal, null);
     Hooks.read_value = loadHeader(ring.ptr, 0, .acquire);
@@ -802,7 +802,7 @@ test "read notification observes pending store after read publication" {
     };
     const ring = testRing(2);
     _ = vmbus_ring_initialize(ring.ptr, ring.len);
-    const payload = [_]u8{1} ** 128;
+    const payload = @as([128]u8, @splat(1));
     var signal: u8 = 0;
     _ = vmbus_ring_write(ring.ptr, ring.len, 6, 0, 1, payload[0..0].ptr, 0, &payload, payload.len, &signal);
     storeHeader(ring.ptr, 8, 1, .release);
@@ -881,7 +881,7 @@ test "GPADL chunks derive from wire capacity" {
 test "GPA direct descriptor validates ranges and PFNs" {
     const ring = testRing(2);
     _ = vmbus_ring_initialize(ring.ptr, ring.len);
-    var desc: [24]u8 = [_]u8{0} ** 24;
+    var desc: [24]u8 = @as([24]u8, @splat(0));
     put32(&desc, 4, 1);
     put32(&desc, 8, 100);
     put32(&desc, 12, 20);
@@ -901,7 +901,7 @@ test "GPA direct descriptor validates ranges and PFNs" {
         &signal,
     ));
     put32(&desc, 12, page_size);
-    try std.testing.expectEqual(@intFromEnum(RingResult.malformed), vmbus_ring_write(
+    try std.testing.expectEqual(@backingInt(RingResult.malformed), vmbus_ring_write(
         ring.ptr,
         ring.len,
         9,
@@ -918,7 +918,7 @@ test "GPA direct descriptor validates ranges and PFNs" {
 test "transfer page validation rejects corruption and footer mismatch progresses" {
     const ring = testRing(2);
     _ = vmbus_ring_initialize(ring.ptr, ring.len);
-    var transfer: [16]u8 = [_]u8{0} ** 16;
+    var transfer: [16]u8 = @as([16]u8, @splat(0));
     transfer[2] = 1;
     put32(&transfer, 4, 1);
     put32(&transfer, 8, 64);
@@ -954,7 +954,7 @@ test "transfer page validation rejects corruption and footer mismatch progresses
         out.len,
     ));
     try std.testing.expectEqual(@as(u8, 1), meta.trailer_mismatch);
-    try std.testing.expectEqual(@intFromEnum(RingResult.empty), vmbus_ring_read(
+    try std.testing.expectEqual(@backingInt(RingResult.empty), vmbus_ring_read(
         ring.ptr,
         ring.len,
         &meta,
@@ -963,17 +963,17 @@ test "transfer page validation rejects corruption and footer mismatch progresses
         &out,
         out.len,
     ));
-    var padded4: [20]u8 = [_]u8{0} ** 20;
+    var padded4: [20]u8 = @as([20]u8, @splat(0));
     @memcpy(padded4[0..transfer.len], &transfer);
     @memset(padded4[transfer.len..], 0xcc);
-    var padded8: [24]u8 = [_]u8{0} ** 24;
+    var padded8: [24]u8 = @as([24]u8, @splat(0));
     @memcpy(padded8[0..transfer.len], &transfer);
     @memset(padded8[transfer.len..], 0xdd);
     try std.testing.expect(validateTransferPagesDescriptor(&transfer));
     try std.testing.expect(validateTransferPagesDescriptor(&padded4));
     try std.testing.expect(validateTransferPagesDescriptor(&padded8));
     try std.testing.expect(!validateTransferPagesDescriptor(transfer[0..15]));
-    var misaligned: [17]u8 = [_]u8{0} ** 17;
+    var misaligned: [17]u8 = @as([17]u8, @splat(0));
     @memcpy(misaligned[0..transfer.len], &transfer);
     try std.testing.expect(!validateTransferPagesDescriptor(&misaligned));
     put32(&padded8, 4, std.math.maxInt(u32));
@@ -1017,7 +1017,7 @@ test "transfer page validation rejects corruption and footer mismatch progresses
         &signal,
     ));
     put16(ring.ptr[page_size .. page_size + packet_header_size], 2, 3);
-    try std.testing.expectEqual(@intFromEnum(RingResult.malformed), vmbus_ring_read(
+    try std.testing.expectEqual(@backingInt(RingResult.malformed), vmbus_ring_read(
         ring.ptr,
         ring.len,
         &meta,
@@ -1045,7 +1045,7 @@ test "transfer page validation rejects corruption and footer mismatch progresses
         2,
         std.math.maxInt(u16),
     );
-    try std.testing.expectEqual(@intFromEnum(RingResult.malformed), vmbus_ring_read(
+    try std.testing.expectEqual(@backingInt(RingResult.malformed), vmbus_ring_read(
         ring.ptr,
         ring.len,
         &meta,
@@ -1056,7 +1056,7 @@ test "transfer page validation rejects corruption and footer mismatch progresses
     ));
 
     transfer[3] = 1;
-    try std.testing.expectEqual(@intFromEnum(RingResult.malformed), vmbus_ring_write(
+    try std.testing.expectEqual(@backingInt(RingResult.malformed), vmbus_ring_write(
         ring.ptr,
         ring.len,
         7,
@@ -1072,7 +1072,7 @@ test "transfer page validation rejects corruption and footer mismatch progresses
 
 test "control message layouts are exact" {
     var message: [240]u8 = undefined;
-    const user = [_]u8{1} ** 120;
+    const user = @as([120]u8, @splat(1));
     try std.testing.expectEqual(@as(c_int, 148), vmbus_open_message(
         &message,
         message.len,

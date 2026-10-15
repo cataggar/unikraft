@@ -21,6 +21,8 @@ _records_spec.loader.exec_module(accepted_records)
 MAX_TOTAL = 512 * 1024 * 1024
 MAX_MEMBERS = 96
 MAX_JSON = 65536
+WAMR_REVISION = "bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20"
+HISTORICAL_WAMR_REVISION = "a53205d77be3b880eb8f8b96679512ba58e2331a"
 V1_ZIP_MEMBERS = 55
 V2_ZIP_MEMBERS = 85
 PYTHON_SUPERVISOR_RELATIVE = Path("compute/supervisor/bin/wamr-ci-supervisor")
@@ -255,9 +257,10 @@ def executable_identity(value):
 
 def supervised_command_record(
         ci, value, stage, role_identities, transport_context,
-        profile="qcow2-derived-vhd"):
+        profile="qcow2-derived-vhd", *, historical_generation=False):
     ci.validate_supervised_command_binding(
-        value, stage, role_identities, transport_context, profile)
+        value, stage, role_identities, transport_context, profile,
+        historical_generation=historical_generation)
     request = value["supervisor"]["request"]
     bindings = [
         request["supervisor"],
@@ -393,15 +396,25 @@ def command_supervisor_record(value):
 
 
 def dependency_record(ci, value, expected):
+    require(isinstance(value, dict)
+            and isinstance(value.get("packages"), dict)
+            and isinstance(value["packages"].get("hash_verification"), dict))
+    algorithm = value.get("packages", {}).get(
+        "hash_verification", {}).get("algorithm")
+    require(isinstance(algorithm, str)
+            and algorithm in {"zig-0.17.0-fetch-path", "zig-0.16.0-fetch-path"})
+    historical = algorithm == "zig-0.16.0-fetch-path"
+    root_package = (
+        ci.HISTORICAL_MIZ_PACKAGE_HASH if historical else ci.MIZ_PACKAGE_HASH)
     require(set(value) == {
         "schema", "version", "request", "source_manifests",
         "restore_directory", "restore", "packages",
     } and value["schema"] == "uk.wamr.zig-dependency-custody"
       and type(value["version"]) is int and value["version"] == 1
       and value["request"] == {
-          "url": ci.MIZ_URL,
-          "revision": ci.MIZ_REVISION,
-          "package_hash": ci.MIZ_PACKAGE_HASH,
+          "url": ci.HISTORICAL_MIZ_URL if historical else ci.MIZ_URL,
+          "revision": ci.HISTORICAL_MIZ_REVISION if historical else ci.MIZ_REVISION,
+          "package_hash": root_package,
       })
     expected_paths = {
         "build.zig": "support/tools/hyperv/local_boot/build.zig",
@@ -506,9 +519,9 @@ def dependency_record(ci, value, expected):
             and total_files == files
             and total_directories == directories
             and total_bytes == package_bytes
-            and ci.MIZ_PACKAGE_HASH in dependency_graph)
+            and root_package in dependency_graph)
     reachable = set()
-    pending = [ci.MIZ_PACKAGE_HASH]
+    pending = [root_package]
     while pending:
         name = pending.pop()
         require(name in dependency_graph)
@@ -528,7 +541,8 @@ def dependency_record(ci, value, expected):
             and manifest_summary["sha256"] == manifest_digest.hexdigest())
     hash_verification = packages["hash_verification"]
     require(set(hash_verification) == {"algorithm", "count", "sha256"}
-            and hash_verification["algorithm"] == "zig-0.16.0-fetch-path")
+            and hash_verification["algorithm"] in {
+                "zig-0.17.0-fetch-path", "zig-0.16.0-fetch-path"})
     bounded_integer(hash_verification["count"], 1, ci.PACKAGE_MAX_ROOTS)
     require(hash_verification["count"] == roots)
     hash_records = [{
@@ -599,11 +613,14 @@ def decode(raw):
     return value
 
 
-def context(value):
+def context(value, *, version=None):
     require(set(value) == {"repository", "run_id", "run_attempt", "source_revision",
                            "source_tree", "wamr_revision"})
     require(value["repository"] == "cataggar/unikraft"
-            and value["wamr_revision"] == "a53205d77be3b880eb8f8b96679512ba58e2331a")
+            and value["wamr_revision"] in (
+                WAMR_REVISION, HISTORICAL_WAMR_REVISION))
+    if version == 1:
+        require(value["wamr_revision"] == HISTORICAL_WAMR_REVISION)
     for key in ("run_id", "run_attempt"):
         require(type(value[key]) is str and re.fullmatch(r"[1-9][0-9]{0,19}", value[key]))
     for key in ("source_revision", "source_tree"):
@@ -1032,7 +1049,7 @@ def validate_local_supervisor(handoff, supervisor, start, expected):
 
 def native(
         handoff, validator, supervisor, bundle, expected,
-        native_identity=None):
+        native_identity=None, *, historical=False):
     validator = Path(validator)
     supervisor = Path(supervisor)
     require(validator.is_absolute() and supervisor.is_absolute()
@@ -1080,9 +1097,15 @@ def native(
             require(native_identity == bundle.parent.with_name(
                 bundle.parent.name + "-native-identity") / "accepted")
             handoff.private(native_identity)
+        stage = ("historical-native-revalidation" if historical
+                 else "native-revalidation")
+        verb = "historical-handoff" if historical else "handoff"
+        success = (b"Historical compute handoff revalidated; authority=not_admitted.\n"
+                   if historical else
+                   b"Compute handoff revalidated; authority=not_admitted.\n")
         output, command = handoff.ci.execute(
-            bundle.parent, "native-revalidation",
-            [validator, "handoff", bundle], 600, 4096,
+            bundle.parent, stage,
+            [validator, verb, bundle], 600, 4096,
             input_records=input_records,
             path_roles={
                 "input:validator": validator,
@@ -1094,10 +1117,10 @@ def native(
                 validator_input["files"]["validator"]),
         }
         supervised_command_record(
-            handoff.ci, command, "native-revalidation",
+            handoff.ci, command, stage,
             role_identities, "producer_direct")
         require(handoff.ci.read(output, 4096)
-                == b"Compute handoff revalidated; authority=not_admitted.\n")
+                == success)
         handoff.ci.record_input_paths(
             {"validator": validator}, {}, content=True,
             expected=validator_input)
@@ -1414,7 +1437,8 @@ def publication_records(
                     require(False)
                 supervised_command_record(
                     ci, item, command_stage, role_identities,
-                    transport_context, profile=profile)
+                    transport_context, profile=profile,
+                    historical_generation=bundle["identity"]["wamr_revision"] == HISTORICAL_WAMR_REVISION)
     by_name = dict(zip(
         handoff.NAMES if version == 1 else handoff.V2_NAMES,
         bundle["artifacts"]))
@@ -1517,6 +1541,7 @@ def pack(handoff, stage, archive, source, validator, supervisor, *, producer="py
     handoff.private(stage)
     handoff.private(archive.parent)
     bundle = handoff.ci.document(stage / "bundle.json")
+    context(source, version=bundle["version"])
     require(bundle["source_revision"] == source["source_revision"]
             and bundle["source_tree"] == source["source_tree"]
             and bundle["identity"]["wamr_revision"] == source["wamr_revision"])
@@ -1556,7 +1581,8 @@ def pack(handoff, stage, archive, source, validator, supervisor, *, producer="py
             runtime, stage.with_name("handoff-revalidation"))
     else:
         native(
-            handoff, validator, supervisor, stage / "bundle.json", source)
+            handoff, validator, supervisor, stage / "bundle.json", source,
+            historical=bundle["version"] == 1)
     portable = copy.deepcopy(bundle)
     for item in members(handoff, portable, stage).values():
         item["path"] = Path(item["path"]).relative_to(stage).as_posix()
@@ -1642,7 +1668,7 @@ def verify_archive_descriptor(handoff, handle, expected,
                 and type(manifest["version"]) is int
                 and manifest["version"] == bundle["version"]
                 and manifest["authority"] == "not_admitted"
-                and context(manifest["source"]) == expected
+                and context(manifest["source"], version=manifest["version"]) == expected
                 and bundle["source_revision"] == expected["source_revision"]
                 and bundle["source_tree"] == expected["source_tree"]
                 and bundle["identity"]["wamr_revision"] == expected["wamr_revision"]
@@ -1810,7 +1836,8 @@ def import_bundle(
         native(
             handoff, validator, supervisor,
             output / "candidate-bundle.json", expected,
-            native_identity=native_identity)
+            native_identity=native_identity,
+            historical=bundle["version"] == 1)
     # Only a fully revalidated import publishes the operator-facing bundle.
     handoff.ci.save(output / "bundle.json", bundle)
     return bundle
@@ -1858,10 +1885,9 @@ def publish_ci(handoff):
             handoff.ci.tool("zig"), "build", "--build-file",
             handoff.ci.REPO / "support/tools/hyperv/direct/build.zig",
             "--cache-dir", runtime / "compute/cache",
-            "--global-cache-dir", runtime / "compute/global-cache",
             "--prefix", publication / "tools",
             *handoff.ci.RECORDED_EXECUTABLE_TARGET,
-            "-Doptimize=ReleaseSafe", "-j2", "install"], 600,
+            "-Doptimize=safe", "-j2", "install"], 600,
             input_records=handoff.ci.consumer_file_records(
                 start["consumer_inputs"]))
         del unused_output

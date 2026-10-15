@@ -26,7 +26,7 @@ const Fixture = struct {
         errdefer root.close(io);
         var nonce: [8]u8 = undefined;
         io.random(&nonce);
-        const name = try std.fmt.allocPrint(a, "guard-{x}", .{nonce});
+        const name = try a.print("guard-{x}", .{nonce});
         defer a.free(name);
         try root.dir.createDir(io, name, .fromMode(0o700));
         const container = try root.dir.openDir(io, name, .{ .follow_symlinks = false, .iterate = true });
@@ -70,7 +70,7 @@ const Fixture = struct {
         if (!self.reaped) {
             k.kill(self.owner_fd) catch @panic("fixture owner kill");
             var status: u32 = 0;
-            _ = k.linux.waitpid(self.owner, &status, 0);
+            _ = k.linux.waitpid(self.owner, @ptrCast(&status), 0);
         }
         k.close(self.owner_fd);
         if (self.custody_fd) |descriptor| {
@@ -180,7 +180,7 @@ const Descendants = struct {
         defer k.close(proc);
         var path: [96]u8 = undefined;
         var bytes: [4096]u8 = undefined;
-        const data = try k.procRead(proc, try std.fmt.bufPrintZ(&path, "{d}/task/{d}/children", .{ init_pid, init_pid }), &bytes);
+        const data = try k.procRead(proc, try std.mem.printSentinel(&path, "{d}/task/{d}/children", .{ init_pid, init_pid }, 0), &bytes);
         var parts = std.mem.tokenizeAny(u8, data, " \n");
         var fds: [2]i32 = undefined;
         var count: usize = 0;

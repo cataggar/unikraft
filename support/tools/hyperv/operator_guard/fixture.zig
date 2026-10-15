@@ -19,7 +19,7 @@ pub const Mode = enum {
     seal_interrupted,
 };
 pub const Request = struct { mode: Mode, expected: r.Expected };
-pub const seed = [_]u8{0x59} ** 32;
+pub const seed = @as([32]u8, @splat(0x59));
 pub const budget: r.Budget = .{ .control = 8388608, .staging = 268435456 };
 
 // Faults exist only in this separately bound synthetic executable. File markers
@@ -127,7 +127,7 @@ pub fn main(init: std.process.Init) void {
 }
 fn execute(init: std.process.Init) !void {
     // Scope CI kernel-denial evidence to this synthetic executable.
-    _ = try k.checked(k.linux.prctl(@intFromEnum(k.linux.PR.SET_NAME), @intFromPtr("uk-custody-test"), 0, 0, 0));
+    _ = try k.checked(k.linux.prctl(@backingInt(k.linux.PR.SET_NAME), @intFromPtr("uk-custody-test"), 0, 0, 0));
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     var fault: Fault = .{ .original = init.io };
     var controlled = init;
@@ -216,7 +216,7 @@ fn worker(input: guard.WorkerInput) !void {
         std.mem.indexOf(u8, status, "CapPrm:\t0000000000000000") == null or
         std.mem.indexOf(u8, status, "NoNewPrivs:\t1") == null) return error.RetainedCapabilities;
     if (std.mem.eql(u8, mode, "flood")) {
-        const output = [_]u8{'x'} ** 4096;
+        const output = @as([4096]u8, @splat('x'));
         for (0..128) |_| try k.write(1, &output);
         return;
     }
