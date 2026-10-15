@@ -194,7 +194,7 @@ def dependency_custody(source):
                 "sha256": manifest_digest.hexdigest(),
             },
             "hash_verification": {
-                "algorithm": "zig-0.17.0-fetch-path",
+                "algorithm": "zig-0.16.0-fetch-path",
                 "count": 1,
                 "sha256": digest(json.dumps(
                     hash_records, sort_keys=True,
@@ -846,7 +846,8 @@ class Compute(unittest.TestCase):
         item = handoff.artifact(path)
         bundle = dict(
             schema="uk.wamr.local-image-handoff", version=1, authority="not_admitted",
-            source_revision="a" * 40, source_tree="b" * 40, identity=identity(),
+            source_revision="a" * 40, source_tree="b" * 40,
+            identity=dict(identity(), wamr_revision=handoff.ci.REVISION),
             artifacts=[item] * len(handoff.NAMES), evidence=[],
             boots=[
                 dict(mode=mode, serial=item, request=item,
@@ -928,8 +929,8 @@ class Compute(unittest.TestCase):
             path = app / "build/artifacts" / name
             write(path, ("synthetic " + name).encode())
             files[name] = ci.digest(path)
-        runtime_identity = dict(wamr_revision=SDK, minimal_wasi=False,
-                                compiler_profile="unikraft-x86_64", zig_version="0.17.0",
+        runtime_identity = dict(wamr_revision=handoff.ci.REVISION, minimal_wasi=False,
+                                compiler_profile="unikraft-x86_64", zig_version="0.16.0",
                                 files=files)
         write(app / "build/artifacts/identity.json", runtime_identity)
         source = dict(
@@ -988,7 +989,7 @@ class Compute(unittest.TestCase):
                 "footer_sha256", "packaging")}))
         boot_inputs = ci.boot_input_state(runtime, tools)
         write(root / "evidence/boot-inputs.json", boot_inputs)
-        observation = dict(result(), **{
+        observation = dict(result(), wamr_revision=handoff.ci.REVISION, **{
             key + "_sha256": files[name] for key, name in (
                 ("wasm", "tiny.wasm"), ("cwasm", "tiny.cwasm"), ("runtime", "libwamr-aot.a"))})
         with mock.patch.object(ci, "APP", app), \
@@ -1122,7 +1123,7 @@ class Compute(unittest.TestCase):
         bundle = read(bundle_path)
         source = dict(repository="cataggar/unikraft", run_id="1234567", run_attempt="1",
                       source_revision=bundle["source_revision"], source_tree=bundle["source_tree"],
-                      wamr_revision=SDK)
+                      wamr_revision=handoff.ci.REVISION)
         archive = self.root / "public.zip"
         for name in ("subscription.json", "sas.txt", "credentials", "extra"):
             write(stage / name, b"must never be published")

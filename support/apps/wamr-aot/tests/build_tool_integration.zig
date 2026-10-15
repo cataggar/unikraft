@@ -72,6 +72,20 @@ test "native prepare refuses unbound or incorrectly hashed offline packages" {
     defer allocator.free(missing.stdout);
     defer allocator.free(missing.stderr);
     try testing.expect(missing.term == .exited and missing.term.exited != 0);
+    const miz_repository = try fixtureRepository(&temporary, "miz-custody-package");
+    defer allocator.free(miz_repository);
+    try bindPreparePackages(miz_repository, &environment);
+    const miz_packages = try build_tool.files.PrivateDirectory.open(io, environment.get("ZIG_LOCAL_PKG_DIR").?);
+    defer miz_packages.close(io);
+    try miz_packages.dir.deleteTree(io, build_tool.wabt_hash);
+    try miz_packages.dir.deleteTree(io, build_tool.wasip2_hash);
+    const miz_pkg = try build_tool.files.ensurePrivateDirectory(io, miz_packages.dir, "miz-0.2.0-Z3lHlLgL2wDiGxutMJMDy9Qy4CLNCwOptwgQLp1ZDSiv");
+    defer miz_pkg.close(io);
+    try build_tool.files.writePrivateAtomicReplace(io, miz_pkg, "build.zig", "fixture package\n");
+    const miz_result = try runCli(cli, &.{ cli, "prepare", "--repository", miz_repository, "--source-archive", archive }, &environment);
+    defer allocator.free(miz_result.stdout);
+    defer allocator.free(miz_result.stderr);
+    try expectExit(miz_result.term, 0);
 }
 
 test "native prepare and verify cover every variant with create-only output" {

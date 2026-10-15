@@ -139,7 +139,8 @@ pub const CandidateScope = struct {
         }
         try hex(self.source_revision, 40);
         try hex(self.source_tree, 40);
-        const expected_sdk = if (self.authority == .not_admitted and historicalV2LocalPins(self.source_revision, self.source_tree))
+        const expected_sdk = if (historicalV1LocalPins(self.source_revision, self.source_tree) or
+            (self.authority == .not_admitted and historicalV2LocalPins(self.source_revision, self.source_tree)))
             historical_sdk
         else
             sdk;
@@ -714,9 +715,25 @@ fn legacyLocalPins(source_revision: []const u8, source_tree: []const u8) bool {
         eq(source_tree, "54f8e118146c78c24e7c802657c6ec62b268a5de");
 }
 
+fn preSupervisorLocalPins(source_revision: []const u8, source_tree: []const u8) bool {
+    return (eq(source_revision, "0711a0b6bf2285a4ba6ab6dd3bd4088478d665e1") and
+        eq(source_tree, "3d9def2872f41248b518a850a48a5c462e158890")) or
+        (eq(source_revision, "c9c00535399354063486957611bf6e09c8ae4592") and
+            eq(source_tree, "02827e49c25d06eba21bb2157833fc135811eedb")) or
+        (eq(source_revision, "3c6d5d98dc5736d86e97884184b26be39c3f11d5") and
+            eq(source_tree, "feb57a66615a6083378c7261e1e53c37730e0650"));
+}
+
+fn historicalV1LocalPins(source_revision: []const u8, source_tree: []const u8) bool {
+    return legacyLocalPins(source_revision, source_tree) or
+        preSupervisorLocalPins(source_revision, source_tree);
+}
+
 fn historicalV2LocalPins(source_revision: []const u8, source_tree: []const u8) bool {
-    return eq(source_revision, "e98623f780fa23d05b5797004e4b88160404eb1b") and
-        eq(source_tree, "9716eac4251f2ac3274c5a0073b54cb2058b3d6a");
+    return (eq(source_revision, "e98623f780fa23d05b5797004e4b88160404eb1b") and
+        eq(source_tree, "9716eac4251f2ac3274c5a0073b54cb2058b3d6a")) or
+        (eq(source_revision, "2830293aaf1df37877cddf4dae97f5cf255b9ae2") and
+            eq(source_tree, "1234567890abcdef1234567890abcdef12345678"));
 }
 
 const HandoffRuntime = struct {
@@ -1650,7 +1667,11 @@ pub fn verifyHandoff(a: std.mem.Allocator, io: std.Io, bytes: []const u8) !void 
 }
 
 pub fn verifyBundle(a: std.mem.Allocator, io: std.Io, bundle: Bundle) !void {
-    return verifyBundleRuntime(a, io, bundle, current_handoff_runtime);
+    const expected_runtime = if (historicalV1LocalPins(bundle.source_revision, bundle.source_tree))
+        historical_handoff_runtime
+    else
+        current_handoff_runtime;
+    return verifyBundleRuntime(a, io, bundle, expected_runtime);
 }
 
 pub fn verifyHistoricalHandoff(a: std.mem.Allocator, io: std.Io, bytes: []const u8) !void {
@@ -2675,7 +2696,11 @@ fn commonPlan(
     if (!eq(run.repository, "cataggar/unikraft")) return error.InvalidIdentity;
     try decimal(run.run_id);
     try decimal(run.run_attempt);
-    if (!eq(identity.wamr_revision, sdk)) return error.WrongSdk;
+    const expected_sdk = if (historicalV2LocalPins(source_revision, source_tree))
+        historical_sdk
+    else
+        sdk;
+    if (!eq(identity.wamr_revision, expected_sdk)) return error.WrongSdk;
     inline for (@typeInfo(Identity).@"struct".field_names) |member| {
         if (comptime !eq(member, "wamr_revision")) {
             _ = try c.parseSha256(@field(identity, member));

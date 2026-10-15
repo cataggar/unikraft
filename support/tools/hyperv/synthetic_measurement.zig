@@ -10,7 +10,7 @@ pub const Optimize = enum {
     ReleaseFast,
     ReleaseSmall,
 
-    fn fromCompiler(mode: std.lang.Optimize) Optimize {
+    pub fn fromCompiler(mode: std.lang.Optimize) Optimize {
         return switch (mode) {
             .debug => .Debug,
             .safe => .ReleaseSafe,

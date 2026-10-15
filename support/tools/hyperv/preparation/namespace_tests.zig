@@ -1112,7 +1112,7 @@ fn internalRuntimeProbe(a: std.mem.Allocator, io: std.Io, directory: fs.Director
     for (collection.records[0..collection.count], 0..) |record, index| {
         try std.testing.expectEqual(@as(internal.Phase, @fromBackingInt(@intCast(index))), record.phase);
         try std.testing.expectEqual(internal.Context.isolation, record.context);
-        try std.testing.expectEqual(builtin.mode, record.sample.optimize);
+        try std.testing.expectEqual(@import("synthetic_measurement").Optimize.fromCompiler(builtin.mode), record.sample.optimize);
         try std.testing.expectEqual(builtin.zig_backend, record.sample.backend);
     }
     var buffer: [internal.log_bytes]u8 = undefined;

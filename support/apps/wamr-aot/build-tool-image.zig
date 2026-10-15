@@ -111,9 +111,15 @@ pub const RootPackages = struct {
     identity: contract.files.Snapshot,
     tree: [32]u8,
     names: []const []const u8,
+    fetch_sdk_urls: bool = false,
 
     pub const root_names = [_][]const u8{ contract.translate_c_hash, contract.aro_hash };
     pub const sdk_names = [_][]const u8{ contract.translate_c_hash, contract.aro_hash, contract.wabt_hash, contract.wasip2_hash };
+    pub const miz_custody_names = [_][]const u8{
+        contract.translate_c_hash,
+        contract.aro_hash,
+        "miz-0.2.0-Z3lHlLgL2wDiGxutMJMDy9Qy4CLNCwOptwgQLp1ZDSiv",
+    };
 
     pub fn open(
         allocator: std.mem.Allocator,
@@ -128,7 +134,14 @@ pub const RootPackages = struct {
         io: std.Io,
         environment: *const std.process.Environ.Map,
     ) !RootPackages {
-        return openNames(allocator, io, environment, &sdk_names);
+        return openNames(allocator, io, environment, &sdk_names) catch |err| switch (err) {
+            error.FileNotFound => {
+                var packages = try openNames(allocator, io, environment, &miz_custody_names);
+                packages.fetch_sdk_urls = true;
+                return packages;
+            },
+            else => return err,
+        };
     }
 
     fn openNames(
@@ -169,7 +182,7 @@ pub const RootPackages = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         zig: contract.process.Tool,
-        environment: *const std.process.Environ.Map,
+        environment: *std.process.Environ.Map,
         state: std.Io.Dir,
         state_path: []const u8,
         runner: anytype,
@@ -191,6 +204,20 @@ pub const RootPackages = struct {
             defer allocator.free(expected);
             if (!std.mem.eql(u8, result.stdout, expected))
                 return error.UnpinnedRootPackage;
+        }
+        if (self.fetch_sdk_urls) {
+            inline for (.{
+                .{ contract.wabt_url, contract.wabt_hash },
+                .{ contract.wasip2_url, contract.wasip2_hash },
+            }) |entry| {
+                var result = try runner.runSuccess(zig, .root_dependency_hash, &.{
+                    zig.path, "fetch", "--pkg-dir", hashes_path, entry[0],
+                }, environment, cwd, cwd_path, 4096);
+                defer result.deinit(allocator);
+                if (!std.mem.eql(u8, result.stdout, entry[1] ++ "\n"))
+                    return error.UnpinnedRootPackage;
+            }
+            try environment.put("ZIG_LOCAL_PKG_DIR", hashes_path);
         }
         try self.verify(allocator, io);
     }

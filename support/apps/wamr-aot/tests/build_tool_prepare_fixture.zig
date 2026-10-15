@@ -17,9 +17,16 @@ fn run(init: std.process.Init) !void {
     const arguments = try init.minimal.args.toSlice(allocator);
     try recordEnvironment(init, allocator, arguments);
     if (arguments.len == 5 and std.mem.eql(u8, arguments[1], "fetch")) {
-        const name = std.fs.path.basename(arguments[4]);
+        const target = arguments[4];
+        const name = if (std.mem.eql(u8, target, build_tool.wabt_url))
+            build_tool.wabt_hash
+        else if (std.mem.eql(u8, target, build_tool.wasip2_url))
+            build_tool.wasip2_hash
+        else
+            std.fs.path.basename(target);
         if (!std.mem.eql(u8, name, build_tool.translate_c_hash) and
             !std.mem.eql(u8, name, build_tool.aro_hash) and
+            !std.mem.eql(u8, name, "miz-0.2.0-Z3lHlLgL2wDiGxutMJMDy9Qy4CLNCwOptwgQLp1ZDSiv") and
             !std.mem.eql(u8, name, build_tool.wabt_hash) and
             !std.mem.eql(u8, name, build_tool.wasip2_hash))
             return error.UnpinnedPackage;
