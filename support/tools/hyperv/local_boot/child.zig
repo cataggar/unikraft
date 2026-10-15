@@ -16,7 +16,7 @@ pub fn arguments(a: std.mem.Allocator, config: c.Config, source_size: u64, sourc
         config.qemu, "-no-user-config",
         "-machine",  "q35,accel=kvm",
         "-cpu",      if (config.disable_x2apic) c.cpu_features ++ ",x2apic=off" else c.cpu_features,
-        "-smp",      try std.fmt.allocPrint(a, "{d}", .{config.cpus}),
+        "-smp",      try a.print("{d}", .{config.cpus}),
         "-m",        "512M",
         "-drive",    "if=pflash,format=raw,readonly=on,file=OVMF_CODE.fd",
         "-drive",    "if=pflash,format=raw,file=OVMF_VARS.fd",
@@ -26,7 +26,7 @@ pub fn arguments(a: std.mem.Allocator, config: c.Config, source_size: u64, sourc
         .raw_disk, .fixed_vhd => {
             if (source_fd < 3 or source_size == 0 or source_size > config.source.maximumPhysicalSize())
                 return error.InvalidRawDisk;
-            const filename = try std.fmt.allocPrint(a, "/proc/self/fd/{d}", .{source_fd});
+            const filename = try a.print("/proc/self/fd/{d}", .{source_fd});
             const block = if (config.source.kind == .fixed_vhd) try std.json.Stringify.valueAlloc(a, .{
                 .driver = "vpc",
                 .@"node-name" = "local-boot-disk",
@@ -44,7 +44,7 @@ pub fn arguments(a: std.mem.Allocator, config: c.Config, source_size: u64, sourc
         },
         .qcow2 => {
             if (source_fd < 3 or source_size == 0 or source_size > c.max_input) return error.InvalidQcow2Profile;
-            const filename = try std.fmt.allocPrint(a, "/proc/self/fd/{d}", .{source_fd});
+            const filename = try a.print("/proc/self/fd/{d}", .{source_fd});
             const file_block = try std.json.Stringify.valueAlloc(a, .{
                 .driver = "file",
                 .@"node-name" = "local-boot-qcow2-file",
@@ -93,8 +93,8 @@ pub fn execute(init: std.process.Init) !void {
     if (!std.mem.eql(u8, raw, canonical)) return error.IncompleteRequest;
     var death_signal: c_int = 0;
     if (request.supervisor_pid != linux.getppid() or linux.getpgid(0) != linux.getpid() or
-        linux.errno(linux.prctl(@intFromEnum(linux.PR.GET_PDEATHSIG), @intFromPtr(&death_signal), 0, 0, 0)) != .SUCCESS or
-        death_signal != @intFromEnum(linux.SIG.KILL)) return error.InvalidSupervisor;
+        linux.errno(linux.prctl(@backingInt(linux.PR.GET_PDEATHSIG), @intFromPtr(&death_signal), 0, 0, 0)) != .SUCCESS or
+        death_signal != @backingInt(linux.SIG.KILL)) return error.InvalidSupervisor;
     if (work.lock(io)) |value| {
         var unexpected = value;
         unexpected.close(io);
@@ -144,7 +144,7 @@ pub fn execute(init: std.process.Init) !void {
     } else source_fd = try files.inheritedReadOnly(artifacts.items[0].file);
     const args = try arguments(a, request.config, request.pins[0].size, source_fd);
     const argv = try a.allocSentinel(?[*:0]const u8, args.len, null);
-    for (args, 0..) |arg, i| argv[i] = (try a.dupeZ(u8, arg)).ptr;
+    for (args, 0..) |arg, i| argv[i] = (try a.dupeSentinel(u8, arg, 0)).ptr;
     var environment: std.process.Environ.Map = .init(a);
     defer environment.deinit();
     try environment.put("TMPDIR", request.config.work_dir);

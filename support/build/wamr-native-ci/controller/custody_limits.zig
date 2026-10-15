@@ -23,10 +23,14 @@ pub const dependency_roots = 128;
 pub const dependency_entries = 16_384;
 pub const dependency_bytes = 256 * mib;
 pub const dependency_file = 64 * mib;
-pub const wamr_revision = "a53205d77be3b880eb8f8b96679512ba58e2331a";
-pub const miz_revision = "669a27982b376311f558e820b69e9a692735b0cd";
-pub const miz_package_hash = "miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx";
+pub const wamr_revision = "bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20";
+pub const miz_revision = "66ea6701cf0e1b6d31e5f30fade00b7a546d4b44";
+pub const miz_package_hash = "miz-0.2.0-Z3lHlLgL2wDiGxutMJMDy9Qy4CLNCwOptwgQLp1ZDSiv";
 pub const miz_url = "git+https://github.com/cataggar/miz.git#" ++ miz_revision;
+pub const historical_miz_revision = "669a27982b376311f558e820b69e9a692735b0cd";
+pub const historical_miz_package_hash = "miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx";
+pub const historical_miz_url = "git+https://github.com/cataggar/miz.git#" ++ historical_miz_revision;
+pub const historical_wamr_revision = "a53205d77be3b880eb8f8b96679512ba58e2331a";
 pub const roles = [_][]const u8{
     ".d",                          ".zig-cache", "support/apps/wamr-aot/.config",
     "support/apps/wamr-aot/build",

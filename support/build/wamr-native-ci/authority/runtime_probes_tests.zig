@@ -24,15 +24,15 @@ pub const Synthetic = struct {
 fn integer(comptime T: type, bytes: []u8, offset: usize, value: T) void {
     std.mem.writeInt(T, bytes[offset..][0..@sizeOf(T)], value, .little);
 }
-fn program(bytes: []u8, index: usize, kind: u32, offset: u64, size: u64, flags: u32) void {
+fn program(bytes: []u8, index: usize, kind: std.elf.PT, offset: u64, size: u64, flags: u32) void {
     const at = 64 + index * 56;
-    integer(u32, bytes, at, kind);
+    integer(u32, bytes, at, @intFromEnum(kind));
     integer(u32, bytes, at + 4, flags);
     integer(u64, bytes, at + 8, offset);
     integer(u64, bytes, at + 16, 0x400000 + offset);
     integer(u64, bytes, at + 32, size);
     integer(u64, bytes, at + 40, size);
-    integer(u64, bytes, at + 48, if (kind == std.elf.PT_LOAD) 0x1000 else 8);
+    integer(u64, bytes, at + 48, if (kind == .LOAD) 0x1000 else 8);
 }
 fn dynamic(bytes: []u8, index: usize, tag: i64, value: u64) void {
     integer(i64, bytes, 0x200 + index * 16, tag);
@@ -40,7 +40,7 @@ fn dynamic(bytes: []u8, index: usize, tag: i64, value: u64) void {
 }
 /// Data-only images: never made executable, sealed, or accepted as a runtime.
 pub fn synthetic(config: Synthetic) ![2048]u8 {
-    var bytes = [_]u8{0} ** 2048;
+    var bytes = @as([2048]u8, @splat(0));
     @memcpy(bytes[0..7], "\x7fELF\x02\x01\x01");
     integer(u16, &bytes, 16, 3);
     integer(u16, &bytes, 18, @intFromEnum(std.elf.EM.X86_64));
@@ -50,12 +50,12 @@ pub fn synthetic(config: Synthetic) ![2048]u8 {
     integer(u16, &bytes, 52, 64);
     integer(u16, &bytes, 54, 56);
     integer(u16, &bytes, 56, if (config.role == .interpreter) 3 else 2);
-    program(&bytes, 0, std.elf.PT_LOAD, 0, bytes.len, std.elf.PF_R | std.elf.PF_X);
-    program(&bytes, 1, std.elf.PT_DYNAMIC, 0x200, 96, std.elf.PF_R);
+    program(&bytes, 0, .LOAD, 0, bytes.len, std.elf.PF_R | std.elf.PF_X);
+    program(&bytes, 1, .DYNAMIC, 0x200, 96, std.elf.PF_R);
     if (config.role == .interpreter) {
         if (config.interpreter.len >= 256) return error.InvalidSynthetic;
         @memcpy(bytes[0x100..][0..config.interpreter.len], config.interpreter);
-        program(&bytes, 2, std.elf.PT_INTERP, 0x100, config.interpreter.len + 1, std.elf.PF_R);
+        program(&bytes, 2, .INTERP, 0x100, config.interpreter.len + 1, std.elf.PF_R);
     }
     var cursor: usize = 1;
     var entry: usize = 2;
@@ -190,7 +190,7 @@ test "ELF dynamic strings duplicates mapping and terminator bounds refuse" {
     {
         var bytes = try synthetic(.{ .role = .library });
         integer(u16, &bytes, 56, 3);
-        program(&bytes, 2, std.elf.PT_LOAD, 0, bytes.len, std.elf.PF_R);
+        program(&bytes, 2, .LOAD, 0, bytes.len, std.elf.PF_R);
         try t.expectError(error.AmbiguousLoad, probes.inspectElf(a, &bytes, .library));
     }
     {
@@ -223,7 +223,7 @@ const Fixture = struct {
     fn init() !Fixture {
         const parent = try std.Io.Dir.openDirAbsolute(io, @import("test_options").fixture_root, .{});
         errdefer parent.close(io);
-        const name = try std.fmt.allocPrint(a, "runtime-probes-{d}", .{linux.getpid()});
+        const name = try a.print("runtime-probes-{d}", .{linux.getpid()});
         errdefer a.free(name);
         try parent.createDir(io, name, .fromMode(0o700));
         errdefer parent.deleteTree(io, name) catch @panic("probe fixture cleanup");
@@ -384,7 +384,7 @@ test "retained ELF source rejects same bytes inode replacement and ancestor rena
     try fixture.dir.rename("old-loader", fixture.dir, probes.loader_basename, io);
     var current_loader = try fixture.retained(probes.loader_basename);
     defer current_loader.deinit();
-    const moved = try std.fmt.allocPrint(a, "{s}-moved", .{fixture.name});
+    const moved = try a.print("{s}-moved", .{fixture.name});
     defer a.free(moved);
     try fixture.parent.rename(fixture.name, fixture.parent, moved, io);
     defer fixture.parent.deleteTree(io, moved) catch @panic("moved probe fixture cleanup");
@@ -622,10 +622,10 @@ test "copied loader listing refuses escape alias missing duplicate malformed and
     const duplicate = try std.mem.concat(a, u8, &.{ listing.written(), listing.written() });
     defer a.free(duplicate);
     try t.expectError(error.InvalidLoaderListing, probes.validateListing(a, duplicate, layout, parsed.value, required, interpreter_path_sha256));
-    const missing = try std.fmt.allocPrint(a, "{s} (0x1)\n", .{parsed.value.dynamic_loader.path});
+    const missing = try a.print("{s} (0x1)\n", .{parsed.value.dynamic_loader.path});
     defer a.free(missing);
     if (required.len > 1) try t.expectError(error.IncompleteLoaderListing, probes.validateListing(a, missing, layout, parsed.value, required, interpreter_path_sha256));
-    const wrong_interpreter = try std.fmt.allocPrint(a, "/other/{s} => {s} (0x1)\n", .{ probes.loader_basename, parsed.value.dynamic_loader.path });
+    const wrong_interpreter = try a.print("/other/{s} => {s} (0x1)\n", .{ probes.loader_basename, parsed.value.dynamic_loader.path });
     defer a.free(wrong_interpreter);
     try t.expectError(error.InvalidLoaderListing, probes.validateListing(a, wrong_interpreter, layout, parsed.value, required, interpreter_path_sha256));
     const oversized = try a.alloc(u8, 1024 * 1024 + 1);

@@ -11,8 +11,8 @@ pub const Fixture = enum {
     git_timeout,
 
     pub fn fromMode(input: []const u8) !Fixture {
-        inline for (std.meta.fields(Fixture)) |field| {
-            const fixture: Fixture = @enumFromInt(field.value);
+        inline for (@typeInfo(Fixture).@"enum".field_values) |field| {
+            const fixture: Fixture = @fromBackingInt(@intCast(field));
             if (std.mem.eql(u8, input, fixture.mode())) return fixture;
         }
         return error.InvalidFixtureObservationMode;
@@ -99,7 +99,7 @@ pub const Stage = enum {
     namespace_return,
 
     pub fn clockScope(self: Stage) ClockScope {
-        return if (@intFromEnum(self) <= @intFromEnum(Stage.namespace_enter) or self == .namespace_return)
+        return if (@backingInt(self) <= @backingInt(Stage.namespace_enter) or self == .namespace_return)
             .outer_helper
         else
             .inner_payload;
@@ -158,7 +158,7 @@ pub const Stage = enum {
         };
     }
 };
-pub const stage_count = std.meta.fields(Stage).len;
+pub const stage_count = @typeInfo(Stage).@"enum".field_names.len;
 pub const record_bytes = 512;
 pub const total_record_bytes = stage_count * record_bytes;
 pub const log_bytes = stage_count * (record_bytes + 128) + 256;
@@ -197,7 +197,7 @@ pub const Record = struct {
         const json = try c.canonical(allocator, self);
         defer allocator.free(json);
         if (json.len > record_bytes) return error.FixtureObservationTooLarge;
-        var result = [_]u8{0} ** record_bytes;
+        var result = @as([record_bytes]u8, @splat(0));
         @memcpy(result[0..json.len], json);
         return result;
     }
@@ -261,7 +261,7 @@ pub const Collection = struct {
                 observation.record = null;
                 continue;
             }
-            const scope = @intFromEnum(record.clock_scope);
+            const scope = @backingInt(record.clock_scope);
             if ((last_wall != null and record.sample.monotonic_ns < last_wall.?) or
                 (last_cpu[scope] != null and record.sample.process_cpu_ns < last_cpu[scope].?))
             {
@@ -282,6 +282,6 @@ pub const Collection = struct {
             .observations = self.observations,
         });
         defer allocator.free(json);
-        return std.fmt.bufPrint(buffer, "{s}{s}", .{ self.fixture.logPrefix(), json });
+        return std.mem.print(buffer, "{s}{s}", .{ self.fixture.logPrefix(), json });
     }
 };

@@ -131,10 +131,61 @@ There are two ways to get started with Unikraft:
 
 ### Zig build facade and experimental Zig C compiler support
 
-Zig 0.16.0 provides a compatibility facade for the existing GNU Make build.
+Exactly Zig 0.17.0 provides a compatibility facade for the existing GNU Make build.
 GNU Make remains the backend; this facade only maps Zig build steps and options
 to Make targets and assignments. It does not yet model Unikraft's components
 as a native Zig build graph.
+
+Root builds use the pinned `translate_c` tool and its GitHub-hosted Aro fork for
+target-aware generated C bindings. Set `ZIG_LOCAL_PKG_DIR` to a scoped directory
+outside the source worktree before building; Zig 0.17 otherwise creates an
+untracked `zig-pkg` directory, which source-provenance checks correctly refuse.
+Strict producers restore exact copied `build.zig` and `build.zig.zon` files into
+private scratch with `zig build --fetch=all`, then pass the restored depot with
+`--system` and the same `ZIG_LOCAL_PKG_DIR` binding. The environment variable
+takes precedence over the `--system` directory in Zig 0.17. Keep that restoration
+before source/admission custody; do not hide
+untracked dependency sources or allow an ambient depot to substitute for the
+authenticated binding. Set the global cache with `ZIG_GLOBAL_CACHE_DIR`;
+Zig 0.17 `build` and `fetch` no longer accept `--global-cache-dir`.
+
+Zig 0.17's hosted standard-library OS floors are Linux 5.10+, macOS 15+, and
+OpenBSD 7.8+; its Windows floor is Windows 10+. These floors apply to tools
+running on the build/control host, including the facade and hosted verifiers,
+not to freestanding Unikraft guests. Meeting a floor does not establish facade
+support: hosts without the required filesystem/process safety capabilities are
+still rejected. The Windows floor does not add Windows facade support, and none
+of these hosted floors changes guest-platform support or requires a Linux guest.
+
+The root build now requires the immutable `translate_c` package and its Aro
+dependency even for selectors that do not translate C themselves. Restore the
+manifest-pinned closure explicitly before invoking the root build:
+
+```shell
+umask 077
+work="$HOME/unikraft-zig17-build"
+export ZIG_LOCAL_PKG_DIR="$work/packages"
+export ZIG_GLOBAL_CACHE_DIR="$work/global-cache"
+export ZIG_LOCAL_CACHE_DIR="$work/local-cache"
+mkdir -p "$ZIG_LOCAL_PKG_DIR" "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_CACHE_DIR"
+zig build --fetch=all --cache-dir "$ZIG_LOCAL_CACHE_DIR" --prefix "$work/outputs"
+```
+
+Subsequent root invocations use `--system "$ZIG_LOCAL_PKG_DIR"` to prohibit
+implicit fetching. Zig 0.17 gives `ZIG_LOCAL_PKG_DIR` precedence over the
+directory argument to `--system`: fixed child environments must bind both to
+the same qualified depot, or remove the ambient variable before using the
+explicit directory. Never forward an unrelated or untrusted package selector.
+Guarded factories and CI must restore, authenticate, and
+bind the compiler and complete package closure **before** establishing
+source/admission custody. `--system` disables fetching; a directory path or
+hash-shaped package name alone is not authentication. Do not replace the
+qualified depot with an empty tree or remove `--system` to make a gate pass.
+Keep package depots outside every source snapshot: Zig 0.17's default
+`zig-pkg` acquisition writes new package sources into the build root, which
+must fail strict source custody rather than be ignored. Scope this root depot
+to root invocations; independent restorers retain their own per-restore
+`--pkg-dir`. Do not override all restorers through a shared `GITHUB_ENV` entry.
 
 The facade also exposes an isolated native configuration parser and header
 generator. It consumes an already solved Kconfig `.config`; it does not
@@ -142,9 +193,9 @@ evaluate `Config.uk`, resolve dependencies/defaults, or replace the Kconfig
 solver. The non-destructive native steps are:
 
 ```shell
-zig build config-inspect -Dapp=/absolute/path/to/app
-zig build config-validate -Dapp=/absolute/path/to/app
-zig build config-header -Dapp=/absolute/path/to/app
+zig build --system "$ZIG_LOCAL_PKG_DIR" config-inspect -Dapp=/absolute/path/to/app
+zig build --system "$ZIG_LOCAL_PKG_DIR" config-validate -Dapp=/absolute/path/to/app
+zig build --system "$ZIG_LOCAL_PKG_DIR" config-header -Dapp=/absolute/path/to/app
 ```
 
 `config-inspect` prints the selected architecture and platform, and
@@ -162,7 +213,7 @@ generated header below a prefix other than the build output.
 From the Unikraft repository, build an application with:
 
 ```shell
-zig build \
+zig build --system "$ZIG_LOCAL_PKG_DIR" \
   -Dapp=/absolute/path/to/app \
   -Dconfig=/absolute/path/to/app/.config
 ```
@@ -177,6 +228,13 @@ ancestors, existing source directories, filesystem roots, and unmarked existing
 directories. New output directories receive a small marker so subsequent
 builds can distinguish them from source trees.
 
+Zig 0.17 separates configuration from build execution. Configuration-time
+`.config` reads declare content dependencies, while canonical-path, file-kind,
+permission and marker trust checks deliberately poison the configuration cache:
+these checks must run on every invocation, including warm caches. Individual
+compilation and generated-header steps remain content-cached. Do not override
+configuration cache poisoning for trusted build execution.
+
 The default step delegates to Make's `all` target. Named steps include
 `images`, `libs`, `objs`, `preprocess`, `prepare`, `fetch`, configuration
 targets such as `menuconfig` and `defconfig`. The compatibility names `clean`,
@@ -184,8 +242,8 @@ targets such as `menuconfig` and `defconfig`. The compatibility names `clean`,
 refuse to run; see the cleanup safety limitation below. For example:
 
 ```shell
-zig build menuconfig -Dapp=/absolute/path/to/app
-zig build images -Dapp=/absolute/path/to/app -Dverbose=1
+zig build --system "$ZIG_LOCAL_PKG_DIR" menuconfig -Dapp=/absolute/path/to/app
+zig build --system "$ZIG_LOCAL_PKG_DIR" images -Dapp=/absolute/path/to/app -Dverbose=1
 ```
 
 `-Dapp`, `-Doutput`, `-Dconfig`, and `-Dimage-name` map to Make's `A`, `O`,
@@ -245,7 +303,7 @@ ancestors must be root- or current-user-owned and not group/other-writable. A
 root-owned `01777` sticky boundary is accepted only when its protected child
 entry is trusted and not group/other-writable. Linux retains the opened
 executable descriptor and uses `fexecve`, so replacing the final directory
-entry cannot change the executed backend. Zig 0.16's macOS and OpenBSD libc
+entry cannot change the executed backend. Zig 0.17's macOS and OpenBSD libc
 targets do not export `fexecve`, so descriptor execution is conservatively
 gated to Linux. Other supported hosts retain the original descriptor, re-open
 the fully trusted chain at the last possible point, require matching
@@ -293,7 +351,7 @@ Until cleanup is implemented using portable descriptor-relative deletion, the
 facade refuses all four steps instead of exposing a check-then-delete race. Use
 manual cleanup, or invoke GNU Make directly only after independently ensuring
 the application, output, and configuration path components cannot be replaced.
-`zig build test` runs the facade's path, argument, and lock unit checks.
+The offline `test` selector runs the facade's path, argument, and lock unit checks.
 It also links the production runner for x86_64/aarch64 macOS and x86_64
 OpenBSD, catching target-libc symbol availability rather than stopping after
 code generation.
@@ -306,7 +364,7 @@ runtime/build-marker entries, and differing temporary-directory environments.
 The experimental QEMU/x86_64 native Zig image pipeline becomes:
 
 ```shell
-zig build native-images \
+zig build --system "$ZIG_LOCAL_PKG_DIR" native-images \
   -Dnative-profile=qemu-x86_64 \
   -Dapp=/absolute/path/to/app \
   -Dconfig=/absolute/path/to/solved-qemu-x86_64.config \
@@ -337,7 +395,7 @@ For QEMU/ARM64, use the same GCC-free tool contract with an explicit
 freestanding AArch64 target:
 
 ```shell
-zig build native-images \
+zig build --system "$ZIG_LOCAL_PKG_DIR" native-images \
   -Dnative-profile=qemu-arm64 \
   -Dapp=/absolute/path/to/app \
   -Dconfig=/absolute/path/to/solved-qemu-arm64.config \
@@ -389,14 +447,14 @@ Freestanding targeting alone is not sufficient. Queue publication, legacy
 event routing, and the ISR scheduler wake callback stay on this restricted
 path; protocol processing and channel/driver callbacks run in the worker.
 
-`zig build test-hyperv-irq` runs the targeted hosted correctness tests, including
+The offline `test-hyperv-irq` selector runs the targeted hosted correctness tests, including
 8-, 196-, and 240-byte receive payloads. Native Hyper-V image publication also
 checks the final linked IRQ call graph for unsaved FP/SIMD use and strong VMBus
 hook resolution using compiled Zig proof tools. For GNU Make images, build
 the native checker and run the same check explicitly:
 
 ```shell
-zig build build-hyperv-image-proofs -j2
+zig build --system "$ZIG_LOCAL_PKG_DIR" build-hyperv-image-proofs -j2
 ./zig-out/bin/hyperv-image-proof irq --image /path/to/image.dbg
 ```
 
@@ -407,7 +465,7 @@ logging immediately leading to a fatal trap is excluded: it cannot return to
 the interrupted context. This compiler/register check is not live Hyper-V I/O
 or AP workload acceptance.
 
-`zig build test-hyperv-image-proofs -j2` runs the Python-free proof aggregate:
+The offline `test-hyperv-image-proofs -j2` selector runs the Python-free proof aggregate:
 native parser/register tests, real C/Zig objects and linked x86-64 ELF fixtures,
 and refusal mutations. It does not execute a guest or invoke Make. Set
 `-Dproof-nm=/path/to/llvm-nm` and `-Dproof-objdump=/path/to/llvm-objdump` when
@@ -417,7 +475,7 @@ See [native image proof coverage](support/build/hyperv-image-proofs.md) for the
 SMP/IRQ/driver CLI, assertion mapping, and evidence limits.
 
 ```shell
-zig build native-images \
+zig build --system "$ZIG_LOCAL_PKG_DIR" native-images \
   -Dnative-profile=hyperv-x86_64-efi \
   -Dapp=/absolute/path/to/app \
   -Dconfig=/absolute/path/to/solved-x86_64-efi.config \
@@ -526,7 +584,7 @@ addresses rather than consulting a GOT that has not yet been relocated.
 
 #### Experimental LTO (QEMU/x86_64 native pipeline only)
 
-The Zig 0.16 `native-images` pipeline supports a whole-program flat LTO path
+The Zig 0.17 `native-images` pipeline supports a whole-program flat LTO path
 for the `qemu-x86_64` profile. Selecting `CONFIG_OPTIMIZE_LTO=y` with the
 `qemu-arm64`, `hyperv-x86_64-efi`, or `hyperv-x86_64-efi-netvsc` native
 profiles is detected at build time and rejected with an explicit error.
@@ -535,8 +593,8 @@ affected: it retains its existing compiler-specific per-library LTO behavior
 (e.g. `-flto` forwarded to GCC or Clang) unchanged.
 
 To enable LTO for the QEMU/x86_64 native pipeline, copy the application
-x86_64 defconfig, append `CONFIG_OPTIMIZE_LTO=y`, run `zig build olddefconfig`
-to fill in remaining defaults, then run `zig build native-images` with the same
+x86_64 defconfig, append `CONFIG_OPTIMIZE_LTO=y`, run the offline `olddefconfig`
+selector to fill in remaining defaults, then run `native-images` with the same
 tool arguments. Using a shell array avoids repeating the argument list:
 
 ```shell
@@ -564,8 +622,8 @@ zig_args=(
   "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt"
 )
 
-zig build olddefconfig "${zig_args[@]}"
-zig build native-images -Dnative-profile=qemu-x86_64 "${zig_args[@]}"
+zig build --system "$ZIG_LOCAL_PKG_DIR" olddefconfig "${zig_args[@]}"
+zig build --system "$ZIG_LOCAL_PKG_DIR" native-images -Dnative-profile=qemu-x86_64 "${zig_args[@]}"
 ```
 
 When `CONFIG_OPTIMIZE_LTO=y` is active the per-library `zig cc -r` partial-link

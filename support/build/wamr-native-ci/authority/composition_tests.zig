@@ -37,7 +37,7 @@ pub const Fixture = struct {
         var arena = std.heap.ArenaAllocator.init(a);
         errdefer arena.deinit();
         const allocator = arena.allocator();
-        const name = try std.fmt.allocPrint(allocator, "composition-{d}", .{linux.getpid()});
+        const name = try allocator.print("composition-{d}", .{linux.getpid()});
         const parent = try core.private_files.openDirectory(io, options.fixture_root, .private);
         errdefer parent.close(io);
         try parent.createDir(io, name, .fromMode(0o700));

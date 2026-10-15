@@ -4,22 +4,20 @@ const linux = std.os.linux;
 
 pub fn main(init: std.process.Init) void {
     const args = init.minimal.args.toSlice(init.arena.allocator()) catch std.process.exit(2);
-    if (args.len == 15 and
+    if (args.len == 13 and
         std.mem.eql(u8, args[1], "build") and
         std.mem.eql(u8, args[2], "--build-file") and
         std.fs.path.isAbsolute(args[3]) and
         std.mem.endsWith(u8, args[3], "/support/tools/hyperv/direct/build.zig") and
         std.mem.eql(u8, args[4], "--cache-dir") and
         std.fs.path.isAbsolute(args[5]) and
-        std.mem.eql(u8, args[6], "--global-cache-dir") and
+        std.mem.eql(u8, args[6], "--prefix") and
         std.fs.path.isAbsolute(args[7]) and
-        std.mem.eql(u8, args[8], "--prefix") and
-        std.fs.path.isAbsolute(args[9]) and
-        std.mem.eql(u8, args[10], "-Dtarget=x86_64-linux-gnu") and
-        std.mem.eql(u8, args[11], "-Dcpu=x86_64_v2") and
-        std.mem.eql(u8, args[12], "-Doptimize=ReleaseSafe") and
-        std.mem.eql(u8, args[13], "-j2") and
-        std.mem.eql(u8, args[14], "install"))
+        std.mem.eql(u8, args[8], "-Dtarget=x86_64-linux-gnu") and
+        std.mem.eql(u8, args[9], "-Dcpu=x86_64_v2") and
+        std.mem.eql(u8, args[10], "-Doptimize=safe") and
+        std.mem.eql(u8, args[11], "-j2") and
+        std.mem.eql(u8, args[12], "install"))
         return;
     if (args.len == 3 and std.mem.eql(u8, args[1], "handoff")) {
         const bundle = std.Io.Dir.openFileAbsolute(init.io, args[2], .{ .follow_symlinks = false }) catch std.process.exit(2);
@@ -76,18 +74,18 @@ pub fn runScenario(io: std.Io, scenario: []const u8) void {
         std.process.exit(2);
     }
     if (std.mem.eql(u8, scenario, "overflow")) {
-        const chunk = [_]u8{'X'} ** 65536;
+        const chunk = @as([65536]u8, @splat('X'));
         for (0..140) |_|
             std.Io.File.stdout().writeStreamingAll(io, &chunk) catch std.process.exit(2);
         return;
     }
     if (std.mem.eql(u8, scenario, "large-3m") or std.mem.eql(u8, scenario, "large-8m")) {
-        const chunk = [_]u8{'A'} ** 65536;
+        const chunk = @as([65536]u8, @splat('A'));
         const count: usize = if (std.mem.eql(u8, scenario, "large-3m")) 48 else 64;
         for (0..count) |_|
             std.Io.File.stdout().writeStreamingAll(io, &chunk) catch std.process.exit(2);
         if (count == 64) {
-            const stderr_chunk = [_]u8{'B'} ** 65536;
+            const stderr_chunk = @as([65536]u8, @splat('B'));
             for (0..64) |_|
                 std.Io.File.stderr().writeStreamingAll(io, &stderr_chunk) catch std.process.exit(2);
         }

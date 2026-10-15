@@ -293,7 +293,7 @@ fn putLittle(bytes: []u8, offset: usize, value: anytype) void {
 }
 
 fn syntheticElf64(common_section_index: u16) [312]u8 {
-    var bytes = [_]u8{0} ** 312;
+    var bytes = @as([312]u8, @splat(0));
     @memcpy(bytes[0..4], "\x7fELF");
     bytes[4] = 2;
     bytes[5] = 1;

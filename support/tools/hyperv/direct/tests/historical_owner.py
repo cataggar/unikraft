@@ -542,6 +542,7 @@ def prepare(repository, root, git, zig, packages):
             "HOME": str(root / "home"),
             "TMPDIR": str(root / "tmp"),
             "PYTHONDONTWRITEBYTECODE": "1",
+            "ZIG_GLOBAL_CACHE_DIR": str(root / "global"),
             "PATH": str(Path(git).parent) + ":/usr/bin:/bin",
         }
         common = [
@@ -549,9 +550,7 @@ def prepare(repository, root, git, zig, packages):
             "build",
             "--system",
             packages,
-            "--global-cache-dir",
-            root / "global",
-            "-Doptimize=ReleaseSafe",
+            "-Doptimize=safe",
             "-j1",
         ]
         stage = "closure"
@@ -565,7 +564,7 @@ def prepare(repository, root, git, zig, packages):
             [
                 *common,
                 "--build-file",
-                owner / CI / "build.zig",
+                repository / CI / "build.zig",
                 "--cache-dir",
                 root / "controller-cache",
                 "--prefix",
@@ -600,7 +599,7 @@ def prepare(repository, root, git, zig, packages):
             [
                 *common,
                 "--build-file",
-                owner / CI / "supervisor.build.zig",
+                repository / CI / "supervisor.build.zig",
                 "--cache-dir",
                 root / "supervisor-cache",
                 "--prefix",

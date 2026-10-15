@@ -29,6 +29,7 @@ pub const Stage = enum {
     @"supervisor-import-identity",
     @"import-validator-build",
     @"import-native-revalidation",
+    @"import-historical-native-revalidation",
 };
 
 pub const Binding = union(enum) {
@@ -130,13 +131,13 @@ pub fn spec(stage: Stage) Spec {
         .adapter => .{ .stage = stage, .executable = "tool:zig", .seconds = 900, .output_limit = 8 * 1024 * 1024, .argv = &.{
             zig,                                                                                      .{ .literal = "build" },                               .{ .literal = "--build-file" },
             .{ .path = .{ .role = "source", .relative = "support/build/wamr-native-ci/build.zig" } }, .{ .literal = "--system" },                            .{ .path = .{ .role = "work", .relative = "dependencies/zig-pkg" } },
-            .{ .literal = "--prefix" },                                                               .{ .path = .{ .role = "work", .relative = "tools" } }, .{ .literal = "-Doptimize=ReleaseSafe" },
+            .{ .literal = "--prefix" },                                                               .{ .path = .{ .role = "work", .relative = "tools" } }, .{ .literal = "-Doptimize=safe" },
             .{ .literal = "-j2" },                                                                    .{ .literal = "test-unit" },                           .{ .literal = "install" },
         } },
         .@"local-boot-tool" => .{ .stage = stage, .executable = "tool:zig", .seconds = 900, .output_limit = 8 * 1024 * 1024, .argv = &.{
             zig,                                                                                         .{ .literal = "build" },                                          .{ .literal = "--build-file" },
             .{ .path = .{ .role = "source", .relative = "support/tools/hyperv/local_boot/build.zig" } }, .{ .literal = "--system" },                                       .{ .path = .{ .role = "work", .relative = "dependencies/zig-pkg" } },
-            .{ .literal = "--prefix" },                                                                  .{ .path = .{ .role = "work", .relative = "local-boot-tools" } }, .{ .literal = "-Doptimize=ReleaseSafe" },
+            .{ .literal = "--prefix" },                                                                  .{ .path = .{ .role = "work", .relative = "local-boot-tools" } }, .{ .literal = "-Doptimize=safe" },
             .{ .literal = "-j2" },                                                                       .{ .literal = "install" },
         } },
         .fixtures => .{ .stage = stage, .executable = "native:wamr-native-ci-fixtures", .seconds = 600, .output_limit = 8 * 1024 * 1024, .argv = &.{
@@ -170,11 +171,11 @@ pub fn spec(stage: Stage) Spec {
             .seconds = 1800,
             .output_limit = 8 * 1024 * 1024,
             .argv = &.{
-                zig,                                                                                     .{ .literal = "build" },                                      .{ .literal = "--build-file" },
-                .{ .path = .{ .role = "source", .relative = "support/tools/hyperv/direct/build.zig" } }, .{ .literal = "--cache-dir" },                                .{ .path = .{ .role = "work", .relative = "cache" } },
-                .{ .literal = "--global-cache-dir" },                                                    .{ .path = .{ .role = "work", .relative = "global-cache" } }, .{ .literal = "--prefix" },
-                .{ .path = .{ .role = "work", .relative = "public-source/tools" } },                     .{ .literal = "-Dtarget=x86_64-linux-gnu" },                  .{ .literal = "-Dcpu=x86_64_v2" },
-                .{ .literal = "-Doptimize=ReleaseSafe" },                                                .{ .literal = "-j2" },                                        .{ .literal = "install" },
+                zig,                                                                                     .{ .literal = "build" },                                             .{ .literal = "--build-file" },
+                .{ .path = .{ .role = "source", .relative = "support/tools/hyperv/direct/build.zig" } }, .{ .literal = "--cache-dir" },                                       .{ .path = .{ .role = "work", .relative = "cache" } },
+                .{ .literal = "--prefix" },                                                              .{ .path = .{ .role = "work", .relative = "public-source/tools" } }, .{ .literal = "-Dtarget=x86_64-linux-gnu" },
+                .{ .literal = "-Dcpu=x86_64_v2" },                                                       .{ .literal = "-Doptimize=safe" },                                   .{ .literal = "-j2" },
+                .{ .literal = "install" },
             },
         },
         .@"supervisor-import-identity" => .{
@@ -187,17 +188,8 @@ pub fn spec(stage: Stage) Spec {
                 .{ .literal = "--identity" },
             },
         },
-        .@"import-native-revalidation" => .{
-            .stage = stage,
-            .executable = "input:validator",
-            .seconds = 600,
-            .output_limit = 4096,
-            .argv = &.{
-                .{ .path = .{ .role = "input:validator" } },
-                .{ .literal = "handoff" },
-                .{ .path = .{ .role = "input:bundle" } },
-            },
-        },
+        .@"import-native-revalidation" => importHandoffSpec(.@"import-native-revalidation"),
+        .@"import-historical-native-revalidation" => importHandoffSpec(.@"import-historical-native-revalidation"),
         .@"finalize-qcow2" => packageSpec(.@"finalize-qcow2"),
         .@"derive-fixed-vhd" => packageSpec(.@"derive-fixed-vhd"),
         .@"raw-x2apic" => bootSpec(stage, .@"raw-x2apic"),
@@ -208,6 +200,20 @@ pub fn spec(stage: Stage) Spec {
         .@"vpc-legacy-apic" => bootSpec(stage, .@"vpc-legacy-apic"),
         .@"log-validator-x2apic" => validatorSpec(.@"log-validator-x2apic"),
         .@"log-validator-legacy" => validatorSpec(.@"log-validator-legacy"),
+    };
+}
+
+fn importHandoffSpec(comptime stage: Stage) Spec {
+    return .{
+        .stage = stage,
+        .executable = "input:validator",
+        .seconds = 600,
+        .output_limit = 4096,
+        .argv = &.{
+            .{ .path = .{ .role = "input:validator" } },
+            .{ .literal = if (stage == .@"import-historical-native-revalidation") "historical-handoff" else "handoff" },
+            .{ .path = .{ .role = "input:bundle" } },
+        },
     };
 }
 
@@ -372,7 +378,7 @@ pub fn environment(allocator: std.mem.Allocator, stage: Stage) ![]EnvironmentBin
         });
         return bindings.toOwnedSlice(allocator);
     }
-    if (stage == .@"import-native-revalidation") {
+    if (stage == .@"import-native-revalidation" or stage == .@"import-historical-native-revalidation") {
         try bindings.appendSlice(allocator, &.{
             .{ .name = "HOME", .value = .{ .path = .{ .role = "work", .relative = "private" } } },
             .{ .name = "LANG", .value = .{ .literal = "C" } },
@@ -407,6 +413,8 @@ pub fn environment(allocator: std.mem.Allocator, stage: Stage) ![]EnvironmentBin
     });
     if (stage == .adapter or stage == .@"local-boot-tool" or stage == .@"public-validator-build")
         try bindings.append(allocator, .{ .name = "WAMR_CI_LAUNCH_EXECUTABLE", .value = zig });
+    if (stage == .prepare or stage == .config or stage == .@"native-image")
+        try bindings.append(allocator, .{ .name = "ZIG_LOCAL_PKG_DIR", .value = .{ .path = .{ .role = "work", .relative = "dependencies/zig-pkg" } } });
     if (stage == .fixtures)
         try bindings.appendSlice(allocator, &.{
             .{ .name = "WAMR_CI_PACKAGE", .value = .{ .path = .{ .role = "work", .relative = "tools/bin/wamr-ci-package" } } },
@@ -415,10 +423,10 @@ pub fn environment(allocator: std.mem.Allocator, stage: Stage) ![]EnvironmentBin
             .{ .name = "WAMR_CI_SUPERVISOR_FIXTURE", .value = .{ .path = .{ .role = "work", .relative = "tools/bin/wamr-ci-supervisor-fixture" } } },
         });
     for (inputs.host_tools) |name| {
-        const env_name = try std.fmt.allocPrint(allocator, "WAMR_CI_TOOL_{s}", .{name});
+        const env_name = try allocator.print("WAMR_CI_TOOL_{s}", .{name});
         for (env_name["WAMR_CI_TOOL_".len..]) |*letter|
             letter.* = if (letter.* == '-') '_' else std.ascii.toUpper(letter.*);
-        const env_role = try std.fmt.allocPrint(allocator, "tool:{s}", .{name});
+        const env_role = try allocator.print("tool:{s}", .{name});
         defer allocator.free(env_role);
         const owned_role = try allocator.dupe(u8, env_role);
         try bindings.append(allocator, .{ .name = env_name, .value = .{ .path = .{ .role = owned_role } } });

@@ -158,10 +158,10 @@ comptime {
         @compileError("Hyper-V reference TSC page layout changed");
 }
 
-export const hyperv_hypercall_page_storage: [4096]u8 align(4096) linksection(".text.hyperv_hypercall_page") = [_]u8{0} ** 4096;
+export const hyperv_hypercall_page_storage: [4096]u8 align(4096) linksection(".text.hyperv_hypercall_page") = @as([4096]u8, @splat(0));
 // PLAT_HYPERV is restricted to one vCPU; these pages are owned by the BSP.
-export var hyperv_simp_page_storage: [4096]u8 align(4096) linksection(".bss.hyperv_simp_page") = [_]u8{0} ** 4096;
-export var hyperv_siefp_page_storage: [4096]u8 align(4096) linksection(".bss.hyperv_siefp_page") = [_]u8{0} ** 4096;
+export var hyperv_simp_page_storage: [4096]u8 align(4096) linksection(".bss.hyperv_simp_page") = @as([4096]u8, @splat(0));
+export var hyperv_siefp_page_storage: [4096]u8 align(4096) linksection(".bss.hyperv_siefp_page") = @as([4096]u8, @splat(0));
 export var hyperv_reference_tsc_page_storage: ReferenceTscPage align(4096) linksection(".bss.hyperv_reference_tsc_page") = std.mem.zeroes(ReferenceTscPage);
 
 var enabled = false;
@@ -398,12 +398,12 @@ export fn hyperv_runtime_detect() callconv(.c) c_int {
         discovered_privileges_high = features.ebx;
         discovered_max_vp_count = limits.eax;
     }
-    return @intFromEnum(result);
+    return @backingInt(result);
 }
 
 export fn hyperv_runtime_enable(page_gpa: u64, guest_id: u64) callconv(.c) c_int {
     if ((page_gpa & ~page_mask) != 0 or guest_id == 0)
-        return @intFromEnum(EnableResult.bad_page);
+        return @backingInt(EnableResult.bad_page);
 
     wrmsr(msr_guest_os_id, guest_id);
     guest_id_active = true;
@@ -417,10 +417,10 @@ export fn hyperv_runtime_enable(page_gpa: u64, guest_id: u64) callconv(.c) c_int
     {
         wrmsr(msr_guest_os_id, 0);
         guest_id_active = false;
-        return @intFromEnum(EnableResult.msr_rejected);
+        return @backingInt(EnableResult.msr_rejected);
     }
     enabled = true;
-    return @intFromEnum(EnableResult.ok);
+    return @backingInt(EnableResult.ok);
 }
 
 export fn hyperv_synic_enable(
@@ -433,15 +433,15 @@ export fn hyperv_synic_enable(
     if (((simp_gpa | siefp_gpa | reference_tsc_gpa) & ~page_mask) != 0 or
         simp_gpa == siefp_gpa or simp_gpa == reference_tsc_gpa or
         siefp_gpa == reference_tsc_gpa)
-        return @intFromEnum(SynicResult.bad_page);
+        return @backingInt(SynicResult.bad_page);
     if (message_vector < 32 or timer_vector < 32 or message_vector == timer_vector)
-        return @intFromEnum(SynicResult.bad_vector);
+        return @backingInt(SynicResult.bad_vector);
 
     zeroSharedPage(&hyperv_simp_page_storage);
     zeroSharedPage(&hyperv_siefp_page_storage);
     zeroSharedPage(@ptrCast(&hyperv_reference_tsc_page_storage));
     const ref_rc = hyperv_reference_tsc_enable(reference_tsc_gpa);
-    if (ref_rc != @intFromEnum(SynicResult.ok))
+    if (ref_rc != @backingInt(SynicResult.ok))
         return ref_rc;
     const rc = hyperv_synic_cpu_enable(
         simp_gpa,
@@ -449,21 +449,21 @@ export fn hyperv_synic_enable(
         message_vector,
         timer_vector,
     );
-    if (rc != @intFromEnum(SynicResult.ok))
+    if (rc != @backingInt(SynicResult.ok))
         hyperv_reference_tsc_disable();
     return rc;
 }
 
 export fn hyperv_reference_tsc_enable(reference_tsc_gpa: u64) callconv(.c) c_int {
     if ((reference_tsc_gpa & ~page_mask) != 0)
-        return @intFromEnum(SynicResult.bad_page);
+        return @backingInt(SynicResult.bad_page);
     const features: Features = @bitCast(discovered_features);
     if (!features.reference_tsc)
-        return @intFromEnum(SynicResult.ok);
+        return @backingInt(SynicResult.ok);
     if (!programPageMsr(msr_reference_tsc, reference_tsc_gpa))
-        return @intFromEnum(SynicResult.msr_rejected);
+        return @backingInt(SynicResult.msr_rejected);
     @atomicStore(bool, &reference_tsc_enabled, true, .release);
-    return @intFromEnum(SynicResult.ok);
+    return @backingInt(SynicResult.ok);
 }
 
 export fn hyperv_reference_tsc_disable() callconv(.c) void {
@@ -481,44 +481,44 @@ export fn hyperv_synic_cpu_enable(
 ) callconv(.c) c_int {
     if (((simp_gpa | siefp_gpa) & ~page_mask) != 0 or
         simp_gpa == siefp_gpa)
-        return @intFromEnum(SynicResult.bad_page);
+        return @backingInt(SynicResult.bad_page);
     if (message_vector < 32 or timer_vector < 32 or message_vector == timer_vector)
-        return @intFromEnum(SynicResult.bad_vector);
+        return @backingInt(SynicResult.bad_vector);
     const features: Features = @bitCast(discovered_features);
     if (!features.synic or !features.stimer or !features.time_ref_count)
-        return @intFromEnum(SynicResult.missing_privilege);
+        return @backingInt(SynicResult.missing_privilege);
 
     // Publish pages and masked SINTs before enabling SynIC and unmasking them.
     if (!programPageMsr(msr_simp, simp_gpa)) {
         disableLocalSynicState();
-        return @intFromEnum(SynicResult.msr_rejected);
+        return @backingInt(SynicResult.msr_rejected);
     }
     if (!programPageMsr(msr_siefp, siefp_gpa)) {
         disableLocalSynicState();
-        return @intFromEnum(SynicResult.msr_rejected);
+        return @backingInt(SynicResult.msr_rejected);
     }
     if (!programSint(2, message_vector, true) or
         !programSint(4, timer_vector, true))
     {
         disableLocalSynicState();
-        return @intFromEnum(SynicResult.msr_rejected);
+        return @backingInt(SynicResult.msr_rejected);
     }
 
     const control = rdmsr(msr_scontrol) | register_enable;
     wrmsr(msr_scontrol, control);
     if ((rdmsr(msr_scontrol) & register_enable) == 0) {
         disableLocalSynicState();
-        return @intFromEnum(SynicResult.msr_rejected);
+        return @backingInt(SynicResult.msr_rejected);
     }
     if (!programSint(2, message_vector, false) or
         !programSint(4, timer_vector, false))
     {
         disableLocalSynicState();
-        return @intFromEnum(SynicResult.msr_rejected);
+        return @backingInt(SynicResult.msr_rejected);
     }
 
     wrmsr(msr_stimer0_config, @as(u64, 4) << stimer_sint_shift | stimer_auto_enable);
-    return @intFromEnum(SynicResult.ok);
+    return @backingInt(SynicResult.ok);
 }
 
 export fn hyperv_synic_disable() callconv(.c) void {
@@ -558,7 +558,7 @@ export fn hyperv_status_code(result: u64) callconv(.c) u16 {
 }
 
 export fn hyperv_status_kind(result: u64) callconv(.c) u16 {
-    return @intFromEnum(switch (hyperv_status_code(result)) {
+    return @backingInt(switch (hyperv_status_code(result)) {
         0x0000 => StatusKind.success,
         0x0002 => StatusKind.invalid_hypercall_code,
         0x0003 => StatusKind.invalid_hypercall_input,
@@ -666,17 +666,17 @@ export fn hyperv_synic_message_take_page(
     output: *Message,
 ) callconv(.c) c_int {
     const slot = messageSlot(page, sint) orelse
-        return @intFromEnum(MessageResult.invalid_sint);
+        return @backingInt(MessageResult.invalid_sint);
     const message_type_ptr: *u32 =
         @ptrCast(@volatileCast(&slot.message_type));
     const message_type = @atomicLoad(u32, message_type_ptr, .acquire);
     if (message_type == 0)
-        return @intFromEnum(MessageResult.empty);
+        return @backingInt(MessageResult.empty);
     const payload_size = @as(*volatile u8, @ptrCast(&slot.payload_size)).*;
     if (payload_size > max_message_payload) {
         const flags_ptr: *const u8 = @ptrCast(@volatileCast(&slot.flags));
         completeMessageSlot(message_type_ptr, flags_ptr, writeSynicEom);
-        return @intFromEnum(MessageResult.invalid_payload);
+        return @backingInt(MessageResult.invalid_payload);
     }
 
     const src: [*]const volatile u8 = @ptrCast(slot);
@@ -686,7 +686,7 @@ export fn hyperv_synic_message_take_page(
 
     const flags_ptr: *const u8 = @ptrCast(@volatileCast(&slot.flags));
     completeMessageSlot(message_type_ptr, flags_ptr, writeSynicEom);
-    return @intFromEnum(MessageResult.ready);
+    return @backingInt(MessageResult.ready);
 }
 
 export fn hyperv_synic_event_take_word(
@@ -861,8 +861,8 @@ test "SIMP completion clears with a full barrier before conditional EOM" {
         }
 
         test "per-vCPU SIMP and SIEFP pages remain isolated" {
-            var simp0: [4096]u8 align(4096) = [_]u8{0} ** 4096;
-            var simp1: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+            var simp0: [4096]u8 align(4096) = @as([4096]u8, @splat(0));
+            var simp1: [4096]u8 align(4096) = @as([4096]u8, @splat(0));
             const slot0: *Message = @ptrCast(@alignCast(&simp0[2 * 256]));
             const slot1: *Message = @ptrCast(@alignCast(&simp1[2 * 256]));
             slot0.message_type = 0x11;
@@ -873,15 +873,15 @@ test "SIMP completion clears with a full barrier before conditional EOM" {
             slot1.payload[0] = 0xbb;
             var output = std.mem.zeroes(Message);
             try std.testing.expectEqual(
-                @intFromEnum(MessageResult.ready),
+                @backingInt(MessageResult.ready),
                 hyperv_synic_message_take_page(&simp1, 2, &output),
             );
             try std.testing.expectEqual(@as(u32, 0x22), output.message_type);
             try std.testing.expectEqual(@as(u8, 0xbb), output.payload[0]);
             try std.testing.expectEqual(@as(u32, 0x11), slot0.message_type);
 
-            var events0: [4096]u8 align(4096) = [_]u8{0} ** 4096;
-            var events1: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+            var events0: [4096]u8 align(4096) = @as([4096]u8, @splat(0));
+            var events1: [4096]u8 align(4096) = @as([4096]u8, @splat(0));
             const words0: [*]u64 = @ptrCast(@alignCast(&events0));
             const words1: [*]u64 = @ptrCast(@alignCast(&events1));
             words0[2 * event_words_per_sint + 1] = 0x10;
@@ -896,13 +896,13 @@ test "SIMP completion clears with a full barrier before conditional EOM" {
         }
 
         test "malformed SIMP payload is completed instead of wedging the slot" {
-            var simp: [4096]u8 align(4096) = [_]u8{0} ** 4096;
+            var simp: [4096]u8 align(4096) = @as([4096]u8, @splat(0));
             const slot: *Message = @ptrCast(@alignCast(&simp[2 * 256]));
             slot.message_type = 0x44;
             slot.payload_size = max_message_payload + 1;
             var output = std.mem.zeroes(Message);
             try std.testing.expectEqual(
-                @intFromEnum(MessageResult.invalid_payload),
+                @backingInt(MessageResult.invalid_payload),
                 hyperv_synic_message_take_page(&simp, 2, &output),
             );
             try std.testing.expectEqual(@as(u32, 0), slot.message_type);
@@ -943,11 +943,11 @@ test "teardown ordering keeps producers ahead of shared pages" {
 test "status decoding masks the result field" {
     try std.testing.expectEqual(@as(u16, 2), hyperv_status_code(0x123400000002));
     try std.testing.expectEqual(
-        @intFromEnum(StatusKind.invalid_hypercall_code),
+        @backingInt(StatusKind.invalid_hypercall_code),
         hyperv_status_kind(0x123400000002),
     );
     try std.testing.expectEqual(
-        @intFromEnum(StatusKind.unknown),
+        @backingInt(StatusKind.unknown),
         hyperv_status_kind(0xbeef),
     );
 }

@@ -10,7 +10,7 @@ test "production root compiles and refuses before IO without an observer depende
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const sandbox = try @import("namespace/entry_refusal_fixture.zig").invalidAccount(a, std.testing.io);
+    const sandbox = try @import("entry_refusal_fixture.zig").invalidAccount(a, std.testing.io);
     var environment = std.process.Environ.Map.init(a);
     defer environment.deinit();
     try std.testing.expectError(error.InvalidAccount, ns.enter(a, std.testing.io, sandbox, &.{"/unused"}, &environment));

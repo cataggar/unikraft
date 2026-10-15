@@ -109,8 +109,8 @@ pub const ChildTermination = struct { exit: ?u8 = null, signal: ?u32 = null, sto
 pub fn childTermination(result: process.PrivateResult) ChildTermination {
     return if (result.execution.termination) |termination| switch (termination) {
         .exited => |code| .{ .exit = code },
-        .signal => |signal| .{ .signal = @intFromEnum(signal) },
-        .stopped => |signal| .{ .stopped = @intFromEnum(signal) },
+        .signal => |signal| .{ .signal = @backingInt(signal) },
+        .stopped => |signal| .{ .stopped = @backingInt(signal) },
         .unknown => |status| .{ .unknown = status },
     } else .{};
 }
@@ -348,7 +348,7 @@ fn Controller(comptime Hooks: type) type {
         log_failed: bool = false,
 
         fn fmt(self: *Self, comptime format: []const u8, args: anytype) ![]const u8 {
-            return std.fmt.allocPrint(self.a, format, args);
+            return self.a.print(format, args);
         }
 
         fn path(self: *Self, name: []const u8) ![]const u8 {
@@ -434,29 +434,31 @@ fn Controller(comptime Hooks: type) type {
             }
             const capture_error = recordCaptureFailure(self.store, lane, &self.primary_exit, result.capture, status);
             // Process/capture/cleanup lanes remain visible even on child exits.
-            {
-                errdefer |err| {
-                    self.store.recordingFailed(err);
-                    self.cleanup_exit = 1;
-                }
-                const record = try custody.encode(self.a, .{
-                    .role = role,
-                    .lane = lane,
-                    .policy = policy,
-                    .exit = status,
-                    .termination = childTermination(result),
-                    .capture = result.capture,
-                    .stdout_bytes = result.stdout_bytes,
-                    .stderr_bytes = result.stderr_bytes,
-                    .cleanup_complete = result.execution.cleanup_complete,
-                    .failures = result.execution.failures,
-                });
-                try custody.requireDurable(try self.store.writer.createImmutable(self.io, try self.fmt("{s}.process.json", .{label}), record));
-            }
+            self.recordProcess(lane, role, policy, label, result, status) catch |err| {
+                self.store.recordingFailed(err);
+                self.cleanup_exit = 1;
+                return err;
+            };
             if (capture_error) |err| return err;
             if (lane == .primary) try self.verifyPrimary() else try self.verifyTools();
             if (self.poisoned) return error.UnresolvedCleanup;
             return status;
+        }
+
+        fn recordProcess(self: *Self, lane: Lane, role: runtime.Role, policy: CallPolicy, label: []const u8, result: core.process.PrivateResult, status: u8) !void {
+            const record = try custody.encode(self.a, .{
+                .role = role,
+                .lane = lane,
+                .policy = policy,
+                .exit = status,
+                .termination = childTermination(result),
+                .capture = result.capture,
+                .stdout_bytes = result.stdout_bytes,
+                .stderr_bytes = result.stderr_bytes,
+                .cleanup_complete = result.execution.cleanup_complete,
+                .failures = result.execution.failures,
+            });
+            try custody.requireDurable(try self.store.writer.createImmutable(self.io, try self.fmt("{s}.process.json", .{label}), record));
         }
 
         fn required(self: *Self, code: u8) !void {
@@ -664,7 +666,7 @@ fn Controller(comptime Hooks: type) type {
         }
 
         fn upload(self: *Self, role: Role) !void {
-            const index = @intFromEnum(role);
+            const index = @backingInt(role);
             const name = @tagName(role);
             const artifact = self.expected.artifact(role);
             const upload_name = try self.fmt("upload-{s}", .{name});
@@ -806,8 +808,8 @@ fn Controller(comptime Hooks: type) type {
                 try self.diskShow(.primary, disk_label, role);
                 const doc = try self.read(disk_label);
                 defer doc.deinit();
-                _ = observations.retainedDisk(doc.value(), self.expected, role, allocation, self.disk_uuids[@intFromEnum(role)].?) catch |err| return self.refused(disk_label, err);
-                disks[@intFromEnum(role)] = doc.pin;
+                _ = observations.retainedDisk(doc.value(), self.expected, role, allocation, self.disk_uuids[@backingInt(role)].?) catch |err| return self.refused(disk_label, err);
+                disks[@backingInt(role)] = doc.pin;
             }
             const power_label = try self.fmt("{s}-power", .{label});
             try self.azRequired(power_label, &.{ "vm", "get-instance-view", "--resource-group", try self.groupName(), "--name", try self.vmName() });
@@ -984,7 +986,7 @@ fn Controller(comptime Hooks: type) type {
             }
             inline for (profile.roles) |role_name| {
                 const role: Role = role_name;
-                if (self.granted[@intFromEnum(role)])
+                if (self.granted[@backingInt(role)])
                     self.cleanupRevoke(role) catch {
                         self.cleanup_exit = 1;
                     };
@@ -998,7 +1000,7 @@ fn Controller(comptime Hooks: type) type {
             }
             inline for (profile.roles) |role_name| {
                 const role: Role = role_name;
-                if (self.disk_uuids[@intFromEnum(role)]) |uuid| {
+                if (self.disk_uuids[@backingInt(role)]) |uuid| {
                     const label = try self.fmt("cleanup-{s}-identity", .{@tagName(role)});
                     try self.diskShow(.cleanup, label, role);
                     const doc = try self.read(label);
@@ -1029,10 +1031,10 @@ fn Controller(comptime Hooks: type) type {
             try self.diskShow(.cleanup, label, role);
             const doc = try self.read(label);
             defer doc.deinit();
-            try observations.cleanupRevoke(doc.value(), self.expected, role, self.disk_uuids[@intFromEnum(role)]);
+            try observations.cleanupRevoke(doc.value(), self.expected, role, self.disk_uuids[@backingInt(role)]);
             const status = try self.az(.cleanup, try self.fmt("cleanup-{s}-revoke", .{@tagName(role)}), &.{ "disk", "revoke-access", "--resource-group", try self.groupName(), "--name", try self.diskName(role) });
             if (status != 0) return error.RevokeFailed;
-            self.granted[@intFromEnum(role)] = false;
+            self.granted[@backingInt(role)] = false;
         }
 
         fn failureDiagnostics(self: *Self) void {

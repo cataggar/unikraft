@@ -30,7 +30,7 @@ test "unresolved escaped writer poisons supervision and retains the original loc
     defer {
         _ = linux.kill(owned_fixture_pid, .KILL);
         var status: u32 = 0;
-        _ = linux.waitpid(owned_fixture_pid, &status, 0);
+        _ = linux.waitpid(owned_fixture_pid, @ptrCast(&status), 0);
     }
     try testing.expect(!result.execution.cleanup_complete);
     try testing.expectEqual(.cleanup_failed, result.execution.failures.cleanup.?.category);

@@ -37,7 +37,7 @@ copy_bounded() {
   fi
 }
 
-for mode in Debug ReleaseSafe; do
+for mode in debug safe; do
   if [ ! -e "${root}/${mode}" ] && [ ! -L "${root}/${mode}" ]; then continue; fi
   test -d "${root}/${mode}"
   test ! -L "${root}/${mode}"

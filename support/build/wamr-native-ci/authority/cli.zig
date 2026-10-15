@@ -25,10 +25,10 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !Parsed {
         return .{ .arena = arena, .result = .{ .help = null } };
     }
     const action = std.meta.stringToEnum(Action, argv[0]) orelse return error.UnknownCommand;
-    inline for (std.meta.fields(Command)) |field| {
-        if (action == @field(Action, field.name)) {
-            var value: field.type = .{};
-            const table = comptime options(@field(Action, field.name));
+    inline for (@typeInfo(Command).@"union".field_names, @typeInfo(Command).@"union".field_types) |field_name, FieldType| {
+        if (action == @field(Action, field_name)) {
+            var value: FieldType = .{};
+            const table = comptime options(@field(Action, field_name));
             var seen: [table.required.len + table.optional.len + table.repeated_required.len + table.repeated_optional.len]bool = @splat(false);
             var lists: [seen.len]std.ArrayList([]const u8) = @splat(.empty);
             var index: usize = 1;
@@ -56,14 +56,14 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) !Parsed {
                     break :blk argv[index];
                 };
                 if (repeated) try lists[at].append(arena.allocator(), text);
-                try assign(field.type, &value, flag, text, lists[at].items);
+                try assign(FieldType, &value, flag, text, lists[at].items);
                 seen[at] = true;
                 index += 1;
             }
             for (seen[0..table.required.len]) |present| if (!present) return error.MissingOption;
             const start = table.required.len + table.optional.len;
             for (seen[start .. start + table.repeated_required.len]) |present| if (!present) return error.MissingOption;
-            return .{ .arena = arena, .result = .{ .command = @unionInit(Command, field.name, value) } };
+            return .{ .arena = arena, .result = .{ .command = @unionInit(Command, field_name, value) } };
         }
     }
     unreachable;
@@ -89,22 +89,22 @@ fn assign(comptime T: type, value: *T, flag: []const u8, text: []const u8, repea
     if (flag.len < 3 or flag.len - 2 > buffer.len) return error.UnknownOption;
     const name = buffer[0 .. flag.len - 2];
     for (flag[2..], name) |byte, *out| out.* = if (byte == '-') '_' else byte;
-    inline for (std.meta.fields(T)) |field| {
-        if (comptime std.mem.eql(u8, field.name, "tools")) {
-            inline for (std.meta.fields(types.ToolPaths)) |tool| if (std.mem.eql(u8, name, tool.name)) {
-                @field(value.tools, tool.name) = text;
+    inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |field_name, FieldType| {
+        if (comptime std.mem.eql(u8, field_name, "tools")) {
+            inline for (@typeInfo(types.ToolPaths).@"struct".field_names) |tool_name| if (std.mem.eql(u8, name, tool_name)) {
+                @field(value.tools, tool_name) = text;
                 return;
             };
-        } else if (std.mem.eql(u8, name, field.name)) {
-            if (comptime field.type == []const []const u8) {
+        } else if (std.mem.eql(u8, name, field_name)) {
+            if (comptime FieldType == []const []const u8) {
                 if (repeated.len == 0) return error.InvalidOptionTable;
-                @field(value, field.name) = repeated;
-            } else if (comptime field.type == types.Integer or field.type == ?types.Integer) {
-                @field(value, field.name) = std.fmt.parseInt(types.Integer, text, 10) catch return error.InvalidInteger;
-            } else if (comptime field.type == types.Decision) {
-                @field(value, field.name) = std.meta.stringToEnum(types.Decision, text) orelse return error.InvalidDecision;
+                @field(value, field_name) = repeated;
+            } else if (comptime FieldType == types.Integer or FieldType == ?types.Integer) {
+                @field(value, field_name) = std.fmt.parseInt(types.Integer, text, 10) catch return error.InvalidInteger;
+            } else if (comptime FieldType == types.Decision) {
+                @field(value, field_name) = std.meta.stringToEnum(types.Decision, text) orelse return error.InvalidDecision;
             } else {
-                @field(value, field.name) = text;
+                @field(value, field_name) = text;
             }
             return;
         }

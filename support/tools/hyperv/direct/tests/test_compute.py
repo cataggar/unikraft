@@ -27,7 +27,7 @@ FAKE = TOOLS / "wamr-direct-fixture-cli"
 CONTROLLER = TOOLS / "wamr-direct-controller-fixture"
 SUPERVISOR = Path(
     os.environ["WAMR_CI_SUPERVISOR"]).resolve(strict=True)
-SDK = "a53205d77be3b880eb8f8b96679512ba58e2331a"
+SDK = "bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20"
 OWNER = "aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa"
 SUBSCRIPTION = "bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb"
 owner_spec = importlib.util.spec_from_file_location(
@@ -194,7 +194,7 @@ def dependency_custody(source):
                 "sha256": manifest_digest.hexdigest(),
             },
             "hash_verification": {
-                "algorithm": "zig-0.16.0-fetch-path",
+                "algorithm": "zig-0.17.0-fetch-path",
                 "count": 1,
                 "sha256": digest(json.dumps(
                     hash_records, sort_keys=True,
@@ -929,7 +929,7 @@ class Compute(unittest.TestCase):
             write(path, ("synthetic " + name).encode())
             files[name] = ci.digest(path)
         runtime_identity = dict(wamr_revision=SDK, minimal_wasi=False,
-                                compiler_profile="unikraft-x86_64", zig_version="0.16.0",
+                                compiler_profile="unikraft-x86_64", zig_version="0.17.0",
                                 files=files)
         write(app / "build/artifacts/identity.json", runtime_identity)
         source = dict(

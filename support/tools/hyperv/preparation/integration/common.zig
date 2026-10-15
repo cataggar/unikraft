@@ -249,7 +249,7 @@ pub const World = struct {
         if (!std.meta.eql(try fs.metadata(actual), try fs.metadata(selected))) return error.WrongPhysicalActor;
     }
     pub fn receipt(self: *World, directory: fs.Directory, phase: c.Phase, expected: Sha) !p.receipts.Link {
-        const name = try std.fmt.allocPrint(self.allocator, "{s}.receipt.json", .{@tagName(phase)});
+        const name = try self.allocator.print("{s}.receipt.json", .{@tagName(phase)});
         const record = try self.read(p.receipts.Receipt, directory, name, expected);
         try requireReceiptPhase(record.value.phase, phase);
         const result: p.receipts.Link = .{ .receipt = record.value, .sha256 = record.sha256 };

@@ -58,7 +58,7 @@ const Fixture = struct {
     }
 
     fn save(self: *Fixture, name: []const u8, bytes: []const u8) ![]const u8 {
-        const path = try std.fmt.allocPrint(self.allocator, "{s}/{d}-{s}", .{ self.root, self.cases, name });
+        const path = try self.allocator.print("{s}/{d}-{s}", .{ self.root, self.cases, name });
         try commands.write(self.io, path, bytes);
         return path;
     }
@@ -225,7 +225,7 @@ pub fn main(init: std.process.Init) !void {
     if (std.mem.eql(u8, args[6], "fixed-heap")) try heapRegressions(&fixture);
     if (std.mem.eql(u8, args[6], "single"))
         try fixture.cli(&.{ "smp", "--image", image_path, "--max-cpus", "2", "--nm", nm, "--objdump", objdump }, 1, null);
-    const report = try std.fmt.allocPrint(allocator, "PASS: {s}: {d} native CLI cases; real C/Zig object + linked ELF, never executed as a guest\n", .{ args[6], fixture.cases });
+    const report = try allocator.print("PASS: {s}: {d} native CLI cases; real C/Zig object + linked ELF, never executed as a guest\n", .{ args[6], fixture.cases });
     try commands.write(init.io, try std.fs.path.join(allocator, &.{ root, "summary.txt" }), report);
     try std.Io.File.stdout().writeStreamingAll(init.io, report);
 }
@@ -291,15 +291,15 @@ fn operandRegressions(f: *Fixture) !void {
     for ([_][]const u8{ "proof_imul_one", "proof_imul_zero" }, [_]u8{ 0, 1 }) |name, status|
         try constructorCase(f, name, status, if (status == 1) "DriverArgumentMismatch" else null);
     for ([_][]const u8{ "ah", "ch", "dh", "bh", "high_write" }) |alias| {
-        try constructorCase(f, try std.fmt.allocPrint(f.allocator, "proof_{s}_zero", .{alias}), 0, null);
-        try constructorCase(f, try std.fmt.allocPrint(f.allocator, "proof_{s}_nonzero", .{alias}), 1, "DriverArgumentMismatch");
+        try constructorCase(f, try f.allocator.print("proof_{s}_zero", .{alias}), 0, null);
+        try constructorCase(f, try f.allocator.print("proof_{s}_nonzero", .{alias}), 1, "DriverArgumentMismatch");
     }
     const before_memory_flags = f.cases;
     for ([_][]const u8{ "b", "w", "l", "q" }) |suffix| {
         for ([_][]const u8{ "zero", "bad", "unknown_zero", "unknown_bad" }, [_]u8{ 0, 1, 0, 1 }) |variant, status| {
-            try constructorCase(f, try std.fmt.allocPrint(f.allocator, "proof_test_{s}_{s}", .{ suffix, variant }), status, if (status == 1) "DriverArgumentMismatch" else null);
+            try constructorCase(f, try f.allocator.print("proof_test_{s}_{s}", .{ suffix, variant }), status, if (status == 1) "DriverArgumentMismatch" else null);
         }
-        try constructorCase(f, try std.fmt.allocPrint(f.allocator, "proof_cmp_{s}_nonzero", .{suffix}), 0, null);
+        try constructorCase(f, try f.allocator.print("proof_cmp_{s}_nonzero", .{suffix}), 0, null);
     }
     try std.testing.expectEqual(20, f.cases - before_memory_flags);
     try constructorCase(f, "proof_masked_stack_disjoint", 0, null);
@@ -633,10 +633,10 @@ fn mutations(f: *Fixture) !void {
     }
     try std.testing.expectEqual(1, events);
     for ([_][]const u8{ "storvsc", "netvsc" }) |driver| {
-        const ctor = try std.fmt.allocPrint(f.allocator, "lib{s}_vmbus_register_driver", .{driver});
-        const entry = try std.fmt.allocPrint(f.allocator, "__uk_ctortab1_{s}", .{ctor});
-        const descriptor = try std.fmt.allocPrint(f.allocator, "{s}_driver", .{driver});
-        const ids = try std.fmt.allocPrint(f.allocator, "{s}_device_ids", .{driver});
+        const ctor = try f.allocator.print("lib{s}_vmbus_register_driver", .{driver});
+        const entry = try f.allocator.print("__uk_ctortab1_{s}", .{ctor});
+        const descriptor = try f.allocator.print("{s}_driver", .{driver});
+        const ids = try f.allocator.print("{s}_device_ids", .{driver});
         var bytes = try f.edit();
         try f.pointer(bytes, try f.model.address(entry), try f.model.address("_vmbus_register_driver"));
         try f.refuse("ctor-pointer", bytes, "drivers", "ConstructorPointerMismatch");
@@ -738,14 +738,14 @@ fn processCases(f: *Fixture, self: []const u8, image: []const u8, nm_text: []con
     }
     for ([_][]const u8{ "--nm", "--objdump" }) |option| {
         for ([_][]const u8{ "exit", "empty", "malformed" }) |kind| {
-            const command = try std.fmt.allocPrint(f.allocator, "\"{s}\" --mock {s}", .{ self, kind });
+            const command = try f.allocator.print("\"{s}\" --mock {s}", .{ self, kind });
             try f.cli(&.{ "irq", "--image", image, "--nm", if (std.mem.eql(u8, option, "--nm")) command else f.nm, "--objdump", if (std.mem.eql(u8, option, "--objdump")) command else f.objdump }, 1, if (std.mem.eql(u8, kind, "exit")) "ProofToolFailed" else if (std.mem.eql(u8, kind, "empty")) "EmptyProofToolOutput" else "Malformed");
         }
         const text = if (std.mem.eql(u8, option, "--nm")) nm_text else dump;
         var length = text.len;
         while (length > 0 and text[length - 1] == '\n') : (length -= 1) {}
         const path = try f.save("truncated-tool-output", text[0..length]);
-        const command = try std.fmt.allocPrint(f.allocator, "\"{s}\" --mock replay \"{s}\"", .{ self, path });
+        const command = try f.allocator.print("\"{s}\" --mock replay \"{s}\"", .{ self, path });
         try f.cli(&.{ "irq", "--image", image, "--nm", if (std.mem.eql(u8, option, "--nm")) command else f.nm, "--objdump", if (std.mem.eql(u8, option, "--objdump")) command else f.objdump }, 1, "Malformed");
     }
     {
@@ -754,19 +754,19 @@ fn processCases(f: *Fixture, self: []const u8, image: []const u8, nm_text: []con
         const start = if (std.mem.lastIndexOfScalar(u8, nm_text[0..label], '\n')) |newline| newline + 1 else 0;
         changed[start] = if (changed[start] == '0') '1' else '0';
         const path = try f.save("wrong-nm-address", changed);
-        const command = try std.fmt.allocPrint(f.allocator, "\"{s}\" --mock replay \"{s}\"", .{ self, path });
+        const command = try f.allocator.print("\"{s}\" --mock replay \"{s}\"", .{ self, path });
         try f.cli(&.{ "irq", "--image", image, "--nm", command, "--objdump", f.objdump }, 1, "NmAddressMismatch");
         const end = std.mem.indexOfScalarPos(u8, nm_text, start, '\n').? + 1;
         const omitted = try std.mem.concat(f.allocator, u8, &.{ nm_text[0..start], nm_text[end..] });
         const missing_path = try f.save("incomplete-nm-symbols", omitted);
-        const missing_command = try std.fmt.allocPrint(f.allocator, "\"{s}\" --mock replay \"{s}\"", .{ self, missing_path });
+        const missing_command = try f.allocator.print("\"{s}\" --mock replay \"{s}\"", .{ self, missing_path });
         try f.cli(&.{ "irq", "--image", image, "--nm", missing_command, "--objdump", f.objdump }, 1, "IncompleteNmOutput");
     }
     {
         const label = std.mem.indexOf(u8, dump, " <ukplat_time_init>:\n").?;
         const start = std.mem.lastIndexOfScalar(u8, dump[0..label], '\n').? + 1;
         const path = try f.save("incomplete-disassembly-at-line-boundary", dump[0..start]);
-        const command = try std.fmt.allocPrint(f.allocator, "\"{s}\" --mock replay \"{s}\"", .{ self, path });
+        const command = try f.allocator.print("\"{s}\" --mock replay \"{s}\"", .{ self, path });
         try f.cli(&.{ "irq", "--image", image, "--nm", f.nm, "--objdump", command }, 1, "IncompleteDisassembly");
     }
     for ([_]bool{ false, true }) |branch| {
@@ -774,7 +774,7 @@ fn processCases(f: *Fixture, self: []const u8, image: []const u8, nm_text: []con
             try f.edge("uk_boot_entry", "ukplat_lcpu_startup_hook")
         else
             f.model.program.instructions.items[0];
-        const marker = try std.fmt.allocPrint(f.allocator, "{x}:", .{instruction.address});
+        const marker = try f.allocator.print("{x}:", .{instruction.address});
         const start = std.mem.indexOf(u8, dump, marker).? + marker.len;
         const changed = try f.allocator.dupe(u8, dump);
         var position = start;
@@ -785,13 +785,13 @@ fn processCases(f: *Fixture, self: []const u8, image: []const u8, nm_text: []con
         }
         changed[position] = if (changed[position] == '0') '1' else '0';
         const path = try f.save("inconsistent-disassembly", changed);
-        const command = try std.fmt.allocPrint(f.allocator, "\"{s}\" --mock replay \"{s}\"", .{ self, path });
+        const command = try f.allocator.print("\"{s}\" --mock replay \"{s}\"", .{ self, path });
         try f.cli(&.{ "irq", "--image", image, "--nm", f.nm, "--objdump", command }, 1, if (branch) "DisassemblyTargetMismatch" else "DisassemblyBytesMismatch");
     }
     {
         const bytes = try f.edit();
         for (f.model.image.programs, 0..) |program, index| {
-            if (program.p_type == std.elf.PT_LOAD and program.p_flags & std.elf.PF_X != 0)
+            if (program.type == .LOAD and @as(u32, @bitCast(program.flags)) & std.elf.PF_X != 0)
                 std.mem.writeInt(u32, bytes[@intCast(f.model.image.header.phoff + index * 56 + 4)..][0..4], std.elf.PF_R, .little);
         }
         try f.refuse("non-executable-load-segment", bytes, "irq", "AddressOutsideExecutableSegment");

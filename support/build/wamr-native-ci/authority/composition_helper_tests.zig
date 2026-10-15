@@ -42,7 +42,7 @@ fn checkCancel(userdata: ?*anyopaque) std.Io.Cancelable!void {
 fn assertReaped(pid: linux.pid_t) !void {
     try std.testing.expect(pid > 1);
     var status: u32 = 0;
-    try std.testing.expectEqual(linux.E.CHILD, linux.errno(linux.waitpid(pid, &status, linux.W.NOHANG)));
+    try std.testing.expectEqual(linux.E.CHILD, linux.errno(linux.waitpid(pid, @ptrCast(&status), linux.W.NOHANG)));
 }
 
 fn namespaceUnavailable(err: anyerror) !void {
@@ -204,7 +204,7 @@ fn waitOwned(pid: linux.pid_t, milliseconds: u64) !u32 {
     const deadline = try core.process.Deadline.afterMilliseconds(milliseconds);
     var status: u32 = 0;
     while (!try deadline.expired()) {
-        const waited = linux.waitpid(pid, &status, linux.W.NOHANG);
+        const waited = linux.waitpid(pid, @ptrCast(&status), linux.W.NOHANG);
         if (linux.errno(waited) == .SUCCESS and waited == @as(usize, @intCast(pid))) return status;
         if (linux.errno(waited) != .SUCCESS and linux.errno(waited) != .INTR) return error.ForeignTestReap;
         var pause: [0]linux.pollfd = .{};

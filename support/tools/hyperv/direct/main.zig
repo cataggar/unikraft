@@ -112,10 +112,8 @@ pub fn parse(comptime T: type, allocator: std.mem.Allocator, bytes: []const u8) 
 fn shape(comptime T: type, value: std.json.Value) anyerror!void {
     switch (@typeInfo(T)) {
         .@"struct" => |info| {
-            var names: [info.fields.len][]const u8 = undefined;
-            inline for (info.fields, 0..) |field, i| names[i] = field.name;
-            const object = try c.exactFields(value, &names);
-            inline for (info.fields) |field| try shape(field.type, object.get(field.name).?);
+            const object = try c.exactFields(value, info.field_names);
+            inline for (info.field_names, info.field_types) |name, Field| try shape(Field, object.get(name).?);
         },
         .optional => |info| if (value != .null) {
             try shape(info.child, value);

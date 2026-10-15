@@ -214,7 +214,7 @@ pub const Client = struct {
         var request = sdk.http.Request.init(a, plan.method, url);
         defer request.deinit();
         request.body = plan.body;
-        const bearer = std.fmt.allocPrint(a, "Bearer {s}", .{self.token.value.bytes}) catch |err| return .{ .failed = wire.Failure.local(.arm, err, .not_started, null) };
+        const bearer = a.print("Bearer {s}", .{self.token.value.bytes}) catch |err| return .{ .failed = wire.Failure.local(.arm, err, .not_started, null) };
         request.setHeader("Authorization", bearer) catch |err| return .{ .failed = wire.Failure.local(.arm, err, .not_started, null) };
         request.setHeader("Accept", "application/json") catch |err| return .{ .failed = wire.Failure.local(.arm, err, .not_started, null) };
         if (request.body != null) request.setHeader("Content-Type", "application/json") catch |err| return .{ .failed = wire.Failure.local(.arm, err, .not_started, null) };
@@ -276,7 +276,7 @@ pub const Client = struct {
         const resource_poll = async_raw == null and result_url == null and reply.status == 202;
         var poll_url: ?[]const u8 = if (async_raw) |raw| self.pollUrl(a, plan, raw, .status) catch |err| return fail(err, .accepted, reply.status) else null;
         if (poll_url == null and reply.status == 202) {
-            if (result_url) |location| poll_url = location else if (plan.target) |target| poll_url = std.fmt.allocPrint(a, "{s}{s}?api-version={s}", .{ s.arm_host, target.path(a, self.authority) catch |err| return fail(err, .accepted, reply.status), plan.version }) catch |err| return fail(err, .accepted, reply.status) else return fail(error.MissingOperationUrl, .accepted, reply.status);
+            if (result_url) |location| poll_url = location else if (plan.target) |target| poll_url = a.print("{s}{s}?api-version={s}", .{ s.arm_host, target.path(a, self.authority) catch |err| return fail(err, .accepted, reply.status), plan.version }) catch |err| return fail(err, .accepted, reply.status) else return fail(error.MissingOperationUrl, .accepted, reply.status);
         }
         var polls: u16 = 0;
         while (poll_url) |url| {
@@ -452,27 +452,27 @@ pub const Client = struct {
         const relative = try s.relativeUrl(raw);
         const path = relative[0..std.mem.indexOfScalar(u8, relative, '?').?];
         if (plan.operation == .group_delete) {
-            const result_prefix = try std.fmt.allocPrint(a, "/subscriptions/{s}/operationresults/", .{self.authority.subscription});
+            const result_prefix = try a.print("/subscriptions/{s}/operationresults/", .{self.authority.subscription});
             if (std.ascii.startsWithIgnoreCase(path, result_prefix)) {
                 try s.queryVersion(relative, plan.version, false);
                 _ = try s.uuid(path[result_prefix.len..]);
-                return std.fmt.allocPrint(a, "{s}{s}", .{ s.arm_host, relative });
+                return a.print("{s}{s}", .{ s.arm_host, relative });
             }
         }
         if (plan.target) |target| {
             const expected = try target.path(a, self.authority);
             if (std.ascii.eqlIgnoreCase(path, expected)) {
                 try s.queryVersion(relative, plan.version, false);
-                return std.fmt.allocPrint(a, "{s}{s}", .{ s.arm_host, relative });
+                return a.print("{s}{s}", .{ s.arm_host, relative });
             }
-            const prefix = try std.fmt.allocPrint(a, "{s}/operationStatuses/", .{expected});
+            const prefix = try a.print("{s}/operationStatuses/", .{expected});
             if (std.ascii.startsWithIgnoreCase(path, prefix)) {
                 try s.queryVersion(relative, plan.version, false);
                 _ = try s.uuid(path[prefix.len..]);
-                return std.fmt.allocPrint(a, "{s}{s}", .{ s.arm_host, relative });
+                return a.print("{s}{s}", .{ s.arm_host, relative });
             }
         }
-        const prefix = try std.fmt.allocPrint(a, "/subscriptions/{s}/providers/{s}/locations/{s}/", .{ self.authority.subscription, plan.provider, self.authority.location });
+        const prefix = try a.print("/subscriptions/{s}/providers/{s}/locations/{s}/", .{ self.authority.subscription, plan.provider, self.authority.location });
         if (!std.ascii.startsWithIgnoreCase(path, prefix)) return error.UnsafeOperationScope;
         const rest = path[prefix.len..];
         const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.UnsafeOperationScope;
@@ -486,7 +486,7 @@ pub const Client = struct {
             try s.queryVersion(relative, plan.version, false);
         }
         _ = try s.uuid(rest[slash + 1 ..]);
-        return std.fmt.allocPrint(a, "{s}{s}", .{ s.arm_host, relative });
+        return a.print("{s}{s}", .{ s.arm_host, relative });
     }
 
     fn absent(self: *Client, effect: wire.Effect) wire.Outcome(Result) {

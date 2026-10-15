@@ -197,19 +197,19 @@ fn namespaceReport(bytes: []const u8) !azure_runtime.NamespaceReport {
 
 test "namespace refusal names the step the host denied" {
     comptime {
-        const fields = @typeInfo(azure_runtime.NamespaceStage).@"enum".fields;
+        const fields = @typeInfo(azure_runtime.NamespaceStage).@"enum".field_names;
         if (fields.len != namespace_stages.len)
             @compileError("every namespace stage needs a refusal regression");
     }
     for (namespace_stages, 0..) |stage, index| {
         // Zero is reserved: it cannot be told apart from an unwritten report.
-        try testing.expect(@intFromEnum(stage) != 0);
+        try testing.expect(@backingInt(stage) != 0);
         try testing.expectEqual(
             stage,
-            azure_runtime.NamespaceStage.fromCode(@intFromEnum(stage)).?,
+            azure_runtime.NamespaceStage.fromCode(@backingInt(stage)).?,
         );
         for (namespace_stages[index + 1 ..]) |other| {
-            try testing.expect(@intFromEnum(stage) != @intFromEnum(other));
+            try testing.expect(@backingInt(stage) != @backingInt(other));
             try testing.expect(!std.mem.eql(
                 u8,
                 @errorName(stage.refusal()),
@@ -239,7 +239,7 @@ test "namespace report separates a re-exec from a refused step" {
         else => return error.ExpectedReexecutedReport,
     }
     for (namespace_stages) |stage| {
-        switch (try namespaceReport(&.{@intFromEnum(stage)})) {
+        switch (try namespaceReport(&.{@backingInt(stage)})) {
             .refused => |refused| try testing.expectEqual(stage, refused),
             else => return error.ExpectedRefusedReport,
         }
@@ -256,15 +256,13 @@ test "namespace report separates a re-exec from a refused step" {
 test "system loader preload path must remain absent" {
     var fixture = try support.Fixture.init();
     defer fixture.deinit();
-    const present = try std.fmt.allocPrintSentinel(
-        allocator,
+    const present = try allocator.printSentinel(
         "{s}/{s}/ld.so.preload",
         .{ support.options.test_root.?, fixture.name },
         0,
     );
     defer allocator.free(present);
-    const missing = try std.fmt.allocPrintSentinel(
-        allocator,
+    const missing = try allocator.printSentinel(
         "{s}/{s}/missing.preload",
         .{ support.options.test_root.?, fixture.name },
         0,
@@ -332,7 +330,7 @@ test "pinned interpreter changed in place or replaced refuses before child creat
         defer fixture.deinit();
         var lock = try fixture.directory.lock(io);
         defer lock.close(io);
-        const path = try std.fmt.allocPrint(allocator, "{s}/{s}/python", .{ support.options.test_root.?, fixture.name });
+        const path = try allocator.print("{s}/{s}/python", .{ support.options.test_root.?, fixture.name });
         defer allocator.free(path);
         var file = try fixture.directory.dir.createFile(io, "python", .{ .permissions = .fromMode(0o700) });
         try file.writePositionalAll(io, "synthetic interpreter", 0);
@@ -377,7 +375,7 @@ test "local version parser requires complete exact bounded Azure version schema"
         "",                                                                                                                                      "{}",                                                                                                           "null",                                                                                                           "true",                                                                                                                        "[]", valid ++ valid, "noise" ++ valid,
         "{\"azure-cli\":\"2.80.0\",\"azure-cli\":\"2.80.0\",\"azure-cli-core\":\"2.80.0\",\"azure-cli-telemetry\":\"1.1.0\",\"extensions\":{}}", "{\"azure-cli\":\"2.80.0\",\"azure-cli-core\":\"2.81.0\",\"azure-cli-telemetry\":\"1.1.0\",\"extensions\":{}}", "{\"azure-cli\":\"-2.80.0\",\"azure-cli-core\":\"-2.80.0\",\"azure-cli-telemetry\":\"1.1.0\",\"extensions\":{}}", "{\"azure-cli\":\"2.80.0\",\"azure-cli-core\":\"2.80.0\",\"azure-cli-telemetry\":\"1.1.0\",\"extensions\":[],\"extra\":true}",
     }) |invalid| try testing.expectError(error.CliVersionInvalid, launcher.validateVersion(allocator, invalid));
-    try testing.expectError(error.CliVersionInvalid, launcher.validateVersion(allocator, &([_]u8{'x'} ** 4097)));
+    try testing.expectError(error.CliVersionInvalid, launcher.validateVersion(allocator, &(@as([4097]u8, @splat('x')))));
 }
 
 test "uploader uses the original native job parser and checks actual file budgets before spawning" {
@@ -406,7 +404,7 @@ test "uploader uses the original native job parser and checks actual file budget
         .cancellation = &cancellation,
     };
     try adapter.initialize();
-    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ support.options.test_root.?, fixture.name });
+    const path = try allocator.print("{s}/{s}", .{ support.options.test_root.?, fixture.name });
     defer allocator.free(path);
     const base = "{\"contract\":\"uk.hyperv.transfer-job\",\"schema_version\":1,\"kind\":\"pages\",\"request\":\"request.json\",\"sas\":\"sas.txt\",";
     const invalid = try lock.createImmutable(io, "invalid-job.json", base ++ "\"timeout_ms\":4000,\"cleanup_ms\":5000}");
@@ -467,7 +465,7 @@ test "HUP INT TERM latch cancellation without suppressing budgeted owned cleanup
         sender.join();
         try testing.expectEqual(.cancelled, result.execution.failures.primary.?.category);
         try testing.expect(result.execution.cleanup_complete);
-        try testing.expectEqual(@as(?u8, @intCast(@intFromEnum(signal))), cancellation.signal());
+        try testing.expectEqual(@as(?u8, @intCast(@backingInt(signal))), cancellation.signal());
         try testing.expectError(error.Cancelled, adapter.run(.primary, .azure, &.{"environment"}, &lock, "forbidden", "forbidden-err"));
         try budgets.beginCleanup();
         budgets.expires_unix = 0;

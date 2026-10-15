@@ -74,11 +74,11 @@ test "admission synthetic frozen context preserves exact canonical fields and ev
     const value = try records.admission(plan.value, expected.value.plan, approved.value, expected.value.authorization, approved.value.recorded_unix);
     try t.expectEqualStrings(try golden(alloc, "admission"), try records.admissionBytes(alloc, value, approved.value.recorded_unix));
     try admission.Test.paths(plan.value, paths(plan.value));
-    inline for (std.meta.fields(types.ToolPaths)) |field| {
+    inline for (@typeInfo(types.ToolPaths).@"struct".field_names) |field_name| {
         var supplied = paths(plan.value);
-        @field(supplied, field.name) = "/different/tool";
+        @field(supplied, field_name) = "/different/tool";
         try t.expectError(error.ToolBindingMismatch, admission.Test.paths(plan.value, supplied));
-        @field(supplied, field.name) = "";
+        @field(supplied, field_name) = "";
         try t.expectError(error.UnsafePath, admission.Test.paths(plan.value, supplied));
     }
     try admission.Test.planBinding(a, plan.value, plan.value);
@@ -123,7 +123,7 @@ test "admission real run refuses denial pending expiry and exact mismatches befo
             changed.expires_unix = now;
         }
 
-        if (case == 2) changed.candidate_sha256 = "f" ** 64;
+        if (case == 2) changed.candidate_sha256 = &@as([64]u8, @splat('f'));
         if (case == 5) {
             const replacement = try alloc.alloc(u8, decision.reference.len);
             @memset(replacement, 'x');
@@ -131,7 +131,7 @@ test "admission real run refuses denial pending expiry and exact mismatches befo
         }
         var bytes = try canonical(alloc, changed);
         if (case == 3) bytes = try std.mem.replaceOwned(u8, alloc, bytes, "\"decision\":\"approved\"", "\"decision\":\"pending\"");
-        const name = try std.fmt.allocPrint(alloc, "authorization-{d}.json", .{case});
+        const name = try alloc.print("authorization-{d}.json", .{case});
         try fixture.write(name, bytes);
         const authorization_path = try fixture.join(alloc, name);
         const plan_digest = std.fmt.bytesToHex(tx.hash(plan_bytes), .lower);
@@ -169,9 +169,9 @@ test "admission candidate remains no authority with all six flags false and both
     const alloc = arena.allocator();
     const plan = try records.parse(types.Plan, alloc, try golden(alloc, "plan"));
     var candidate: types.compute.CandidateScope = undefined;
-    inline for (std.meta.fields(types.compute.CandidateScope)) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "schema") and !std.mem.eql(u8, field.name, "version") and !std.mem.eql(u8, field.name, "purpose") and !std.mem.eql(u8, field.name, "authority") and !std.mem.eql(u8, field.name, "approval"))
-            @field(candidate, field.name) = @field(plan.value, field.name);
+    inline for (@typeInfo(types.compute.CandidateScope).@"struct".field_names) |field_name| {
+        if (comptime !std.mem.eql(u8, field_name, "schema") and !std.mem.eql(u8, field_name, "version") and !std.mem.eql(u8, field_name, "purpose") and !std.mem.eql(u8, field_name, "authority") and !std.mem.eql(u8, field_name, "approval"))
+            @field(candidate, field_name) = @field(plan.value, field_name);
     }
     candidate.schema = "uk.wamr.direct-compute";
     candidate.version = 2;
@@ -188,9 +188,9 @@ test "admission candidate remains no authority with all six flags false and both
         .expires_unix = 0,
     };
     try admission.Test.candidateBytes(a, try canonical(alloc, candidate));
-    inline for (std.meta.fields(@TypeOf(candidate.approval))) |field| {
+    inline for (@typeInfo(@TypeOf(candidate.approval)).@"struct".field_names, @typeInfo(@TypeOf(candidate.approval)).@"struct".field_types) |field_name, FieldType| {
         var changed = candidate;
-        @field(changed.approval, field.name) = if (field.type == bool) true else 1;
+        @field(changed.approval, field_name) = if (FieldType == bool) true else 1;
         try t.expectError(error.AuthorityNotAllowed, admission.Test.candidateBytes(a, try canonical(alloc, changed)));
     }
 }
@@ -315,11 +315,11 @@ test "admission retained tool custody rejects links and renamed ancestors" {
     var changed = bound;
     changed.path = link;
     try t.expectError(error.UnsafeFile, admission.Test.RetainedArtifact.open(ctx, changed, .tool, 65536));
-    const tool_z = try a.dupeZ(u8, tool_path);
+    const tool_z = try a.dupeSentinel(u8, tool_path, 0);
     defer a.free(tool_z);
     const hardlink = try fixture.join(a, "hardlink");
     defer a.free(hardlink);
-    const hardlink_z = try a.dupeZ(u8, hardlink);
+    const hardlink_z = try a.dupeSentinel(u8, hardlink, 0);
     defer a.free(hardlink_z);
     if (std.os.linux.errno(std.os.linux.linkat(std.os.linux.AT.FDCWD, tool_z, std.os.linux.AT.FDCWD, hardlink_z, 0)) != .SUCCESS) return error.FixtureLink;
     try t.expectError(error.FileChanged, held.revalidate(ctx));
@@ -442,7 +442,7 @@ test "admission preserves existing ledger old-marker missing-sentinel verifier r
     defer fixture.deinit();
     const campaign = "11111111-1111-1111-1111-111111111111";
     const ledger = "22222222-2222-2222-2222-222222222222";
-    const marker = try types.compute.ledgerMarkerBytes(a, campaign, ledger, "a" ** 64);
+    const marker = try types.compute.ledgerMarkerBytes(a, campaign, ledger, &@as([64]u8, @splat('a')));
     defer a.free(marker);
     try fixture.write(types.compute.ledger_marker_name, marker);
     try t.expectError(error.FileNotFound, types.compute.ledgerProposal(a, io, fixture.path, campaign, ledger));

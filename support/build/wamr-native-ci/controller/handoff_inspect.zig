@@ -43,7 +43,7 @@ pub fn bind(accepted: *accepted_run.AcceptedRun, output: []const u8) !plan.Roots
     const compute = try std.fs.path.join(a, &.{ accepted.root, "compute" });
     var tools: [@import("input_custody.zig").host_tools.len][]const u8 = undefined;
     for (@import("input_custody.zig").host_tools, 0..) |tool, i| {
-        const role = try std.fmt.allocPrint(a, "tool:{s}", .{tool});
+        const role = try a.print("tool:{s}", .{tool});
         tools[i] = try inputPath(accepted, role, null);
     }
     const package_tool = try std.fs.path.join(a, &.{ compute, "tools/bin/wamr-ci-package" });

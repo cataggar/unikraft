@@ -122,7 +122,7 @@ pub fn validate(object: format.Object, profile: Profile) !void {
         // Zig emits the const hypercall storage as PROGBITS/A, not AX. The
         // final image's executable mapping is a separate owner's proof.
         const flags: u64 = std.elf.SHF_ALLOC | (if (page.nobits) @as(u64, std.elf.SHF_WRITE) else 0);
-        if (sh.sh_type != @intFromEnum(if (page.nobits) std.elf.SHT.NOBITS else .PROGBITS) or
+        if (sh.sh_type != @backingInt(if (page.nobits) std.elf.SHT.NOBITS else .PROGBITS) or
             sh.sh_size != 4096 or sh.sh_addralign != 4096 or sh.sh_flags != flags or
             sh.sh_addr != 0 or sh.sh_offset % 4096 != 0) return error.InvalidPageSection;
         const symbol = try object.definition(page.symbol, true);
@@ -156,7 +156,7 @@ fn nmRow(line: []const u8) !Nm {
 
 pub fn checkNm(object: format.Object, text: []const u8, names: []const []const u8, mapping: bool) !void {
     if (text.len > tools.output_limit) return error.ToolOutputLimit;
-    var found: [32]bool = [_]bool{false} ** 32;
+    var found: [32]bool = @as([32]bool, @splat(false));
     if (names.len > found.len) return error.InvalidNmOutput;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
@@ -177,7 +177,7 @@ pub fn checkNm(object: format.Object, text: []const u8, names: []const []const u
 
 pub fn checkSections(object: format.Object, text: []const u8) !void {
     if (text.len > tools.output_limit) return error.ToolOutputLimit;
-    var found: [pages.len]bool = [_]bool{false} ** pages.len;
+    var found: [pages.len]bool = @as([pages.len]bool, @splat(false));
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");

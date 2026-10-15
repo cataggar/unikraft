@@ -255,7 +255,7 @@ fn observe(
     if (!std.crypto.timing_safe.eql(c.Sha, raw_record.sha256, prefix_sha256)) return error.RawVhdMismatch;
     var vhd_path_buffer: [64]u8 = undefined;
     const checked = try miz.validateFixedVhd(allocator, io, .{
-        .path = try std.fmt.bufPrint(&vhd_path_buffer, "/proc/self/fd/{d}", .{vhd.handle}),
+        .path = try std.mem.print(&vhd_path_buffer, "/proc/self/fd/{d}", .{vhd.handle}),
         .architecture = .x86_64,
         .expected_efi_sha256 = try binarySha(efi.sha256),
         .expected_virtual_size = c.image_bytes,
@@ -398,12 +398,12 @@ fn packageImpl(
     try requirePrivateDirectory(stage_dir);
     try directoryFile(lock.directory.dir).sync(io);
     var input_path_buffer: [64]u8 = undefined;
-    const input_path = try std.fmt.bufPrint(&input_path_buffer, "/proc/self/fd/{d}", .{input_file.handle});
+    const input_path = try std.mem.print(&input_path_buffer, "/proc/self/fd/{d}", .{input_file.handle});
     var raw_path_buffer: [96]u8 = undefined;
     var vhd_path_buffer: [96]u8 = undefined;
     const raw_build = try miz.build(allocator, io, .{
         .efi_path = input_path,
-        .output_path = try std.fmt.bufPrint(&raw_path_buffer, "/proc/self/fd/{d}/{s}", .{ stage_dir.handle, raw_name }),
+        .output_path = try std.mem.print(&raw_path_buffer, "/proc/self/fd/{d}/{s}", .{ stage_dir.handle, raw_name }),
         .output_format = .raw,
         .architecture = .x86_64,
         .esp_size = esp_bytes,
@@ -413,7 +413,7 @@ fn packageImpl(
     try requireInputUnchanged(io, input, input_file, before, expected_efi);
     const vhd_build = try miz.build(allocator, io, .{
         .efi_path = input_path,
-        .output_path = try std.fmt.bufPrint(&vhd_path_buffer, "/proc/self/fd/{d}/{s}", .{ stage_dir.handle, vhd_name }),
+        .output_path = try std.mem.print(&vhd_path_buffer, "/proc/self/fd/{d}/{s}", .{ stage_dir.handle, vhd_name }),
         .output_format = .vhd,
         .architecture = .x86_64,
         .esp_size = esp_bytes,
@@ -440,7 +440,7 @@ fn packageImpl(
 }
 
 fn syntheticEfi() [512]u8 {
-    var bytes = [_]u8{0} ** 512;
+    var bytes = @as([512]u8, @splat(0));
     bytes[0..2].* = "MZ".*;
     std.mem.writeInt(u32, bytes[0x3c..0x40], 0x80, .little);
     bytes[0x80..0x84].* = "PE\x00\x00".*;
@@ -478,8 +478,8 @@ fn nativeFixture() !NativeFixture {
         .virtual_size = c.image_bytes,
         .esp_offset_bytes = esp_offset,
         .esp_length_bytes = esp_bytes,
-        .disk_guid = [_]u8{1} ** 16,
-        .esp_partition_guid = [_]u8{2} ** 16,
+        .disk_guid = @as([16]u8, @splat(1)),
+        .esp_partition_guid = @as([16]u8, @splat(2)),
         .esp_volume_id = 3,
     };
     var vhd_build = raw_build;
@@ -566,7 +566,7 @@ test "package receipt rejects pin generation filenames modes sizes and zero iden
     changed.vhd.size -= 1;
     try std.testing.expectError(error.InvalidPackageRecord, validateReport(changed));
     changed = report;
-    changed.identities.disk_guid_le = [_]u8{'0'} ** 32;
+    changed.identities.disk_guid_le = @as([32]u8, @splat('0'));
     try std.testing.expectError(error.InvalidIdentity, validateReport(changed));
     changed = report;
     changed.identities.esp_volume_id = 0;

@@ -99,7 +99,7 @@ fn progress(a: std.mem.Allocator, io: std.Io, lock: *p.Locked, state: *c.State) 
 }
 fn retainSerial(a: std.mem.Allocator, io: std.Io, root: p.Directory, config: c.boot.config.Config, index: usize) !void {
     const serial_file = try f.record(a, io, try f.path(a, config.work_dir, c.boot.config.log_name), c.boot.config.max_serial, false);
-    const name = try std.fmt.allocPrint(a, "local-{s}-serial.log", .{c.modes[index]});
+    const name = try a.print("local-{s}-serial.log", .{c.modes[index]});
     try f.copy(io, serial_file, root, name);
 }
 pub fn bootConfig(a: std.mem.Allocator, state: c.State, index: usize) !c.boot.config.Config {
@@ -112,7 +112,7 @@ pub fn bootConfig(a: std.mem.Allocator, state: c.State, index: usize) !c.boot.co
         .qemu = state.inputs.qemu.path,
         .ovmf_code = state.inputs.code.path,
         .ovmf_vars = state.inputs.vars.path,
-        .work_dir = try f.path(a, state.input.state_dir, try std.fmt.allocPrint(a, "boot-{s}", .{c.modes[index]})),
+        .work_dir = try f.path(a, state.input.state_dir, try a.print("boot-{s}", .{c.modes[index]})),
         .expect = state.input.expect,
         .expect_main_return = 2,
         .timeout_ms = state.input.timeout_ms,
@@ -195,7 +195,7 @@ pub fn load(a: std.mem.Allocator, io: std.Io, lock: *p.Locked, self_executable: 
     for (0..4) |index| {
         const expected = state.boots[index] orelse return error.IncompleteMatrix;
         _ = try evidence(a, io, state, index, expected);
-        const alias = try root.read(io, a, try std.fmt.allocPrint(a, "local-{s}-serial.log", .{c.modes[index]}), c.boot.config.max_serial, try c.sha(expected.serial_sha256));
+        const alias = try root.read(io, a, try a.print("local-{s}-serial.log", .{c.modes[index]}), c.boot.config.max_serial, try c.sha(expected.serial_sha256));
         defer a.free(alias);
         if (alias.len != expected.serial_bytes) return error.SerialChanged;
     }

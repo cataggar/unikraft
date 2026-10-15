@@ -186,7 +186,7 @@ pub fn verify(
 /// not an unrelated reviewed binary supplied by the caller.
 pub fn requireCurrentExecutable(io: std.Io, record: Record) !void {
     if (!std.mem.eql(u8, c.compiler_version, builtin.zig_version_string)) return error.CompilerMismatch;
-    const host = if (builtin.cpu.arch == .aarch64) "aarch64_linux" else if (builtin.cpu.arch == .x86_64) "x86_64_linux" else return error.CompilerMismatch;
+    const host = if (builtin.target.cpu.arch == .aarch64) "aarch64_linux" else if (builtin.target.cpu.arch == .x86_64) "x86_64_linux" else return error.CompilerMismatch;
     if (!std.mem.eql(u8, host, @tagName(record.host_target))) return error.CompilerMismatch;
     const executable = record.producer.executable orelse return error.InvalidProvenance;
     const file = try std.Io.Dir.openFileAbsolute(io, "/proc/self/exe", .{});

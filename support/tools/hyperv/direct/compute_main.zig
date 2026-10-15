@@ -30,6 +30,14 @@ fn run(init: std.process.Init) !void {
         try writer.interface.writeAll("Compute handoff revalidated; authority=not_admitted.\n");
         return;
     }
+    if (args.len == 3 and std.mem.eql(u8, args[1], "historical-handoff")) {
+        var bytes = try core.private_files.readSensitiveAbsolute(init.io, a, args[2], 65536, null);
+        defer bytes.deinit();
+        try compute.verifyHistoricalHandoff(a, init.io, bytes.bytes());
+        var writer = std.Io.File.stdout().writerStreaming(init.io, &.{});
+        try writer.interface.writeAll("Historical compute handoff revalidated; authority=not_admitted.\n");
+        return;
+    }
     if (args.len == 3 and std.mem.eql(u8, args[1], "candidate")) {
         const candidate = try compute.loadCandidateScope(a, init.io, args[2]);
         defer candidate.deinit();

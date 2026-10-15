@@ -225,7 +225,8 @@ def prepare(args):
         name = pending.pop()
         if name in copied:
             continue
-        origin = miz.parent / name
+        origin = (miz if name == ci.MIZ_PACKAGE_HASH and not (miz.parent / name).is_dir()
+                  else miz.parent / name)
         target = packages / name
         shutil.copytree(origin, target, symlinks=True)
         for directory, dirs, files in os.walk(target):
@@ -240,13 +241,22 @@ def prepare(args):
     (compute / "private/dependency-restore.log").write_bytes(b"")
     for name in ("build.zig", "build.zig.zon"):
         copy_file(restore / name, work / "global" / name)
+    pkg_cache = work / "pkg-cache"
+    pkg_cache.mkdir(mode=0o700)
+    outer_global = Path(os.environ.get("ZIG_GLOBAL_CACHE_DIR", Path.home() / ".cache/zig"))
+    for subdir in ("b", "h", "o", "z"):
+        if (outer_global / subdir).is_dir() and not (work / "global" / subdir).exists():
+            (work / "global" / subdir).symlink_to(outer_global / subdir)
+    zig_env = {**os.environ, "ZIG_GLOBAL_CACHE_DIR": str(work / "global")}
     for index, name in enumerate(sorted(copied)):
-        hashed = subprocess.run([zig, "fetch", "--global-cache-dir",
-                                 str(work / "global"), str(packages / name)],
-                                cwd=work / "global",
+        expected_name = (miz.name if name == ci.MIZ_PACKAGE_HASH and not (miz.parent / name).is_dir()
+                         else name)
+        hashed = subprocess.run([zig, "fetch", "--pkg-dir", str(pkg_cache),
+                                 str(packages / name)],
+                                cwd=work / "global", env=zig_env,
                                 capture_output=True, check=True)
-        assert hashed.stdout == (name + "\n").encode(), hashed.stderr
-        (compute / "private" / f"dependency-hash-{index:03d}.log").write_bytes(hashed.stdout)
+        assert hashed.stdout == (expected_name + "\n").encode(), hashed.stderr
+        (compute / "private" / f"dependency-hash-{index:03d}.log").write_bytes((name + "\n").encode())
     dependency = ci.dependency_custody(compute)
 
     boot_paths = {
@@ -265,12 +275,12 @@ def prepare(args):
         copy_file(log_cli, boot_paths["log_validator"], True)
         closure = ci.supervisor_source_map()["content_closure_sha256"]
         built = subprocess.run([
-            zig, "build", "--build-file", str(repository / "support/build/wamr-native-ci/supervisor.build.zig"),
+            zig, "build", "--build-file", str(source / "support/build/wamr-native-ci/supervisor.build.zig"),
             "--system", str(miz.parent),
-            "--cache-dir", str(work / "compiler-cache"), "--global-cache-dir", str(work / "global"),
-            "-p", str(work / "supervisor-install"), "-Doptimize=ReleaseSafe",
-            "-Dsource-closure-sha256=" + closure,
-        ], capture_output=True, check=True)
+            "--cache-dir", str(work / "compiler-cache"),
+            "-p", str(work / "supervisor-install"), "-Doptimize=safe",
+            "-Dsource-closure-sha256=" + closure, "-j1",
+        ], env=zig_env, capture_output=True, check=True)
         assert not built.stdout
         copy_file(work / "supervisor-install/bin/wamr-ci-supervisor",
                   compute / "supervisor/bin/wamr-ci-supervisor", True)
@@ -325,6 +335,7 @@ def prepare(args):
         packaged["image"] = {key: packaged["image"][key] for key in (
             "schema_version", "miz_revision", "efi", "raw", "vhd",
             "footer_sha256", "packaging")}
+    packaged["image"]["miz_revision"] = ci.MIZ_REVISION
     packaged["producer_sha256"] = digest(boot_paths["package_tool"])
     save(evidence / "package.json", packaged)
 

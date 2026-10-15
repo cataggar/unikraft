@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 //! Translate the existing C adapter's actual capabilities, never Linux shims.
 const std = @import("std");
-pub const c = @cImport(@cInclude("workloads.h"));
+pub const c = @import("workloads_c");
 
 pub fn Services(comptime aot: type) type {
     return struct {

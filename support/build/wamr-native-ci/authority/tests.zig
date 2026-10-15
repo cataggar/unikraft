@@ -207,9 +207,9 @@ test "Python authority scenario inventory is checked and sorted" {
     const root = try c.exactFields(document.value(), &golden_fields.inventory);
     try expectLiteral(root, "schema", "uk.wamr.authority-python-scenario-inventory");
     try expectInt(root, "schema_version", @as(u8, 1));
-    try expectInt(root, "count", @as(u16, 196));
+    try expectInt(root, "count", @as(u16, 201));
     const items = try array(root.get("scenarios") orelse return error.MissingGolden);
-    try std.testing.expectEqual(@as(usize, 196), items.len);
+    try std.testing.expectEqual(@as(usize, 201), items.len);
     var previous: []const u8 = "";
     for (items) |item| {
         const current = try c.string(item);
@@ -262,7 +262,7 @@ fn expectCommand(commands: std.json.ObjectMap, name: []const u8, required: []con
     const options = try array(m.get("options") orelse return error.MissingGolden);
     const count = required.len + optional.len + repeated_required.len + repeated_optional.len;
     if (options.len != count or count > 64) return error.UnexpectedOptions;
-    var seen = [_]bool{false} ** 64;
+    var seen = @as([64]bool, @splat(false));
     for (options) |option| {
         const object = try c.exactFields(option, &contracts.cli.option_fields);
         const flags = try array(object.get("flags").?);
@@ -379,15 +379,15 @@ fn expectAzureRuntime(value: std.json.Value) !void {
 
 fn expectSchemas(value: std.json.Value) !void {
     const domains = comptime blk: {
-        const declarations = std.meta.declarations(contracts.schema_fields);
+        const declarations = @typeInfo(contracts.schema_fields).@"struct".decl_names;
         var names: [declarations.len][]const u8 = undefined;
-        for (declarations, 0..) |decl, index| names[index] = decl.name;
+        for (declarations, 0..) |decl_name, index| names[index] = decl_name;
         break :blk names;
     };
     const m = try c.exactFields(value, &domains);
-    inline for (comptime std.meta.declarations(contracts.schema_fields)) |decl| {
-        const expected = &@field(contracts.schema_fields, decl.name);
-        const items = try array(m.get(decl.name) orelse return error.MissingGolden);
+    inline for (comptime @typeInfo(contracts.schema_fields).@"struct".decl_names) |decl_name| {
+        const expected = &@field(contracts.schema_fields, decl_name);
+        const items = try array(m.get(decl_name) orelse return error.MissingGolden);
         try std.testing.expectEqual(expected.len, items.len);
         var previous: []const u8 = "";
         for (items) |item| {

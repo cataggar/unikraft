@@ -15,7 +15,7 @@ compiler-free image; all current application modes produce **no benchmark score*
 
 ## Build the actual EFI image
 
-Use Zig **0.16.0**, Make, Bison/Flex (including their usual `yacc`/`lex`
+Use Zig **0.17.0**, Make, Bison/Flex (including their usual `yacc`/`lex`
 names), M4, Bash, LLVM binary tools, and Python 3 for the still-native
 Make graph and separate log validators. Python does **not** prepare or
 verify artifacts, solve the config, or build the native image. From a
@@ -23,10 +23,12 @@ clean Unikraft checkout with a fresh application output root:
 
 ```sh
 umask 077
+export ZIG_LOCAL_PKG_DIR=/path/to/qualified/private/package-depot
 tool_root="$PWD/support/apps/wamr-aot/build/tool"
 test ! -e "$tool_root"
 zig build --build-file support/apps/wamr-aot/build.zig \
-  --prefix "$tool_root" -Doptimize=ReleaseSafe install
+  --system "$ZIG_LOCAL_PKG_DIR" \
+  --prefix "$tool_root" -Doptimize=safe install
 tool="$tool_root/bin/uk-wamr-aot-build"
 "$tool" prepare --repository "$PWD" --source /path/to/wamr
 "$tool" verify --repository "$PWD"
@@ -34,14 +36,28 @@ tool="$tool_root/bin/uk-wamr-aot-build"
 "$tool" native-images --repository "$PWD"
 ```
 
+`prepare`, `olddefconfig` and `native-images` require this explicit, private offline
+depot. Before capturing application inputs or launching the root Build, the
+native helper authenticates the pinned Translator and Aro packages using
+bounded local-path `zig fetch --pkg-dir` operations. It retains their physical
+metadata and checks it again after the root command. The root Build receives
+`--system` with the same depot; an absent, changed, unsafe or mismatched depot
+is refused, never replaced with an ambient cache or an implicit fetch.
+Preparation additionally authenticates the SDK's exact WABT and
+wasip2 packages with the same physical and immutable-hash checks. The Miz
+closure alone restores Translator/Aro, not those additional SDK dependencies;
+the qualified SDK closure must be restored into the bound depot too.
+
 `uk-wamr-aot-build prepare` exports exactly WAMR
-`a53205d77be3b880eb8f8b96679512ba58e2331a` from the local Git object
+`bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20` from the local Git object
 database into this application's ignored `build/wamr-source/`. It never
 builds in, changes, or inherits uncommitted files from the source checkout.
 It builds that revision's host `wamrc`, its freestanding library audit,
 then the integration archive. `prepare` requires `llvm-objcopy` to remove
 checkout-dependent debug sections, then checks the single Zig object member
-and uses pinned `zig ar` to repack it with a stable basename. The original
+and uses pinned `zig ar` to repack it with a stable basename. The Zig 0.17
+input member is exactly `wamr-aot_zcu.o` under the bound cache; the canonical
+archive retains `libwamr-aot_zcu.o`. The original
 archive's long-name table otherwise records an absolute, checkout-dependent
 cache path. These supervised commands retain linkable symbols and are included
 in the verified producer plan. The tiny wasm is genuinely generated from
@@ -59,10 +75,27 @@ of `--source`; it is incompatible with `--development-revision`.
 The same merged SDK supplies the single-root CoreMark bridge and optional
 workloads in [WORKLOADS.md](WORKLOADS.md). This source pin does not establish
 native boot, hardware or measurement qualification.
+Its independently fetched package hash is
+`wamr-0.1.0-_KKF6RgUqwCKfMFTu8Jh5YiEDdwxBEkIpHavOCNMh1uV`.
+This exact-generation compiler port was published by protected
+[WAMR PR #1081](https://github.com/cataggar/wamr/pull/1081). It retains the
+original native APIs and byte-identical C header, with the existing JIT fixture
+included in the package's selected paths. Source custody covers the complete
+selected archive, including the compiler-compatible CLI and WASI sources;
+the publication checks do not substitute for this application's qualification.
+
+Generated workload manifests pin the standalone `cataggar/translate-c`
+`62d06a5d3e93c82727544e8113e4762a315ca0ed` translator. The target-aware
+generated `workloads_c` module uses the actual workload/platform/SDK headers;
+it is not a handwritten C ABI substitute.
+The translator uses the merged Hearth #5 standalone `Translator` pattern,
+with default dependency arguments and explicit guest target/optimization.
+Its Aro dependency is pinned to the GitHub compatibility mirror; see
+[WORKLOADS.md](WORKLOADS.md) for both verified package hashes.
 
 The integration archive explicitly uses x86_64 SysV, PIC, no red zone,
 stack protector, stack checking, unwind tables, libc, or error tracing, and
-single-threaded Zig support. ReleaseSafe checks remain enabled. The wrapper
+single-threaded Zig support. Safe-mode checks remain enabled. The wrapper
 records the actual required native-link properties:
 
 * **PIC** is necessary for Unikraft's EFI PIE link; non-PIC absolute 32-bit
@@ -339,7 +372,8 @@ the private serial record with the installed native validator:
 
 ```sh
 zig build --build-file support/apps/wamr-aot/validator.build.zig \
-  --prefix "$PWD/.d/wamr-validator" -Doptimize=ReleaseSafe install
+  --cache-dir "$PWD/.d/wamr-validator-cache" \
+  --prefix "$PWD/.d/wamr-validator" -Doptimize=safe install
 "$PWD/.d/wamr-validator/bin/uk-wamr-log-validate" tiny \
   --log /private/attempt/hyperv-efi-boot.log \
   --identity support/apps/wamr-aot/build/artifacts/identity.json \
@@ -394,7 +428,8 @@ tiny-only serial scope. Run synthetic unit/property/fault, C oracle and native
 CLI integration fixtures without building or booting an image:
 
 ```sh
-zig build --build-file support/apps/wamr-aot/validator.build.zig -Doptimize=ReleaseSafe test
+zig build --build-file support/apps/wamr-aot/validator.build.zig \
+  --cache-dir "$PWD/.d/wamr-validator-cache" -Doptimize=safe test
 ```
 
 The native golden and property cases cover the former parser mutation matrices;
@@ -405,12 +440,18 @@ not the host Python version: native goldens include Unicode 16-only rejection
 ranges and printable Unicode 15 boundary cases.
 
 ```sh
+umask 077
+mkdir -p .zig-cache/tmp
+chmod 0700 .zig-cache .zig-cache/tmp
 zig build --build-file support/apps/wamr-aot/build.zig test-unit test-integration
 zig test build.zig --test-filter 'native WAMR'
 zig test support/build/native-image-graph.zig
 zig build test-hyperv-image-proofs test-native-compiler-options -j2
 zig build test-hyperv-clock -j2
 ```
+
+The fixture parents must be owner-only: Zig 0.17's testing helper defaults to
+writable directory modes, which the unchanged source-custody checks refuse.
 
 The app's native tests own producer golden bytes/modes, image command plans,
 refusals and supervision faults; the former parser-only Python tests have

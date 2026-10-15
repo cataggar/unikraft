@@ -1,6 +1,6 @@
 # Native Hyper-V private transfers
 
-This is the Linux Zig 0.16.0 transfer module for the Python-free
+This is the Linux Zig 0.17.0 transfer module for the Python-free
 #120/#89 migration. It does **not** authorize cloud execution, allocate disks,
 grant/revoke access, discover credentials, select subscription authority, or
 replace either controller. Azure execution remains paused.
@@ -266,12 +266,12 @@ mkdir -p "$out"/{global-cache,cache,tmp,home,outputs,restore}
 cp support/tools/hyperv/transfer/build.zig \
    support/tools/hyperv/transfer/build.zig.zon "$out/restore/"
 /home/g/.local/bin/zig build --build-file "$out/restore/build.zig" --fetch=all \
-  --cache-dir "$ZIG_LOCAL_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" -j2
+  --cache-dir "$ZIG_LOCAL_CACHE_DIR" -j2
 # Package restore is the only permitted network operation. All builds/tests
 # thereafter explicitly disable fetching:
 /home/g/.local/bin/zig build --build-file support/tools/hyperv/transfer/build.zig \
   test --system "$out/restore/zig-pkg" \
-  --cache-dir "$ZIG_LOCAL_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
+  --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
   --prefix "$out/outputs/install" -Dfixture-root="$out/outputs" -j2 --summary all
 # Use the same flags without `test` for the standalone library build.
 /home/g/.local/bin/zig fmt --check support/tools/hyperv/transfer/*.zig \

@@ -15,8 +15,8 @@ const Assets = struct {
     qemu: []const u8,
     raw: []u8,
     vhd: []u8,
-    code: [32]u8 = [_]u8{0xcc} ** 32,
-    vars: [512]u8 = [_]u8{0xa5} ** 512,
+    code: [32]u8 = @as([32]u8, @splat(0xcc)),
+    vars: [512]u8 = @as([512]u8, @splat(0xa5)),
 
     fn init(mode: u8) !Assets {
         var arena = std.heap.ArenaAllocator.init(a);
@@ -193,10 +193,10 @@ const Fixture = struct {
             self.private_downloads += 1;
         }
         const body = self.assets.body(artifact.role);
-        const url = try std.fmt.allocPrint(a, "https://fixture.blob.core.windows.net/private/{s}", .{artifact.blob});
+        const url = try a.print("https://fixture.blob.core.windows.net/private/{s}", .{artifact.blob});
         defer a.free(url);
         var length: [24]u8 = undefined;
-        var mock: wf.Mock = .{ .steps = &.{.{ .url = url, .response = body, .headers = &.{.{ .name = "Content-Length", .value = try std.fmt.bufPrint(&length, "{d}", .{body.len}) }} }} };
+        var mock: wf.Mock = .{ .steps = &.{.{ .url = url, .response = body, .headers = &.{.{ .name = "Content-Length", .value = try std.mem.print(&length, "{d}", .{body.len}) }} }} };
         var client = try mock.authenticated();
         defer client.deinit();
         const file = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_write, .follow_symlinks = false });
@@ -216,7 +216,7 @@ const Fixture = struct {
             try t.expect(self.public_receipt == null);
             self.public_receipt = try a.dupe(u8, bytes);
         }
-        const url = try std.fmt.allocPrint(self.assets.arena.allocator(), "https://fixture.blob.core.windows.net/private/runs/{s}/evidence/{s}/{s}/{s}", .{ f.run_text, @tagName(signed.phase), p.uuidText(signed.phase_nonce), name });
+        const url = try self.assets.arena.allocator().print("https://fixture.blob.core.windows.net/private/runs/{s}/evidence/{s}/{s}/{s}", .{ f.run_text, @tagName(signed.phase), p.uuidText(signed.phase_nonce), name });
         const duplicate = self.published.contains(url);
         if (!duplicate) try self.published.put(url, {});
         var mock: wf.Mock = .{ .steps = &.{.{ .url = url, .method = .PUT, .request_body = bytes, .status = if (duplicate) 412 else 201, .fail_open = self.fail_publication == self.publications }} };
@@ -277,7 +277,7 @@ test "real supervised children public two private four exact acceptance no seven
     try t.expect(fixture.store.record.control_bytes < p.max_control);
     var launches: [6][36]u8 = undefined;
     for (0..6) |index| {
-        const path = try std.fmt.allocPrint(a, "{s}/boot-{d}", .{ fixture.work_root, index });
+        const path = try a.print("{s}/boot-{d}", .{ fixture.work_root, index });
         defer a.free(path);
         const directory = try host.core.private_files.Directory.open(io, path);
         defer directory.close(io);
@@ -317,7 +317,7 @@ test "signed stale wrong VM run runner manifest image nonce and unauthorized com
         defer a.free(bytes);
         if (engine.execute(bytes)) |_| return error.AcceptedInvalidCommand else |_| {}
     }
-    engine.key = [_]u8{0x42} ** 32;
+    engine.key = @as([32]u8, @splat(0x42));
     try t.expectError(error.InvalidSignature, engine.execute(public));
     try t.expectEqual(@as(u8, 0), fixture.store.record.boots_attempted);
     try t.expectEqual(@as(usize, 0), fixture.downloads);
@@ -531,14 +531,14 @@ test "successful child cannot strand native descendants" {
     defer a.free(public);
     try engine.execute(public);
     for (0..2) |index| {
-        const path = try std.fmt.allocPrint(a, "{s}/boot-{d}", .{ fixture.work_root, index });
+        const path = try a.print("{s}/boot-{d}", .{ fixture.work_root, index });
         defer a.free(path);
         const directory = try host.files.durableDirectory(io, path);
         defer directory.close(io);
         const bytes = try directory.read(io, a, "descendant.pid", 32, null);
         defer a.free(bytes);
         const pid = try std.fmt.parseInt(std.os.linux.pid_t, bytes, 10);
-        const observed = std.os.linux.kill(pid, @enumFromInt(0));
+        const observed = std.os.linux.kill(pid, @fromBackingInt(@intCast(0)));
         try t.expectEqual(std.os.linux.E.SRCH, std.os.linux.errno(observed));
     }
 }

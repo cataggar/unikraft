@@ -20,7 +20,7 @@ pub const vm_id = group_id ++ "/providers/Microsoft.Compute/virtualMachines/" ++
 pub const os_id = group_id ++ "/providers/Microsoft.Compute/disks/" ++ prefix ++ "-os";
 pub const data_id = group_id ++ "/providers/Microsoft.Compute/disks/" ++ prefix ++ "-data";
 pub const nic_id = group_id ++ "/providers/Microsoft.Network/networkInterfaces/" ++ prefix ++ "-nic";
-pub const image_sha = "a" ** 64;
+pub const image_sha = &@as([64:0]u8, @splat('a'));
 pub const tags = .{ .@"managed-by" = "unikraft-hyperv", .@"uk-direct-run" = owner, .@"unikraft-run" = prefix, .@"image-sha256" = image_sha };
 
 pub fn expect(ok: bool) !void {
@@ -194,7 +194,7 @@ pub const Context = struct {
         try c.append("calls", try std.mem.concat(c.a, u8, &.{ line, "\n" }));
     }
     pub fn timestamp(c: Context, relative: []const u8) !void {
-        if (!try c.exists(relative)) try c.write(relative, try std.fmt.allocPrint(c.a, "{d}\n", .{now(c.io)}));
+        if (!try c.exists(relative)) try c.write(relative, try c.a.print("{d}\n", .{now(c.io)}));
     }
     pub fn digest(c: Context, relative: []const u8) ![64]u8 {
         return hash(try c.read(relative));

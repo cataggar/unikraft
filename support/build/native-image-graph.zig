@@ -212,7 +212,7 @@ fn registerLibraries(
                     .name = "hyperv-runtime",
                     .root_source_file = source,
                     .output = output,
-                    .optimize = .ReleaseFast,
+                    .optimize = .fast,
                     .pic = true,
                     .isr = true,
                 }},
@@ -290,7 +290,7 @@ fn registerLibraries(
                     .name = "vmbus-protocol",
                     .root_source_file = source,
                     .output = output,
-                    .optimize = .ReleaseFast,
+                    .optimize = .fast,
                     .pic = true,
                     .isr = true,
                 },
@@ -298,7 +298,7 @@ fn registerLibraries(
                     .name = "vmbus-channel",
                     .root_source_file = channel_source,
                     .output = channel_output,
-                    .optimize = .ReleaseFast,
+                    .optimize = .fast,
                     .pic = true,
                 },
             },
@@ -323,7 +323,7 @@ fn registerLibraries(
                     .name = "storvsc-core",
                     .root_source_file = storvsc_source,
                     .output = storvsc_output,
-                    .optimize = .ReleaseFast,
+                    .optimize = .fast,
                     .pic = true,
                 }},
             );
@@ -364,7 +364,7 @@ fn registerLibraries(
                     .name = "netvsc-protocol",
                     .root_source_file = netvsc_source,
                     .output = netvsc_output,
-                    .optimize = .ReleaseFast,
+                    .optimize = .fast,
                     .pic = true,
                 }},
             );
@@ -528,7 +528,7 @@ fn registerLibrary(
             .partial_link_output = try joinPath(
                 allocator,
                 roots.output,
-                try std.fmt.allocPrint(allocator, "{s}.ld.o", .{library.name}),
+                try allocator.print("{s}.ld.o", .{library.name}),
             ),
             .partial_link_sequence = sequence,
             .transform = .{
@@ -536,7 +536,7 @@ fn registerLibrary(
                 .output = try joinPath(
                     allocator,
                     roots.output,
-                    try std.fmt.allocPrint(allocator, "{s}.o", .{library.name}),
+                    try allocator.print("{s}.o", .{library.name}),
                 ),
                 .sequence = transform_sequence,
             },
@@ -749,9 +749,9 @@ fn postProcess(
         .@"hyperv-x86_64-efi-wamr" => "wamr_hyperv-x86_64-efi",
     };
     const image = try joinPath(allocator, output_root, image_relative);
-    const bootinfo = try std.fmt.allocPrint(allocator, "{s}.bootinfo", .{image});
-    const debug_image = try std.fmt.allocPrint(allocator, "{s}.dbg", .{image});
-    const relocations = try std.fmt.allocPrint(allocator, "{s}.uk_reloc.bin", .{debug_image});
+    const bootinfo = try allocator.print("{s}.bootinfo", .{image});
+    const debug_image = try allocator.print("{s}.dbg", .{image});
+    const relocations = try allocator.print("{s}.uk_reloc.bin", .{debug_image});
     const compile_database = try joinPath(allocator, output_root, "compile_commands.json");
     const protocol_name = switch (profile) {
         .@"qemu-x86_64" => "multiboot",

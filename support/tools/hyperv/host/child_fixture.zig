@@ -69,7 +69,7 @@ fn execute(init: std.process.Init) !void {
                 _ = linux.nanosleep(&duration, null);
             }
         }
-        const pid = try std.fmt.allocPrint(init.gpa, "{d}", .{child});
+        const pid = try init.gpa.print("{d}", .{child});
         defer init.gpa.free(pid);
         try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = "descendant.pid", .data = pid, .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) } });
     }

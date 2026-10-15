@@ -27,7 +27,7 @@ private_file() {
 }
 
 private_directory "${root}"
-for mode in Debug ReleaseSafe; do
+for mode in debug safe; do
   work="${root}/${mode}"
   if [ ! -e "${work}" ] && [ ! -L "${work}" ]; then
     printf 'persistence_build_evidence: %s_not_started\n' "${mode}"

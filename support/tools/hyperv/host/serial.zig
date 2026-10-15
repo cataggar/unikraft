@@ -93,7 +93,7 @@ pub fn validate(allocator: std.mem.Allocator, text: []const u8, policy: p.Policy
     if (guarded) |contract| try contract.validate();
     const bytes = try normalized(allocator, text);
     defer allocator.free(bytes);
-    var capability_counts = [_]usize{0} ** 4;
+    var capability_counts = @as([4]usize, @splat(0));
     var capability_positions: [4]usize = undefined;
     var platform_count: usize = 0;
     var platform_position: usize = 0;
@@ -105,7 +105,7 @@ pub fn validate(allocator: std.mem.Allocator, text: []const u8, policy: p.Policy
     var persistence_count: usize = 0;
     var persistence_positions: [3]usize = undefined;
     var start_buffer: [256]u8 = undefined;
-    const start = if (guarded) |g| try std.fmt.bufPrint(&start_buffer, "HYPERV_PERSISTENCE START PASS run={s} address=0:0:{d} sectors={d} sector_size=512", .{ g.run_id, g.lun, g.sectors }) else "";
+    const start = if (guarded) |g| try std.mem.print(&start_buffer, "HYPERV_PERSISTENCE START PASS run={s} address=0:0:{d} sectors={d} sector_size=512", .{ g.run_id, g.lun, g.sectors }) else "";
     const persistence = [_][]const u8{ start, "HYPERV_PERSISTENCE SELECT UNAVAILABLE reason=no-devices writes=0 flushes=0", "UK_HYPERV_PERSISTENCE_UNAVAILABLE:1:2:no-devices" };
     if ((policy == .guarded_v2) != (guarded != null)) return error.InvalidGuardedContract;
     var lines = std.mem.splitScalar(u8, bytes, '\n');

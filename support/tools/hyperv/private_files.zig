@@ -29,9 +29,9 @@ pub fn childNamespaceEnvironment(
 ) !void {
     var buffer: [32]u8 = undefined;
     try environment.put(namespace_marker, namespace_child);
-    try environment.put(namespace_uid, try std.fmt.bufPrint(&buffer, "{d}", .{uid}));
-    try environment.put(namespace_gid, try std.fmt.bufPrint(&buffer, "{d}", .{gid}));
-    try environment.put(namespace_parent, try std.fmt.bufPrint(&buffer, "{d}", .{linux.getpid()}));
+    try environment.put(namespace_uid, try std.mem.print(&buffer, "{d}", .{uid}));
+    try environment.put(namespace_gid, try std.mem.print(&buffer, "{d}", .{gid}));
+    try environment.put(namespace_parent, try std.mem.print(&buffer, "{d}", .{linux.getpid()}));
 }
 
 pub fn inheritChildNamespace(environment: *std.process.Environ.Map) !void {
@@ -89,22 +89,14 @@ fn verifyControllerNamespace(
     var parent_gid_map: [64]u8 = undefined;
     verifyParentInitialIdMap(
         io,
-        try std.fmt.bufPrint(
-            &parent_uid_map,
-            "/proc/{d}/uid_map",
-            .{parent},
-        ),
+        try std.mem.print(&parent_uid_map, "/proc/{d}/uid_map", .{parent}),
     ) catch |err| switch (err) {
         error.IdMapMismatch => return error.InvalidNamespaceParentMap,
         else => return error.InvalidNamespaceParentMapUnavailable,
     };
     verifyParentInitialIdMap(
         io,
-        try std.fmt.bufPrint(
-            &parent_gid_map,
-            "/proc/{d}/gid_map",
-            .{parent},
-        ),
+        try std.mem.print(&parent_gid_map, "/proc/{d}/gid_map", .{parent}),
     ) catch |err| switch (err) {
         error.IdMapMismatch => return error.InvalidNamespaceParentMap,
         else => return error.InvalidNamespaceParentMapUnavailable,
@@ -124,11 +116,7 @@ fn verifyChildNamespace(
     var parent_gid_map: [64]u8 = undefined;
     verifyIdMap(
         io,
-        try std.fmt.bufPrint(
-            &parent_uid_map,
-            "/proc/{d}/uid_map",
-            .{parent},
-        ),
+        try std.mem.print(&parent_uid_map, "/proc/{d}/uid_map", .{parent}),
         host_uid,
     ) catch |err| switch (err) {
         error.IdMapMismatch => return error.InvalidNamespaceParentMap,
@@ -136,11 +124,7 @@ fn verifyChildNamespace(
     };
     verifyIdMap(
         io,
-        try std.fmt.bufPrint(
-            &parent_gid_map,
-            "/proc/{d}/gid_map",
-            .{parent},
-        ),
+        try std.mem.print(&parent_gid_map, "/proc/{d}/gid_map", .{parent}),
         host_gid,
     ) catch |err| switch (err) {
         error.IdMapMismatch => return error.InvalidNamespaceParentMap,
@@ -149,11 +133,7 @@ fn verifyChildNamespace(
     var parent_status: [64]u8 = undefined;
     try verifyRestrictedProcess(
         io,
-        try std.fmt.bufPrint(
-            &parent_status,
-            "/proc/{d}/status",
-            .{parent},
-        ),
+        try std.mem.print(&parent_status, "/proc/{d}/status", .{parent}),
     );
     try verifyRestrictedProcess(io, "/proc/self/status");
     return verifyNamespace(io, host_uid, host_gid);
@@ -467,7 +447,7 @@ const diagnostics = @import("diagnostics.zig");
 const sensitive = @import("sensitive.zig");
 
 comptime {
-    if (builtin.os.tag != .linux) @compileError("Hyper-V private host files currently require Linux");
+    if (builtin.target.os.tag != .linux) @compileError("Hyper-V private host files currently require Linux");
 }
 
 pub const Directory = struct {

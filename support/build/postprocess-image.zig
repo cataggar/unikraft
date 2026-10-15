@@ -206,11 +206,11 @@ pub fn bootinfo(allocator: std.mem.Allocator, image: Image, input_name: []const 
     var regions: std.ArrayList(Region) = .empty;
     defer regions.deinit(allocator);
     for (image.programs) |ph| {
-        if (ph.p_type != elf.PT_LOAD) continue;
-        const size = (try add(ph.p_memsz, 4095)) & ~@as(u64, 4095);
+        if (ph.type != .LOAD) continue;
+        const size = (try add(ph.memsz, 4095)) & ~@as(u64, 4095);
         if (size == 0) continue;
-        _ = try add(ph.p_vaddr, size);
-        try regions.append(allocator, .{ .base = ph.p_vaddr, .size = size, .flags = ph.p_flags & 7 });
+        _ = try add(ph.vaddr, size);
+        try regions.append(allocator, .{ .base = ph.vaddr, .size = size, .flags = @as(u32, @bitCast(ph.flags)) & 7 });
     }
     std.mem.sort(Region, regions.items, {}, regionLessThan);
     var kept: usize = 0;
@@ -228,7 +228,7 @@ pub fn bootinfo(allocator: std.mem.Allocator, image: Image, input_name: []const 
         kept += 1;
     }
     if (kept > capacity) return error.BootinfoCapacity;
-    var region_name = [_]u8{0} ** 36;
+    var region_name = @as([36]u8, @splat(0));
     if (names) {
         const basename = std.fs.path.basename(input_name);
         const dot = std.mem.lastIndexOfScalar(u8, basename, '.');
@@ -260,9 +260,9 @@ pub fn bootinfo(allocator: std.mem.Allocator, image: Image, input_name: []const 
     return result;
 }
 
-fn programLessThan(_: void, a: elf.Elf64_Phdr, b: elf.Elf64_Phdr) bool {
+fn programLessThan(_: void, a: elf.Elf64.Phdr, b: elf.Elf64.Phdr) bool {
     // Overflow has already been checked by Image.parse.
-    return a.p_vaddr + a.p_memsz < b.p_vaddr + b.p_memsz;
+    return a.vaddr + a.memsz < b.vaddr + b.memsz;
 }
 
 pub fn efi(allocator: std.mem.Allocator, image: Image, debug: Image) ![]u8 {
@@ -272,22 +272,22 @@ pub fn efi(allocator: std.mem.Allocator, image: Image, debug: Image) ![]u8 {
     const base = try debug.symbol("_base_addr");
     const bss = try debug.symbol("__bss_start");
     const entry = try debug.symbol("uk_efi_entry64");
-    var programs: std.ArrayList(elf.Elf64_Phdr) = .empty;
+    var programs: std.ArrayList(elf.Elf64.Phdr) = .empty;
     defer programs.deinit(allocator);
     var executable_entry = false;
     for (image.programs) |ph| {
-        if (ph.p_type != elf.PT_LOAD) continue;
-        if (ph.p_vaddr < base) return error.InvalidAddress;
-        if (ph.p_flags & elf.PF_X != 0 and entry >= ph.p_vaddr and entry - ph.p_vaddr < ph.p_memsz)
+        if (ph.type != .LOAD) continue;
+        if (ph.vaddr < base) return error.InvalidAddress;
+        if (@as(u32, @bitCast(ph.flags)) & elf.PF_X != 0 and entry >= ph.vaddr and entry - ph.vaddr < ph.memsz)
             executable_entry = true;
         try programs.append(allocator, ph);
     }
     if (programs.items.len == 0) return error.MissingLoadSegments;
     if (!executable_entry) return error.InvalidEfiEntry;
     if (programs.items.len > std.math.maxInt(u16)) return error.TooManyPeSections;
-    std.mem.sort(elf.Elf64_Phdr, programs.items, {}, programLessThan);
+    std.mem.sort(elf.Elf64.Phdr, programs.items, {}, programLessThan);
     const last = programs.items[programs.items.len - 1];
-    const end = try add(last.p_vaddr, last.p_memsz);
+    const end = try add(last.vaddr, last.memsz);
     if (bss < base or bss > end) return error.InvalidBssAddress;
     const table_end = 200 + 40 * programs.items.len;
     // Retain mkefi's extra section slot and *next* page alignment, even when
@@ -299,11 +299,11 @@ pub fn efi(allocator: std.mem.Allocator, image: Image, debug: Image) ![]u8 {
     var data_size: u64 = 0;
     var code_base: u64 = 0;
     for (programs.items) |ph| {
-        if (ph.p_flags & (elf.PF_R | elf.PF_X) == (elf.PF_R | elf.PF_X)) {
-            code_size = try add(code_size, ph.p_memsz);
-            code_base = try add(try sub(ph.p_vaddr, base), headers);
-        } else if (ph.p_flags & elf.PF_R != 0) {
-            data_size = try add(data_size, ph.p_memsz);
+        if (@as(u32, @bitCast(ph.flags)) & (elf.PF_R | elf.PF_X) == (elf.PF_R | elf.PF_X)) {
+            code_size = try add(code_size, ph.memsz);
+            code_base = try add(try sub(ph.vaddr, base), headers);
+        } else if (@as(u32, @bitCast(ph.flags)) & elf.PF_R != 0) {
+            data_size = try add(data_size, ph.memsz);
         }
     }
     // These legacy fields include the header page in BSS accounting and twice
@@ -339,10 +339,10 @@ pub fn efi(allocator: std.mem.Allocator, image: Image, debug: Image) ![]u8 {
     for (programs.items, 0..) |ph, index| {
         const offset = 200 + 40 * index;
         put(u64, result, offset, 0x554b5f5048445200, .little);
-        try pe32(result, offset + 8, ph.p_memsz);
-        try pe32(result, offset + 12, try add(try sub(ph.p_vaddr, base), headers));
-        try pe32(result, offset + 16, ph.p_filesz);
-        try pe32(result, offset + 20, try add(ph.p_offset, headers));
+        try pe32(result, offset + 8, ph.memsz);
+        try pe32(result, offset + 12, try add(try sub(ph.vaddr, base), headers));
+        try pe32(result, offset + 16, ph.filesz);
+        try pe32(result, offset + 20, try add(ph.offset, headers));
         put(u32, result, offset + 36, 0xe0d00040, .little);
     }
     return result;

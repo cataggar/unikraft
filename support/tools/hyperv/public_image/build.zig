@@ -18,7 +18,10 @@ pub fn build(b: *std.Build) void {
     });
     const kconfig = b.createModule(.{ .root_source_file = b.path("../../../build/kconfig.zig"), .target = target, .optimize = optimize });
     const elf = b.createModule(.{ .root_source_file = b.path("../../../build/postprocess-elf.zig"), .target = target, .optimize = optimize });
-    const peer = b.build_root.handle.readFileAlloc(b.graph.io, "../../../scripts/hyperv-network-peer.py", b.allocator, .limited(4 * 1024 * 1024)) catch @panic("public peer source unavailable");
+    const peer_source = b.path("../../../scripts/hyperv-network-peer.py");
+    b.dependOnFileContents(peer_source);
+    const peer_path = b.root.joinString(b.allocator, "../../../scripts/hyperv-network-peer.py") catch @panic("cannot resolve peer source");
+    const peer = std.Io.Dir.cwd().readFileAlloc(b.graph.io, peer_path, b.allocator, .limited(4 * 1024 * 1024)) catch @panic("public peer source unavailable");
     var peer_hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(peer, &peer_hash, .{});
     const pins = b.addOptions();
@@ -59,6 +62,7 @@ pub fn build(b: *std.Build) void {
     }), .filters = filters });
     tests.root_module.addOptions("test_options", options);
     const run_tests = b.addRunArtifact(tests);
+    run_tests.has_side_effects = true;
     b.step("test", "Test native public packaging/export without real guest boots").dependOn(&run_tests.step);
     const hash_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("../sha256_tests.zig"),
@@ -80,7 +84,9 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "public_image", .module = module }},
     }), .filters = filters });
     import_tests.root_module.addOptions("test_options", import_options);
-    b.step("test-import", "Test physical native import and reload without guests or networking").dependOn(&b.addRunArtifact(import_tests).step);
+    const run_import_tests = b.addRunArtifact(import_tests);
+    run_import_tests.has_side_effects = true;
+    b.step("test-import", "Test physical native import and reload without guests or networking").dependOn(&run_import_tests.step);
     const measurement = b.createModule(.{
         .root_source_file = b.path("../synthetic_measurement.zig"),
         .target = target,

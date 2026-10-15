@@ -35,12 +35,12 @@ test "authorization operation refuses invalid windows signed overflow and author
     try std.testing.expectEqual(error.ApprovalExpired, authorization.run(.{ .allocator = a, .io = io }, command).refused.err);
     command.recorded_unix = now - 1;
     command.expires_unix = now + 600;
-    for ([_][]const u8{ "", "bad\n", "\x7f", "\xff", "a" ** 129 }) |bad| {
+    for ([_][]const u8{ "", "bad\n", "\x7f", "\xff", &@as([129]u8, @splat('a')) }) |bad| {
         command.approver = bad;
         try std.testing.expectEqual(error.InvalidAuthorityField, authorization.run(.{ .allocator = a, .io = io }, command).refused.err);
     }
     command.approver = "operator";
-    command.reference = "r" ** 257;
+    command.reference = &@as([257]u8, @splat('r'));
     try std.testing.expectEqual(error.InvalidAuthorityField, authorization.run(.{ .allocator = a, .io = io }, command).refused.err);
 }
 
@@ -83,10 +83,12 @@ test "authorization frozen current decisions bind exact template and denied cann
         try std.testing.expectError(error.ApprovalExpired, records.decisionCurrent(decision, value.expires_unix));
         if (value.decision == .denied) try std.testing.expectError(error.NotAuthorized, decision.current(value.recorded_unix));
     }
+    const e64 = @as([128]u8, @bitCast(@as([64][2]u8, @splat("é".*))));
+    const e128 = @as([256]u8, @bitCast(@as([128][2]u8, @splat("é".*))));
     var inputs: types.AuthorizationInputs = .{
         .decision = .denied,
-        .approver = "é" ** 64,
-        .reference = "é" ** 128,
+        .approver = &e64,
+        .reference = &e128,
         .recorded_unix = std.math.maxInt(u64) - 3600,
         .expires_unix = std.math.maxInt(u64),
         .now = std.math.maxInt(u64) - 3600,
@@ -97,10 +99,10 @@ test "authorization frozen current decisions bind exact template and denied cann
     inputs.recorded_unix -= 1;
     try std.testing.expectError(error.InvalidApprovalWindow, records.authorization(plan.value, &digest, template, inputs));
     inputs.recorded_unix += 1;
-    inputs.approver = "é" ** 64 ++ "x";
+    inputs.approver = &(e64 ++ "x".*);
     try std.testing.expectError(error.InvalidAuthorityField, records.authorization(plan.value, &digest, template, inputs));
-    inputs.approver = "é" ** 64;
-    inputs.reference = "é" ** 128 ++ "x";
+    inputs.approver = &e64;
+    inputs.reference = &(e128 ++ "x".*);
     try std.testing.expectError(error.InvalidAuthorityField, records.authorization(plan.value, &digest, template, inputs));
     inputs.reference = "operator-reference";
     for (0..33) |index| {
@@ -123,7 +125,7 @@ const Fixture = struct {
         self.* = .{ .arena = .init(a), .path = undefined, .directory = undefined, .plan = undefined, .command = .{} };
         errdefer self.arena.deinit();
         const allocator = self.arena.allocator();
-        self.path = try std.fmt.allocPrint(allocator, "{s}/authorization-pipeline-{d}", .{ options.fixture_root, std.os.linux.getpid() });
+        self.path = try allocator.print("{s}/authorization-pipeline-{d}", .{ options.fixture_root, std.os.linux.getpid() });
         const package = try std.Io.Dir.cwd().realPathFileAlloc(io, options.authorization_package, allocator);
         const native_tool = try std.Io.Dir.cwd().realPathFileAlloc(io, options.process_fixture, allocator);
         const generated = try std.process.run(allocator, io, .{
@@ -188,7 +190,7 @@ const Fixture = struct {
         return command;
     }
     fn partialCount(self: *Fixture, name: []const u8) !usize {
-        const prefix = try std.fmt.allocPrint(self.arena.allocator(), "{s}.partial-", .{name});
+        const prefix = try self.arena.allocator().print("{s}.partial-", .{name});
         var entries = self.directory.iterate();
         var count: usize = 0;
         while (try entries.next(io)) |entry| {
@@ -282,7 +284,7 @@ test "authorization input parser rejects duplicate unknown coercive and noncanon
         };
         try std.testing.expectError(case[2], authorization.Test.parseRecord(types.Plan, allocator, changed));
     }
-    const extra_lf = try std.fmt.allocPrint(allocator, "{s}\n", .{bytes});
+    const extra_lf = try allocator.print("{s}\n", .{bytes});
     try std.testing.expectError(error.NonCanonical, authorization.Test.parseRecord(types.Plan, allocator, extra_lf));
     const numeric_overflow = try std.mem.replaceOwned(u8, allocator, bytes, "\"version\":2", "\"version\":18446744073709551616");
     try std.testing.expectError(error.IntegerOverflow, authorization.Test.parseRecord(types.Plan, allocator, numeric_overflow));
@@ -375,7 +377,7 @@ test "authorization real pipeline preserves short writes sync uncertainty and cl
     };
     for (cases, 0..) |selected, index| {
         var hooks = selected;
-        const name = try std.fmt.allocPrint(fixture.arena.allocator(), "write-fault-{d}.json", .{index});
+        const name = try fixture.arena.allocator().print("write-fault-{d}.json", .{index});
         var named_vtable = io.vtable.*;
         named_vtable.dirCreateFileAtomic = @import("test_fixtures.zig").namedAtomic;
         const fault_io: std.Io = if (selected.final_fault == .cleanup) .{ .userdata = io.userdata, .vtable = &named_vtable } else io;

@@ -28,7 +28,7 @@ test "native disk readback requires exact VHD logical bytes Gen2 role and origin
     const expected_vm = try (azure.scope.Ref{ .kind = .vm, .name = "synthetic-vm" }).path(alloc, job.input.authority);
     for ([_]bool{ true, false }) |os| {
         const logical = if (os) job.input.guest.size - 512 else job.input.data.size - 512;
-        const raw = try std.fmt.allocPrint(alloc, "{{\"managedBy\":null,\"properties\":{{\"diskSizeBytes\":{d}{s}}}}}", .{ logical, if (os) @as([]const u8, ",\"osType\":\"Linux\",\"hyperVGeneration\":\"V2\"") else "" });
+        const raw = try alloc.print("{{\"managedBy\":null,\"properties\":{{\"diskSizeBytes\":{d}{s}}}}}", .{ logical, if (os) @as([]const u8, ",\"osType\":\"Linux\",\"hyperVGeneration\":\"V2\"") else "" });
         const json = try std.json.parseFromSliceLeaky(std.json.Value, alloc, raw, .{ .allocate = .alloc_always, .parse_numbers = false });
         try p.native.requireDiskReadback(alloc, job, os, json, .detached);
         try t.expectError(error.InvalidAttachment, p.native.requireDiskReadback(alloc, job, os, json, .attached));
@@ -40,9 +40,9 @@ test "native disk readback requires exact VHD logical bytes Gen2 role and origin
         if (p.native.requireDiskReadback(alloc, job, os, attached, .cleanup)) |_| return error.AcceptedWrongAttachment else |_| {}
         try attached.object.put(alloc, "managedBy", .null);
         const props = attached.object.getPtr("properties").?;
-        try props.object.put(alloc, "diskSizeBytes", .{ .number_string = try std.fmt.allocPrint(alloc, "{d}", .{logical + 512}) });
+        try props.object.put(alloc, "diskSizeBytes", .{ .number_string = try alloc.print("{d}", .{logical + 512}) });
         try t.expectError(error.WrongGeometry, p.native.requireDiskReadback(alloc, job, os, attached, .detached));
-        try props.object.put(alloc, "diskSizeBytes", .{ .number_string = try std.fmt.allocPrint(alloc, "{d}", .{logical}) });
+        try props.object.put(alloc, "diskSizeBytes", .{ .number_string = try alloc.print("{d}", .{logical}) });
         if (os) try props.object.put(alloc, "hyperVGeneration", .{ .string = "V1" }) else try props.object.put(alloc, "osType", .{ .string = "Linux" });
         try t.expectError(error.InvalidDiskRole, p.native.requireDiskReadback(alloc, job, os, attached, .detached));
     }
@@ -70,7 +70,7 @@ test "storage identity is independent of cloud ownership UUID without weakening 
     changed.cleanup_authority.owner_run = "99999999-9999-4999-8999-999999999999".*;
     try t.expectError(error.AuthorityMismatch, changed.validate());
     changed = input;
-    changed.run_id = [_]u8{'0'} ** 32;
+    changed.run_id = @as([32]u8, @splat('0'));
     try t.expectError(error.NilIdentity, changed.validate());
     changed = input;
     changed.run_id[0] = 'A';
@@ -116,7 +116,7 @@ test "strict canonical input preserves original identities geometry and separate
     changed.cleanup_seconds = 1801;
     try t.expectError(error.InvalidBudget, changed.validate());
     changed = input;
-    changed.guest.sha256 = [_]u8{'0'} ** 64;
+    changed.guest.sha256 = @as([64]u8, @splat('0'));
     try t.expectError(error.NilIdentity, changed.validate());
     changed = input;
     changed.disk_id = changed.run_id;
@@ -177,13 +177,15 @@ test "actual C serial order identity IO counts and unchanged complete prefix" {
     const wrong_vpd = try std.mem.replaceOwned(u8, a, suffix, "11223344", "11223345");
     defer a.free(wrong_vpd);
     try t.expectError(error.IdentityDrift, p.evidence.parse(wrong_vpd, 2, f.input(), boot1));
-    const decorated = try std.fmt.allocPrint(a, "\x1b[32m\x00{s}\x1b[0m\n", .{first});
+    const decorated = try a.print("\x1b[32m\x00{s}\x1b[0m\n", .{first});
     defer a.free(decorated);
     _ = try p.evidence.parse(decorated, 1, f.input(), null);
-    const excessive = try std.mem.concat(a, u8, &.{ "x" ** 8193, "\n", first });
+    const excessive = try std.mem.concat(a, u8, &.{ &@as([8193:0]u8, @splat('x')), "\n", first });
     defer a.free(excessive);
     try t.expectError(error.SerialLineTooLong, p.evidence.parse(excessive, 1, f.input(), null));
-    const candidates = try std.mem.replaceOwned(u8, a, first, "HYPERV_PERSISTENCE SELECT", "HYPERV_PERSISTENCE CANDIDATE_REJECT PASS reason=boot-signature id=0\n" ** 17 ++ "HYPERV_PERSISTENCE SELECT");
+    const rejection = "HYPERV_PERSISTENCE CANDIDATE_REJECT PASS reason=boot-signature id=0\n";
+    const rejections: [17][rejection.len]u8 = @splat(rejection.*);
+    const candidates = try std.mem.replaceOwned(u8, a, first, "HYPERV_PERSISTENCE SELECT", @as(*const [17 * rejection.len]u8, @ptrCast(&rejections)).* ++ "HYPERV_PERSISTENCE SELECT");
     defer a.free(candidates);
     try t.expectError(error.InvalidCandidateOrder, p.evidence.parse(candidates, 1, f.input(), null));
 }
@@ -200,7 +202,7 @@ test "ukboot terminal supports ukprint feature combinations and exact raw boot p
         for ([_][]const u8{ "", "<main> ", "<init> ", "<<n/a>> ", "<0xffff800012345678> " }) |thread| {
             for ([_][]const u8{ "", "{r:0xffff800000012345,f:0} ", "{r:0,f:0x1234} " }) |caller| {
                 for ([_][]const u8{ "", "<boot.c @    1> ", "<boot.c @  544> ", "<boot.c @ 9999> ", "<boot.c @ 10000> " }) |source| {
-                    const terminal = try std.fmt.allocPrint(a, "{s}Info: {s}{s}[libukboot] {s}main returned 0", .{ timestamp, thread, caller, source });
+                    const terminal = try a.print("{s}Info: {s}{s}[libukboot] {s}main returned 0", .{ timestamp, thread, caller, source });
                     defer a.free(terminal);
                     const bytes = try std.mem.replaceOwned(u8, a, first, f.terminal, terminal);
                     defer a.free(bytes);
@@ -280,7 +282,7 @@ test "ukboot terminal refuses nonzero duplicate reordered spoofed and truncated 
         "Info: {r:0x01,f:0} [libukboot] main returned 0",
         "Info: {r:0x10000000000000000,f:0} [libukboot] main returned 0",
         "Info: {r:0x1,f:0,g:0} [libukboot] main returned 0",
-        "Info: <" ++ "x" ** 256 ++ "> [libukboot] main returned 0",
+        "Info: <" ++ &@as([256:0]u8, @splat('x')) ++ "> [libukboot] main returned 0",
     }) |terminal| {
         const bad = try std.mem.replaceOwned(u8, a, first, f.terminal, terminal);
         defer a.free(bad);
@@ -307,9 +309,9 @@ test "synthetic admitted model executes exactly deployment boot one and sole res
     const state = try p.engine.execute(a, t.io, work.directory, model.options(), false);
     try t.expect(state.succeeded());
     try t.expectEqual(@as(u8, 2), state.boot_count);
-    try t.expectEqual(@as(u8, 1), model.calls[@intFromEnum(p.model.Step.deploy_boot1)]);
-    try t.expectEqual(@as(u8, 1), model.calls[@intFromEnum(p.model.Step.start_boot2)]);
-    try t.expectEqual(@as(u8, 1), model.calls[@intFromEnum(p.model.Step.cleanup_absence)]);
+    try t.expectEqual(@as(u8, 1), model.calls[@backingInt(p.model.Step.deploy_boot1)]);
+    try t.expectEqual(@as(u8, 1), model.calls[@backingInt(p.model.Step.start_boot2)]);
+    try t.expectEqual(@as(u8, 1), model.calls[@backingInt(p.model.Step.cleanup_absence)]);
     try t.expectError(error.AttemptConsumed, p.engine.execute(a, t.io, work.directory, model.options(), false));
     const persisted = try p.engine.loadState(a, t.io, work.directory, binding);
     try t.expect(persisted.succeeded());
@@ -320,7 +322,7 @@ test "synthetic admitted model executes exactly deployment boot one and sole res
     contradictory.boot_count = 1;
     try t.expectError(error.InvalidBootCount, contradictory.validate());
     contradictory = persisted;
-    contradictory.records[@intFromEnum(p.model.Step.observe_deallocated)].progress = .unissued;
+    contradictory.records[@backingInt(p.model.Step.observe_deallocated)].progress = .unissued;
     try t.expectError(error.InvalidRestartIntent, contradictory.validate());
     contradictory = persisted;
     contradictory.group_absent = false;
@@ -337,7 +339,7 @@ test "wrong serial and identity fail while cleanup retains independent absence" 
         try t.expect(!state.succeeded());
         try t.expect(state.failures.primary != null);
         try t.expect(state.group_absent);
-        try t.expectEqual(@as(u8, 1), model.calls[@intFromEnum(p.model.Step.start_boot2)]);
+        try t.expectEqual(@as(u8, 1), model.calls[@backingInt(p.model.Step.start_boot2)]);
         try t.expect(state.boot2 == null);
     }
 }
@@ -350,10 +352,10 @@ test "ambiguous upload is consumed without replay and access is cleaned independ
     const state = try p.engine.execute(a, t.io, work.directory, model.options(), false);
     try t.expect(state.consumed);
     try t.expectEqual(@as(u8, 0), state.boot_count);
-    try t.expectEqual(@as(u8, 1), model.calls[@intFromEnum(p.model.Step.data_upload)]);
-    try t.expectEqual(@as(u8, 1), model.calls[@intFromEnum(p.model.Step.cleanup_data_revoke)]);
-    try t.expectEqual(@as(u8, 1), model.calls[@intFromEnum(p.model.Step.cleanup_data_access)]);
-    try t.expectEqual(.unknown, state.records[@intFromEnum(p.model.Step.data_upload)].effect);
+    try t.expectEqual(@as(u8, 1), model.calls[@backingInt(p.model.Step.data_upload)]);
+    try t.expectEqual(@as(u8, 1), model.calls[@backingInt(p.model.Step.cleanup_data_revoke)]);
+    try t.expectEqual(@as(u8, 1), model.calls[@backingInt(p.model.Step.cleanup_data_access)]);
+    try t.expectEqual(.unknown, state.records[@backingInt(p.model.Step.data_upload)].effect);
     try t.expectError(error.AttemptConsumed, p.engine.execute(a, t.io, work.directory, model.options(), false));
 }
 
@@ -374,7 +376,7 @@ test "403 is not absence and independent cleanup authority cannot be borrowed" {
     try t.expect(failed.failures.primary != null);
     try t.expect(failed.failures.cleanup != null);
     try t.expect(failed.cleanup_required);
-    try t.expectEqual(@as(u8, 0), expired.calls[@intFromEnum(p.model.Step.cleanup_delete)]);
+    try t.expectEqual(@as(u8, 0), expired.calls[@backingInt(p.model.Step.cleanup_delete)]);
 }
 
 test "private metadata prepared state lock and source binding cannot rearm consumption" {
@@ -438,7 +440,7 @@ fn reportNativeFailure(mode: f.Mode, state: p.model.State) void {
     for (state.records, 0..) |record, index| {
         if (record.progress != .failed and record.progress != .intent) continue;
         std.debug.print("  {s}: progress={s}, effect={s}\n", .{
-            @tagName(@as(p.model.Step, @enumFromInt(index))), @tagName(record.progress), @tagName(record.effect),
+            @tagName(@as(p.model.Step, @fromBackingInt(@intCast(index)))), @tagName(record.progress), @tagName(record.effect),
         });
     }
 }
@@ -484,7 +486,7 @@ test "blocked native worker is killed and malformed delivery retains accepted ef
         try t.expect(state.group_absent);
         try t.expectEqual(@as(u8, 0), state.boot_count);
         try t.expect(try core.process.monotonicNanoseconds() - before < 20 * std.time.ns_per_s);
-        const record = state.records[@intFromEnum(p.model.Step.data_upload)];
+        const record = state.records[@backingInt(p.model.Step.data_upload)];
         try t.expectEqual(if (mode == .malformed_output) @import("hyperv_transfer").diagnostic.Certainty.accepted else .unknown, record.effect);
         const serialized = try p.local.encode(a, state);
         defer a.free(serialized);
@@ -535,7 +537,7 @@ test "consumed marker crash window cannot inspect unconsumed or accept unknown s
     _ = try p.engine.execute(a, t.io, work.directory, runtime, false);
     const state = try p.engine.loadState(a, t.io, work.directory, binding);
     try t.expect(state.consumed and state.cleanup_required and state.failures.recording != null);
-    try t.expectEqual(@as(u8, 0), model.calls[@intFromEnum(p.model.Step.group_create)]);
+    try t.expectEqual(@as(u8, 0), model.calls[@backingInt(p.model.Step.group_create)]);
     try t.expectError(error.AttemptConsumed, p.engine.execute(a, t.io, work.directory, model.options(), false));
     const binary = try executable(options.cli);
     defer a.free(binary.path);
@@ -575,8 +577,8 @@ test "durability failure consumes admission before effects and retains accepted 
         runtime.record_hook = .{ .context = &fault, .call = RecordingFault.fail };
         const state = try p.engine.execute(a, t.io, work.directory, runtime, false);
         try t.expect(state.consumed and !state.succeeded() and state.failures.recording != null);
-        try t.expectEqual(@as(u8, if (at == 2) 0 else 1), model.calls[@intFromEnum(p.model.Step.start_boot2)]);
-        if (at == 2) try t.expectEqual(@as(u8, 0), model.calls[@intFromEnum(p.model.Step.group_create)]);
+        try t.expectEqual(@as(u8, if (at == 2) 0 else 1), model.calls[@backingInt(p.model.Step.start_boot2)]);
+        if (at == 2) try t.expectEqual(@as(u8, 0), model.calls[@backingInt(p.model.Step.group_create)]);
         try t.expectError(error.AttemptConsumed, p.engine.execute(a, t.io, work.directory, model.options(), false));
     }
 }
@@ -605,13 +607,13 @@ test "serialized upload models reject counter disagreement and sealed serial rep
     var model = f.Model{ .allocator = a };
     const state = try p.engine.execute(a, t.io, work.directory, model.options(), false);
     var bad = state;
-    bad.records[@intFromEnum(p.model.Step.data_upload)].transfer.?.bytes_accepted = 0;
+    bad.records[@backingInt(p.model.Step.data_upload)].transfer.?.bytes_accepted = 0;
     try t.expectError(error.InvalidTransfer, bad.validate());
     bad = state;
-    bad.records[@intFromEnum(p.model.Step.data_upload)].page_report.?.plan.bytes -= 512;
+    bad.records[@backingInt(p.model.Step.data_upload)].page_report.?.plan.bytes -= 512;
     if (bad.validate()) |_| return error.AcceptedInvalidProgress else |_| {}
     bad = state;
-    bad.records[@intFromEnum(p.model.Step.observe_final_deallocated)].progress = .failed;
+    bad.records[@backingInt(p.model.Step.observe_final_deallocated)].progress = .failed;
     try t.expect(!bad.succeeded());
     var lock = try work.directory.lock(t.io);
     defer lock.close(t.io);
@@ -636,7 +638,7 @@ test "partial native page checkpoint survives killed delivery without claiming f
         const state = try p.engine.execute(a, t.io, work.directory, runtime, false);
         errdefer reportNativeFailure(mode, state);
         try t.expect(!state.succeeded() and state.consumed and state.group_absent and state.process_cleanup_complete);
-        const record = state.records[@intFromEnum(p.model.Step.data_upload)];
+        const record = state.records[@backingInt(p.model.Step.data_upload)];
         try t.expectEqual(.unknown, record.effect);
         if (mode == .partial_pages) {
             try t.expectEqual(@as(u64, 4194304), record.page_report.?.progress.?.bytes_confirmed);
@@ -728,8 +730,8 @@ test "cleanup recovery requires bound parent reaping proof and never replays mut
     state.group_absent = false;
     state.secrets_disposed = false;
     state.data_access_pending = true;
-    for (state.records[@intFromEnum(p.model.Step.data_upload)..]) |*record| record.* = .{};
-    state.records[@intFromEnum(p.model.Step.data_upload)] = .{ .progress = .intent, .effect = .unknown };
+    for (state.records[@backingInt(p.model.Step.data_upload)..]) |*record| record.* = .{};
+    state.records[@backingInt(p.model.Step.data_upload)] = .{ .progress = .intent, .effect = .unknown };
     timing.recoverySnapshot(options.persistence_timing, .recovery_rewritten, state);
     try state.validate();
     timing.recoverySnapshot(options.persistence_timing, .recovery_validated, state);
@@ -766,15 +768,15 @@ test "cleanup-only recovery keeps deadline and SAS obligations without replaying
     const failed = try p.engine.execute(a, t.io, work.directory, model.options(), false);
     try t.expect(failed.group_absent and failed.data_access_pending and failed.cleanup_required);
     try t.expect(!failed.secrets_disposed);
-    try t.expectEqual(@as(u8, 0), model.calls[@intFromEnum(p.model.Step.cleanup_dispose)]);
+    try t.expectEqual(@as(u8, 0), model.calls[@backingInt(p.model.Step.cleanup_dispose)]);
     model.fail_at = null;
     const recovered = try p.engine.execute(a, t.io, work.directory, model.options(), true);
     try t.expect(!recovered.cleanup_required and recovered.secrets_disposed and !recovered.data_access_pending);
     try t.expectEqual(failed.cleanup_deadline_ns, recovered.cleanup_deadline_ns);
     try t.expect(recovered.failures.primary != null and recovered.failures.cleanup != null);
-    try t.expectEqual(@as(u8, 1), model.calls[@intFromEnum(p.model.Step.data_upload)]);
-    try t.expectEqual(@as(u8, 1), model.calls[@intFromEnum(p.model.Step.cleanup_delete)]);
-    try t.expectEqual(@as(u8, 2), model.calls[@intFromEnum(p.model.Step.cleanup_data_access)]);
+    try t.expectEqual(@as(u8, 1), model.calls[@backingInt(p.model.Step.data_upload)]);
+    try t.expectEqual(@as(u8, 1), model.calls[@backingInt(p.model.Step.cleanup_delete)]);
+    try t.expectEqual(@as(u8, 2), model.calls[@backingInt(p.model.Step.cleanup_data_access)]);
 }
 
 test "failed native creation delivery retains UUID and refuses cleanup replacement" {
@@ -799,13 +801,13 @@ test "failed native creation delivery retains UUID and refuses cleanup replaceme
         try t.expectEqual(state.originals.os, saved.originals.os);
         if (mode == .replaced_after_create) {
             try t.expect(!state.group_absent and state.cleanup_required);
-            try t.expectEqual(.unissued, state.records[@intFromEnum(p.model.Step.cleanup_delete)].progress);
+            try t.expectEqual(.unissued, state.records[@backingInt(p.model.Step.cleanup_delete)].progress);
         } else try t.expect(state.group_absent and !state.cleanup_required);
         if (mode == .unstarted_grant) {
             try t.expect(!state.data_access_pending and state.secrets_disposed);
-            try t.expectEqual(.not_started, state.records[@intFromEnum(p.model.Step.data_grant)].effect);
-            try t.expectEqual(.skipped, state.records[@intFromEnum(p.model.Step.cleanup_data_revoke)].progress);
-            try t.expectEqual(.skipped, state.records[@intFromEnum(p.model.Step.cleanup_data_access)].progress);
+            try t.expectEqual(.not_started, state.records[@backingInt(p.model.Step.data_grant)].effect);
+            try t.expectEqual(.skipped, state.records[@backingInt(p.model.Step.cleanup_data_revoke)].progress);
+            try t.expectEqual(.skipped, state.records[@backingInt(p.model.Step.cleanup_data_access)].progress);
         }
     }
 }
@@ -844,7 +846,7 @@ fn timingHeader() !timing.Header {
 test "persistence timing canonical bounded schema rejects invalid and cross-process records" {
     const header = try timingHeader();
     const record = try timing.Record.observe(header, .child_entry, null);
-    var bytes = [_]u8{0} ** timing.max_bytes;
+    var bytes = @as([timing.max_bytes]u8, @splat(0));
     @memcpy(bytes[0..timing.slot_size], &try header.encode());
     @memcpy(bytes[timing.slot_size..][0..timing.slot_size], &try record.encode());
     const end = 2 * timing.slot_size;
@@ -853,7 +855,7 @@ test "persistence timing canonical bounded schema rejects invalid and cross-proc
     try t.expectEqual(@as(usize, 1), prefix.count);
     try t.expectEqual(.partial_slot, (try timing.decode(a, bytes[0 .. end + 1], header)).status);
     try t.expectEqual(.empty, (try timing.decode(a, bytes[0..timing.slot_size], header)).status);
-    try t.expectError(error.DiagnosticOverflow, timing.decode(a, &([_]u8{0} ** (timing.max_bytes + 1)), header));
+    try t.expectError(error.DiagnosticOverflow, timing.decode(a, &(@as([(timing.max_bytes + 1)]u8, @splat(0))), header));
     try t.expectError(error.InvalidDiagnostic, timing.decode(a, bytes[0 .. timing.slot_size - 1], header));
     var other = header;
     other.identity.nonce[0] = '9';
@@ -891,7 +893,7 @@ test "persistence timing canonical bounded schema rejects invalid and cross-proc
     records = .{ .child = true };
     for (0..timing.child_slots) |index| {
         next = record;
-        next.stage = @enumFromInt(timing.parent_slots + index);
+        next.stage = @fromBackingInt(@intCast(timing.parent_slots + index));
         try records.push(next);
     }
     try t.expectError(error.DiagnosticOverflow, records.push(next));
@@ -943,7 +945,7 @@ test "persistence timing default off is inert and shared sealing failure keeps e
         .io = t.io,
         .directory = work.directory,
         .root_path = work.path,
-        .executable = .{ .path = "/synthetic-never-opened", .size = 4096, .sha256 = [_]u8{1} ** 32 },
+        .executable = .{ .path = "/synthetic-never-opened", .size = 4096, .sha256 = @as([32]u8, @splat(1)) },
         .provision = .{ .context = &provision, .call = Provision.call },
     };
     defer supervisor.deinit();
@@ -1020,7 +1022,7 @@ test "persistence timing native malformed delivery preserves failure even when d
             try t.expectEqual(.parent_end, trace.records.values[trace.records.count - 1].stage);
         } else {
             try t.expectEqual(@as(usize, 0), trace.records.count);
-            const directory = try core.private_files.Directory.open(t.io, supervisor.directories[@intFromEnum(job.step)].?);
+            const directory = try core.private_files.Directory.open(t.io, supervisor.directories[@backingInt(job.step)].?);
             defer directory.close(t.io);
             try t.expectError(error.FileNotFound, directory.openFile(t.io, timing.file_name));
         }
@@ -1081,7 +1083,7 @@ test "persistence timing bounded report survives fixture cleanup for success and
         const sidecar = try timing.Sidecar.create(t.io, work.directory, header);
         defer sidecar.close(t.io);
         for (0..timing.child_slots) |index| {
-            var record = try timing.Record.observe(header, @enumFromInt(timing.parent_slots + index), null);
+            var record = try timing.Record.observe(header, @fromBackingInt(@intCast(timing.parent_slots + index)), null);
             record.sample.monotonic_ns = index;
             record.sample.process_cpu_ns = index;
             try sidecar.file.writePositionalAll(t.io, &try record.encode(), (index + 1) * timing.slot_size);
@@ -1090,7 +1092,7 @@ test "persistence timing bounded report survives fixture cleanup for success and
     }
     try t.expectEqual(timing.Status.complete, trace.child_records.status);
     for (0..timing.parent_slots) |index| {
-        const stage: timing.Stage = @enumFromInt(index);
+        const stage: timing.Stage = @fromBackingInt(@intCast(index));
         var record = try timing.Record.observe(header, stage, if (stage == .process_return) true else null);
         record.sample.monotonic_ns = index;
         record.sample.process_cpu_ns = index;

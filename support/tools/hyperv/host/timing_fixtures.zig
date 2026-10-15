@@ -86,7 +86,7 @@ test "host timing rejects unknown labels fields and noncanonical slots" {
     doc.value().object.getPtr("authority").?.* = .{ .string = "accepted" };
     bytes = try timing.encodeSlot(doc.value());
     if (timing.decodeRecord(a, &bytes)) |_| return error.AcceptedAuthority else |_| {}
-    bytes = [_]u8{0} ** timing.slot_bytes;
+    bytes = @as([timing.slot_bytes]u8, @splat(0));
     bytes[0] = ' ';
     @memcpy(bytes[1..][0..plain.len], plain);
     try t.expectError(error.InvalidHostTiming, timing.decodeRecord(a, &bytes));
@@ -108,7 +108,7 @@ test "host timing cleanup gates reads and retains missing invalid and overflow s
     try directory.directory.dir.writeFile(io, .{ .sub_path = timing.child_name, .data = "partial", .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) } });
     try t.expectEqual(timing.ChildStatus.invalid, parent.collect(a, io, directory.path).summary.child);
     try directory.directory.dir.deleteFile(io, timing.child_name);
-    const oversized = [_]u8{0} ** (timing.slot_bytes + 1);
+    const oversized = @as([(timing.slot_bytes + 1)]u8, @splat(0));
     try directory.directory.dir.writeFile(io, .{ .sub_path = timing.child_name, .data = &oversized, .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) } });
     try t.expectEqual(timing.ChildStatus.overflow, parent.collect(a, io, directory.path).summary.child);
     try directory.directory.dir.deleteFile(io, timing.child_name);

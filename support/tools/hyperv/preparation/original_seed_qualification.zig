@@ -163,7 +163,7 @@ pub fn main(init: std.process.Init) !void {
         .schema = "unikraft.hyperv.original-seed.offline-qualification.native",
         .version = @as(u8, 1),
         .authority = "not_admitted",
-        .host_arch = @tagName(@import("builtin").cpu.arch),
+        .host_arch = @tagName(@import("builtin").target.cpu.arch),
         .optimization = @tagName(@import("builtin").mode),
         .compiler_version = c.compiler_version,
         .full_size_creations = @as(u8, 1),

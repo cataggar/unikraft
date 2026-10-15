@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 const std = @import("std");
 
-fn module(b: *std.Build, root: std.Build.LazyPath, source: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+fn module(b: *std.Build, root: std.Build.LazyPath, source: []const u8, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Module {
     const result = b.createModule(.{
         .root_source_file = root.path(b, source),
         .target = target,
@@ -20,20 +20,20 @@ fn module(b: *std.Build, root: std.Build.LazyPath, source: []const u8, target: s
 pub fn tool(b: *std.Build, root: std.Build.LazyPath) *std.Build.Step.Compile {
     return b.addExecutable(.{
         .name = "hyperv-image-proof",
-        .root_module = module(b, root, "support/build/hyperv-proof-tool.zig", b.graph.host, .ReleaseSafe),
+        .root_module = module(b, root, "support/build/hyperv-proof-tool.zig", b.graph.host, .safe),
     });
 }
 
 pub fn tests(b: *std.Build, root: std.Build.LazyPath) *std.Build.Step {
     const step = b.step("test-hyperv-image-proofs", "Run native Hyper-V linked-image proofs and refusal fixtures; no guest execution");
     const proof_tool = tool(b, root);
-    for ([_]std.builtin.OptimizeMode{ .Debug, .ReleaseSafe }) |optimize| {
+    for ([_]std.lang.Optimize{ .debug, .safe }) |optimize| {
         const unit = b.addTest(.{ .root_module = module(b, root, "support/build/hyperv-proof-tests.zig", b.graph.host, optimize) });
         step.dependOn(&b.addRunArtifact(unit).step);
     }
     const debug_tool = b.addExecutable(.{
         .name = "hyperv-image-proof-debug",
-        .root_module = module(b, root, "support/build/hyperv-proof-tool.zig", b.graph.host, .Debug),
+        .root_module = module(b, root, "support/build/hyperv-proof-tool.zig", b.graph.host, .debug),
     });
     const install = b.step("build-hyperv-image-proofs", "Build/install the native Hyper-V linked-image proof CLI only");
     install.dependOn(&b.addInstallArtifact(proof_tool, .{}).step);
@@ -41,7 +41,7 @@ pub fn tests(b: *std.Build, root: std.Build.LazyPath) *std.Build.Step {
     const objdump = b.option([]const u8, "proof-objdump", "Native objdump command for image proof fixtures") orelse "llvm-objdump";
     const fixture_runner = b.addExecutable(.{
         .name = "hyperv-proof-fixtures",
-        .root_module = module(b, root, "support/build/hyperv-proof-fixtures.zig", b.graph.host, .Debug),
+        .root_module = module(b, root, "support/build/hyperv-proof-fixtures.zig", b.graph.host, .debug),
     });
     const config = b.addWriteFiles();
     _ = config.add("uk/bits/config.h", "/* Native, freestanding proof fixture configuration. */\n");
@@ -57,12 +57,12 @@ pub fn tests(b: *std.Build, root: std.Build.LazyPath) *std.Build.Step {
         .{ .name = "single", .cpus = 1, .fixed = false, .paging = false },
     }) |options| {
         const target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .freestanding, .abi = .none });
-        const fixture_module = module(b, root, "support/build/tests/hyperv-proof-fixture.zig", target, .ReleaseSmall);
+        const fixture_module = module(b, root, "support/build/tests/hyperv-proof-fixture.zig", target, .small);
         fixture_module.strip = false;
         const object = b.addObject(.{ .name = b.fmt("proof-zig-{s}", .{options.name}), .root_module = fixture_module });
         const executable = b.addExecutable(.{
             .name = b.fmt("proof-image-{s}", .{options.name}),
-            .root_module = b.createModule(.{ .target = target, .optimize = .ReleaseSmall, .strip = false }),
+            .root_module = b.createModule(.{ .target = target, .optimize = .small, .strip = false }),
         });
         executable.root_module.addObject(object);
         executable.root_module.addIncludePath(config.getDirectory());
@@ -92,7 +92,7 @@ pub fn tests(b: *std.Build, root: std.Build.LazyPath) *std.Build.Step {
             run.addFileArg(executable.getEmittedBin());
             run.addFileArg(object.getEmittedBin());
             run.addArgs(&.{ nm, objdump, options.name, b.fmt("{d}", .{options.cpus}) });
-            _ = run.addOutputDirectoryArg(b.fmt("proof-fixtures-{s}-{s}", .{ options.name, mode }));
+            _ = run.addOutputDirectoryArg2(b.fmt("proof-fixtures-{s}-{s}", .{ options.name, mode }), .{ .make_absolute = true });
             step.dependOn(&run.step);
         }
     }

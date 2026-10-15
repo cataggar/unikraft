@@ -134,6 +134,56 @@ parity, private-runtime product acceptance, workflow cutover and Python deletion
 remain separately gated. Tests simulate privilege only in fresh fixture roots;
 they do not substitute user-writable products for root-owned production custody.
 
+## Compiler and historical-import compatibility
+
+New producers require official Zig 0.17.0 and use `-Doptimize=safe`.
+`zig build` receives its global cache through the bound
+`ZIG_GLOBAL_CACHE_DIR` environment variable, not `--global-cache-dir`.
+Current `zig fetch` rehashes use a separately bound `--pkg-dir` because its
+removed global-cache CLI flag is also rejected by Zig 0.17.
+Historical imported build commands retain their original flag bindings.
+Dependency-custody schema version 1 now records the producer-specific
+`zig-0.17.0-fetch-path` algorithm. Read-only imports explicitly retain
+`zig-0.16.0-fetch-path`, its original Miz revision/package hash, historical
+`ReleaseSafe` command bindings, and Zig 0.16.0 runtime identities. These are
+not accepted as new local producer inputs or relabelled as Zig 0.17 evidence.
+The historical source, canonical records, physical custody, dependency graph,
+and actual native output revalidation remain required; schema versions and
+resource bounds are unchanged.
+
+The standalone controller Build declares embedded source inputs directly from
+`support/controller_source_closure.zig`. This handles Zig 0.17's distinct
+nested-build-root path domains without changing the compiled source bytes or
+closure recipe. Inventory changes invalidate cached configuration.
+
+New dependency restoration binds the qualified exact-generation Miz
+`66ea6701cf0e1b6d31e5f30fade00b7a546d4b44` package; the Zig 0.16 import
+algorithm still selects its original `669a27982b376311f558e820b69e9a692735b0cd`
+revision and package hash. Changing only an imported algorithm name cannot
+authenticate a package from the other generation.
+
+The WAMR-specific `dependency-restore/build.zig.zon` seeds both current Miz and
+the current SDK, so a cold `--fetch=all` also restores the SDK's immutable
+WABT/wasip2 and Translator/Aro closure before admission. Its Build installs no
+artifacts. It does not add SDK dependencies to generic local-boot consumers or
+change the historical singleton-Miz manifest.
+
+New SDK producers select exact-generation compatibility revision
+`bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20`, published by protected
+[WAMR PR #1081](https://github.com/cataggar/wamr/pull/1081).
+Frozen Zig 0.16 imports retain
+`a53205d77be3b880eb8f8b96679512ba58e2331a`; changing only the runtime compiler
+version or SDK revision cannot authenticate the other generation. SDK source
+custody covers the complete selected Git archive, including
+`build/environment.zig`, `include/wamr_aot.h`, and
+`tests/unikraft-jit/fixture.zig`, `src/main.zig`, and `src/wasi/net_io.zig`,
+without changing its metadata
+schema or evidence bounds.
+
+The exact-generation WAMR/Miz dependency qualification is a separate
+prerequisite to an integrated build. Validator or controller fixture success
+alone does not qualify the SDK, hardware, deployment, or cloud lineage.
+
 ## Authority contract freeze (#189 PR1; no caller cutover)
 
 `authority/root.zig` exports the frozen contracts and native source foundations
@@ -166,7 +216,7 @@ embedded records and the outer document; malformed metadata, extra domains or
 nested fields, scalar coercions and unsupported versions must fail that same
 consumer, not a comparison against another golden.
 
-Run with Zig 0.16 and fresh owner-only roots (no credentials or cloud calls):
+Run with Zig 0.17.0 and fresh owner-only roots (no credentials or cloud calls):
 
 ```sh
 umask 077
@@ -184,6 +234,12 @@ The full package build's `test-authority-contracts`, `test-controller`, and
 and removes only its fresh child below the scratch parent, preserving existing
 parent contents. `--write` intentionally regenerates checked-in goldens for
 review; it is not part of verification.
+The current v2 fixtures bind the Zig 0.17 SDK generation. Frozen v1 fixtures
+retain the original SDK revision and byte-identical archives; their generator
+selects the historical source context explicitly rather than relabelling it.
+The controller test runner retains its selected optimization mode but is
+stripped because it serves as its own retained handoff-controller executable.
+This keeps debug information outside the unchanged 64 MiB executable bound.
 
 The scenario inventory tracks every test in its three named Python sources.
 After adding or removing tests there, regenerate and review
@@ -666,6 +722,14 @@ checkout must be clean, match the owner's embedded tracked source closure,
 and remain unchanged throughout bounded native supervision. It is not required
 to masquerade as the historical producer checkout. No v1 build, boot,
 validator-build, profile admission, or Python fallback is enabled.
+Only that validated frozen-v1 compatibility selects the distinct bounded
+`import-historical-native-revalidation` command record: its validator verb is
+`historical-handoff` and its exact success marker starts with `Historical`.
+Ordinary current revalidation retains `handoff` and the `Compute` marker;
+neither route accepts the other's command binding or success marker. Fresh
+Python v1 import revalidation uses the same explicit historical verb and marker.
+Original producer records, Zig 0.16 SDK identities, and frozen Miz packaging
+revisions are never rewritten.
 The historical archive/operator router now selects this native read-only
 operation before writing candidate records, using the current native supervisor
 and its build-derived validator. Its independent Python publication-record
@@ -742,14 +806,14 @@ local proof after the original consumer files or loader are removed.
 `zig build --build-file support/build/wamr-native-ci/build.zig test-controller`
 runs the native controller foundation's CLI/profile, canonical-record,
 source-closure and refusal fixtures. Build the portable executable with
-`-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=ReleaseSafe`. To place
+`-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=safe`. To place
 only that executable in an existing canonical, owner-only `0700` runtime,
 invoke `install-controller` with `-Dcontroller-runtime=/absolute/runtime`.
 Installation creates `controller/bin/uk-wamr-native-ci` (private `0700` path
 and ELF) and refuses any preexisting slot; it does not install over a prior
 controller. The controller is always compiled for GNU/x86_64_v2, independent
 of the other package artifacts; `install-controller` additionally requires
-the explicit GNU/v2 and `ReleaseSafe` flags and refuses musl, v3, or an
+the explicit GNU/v2 and `safe` flags and refuses musl, v3, or an
 unspecified target before creating a slot. `describe --output json-v1`
 reports that fixed target and the embedded source-content closure without
 accessing a runtime or granting boot authority.
@@ -860,7 +924,10 @@ The protected x86 job exercises `test-controller-limits` and then
 and cache outside the production source checkout; this reports fixture failures
 without exposing private supervised-command output. On failure it runs the
 host test binary directly for diagnostic errors while keeping the original
-gate failed. The compatibility
+gate failed. The host controller fixture omits debug symbols in both modes
+and uses LLVM/LLD in `debug` to stay within the unchanged 16 MiB supervisor
+identity limit. `debug` still enables its normal safety checks and assertions;
+production compiler and linker selection is unchanged. The compatibility
 `tests/source_custody_production_limits.py` launcher invokes only the native
 limit fixture; production `build` uses the installed native controller.
 
@@ -889,7 +956,7 @@ unchanged. This does not complete #88's guarded Azure authority or image handoff
 
 The job builds the distinct `hyperv-x86_64-efi-wamr` target using the
 adapter-installed app-owned `uk-wamr-aot-build` executable, pinned WAMR
-`a53205d77be3b880eb8f8b96679512ba58e2331a`, Zig 0.16.0, the existing LLVM
+`661ac49584c4d0ac57adb78eba62f3ff3e9795df`, Zig 0.17.0, the existing LLVM
 distribution and the native final-image graph. Its constructor/returning-IRQ,
 SMP, relocation and EFI checks are not replaced, mocked or disabled.
 There is no guest compiler or hosted-runtime substitute. Only the tiny
@@ -1037,7 +1104,7 @@ supervisor's exact tracked source closure are checked before and after that
 build. The native production controller supervises commands directly through
 the shared process library and records its own embedded source closure.
 Both supervisor implementations and the public validator use the fixed
-`-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2` target with `ReleaseSafe`, not the
+`-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2` target with `safe`, not the
 runner's native microarchitecture. The validator's supervised command contract
 binds these exact flags; the supervisor's source closure binds the bootstrap
 selection. Rebuilding the same sources with the pinned Zig compiler and those
@@ -1210,8 +1277,28 @@ Before Zig runs it binds each copy's exact
 device/inode/type, ownership, links, size, mtime and ctime plus the parent
 directory metadata, and requires the same identities immediately afterward.
 It also byte-compares the copies, parses the one exact Miz
-URL/revision/package hash, and only then performs the bounded fetch. Before
-reading package content it enumerates and snapshots the complete bounded
+URL/revision/package hash, and only then performs the bounded fetch.
+The restoration command's fresh environment binds
+`ZIG_LOCAL_PKG_DIR` to that restore's `compute/dependencies/zig-pkg`;
+the Python restoration command also uses the restore directory as its cwd.
+This is a per-restoration binding, not a process-global or CI-wide package
+directory override. No default `zig-pkg` may be introduced into source custody.
+The current prepare, config and native-image command bindings pass this same
+authenticated depot to the image helper as `ZIG_LOCAL_PKG_DIR`. The helper
+revalidates the immutable Translator/Aro closure before the root Build and
+passes `--system`; the current Miz closure already restores those exact
+packages transitively, so no additional manifest root is needed.
+That statement concerns the root translator only: raw SDK preparation also
+requires the immutable WABT and wasip2 closure from the qualified SDK manifest,
+restored and authenticated before source/admission custody. Preparation never
+fetches a missing SDK package implicitly.
+Zig 0.17 gives `ZIG_LOCAL_PKG_DIR` precedence over the `--system` directory.
+Root and preparation helpers therefore bind both to the same authenticated
+depot. Other fixed bootstrap/tool environments remove that variable instead
+of forwarding ambient or extra package-directory overrides.
+Historical command records retain their original environment through the
+explicit historical import selector, never current producer admission.
+Before reading package content it enumerates and snapshots the complete bounded
 directory set, including `zig-pkg`, then requires the exact set and metadata
 after traversal. The restored tree rejects links, nonregular entries, unsafe
 names, extra/missing/duplicate roots and incomplete transitive manifests.
@@ -1219,7 +1306,7 @@ An upstream package's `.dependencies = .{}` has no transitive edges; the
 source-pinned root manifest must still name exactly one Miz dependency.
 Under its owner-only `0700` root, descriptor-relative native custody admits
 and records upstream package file/directory modes (including `0777`) without
-relaxing the general host-artifact policy. Zig 0.16
+relaxing the general host-artifact policy. Zig 0.17.0
 `fetch PATH` independently recomputes every package hash, including Miz rather
 than trusting its directory name. `build-start.json` embeds
 `uk.wamr.zig-dependency-custody` version 1: request and source/copy manifest
@@ -1298,38 +1385,42 @@ artifact.
 
 ## Focused checks
 
-From a checkout with Zig 0.16:
+From a checkout with Zig 0.17.0 and qualified dependency pins:
+set `WAMR_CI_CHECK_ROOT` to a fresh canonical, owner-only scratch directory
+outside the source checkout. Source-custody limit fixtures deliberately refuse
+a cache root inside the checkout. Each build script uses a distinct local cache.
 
 ```sh
 umask 077
-mkdir -p .d/wamr-ci-check/{cache,global-cache/tmp,scratch,restore,out,fixtures}
-export TMPDIR="$PWD/.d/wamr-ci-check/scratch"
-export ZIG_GLOBAL_CACHE_DIR="$PWD/.d/wamr-ci-check/global-cache"
+check_root="${WAMR_CI_CHECK_ROOT:?select a private directory outside the checkout}"
+mkdir -p "$check_root"/{restore-cache,controller-cache,supervisor-cache,global-cache/tmp,scratch,restore,out}
+export TMPDIR="$check_root/scratch"
+export ZIG_GLOBAL_CACHE_DIR="$check_root/global-cache"
 cp support/tools/hyperv/local_boot/build.zig \
-  support/tools/hyperv/local_boot/build.zig.zon .d/wamr-ci-check/restore/
-zig build --build-file .d/wamr-ci-check/restore/build.zig --fetch=all \
-  --cache-dir .d/wamr-ci-check/cache \
-  --global-cache-dir .d/wamr-ci-check/global-cache -j2
+  support/tools/hyperv/local_boot/build.zig.zon "$check_root/restore/"
+ZIG_LOCAL_PKG_DIR="$check_root/restore/zig-pkg" \
+zig build --build-file "$check_root/restore/build.zig" --fetch=all \
+  --cache-dir "$check_root/restore-cache" \
+  -j2
 zig build --build-file support/build/wamr-native-ci/build.zig \
-  --system "$PWD/.d/wamr-ci-check/restore/zig-pkg" \
-  --cache-dir .d/wamr-ci-check/cache --prefix "$PWD/.d/wamr-ci-check/out" \
-  -Dtest-root="$PWD/.d/wamr-ci-check/fixtures" \
-  -Doptimize=ReleaseSafe -j2 test install
+  --system "$check_root/restore/zig-pkg" \
+  --cache-dir "$check_root/controller-cache" --prefix "$check_root/out" \
+  -Dtest-root="$check_root/fixtures" \
+  -Doptimize=safe -j2 test install
 SUPERVISOR_SOURCE_SHA256="$(
-  "$PWD/.d/wamr-ci-check/out/bin/uk-wamr-native-ci" \
+  "$check_root/out/bin/uk-wamr-native-ci" \
     supervisor-source-closure --git "$(command -v git)" --output sha256-v1
 )"
 zig build --build-file support/build/wamr-native-ci/supervisor.build.zig \
-  --system "$PWD/.d/wamr-ci-check/restore/zig-pkg" \
-  --cache-dir .d/wamr-ci-check/cache \
-  --global-cache-dir .d/wamr-ci-check/global-cache \
-  --prefix "$PWD/.d/wamr-ci-check/supervisor" \
+  --system "$check_root/restore/zig-pkg" \
+  --cache-dir "$check_root/supervisor-cache" \
+  --prefix "$check_root/supervisor" \
   -Dsource-closure-sha256="$SUPERVISOR_SOURCE_SHA256" \
-  -Doptimize=ReleaseSafe -j2 install
-WAMR_CI_PACKAGE="$PWD/.d/wamr-ci-check/out/bin/wamr-ci-package" \
-WAMR_CI_LOG_VALIDATE="$PWD/.d/wamr-ci-check/out/bin/uk-wamr-log-validate" \
-WAMR_CI_SUPERVISOR="$PWD/.d/wamr-ci-check/supervisor/bin/wamr-ci-supervisor" \
-WAMR_CI_SUPERVISOR_FIXTURE="$PWD/.d/wamr-ci-check/out/bin/wamr-ci-supervisor-fixture" \
+  -Doptimize=safe -j2 install
+WAMR_CI_PACKAGE="$check_root/out/bin/wamr-ci-package" \
+WAMR_CI_LOG_VALIDATE="$check_root/out/bin/uk-wamr-log-validate" \
+WAMR_CI_SUPERVISOR="$check_root/supervisor/bin/wamr-ci-supervisor" \
+WAMR_CI_SUPERVISOR_FIXTURE="$check_root/out/bin/wamr-ci-supervisor-fixture" \
   python3 -m unittest discover -s support/build/wamr-native-ci/tests -v
 ```
 
@@ -1389,6 +1480,15 @@ a second controller acceptance implementation. Native export produces only v2;
 the literal historical v1 layouts remain read-only compatibility.
 `test-controller-limits`, `test-controller-fault-parity`,
 `test-differential-records`, and `test-handoff-contracts` run those suites separately.
+Executable-custody and pre-spawn fixtures use a build-produced native no-op ELF,
+not an ambient `/usr/bin/true`. The no-op is built in `safe` without debug symbols
+to retain the existing fixture size bound; the test runners retain their selected
+`debug` or `safe` mode. Executable admission, retained-descriptor and cancellation
+policies are unchanged. Keep the test executable and fixture artifacts under the
+canonical, owner-only private qualification root.
+Build options track the compiler library and repository directories as directory
+inputs. Scratch fixture roots are untracked output paths, not input files or
+directory-content dependencies.
 The neutral v1/v2 fixture constructors in `tests/controller_record_fixtures.py`
 remain available to #187/#189. `test_differential_parity.DeterministicContracts`
 is only a compatibility import of their neutral byte tests, not a controller
@@ -1623,7 +1723,7 @@ local-boot installation paths, and native-only boot-input validator role are
 checked against their own exact physical contracts; each QCOW2 acceptance
 binds its own boot-input record rather than treating different hashes as equal.
 Shared production executables are built without path-dependent debug sections
-outside Debug mode so separately cached ReleaseSafe builds retain identical
+outside debug mode so separately cached safe builds retain identical
 bytes for strict paired tool and boot-input custody. The pinned upstream WAMR
 compiler is also built with its supported `-Dstrip=true` option: otherwise its
 debug sections change the compiler and generated runtime-identity bytes across

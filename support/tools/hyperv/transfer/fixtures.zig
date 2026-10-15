@@ -212,6 +212,12 @@ const Fixture = struct {
     name: []const u8,
 
     fn init(name: []const u8) !Fixture {
+        const root_path = @import("test_options").test_root orelse return error.TestRootRequired;
+        const root = try @import("hyperv_core").private_files.Directory.open(io, root_path);
+        defer root.close(io);
+        const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
+        defer allocator.free(cwd);
+        if (!std.mem.eql(u8, cwd, root_path)) return error.TestRootMismatch;
         try std.Io.Dir.cwd().createDir(io, name, .fromMode(0o700));
         errdefer std.Io.Dir.cwd().deleteDir(io, name) catch {};
         const dir = try std.Io.Dir.cwd().openDir(io, name, .{ .follow_symlinks = false });
@@ -230,7 +236,7 @@ const Fixture = struct {
         defer handle.close(io);
         // Creation applies umask; permission-refusal fixtures need exact modes.
         try handle.setPermissions(io, .fromMode(mode));
-        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.path, name });
+        return allocator.print("{s}/{s}", .{ self.path, name });
     }
     fn input(self: Fixture, bytes: []const u8) !files.Input {
         var hash: [32]u8 = undefined;
@@ -238,7 +244,7 @@ const Fixture = struct {
         return .{ .path = try self.file("source", bytes, 0o600), .size = bytes.len, .sha256 = hash };
     }
     fn destination(self: Fixture) ![]u8 {
-        return std.fmt.allocPrint(allocator, "{s}/download", .{self.path});
+        return allocator.print("{s}/download", .{self.path});
     }
 };
 
@@ -298,7 +304,7 @@ test "create-only block wire streams across uneven boundaries with MD5 and full 
 test "transport entry is unknown even at zero bytes and after partial body" {
     const fixture = try Fixture.init("unknown-upload");
     defer fixture.deinit();
-    const bytes = [_]u8{0x5a} ** 32768;
+    const bytes = @as([32768]u8, @splat(0x5a));
     const input = try fixture.input(&bytes);
     defer allocator.free(input.path);
     for ([_]usize{ 0, 7001 }) |failure| {
@@ -365,7 +371,7 @@ test "header XML JSON absent unknown malformed and conflicting metadata are expl
 }
 
 test "redirect is returned without following and error bodies are capped" {
-    const huge = [_]u8{'X'} ** (d.max_error_body + 4000);
+    const huge = @as([(d.max_error_body + 4000)]u8, @splat('X'));
     var mock: Mock = .{ .steps = &.{.{
         .url = container_url,
         .status = 307,
@@ -559,8 +565,8 @@ test "managed disk partial known rejection and unknown later update never replay
 test "footer mismatch keeps accepted page updates and actual readback status" {
     const fixture = try Fixture.init("footer-mismatch");
     defer fixture.deinit();
-    const bytes = [_]u8{0x7a} ** 512;
-    const wrong = [_]u8{0x79} ** 512;
+    const bytes = @as([512]u8, @splat(0x7a));
+    const wrong = @as([512]u8, @splat(0x79));
     const input = try fixture.input(&bytes);
     defer allocator.free(input.path);
     var md5: [16]u8 = undefined;
@@ -621,7 +627,7 @@ test "private request and SAS files refuse symlink public mode directory and ove
     defer allocator.free(public);
     try testing.expectError(error.UnsafeFile, contract.Request.load(allocator, io, public));
     try fixture.dir.symLink(io, "request", "link", .{});
-    const link = try std.fmt.allocPrint(allocator, "{s}/link", .{fixture.path});
+    const link = try allocator.print("{s}/link", .{fixture.path});
     defer allocator.free(link);
     try testing.expectError(error.UnsafeFile, contract.Request.load(allocator, io, link));
     try testing.expectError(error.UnsafeFile, files.readSensitive(io, allocator, fixture.path, 100, null));
@@ -720,12 +726,12 @@ test "FIFO symlink ancestor wrong size and nonprivate output directory refuse wi
         std.os.linux.S.IFIFO | 0o600,
         0,
     )));
-    const fifo = try std.fmt.allocPrint(allocator, "{s}/fifo", .{fixture.path});
+    const fifo = try allocator.print("{s}/fifo", .{fixture.path});
     defer allocator.free(fifo);
     try testing.expectError(error.UnsafeFile, files.openRegular(io, fifo, .private));
     try fixture.dir.createDir(io, "nested", .fromMode(0o700));
     try fixture.dir.symLink(io, "nested", "alias", .{ .is_directory = true });
-    const alias = try std.fmt.allocPrint(allocator, "{s}/alias/input", .{fixture.path});
+    const alias = try allocator.print("{s}/alias/input", .{fixture.path});
     defer allocator.free(alias);
     if (files.Parent.open(io, alias, .artifact)) |parent| {
         parent.close(io);
@@ -737,7 +743,7 @@ test "FIFO symlink ancestor wrong size and nonprivate output directory refuse wi
         defer directory.close(io);
         try directory.setPermissions(io, .fromMode(0o755));
     }
-    const public = try std.fmt.allocPrint(allocator, "{s}/public/output", .{fixture.path});
+    const public = try allocator.print("{s}/public/output", .{fixture.path});
     defer allocator.free(public);
     try expectFailure(client.downloadBlob(blob, .{ .path = public, .maximum = 100 }), .unsafe_file, .not_started, null);
     try testing.expectEqual(@as(usize, 0), mock.calls);
@@ -748,7 +754,7 @@ test "fragmented downloads stop reader calls immediately on cancellation or dead
     defer fixture.deinit();
     const destination = try fixture.destination();
     defer allocator.free(destination);
-    const bytes = [_]u8{0x41} ** 32768;
+    const bytes = @as([32768]u8, @splat(0x41));
     for ([_]bool{ false, true }) |timed| {
         var mock: Mock = .{ .steps = &.{.{
             .method = .GET,
@@ -777,7 +783,7 @@ test "fragmented downloads stop reader calls immediately on cancellation or dead
 test "fragmented footer stops reader calls immediately on cancellation or deadline" {
     const fixture = try Fixture.init("footer-stop");
     defer fixture.deinit();
-    const bytes = [_]u8{0x58} ** 512;
+    const bytes = @as([512]u8, @splat(0x58));
     const input = try fixture.input(&bytes);
     defer allocator.free(input.path);
     var md5: [16]u8 = undefined;
@@ -840,7 +846,7 @@ test "fragmented error extraction stops reader calls without losing rejection ce
 test "page deadline at transport entry is unknown and growing source stays accepted but fails verification" {
     const fixture = try Fixture.init("page-local-failure");
     defer fixture.deinit();
-    const bytes = [_]u8{0x6b} ** 512;
+    const bytes = @as([512]u8, @splat(0x6b));
     const input = try fixture.input(&bytes);
     defer allocator.free(input.path);
     var timed: Mock = .{ .steps = &.{.{ .url = disk_url ++ "&comp=page", .length = 512, .before = expire }} };
@@ -883,8 +889,8 @@ test "buffered-only runtime is refused before transport" {
 test "footer refuses missing integrity wrong range excess and truncated data" {
     const fixture = try Fixture.init("footer-contracts");
     defer fixture.deinit();
-    const bytes = [_]u8{0x68} ** 512;
-    const extra = [_]u8{0x68} ** 513;
+    const bytes = @as([512]u8, @splat(0x68));
+    const extra = @as([513]u8, @splat(0x68));
     const input = try fixture.input(&bytes);
     defer allocator.free(input.path);
     var md5: [16]u8 = undefined;
@@ -916,12 +922,11 @@ test "footer refuses missing integrity wrong range excess and truncated data" {
 test "managed disk private worker binds strict geometry hash and separate SAS channel" {
     const fixture = try Fixture.init("disk-private-worker");
     defer fixture.deinit();
-    const bytes = [_]u8{0x4d} ** 512;
+    const bytes = @as([512]u8, @splat(0x4d));
     const input = try fixture.input(&bytes);
     defer allocator.free(input.path);
     const hash = std.fmt.bytesToHex(input.sha256, .lower);
-    const raw = try std.fmt.allocPrint(
-        allocator,
+    const raw = try allocator.print(
         "{{\"schema\":\"{s}\",\"schema_version\":1,\"endpoint\":\"{s}\",\"path\":\"{s}\",\"size\":512,\"sha256\":\"{s}\"}}",
         .{ contract.disk_schema, disk_endpoint, input.path, hash },
     );

@@ -98,7 +98,7 @@ fn zero(bytes: []const u8) bool {
 fn sectorCrc(bytes: *const Sector) u32 {
     var checked = bytes.*;
     @memset(checked[508..512], 0);
-    return std.hash.crc.Crc32IsoHdlc.hash(&checked);
+    return std.hash.crc.@"CRC-32/ISO-HDLC".hash(&checked);
 }
 
 /// Encodes one 512-byte record, not a disk. General guarded geometry is accepted

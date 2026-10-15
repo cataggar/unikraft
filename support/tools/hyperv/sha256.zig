@@ -7,7 +7,7 @@ extern fn hyperv_sha256_clear_upper() callconv(.c) void;
 fn clearUpper() void {
     if (@inComptime()) return;
     if (comptime builtin.zig_backend == .stage2_x86_64 and
-        builtin.cpu.hasAll(.x86, &.{ .sha, .avx2 }))
+        builtin.target.cpu.hasAll(.x86, &.{ .sha, .avx2 }))
     {
         hyperv_sha256_clear_upper();
     }

@@ -40,7 +40,7 @@ pub const State = struct {
     private_at: ?u64 = null,
     acceptance_sha256: ?p.Hash = null,
     completion_sha256: ?p.Hash = null,
-    actions: [c.action_count]Observation = [_]Observation{.{}} ** c.action_count,
+    actions: [c.action_count]Observation = @as([c.action_count]Observation, @splat(.{})),
     spent: c.Debit = .{ .staged = c.emergency_bytes + c.worker_output_reservation, .control = c.emergency_bytes + c.worker_output_reservation },
     failures: core.diagnostics.Failures = .{},
 
@@ -167,7 +167,7 @@ pub const Store = struct {
             }
         } else if (state.phase != .prepared) return error.MissingDurableIntent;
         for (&store.state.actions, 0..) |*entry, i| {
-            const action: c.Action = @enumFromInt(i);
+            const action: c.Action = @fromBackingInt(@intCast(i));
             const name = try store.intentName(action);
             defer allocator.free(name);
             const file = lock.directory.openFile(io, name) catch |err| switch (err) {
@@ -272,7 +272,7 @@ pub const Store = struct {
         try durable(try self.lock.createImmutable(self.io, name, bytes));
     }
     pub fn begin(self: *Store, action: c.Action, reserve: u64, control: bool) !void {
-        const entry = &self.state.actions[@intFromEnum(action)];
+        const entry = &self.state.actions[@backingInt(action)];
         if (entry.status != .fresh) return error.AttemptConsumed;
         try self.charge(reserve, control);
         try self.charge(4096, true);
@@ -308,7 +308,7 @@ pub const Store = struct {
         }, failure) catch unreachable;
     }
     fn intentName(self: *Store, action: c.Action) ![]u8 {
-        return std.fmt.allocPrint(self.allocator, "intent-{s}.json", .{@tagName(action)});
+        return self.allocator.print("intent-{s}.json", .{@tagName(action)});
     }
 };
 

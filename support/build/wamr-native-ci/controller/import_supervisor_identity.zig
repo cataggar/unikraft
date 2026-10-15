@@ -205,13 +205,13 @@ pub fn verifyGitIdentity(
     try notCancelled(signal);
     const commit = try source.gitOutput(a, io, repository, git, &.{ "rev-parse", "--verify", revision_ref }, 65, null);
     defer a.free(commit);
-    const expected_commit = try std.fmt.allocPrint(a, "{s}\n", .{identity.revision});
+    const expected_commit = try a.print("{s}\n", .{identity.revision});
     defer a.free(expected_commit);
     try same(commit, expected_commit);
     try notCancelled(signal);
     const tree = try source.gitOutput(a, io, repository, git, &.{ "rev-parse", tree_ref }, 65, null);
     defer a.free(tree);
-    const expected_tree = try std.fmt.allocPrint(a, "{s}\n", .{identity.tree});
+    const expected_tree = try a.print("{s}\n", .{identity.tree});
     defer a.free(expected_tree);
     try same(tree, expected_tree);
 }
@@ -458,7 +458,7 @@ pub fn run(
         .supervisor = supervisor_path,
         .package_tool = "",
         .validator = "",
-        .tools = @splat(""),
+        .tools = @as([inputs.host_tools.len][]const u8, @splat("")),
     };
     const outcome = try adapter.execute(allocator, io, .{
         .roots = roots,

@@ -102,7 +102,7 @@ const Family = struct {
         return self.worker_reaped;
     }
     fn reapOne(pid: linux.pid_t, status: *u32) !bool {
-        const waited = linux.waitpid(pid, status, linux.W.NOHANG);
+        const waited = linux.waitpid(pid, @ptrCast(status), linux.W.NOHANG);
         if (linux.errno(waited) == .INTR) return false;
         if (linux.errno(waited) != .SUCCESS) return error.HelperReapFailed;
         if (waited == 0) return false;
@@ -135,21 +135,21 @@ const WireCommand = struct {
     fn encode(value: probes.CommandEvidence) WireCommand {
         var result: WireCommand = undefined;
         @memset(std.mem.asBytes(&result), 0);
-        inline for (std.meta.fields(WireCommand)) |field| {
-            if (comptime std.mem.eql(u8, field.name, "freshness_code"))
+        inline for (@typeInfo(WireCommand).@"struct".field_names) |field_name| {
+            if (comptime std.mem.eql(u8, field_name, "freshness_code"))
                 result.freshness_code = if (value.freshness) |err| @intFromError(err) else 0
             else
-                @field(result, field.name) = @field(value, field.name);
+                @field(result, field_name) = @field(value, field_name);
         }
         return result;
     }
     fn decode(self: WireCommand) probes.CommandEvidence {
         var result: probes.CommandEvidence = undefined;
-        inline for (std.meta.fields(WireCommand)) |field| {
-            if (comptime std.mem.eql(u8, field.name, "freshness_code"))
+        inline for (@typeInfo(WireCommand).@"struct".field_names) |field_name| {
+            if (comptime std.mem.eql(u8, field_name, "freshness_code"))
                 result.freshness = if (self.freshness_code != 0) @errorFromInt(self.freshness_code) else null
             else
-                @field(result, field.name) = @field(self, field.name);
+                @field(result, field_name) = @field(self, field_name);
         }
         result.stdout_redacted = if (self.stdout_bytes == 0) "" else "[redacted]";
         result.stderr_redacted = if (self.stderr_bytes == 0) "" else "[redacted]";
@@ -317,7 +317,7 @@ fn child(fd: linux.fd_t, parent: linux.pid_t, job: Job, cwd: std.Io.Dir, slot: *
         job.process_test.after_report_ms != 0)
     {
         if (job.process_test.empty_after_report) {
-            const empty: [0]u8 = .{};
+            const empty: [1]u8 = .{0};
             _ = linux.sendto(fd, &empty, 0, linux.MSG.NOSIGNAL, null, 0);
         } else _ = linux.close(fd);
         var pause: [0]linux.pollfd = .{};

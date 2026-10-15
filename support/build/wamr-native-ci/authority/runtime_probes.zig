@@ -60,31 +60,31 @@ pub fn inspectElf(a: std.mem.Allocator, bytes: []const u8, role: ElfRole) !ElfIn
         try elf.integer(u16, bytes, 54, .little) != 56)
         return error.InvalidElf;
     _ = try elf.range(bytes, phoff, @as(u64, phnum) * 56);
-    var programs: [1024]std.elf.Elf64_Phdr = undefined;
-    var dynamic: ?std.elf.Elf64_Phdr = null;
+    var programs: [1024]std.elf.Elf64.Phdr = undefined;
+    var dynamic: ?std.elf.Elf64.Phdr = null;
     var result: ElfInfo = .{ .allocator = a, .entry = try elf.integer(u64, bytes, 24, .little) };
     errdefer result.deinit();
     var entry_loaded = false;
     var loads: usize = 0;
     for (programs[0..phnum], 0..) |*ph, index| {
-        ph.* = try elf.structure(std.elf.Elf64_Phdr, bytes, phoff + index * 56, .little);
-        _ = try elf.range(bytes, ph.p_offset, ph.p_filesz);
-        _ = try elf.add(ph.p_vaddr, ph.p_memsz);
-        switch (ph.p_type) {
-            std.elf.PT_LOAD => {
+        ph.* = try elf.structure(std.elf.Elf64.Phdr, bytes, phoff + index * 56, .little);
+        _ = try elf.range(bytes, ph.offset, ph.filesz);
+        _ = try elf.add(ph.vaddr, ph.memsz);
+        switch (ph.type) {
+            .LOAD => {
                 loads += 1;
-                if (ph.p_filesz > ph.p_memsz or ph.p_flags & ~@as(u32, 7) != 0 or
-                    (ph.p_align > 1 and (!std.math.isPowerOfTwo(ph.p_align) or
-                        ph.p_offset % ph.p_align != ph.p_vaddr % ph.p_align)))
+                if (ph.filesz > ph.memsz or @as(u32, @bitCast(ph.flags)) & ~@as(u32, 7) != 0 or
+                    (ph.@"align" > 1 and (!std.math.isPowerOfTwo(ph.@"align") or
+                        ph.offset % ph.@"align" != ph.vaddr % ph.@"align")))
                     return error.InvalidElf;
-                if (ph.p_flags & std.elf.PF_X != 0 and result.entry >= ph.p_vaddr and
-                    result.entry - ph.p_vaddr < ph.p_filesz)
+                if (ph.flags.X and result.entry >= ph.vaddr and
+                    result.entry - ph.vaddr < ph.filesz)
                     entry_loaded = true;
             },
-            std.elf.PT_INTERP => {
-                if (result.interpreter != null or ph.p_filesz < 2 or ph.p_filesz > 4096)
+            .INTERP => {
+                if (result.interpreter != null or ph.filesz < 2 or ph.filesz > 4096)
                     return error.InvalidInterpreter;
-                const value = try elf.range(bytes, ph.p_offset, ph.p_filesz);
+                const value = try elf.range(bytes, ph.offset, ph.filesz);
                 if (value[value.len - 1] != 0 or std.mem.indexOfScalar(u8, value[0 .. value.len - 1], 0) != null)
                     return error.InvalidInterpreter;
                 try absolutePath(value[0 .. value.len - 1]);
@@ -92,8 +92,8 @@ pub fn inspectElf(a: std.mem.Allocator, bytes: []const u8, role: ElfRole) !ElfIn
                     return error.InvalidInterpreter;
                 result.interpreter = try a.dupe(u8, value[0 .. value.len - 1]);
             },
-            std.elf.PT_DYNAMIC => {
-                if (dynamic != null or ph.p_filesz == 0 or ph.p_filesz % 16 != 0 or ph.p_filesz / 16 > 4096)
+            .DYNAMIC => {
+                if (dynamic != null or ph.filesz == 0 or ph.filesz % 16 != 0 or ph.filesz / 16 > 4096)
                     return error.InvalidDynamic;
                 dynamic = ph.*;
             },
@@ -106,15 +106,15 @@ pub fn inspectElf(a: std.mem.Allocator, bytes: []const u8, role: ElfRole) !ElfIn
     // glibc's libc DSO is itself executable and may name the same interpreter.
     if (role == .loader and result.interpreter != null) return error.InvalidInterpreter;
     const dyn = dynamic orelse return error.MissingDynamic;
-    if (try mappedOffset(programs[0..phnum], dyn.p_vaddr, dyn.p_filesz) != dyn.p_offset)
+    if (try mappedOffset(programs[0..phnum], dyn.vaddr, dyn.filesz) != dyn.offset)
         return error.InvalidDynamic;
     var string_address: ?u64 = null;
     var string_size: ?u64 = null;
     var ended = false;
     var entries: [4096]std.elf.Elf64_Dyn = undefined;
     var count: usize = 0;
-    while (count < dyn.p_filesz / 16) : (count += 1) {
-        const entry = try elf.structure(std.elf.Elf64_Dyn, bytes, dyn.p_offset + count * 16, .little);
+    while (count < dyn.filesz / 16) : (count += 1) {
+        const entry = try elf.structure(std.elf.Elf64_Dyn, bytes, dyn.offset + count * 16, .little);
         entries[count] = entry;
         switch (entry.d_tag) {
             std.elf.DT_NULL => {
@@ -165,14 +165,14 @@ pub fn inspectElf(a: std.mem.Allocator, bytes: []const u8, role: ElfRole) !ElfIn
     return result;
 }
 
-fn mappedOffset(programs: []const std.elf.Elf64_Phdr, address: u64, size: u64) !u64 {
+fn mappedOffset(programs: []const std.elf.Elf64.Phdr, address: u64, size: u64) !u64 {
     var result: ?u64 = null;
     for (programs) |ph| {
-        if (ph.p_type != std.elf.PT_LOAD or address < ph.p_vaddr) continue;
-        const delta = address - ph.p_vaddr;
-        if (delta > ph.p_filesz or size > ph.p_filesz - delta) continue;
+        if (ph.type != .LOAD or address < ph.vaddr) continue;
+        const delta = address - ph.vaddr;
+        if (delta > ph.filesz or size > ph.filesz - delta) continue;
         if (result != null) return error.AmbiguousLoad;
-        result = try elf.add(ph.p_offset, delta);
+        result = try elf.add(ph.offset, delta);
     }
     return result orelse error.UnloadedDynamic;
 }
@@ -486,7 +486,7 @@ pub fn requireCopiedLayout(ctx: types.Context, root: std.Io.Dir, layout: types.R
     }
     const lib = try root.openDir(ctx.io, "lib", .{ .follow_symlinks = false });
     defer lib.close(ctx.io);
-    const library_name = try std.fmt.allocPrint(ctx.allocator, "python{s}", .{contract.python_version});
+    const library_name = try ctx.allocator.print("python{s}", .{contract.python_version});
     defer ctx.allocator.free(library_name);
     const library = try lib.openDir(ctx.io, library_name, .{ .follow_symlinks = false });
     defer library.close(ctx.io);
@@ -524,7 +524,7 @@ fn inspectTree(ctx: types.Context, root: std.Io.Dir, layout: types.RuntimeLayout
         .needed_edges = 0,
         .interpreter_sha256 = try core.contracts.parseSha256(contract.interpreter.sha256),
         .interpreter_path_sha256 = undefined,
-        .interpreter_closure = [_]bool{false} ** runtime.max_loader_files,
+        .interpreter_closure = @as([runtime.max_loader_files]bool, @splat(false)),
     };
     var bounds: WalkBounds = .{};
     try walkElf(ctx, root, "", 0, layout, contract, &evidence, &bounds);
@@ -551,7 +551,7 @@ fn interpreterClosure(ctx: types.Context, root: std.Io.Dir, contract: runtime.Co
     try addRequired(info, contract, required);
     const loader_dir = try root.openDir(ctx.io, "loader", .{ .follow_symlinks = false });
     defer loader_dir.close(ctx.io);
-    var inspected = [_]bool{false} ** runtime.max_loader_files;
+    var inspected = @as([runtime.max_loader_files]bool, @splat(false));
     for (contract.loader_dependencies, 0..) |dependency, index|
         if (std.mem.eql(u8, dependency.path, contract.dynamic_loader.path)) {
             required[index] = true;

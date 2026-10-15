@@ -64,7 +64,7 @@ pub fn inspectVhd(a: std.mem.Allocator, io: std.Io, file: std.Io.File, expected:
     if (!std.mem.eql(u8, &raw_digest, &expected.raw) or !std.mem.eql(u8, &vhd_digest, &expected.vhd)) return error.PayloadMismatch;
     var footer: [512]u8 = undefined;
     if (try file.readPositionalAll(io, &footer, c.raw_bytes) != footer.len) return error.ArtifactChanged;
-    const fd_path = try std.fmt.allocPrint(a, "/proc/self/fd/{d}", .{file.handle});
+    const fd_path = try a.print("/proc/self/fd/{d}", .{file.handle});
     defer a.free(fd_path);
     const verified = try miz.validateFixedVhd(a, io, .{
         .path = fd_path,
@@ -117,11 +117,11 @@ pub fn build(a: std.mem.Allocator, io: std.Io, root: p.Directory, efi: c.File) !
     const stage_dir = try root.dir.openDir(io, "package-stage", .{ .follow_symlinks = false, .iterate = true });
     defer stage_dir.close(io);
     try f.sync(io, root.dir);
-    const source_path = try std.fmt.allocPrint(a, "/proc/self/fd/{d}", .{source.handle});
+    const source_path = try a.print("/proc/self/fd/{d}", .{source.handle});
     for ([_]struct { name: []const u8, format: @FieldType(miz.Options, "output_format") }{
         .{ .name = "unikraft.raw", .format = .raw }, .{ .name = "unikraft.vhd", .format = .vhd },
     }) |item| {
-        const report = try miz.build(a, io, .{ .efi_path = source_path, .output_path = try std.fmt.allocPrint(a, "/proc/self/fd/{d}/{s}", .{ stage_dir.handle, item.name }), .output_format = item.format, .architecture = .x86_64, .esp_size = c.esp_bytes, .max_efi_size = c.max_efi });
+        const report = try miz.build(a, io, .{ .efi_path = source_path, .output_path = try a.print("/proc/self/fd/{d}/{s}", .{ stage_dir.handle, item.name }), .output_format = item.format, .architecture = .x86_64, .esp_size = c.esp_bytes, .max_efi_size = c.max_efi });
         if (report.output_format != item.format or report.architecture != .x86_64 or report.input_size != efi.size or
             !std.mem.eql(u8, &report.input_sha256, &try c.sha(efi.sha256)) or report.virtual_size != c.raw_bytes or
             report.esp_offset_bytes != c.mib or report.esp_length_bytes != c.esp_bytes) return error.InvalidPackage;

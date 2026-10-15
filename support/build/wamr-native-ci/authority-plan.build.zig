@@ -24,7 +24,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("../../tools/hyperv/direct/compute_main.zig"),
             .target = target,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .imports = &.{
                 .{ .name = "hyperv_core", .module = core },
                 .{ .name = "local_serial", .module = serial },
@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) void {
     });
     const writer = b.addExecutable(.{
         .name = "authority-plan-validator-identity",
-        .root_module = b.createModule(.{ .root_source_file = b.path("build.zig"), .target = b.graph.host, .optimize = .ReleaseSafe }),
+        .root_module = b.createModule(.{ .root_source_file = b.path("authority.build.zig"), .target = b.graph.host, .optimize = .safe }),
     });
     const identity_run = b.addRunArtifact(writer);
     identity_run.addFileArg(direct.getEmittedBin());
@@ -51,11 +51,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "hyperv_core", .module = core },
             .{ .name = "wamr_log_validator", .module = validator },
             .{ .name = "import_validator_identity", .module = identity },
-            .{ .name = "controller_source_closure", .module = b.createModule(.{
-                .root_source_file = b.path("../../controller_source_closure.zig"),
-                .target = target,
-                .optimize = optimize,
-            }) },
+            .{ .name = "controller_source_closure", .module = foundation.sourceClosureModule(b, target, optimize) },
             .{ .name = "handoff_contracts", .module = b.createModule(.{
                 .root_source_file = b.path("handoff/contracts.zig"),
                 .target = target,
@@ -70,7 +66,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{ .{ .name = "hyperv_core", .module = core }, .{ .name = "wamr_controller", .module = controller } },
     });
-    const fixture_root = b.option([]const u8, "test-root", "Existing private absolute plan fixture root") orelse @panic("-Dtest-root is required");
+    const fixture_root = foundation.defaultFixtureRoot(b);
     const options = foundation.testOptions(b, target, optimize, fixture_root);
     const options_module = options.createModule();
     handoff.addImport("test_options", options_module);

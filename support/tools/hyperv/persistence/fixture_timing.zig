@@ -12,8 +12,8 @@ const linux = std.os.linux;
 pub const Stage = worker.Observer.Stage;
 pub const file_name = "synthetic-persistence-timing-v1";
 pub const slot_size = 1024;
-pub const parent_slots = @intFromEnum(Stage.child_entry);
-pub const child_slots = @typeInfo(Stage).@"enum".fields.len - parent_slots;
+pub const parent_slots = @backingInt(Stage.child_entry);
+pub const child_slots = @typeInfo(Stage).@"enum".field_names.len - parent_slots;
 pub const max_bytes = (1 + child_slots) * slot_size;
 pub const max_jobs = 8 * m.step_count + 1;
 pub const log_prefix = "persistence_timing ";
@@ -91,7 +91,7 @@ pub const Record = struct {
 };
 
 fn encodeSlot(value: anytype) ![slot_size]u8 {
-    var slot = [_]u8{0} ** slot_size;
+    var slot = @as([slot_size]u8, @splat(0));
     var out: std.Io.Writer = .fixed(&slot);
     try std.json.Stringify.value(value, .{}, &out);
     try out.writeByte('\n');
@@ -116,13 +116,13 @@ pub const Records = struct {
     pub fn push(self: *Records, record: Record) !void {
         if (self.count == (if (self.child) child_slots else parent_slots)) return error.DiagnosticOverflow;
         try record.validate();
-        const stage = @intFromEnum(record.stage);
+        const stage = @backingInt(record.stage);
         if ((stage >= parent_slots) != self.child or
             (self.count == 0 and record.stage != (if (self.child) Stage.child_entry else .parent_begin)))
             return error.InvalidDiagnostic;
         if (self.count != 0) {
             const previous = self.values[self.count - 1];
-            if (stage <= @intFromEnum(previous.stage) or record.sequence != previous.sequence or record.mode != previous.mode or
+            if (stage <= @backingInt(previous.stage) or record.sequence != previous.sequence or record.mode != previous.mode or
                 record.step != previous.step or record.worker_bytes != previous.worker_bytes or record.deadline_ns != previous.deadline_ns or
                 record.operation_ms != previous.operation_ms or record.sample.monotonic_ns < previous.sample.monotonic_ns or
                 record.sample.process_cpu_ns < previous.sample.process_cpu_ns or
@@ -439,9 +439,9 @@ pub fn recoverySnapshot(enabled: bool, stage: enum { recovery_initial, recovery_
     if (!enabled) return;
     // Only the exact local validation preconditions, not bodies or effect proof.
     std.debug.print("persistence_timing scope=synthetic_timing_only authority=none stage={s} phase={s} os_pending={} os_grant_obligation={} os_access_done={} cleanup_os_access_done={} data_pending={} data_grant_obligation={} data_access_done={} cleanup_data_access_done={} data_upload_progress={s}\n", .{
-        @tagName(stage),                                                                                                                            @tagName(state.phase),                                                                                                                          state.os_access_pending,
-        state.records[@intFromEnum(m.Step.os_grant)].progress != .unissued and state.records[@intFromEnum(m.Step.os_grant)].effect != .not_started, state.isDone(.os_access_closed),                                                                                                                state.isDone(.cleanup_os_access),
-        state.data_access_pending,                                                                                                                  state.records[@intFromEnum(m.Step.data_grant)].progress != .unissued and state.records[@intFromEnum(m.Step.data_grant)].effect != .not_started, state.isDone(.data_access_closed),
-        state.isDone(.cleanup_data_access),                                                                                                         @tagName(state.records[@intFromEnum(m.Step.data_upload)].progress),
+        @tagName(stage),                                                                                                                          @tagName(state.phase),                                                                                                                        state.os_access_pending,
+        state.records[@backingInt(m.Step.os_grant)].progress != .unissued and state.records[@backingInt(m.Step.os_grant)].effect != .not_started, state.isDone(.os_access_closed),                                                                                                              state.isDone(.cleanup_os_access),
+        state.data_access_pending,                                                                                                                state.records[@backingInt(m.Step.data_grant)].progress != .unissued and state.records[@backingInt(m.Step.data_grant)].effect != .not_started, state.isDone(.data_access_closed),
+        state.isDone(.cleanup_data_access),                                                                                                       @tagName(state.records[@backingInt(m.Step.data_upload)].progress),
     });
 }

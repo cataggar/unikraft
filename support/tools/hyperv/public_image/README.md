@@ -116,10 +116,11 @@ templates. Those are not this producer. Revision 4 sets `controller_sha256`
 to the physically reverified native executable SHA256;
 `artifacts.miz.sha256` identifies that same executable containing embedded
 miz, rather than an unused external miz CLI. `artifacts.miz.revision` is the
-reviewed bounded-open commit
-`669a27982b376311f558e820b69e9a692735b0cd`, with package hash
-`miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx` pinned in
-`build.zig.zon`.
+Zig 0.17 port of the reviewed bounded-open generation,
+`66ea6701cf0e1b6d31e5f30fade00b7a546d4b44`, with package hash
+`miz-0.2.0-Z3lHlLgL2wDiGxutMJMDy9Qy4CLNCwOptwgQLp1ZDSiv` pinned in
+`build.zig.zon`. Earlier images retain their original compiler and producer
+records; changing this pin does not authenticate or relabel them.
 
 Consequently the **unchanged legacy revision-3 importer intentionally
 rejects this export**. Parent integration must explicitly admit native
@@ -318,7 +319,7 @@ zig build --build-file support/tools/hyperv/public_image/build.zig \
   -Dtest-root="$S/fixtures" -j2 test install --summary all
 zig build --build-file support/tools/hyperv/public_image/build.zig \
   --system "$S/restore/zig-pkg" --prefix "$S/outputs/release" \
-  -Dtest-root="$S/fixtures" -Doptimize=ReleaseSafe -j2 test install --summary all
+  -Dtest-root="$S/fixtures" -Doptimize=safe -j2 test install --summary all
 zig build --build-file support/tools/hyperv/local_boot/build.zig \
   --system "$S/restore/zig-pkg" \
   --prefix "$S/outputs/local-debug" -Dtest-root="$S/fixtures" \
@@ -326,7 +327,7 @@ zig build --build-file support/tools/hyperv/local_boot/build.zig \
 zig build --build-file support/tools/hyperv/local_boot/build.zig \
   --system "$S/restore/zig-pkg" \
   --prefix "$S/outputs/local-release" -Dtest-root="$S/fixtures" \
-  -Doptimize=ReleaseSafe -j2 test install --summary all
+  -Doptimize=safe -j2 test install --summary all
 ```
 
 The separate uninstalled native QEMU fixture checks actual argv, vpc versus
@@ -380,3 +381,28 @@ each. CPU-specific measurements are not guest benchmarks or qualification.
 The regular required integration contexts remain unchanged. A repeated
 `-Dtest-filter=...` selector is available for targeted local diagnosis; CI
 does not filter or exclude any original fixture case.
+
+### Zig 0.17 configure cache
+
+Native commands use Zig 0.17's `debug` and `safe` optimization modes.
+Give each standalone `--build-file` its own local `--cache-dir` or
+`ZIG_LOCAL_CACHE_DIR`; do not reuse one configuration cache across public,
+preparation, namespace or integration scripts. A different script argument is
+not sufficient isolation in Zig 0.17. The global compiler cache may be shared.
+The configure-time peer commitment explicitly depends on the peer script's
+contents: reusing a build cache neither preserves an old hash after an edit
+nor accepts a deleted source. Run the isolated native build-schema regression
+from the repository root:
+
+```sh
+python3 support/tools/hyperv/public_image/configure_cache_tests.py \
+  /home/g/.local/bin/zig .zig17-peer-cache-test
+```
+
+It uses fresh private synthetic sources and the actual package build script,
+then removes its own directory. No guest, network or cloud resource is used.
+An optional third argument selects a fresh private cache directory on another
+filesystem; that directory is also removed. The actual build uses
+`ZIG_GLOBAL_CACHE_DIR`, not the removed Zig 0.17 build CLI flag.
+Filesystem-custody fixture runs are deliberately uncached: a previous successful
+run is not a substitute for current no-follow, metadata and source validation.

@@ -103,7 +103,7 @@ pub const Directory = struct {
         const before = try metadata(path_file);
         try checkFile(before, policy);
         var path: [64]u8 = undefined;
-        const handle_path = try std.fmt.bufPrint(&path, "/proc/self/fd/{d}", .{path_file.handle});
+        const handle_path = try std.mem.print(&path, "/proc/self/fd/{d}", .{path_file.handle});
         const file = try std.Io.Dir.openFileAbsolute(io, handle_path, .{});
         errdefer file.close(io);
         if (!std.meta.eql(before, try metadata(file))) return error.SourceChanged;
@@ -194,7 +194,7 @@ fn collect(
         const relative = if (prefix.len == 0)
             try allocator.dupe(u8, entry.name)
         else
-            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, entry.name });
+            try allocator.print("{s}/{s}", .{ prefix, entry.name });
         defer allocator.free(relative);
         try c.relative(relative);
         const handle = try directory.openFile(io, entry.name, .{ .path_only = true, .follow_symlinks = false });

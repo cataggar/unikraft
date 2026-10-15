@@ -1,6 +1,6 @@
 # Native ARM and explicit credentials
 
-This is a standalone Zig 0.16 module, `hyperv_azure`, built against the existing
+This is a standalone Zig 0.17.0 module, `hyperv_azure`, built against the existing
 Hyper-V foundation and pinned Azure SDK Core. It binds real SDK HTTP operations;
 the tests inject HTTP responses and never acquire a real token or contact ARM.
 There is no CLI, arbitrary-URL ARM proxy, credential discovery, controller state
@@ -208,7 +208,7 @@ not distributed transactions or an authorization grant.
 ## Standalone build
 
 No repository root build, guest/Make build, interpreter, CLI login or new test
-framework is required. From the repository root with Zig 0.16.0 on `PATH`:
+framework is required. From the repository root with Zig 0.17.0 on `PATH`:
 
 ```sh
 repo="$PWD"
@@ -222,7 +222,7 @@ cp support/tools/hyperv/azure/build.zig \
   support/tools/hyperv/azure/build.zig.zon "$base/restore/"
 zig build --build-file "$base/restore/build.zig" --fetch=all -j2
 
-for mode in Debug ReleaseSafe; do
+for mode in debug safe; do
   ZIG_LOCAL_CACHE_DIR="$base/$mode/zig-local" \
     zig build --build-file "$repo/support/tools/hyperv/azure/build.zig" \
       --system "$base/restore/zig-pkg" --prefix "$base/outputs/$mode" \
@@ -234,8 +234,8 @@ The isolated package directory contains these immutable dependencies:
 
 | Package | Git revision | Zig package hash |
 | --- | --- | --- |
-| Core | `bc77bcacbb64af935ca53d60bf8a351c9592bc41` | `azure_sdk_core-0.3.0-eFY0Ev0-CACjsFaYPL6jS7CpeVNvsqYqTrXRfgQKiRFV` |
-| serde | `73d872776b0361b6fc92f6cecd7ccf2f05e77cdd` | `serde-1.0.1-1DszT1XhDACnteUU3yWahMMjLjkJqB34hwROPIfhZc7l` |
+| Core | `b4bbb6591cc2bc7cac4fdd74ae90f530a4eb1c6e` | `azure_sdk_core-0.3.0-eFY0Etg_CAASjGGdgFohL15vsSsaAc_oJql_9TSxgssN` |
+| serde | `7ecb2014a30b6b1203a94f377836763a03ab0658` | `serde-1.0.1-1DszT3vxDABKmINtLJvIUkhktMnhkZUQIGQUslp73pfb` |
 
 Restoration verifies the package hashes from the pinned manifests. This Zig
 distribution writes `zig-pkg` beside the build file, so only the scratch copy

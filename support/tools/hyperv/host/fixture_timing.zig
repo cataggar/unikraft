@@ -31,7 +31,7 @@ pub const Cleanup = enum { not_called, unconfirmed, incomplete, complete };
 pub const slot_bytes = 1024;
 pub const parent_slots = 9;
 pub const max_bytes = (parent_slots + 2) * slot_bytes;
-pub const aggregate_bytes = @typeInfo(Fixture).@"enum".fields.len * max_bytes;
+pub const aggregate_bytes = @typeInfo(Fixture).@"enum".field_names.len * max_bytes;
 pub const child_name = "synthetic-host-child-entry-v1";
 
 pub const Record = struct {
@@ -58,7 +58,7 @@ pub const Record = struct {
 };
 
 pub fn encodeSlot(value: anytype) ![slot_bytes]u8 {
-    var bytes = [_]u8{0} ** slot_bytes;
+    var bytes = @as([slot_bytes]u8, @splat(0));
     var out: std.Io.Writer = .fixed(&bytes);
     try std.json.Stringify.value(value, .{}, &out);
     try out.writeByte('\n');
@@ -313,7 +313,7 @@ pub const Report = struct {
         const root = try core.private_files.Directory.open(io, root_path);
         defer root.close(io);
         var name: [96]u8 = undefined;
-        const path = try std.fmt.bufPrint(&name, "synthetic-host-timing-{s}-v1.jsonl", .{@tagName(self.summary.fixture)});
+        const path = try std.mem.print(&name, "synthetic-host-timing-{s}-v1.jsonl", .{@tagName(self.summary.fixture)});
         var buffer: [max_bytes]u8 = undefined;
         const bytes = try self.encode(&buffer);
         const file = try root.dir.createFile(io, path, .{ .exclusive = true, .permissions = .fromMode(0o600) });

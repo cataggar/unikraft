@@ -23,14 +23,14 @@ fn mark(io: std.Io, artifact: usize, pass: usize, phase: Phase, bytes: usize) !v
         .phase = phase,
         .fixture_bytes = bytes,
         .self_bytes = try measurement.selfExecutableBytes(io),
-        .cpu_model = builtin.cpu.model.name,
+        .cpu_model = builtin.target.cpu.model.name,
         .sample = try measurement.capture(),
     }, .{}, &writer);
     std.debug.print("preparation synthetic hash cost: {s}\n", .{writer.buffered()});
 }
 
 inline fn dirtyUpper(pass: usize) void {
-    if (comptime builtin.cpu.arch == .x86_64 and builtin.cpu.hasAll(.x86, &.{ .sha, .avx2 })) {
+    if (comptime builtin.target.cpu.arch == .x86_64 and builtin.target.cpu.hasAll(.x86, &.{ .sha, .avx2 })) {
         if (pass == 1)
             asm volatile ("vpcmpeqd %%ymm0, %%ymm0, %%ymm0" ::: .{ .ymm0 = true });
     }

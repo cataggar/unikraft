@@ -2,6 +2,7 @@
 //! hardware application's return-2 preparation or its export contract.
 const std = @import("std");
 const image = @import("public_image");
+const package_options = @import("package_options");
 const c = image.contracts;
 const f = image.files;
 const compute = image.compute_artifacts;
@@ -138,11 +139,12 @@ fn execute(init: std.process.Init) !void {
     if (input.command == .package) try f.cleanupStage(io, root, "package-stage");
     const vhd = try root.openFile(io, "unikraft.vhd");
     defer vhd.close(io);
-    const inspection = try image.package.inspectVhd(a, io, vhd, .{
+    var inspection = try image.package.inspectVhd(a, io, vhd, .{
         .efi = try c.sha(efi.sha256),
         .raw = try c.sha(observed.raw.sha256),
         .vhd = try c.sha(observed.vhd.sha256),
     });
+    inspection.miz_revision = package_options.miz_revision;
     try f.verify(a, io, producer, c.max_tool, true);
     const bytes = try c.encode(a, .{
         .schema_version = @as(u8, 1),

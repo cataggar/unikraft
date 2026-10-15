@@ -92,7 +92,14 @@ fn execute(init: std.process.Init) !void {
     try errout.interface.writeAll("synthetic stderr retained\n");
     try out.interface.writeAll(prefix);
     if (mode == 4) while (true) try std.Io.sleep(io, .fromSeconds(1), .awake);
-    if (mode == 5) while (true) try out.interface.writeAll("synthetic flood\n" ** 1024);
+    const flood = comptime blk: {
+        @setEvalBranchQuota(2048);
+        const line = "synthetic flood\n";
+        var bytes: [line.len * 1024]u8 = undefined;
+        for (0..1024) |i| @memcpy(bytes[i * line.len ..][0..line.len], line);
+        break :blk bytes;
+    };
+    if (mode == 5) while (true) try out.interface.writeAll(&flood);
     if (mode == 6) {
         try work.dir.deleteFile(io, "OVMF_VARS.fd");
         try work.dir.createDir(io, "OVMF_VARS.fd", .fromMode(0o700));
@@ -105,7 +112,7 @@ fn execute(init: std.process.Init) !void {
             const duration: linux.timespec = .{ .sec = 1, .nsec = 0 };
             _ = linux.nanosleep(&duration, null);
         };
-        try work.dir.writeFile(io, .{ .sub_path = "descendant.pid", .data = try std.fmt.allocPrint(a, "{d}", .{pid}), .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) } });
+        try work.dir.writeFile(io, .{ .sub_path = "descendant.pid", .data = try a.print("{d}", .{pid}), .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) } });
     }
     if (mode == 9) {
         const writable = try std.Io.Dir.openFileAbsolute(io, request.config.source.path, .{ .mode = .read_write });

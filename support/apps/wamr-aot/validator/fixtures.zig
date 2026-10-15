@@ -47,7 +47,7 @@ pub fn wasi(allocator: std.mem.Allocator, name: []const u8, wasm: []const u8, cw
     const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(stdout.len));
     defer allocator.free(encoded);
     _ = std.base64.standard.Encoder.encode(encoded, stdout);
-    return std.fmt.allocPrint(allocator, "WAMR_NATIVE_WASI={{\"version\":1,\"correctness_only\":true,\"workload\":\"{s}\",\"wasm_sha256\":\"{s}\",\"cwasm_sha256\":\"{s}\",\"terminal\":2,\"detail\":0,\"crc_ok\":true,\"output_error\":0,\"pending_stdout\":0,\"pending_stderr\":0,\"unsupported_clock\":0,\"realtime_supported\":true,\"stdout_base64\":\"{s}\",\"stderr_base64\":\"\"}}\n", .{ name, wasm, cwasm, encoded });
+    return allocator.print("WAMR_NATIVE_WASI={{\"version\":1,\"correctness_only\":true,\"workload\":\"{s}\",\"wasm_sha256\":\"{s}\",\"cwasm_sha256\":\"{s}\",\"terminal\":2,\"detail\":0,\"crc_ok\":true,\"output_error\":0,\"pending_stdout\":0,\"pending_stderr\":0,\"unsupported_clock\":0,\"realtime_supported\":true,\"stdout_base64\":\"{s}\",\"stderr_base64\":\"\"}}\n", .{ name, wasm, cwasm, encoded });
 }
 
 pub fn serial(allocator: std.mem.Allocator, with_wasi: bool) ![]u8 {
@@ -55,7 +55,7 @@ pub fn serial(allocator: std.mem.Allocator, with_wasi: bool) ![]u8 {
     defer allocator.free(first);
     const second = if (with_wasi) try wasi(allocator, "coremark-nofp", identity.nofp_wasm, identity.nofp_cwasm) else try allocator.dupe(u8, "");
     defer allocator.free(second);
-    return std.fmt.allocPrint(allocator, "Hyper-V Hv#1 hypercall page enabled\nHyper-V SynIC:\nPowered by\nCalling main(0, 0)\n{s}{s}" ++
+    return allocator.print("Hyper-V Hv#1 hypercall page enabled\nHyper-V SynIC:\nPowered by\nCalling main(0, 0)\n{s}{s}" ++
         "WAMR_NATIVE_COMPUTE={{\"version\":1,\"workload\":\"tiny\",\"wamr_revision\":\"{s}\",\"wasm_sha256\":\"{s}\",\"cwasm_sha256\":\"{s}\",\"runtime_sha256\":\"{s}\",\"platform_status\":0,\"checks\":2,\"answer\":42,\"terminal\":1,\"detail\":2,\"reserved_bytes\":0,\"frame_bytes\":0,\"accessible_bytes\":0,\"allocation_bytes\":0,\"system_page_table_bytes\":4096,\"error_name\":\"\"}}\n" ++
         "WAMR_NATIVE_AOT_OK answer=42 teardown=0\n[    1.000001] Info: [libukboot] main returned 0\n", .{ first, second, identity.wamr_revision, identity.tiny_wasm, identity.tiny_cwasm, identity.runtime });
 }

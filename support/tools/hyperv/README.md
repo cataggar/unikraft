@@ -1,6 +1,6 @@
 # Native Hyper-V host tool and supervised transfers
 
-This standalone Zig 0.16.0 package does not import the repository's root build,
+This standalone Zig 0.17.0 package does not import the repository's root build,
 run any legacy controller, use Azure CLI, or acquire ambient credentials.
 The dependency-free `hyperv_core` foundation is combined with the pinned SDK
 transfer module in the `hyperv` facade. Its only installed executable is
@@ -54,7 +54,7 @@ runtime parity, controller-retirement approval or authority to run Azure.
 
 ## Build and test
 
-From the repository root, using the already installed Zig 0.16.0 compiler:
+From the repository root, using the already installed Zig 0.17.0 compiler:
 
 ```sh
 CORE_WORK="$PWD/.d/zig-migration-transfer-core"
@@ -65,15 +65,15 @@ export TMPDIR="$CORE_WORK/tmp" HOME="$CORE_WORK/home"
 export XDG_CACHE_HOME="$CORE_WORK/cache"
 export ZIG_GLOBAL_CACHE_DIR="$CORE_WORK/zig-global"
 export ZIG_LOCAL_CACHE_DIR="$CORE_WORK/zig-local"
-# This Zig distribution restores beside the build file. Keep that operation
-# in scratch, then disable fetching for every source-tree build.
+# Bind this restore's package directory explicitly, independently of ambient
+# ZIG_LOCAL_PKG_DIR, then disable fetching for every source-tree build.
 cp support/tools/hyperv/build.zig support/tools/hyperv/build.zig.zon "$CORE_WORK/restore/"
 zig build --build-file "$CORE_WORK/restore/build.zig" \
-  --fetch=all --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
-  --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" -j2
-zig build --build-file support/tools/hyperv/build.zig \
+  --fetch=all --pkg-dir "$CORE_WORK/restore/zig-pkg" \
+  --cache-dir "$CORE_WORK/restore/cache" -j2
+env -u ZIG_LOCAL_PKG_DIR zig build --build-file support/tools/hyperv/build.zig \
   --system "$CORE_WORK/restore/zig-pkg" \
-  --cache-dir "$ZIG_LOCAL_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" \
+  --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
   --prefix "$CORE_WORK/out" -Dtest-root="$CORE_WORK/fixtures" \
   -j2 test-core test-transfer test-worker install --summary all
 ```
@@ -111,6 +111,44 @@ snapshot, EOF/identity check and deadline. `test-sha256`, also included in
 `test-core` and persistence `test`, retains runtime and compile-time known-vector, streaming, `peek`
 and continuation equivalence. The producer and runner source guards
 independently pin the shared implementation, assembly and test dependency.
+
+Zig 0.17 reads CPU features from `builtin.target.cpu`; the SHA/AVX2 gate and
+C ABI fence are unchanged. Allocator sentinel methods retain the terminating
+zero byte for native argv and proc paths. Linux wait status storage retains its
+unsigned raw bits, with the signed `waitpid` pointer adapted only at the syscall
+boundary; termination, cancellation and cleanup diagnostics keep their existing
+schemas. Use `-Doptimize=debug` or `-Doptimize=safe` for checked qualification.
+The synthetic v1 sampling records keep their existing `Debug`/`ReleaseSafe`
+wire enum spellings; lowercase compiler mode names do not alter that contract.
+The explicit direct WAMR `historical-handoff` command revalidates only version-one
+imports bound to the existing immutable historical source revision/tree allowlist
+and frozen Zig 0.16 runtime/SDK/profile. Its SDK remains
+`a53205d77be3b880eb8f8b96679512ba58e2331a`. Ordinary `handoff` validation always
+requires Zig 0.17 and current SDK
+`bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20`, even if input strings quote historical
+pins. The historical command is not a fallback for failed current validation and does not
+relax artifact, boot, private-file or authority validation. The standalone direct
+`test-compute-runtime` selector checks rejection across those generation boundaries.
+`zig build` reads the private global cache from `ZIG_GLOBAL_CACHE_DIR` rather
+than accepting the old `--global-cache-dir` build option.
+Zig 0.17 defaults its package directory to `zig-pkg` beside the build file.
+Every source-tree build/fetch caller must instead bind an authenticated
+external depot with `--system`, or an explicit external `ZIG_LOCAL_PKG_DIR`.
+Untracked fetched source under `zig-pkg` is not a custody exclusion and must
+not be ignored to make source admission pass. Standalone restores bind their
+own `--pkg-dir`; a shared environment setting must not redirect them into
+another restore's depot.
+For system-only builds, remove inherited `ZIG_LOCAL_PKG_DIR` from that child
+environment: Zig 0.17 otherwise lets it override the supplied `--system`
+directory. Explicit restore `--pkg-dir` still takes precedence over the
+environment and remains scoped to that restore.
+The direct native process and lifecycle child fixtures strip debug metadata in both checked modes;
+its safety checks and synthetic runtime modes remain enabled. This keeps exact executable
+snapshotting within the existing 120–200 ms fixture deadlines despite the
+larger compiler-generated debug sections. Test drivers retain their selected
+optimization mode, and production executable selection and deadlines are not
+changed. Native lifecycle validation uses a separate uninstalled validator
+fixture; the installed production validator retains its existing build policy.
 
 ## Local inspection CLI
 

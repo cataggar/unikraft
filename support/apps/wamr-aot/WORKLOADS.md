@@ -37,17 +37,33 @@ Request fields are never echoed into independent observations.
 
 ### Supported SDK and explicit development selection
 
-All variants use merged WAMR
-`a53205d77be3b880eb8f8b96679512ba58e2331a`, including the AOT producer and the
+All variants select the exact-generation Zig 0.17 WAMR compatibility revision
+`bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20`, including the AOT producer and the
 PIC, final-link-owned compiler-runtime sampler APIs. This supported source pin
-is not qualified image or deployment lineage:
+is not qualified image or deployment lineage.
+
+The generated consumer also pins `cataggar/translate-c`
+`62d06a5d3e93c82727544e8113e4762a315ca0ed`, using the same
+`Translator` / `.init(b.dependency("translate_c", .{}), ...)` pattern as
+[Hearth #5](https://github.com/cataggar/hearth/pull/5). It translates the actual `workloads.h`, `platform.h`, and
+generated `wamr_aot.h` into the `workloads_c` module, including the package's
+required helper imports. Translation keeps the freestanding target, generated
+include paths, shared SDK module roots, PIC, and final-link-owned compiler runtime.
+The immutable translator package hash is
+`translate_c-2.0.0-Q_BUWlpOBwBWvgGBM20tJq-GXgPio3v3UD39rXEn70KN`.
+Its sole compatibility-fork change redirects Aro to `cataggar/arocc`
+`d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b`, whose verified hash is
+`aro-0.0.0-JSD1QtuBNwCASyBtNF3pqTl_W3oAJQGEVyFAtrBSE_Pa`.
+Aro has no package dependencies, so this chain downloads nothing from Codeberg.
 
 ```sh
 umask 077
+export ZIG_LOCAL_PKG_DIR=/path/to/qualified/private/package-depot
 tool_root="$PWD/support/apps/wamr-aot/build/tool"
 test ! -e "$tool_root"
 zig build --build-file support/apps/wamr-aot/build.zig \
-  --prefix "$tool_root" -Doptimize=ReleaseSafe install
+  --system "$ZIG_LOCAL_PKG_DIR" \
+  --prefix "$tool_root" -Doptimize=safe install
 tool="$tool_root/bin/uk-wamr-aot-build"
 "$tool" prepare --repository "$PWD" \
   --source /path/to/local/wamr --variant snapshot
@@ -67,6 +83,15 @@ An explicitly selected development revision also supports local tiny/CoreMark
 bridge integration, but its manifest remains development-only and the
 credential-free CI adapter refuses it.
 
+The Zig 0.17.0 build translates the actual `workloads.h` with the translator
+provided by that exact compiler release. Translation uses the same x86_64
+freestanding target and generated `../artifacts` include directory as the
+native consumer; `native-services.zig` imports the generated C ABI module.
+SDK modules remain shared, PIC is applied to their existing import graph,
+and the static library does not bundle a second compiler runtime.
+An exact-generation Zig 0.17-compatible SDK pin must be qualified separately;
+compile-only fixtures do not establish workload or hardware qualification.
+
 The same existing `hyperv-x86_64-efi-wamr` graph produces the real native ELF and
 EFI, including its final IRQ/SMP/relocation safety gates. No selector-only or
 audit ELF is substituted. A fresh optional solved config provisions a **1 MiB
@@ -85,7 +110,7 @@ to invent an argument or an unbound sidecar. The two correctness images cannot
 be presented as the single JIT image expected by a future independently qualified
 fast/full measurement transport.
 
-All consumers and imported SDK modules are PIC, ReleaseSafe, single-threaded,
+All consumers and imported SDK modules are PIC, safe-mode, single-threaded,
 x86_64 freestanding SysV, with no red zone, libc, stack checker/protector, unwind
 tables or Zig error tracing. The archive does **not** bundle compiler-rt:
 Unikraft's existing final link supplies those intrinsics. Preparation records
@@ -190,10 +215,15 @@ teardown. Base adapter page-permission/failure selftests still execute first.
 ## Validation, without relabeling emulation
 
 ```sh
+umask 077
+mkdir -p .zig-cache/tmp
+chmod 0700 .zig-cache .zig-cache/tmp
 zig build --build-file support/apps/wamr-aot/build.zig test-unit test-integration
-zig build --build-file support/apps/wamr-aot/validator.build.zig -Doptimize=ReleaseSafe test
 zig build --build-file support/apps/wamr-aot/validator.build.zig \
-  --prefix "$PWD/.d/wamr-validator" -Doptimize=ReleaseSafe install
+  --cache-dir "$PWD/.d/wamr-validator-cache" -Doptimize=safe test
+zig build --build-file support/apps/wamr-aot/validator.build.zig \
+  --cache-dir "$PWD/.d/wamr-validator-cache" \
+  --prefix "$PWD/.d/wamr-validator" -Doptimize=safe install
 "$PWD/.d/wamr-validator/bin/uk-wamr-log-validate" workload \
   --mode snapshot --log /private/exact-boot/serial.log \
   --identity /private/exact-boot/identity.json --output json-v1

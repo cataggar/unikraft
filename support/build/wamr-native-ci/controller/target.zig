@@ -16,6 +16,6 @@ pub fn portableQuery() std.Target.Query {
     }) catch unreachable;
 }
 
-pub fn permitsInstall(requested: std.Target.Query, optimize: std.builtin.OptimizeMode) bool {
-    return requested.eql(portableQuery()) and optimize == .ReleaseSafe;
+pub fn permitsInstall(requested: std.Target.Query, optimize: std.lang.Optimize) bool {
+    return requested.eql(portableQuery()) and optimize == .safe;
 }

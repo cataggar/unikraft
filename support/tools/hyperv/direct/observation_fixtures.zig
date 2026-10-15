@@ -31,11 +31,11 @@ pub const scope: direct.Scope = .{
     .cleanup_seconds = 60,
     .operation_seconds = 10,
     .poll_seconds = 1,
-    .os_vhd = .{ .path = "/synthetic-only/os.vhd", .size = 1049088, .sha256 = "a" ** 64 },
-    .seed_raw = .{ .path = "/synthetic-only/seed.raw", .size = 4294967296, .sha256 = "a" ** 64 },
-    .seed_vhd = .{ .path = "/synthetic-only/seed.vhd", .size = 4294967808, .sha256 = "a" ** 64 },
-    .manifest = .{ .path = "/synthetic-only/seed.json", .size = 1, .sha256 = "a" ** 64 },
-    .config = .{ .path = "/synthetic-only/config", .size = 1, .sha256 = "a" ** 64 },
+    .os_vhd = .{ .path = "/synthetic-only/os.vhd", .size = 1049088, .sha256 = &@as([64:0]u8, @splat('a')) },
+    .seed_raw = .{ .path = "/synthetic-only/seed.raw", .size = 4294967296, .sha256 = &@as([64:0]u8, @splat('a')) },
+    .seed_vhd = .{ .path = "/synthetic-only/seed.vhd", .size = 4294967808, .sha256 = &@as([64:0]u8, @splat('a')) },
+    .manifest = .{ .path = "/synthetic-only/seed.json", .size = 1, .sha256 = &@as([64:0]u8, @splat('a')) },
+    .config = .{ .path = "/synthetic-only/config", .size = 1, .sha256 = &@as([64:0]u8, @splat('a')) },
 };
 
 pub const group_id = "/subscriptions/bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb/resourceGroups/fixture-direct-rg";

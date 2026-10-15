@@ -202,7 +202,7 @@ test "partial native command upload preserves ambiguity and conflicting lengths 
     defer lock.close(io);
     var store = try pf.journal.Store.open(a, io, &lock, &fixture.input);
     try capability(&store);
-    const bytes = [_]u8{'x'} ** 512;
+    const bytes = @as([512]u8, @splat('x'));
     try store.immutable("public-command.json", &bytes, true);
     var wire: BlobWire = .{};
     defer wire.mock.deinit();

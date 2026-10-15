@@ -190,27 +190,27 @@ test "C embedding and identity header retain historical exact bytes" {
         embedded,
     );
     const header = try build_tool.prepare.identityHeaderAlloc(allocator, .{
-        .revision = "a" ** 40,
+        .revision = &@as([40]u8, @splat('a')),
         .variant = .snapshot,
         .jit_mode = null,
-        .source_tree_sha256 = "b" ** 64,
-        .compiler_sha256 = "c" ** 64,
+        .source_tree_sha256 = &@as([64]u8, @splat('b')),
+        .compiler_sha256 = &@as([64]u8, @splat('c')),
         .coremark = false,
-        .wasm_sha256 = "d" ** 64,
-        .cwasm_sha256 = "e" ** 64,
-        .library_sha256 = "f" ** 64,
+        .wasm_sha256 = &@as([64]u8, @splat('d')),
+        .cwasm_sha256 = &@as([64]u8, @splat('e')),
+        .library_sha256 = &@as([64]u8, @splat('f')),
     });
     defer allocator.free(header);
     try testing.expectEqualStrings(
-        "#define WAMR_REVISION \"" ++ "a" ** 40 ++ "\"\n" ++
+        "#define WAMR_REVISION \"" ++ @as([40]u8, @splat('a')) ++ "\"\n" ++
             "#define WAMR_APP_VARIANT 1\n" ++
             "#define WAMR_JIT_BOOT_MODE 0\n" ++
-            "#define WAMR_SOURCE_TREE_SHA256 \"" ++ "b" ** 64 ++ "\"\n" ++
-            "#define WAMR_COMPILER_SHA256 \"" ++ "c" ** 64 ++ "\"\n" ++
+            "#define WAMR_SOURCE_TREE_SHA256 \"" ++ @as([64]u8, @splat('b')) ++ "\"\n" ++
+            "#define WAMR_COMPILER_SHA256 \"" ++ @as([64]u8, @splat('c')) ++ "\"\n" ++
             "#define WAMR_HAS_COREMARK 0\n" ++
-            "#define WAMR_WASM_SHA256 \"" ++ "d" ** 64 ++ "\"\n" ++
-            "#define WAMR_CWASM_SHA256 \"" ++ "e" ** 64 ++ "\"\n" ++
-            "#define WAMR_LIBRARY_SHA256 \"" ++ "f" ** 64 ++ "\"\n",
+            "#define WAMR_WASM_SHA256 \"" ++ @as([64]u8, @splat('d')) ++ "\"\n" ++
+            "#define WAMR_CWASM_SHA256 \"" ++ @as([64]u8, @splat('e')) ++ "\"\n" ++
+            "#define WAMR_LIBRARY_SHA256 \"" ++ @as([64]u8, @splat('f')) ++ "\"\n",
         header,
     );
 }
@@ -278,7 +278,7 @@ test "private file helpers set explicit modes and reject hard-linked state" {
             "refused\n",
         ),
     );
-    const name = try allocator.dupeZ(u8, "record.json");
+    const name = try allocator.dupeSentinel(u8, "record.json", 0);
     defer allocator.free(name);
     if (linux.errno(linux.linkat(
         temporary.dir.handle,
@@ -652,7 +652,7 @@ const Tar = struct {
         link: []const u8,
         contents: []const u8,
     ) !void {
-        var header: [512]u8 = [_]u8{0} ** 512;
+        var header: [512]u8 = @as([512]u8, @splat(0));
         if (name.len > 100 or link.len > 100) return error.FixturePathTooLong;
         @memcpy(header[0..name.len], name);
         putOctal(header[100..108], mode);
@@ -682,7 +682,7 @@ const Tar = struct {
             if (adjusted == length) break;
             length = adjusted;
         }
-        const record = try std.fmt.allocPrint(self.allocator, "{d} path={s}\n", .{ length, path });
+        const record = try self.allocator.print("{d} path={s}\n", .{ length, path });
         defer self.allocator.free(record);
         try self.entry("pax-header", 'x', 0o644, "", record);
     }

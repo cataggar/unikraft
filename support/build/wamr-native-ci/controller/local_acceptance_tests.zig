@@ -355,7 +355,7 @@ fn together(io: std.Io, fixtures: []const Fixture, comptime operation: fn (Fixtu
 pub fn workerBackfill(a: std.mem.Allocator, io: std.Io) !void {
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{});
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "complete-local-backfill-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("complete-local-backfill-{d}", .{std.os.linux.getpid()});
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("complete local backfill cleanup failed");
     const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
@@ -402,7 +402,7 @@ pub fn workerBackfill(a: std.mem.Allocator, io: std.Io) !void {
 pub fn workerFailure(a: std.mem.Allocator, io: std.Io) !void {
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{});
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "complete-local-workers-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("complete-local-workers-{d}", .{std.os.linux.getpid()});
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("complete local worker cleanup failed");
     const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
@@ -437,7 +437,7 @@ pub fn workerFailure(a: std.mem.Allocator, io: std.Io) !void {
 pub fn qualify(a: std.mem.Allocator, io: std.Io, stage: []const u8) !void {
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "complete-local-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("complete-local-{d}", .{std.os.linux.getpid()});
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("complete local fixture cleanup failed");
     const root = try parent.openDir(io, name, .{ .iterate = true });
@@ -474,7 +474,7 @@ pub fn qualify(a: std.mem.Allocator, io: std.Io, stage: []const u8) !void {
 pub fn composition(a: std.mem.Allocator, io: std.Io, stage: []const u8, reader_repository: []const u8) !void {
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{});
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "private-composition-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("private-composition-{d}", .{std.os.linux.getpid()});
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("private composition fixture cleanup failed");
     const work = try std.fs.path.join(a, &.{ options.fixture_root, name });

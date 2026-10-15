@@ -123,14 +123,14 @@ explicit existing-build target separately on each actual host architecture:
 ```sh
 # scratch is an already-created private directory outside the checkout.
 # packages is the pinned package directory from a copied-manifest restore.
-zig build --build-file support/tools/hyperv/preparation/build.zig \
+ZIG_GLOBAL_CACHE_DIR="$scratch/global" zig build --build-file support/tools/hyperv/preparation/build.zig \
   --system "$packages" --cache-dir "$scratch/cache" \
-  --global-cache-dir "$scratch/global" --prefix "$scratch/installed" \
-  -Doptimize=ReleaseSafe -j2 test-original-seed install --summary all
-zig build --build-file support/tools/hyperv/preparation/build.zig \
+  --prefix "$scratch/installed" \
+  -Doptimize=safe -j2 test-original-seed install --summary all
+ZIG_GLOBAL_CACHE_DIR="$scratch/global" zig build --build-file support/tools/hyperv/preparation/build.zig \
   --system "$packages" --cache-dir "$scratch/cache" \
-  --global-cache-dir "$scratch/global" --prefix "$scratch/installed" \
-  -Doptimize=ReleaseSafe -Doriginal-seed-root="$scratch/fresh-full-size" \
+  --prefix "$scratch/installed" \
+  -Doptimize=safe -Doriginal-seed-root="$scratch/fresh-full-size" \
   -j2 qualify-original-seed --summary all
 ```
 
@@ -247,9 +247,9 @@ outside the checkout and `-j2`.
 An explicit, noninstalled native driver exercises the actual CLI pipeline:
 
 ```text
-zig build --build-file support/tools/hyperv/preparation/build.zig \
-  --system PACKAGES --cache-dir SCRATCH/cache --global-cache-dir SCRATCH/global \
-  --prefix SCRATCH/installed -Doptimize=ReleaseSafe -j2 \
+ZIG_GLOBAL_CACHE_DIR=SCRATCH/global zig build --build-file support/tools/hyperv/preparation/build.zig \
+  --system PACKAGES --cache-dir SCRATCH/cache \
+  --prefix SCRATCH/installed -Doptimize=safe -j2 \
   -Ddirect-config-root=FRESH_ABSOLUTE_PRIVATE_PATH qualify-direct-config --summary all
 ```
 
@@ -327,8 +327,11 @@ Ubuntu/archive authority.
 
 ## Build and focused fixtures
 
-Use installed Zig 0.16.0, never the repository root build. Put all caches,
+Use installed Zig 0.17.0, never the repository root build. Put all caches,
 outputs and temporary directories under an explicit fresh preparation scratch.
+Use distinct local configuration caches for preparation, namespace and
+integration `--build-file` scripts, even when their source tree is the same.
+The CI wrapper already selects separate cache directories for each script.
 The existing dependency cache is read-only through `--system`. These focused
 commands do not authorize dependency restoration or real evidence acquisition.
 The existing `test` target accepts repeatable `-Dtest-filter=...` selectors;
@@ -367,7 +370,7 @@ cd "$scratch/work"
   -j2 test install --summary all
 ```
 
-Repeat with `-Doptimize=ReleaseSafe` and a different output prefix. Installed
+Repeat with `-Doptimize=safe` and a different output prefix. Installed
 executables are `uk-hyperv-prepare` and `preparation-namespace`; the latter has
 an actual typed, descriptor/status-channel worker implementation.
 The example selects the installed public AArch64 Git closure. CI must supply
@@ -395,10 +398,9 @@ checkout or fresh execution/admission evidence.
 The separate existing-runner namespace fixture build uses:
 
 ```sh
-/home/g/.local/bin/zig build \
+ZIG_GLOBAL_CACHE_DIR="$scratch/ns-global" /home/g/.local/bin/zig build \
   --build-file /d/unikraft-worktrees/fleet-origin/support/tools/hyperv/preparation/namespace/build.zig \
   --cache-dir "$scratch/ns-local" \
-  --global-cache-dir "$scratch/ns-global" \
   --system /d/unikraft-worktrees/fleet-ci/.d/zig-migration-preparation/restore/zig-pkg \
   --prefix "$scratch/outputs/namespace-debug" \
   -Dworkspace="$scratch/ns-debug-work" "${git_fixture[@]}" \
@@ -463,14 +465,14 @@ umask 077
 scratch="$PWD/.d/namespace-observations-debug"
 test ! -e "$scratch"
 mkdir -p "$scratch"/{work,cache,global,compiler-scratch}
-TMPDIR="$scratch/compiler-scratch" zig build \
+TMPDIR="$scratch/compiler-scratch" ZIG_GLOBAL_CACHE_DIR="$scratch/global" zig build \
   --build-file support/tools/hyperv/preparation/namespace/build.zig \
-  --cache-dir "$scratch/cache" --global-cache-dir "$scratch/global" \
-  -Dworkspace="$scratch/work" -Dobservations-only=true -Doptimize=Debug \
+  --cache-dir "$scratch/cache" \
+  -Dworkspace="$scratch/work" -Dobservations-only=true -Doptimize=debug \
   -j2 test-observations --summary all
 ```
 
-Repeat with `-Doptimize=ReleaseSafe` and a new private root. Both the boolean
+Repeat with `-Doptimize=safe` and a new private root. Both the boolean
 and the `test-observations` step are required: the boolean selects an independent
 build graph before the ordinary Git/fixture options are processed. The hook-free
 test also has an explicit `test-observer-exclusion` step and is a dependency of
@@ -521,14 +523,14 @@ cd /d/unikraft-worktrees/fleet-origin
   --build-file support/tools/hyperv/preparation/namespace/build.zig \
   --cache-dir "$scratch/ns-release-cache" --prefix "$scratch/ns-release-fixture" \
   -Dworkspace="$scratch/ns-release-work" "${git_fixture[@]}" \
-  -Doptimize=ReleaseSafe -j2 install-fixture --summary all
+  -Doptimize=safe -j2 install-fixture --summary all
 /home/g/.local/bin/zig build \
   --build-file support/tools/hyperv/preparation/namespace/build.zig \
   --cache-dir "$scratch/ns-release-cache" --prefix "$scratch/ns-release-suite" \
   -Dworkspace="$scratch/ns-release-work" "${git_fixture[@]}" \
   -Dfixture-executable="$scratch/ns-release-fixture/bin/preparation-namespace-fixture" \
   -Dci-report="$scratch/ns-release-baseline.json" \
-  -Doptimize=ReleaseSafe -j2 test install --summary all
+  -Doptimize=safe -j2 test install --summary all
 ```
 
 The external executable must be built with the same workspace, Git material and
@@ -845,6 +847,27 @@ evidence, not GitHub execution, production admission or authorization to adopt.
 
 ## Wire versions and types
 
+Current preparation producers and compiler-origin validation require Zig
+`0.17.0`; native optimization options are `debug` and `safe`. The historical
+Zig 0.16 measurements and prepared-image records below remain historical:
+rebuilding and independently reviewing their physical source/compiler custody
+is required, not relabelling the original evidence.
+
+Literal dependency ZON is still bounded and validated in its entirety.
+Selected pin fields are exact (`url`, `hash`, optional boolean `lazy`), with
+unknown fields rejected. Zig 0.17's `fromZoir` does not forward its selected
+node option, so the selected literal's AST source span is decoded with
+`fromSlice` only after complete-manifest ZonGen validation. Decoded strings and
+diagnostics belong to the declaration arena; selected values remain valid
+after AST/ZOIR and source cleanup until declaration comparison completes.
+Filesystem-custody test runs remain live on every build invocation rather than
+reusing an earlier test result for changed source, fixture or private-file
+metadata; compilation and generated-artifact caching remain available.
+The Zig build CLI receives its global cache through the validated namespace
+environment's `ZIG_GLOBAL_CACHE_DIR`, bound to the selected private scratch
+directory. No ambient cache is inherited; Zig 0.17 build no longer accepts a
+`--global-cache-dir` argument.
+
 Canonical JSON has sorted keys, exact fields/types and one final LF, included
 in document hashes. Duplicate/unknown/missing fields, noncanonical encodings,
 floating/exponent integers and unknown enums are rejected. Generic document
@@ -907,7 +930,7 @@ Actual local actor and same-source static namespace helper require
 `local_build` at their consuming call sites; distribution cannot bypass those
 relations. Utilities also use `role=preparation`, so that role does **not**
 impose local-build or static-only requirements on utilities. Prebuilt Zig must
-be a native executable distribution at runtime revision `0.16.0`.
+be a native executable distribution at runtime revision `0.17.0`.
 Bison data, CA bundles and firmware use data distributions, never package-data
 disguises. The miz hash/revision pins remain immutable.
 
@@ -1089,6 +1112,27 @@ UMASK/SHELL/cache overrides or the former preparation-environment option pair.
 No arbitrary command, Make argument,
 shell string, inherited environment or alternate facade lock hook is exposed
 by the worker protocol.
+
+Root builds require the root manifest's Hearth `translate_c` package and its Aro
+dependency closure. Restoring only the standalone preparation manifest's miz
+closure is insufficient. The factory must restore, authenticate and bind the
+complete selected root-build depot before source/admission custody; an empty
+depot is no longer a valid root-build input. Restoration is not a producer or
+namespace-helper operation.
+
+The producer already supplies its reviewed `tools.packages` directory through
+`--system`, binds its complete origin/tree contract in `producer.Binding`, and
+revalidates it before helper entry and after execution. The helper reopens that
+same binding and mounts the dependency runtime read-only. Keep `--system`:
+missing packages must refuse the build, never trigger an implicit network fetch,
+an ambient package-cache fallback, or an unreviewed replacement depot.
+
+Zig 0.17 gives `ZIG_LOCAL_PKG_DIR` precedence over the `--system` directory. The
+helper creates a fresh allowlisted environment, and `Record.apply` removes that
+override so the producer's bound `--system` depot remains authoritative. Direct
+factory/qualification callers must either unset it or explicitly bind it to the
+same authenticated depot. A standalone restorer must keep its own per-restore
+package directory; do not globally override all restorers with one depot.
 
 `producer.describe` and `bindingDigest` create material for independent review.
 They do not approve it. `producer.execute` requires an independently supplied
@@ -1315,8 +1359,10 @@ with independently specified seed/intent/receipt layouts and fixed-VHD footer.
 It never reads, copies, hashes or regenerates the original 4 GiB seed.
 Persistence's later custody gate still requires original IDs and exact
 LUN 7 / 8388608 x 512 geometry. Pinned miz revision is
-`669a27982b376311f558e820b69e9a692735b0cd`, package hash
-`miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx`.
+`66ea6701cf0e1b6d31e5f30fade00b7a546d4b44`, package hash
+`miz-0.2.0-Z3lHlLgL2wDiGxutMJMDy9Qy4CLNCwOptwgQLp1ZDSiv`, the Zig 0.17
+port of the same reviewed bounded-open generation. Earlier execution records
+below remain historical; their producer provenance is not relabelled.
 
 Filesystem traversal/hash byte/count bounds and between-operation deadlines
 do not interrupt every blocked syscall or native miz call. An independent
@@ -1388,7 +1434,7 @@ use its `review-*` filenames:
 ```
 
 The six commands were `bash .../focused.sh SUITE MODE`, with `SUITE=prep,ns,int`
-and `MODE=Debug,ReleaseSafe`. The wrapper uses the build files in this package,
+and `MODE=debug,safe`. The wrapper uses the build files in this package,
 `test install -j2 -Doptimize=MODE --summary all`, explicit per-suite caches/
 prefixes below that fresh root, and the **read-only**
 `/d/unikraft-worktrees/fleet-ci/.d/zig-migration-preparation/restore/zig-pkg`

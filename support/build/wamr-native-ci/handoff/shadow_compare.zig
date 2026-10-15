@@ -83,11 +83,11 @@ fn replaceBinding(a: std.mem.Allocator, item: *std.json.Value, path: []const u8,
     core.Sha256.hash(raw, &digest, .{});
     item.object.getPtr("path").?.* = .{ .string = try a.dupe(u8, path) };
     item.object.getPtr("sha256").?.* = .{ .string = try a.dupe(u8, &std.fmt.bytesToHex(digest, .lower)) };
-    item.object.getPtr("size").?.* = .{ .number_string = try std.fmt.allocPrint(a, "{d}", .{raw.len}) };
+    item.object.getPtr("size").?.* = .{ .number_string = try a.print("{d}", .{raw.len}) };
 }
 
 fn documentPath(a: std.mem.Allocator, root: []const u8, name: []const u8) ![]u8 {
-    return std.fmt.allocPrint(a, "{s}/{s}", .{ root, name });
+    return a.print("{s}/{s}", .{ root, name });
 }
 
 fn sameField(a: std.mem.Allocator, left: std.json.Value, right: std.json.Value, name: []const u8) !void {

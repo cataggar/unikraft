@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
+unset ZIG_LOCAL_PKG_DIR
 
 test "$(id -u)" -ne 0
 root="${RUNNER_TEMP:?}/hyperv-ci/native-operator-guard"
 package=support/tools/hyperv/operator_guard
+packages="${root}/packages"
 installation=/var/lib/unikraft-hyperv-custody-ci
 executable="${installation}/operator-guard-fixture"
 profile="${installation}/profile"
@@ -32,10 +34,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "${root}/baseline/fixtures"
+mkdir -p "${root}/baseline/fixtures" "${packages}"
 zig build --build-file "${package}/build.zig" \
+  --system "${packages}" \
   --cache-dir "${root}/fixture-cache" --prefix "${root}/fixture-out" \
-  -Dfixture-optimize=ReleaseSafe -j2 install-fixture --summary all
+  -Dfixture-optimize=safe -j2 install-fixture --summary all
 
 # Never profile a writable cache path, compiler, shell, or arbitrary test runner.
 for directory in / /var /var/lib; do
@@ -52,10 +55,11 @@ sha256sum "${executable}" > "${root}/fixture-sha256.txt"
 started="$(date --utc '+%Y-%m-%d %H:%M:%S')"
 baseline=0
 zig build --build-file "${package}/build.zig" \
+  --system "${packages}" \
   --cache-dir "${root}/baseline/cache" --prefix "${root}/baseline/out" \
   -Dtest-root="${root}/baseline/fixtures" \
   "-Dfixture-executable=${executable}" \
-  -Dtest-filter='kernel guard completes' -Doptimize=Debug -j2 test --summary all \
+  -Dtest-filter='kernel guard completes' -Doptimize=debug -j2 test --summary all \
   > "${root}/baseline.log" 2>&1 || baseline=$?
 
 if [ "${baseline}" -ne 0 ]; then
@@ -81,9 +85,10 @@ if [ "${baseline}" -ne 0 ]; then
   test "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns)" = 1
 fi
 
-for mode in Debug ReleaseSafe; do
+for mode in debug safe; do
   mkdir -p "${root}/${mode}/fixtures"
   zig build --build-file "${package}/build.zig" \
+    --system "${packages}" \
     --cache-dir "${root}/${mode}/zig-local-cache" \
     --prefix "${root}/${mode}/out" \
     -Dtest-root="${root}/${mode}/fixtures" \
@@ -105,9 +110,10 @@ fi
 
 for target in x86_64-linux-musl aarch64-linux-musl; do
   zig build --build-file "${package}/build.zig" \
+    --system "${packages}" \
     --cache-dir "${root}/${target}/zig-local-cache" \
     --prefix "${root}/${target}/out" \
-    -Dtarget="${target}" -Doptimize=ReleaseSafe \
+    -Dtarget="${target}" -Doptimize=safe \
     -j2 compile-guard --summary all
   binary_bytes="$(stat -c %s "${root}/${target}/out/bin/operator-guard-target-fixture")"
   test "$((binary_bytes + 233504))" -le 8388608

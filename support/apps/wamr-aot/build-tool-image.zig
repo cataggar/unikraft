@@ -87,6 +87,7 @@ pub fn execute(
 
 const Stage = enum {
     bison_data,
+    root_dependency_hash,
     root_olddefconfig,
     root_native_images,
     git_clean,
@@ -95,11 +96,182 @@ const Stage = enum {
     fn name(self: Stage) []const u8 {
         return switch (self) {
             .bison_data => "bison-data",
+            .root_dependency_hash => "root-dependency-hash",
             .root_olddefconfig => "root-olddefconfig",
             .root_native_images => "root-native-images",
             .git_clean => "git-clean",
             .git_revision => "git-revision",
         };
+    }
+};
+
+pub const RootPackages = struct {
+    path: []const u8,
+    directory: contract.files.PrivateDirectory,
+    identity: contract.files.Snapshot,
+    tree: [32]u8,
+    names: []const []const u8,
+
+    pub const root_names = [_][]const u8{ contract.translate_c_hash, contract.aro_hash };
+    pub const sdk_names = [_][]const u8{ contract.translate_c_hash, contract.aro_hash, contract.wabt_hash, contract.wasip2_hash };
+
+    pub fn open(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        environment: *const std.process.Environ.Map,
+    ) !RootPackages {
+        return openNames(allocator, io, environment, &root_names);
+    }
+
+    pub fn openSDK(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        environment: *const std.process.Environ.Map,
+    ) !RootPackages {
+        return openNames(allocator, io, environment, &sdk_names);
+    }
+
+    fn openNames(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        environment: *const std.process.Environ.Map,
+        names: []const []const u8,
+    ) !RootPackages {
+        const path = environment.get("ZIG_LOCAL_PKG_DIR") orelse
+            return error.UnboundRootPackages;
+        try core.private_files.absoluteFilePath(path);
+        const directory = try contract.files.PrivateDirectory.open(io, path);
+        errdefer directory.close(io);
+        const identity = try contract.files.snapshot(.{ .handle = directory.dir.handle, .flags = .{ .nonblocking = false } });
+        return .{
+            .path = path,
+            .directory = directory,
+            .identity = identity,
+            .tree = try fingerprint(allocator, io, directory.dir, names),
+            .names = names,
+        };
+    }
+
+    pub fn close(self: RootPackages, io: std.Io) void {
+        self.directory.close(io);
+    }
+
+    pub fn verify(self: RootPackages, allocator: std.mem.Allocator, io: std.Io) !void {
+        const named = try contract.files.PrivateDirectory.open(io, self.path);
+        defer named.close(io);
+        if (!contract.files.sameSnapshot(self.identity, try contract.files.snapshot(.{ .handle = named.dir.handle, .flags = .{ .nonblocking = false } })) or
+            !std.meta.eql(self.tree, try fingerprint(allocator, io, self.directory.dir, self.names)))
+            return error.RootPackagesChanged;
+    }
+
+    pub fn authenticate(
+        self: RootPackages,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        zig: contract.process.Tool,
+        environment: *const std.process.Environ.Map,
+        state: std.Io.Dir,
+        state_path: []const u8,
+        runner: anytype,
+        cwd: std.Io.Dir,
+        cwd_path: []const u8,
+    ) !void {
+        const hashes = try contract.files.ensurePrivateDirectory(io, state, "root-package-hashes");
+        defer hashes.close(io);
+        const hashes_path = try std.fs.path.join(allocator, &.{ state_path, "root-package-hashes" });
+        defer allocator.free(hashes_path);
+        for (self.names) |name| {
+            const package_path = try std.fs.path.join(allocator, &.{ self.path, name });
+            defer allocator.free(package_path);
+            var result = try runner.runSuccess(zig, .root_dependency_hash, &.{
+                zig.path, "fetch", "--pkg-dir", hashes_path, package_path,
+            }, environment, cwd, cwd_path, 4096);
+            defer result.deinit(allocator);
+            const expected = try allocator.print("{s}\n", .{name});
+            defer allocator.free(expected);
+            if (!std.mem.eql(u8, result.stdout, expected))
+                return error.UnpinnedRootPackage;
+        }
+        try self.verify(allocator, io);
+    }
+
+    fn fingerprint(allocator: std.mem.Allocator, io: std.Io, directory: std.Io.Dir, names: []const []const u8) ![32]u8 {
+        var hasher = core.Sha256.init(.{});
+        var entries: usize = 0;
+        var bytes: u64 = 0;
+        for (names) |name| {
+            try core.private_files.basename(name);
+            const child = try directory.openDir(io, name, .{ .follow_symlinks = false, .iterate = true });
+            defer child.close(io);
+            hasher.update(name);
+            try collect(allocator, io, child, &hasher, &entries, &bytes, 0);
+        }
+        return hasher.finalResult();
+    }
+
+    fn collect(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        directory: std.Io.Dir,
+        hasher: *core.Sha256,
+        entries: *usize,
+        bytes: *u64,
+        depth: usize,
+    ) !void {
+        if (depth > 64 or entries.* >= 16384) return error.RootPackageLimitExceeded;
+        const before = try contract.files.snapshot(.{ .handle = directory.handle, .flags = .{ .nonblocking = false } });
+        try bindMetadata(hasher, before, true);
+        var names_list: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (names_list.items) |name| allocator.free(name);
+            names_list.deinit(allocator);
+        }
+        var iterator = directory.iterate();
+        while (try iterator.next(io)) |entry| {
+            if (entries.* >= 16384) return error.RootPackageLimitExceeded;
+            entries.* += 1;
+            try core.private_files.basename(entry.name);
+            const name = try allocator.dupe(u8, entry.name);
+            errdefer allocator.free(name);
+            try names_list.append(allocator, name);
+        }
+        std.mem.sort([]const u8, names_list.items, {}, struct {
+            fn less(_: void, left: []const u8, right: []const u8) bool {
+                return std.mem.lessThan(u8, left, right);
+            }
+        }.less);
+        for (names_list.items) |name| {
+            hasher.update(name);
+            hasher.update(&.{0});
+            if (directory.openDir(io, name, .{ .follow_symlinks = false, .iterate = true })) |child| {
+                defer child.close(io);
+                try collect(allocator, io, child, hasher, entries, bytes, depth + 1);
+            } else |err| switch (err) {
+                error.NotDir => {
+                    const file = try (contract.files.PrivateDirectory{ .dir = directory }).openFile(io, name);
+                    defer file.close(io);
+                    const info = try contract.files.snapshot(file);
+                    try bindMetadata(hasher, info, false);
+                    bytes.* = try std.math.add(u64, bytes.*, info.size);
+                    if (info.size > 64 * 1024 * 1024 or bytes.* > 256 * 1024 * 1024)
+                        return error.RootPackageLimitExceeded;
+                },
+                else => return err,
+            }
+        }
+        if (!contract.files.sameSnapshot(before, try contract.files.snapshot(.{ .handle = directory.handle, .flags = .{ .nonblocking = false } })))
+            return error.RootPackagesChanged;
+    }
+
+    fn bindMetadata(hasher: *core.Sha256, info: contract.files.Snapshot, directory: bool) !void {
+        if (info.uid != linux.geteuid() or (info.mode & 0o022) != 0 or
+            (info.mode & linux.S.IFMT) != (if (directory) @as(u16, linux.S.IFDIR) else @as(u16, linux.S.IFREG)) or
+            (!directory and info.nlink != 1))
+            return error.UnsafeRootPackage;
+        inline for (.{ info.ino, info.dev_major, info.dev_minor, info.size, info.mode, info.uid, info.nlink, info.mtime.sec, info.mtime.nsec, info.ctime.sec, info.ctime.nsec }) |value| {
+            var buffer: [40]u8 = undefined;
+            hasher.update(try std.fmt.bufPrint(&buffer, "{d}\x00", .{value}));
+        }
     }
 };
 
@@ -224,7 +396,7 @@ const Diagnostics = struct {
             .{ self.index, stage.name() },
         );
         self.index += 1;
-        const contents = try std.fmt.allocPrint(
+        const contents = try std.mem.Allocator.print(
             allocator,
             "{s}\n",
             .{@errorName(err)},
@@ -383,8 +555,8 @@ const SelectedTools = struct {
     }
 
     fn close(self: *SelectedTools, allocator: std.mem.Allocator, io: std.Io) void {
-        inline for (std.meta.fields(SelectedTools)) |field|
-            @field(self, field.name).close(allocator, io);
+        inline for (@typeInfo(SelectedTools).@"struct".field_names) |name|
+            @field(self, name).close(allocator, io);
         self.* = undefined;
     }
 
@@ -413,15 +585,15 @@ const SelectedTools = struct {
     }
 
     fn same(left: *const SelectedTools, right: *const SelectedTools) bool {
-        inline for (std.meta.fields(SelectedTools)) |field| {
+        inline for (@typeInfo(SelectedTools).@"struct".field_names) |name| {
             if (!std.meta.eql(
-                @field(left, field.name).executable.identity,
-                @field(right, field.name).executable.identity,
+                @field(left, name).executable.identity,
+                @field(right, name).executable.identity,
             )) return false;
             if (!std.mem.eql(
                 u8,
-                @field(left, field.name).path,
-                @field(right, field.name).path,
+                @field(left, name).path,
+                @field(right, name).path,
             )) return false;
         }
         return true;
@@ -599,6 +771,8 @@ fn executeOpen(
     } else if (!std.meta.eql(self_tool.executable.identity, running.identity)) {
         return imageInputChanged(io, state, "direct-identity");
     }
+    const root_packages = try RootPackages.open(allocator, io, inherited);
+    defer root_packages.close(io);
 
     const private_paths = try createEnvironmentDirectories(
         a,
@@ -642,8 +816,6 @@ fn executeOpen(
         environment_bytes,
     );
 
-    try ensureAppConfig(allocator, io, repository, build_path);
-
     const portable_config = if (inherited.get("WAMR_CI_PORTABLE_CONFIG")) |flag|
         if (std.mem.eql(u8, flag, "1"))
             true
@@ -655,6 +827,10 @@ fn executeOpen(
     var root_environment = try cloneEnvironment(allocator, inherited);
     defer root_environment.deinit();
     try root_environment.put("TMPDIR", make_environment.tmp);
+    try root_environment.put("ZIG_GLOBAL_CACHE_DIR", make_environment.zig_global_cache);
+    try root_environment.put("ZIG_LOCAL_PKG_DIR", root_packages.path);
+    try root_packages.authenticate(allocator, io, tools.zig, &root_environment, state, state_path, &runner, repository.root.dir, repository.root.path);
+    try ensureAppConfig(allocator, io, repository, build_path);
     const environment_path = try std.fs.path.join(
         a,
         &.{ state_path, "environment.json" },
@@ -673,6 +849,7 @@ fn executeOpen(
         make_environment,
         &tools,
         portable_config,
+        root_packages.path,
     );
 
     var config_input: ?contract.files.RetainedFile = null;
@@ -711,6 +888,8 @@ fn executeOpen(
         contract.process.maximum_diagnostic_bytes,
     );
     defer root_result.deinit(allocator);
+    root_packages.verify(allocator, io) catch
+        return imageInputChanged(io, state, "root-packages-after-root");
 
     var tools_after = try SelectedTools.resolve(allocator, io, inherited, state);
     defer tools_after.close(allocator, io);
@@ -1109,6 +1288,7 @@ fn rootCommand(
     make_environment: MakeEnvironment,
     tools: *const SelectedTools,
     portable_config: bool,
+    packages_path: []const u8,
 ) ![]const []const u8 {
     var arguments: std.ArrayList([]const u8) = .empty;
     try arguments.appendSlice(allocator, &.{
@@ -1118,38 +1298,38 @@ fn rootCommand(
         "-j2",
         "--cache-dir",
         make_environment.zig_local_cache,
-        "--global-cache-dir",
-        make_environment.zig_global_cache,
-        try std.fmt.allocPrint(allocator, "-Dapp={s}", .{repository.app.path}),
-        try std.fmt.allocPrint(
+        "--system",
+        packages_path,
+        try allocator.print("-Dapp={s}", .{repository.app.path}),
+        try std.mem.Allocator.print(
             allocator,
             "-Dnative-make-environment={s}",
             .{environment_path},
         ),
-        try std.fmt.allocPrint(allocator, "-Dconfig={s}", .{config_path}),
-        try std.fmt.allocPrint(allocator, "-Dmake-command={s}", .{tools.make.path}),
-        try std.fmt.allocPrint(allocator, "-Dbison-command={s}", .{tools.bison.path}),
-        try std.fmt.allocPrint(allocator, "-Dflex-command={s}", .{tools.flex.path}),
-        try std.fmt.allocPrint(
+        try allocator.print("-Dconfig={s}", .{config_path}),
+        try allocator.print("-Dmake-command={s}", .{tools.make.path}),
+        try allocator.print("-Dbison-command={s}", .{tools.bison.path}),
+        try allocator.print("-Dflex-command={s}", .{tools.flex.path}),
+        try std.mem.Allocator.print(
             allocator,
             "-Dcompiler={s} cc -target x86_64-freestanding-none",
             .{tools.zig.path},
         ),
         "-Dcompiler-targeted=true",
-        try std.fmt.allocPrint(allocator, "-Dhost-cc={s} cc", .{tools.zig.path}),
-        try std.fmt.allocPrint(allocator, "-Dhost-cxx={s} c++", .{tools.zig.path}),
+        try allocator.print("-Dhost-cc={s} cc", .{tools.zig.path}),
+        try allocator.print("-Dhost-cxx={s} c++", .{tools.zig.path}),
         "-Dhost-cflags=-fno-sanitize=null",
-        try std.fmt.allocPrint(allocator, "-Dmake-arg=AR={s} ar", .{tools.zig.path}),
-        try std.fmt.allocPrint(allocator, "-Dmake-arg=CP={s} -f", .{tools.cp.path}),
-        try std.fmt.allocPrint(allocator, "-Dmake-arg=MKDIR={s}", .{tools.mkdir.path}),
-        try std.fmt.allocPrint(allocator, "-Dmake-arg=PYTHON={s}", .{tools.python3.path}),
-        try std.fmt.allocPrint(allocator, "-Dmake-arg=READLINK={s}", .{tools.readlink.path}),
+        try allocator.print("-Dmake-arg=AR={s} ar", .{tools.zig.path}),
+        try allocator.print("-Dmake-arg=CP={s} -f", .{tools.cp.path}),
+        try allocator.print("-Dmake-arg=MKDIR={s}", .{tools.mkdir.path}),
+        try allocator.print("-Dmake-arg=PYTHON={s}", .{tools.python3.path}),
+        try allocator.print("-Dmake-arg=READLINK={s}", .{tools.readlink.path}),
         "-Dmake-arg=HOSTOSENV=Linux",
         "-Dmake-arg=WGET_VERSION=unavailable",
         "-Dmake-arg=WGET=false",
-        try std.fmt.allocPrint(allocator, "-Dmake-arg=ZIG={s}", .{tools.zig.path}),
-        try std.fmt.allocPrint(allocator, "-Dmake-arg=YACC={s}", .{tools.bison.path}),
-        try std.fmt.allocPrint(allocator, "-Dmake-arg=LEX={s}", .{tools.flex.path}),
+        try allocator.print("-Dmake-arg=ZIG={s}", .{tools.zig.path}),
+        try allocator.print("-Dmake-arg=YACC={s}", .{tools.bison.path}),
+        try allocator.print("-Dmake-arg=LEX={s}", .{tools.flex.path}),
         "-Dmake-arg=KCONFIG_OVERWRITECONFIG=1",
         "-Dmake-arg=UK_CFLAGS=-std=gnu17",
         "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt",
@@ -1165,7 +1345,7 @@ fn rootCommand(
     }) |entry| {
         try arguments.append(
             allocator,
-            try std.fmt.allocPrint(
+            try std.mem.Allocator.print(
                 allocator,
                 "-Dmake-arg={s}={s}",
                 .{ entry[0], @field(tools, entry[1]).path },
@@ -1174,7 +1354,7 @@ fn rootCommand(
     }
     try arguments.append(
         allocator,
-        try std.fmt.allocPrint(
+        try std.mem.Allocator.print(
             allocator,
             "-Dwamr-aot-tool={s}",
             .{executable_path},
@@ -1632,7 +1812,7 @@ fn requireSha256(value: []const u8) !void {
 fn commandFailure(stage: Stage) anyerror {
     return switch (stage) {
         .bison_data => error.BisonDataCommandFailed,
-        .root_olddefconfig, .root_native_images => error.RootBuildCommandFailed,
+        .root_dependency_hash, .root_olddefconfig, .root_native_images => error.RootBuildCommandFailed,
         .git_clean => error.GitCleanCommandFailed,
         .git_revision => error.GitRevisionCommandFailed,
     };
@@ -1716,7 +1896,7 @@ fn writePrimary(
         .exited => |code| try writer.print("\"exited\":{d}", .{code}),
         .signal => |signal| try writer.print(
             "\"signal\":{d}",
-            .{@intFromEnum(signal)},
+            .{@backingInt(signal)},
         ),
         .unknown => |status| try writer.print("\"unknown\":{d}", .{status}),
         else => try contract.json.writeString(writer, @tagName(primary)),

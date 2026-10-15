@@ -121,21 +121,21 @@ pub const Bound = struct {
             .data => return error.InvalidRuntime,
         };
         if (image.header.machine != expected) return error.InvalidRuntime;
-        if (executable and self.contract.role != .qemu and expected != (if (builtin.cpu.arch == .aarch64) std.elf.EM.AARCH64 else std.elf.EM.X86_64))
+        if (executable and self.contract.role != .qemu and expected != (if (builtin.target.cpu.arch == .aarch64) std.elf.EM.AARCH64 else std.elf.EM.X86_64))
             return error.InvalidRuntime;
         var result: ElfInfo = .{ .needed = &.{} };
-        var dynamic: ?std.elf.Elf64_Phdr = null;
-        for (image.programs) |program| switch (program.p_type) {
-            std.elf.PT_INTERP => {
+        var dynamic: ?@TypeOf(image.programs[0]) = null;
+        for (image.programs) |program| switch (program.type) {
+            .INTERP => {
                 if (self.contract.loader == null) return error.IncompleteRuntime;
-                if (result.interpreter != null or program.p_filesz < 2 or program.p_filesz > 4096) return error.InvalidRuntime;
-                const value = try elf.range(bytes, program.p_offset, program.p_filesz);
+                if (result.interpreter != null or program.filesz < 2 or program.filesz > 4096) return error.InvalidRuntime;
+                const value = try elf.range(bytes, program.offset, program.filesz);
                 if (value[value.len - 1] != 0 or std.mem.indexOfScalar(u8, value[0 .. value.len - 1], 0) != null)
                     return error.InvalidRuntime;
                 try absolutePath(value[0 .. value.len - 1]);
                 result.interpreter = try allocator.dupe(u8, value[0 .. value.len - 1]);
             },
-            std.elf.PT_DYNAMIC => {
+            .DYNAMIC => {
                 if (dynamic != null) return error.InvalidRuntime;
                 dynamic = program;
             },
@@ -146,8 +146,8 @@ pub const Bound = struct {
         for (image.sections) |section| {
             if (section.header.sh_type != std.elf.SHT_DYNAMIC) continue;
             dynamic_count += 1;
-            if (dynamic_count != 1 or dynamic == null or section.header.sh_offset != dynamic.?.p_offset or
-                section.header.sh_addr != dynamic.?.p_vaddr or section.header.sh_size != dynamic.?.p_filesz or
+            if (dynamic_count != 1 or dynamic == null or section.header.sh_offset != dynamic.?.offset or
+                section.header.sh_addr != dynamic.?.vaddr or section.header.sh_size != dynamic.?.filesz or
                 section.header.sh_size == 0 or section.header.sh_size % @sizeOf(std.elf.Elf64_Dyn) != 0 or
                 section.header.sh_entsize != @sizeOf(std.elf.Elf64_Dyn) or section.header.sh_link >= image.sections.len)
                 return error.InvalidRuntime;
@@ -439,7 +439,7 @@ pub const TestFixture = struct {
 
     /// The caller supplies public fixture paths; this never searches the host.
     pub fn copyRuntime(allocator: std.mem.Allocator, io: std.Io, directory: fs.Directory, selected: Inputs) !Bound {
-        if (builtin.os.tag != .linux or (builtin.cpu.arch != .aarch64 and builtin.cpu.arch != .x86_64))
+        if (builtin.target.os.tag != .linux or (builtin.target.cpu.arch != .aarch64 and builtin.target.cpu.arch != .x86_64))
             return error.UnsupportedFixtureArchitecture;
         if (selected.libraries.len == 0 or selected.libraries.len > 256) return error.InvalidRuntime;
         const Input = struct { source: []const u8, destination: []const u8, mode: u16 };
@@ -482,7 +482,7 @@ pub const TestFixture = struct {
             .role = .git,
             .origin = synthetic.origin,
             .evidence = synthetic.evidence,
-            .target = if (builtin.cpu.arch == .aarch64) .aarch64_linux else .x86_64_linux,
+            .target = if (builtin.target.cpu.arch == .aarch64) .aarch64_linux else .x86_64_linux,
             .tree = inventory.tree,
             .executable = try directory.record(allocator, io, "bin/git", 64 * 1024 * 1024, .executable),
             .loader = try directory.record(allocator, io, "lib/loader", 64 * 1024 * 1024, .executable),
@@ -644,7 +644,7 @@ test "runtime real relocated Git binds all ELF bytes modes and transitive depend
     try std.testing.expectError(error.AmbientRuntimeForbidden, fixture.git.runtime.originPaths(allocator, "bin/git", "$ORIGIN/../../outside"));
     try std.testing.expectError(error.AmbientRuntimeForbidden, fixture.git.runtime.originPaths(allocator, "bin/git", "$ORIGIN/../lib:"));
     try std.testing.expectError(error.AmbientRuntimeForbidden, fixture.git.resolution("libc.so.6 => /usr/lib/libc.so.6 (0x1234)\n"));
-    const incomplete = try std.fmt.allocPrint(allocator, "{s}/lib/loader (0x1234)\n", .{fixture.git.runtime.directory.path});
+    const incomplete = try allocator.print("{s}/lib/loader (0x1234)\n", .{fixture.git.runtime.directory.path});
     try std.testing.expectError(error.IncompleteRuntime, fixture.git.resolution(incomplete));
     try std.testing.expectError(error.IncompleteRuntime, fixture.git.resolution(try std.mem.concat(allocator, u8, &.{ incomplete, incomplete })));
     try std.testing.expectError(error.InvalidRuntimeResolution, fixture.git.resolution("linux-vdso.so.1 (0xNOTHEX)\n"));

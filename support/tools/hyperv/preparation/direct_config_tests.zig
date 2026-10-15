@@ -34,7 +34,7 @@ const metadata_text =
 
 fn replaced(bytes: []const u8, from: []const u8, to: []const u8) ![]u8 {
     const offset = std.mem.indexOf(u8, bytes, from) orelse return error.MissingFixtureText;
-    return std.fmt.allocPrint(a, "{s}{s}{s}", .{ bytes[0..offset], to, bytes[offset + from.len ..] });
+    return a.print("{s}{s}{s}", .{ bytes[0..offset], to, bytes[offset + from.len ..] });
 }
 fn refused(value: anytype) !void {
     if (value) |_| return error.ExpectedRefusal else |_| {}
@@ -70,7 +70,7 @@ test "direct fragment is distinct unsolved CPU1 config and never changes the ori
 test "direct metadata types all supplied candidate settings without claiming a solver or approval" {
     const fragment = try config.renderDirectPersistence(a, guard);
     defer a.free(fragment);
-    const candidate = try std.fmt.allocPrint(a, "{s}CONFIG_UNRELATED=10\nCONFIG_ARCH_X86_64=y\nCONFIG_PLAT_HYPERV=y\n", .{fragment});
+    const candidate = try a.print("{s}CONFIG_UNRELATED=10\nCONFIG_ARCH_X86_64=y\nCONFIG_PLAT_HYPERV=y\n", .{fragment});
     defer a.free(candidate);
     var metadata = try config.Metadata.parse(a, metadata_text);
     defer metadata.deinit();
@@ -79,7 +79,7 @@ test "direct metadata types all supplied candidate settings without claiming a s
     try metadata.addSymbol("PLAT_HYPERV", .boolean);
     try config.validateDirectPersistenceWithMetadata(a, candidate, guard, &metadata);
     try refused(config.validateDirectPersistence(a, candidate, guard));
-    const missing = try std.fmt.allocPrint(a, "{s}CONFIG_UNDECLARED=y\n", .{candidate});
+    const missing = try a.print("{s}CONFIG_UNDECLARED=y\n", .{candidate});
     defer a.free(missing);
     try std.testing.expectError(error.IncompleteMetadata, config.validateDirectPersistenceWithMetadata(a, missing, guard, &metadata));
     var empty = config.Metadata.init(a);
@@ -91,9 +91,9 @@ test "direct metadata conflicts duplicates unknown guarded declarations and miss
     const fragment = try config.renderDirectPersistence(a, guard);
     defer a.free(fragment);
     for ([_][]const u8{ "LIBSTORVSC_MAX_LUNS", "UKPLAT_CPU_MAXCOUNT", "APPHYPERVACCEPTANCE_PERSISTENCE_LUN" }) |name| {
-        const from = try std.fmt.allocPrint(a, "symbol\t{s}\tint", .{name});
+        const from = try a.print("symbol\t{s}\tint", .{name});
         defer a.free(from);
-        const to = try std.fmt.allocPrint(a, "symbol\t{s}\thex", .{name});
+        const to = try a.print("symbol\t{s}\thex", .{name});
         defer a.free(to);
         const changed = try replaced(metadata_text, from, to);
         defer a.free(changed);
@@ -148,7 +148,7 @@ test "direct renderer and validators reject stale geometry identities policy and
         "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_TARGET=0\n",
         "CONFIG_APPHYPERVACCEPTANCE_DANGEROUS=y\n",
     }) |extra| {
-        const changed = try std.fmt.allocPrint(a, "{s}{s}", .{ fragment, extra });
+        const changed = try a.print("{s}{s}", .{ fragment, extra });
         defer a.free(changed);
         try refused(config.validateDirectPersistenceWithMetadata(a, changed, guard, &metadata));
     }

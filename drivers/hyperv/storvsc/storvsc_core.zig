@@ -220,12 +220,12 @@ const RequestContext = struct {
     transferred: u32 = 0,
     result: c_int = 0,
     state: ContextState = .free,
-    direction: u8 = @intFromEnum(Direction.none),
+    direction: u8 = @backingInt(Direction.none),
     allow_short: u8 = 0,
     srb_status: u8 = 0,
     scsi_status: u8 = 0,
     sense_len: u8 = 0,
-    sense: [max_sense_size]u8 = [_]u8{0} ** max_sense_size,
+    sense: [max_sense_size]u8 = @as([max_sense_size]u8, @splat(0)),
 };
 
 const Core = struct {
@@ -239,7 +239,7 @@ const Core = struct {
     resetting: u8 = 0,
     media_ready: u8 = 0,
     read_only: u8 = 0,
-    reserved0: [3]u8 = [_]u8{0} ** 3,
+    reserved0: [3]u8 = @as([3]u8, @splat(0)),
     selected_version: u16 = 0,
     reserved1: u16 = 0,
     packet_size: u32 = legacy_packet_size,
@@ -251,7 +251,7 @@ const Core = struct {
     control_deadline: u64 = 0,
     control_timeout_ns: u64 = 0,
     contexts: [max_contexts]RequestContext =
-        [_]RequestContext{.{}} ** max_contexts,
+        @splat(.{}),
 };
 
 const request_completion_flag: u32 = 1;
@@ -457,8 +457,8 @@ fn beginControl(
     event.kind = .transmit;
     event.tx.transaction_id = id;
     event.tx.packet_len = packet_size;
-    event.tx.direction = @intFromEnum(Direction.none);
-    putLe32(event.tx.packet[0..], 0, @intFromEnum(operation));
+    event.tx.direction = @backingInt(Direction.none);
+    putLe32(event.tx.packet[0..], 0, @backingInt(operation));
     putLe32(event.tx.packet[0..], 4, request_completion_flag);
     core.control_kind = kind;
     core.control_id = id;
@@ -616,7 +616,7 @@ fn parseRequestCompletion(
         );
         return;
     }
-    if (getLe32(payload, 0) != @intFromEnum(Operation.complete_io)) {
+    if (getLe32(payload, 0) != @backingInt(Operation.complete_io)) {
         completeRequest(
             context,
             slot,
@@ -705,7 +705,7 @@ fn parseRequestCompletion(
 
 fn controlPacketValid(payload: []const u8) bool {
     return completionPacketSizeValid(payload.len) and
-        getLe32(payload, 0) == @intFromEnum(Operation.complete_io);
+        getLe32(payload, 0) == @backingInt(Operation.complete_io);
 }
 
 export fn storvsc_core_initialize(
@@ -770,11 +770,11 @@ export fn storvsc_core_receive(
             return 0;
         }
         switch (getLe32(payload, 0)) {
-            @intFromEnum(Operation.remove_device) => {
+            @backingInt(Operation.remove_device) => {
                 event.kind = .remove_device;
                 event.err = -enodev;
             },
-            @intFromEnum(Operation.enumerate_bus) => {
+            @backingInt(Operation.enumerate_bus) => {
                 event.kind = .enumerate_bus;
             },
             else => {},
@@ -941,9 +941,9 @@ fn allocateContext(
         spec.transfer_len > core.transfer_limit or spec.reserved != 0 or
         spec.address_reserved != 0)
         return -einval;
-    if (spec.direction > @intFromEnum(Direction.none))
+    if (spec.direction > @backingInt(Direction.none))
         return -einval;
-    if (spec.direction == @intFromEnum(Direction.none)) {
+    if (spec.direction == @backingInt(Direction.none)) {
         if (spec.transfer_len != 0 or spec.minimum_transfer != 0)
             return -einval;
     } else if (spec.transfer_len == 0) {
@@ -973,7 +973,7 @@ fn allocateContext(
     tx.transfer_len = spec.transfer_len;
     tx.slot = @intCast(slot);
     tx.direction = spec.direction;
-    putLe32(tx.packet[0..], 0, @intFromEnum(Operation.execute_srb));
+    putLe32(tx.packet[0..], 0, @backingInt(Operation.execute_srb));
     putLe32(tx.packet[0..], 4, request_completion_flag);
     putLe16(
         tx.packet[0..],
@@ -991,9 +991,9 @@ fn allocateContext(
         tx.packet[28 + i] = spec.cdb[i];
     if (core.packet_size == modern_packet_size) {
         var flags = srb_flags_disable_synch_transfer;
-        if (spec.direction == @intFromEnum(Direction.read))
+        if (spec.direction == @backingInt(Direction.read))
             flags |= srb_flags_data_in;
-        if (spec.direction == @intFromEnum(Direction.write))
+        if (spec.direction == @backingInt(Direction.write))
             flags |= srb_flags_data_out;
         putLe32(tx.packet[0..], 52, flags);
         putLe32(tx.packet[0..], 56, 60);
@@ -1040,9 +1040,9 @@ fn prepareBlock(
         .transfer_len = 0,
         .minimum_transfer = 0,
         .timeout_ns = timeout_ns,
-        .cdb = [_]u8{0} ** 16,
+        .cdb = @as([16]u8, @splat(0)),
         .cdb_len = 0,
-        .direction = @intFromEnum(Direction.none),
+        .direction = @backingInt(Direction.none),
         .allow_short = 0,
         .reserved = 0,
         .path_id = address.path_id,
@@ -1075,9 +1075,9 @@ fn prepareBlock(
     spec.transfer_len = @intCast(bytes);
     spec.minimum_transfer = @intCast(bytes);
     spec.direction = if (operation == 0)
-        @intFromEnum(Direction.read)
+        @backingInt(Direction.read)
     else
-        @intFromEnum(Direction.write);
+        @backingInt(Direction.write);
     const last_sector = end - 1;
     const use_cdb10 = cdb_size == 10 or
         (cdb_size == 0 and last_sector <= std.math.maxInt(u32) and
@@ -1124,7 +1124,7 @@ export fn storvsc_core_prepare_block(
         .sectors = core.sectors,
         .sector_size = core.sector_size,
         .read_only = core.read_only,
-        .reserved = [_]u8{0} ** 3,
+        .reserved = @as([3]u8, @splat(0)),
     };
     return prepareBlock(
         core,
@@ -1159,7 +1159,7 @@ export fn storvsc_core_prepare_block_at(
         .sectors = core.sectors,
         .sector_size = core.sector_size,
         .read_only = core.read_only,
-        .reserved = [_]u8{0} ** 3,
+        .reserved = @as([3]u8, @splat(0)),
     };
     return prepareBlock(
         core,
@@ -1428,7 +1428,7 @@ export fn storvsc_build_report_luns(
     spec.cdb[0] = 0xa0;
     putBe32(spec.cdb[0..], 6, @intCast(allocation_size));
     spec.cdb_len = 12;
-    spec.direction = @intFromEnum(Direction.read);
+    spec.direction = @backingInt(Direction.read);
     spec.allow_short = 1;
     spec.path_id = path_id;
     spec.target_id = target_id;
@@ -1761,8 +1761,8 @@ fn completionPacket(
     scsi_status: u8,
     transfer: u32,
 ) [max_packet_size]u8 {
-    var packet = [_]u8{0} ** max_packet_size;
-    putLe32(packet[0..], 0, @intFromEnum(Operation.complete_io));
+    var packet = @as([max_packet_size]u8, @splat(0));
+    putLe32(packet[0..], 0, @backingInt(Operation.complete_io));
     putLe32(packet[0..], 8, status);
     packet[14] = srb_status;
     packet[15] = scsi_status;
@@ -1774,7 +1774,7 @@ fn completionPacket(
 fn expectTransmit(event: *const Event, operation: Operation) !void {
     try std.testing.expectEqual(EventKind.transmit, event.kind);
     try std.testing.expectEqual(
-        @intFromEnum(operation),
+        @backingInt(operation),
         getLe32(event.tx.packet[0..], 0),
     );
     try std.testing.expect(event.tx.transaction_id != 0);
@@ -1942,7 +1942,7 @@ test "REPORT LUNS construction and SRB addressing are exact" {
     try std.testing.expectEqual(@as(u8, 0xa0), spec.cdb[0]);
     try std.testing.expectEqual(@as(u8, 12), spec.cdb_len);
     try std.testing.expectEqual(
-        @as(u8, @intFromEnum(Direction.read)),
+        @as(u8, @backingInt(Direction.read)),
         spec.direction,
     );
     try std.testing.expectEqual(@as(u8, 1), spec.allow_short);
@@ -1992,7 +1992,7 @@ test "REPORT LUNS construction and SRB addressing are exact" {
 }
 
 test "REPORT LUNS parsing is bounded deterministic and fail closed" {
-    var data = [_]u8{0} ** report_luns_data_size;
+    var data = @as([report_luns_data_size]u8, @splat(0));
     var addresses: [report_luns_max]Address = undefined;
     var count: usize = 99;
     putBe32(&data, 0, 3 * report_lun_entry_size);
@@ -2034,7 +2034,7 @@ test "REPORT LUNS parsing is bounded deterministic and fail closed" {
     );
     try std.testing.expectEqual(@as(usize, 0), count);
 
-    data = [_]u8{0} ** report_luns_data_size;
+    data = @as([report_luns_data_size]u8, @splat(0));
     count = 99;
     try std.testing.expectEqual(
         @as(c_int, 0),
@@ -2119,7 +2119,7 @@ test "REPORT LUNS parsing is bounded deterministic and fail closed" {
         ),
     );
 
-    data = [_]u8{0} ** report_luns_data_size;
+    data = @as([report_luns_data_size]u8, @splat(0));
     putBe32(&data, 0, report_lun_entry_size);
     data[8] = 0x41;
     try std.testing.expectEqual(
@@ -2175,7 +2175,7 @@ test "REPORT LUNS parsing is bounded deterministic and fail closed" {
         ),
     );
 
-    data = [_]u8{0} ** report_luns_data_size;
+    data = @as([report_luns_data_size]u8, @splat(0));
     putBe32(&data, 0, 2 * report_lun_entry_size);
     data[9] = 9;
     data[16] = 0x40;
@@ -2414,9 +2414,9 @@ test "pool exhaustion reuse and generation bearing IDs are exact once" {
         .transfer_len = 0,
         .minimum_transfer = 0,
         .timeout_ns = 100,
-        .cdb = [_]u8{0} ** 16,
+        .cdb = @as([16]u8, @splat(0)),
         .cdb_len = 6,
-        .direction = @intFromEnum(Direction.none),
+        .direction = @backingInt(Direction.none),
         .allow_short = 0,
         .reserved = 0,
         .path_id = 0,
@@ -2489,9 +2489,9 @@ test "known malformed oversized and short completions finish deterministically" 
         .transfer_len = 8,
         .minimum_transfer = 8,
         .timeout_ns = 100,
-        .cdb = [_]u8{0} ** 16,
+        .cdb = @as([16]u8, @splat(0)),
         .cdb_len = 10,
-        .direction = @intFromEnum(Direction.read),
+        .direction = @backingInt(Direction.read),
         .allow_short = 0,
         .reserved = 0,
         .path_id = 0,
@@ -2558,9 +2558,9 @@ test "request completions accept sanctioned sizes and reject all others" {
         .transfer_len = 0,
         .minimum_transfer = 0,
         .timeout_ns = 100,
-        .cdb = [_]u8{0} ** 16,
+        .cdb = @as([16]u8, @splat(0)),
         .cdb_len = 6,
-        .direction = @intFromEnum(Direction.none),
+        .direction = @backingInt(Direction.none),
         .allow_short = 0,
         .reserved = 0,
         .path_id = 0,
@@ -2608,7 +2608,7 @@ test "request completions accept sanctioned sizes and reject all others" {
         &event,
     );
     _ = storvsc_core_prepare_scsi(&storage, &spec, 14, &tx);
-    var oversized = [_]u8{0} ** 65;
+    var oversized = @as([65]u8, @splat(0));
     for (packet, 0..) |byte, index|
         oversized[index] = byte;
     _ = storvsc_core_receive(
@@ -2678,9 +2678,9 @@ test "timeout reset and cancellation leave every request completable once" {
         .transfer_len = 0,
         .minimum_transfer = 0,
         .timeout_ns = 10,
-        .cdb = [_]u8{0} ** 16,
+        .cdb = @as([16]u8, @splat(0)),
         .cdb_len = 6,
-        .direction = @intFromEnum(Direction.none),
+        .direction = @backingInt(Direction.none),
         .allow_short = 0,
         .reserved = 0,
         .path_id = 0,
@@ -2737,9 +2737,9 @@ test "sense SRB SCSI and host status mapping is bounded" {
         .transfer_len = 0,
         .minimum_transfer = 0,
         .timeout_ns = 100,
-        .cdb = [_]u8{0} ** 16,
+        .cdb = @as([16]u8, @splat(0)),
         .cdb_len = 6,
-        .direction = @intFromEnum(Direction.none),
+        .direction = @backingInt(Direction.none),
         .allow_short = 0,
         .reserved = 0,
         .path_id = 0,
@@ -2810,13 +2810,13 @@ test "capacity inquiry and mode parsers reject arithmetic and layout edges" {
     var capacity: Capacity = undefined;
     var inquiry: Inquiry = undefined;
     var mode: Mode = undefined;
-    var data = [_]u8{0} ** 36;
+    var data = @as([36]u8, @splat(0));
     data[4] = 31;
     try std.testing.expectEqual(
         @as(c_int, 0),
         storvsc_parse_inquiry(&data, data.len, &inquiry),
     );
-    var long_inquiry = [_]u8{0} ** 96;
+    var long_inquiry = @as([96]u8, @splat(0));
     long_inquiry[4] = 0xff;
     try std.testing.expectEqual(
         @as(c_int, 0),
@@ -2851,7 +2851,7 @@ test "capacity inquiry and mode parsers reject arithmetic and layout edges" {
         storvsc_parse_inquiry(&data, data.len, &inquiry),
     );
 
-    var capacity10 = [_]u8{0} ** 8;
+    var capacity10 = @as([8]u8, @splat(0));
     putBe32(&capacity10, 0, 99);
     putBe32(&capacity10, 4, 512);
     try std.testing.expectEqual(
@@ -2866,7 +2866,7 @@ test "capacity inquiry and mode parsers reject arithmetic and layout edges" {
     );
     try std.testing.expectEqual(@as(u8, 1), capacity.needs_capacity16);
 
-    var capacity16 = [_]u8{0} ** 32;
+    var capacity16 = @as([32]u8, @splat(0));
     putBe64(&capacity16, 0, 0x1_0000_0000);
     putBe32(&capacity16, 8, 4096);
     try std.testing.expectEqual(
@@ -2913,19 +2913,19 @@ test "per-LUN media controls bounds and access independently" {
         .sectors = 1000,
         .sector_size = 512,
         .read_only = 0,
-        .reserved = [_]u8{0} ** 3,
+        .reserved = @as([3]u8, @splat(0)),
     };
     const large: Media = .{
         .sectors = 2000,
         .sector_size = 512,
         .read_only = 0,
-        .reserved = [_]u8{0} ** 3,
+        .reserved = @as([3]u8, @splat(0)),
     };
     const large_read_only: Media = .{
         .sectors = 2000,
         .sector_size = 512,
         .read_only = 1,
-        .reserved = [_]u8{0} ** 3,
+        .reserved = @as([3]u8, @splat(0)),
     };
 
     _ = storvsc_core_initialize(&storage, 1, 4);
@@ -3047,7 +3047,7 @@ test "guarded CDB selector supports explicit ten and sixteen byte commands" {
         .sectors = @as(u64, std.math.maxInt(u32)) + 2,
         .sector_size = 512,
         .read_only = 0,
-        .reserved = [_]u8{0} ** 3,
+        .reserved = @as([3]u8, @splat(0)),
     };
 
     _ = storvsc_core_initialize(&storage, 1, 4);
@@ -3149,7 +3149,7 @@ fn appendVpdDescriptor(
 }
 
 test "VPD page 83 parsing is deterministic bounded and fail closed" {
-    var data = [_]u8{0} ** 128;
+    var data = @as([128]u8, @splat(0));
     var identity: VpdId = undefined;
     var offset: usize = 4;
     const t10 = [_]u8{ 'M', 'S', 'F', 'T', 'D', 'I', 'S', 'K' };
@@ -3180,7 +3180,7 @@ test "VPD page 83 parsing is deterministic bounded and fail closed" {
         identity.bytes[0..identity.length],
     );
 
-    data = [_]u8{0} ** 128;
+    data = @as([128]u8, @splat(0));
     data[1] = 0x83;
     offset = 4;
     appendVpdDescriptor(&data, &offset, 1, 0, 4, &naa_low);
@@ -3195,7 +3195,7 @@ test "VPD page 83 parsing is deterministic bounded and fail closed" {
         storvsc_parse_vpd83(&data, offset, &identity),
     );
 
-    data = [_]u8{0} ** 128;
+    data = @as([128]u8, @splat(0));
     data[1] = 0x83;
     offset = 4;
     appendVpdDescriptor(&data, &offset, 1, 0, 3, &[_]u8{ 0x50, 1 });
@@ -3205,7 +3205,7 @@ test "VPD page 83 parsing is deterministic bounded and fail closed" {
         storvsc_parse_vpd83(&data, offset, &identity),
     );
 
-    data = [_]u8{0} ** 128;
+    data = @as([128]u8, @splat(0));
     data[1] = 0x83;
     offset = 4;
     appendVpdDescriptor(&data, &offset, 2, 0, 3, &naa_low);
@@ -3216,7 +3216,7 @@ test "VPD page 83 parsing is deterministic bounded and fail closed" {
         storvsc_parse_vpd83(&data, offset, &identity),
     );
     try std.testing.expectEqual(@as(u8, 1), identity.code_set);
-    data = [_]u8{0} ** 128;
+    data = @as([128]u8, @splat(0));
     data[1] = 0x83;
     offset = 4;
     appendVpdDescriptor(&data, &offset, 1, 0, 3, &naa_low);
@@ -3233,7 +3233,7 @@ test "VPD page 83 parsing is deterministic bounded and fail closed" {
         identity.bytes[0..identity.length],
     );
 
-    data = [_]u8{0} ** 128;
+    data = @as([128]u8, @splat(0));
     data[1] = 0x83;
     putBe16(&data, 2, 4);
     data[4] = 1;
@@ -3249,7 +3249,7 @@ test "VPD page 83 parsing is deterministic bounded and fail closed" {
         storvsc_parse_vpd83(&data, 8, &identity),
     );
 
-    data = [_]u8{0} ** 128;
+    data = @as([128]u8, @splat(0));
     data[1] = 0x83;
     putBe16(&data, 2, 69);
     data[4] = 3;
@@ -3417,11 +3417,11 @@ test "unsolicited remove enumerate and oversized packets are separated" {
     var storage: [core_storage_size]u8 align(core_storage_align) = undefined;
     var event: Event = undefined;
     _ = storvsc_core_initialize(&storage, 1, 2);
-    var packet = [_]u8{0} ** 65;
-    putLe32(packet[0..], 0, @intFromEnum(Operation.remove_device));
+    var packet = @as([65]u8, @splat(0));
+    putLe32(packet[0..], 0, @backingInt(Operation.remove_device));
     _ = storvsc_core_receive(&storage, 0, &packet, 4, 0, &event);
     try std.testing.expectEqual(EventKind.remove_device, event.kind);
-    putLe32(packet[0..], 0, @intFromEnum(Operation.enumerate_bus));
+    putLe32(packet[0..], 0, @backingInt(Operation.enumerate_bus));
     _ = storvsc_core_receive(&storage, 0, &packet, 4, 0, &event);
     try std.testing.expectEqual(EventKind.enumerate_bus, event.kind);
     _ = storvsc_core_receive(&storage, 0, &packet, 65, 0, &event);

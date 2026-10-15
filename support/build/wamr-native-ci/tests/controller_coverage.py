@@ -57,7 +57,7 @@ ADAPTER_CLASSES = {
     "NativeRecordBridge": ("retained-live-handoff-public-owner", 37),
     "Contract": ("retained-controller-compatibility-witness", 6),
     "PhysicalPackage": ("retained-physical-package-owner", 4),
-    "Evidence": ("retained-mixed-custody-supervision-public-owner", 93),
+    "Evidence": ("retained-mixed-custody-supervision-public-owner", 98),
 }
 
 

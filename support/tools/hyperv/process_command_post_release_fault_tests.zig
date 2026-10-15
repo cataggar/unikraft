@@ -66,11 +66,7 @@ test "post-release faults clean ordinary setsid and double-fork trees" {
             var fixture = try support.Fixture.init();
             defer fixture.deinit();
             var marker_buffer: [96:0]u8 = undefined;
-            const marker = try std.fmt.bufPrintZ(
-                &marker_buffer,
-                "{s}-{s}",
-                .{ mode, @tagName(case.fault) },
-            );
+            const marker = try std.mem.printSentinel(&marker_buffer, "{s}-{s}", .{ mode, @tagName(case.fault) }, 0);
             var fault: process.CommandPostReleaseTestState = .{
                 .fault = case.fault,
             };
@@ -134,7 +130,7 @@ test "unexpected post-release unwind is recovered by the cleanup guard" {
         var fixture = try support.Fixture.init();
         defer fixture.deinit();
         var marker_buffer: [64:0]u8 = undefined;
-        const marker = try std.fmt.bufPrintZ(&marker_buffer, "{s}-unwind", .{mode});
+        const marker = try std.mem.printSentinel(&marker_buffer, "{s}-unwind", .{mode}, 0);
         var fault: process.CommandPostReleaseTestState = .{ .fault = .unwind };
         try testing.expectError(
             error.PostReleaseTestFailure,

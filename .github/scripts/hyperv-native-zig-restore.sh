@@ -26,15 +26,20 @@ for attempt in 1 2 3; do
   mkdir -m 700 -- "${stage}"
   mkdir -m 700 -- "${stage}/global" "${stage}/global/tmp"
   cp -- "${root}/build.zig" "${root}/build.zig.zon" "${stage}/"
-  if timeout --kill-after=5 180 zig build \
+  if timeout --kill-after=5 180 env \
+      ZIG_GLOBAL_CACHE_DIR="${stage}/global" \
+      ZIG_LOCAL_PKG_DIR="${stage}/zig-pkg" \
+      zig build \
       --build-file "${stage}/build.zig" --fetch=all -j2 \
-      --cache-dir "${stage}/cache" --global-cache-dir "${stage}/global" \
+      --cache-dir "${stage}/cache" \
       > "${stage}/fetch.log" 2>&1; then
     cat -- "${stage}/fetch.log"
     if [[ ! -d "${stage}/zig-pkg" || -L "${stage}/zig-pkg" ]]; then
       echo "Native Zig restoration refused: missing verified packages." >&2
       exit 1
     fi
+    find "${stage}/zig-pkg" -type d -exec chmod 0700 {} +
+    find "${stage}/zig-pkg" -type f -exec chmod 0600 {} +
     mv --no-clobber -T -- "${stage}/zig-pkg" "${root}/zig-pkg"
     if [[ -e "${stage}/zig-pkg" ]]; then
       echo "Native Zig restoration refused: package destination occupied." >&2

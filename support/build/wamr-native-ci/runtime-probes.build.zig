@@ -5,7 +5,7 @@
 const std = @import("std");
 const foundation = @import("authority.build.zig");
 
-fn imports(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, options: ?*std.Build.Module) void {
+fn imports(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, options: ?*std.Build.Module) void {
     const core = b.createModule(.{ .root_source_file = b.path("../../tools/hyperv/core.zig"), .target = target, .optimize = optimize });
     if (target.result.cpu.arch == .x86_64) core.addAssemblyFile(b.path("../../tools/hyperv/sha256_clear_upper.S"));
     const serial = b.createModule(.{
@@ -30,7 +30,7 @@ fn imports(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedT
         .imports = &.{
             .{ .name = "hyperv_core", .module = core },
             .{ .name = "wamr_log_validator", .module = validator },
-            .{ .name = "controller_source_closure", .module = b.createModule(.{ .root_source_file = b.path("../../controller_source_closure.zig"), .target = target, .optimize = optimize }) },
+            .{ .name = "controller_source_closure", .module = foundation.sourceClosureModule(b, target, optimize) },
             .{ .name = "handoff_contracts", .module = b.createModule(.{
                 .root_source_file = b.path("handoff/contracts.zig"),
                 .target = target,
@@ -49,7 +49,6 @@ fn imports(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedT
         },
     });
     foundation.addImports(b, module, target, optimize, core, serial, validator, handoff);
-    module.addImport("producer_elf", b.createModule(.{ .root_source_file = b.path("../postprocess-elf.zig"), .target = target, .optimize = optimize }));
     if (options) |value| {
         module.addImport("test_options", value);
         handoff.addImport("test_options", value);
@@ -59,8 +58,7 @@ fn imports(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedT
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const fixture_root = b.option([]const u8, "test-root", "Existing private absolute source-only fixture root") orelse @panic("-Dtest-root is required");
-    if (!std.fs.path.isAbsolute(fixture_root)) @panic("fixture root must be absolute");
+    const fixture_root = foundation.defaultFixtureRoot(b);
     const fixture = b.addExecutable(.{
         .name = "authority-runtime-probe-fault-fixture",
         .root_module = b.createModule(.{

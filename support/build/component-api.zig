@@ -331,9 +331,11 @@ pub const TargetZigObject = struct {
     root_source_file: []const u8,
     output: []const u8,
     condition: Condition = .always,
-    optimize: ?std.builtin.OptimizeMode = null,
+    optimize: ?std.lang.Optimize = null,
     includes: []const Include = &.{},
     c_macros: []const CMacro = &.{},
+    /// Build-time C translation imported by this Zig source.
+    c_translation: ?CTranslation = null,
     dependencies: []const []const u8 = &.{},
     pic: bool = false,
     /// Restrict code generation to registers saved by the IRQ entry.
@@ -343,6 +345,11 @@ pub const TargetZigObject = struct {
     pub const CMacro = struct {
         name: []const u8,
         value: []const u8,
+    };
+
+    pub const CTranslation = struct {
+        import_name: []const u8 = "config",
+        headers: []const []const u8,
     };
 };
 
@@ -972,6 +979,24 @@ pub const BuildContext = struct {
                             .{ library.name, object.name },
                         );
                         return error.InvalidModel;
+                    }
+                }
+                if (object.c_translation) |translation| {
+                    if (translation.import_name.len == 0 or translation.headers.len == 0) {
+                        try self.setDiagnostic(
+                            "library '{s}' target Zig object '{s}' has an empty C translation import or header list",
+                            .{ library.name, object.name },
+                        );
+                        return error.InvalidModel;
+                    }
+                    for (translation.headers) |header| {
+                        if (header.len == 0) {
+                            try self.setDiagnostic(
+                                "library '{s}' target Zig object '{s}' has an empty C translation header",
+                                .{ library.name, object.name },
+                            );
+                            return error.InvalidModel;
+                        }
                     }
                 }
             }
@@ -1750,7 +1775,7 @@ pub const BuildContext = struct {
     }
 
     fn setDiagnostic(self: *BuildContext, comptime format: []const u8, args: anytype) error{OutOfMemory}!void {
-        self.diagnostic = std.fmt.allocPrint(self.arena.allocator(), format, args) catch
+        self.diagnostic = self.arena.allocator().print(format, args) catch
             return error.OutOfMemory;
     }
 };
@@ -2122,6 +2147,10 @@ fn copyTargetZigObjects(
             .optimize = object.optimize,
             .includes = try copyIncludes(allocator, object.includes),
             .c_macros = macros,
+            .c_translation = if (object.c_translation) |translation| .{
+                .import_name = try allocator.dupe(u8, translation.import_name),
+                .headers = try copyStringList(allocator, translation.headers),
+            } else null,
             .dependencies = try copyStringList(allocator, object.dependencies),
             .pic = object.pic,
             .isr = object.isr,
@@ -2552,6 +2581,35 @@ fn testContextWith(config: ConfigQuery, toolchain: Toolchain) !BuildContext {
 
 fn testContext() !BuildContext {
     return testContextWithConfig(testConfig());
+}
+
+test "target C translation metadata owns caller storage" {
+    var context = try testContext();
+    defer context.deinit();
+    var name = "config".*;
+    var header = "uk/bits/config.h".*;
+    try context.registerLibrary(.{
+        .name = "libtranslated",
+        .origin = .{ .internal = .library },
+        .layout = .{ .ordinary = .{ .build_subdir = "libtranslated" } },
+        .target_zig_objects = &.{.{
+            .name = "translated",
+            .root_source_file = "/src/unikraft/translated.zig",
+            .output = "/src/app/build/translated.o",
+            .c_translation = .{ .import_name = &name, .headers = &.{&header} },
+        }},
+    });
+    @memset(&name, 'x');
+    @memset(&header, 'x');
+    try context.registerPlatform(.{
+        .name = "kvm",
+        .origin = .{ .internal = .platform },
+        .enable = .{ .config_enabled = "CONFIG_PLAT_KVM" },
+    });
+    const graph = try context.finalize();
+    const translation = graph.libraries[0].target_zig_objects[0].c_translation.?;
+    try std.testing.expectEqualStrings("config", translation.import_name);
+    try std.testing.expectEqualStrings("uk/bits/config.h", translation.headers[0]);
 }
 
 test "ukboot variants retain registration order" {

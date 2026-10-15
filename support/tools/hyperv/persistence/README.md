@@ -9,7 +9,7 @@ and unchanged. `evidence.EvidenceInput` / `evidence.parseWorkload` expose only
 the pure serial identity/geometry parser for the direct lane; they carry no authority
 and cannot turn a synthetic or nested receipt into accepted persistence.
 
-This standalone Zig 0.16 package implements the #89 two-boot execution and
+This standalone Zig 0.17.0 package implements the #89 two-boot execution and
 cleanup state machine. It does **not** constitute real boot, upload, or
 persistence acceptance. No production preparation/COMPLETED-preflight loader
 or approved credential/route selection is provided by this package.
@@ -266,21 +266,39 @@ No historical private artifacts, original seed, image, credential or cloud
 operation is needed or permitted.
 
 Use the pinned manifest, restore copied manifests into scoped scratch with
-`--fetch=all`, then build with `--system SCRATCH/restore/zig-pkg`. Set HOME,
+`--fetch=all --pkg-dir SCRATCH/restore/zig-pkg`, then build with
+`--system SCRATCH/restore/zig-pkg`. Each restore binds its own depot instead
+of inheriting another restore's `ZIG_LOCAL_PKG_DIR`. Set HOME,
 TMPDIR and Zig/XDG caches beneath `.d/zig-migration-persistence`. With an
 existing owner-only absolute fixture directory:
 
 ```text
-zig build --build-file support/tools/hyperv/persistence/build.zig \
+ZIG_GLOBAL_CACHE_DIR=SCRATCH/global-cache env -u ZIG_LOCAL_PKG_DIR zig build --build-file support/tools/hyperv/persistence/build.zig \
   --system SCRATCH/restore/zig-pkg \
-  --cache-dir SCRATCH/cache --global-cache-dir SCRATCH/global-cache \
+  --cache-dir SCRATCH/cache \
   --prefix SCRATCH/outputs/debug -Dtest-root=SCRATCH/fixtures \
   -j2 test test-arm install
 ```
 
-Repeat with `-Doptimize=ReleaseSafe` and a distinct output prefix. No new SDK
+Repeat with `-Doptimize=safe` and a distinct output prefix. No new SDK
 surface, dependency, tool installation, root build, CI, producer-pin or
 legacy-controller change is required by this package.
+
+Zig 0.17 separates build configuration from the maker process. The configured
+build record keeps its exact v1 fields, but maker-global test seed, compiler-rt
+optimization and debug-incremental settings are not exposed to the configurer
+and are recorded as `null`, never as an observed false/default. Build-ID and
+incremental fields describe explicit `Compile` settings only; maker-global
+defaults are not claimed. The existing null semantics, observed parent builtin
+record, full source envelopes and ELF/proof revalidation remain unchanged.
+Strip-equivalence, strip-proof and build-evidence test steps require an explicit
+private `-Dtest-root`; none defaults to the source tree or build cache. Generated
+0.17 artifact option paths are resolved against the observed build cwd before
+private fixture execution, retaining absolute-path and no-follow checks.
+Capture arguments also normalize only configured graph-owned source paths
+against the observed build cwd. Incoming collector arguments still reject
+relative paths and dot components; source custody still opens without following
+symlinks.
 
 ### Default-off exact parent build evidence
 
@@ -542,13 +560,14 @@ mkdir -p "${TRIAL_ROOT:?}"/{home,tmp,global}
 chmod 700 "$TRIAL_ROOT"
 export HOME="$TRIAL_ROOT/home" TMPDIR="$TRIAL_ROOT/tmp"
 export XDG_CACHE_HOME="$TRIAL_ROOT/global"
+export ZIG_GLOBAL_CACHE_DIR="$TRIAL_ROOT/global"
 filters=(
   'real native leaf workers deliver bound private results and exact serial model'
   'partial native page checkpoint survives killed delivery without claiming full upload'
   'cleanup recovery requires bound parent reaping proof and never replays mutations'
   'failed native creation delivery retains UUID and refuses cleanup replacement'
 )
-for mode in Debug ReleaseSafe; do
+for mode in debug safe; do
   for timing in false true; do
     index=0
     for filter in "${filters[@]}"; do
@@ -556,9 +575,9 @@ for mode in Debug ReleaseSafe; do
       mkdir -p "$run/fixtures"
       chmod 700 "$run" "$run/fixtures"
       status=0
-      "$ZIG" build --build-file support/tools/hyperv/persistence/build.zig \
+      env -u ZIG_LOCAL_PKG_DIR "$ZIG" build --build-file support/tools/hyperv/persistence/build.zig \
         --system "${PERSISTENCE_PACKAGES:?}" \
-        --cache-dir "$run/cache" --global-cache-dir "$TRIAL_ROOT/global" \
+        --cache-dir "$run/cache" \
         --prefix "$run/out" -Dtest-root="$run/fixtures" \
         -Dtest-filter="$filter" -Doptimize="$mode" \
         -Dpersistence-timing="$timing" -j2 test --summary all \
@@ -678,21 +697,29 @@ remains the same 34 cases.
 
 ```bash
 umask 077
-"$ZIG" build --build-file support/tools/hyperv/persistence/build.zig \
+export ZIG_GLOBAL_CACHE_DIR="$SCRATCH/global"
+env -u ZIG_LOCAL_PKG_DIR "$ZIG" build --build-file support/tools/hyperv/persistence/build.zig \
   --system "$PERSISTENCE_PACKAGES" --cache-dir "$SCRATCH/cache" \
-  --global-cache-dir "$SCRATCH/global" --prefix "$SCRATCH/out" \
-  -Dtest-root="$SCRATCH/fixtures" -Doptimize=Debug \
+  --prefix "$SCRATCH/out" \
+  -Dtest-root="$SCRATCH/fixtures" -Doptimize=debug \
   -Dstrip-fixture-debug=true -Dfixture-objcopy="$LLVM_OBJCOPY" \
   -j2 test-strip-equivalence test-strip-proof --summary all
 bash support/tools/hyperv/persistence/fixture-strip-build-tests.sh \
-  "$ZIG" "$LLVM_OBJCOPY" "$PERSISTENCE_PACKAGES" "$PRIVATE_TEST_ROOT"
+  "$ZIG" "$LLVM_OBJCOPY" "$PERSISTENCE_PACKAGES" "$PRIVATE_TEST_ROOT" \
+  file_offset_relayout
 ```
 
-The Bash runner requires a new existing owner-only root. It uses the real
+The Bash runner requires a new existing owner-only root. Its optional fifth
+argument selects the existing layout policy before any build; omission keeps
+`identical_program_headers`. It never falls back from a refused layout.
+Each named case gets a distinct private fixture child, so cached binaries do
+not substitute for fresh native-case execution. It uses the real
 build/run graph to cover quiet raw selection, invalid flags, qualified native
 execution, create-only report refusal on a cache hit, uncached verification
 with no report, namespace-schema refusal, invalid tool output and cached
-candidate tampering. Deliberately invalid shell payloads would leave a marker
+candidate tampering. It requires the selected native run's exact one-case
+result, not an aggregate summary that also counts the shared SHA tests.
+Deliberately invalid shell payloads would leave a marker
 if incorrectly executed; both rejection paths must leave none. Only the
 runner's candidate cache copy is corrupted, after retaining full good raw/
 candidate copies. The selected raw is never modified, and a final default-off
@@ -700,7 +727,7 @@ run remains independent of the rejected candidate.
 
 #### Parent-owned native x64 qualification recipe
 
-After independent review, use the already-approved native Zig 0.16, exact
+After independent review, use the already-approved native Zig 0.17.0, exact
 persistence SDKs and pinned LLVM 22.1.8. Set the absolute variables below and a
 new private `QUALIFICATION_ROOT`; the parent separately owns VM/readiness,
 source/tool provenance and disk bindings. Choose `LAYOUT_POLICY` **before**
@@ -714,8 +741,9 @@ root="${QUALIFICATION_ROOT:?}"
 mkdir -m 700 -- "$root"
 mkdir -- "$root/home" "$root/tmp" "$root/global"
 export HOME="$root/home" TMPDIR="$root/tmp" XDG_CACHE_HOME="$root/global"
+export ZIG_GLOBAL_CACHE_DIR="$root/global"
 "${ZIG:?}" version > "$root/zig.version"
-test "$(tr -d '\n' < "$root/zig.version")" = 0.16.0
+test "$(tr -d '\n' < "$root/zig.version")" = 0.17.0
 "${LLVM_OBJCOPY:?}" --version > "$root/objcopy.version"
 awk -f support/tools/hyperv/preparation/ci-objcopy-version.awk "$root/objcopy.version"
 sha256sum -- "$LLVM_OBJCOPY" > "$root/objcopy.sha256"
@@ -732,7 +760,7 @@ filters=(
   'cleanup recovery requires bound parent reaping proof and never replays mutations'
   'failed native creation delivery retains UUID and refuses cleanup replacement'
 )
-for mode in Debug ReleaseSafe; do
+for mode in debug safe; do
   for variant in raw qualified; do
     index=0
     for filter in "${filters[@]}"; do
@@ -744,9 +772,9 @@ for mode in Debug ReleaseSafe; do
           "${layout[@]}" "-Dstrip-fixture-report=$run/qualification.json")
       fi
       status=0
-      "$ZIG" build --build-file support/tools/hyperv/persistence/build.zig \
+      env -u ZIG_LOCAL_PKG_DIR "$ZIG" build --build-file support/tools/hyperv/persistence/build.zig \
         --system "${PERSISTENCE_PACKAGES:?}" --cache-dir "$run/cache" \
-        --global-cache-dir "$root/global" --prefix "$run/out" \
+        --prefix "$run/out" \
         -Dtest-root="$run/fixtures" -Dtest-filter="$filter" \
         -Doptimize="$mode" -Dpersistence-timing=true "${selection[@]}" \
         -j2 test --summary all > "$run/engine.log" 2>&1 || status=$?

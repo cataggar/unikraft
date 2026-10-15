@@ -43,7 +43,7 @@ pub const Authority = struct {
 
     pub fn groupPath(self: Authority, allocator: std.mem.Allocator) ![]u8 {
         try self.validate();
-        return std.fmt.allocPrint(allocator, "/subscriptions/{s}/resourceGroups/{s}", .{ self.subscription, self.group });
+        return allocator.print("/subscriptions/{s}/resourceGroups/{s}", .{ self.subscription, self.group });
     }
 };
 
@@ -125,13 +125,13 @@ pub const Ref = struct {
             const vnet = self.parent orelse return error.InvalidName;
             try name(vnet);
             if (self.gallery_image != null) return error.InvalidName;
-            return std.fmt.allocPrint(allocator, "{s}/providers/Microsoft.Network/virtualNetworks/{s}/subnets/{s}", .{ group, vnet, self.name });
+            return allocator.print("{s}/providers/Microsoft.Network/virtualNetworks/{s}/subnets/{s}", .{ group, vnet, self.name });
         }
         if (self.kind == .gallery_image) {
             const gallery = self.parent orelse return error.InvalidName;
             try name(gallery);
             if (self.gallery_image != null) return error.InvalidName;
-            return std.fmt.allocPrint(allocator, "{s}/providers/Microsoft.Compute/galleries/{s}/images/{s}", .{ group, gallery, self.name });
+            return allocator.print("{s}/providers/Microsoft.Compute/galleries/{s}/images/{s}", .{ group, gallery, self.name });
         }
         if (self.kind == .gallery_version) {
             const gallery = self.parent orelse return error.InvalidName;
@@ -139,10 +139,10 @@ pub const Ref = struct {
             try name(gallery);
             try name(image);
             if (std.ascii.eqlIgnoreCase(self.name, "latest")) return error.UnpinnedImage;
-            return std.fmt.allocPrint(allocator, "{s}/providers/Microsoft.Compute/galleries/{s}/images/{s}/versions/{s}", .{ group, gallery, image, self.name });
+            return allocator.print("{s}/providers/Microsoft.Compute/galleries/{s}/images/{s}/versions/{s}", .{ group, gallery, image, self.name });
         }
         if (self.parent != null or self.gallery_image != null) return error.InvalidName;
-        return std.fmt.allocPrint(allocator, "{s}/providers/{s}/{s}/{s}", .{ group, self.kind.provider(), self.kind.resourceType(), self.name });
+        return allocator.print("{s}/providers/{s}/{s}/{s}", .{ group, self.kind.provider(), self.kind.resourceType(), self.name });
     }
 
     pub fn requireId(self: Ref, allocator: std.mem.Allocator, authority: Authority, raw: []const u8) !void {
@@ -264,5 +264,5 @@ pub fn continuationFiltered(allocator: std.mem.Allocator, original_path: []const
     try queryPolicy(path, version, true, if (filter) |expected| .{ .allocator = allocator, .expected = expected } else null, false);
     const end = std.mem.indexOfScalar(u8, path, '?').?;
     if (!std.ascii.eqlIgnoreCase(path[0..end], original_path)) return error.ScopeMismatch;
-    return std.fmt.allocPrint(allocator, "{s}{s}", .{ arm_host, path });
+    return allocator.print("{s}{s}", .{ arm_host, path });
 }

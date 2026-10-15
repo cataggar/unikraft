@@ -77,7 +77,7 @@ class HistoricalControllerFixture(unittest.TestCase):
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
             suite = unittest.defaultTestLoader.loadTestsFromModule(module)
-            self.assertEqual(suite.countTestCases(), 150)
+            self.assertEqual(suite.countTestCases(), 155)
             native = unittest.defaultTestLoader.loadTestsFromTestCase(
                 module.NativeAcquisitionFixtures)
             self.assertEqual(native.countTestCases(), 10)

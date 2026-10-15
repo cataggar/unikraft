@@ -238,7 +238,7 @@ test "private fixture stages genuine shared Python before native tool custody" {
     const io = std.testing.io;
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "private-python-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("private-python-{d}", .{std.os.linux.getpid()});
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("private Python fixture cleanup failed");
     const root = try parent.openDir(io, name, .{ .iterate = true });
@@ -314,7 +314,7 @@ test "build command table has closed roles, order, deadlines and native executab
         .package_tool = "/package",
         .validator = "/validator",
         .supervisor_fixture = "/supervisor-fixture",
-        .tools = [_][]const u8{"/tool"} ** controller.input_custody.host_tools.len,
+        .tools = @as([controller.input_custody.host_tools.len][]const u8, @splat("/tool")),
     }).get("tool:sh"));
 }
 
@@ -442,7 +442,7 @@ fn handoffInspectFixtures() !void {
 
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "handoff-inspect-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("handoff-inspect-{d}", .{std.os.linux.getpid()});
     defer a.free(name);
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("handoff inspect fixture cleanup failed");
@@ -516,17 +516,17 @@ fn handoffInspectFixtures() !void {
         .validator = bound_tool,
         .supervisor_fixture = bound_tool,
         .efi = efi,
-        .tools = [_][]const u8{bound_tool} ** controller.input_custody.host_tools.len,
+        .tools = @as([controller.input_custody.host_tools.len][]const u8, @splat(bound_tool)),
     };
     const sample = controller.accepted_run.PinnedInput{
         .role = "",
         .path = "",
-        .snapshot = .{ .bytes = 1, .sha256 = [_]u8{'0'} ** 64, .metadata = [_]i128{0} ** 9 },
+        .snapshot = .{ .bytes = 1, .sha256 = @as([64]u8, @splat('0')), .metadata = @as([9]i128, @splat(0)) },
     };
     var pinned: [controller.input_custody.host_tools.len + 6]controller.accepted_run.PinnedInput = undefined;
     for (controller.input_custody.host_tools, 0..) |tool, i| {
         pinned[i] = sample;
-        pinned[i].role = try std.fmt.allocPrint(accepted.arena.allocator(), "tool:{s}", .{tool});
+        pinned[i].role = try accepted.arena.allocator().print("tool:{s}", .{tool});
         pinned[i].path = bound_tool;
     }
     const additional = [_]struct { role: []const u8, path: []const u8 }{
@@ -616,7 +616,7 @@ fn handoffInspectFixtures() !void {
     const python_supervisor_json = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{ .metadata = python_supervisor_record.metadata, .sha256 = python_supervisor_record.sha256 }, .{}), .{ .parse_numbers = false });
     var start_files = std.json.Value{ .object = .empty };
     for (controller.input_custody.host_tools) |tool|
-        try start_files.object.put(a, try std.fmt.allocPrint(a, "tool:{s}", .{tool}), tool_json);
+        try start_files.object.put(a, try a.print("tool:{s}", .{tool}), tool_json);
     try start_files.object.put(a, "command-supervisor", supervisor_json);
     const build_start = try controller.records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, .{ .consumer_inputs = .{ .files = start_files } }, .{}));
     try writeFixtureFile(io, source_evidence, "build-start.json", build_start);
@@ -669,7 +669,7 @@ fn handoffInspectFixtures() !void {
     _ = try source_evidence.deleteFile(io, "build-start.json");
     var python_start_files = std.json.Value{ .object = .empty };
     for (controller.input_custody.host_tools) |tool|
-        try python_start_files.object.put(a, try std.fmt.allocPrint(a, "tool:{s}", .{tool}), tool_json);
+        try python_start_files.object.put(a, try a.print("tool:{s}", .{tool}), tool_json);
     try python_start_files.object.put(a, "command-supervisor", python_supervisor_json);
     const python_build_start = try controller.records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, .{ .consumer_inputs = .{ .files = python_start_files } }, .{}));
     try writeFixtureFile(io, source_evidence, "build-start.json", python_build_start);
@@ -770,7 +770,7 @@ fn handoffInspectFixtures() !void {
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), validator_plan.output_limit);
     try std.testing.expectEqualStrings(
         try std.fs.path.join(a, &.{ output, "public-source/tools" }),
-        try plan.path(a, validator_plan.argv[9], roots),
+        try plan.path(a, validator_plan.argv[7], roots),
     );
     const env = try plan.environment(a, .@"public-validator-build");
     defer plan.freeEnvironment(a, env);
@@ -851,9 +851,9 @@ test "six boot modes bind exact image, APIC flags, validator and command budgets
         try std.testing.expectEqual(@as(usize, 64 * 1024), selected.output_limit);
         try std.testing.expectEqualStrings("input:local_boot_tool", selected.executable);
         try std.testing.expectEqualStrings("input:local_boot_tool", selected.argv[0].path.role);
-        const image_path = try std.fmt.allocPrint(a, "package/{s}", .{plan.bootImage(mode)});
+        const image_path = try a.print("package/{s}", .{plan.bootImage(mode)});
         defer a.free(image_path);
-        const slot_path = try std.fmt.allocPrint(a, "boot-{s}", .{@tagName(mode)});
+        const slot_path = try a.print("boot-{s}", .{@tagName(mode)});
         defer a.free(slot_path);
         try std.testing.expectEqualStrings(image_path, selected.argv[2].path.relative);
         try std.testing.expectEqualStrings(slot_path, selected.argv[10].path.relative);
@@ -904,8 +904,7 @@ test "six boot modes bind exact image, APIC flags, validator and command budgets
 test "exact bounded validator JSON rejects every malformed tiny result" {
     const a = std.testing.allocator;
     const raw_hash = std.fmt.bytesToHex(controller.records.fileIdentity("abc"), .lower);
-    const valid = try std.fmt.allocPrint(
-        a,
+    const valid = try a.print(
         "{{\"compute\":{{\"answer\":42}},\"mode\":\"tiny\",\"raw_serial_bytes\":3,\"raw_serial_sha256\":\"{s}\",\"schema\":\"uk.wamr.log-validation\",\"schema_version\":1}}\n",
         .{&raw_hash},
     );
@@ -939,7 +938,7 @@ test "native diagnostics retain only bounded allowlisted observations and never 
     const io = std.testing.io;
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "boot-diagnostics-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("boot-diagnostics-{d}", .{std.os.linux.getpid()});
     defer a.free(name);
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("diagnostics fixture cleanup failed");
@@ -1012,7 +1011,7 @@ test "result refuses unpinned evidence files and directories before publication"
     const io = std.testing.io;
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "result-evidence-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("result-evidence-{d}", .{std.os.linux.getpid()});
     defer a.free(name);
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("result evidence fixture cleanup failed");
@@ -1067,7 +1066,7 @@ test "boot recheck uses transient scratch and refuses changed pinned evidence wi
     const io = std.testing.io;
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "boot-recheck-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("boot-recheck-{d}", .{std.os.linux.getpid()});
     defer a.free(name);
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("boot recheck fixture cleanup failed");
@@ -1125,7 +1124,7 @@ test "occupied build output and boot slots refuse without erasing prior state" {
     const io = std.testing.io;
     const parent = try core.private_files.Directory.open(io, options.fixture_root);
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "native-prior-output-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("native-prior-output-{d}", .{std.os.linux.getpid()});
     try parent.dir.createDir(io, name, .fromMode(0o700));
     defer parent.dir.deleteTree(io, name) catch @panic("prior-output cleanup failed");
     const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
@@ -1175,7 +1174,7 @@ test "changed raw QCOW2 and derived VHD images never publish compute evidence" {
     const io = std.testing.io;
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "compute-image-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("compute-image-{d}", .{std.os.linux.getpid()});
     defer a.free(name);
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("compute image fixture cleanup failed");
@@ -1213,8 +1212,8 @@ test "changed raw QCOW2 and derived VHD images never publish compute evidence" {
     defer ctx.pinned.deinit();
     const source = "original-image";
     const hash = std.fmt.bytesToHex(controller.records.fileIdentity(source), .lower);
-    ctx.package = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), try std.fmt.allocPrint(arena.allocator(), "{{\"image\":{{\"raw\":{{\"sha256\":\"{s}\"}}}}}}", .{&hash}), .{});
-    const output = try std.fmt.allocPrint(arena.allocator(), "{{\"output\":{{\"sha256\":\"{s}\"}}}}", .{&hash});
+    ctx.package = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), try arena.allocator().print("{{\"image\":{{\"raw\":{{\"sha256\":\"{s}\"}}}}}}", .{&hash}), .{});
+    const output = try arena.allocator().print("{{\"output\":{{\"sha256\":\"{s}\"}}}}", .{&hash});
     ctx.finalization = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), output, .{});
     ctx.derivation = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), output, .{});
     for ([_]usize{ 0, 2, 4 }, [_][]const u8{
@@ -1277,10 +1276,10 @@ test "transport encoder preserves full 3 MiB and 8 MiB streams and refuses true 
 
 test "native tiny build identity refuses development optional JIT and altered file sets" {
     const a = std.testing.allocator;
-    const identity = try std.fmt.allocPrint(a,
-        \\{{"wamr_revision":"{s}","compiler_profile":"unikraft-x86_64","zig_version":"0.16.0","minimal_wasi":false,"development_only":false,"variant":"tiny","jit_mode":null,"files":{{
+    const identity = try a.print(
+        \\{{"wamr_revision":"{s}","compiler_profile":"unikraft-x86_64","zig_version":"0.17.0","minimal_wasi":false,"development_only":false,"variant":"tiny","jit_mode":null,"files":{{
         \\"embedded.c":"{s}","identity.h":"{s}","libwamr-aot.a":"{s}","tiny.cwasm":"{s}","tiny.wasm":"{s}","wamr_aot.h":"{s}","wamrc":"{s}"}}}}
-    , .{ controller.custody_limits.wamr_revision, &([_]u8{'a'} ** 64), &([_]u8{'a'} ** 64), &([_]u8{'a'} ** 64), &([_]u8{'a'} ** 64), &([_]u8{'a'} ** 64), &([_]u8{'a'} ** 64), &([_]u8{'a'} ** 64) });
+    , .{ controller.custody_limits.wamr_revision, &@as([64]u8, @splat('a')), &@as([64]u8, @splat('a')), &@as([64]u8, @splat('a')), &@as([64]u8, @splat('a')), &@as([64]u8, @splat('a')), &@as([64]u8, @splat('a')), &@as([64]u8, @splat('a')) });
     defer a.free(identity);
     const Mutation = struct { key: []const u8, value: ?std.json.Value = null };
     const changes = [_]Mutation{
@@ -1291,6 +1290,7 @@ test "native tiny build identity refuses development optional JIT and altered fi
         .{ .key = "jit_mode", .value = .{ .string = "fast" } },
         .{ .key = "minimal_wasi", .value = .{ .bool = true } },
         .{ .key = "compiler_profile", .value = .{ .string = "different" } },
+        .{ .key = "zig_version", .value = .{ .string = "0.16.0" } },
         .{ .key = "files", .value = .{ .object = .empty } },
     };
     for (changes, 0..) |change, index| {
@@ -1301,6 +1301,16 @@ test "native tiny build identity refuses development optional JIT and altered fi
         if (change.value) |replacement| try value.object.put(local, change.key, replacement);
         const native = if (controller.build_pipeline.admitPreparedIdentity(value)) |_| true else |_| false;
         try std.testing.expectEqual(index == 0, native);
+        if (std.mem.eql(u8, change.key, "zig_version")) {
+            try std.testing.expectError(error.InvalidProducer, controller.build_pipeline.admitImportedIdentity(value));
+            try value.object.put(local, "wamr_revision", .{ .string = controller.custody_limits.historical_wamr_revision });
+            try controller.build_pipeline.admitImportedIdentity(value);
+            try std.testing.expectError(error.InvalidProducer, controller.build_pipeline.admitPreparedIdentity(value));
+            try value.object.put(local, "zig_version", .{ .string = "0.17.0" });
+            try std.testing.expectError(error.InvalidProducer, controller.build_pipeline.admitImportedIdentity(value));
+            try value.object.put(local, "zig_version", .{ .string = "0.15.2" });
+            try std.testing.expectError(error.InvalidProducer, controller.build_pipeline.admitImportedIdentity(value));
+        }
     }
 }
 
@@ -1311,7 +1321,7 @@ fn directSharedSupervisorFixtures() !void {
     defer a.free(cache);
     const parent = try std.Io.Dir.openDirAbsolute(io, cache, .{ .iterate = true });
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "supervision-fixture-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("supervision-fixture-{d}", .{std.os.linux.getpid()});
     defer a.free(name);
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("supervision fixture cleanup failed");
@@ -1356,7 +1366,7 @@ fn directSharedSupervisorFixtures() !void {
         try writeFixtureFile(io, fixtures, "scenario", if (scenario.cancelled) "timeout" else scenario.name);
         const work = try std.fs.path.join(a, &.{ fixture_root, scenario.name });
         defer a.free(work);
-        const repeated = [_][]const u8{bound_tool} ** controller.input_custody.host_tools.len;
+        const repeated = @as([controller.input_custody.host_tools.len][]const u8, @splat(bound_tool));
         const stop = std.atomic.Value(bool).init(scenario.cancelled);
         const result = try controller.command_adapter.execute(a, io, .{
             .roots = .{
@@ -1463,7 +1473,7 @@ fn directSharedSupervisorFixtures() !void {
                 .roots = undefined,
                 .signal = &cancellation,
             };
-            context.command_records[@intFromEnum(controller.command_plan.Stage.fixtures)] =
+            context.command_records[@backingInt(controller.command_plan.Stage.fixtures)] =
                 try controller.custody_files.readFile(io, record_path, 1024 * 1024, true);
             try controller.build_pipeline.requireBuildEvidence(&context);
             const changed = try evidence.openFile(io, "command-fixtures.json", .{
@@ -1500,9 +1510,9 @@ test "closed production profile and historical read-only mode order" {
 test "portable target installer refuses musl, v3 and incomplete overrides" {
     const target = controller.target;
     const correct = target.portableQuery();
-    try std.testing.expect(target.permitsInstall(correct, .ReleaseSafe));
-    try std.testing.expect(!target.permitsInstall(correct, .Debug));
-    try std.testing.expect(!target.permitsInstall(.{}, .ReleaseSafe));
+    try std.testing.expect(target.permitsInstall(correct, .safe));
+    try std.testing.expect(!target.permitsInstall(correct, .debug));
+    try std.testing.expect(!target.permitsInstall(.{}, .safe));
     for ([_]struct { triple: []const u8, cpu: ?[]const u8 }{
         .{ .triple = "x86_64-linux-musl", .cpu = "x86_64_v2" },
         .{ .triple = "x86_64-linux-gnu", .cpu = "x86_64_v3" },
@@ -1512,7 +1522,7 @@ test "portable target installer refuses musl, v3 and incomplete overrides" {
             .arch_os_abi = bad.triple,
             .cpu_features = bad.cpu,
         });
-        try std.testing.expect(!target.permitsInstall(query, .ReleaseSafe));
+        try std.testing.expect(!target.permitsInstall(query, .safe));
     }
 }
 
@@ -1549,6 +1559,10 @@ test "imported revalidation binds only the built validator and private bundle" {
     try std.testing.expectEqualStrings("input:validator", spec.argv[0].path.role);
     try std.testing.expectEqualStrings("handoff", spec.argv[1].literal);
     try std.testing.expectEqualStrings("input:bundle", spec.argv[2].path.role);
+    const historical = plan.spec(.@"import-historical-native-revalidation");
+    try std.testing.expectEqualStrings("historical-handoff", historical.argv[1].literal);
+    try std.testing.expectEqual(spec.seconds, historical.seconds);
+    try std.testing.expectEqual(spec.output_limit, historical.output_limit);
     const env = try plan.environment(std.testing.allocator, .@"import-native-revalidation");
     defer plan.freeEnvironment(std.testing.allocator, env);
     try std.testing.expectEqual(@as(usize, 6), env.len);
@@ -1568,7 +1582,7 @@ test "trusted import authenticates relocated native tools without producer files
     const io = std.testing.io;
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "relocated-native-import-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("relocated-native-import-{d}", .{std.os.linux.getpid()});
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("relocated import cleanup failed");
     const root = try parent.openDir(io, name, .{ .iterate = true });
@@ -1712,7 +1726,7 @@ test "native handoff revalidation is supervised and retains bounded refusal evid
     const io = std.testing.io;
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "native-handoff-revalidation-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("native-handoff-revalidation-{d}", .{std.os.linux.getpid()});
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("handoff revalidation fixture cleanup failed");
     const root = try parent.openDir(io, name, .{ .iterate = true });
@@ -1739,7 +1753,7 @@ test "native handoff revalidation is supervised and retains bounded refusal evid
             .validator = "",
             .direct_validator = options.command_fixture,
             .bundle = try std.fs.path.join(a, &.{ path, "bundle.json" }),
-            .tools = @splat(""),
+            .tools = @as([controller.input_custody.host_tools.len][]const u8, @splat("")),
         }, private, evidence, null);
         if (std.mem.eql(u8, scenario, "accepted")) {
             try std.testing.expectEqual(controller.command_plan.Stage.@"import-native-revalidation", (try checked).stage);
@@ -1780,7 +1794,7 @@ test "borrowed custody hashing checks the held descriptor and its current name" 
     const io = std.testing.io;
     const parent = try files.openDirectory(io, options.fixture_root, .private);
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "borrowed-custody-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("borrowed-custody-{d}", .{std.os.linux.getpid()});
     defer a.free(name);
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch {};
@@ -1892,7 +1906,7 @@ test "input tree uses one terminal borrowed descriptor verification and recaptur
     const io = std.testing.io;
     const parent = try core.private_files.openDirectory(io, options.fixture_root, .private);
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "input-terminal-verification-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("input-terminal-verification-{d}", .{std.os.linux.getpid()});
     defer a.free(name);
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("terminal verification fixture cleanup failed");
@@ -1940,7 +1954,7 @@ test "input tree terminal verification refuses ancestor replacement FIFO and can
     const parent = try core.private_files.openDirectory(io, options.fixture_root, .private);
     defer parent.close(io);
     for ([_]CustodyIoProbe.Mode{ .replace_ancestor, .replace_fifo, .cancel_verify }) |mode| {
-        const name = try std.fmt.allocPrint(a, "input-terminal-{s}-{d}", .{ @tagName(mode), std.os.linux.getpid() });
+        const name = try a.print("input-terminal-{s}-{d}", .{ @tagName(mode), std.os.linux.getpid() });
         defer a.free(name);
         try parent.createDir(io, name, .fromMode(0o700));
         defer parent.deleteTree(io, name) catch @panic("terminal refusal fixture cleanup failed");
@@ -1973,7 +1987,7 @@ test "local consumer custody recaptures exact files trees and ancestry" {
     const io = std.testing.io;
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "local-consumer-custody-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("local-consumer-custody-{d}", .{std.os.linux.getpid()});
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("local consumer fixture cleanup failed");
     const root = try parent.openDir(io, name, .{ .iterate = true });
@@ -2097,7 +2111,7 @@ test "imported validator retains runtime paths after the source buffer is releas
     var parsed = try std.json.parseFromSlice(std.json.Value, a, encoded, .{ .parse_numbers = false });
     defer parsed.deinit();
     var file_records = std.json.Value{ .object = .empty };
-    try file_records.object.put(a, try std.fmt.allocPrint(a, "runtime:{s}", .{path}), parsed.value);
+    try file_records.object.put(a, try a.print("runtime:{s}", .{path}), parsed.value);
     var consumer = std.json.Value{ .object = .empty };
     try consumer.object.put(a, "files", file_records);
     var start = std.json.Value{ .object = .empty };
@@ -2298,7 +2312,7 @@ test "native import identity binds the compiled source map under real supervisio
 
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "native-import-identity-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("native-import-identity-{d}", .{std.os.linux.getpid()});
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("native identity fixture cleanup failed");
     const work = try parent.openDir(io, name, .{ .iterate = true });
@@ -2318,7 +2332,7 @@ test "native import identity binds the compiled source map under real supervisio
             .supervisor = options.host_controller_cli,
             .package_tool = "",
             .validator = "",
-            .tools = @splat(""),
+            .tools = @as([controller.input_custody.host_tools.len][]const u8, @splat("")),
         },
         .stage = .@"supervisor-import-identity",
         .private_dir = private,
@@ -2340,7 +2354,7 @@ fn writeRelativeFixtureFile(io: std.Io, dir: std.Io.Dir, name: []const u8, bytes
 fn writeSupervisorSourceFixture(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, skip: ?[]const u8) !void {
     for (controller.import_supervisor_identity.historical_supervisor_sources) |relative| {
         if (skip) |skipped| if (std.mem.eql(u8, relative, skipped)) continue;
-        const bytes = try std.fmt.allocPrint(allocator, "fixture:{s}\n", .{relative});
+        const bytes = try allocator.print("fixture:{s}\n", .{relative});
         defer allocator.free(bytes);
         try writeRelativeFixtureFile(io, dir, relative, bytes);
     }
@@ -2360,13 +2374,13 @@ test "current native reader authenticates its closure without historical Python 
     const io = std.testing.io;
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "native-reader-source-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("native-reader-source-{d}", .{std.os.linux.getpid()});
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("native reader fixture cleanup failed");
     const root = try parent.openDir(io, name, .{ .iterate = true });
     defer root.close(io);
     const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
-    const reader_tools_name = try std.fmt.allocPrint(a, "{s}-reader-tools", .{name});
+    const reader_tools_name = try a.print("{s}-reader-tools", .{name});
     const reader_git = try std.fs.path.join(a, &.{ options.fixture_root, reader_tools_name, "bin/git" });
     try @import("local_acceptance_tests.zig").stageGit(a, io, reader_git);
     defer parent.deleteTree(io, reader_tools_name) catch @panic("native reader tools cleanup failed");
@@ -2390,7 +2404,7 @@ test "current native reader authenticates its closure without historical Python 
         .stderr_limit = .limited(4096),
     });
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, response.term);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}\n", .{expected}), response.stdout);
+    try std.testing.expectEqualStrings(try a.print("{s}\n", .{expected}), response.stdout);
     try appendRelativeFixtureFile(io, root, "support/build/wamr-native-ci/controller/cli.zig", "\n");
     try std.testing.expectError(error.UnsafeSource, controller.import_supervisor_identity.currentReaderSourceContentClosure(a, io, path, reader_git));
 }
@@ -2447,13 +2461,13 @@ test "native executable boundary standalone owner needs no physical Python and r
     const identity = controller.import_supervisor_identity;
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "native-standalone-source-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("native-standalone-source-{d}", .{std.os.linux.getpid()});
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("native standalone fixture cleanup failed");
     const root = try parent.openDir(io, name, .{ .iterate = true });
     defer root.close(io);
     const path = try std.fs.path.join(a, &.{ options.fixture_root, name });
-    const tools_name = try std.fmt.allocPrint(a, "{s}-tools", .{name});
+    const tools_name = try a.print("{s}-tools", .{name});
     const git = try std.fs.path.join(a, &.{ options.fixture_root, tools_name, "bin/git" });
     try @import("local_acceptance_tests.zig").stageGit(a, io, git);
     defer parent.deleteTree(io, tools_name) catch @panic("native standalone tools cleanup failed");
@@ -2476,7 +2490,7 @@ test "native executable boundary standalone owner needs no physical Python and r
         .stderr_limit = .limited(4096),
     });
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, response.term);
-    try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "{s}\n", .{expected}), response.stdout);
+    try std.testing.expectEqualStrings(try a.print("{s}\n", .{expected}), response.stdout);
     const native = try std.process.run(a, io, .{
         .argv = &.{ options.native_standalone_supervisor, "--identity" },
         .stdout_limit = .limited(1024),
@@ -2492,11 +2506,11 @@ test "native executable boundary standalone owner needs no physical Python and r
         .stderr_limit = .limited(4096),
     });
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, historic.term);
-    try std.testing.expectEqualStrings(try identity.identityBytes(a, "a" ** 64), historic.stdout);
+    try std.testing.expectEqualStrings(try identity.identityBytes(a, &@as([64]u8, @splat('a'))), historic.stdout);
     try std.testing.expectError(error.ImportIdentityChanged, identity.validateNativeStandaloneIdentity(a, historic.stdout));
     var forged = try core.contracts.Document.parse(a, native.stdout, .{});
     defer forged.deinit();
-    forged.value().object.getPtr("source_content_closure_sha256").?.* = .{ .string = "0" ** 64 };
+    forged.value().object.getPtr("source_content_closure_sha256").?.* = .{ .string = &@as([64]u8, @splat('0')) };
     const mutated = try forged.canonicalAlloc(a);
     try std.testing.expectError(error.ImportIdentityChanged, identity.validateNativeStandaloneIdentity(a, mutated));
     try appendRelativeFixtureFile(io, root, "support/build/wamr-native-ci/supervisor.zig", "\n");
@@ -2566,10 +2580,10 @@ test "native publication historical profile authenticates actual #263 Git source
     try std.testing.expectEqualStrings(genuine.object.get("content_closure_sha256").?.string, authenticated);
 
     var wrong_tree = source;
-    wrong_tree.tree = "0" ** 40;
+    wrong_tree.tree = &@as([40]u8, @splat('0'));
     try std.testing.expectError(error.ImportIdentityChanged, identity.verifyGitSource(a, io, wrong_tree, options.repository_root, options.git_executable, genuine, null));
     const changed = try std.json.parseFromSliceLeaky(std.json.Value, a, oracle.stdout, .{ .parse_numbers = false });
-    changed.object.get("records").?.object.get("support/build/wamr-native-ci/controller/cli.zig").?.object.getPtr("sha256").?.* = .{ .string = "0" ** 64 };
+    changed.object.get("records").?.object.get("support/build/wamr-native-ci/controller/cli.zig").?.object.getPtr("sha256").?.* = .{ .string = &@as([64]u8, @splat('0')) };
     try std.testing.expectError(error.ImportIdentityChanged, identity.verifyGitSource(a, io, source, options.repository_root, options.git_executable, changed, null));
     const resized = try std.json.parseFromSliceLeaky(std.json.Value, a, oracle.stdout, .{ .parse_numbers = false });
     resized.object.get("records").?.object.get("support/build/wamr-native-ci/controller/cli.zig").?.object.getPtr("bytes").?.* = .{ .number_string = "1" };
@@ -2587,7 +2601,7 @@ test "native source batches preserve duplicate binary blobs across the eight MiB
     const io = std.testing.io;
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{});
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "source-batches-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("source-batches-{d}", .{std.os.linux.getpid()});
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("source batch fixture cleanup failed");
     const root = try parent.openDir(io, name, .{});
@@ -2610,7 +2624,7 @@ test "native source batches preserve duplicate binary blobs across the eight MiB
         try mapped.object.put(a, entry.name, try std.json.parseFromSliceLeaky(std.json.Value, a, metadata, .{ .parse_numbers = false }));
     }
     try source_map.object.put(a, "records", mapped);
-    try source_map.object.put(a, "content_closure_sha256", .{ .string = "0" ** 64 });
+    try source_map.object.put(a, "content_closure_sha256", .{ .string = &@as([64]u8, @splat('0')) });
     try fixtureGit(a, path, &.{ options.git_executable, "init", "-q" });
     try fixtureGit(a, path, &.{ options.git_executable, "add", "-A" });
     try fixtureGit(a, path, &.{ options.git_executable, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "source batches" });
@@ -2625,11 +2639,11 @@ test "native source batches preserve duplicate binary blobs across the eight MiB
     const identity = controller.import_supervisor_identity;
     const before_queries = controller.source_custody.Fixture.gitQueries();
     const authenticated = try identity.verifyGitSource(a, io, selected, path, options.git_executable, source_map, null);
-    try std.testing.expectEqualStrings("0" ** 64, authenticated);
+    try std.testing.expectEqualStrings(&@as([64]u8, @splat('0')), authenticated);
     try std.testing.expect(controller.source_custody.Fixture.gitQueries() - before_queries <= 5);
     const digest = mapped.object.values()[0].object.getPtr("sha256").?;
     const saved = digest.*;
-    digest.* = .{ .string = "f" ** 64 };
+    digest.* = .{ .string = &@as([64]u8, @splat('f')) };
     try std.testing.expectError(error.ImportIdentityChanged, identity.verifyGitSource(a, io, selected, path, options.git_executable, source_map, null));
     digest.* = saved;
     const size = mapped.object.values()[0].object.getPtr("bytes").?;
@@ -2657,7 +2671,7 @@ test "supervisor source closure requires tracked clean Git blobs" {
     defer allocator.free(base_path);
     const base = try std.Io.Dir.openDirAbsolute(io, base_path, .{ .iterate = true });
     defer base.close(io);
-    const name = try std.fmt.allocPrint(allocator, "supervisor-source-fixture-{d}", .{std.os.linux.getpid()});
+    const name = try allocator.print("supervisor-source-fixture-{d}", .{std.os.linux.getpid()});
     defer allocator.free(name);
     try base.createDir(io, name, .fromMode(0o700));
     defer base.deleteTree(io, name) catch @panic("supervisor source fixture cleanup failed");
@@ -2686,7 +2700,7 @@ test "supervisor source closure requires tracked clean Git blobs" {
         options.git_executable,
     ));
 
-    const untracked_name = try std.fmt.allocPrint(allocator, "supervisor-source-untracked-{d}", .{std.os.linux.getpid()});
+    const untracked_name = try allocator.print("supervisor-source-untracked-{d}", .{std.os.linux.getpid()});
     defer allocator.free(untracked_name);
     try base.createDir(io, untracked_name, .fromMode(0o700));
     defer base.deleteTree(io, untracked_name) catch @panic("supervisor untracked fixture cleanup failed");
@@ -2716,7 +2730,7 @@ test "supervisor source closure requires tracked clean Git blobs" {
         options.git_executable,
     ));
 
-    const missing_name = try std.fmt.allocPrint(allocator, "supervisor-source-missing-{d}", .{std.os.linux.getpid()});
+    const missing_name = try allocator.print("supervisor-source-missing-{d}", .{std.os.linux.getpid()});
     defer allocator.free(missing_name);
     try base.createDir(io, missing_name, .fromMode(0o700));
     defer base.deleteTree(io, missing_name) catch @panic("supervisor missing fixture cleanup failed");
@@ -2765,8 +2779,17 @@ test "historical v2 supervised bindings use the closed imported producer contrac
         const value = try historicalBinding(a, historical, name);
         const bytes = try fixtureCanonical(a, value);
         const stage = std.meta.stringToEnum(controller.command_plan.Stage, name) orelse return error.UnexpectedStage;
-        const observed = try controller.accepted_run.validateCommandBinding(a, bytes, stage, .trusted_inner_zip);
+        const historical_root = stage == .prepare or stage == .config or stage == .@"native-image";
+        const historical_value = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .parse_numbers = false });
+        const observed = if (historical_root)
+            try controller.command_validation.validateHistoricalGeneration(a, historical_value, stage, .trusted_inner_zip)
+        else
+            try controller.accepted_run.validateCommandBinding(a, bytes, stage, .trusted_inner_zip);
         try std.testing.expectEqual(stage, observed.stage);
+        if (historical_root) {
+            try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBinding(a, bytes, stage, .trusted_inner_zip));
+            try std.testing.expectError(error.InvalidCommand, controller.command_validation.validateHistoricalGeneration(a, historical_value, stage, .local_runtime));
+        }
         if (stage == .adapter or stage == .@"local-boot-tool" or stage == .fixtures or controller.command_plan.isValidator(stage))
             try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBinding(a, bytes, stage, .local_runtime));
         verified += 1;
@@ -2781,6 +2804,52 @@ test "historical v2 supervised bindings use the closed imported producer contrac
         .adapter,
         .trusted_inner_zip,
     ));
+}
+
+test "public validator cache flag is historical import only" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const script =
+        \\import copy, importlib.util, sys
+        \\s=importlib.util.spec_from_file_location("witness",sys.argv[1])
+        \\m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
+        \\e=m.Evidence(); current=e.supervised_binding("public-validator-build")[0]
+        \\q=current["supervisor"]["request"]; q["argv"]=q["argv"][2:]
+        \\q["native_executable"]=copy.deepcopy(q["command_executable"])
+        \\q["timeout_ns"]=1800*1000000000
+        \\q["issued_ns"]=q["primary_deadline_ns"]-q["timeout_ns"]
+        \\current["supervisor"]["result"]["command"]["executable"]=q["native_executable"]["identity"]
+        \\e.rehash_supervised_binding(current)
+        \\old=copy.deepcopy(current); q=old["supervisor"]["request"]
+        \\i=q["argv"].index(m.ci.command_literal("--prefix"))
+        \\q["argv"][i:i]=[m.ci.command_literal("--global-cache-dir"),m.ci.command_path("work","global-cache")]
+        \\q["argv"]=[m.ci.command_literal("-Doptimize=ReleaseSafe") if item==m.ci.command_literal("-Doptimize=safe") else item for item in q["argv"]]
+        \\e.rehash_supervised_binding(old)
+        \\bad=copy.deepcopy(old); q=bad["supervisor"]["request"]
+        \\i=q["argv"].index(m.ci.command_literal("--global-cache-dir"))
+        \\q["argv"][i+1]=m.ci.command_path("work","unbound-cache")
+        \\e.rehash_supervised_binding(bad)
+        \\sys.stdout.buffer.write(m.ci.canonical_json({"current":current,"historical":old,"tampered":bad}))
+    ;
+    const witness = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/tests/test_adapter.py" });
+    const response = try std.process.run(a, std.testing.io, .{
+        .argv = &.{ options.python_executable, "-B", "-c", script, witness },
+        .cwd = .{ .path = options.repository_root },
+        .stdout_limit = .limited(1024 * 1024),
+        .stderr_limit = .limited(4096),
+    });
+    if (response.term != .exited or response.term.exited != 0)
+        std.debug.print("public validator cache witness: {s}\n", .{response.stderr});
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, response.term);
+    const values = try std.json.parseFromSliceLeaky(std.json.Value, a, response.stdout, .{ .duplicate_field_behavior = .@"error" });
+    const current = try fixtureCanonical(a, values.object.get("current").?);
+    _ = try controller.accepted_run.validateCommandBinding(a, current, .@"public-validator-build", .local_runtime);
+    const historical = try fixtureCanonical(a, values.object.get("historical").?);
+    _ = try controller.accepted_run.validateCommandBinding(a, historical, .@"public-validator-build", .trusted_inner_zip);
+    try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBinding(a, historical, .@"public-validator-build", .local_runtime));
+    const tampered = try fixtureCanonical(a, values.object.get("tampered").?);
+    try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBinding(a, tampered, .@"public-validator-build", .trusted_inner_zip));
 }
 
 test "legacy handoff inspect preserves five rehashed historical refusal witnesses" {
@@ -2812,11 +2881,11 @@ test "legacy handoff inspect preserves five rehashed historical refusal witnesse
                 request.object.getPtr("retained_executables").?.* = .{ .array = std.array_list.Managed(std.json.Value).init(a) };
                 command.object.getPtr("retained_executables").?.* = .{ .array = std.array_list.Managed(std.json.Value).init(a) };
             },
-            1 => record.object.getPtr("sha256").?.* = .{ .string = "0" ** 64 },
-            2 => output.object.getPtr("combined_sha256").?.* = .{ .string = "0" ** 64 },
+            1 => record.object.getPtr("sha256").?.* = .{ .string = &@as([64]u8, @splat('0')) },
+            2 => output.object.getPtr("combined_sha256").?.* = .{ .string = &@as([64]u8, @splat('0')) },
             3 => {
-                record.object.getPtr("sha256").?.* = .{ .string = "1" ** 64 };
-                output.object.getPtr("combined_sha256").?.* = .{ .string = "1" ** 64 };
+                record.object.getPtr("sha256").?.* = .{ .string = &@as([64]u8, @splat('1')) };
+                output.object.getPtr("combined_sha256").?.* = .{ .string = &@as([64]u8, @splat('1')) };
             },
             4 => request.object.getPtr("supervisor").?.object.getPtr("identity").?.object.getPtr("mode").?.* = .{ .number_string = "65536" },
             else => unreachable,
@@ -2935,13 +3004,13 @@ fn legacyHandoffInspectLiveFixture() !void {
     const io = std.testing.io;
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "legacy-handoff-inspect-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("legacy-handoff-inspect-{d}", .{std.os.linux.getpid()});
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("legacy handoff fixture cleanup failed");
     const fixture_dir = try parent.openDir(io, name, .{ .iterate = true });
     defer fixture_dir.close(io);
     const root = try std.fs.path.join(a, &.{ options.fixture_root, name });
-    const output_parent_name = try std.fmt.allocPrint(a, "{s}-outputs", .{name});
+    const output_parent_name = try a.print("{s}-outputs", .{name});
     try parent.createDir(io, output_parent_name, .fromMode(0o700));
     defer parent.deleteTree(io, output_parent_name) catch @panic("legacy handoff output cleanup failed");
     const output_parent = try std.fs.path.join(a, &.{ options.fixture_root, output_parent_name });
@@ -3032,21 +3101,21 @@ fn legacyHandoffInspectLiveFixture() !void {
     const ovmf_vars = try std.fs.path.join(a, &.{ root, "firmware/vars.fd" });
 
     for (controller.profile.modes(.tiny_v1_legacy)) |mode| {
-        const boot_name = try std.fmt.allocPrint(a, "boot-{s}", .{@tagName(mode)});
+        const boot_name = try a.print("boot-{s}", .{@tagName(mode)});
         try compute_root.createDir(io, boot_name, .fromMode(0o700));
         const boot_dir = try compute_root.openDir(io, boot_name, .{ .iterate = true });
         defer boot_dir.close(io);
         try writeFixtureFile(io, boot_dir, "hyperv-efi-boot.log", "serial\n");
         try writeFixtureFile(io, boot_dir, "request.json", "{}\n");
         try writeFixtureFile(io, boot_dir, "report.json", "{}\n");
-        const compute_name = try std.fmt.allocPrint(a, "{s}-compute.json", .{@tagName(mode)});
+        const compute_name = try a.print("{s}-compute.json", .{@tagName(mode)});
         const compute_value = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"accepted\":true}", .{});
         _ = try writeCanonicalValue(io, evidence, compute_name, a, compute_value);
     }
 
     var start_bindings: [controller.input_custody.host_tools.len + 1]controller.input_custody.Binding = undefined;
     for (controller.input_custody.host_tools, 0..) |tool, i|
-        start_bindings[i] = .{ .role = try std.fmt.allocPrint(a, "tool:{s}", .{tool}), .path = host_tool_paths[i] };
+        start_bindings[i] = .{ .role = try a.print("tool:{s}", .{tool}), .path = host_tool_paths[i] };
     start_bindings[controller.input_custody.host_tools.len] = .{ .role = "command-supervisor", .path = supervisor };
     var start_custody = try controller.input_custody.capture(a, io, &start_bindings, &.{});
     defer start_custody.deinit(a);
@@ -3211,7 +3280,7 @@ test "python-produced local runtimes stay outside records and validator-build ac
     const io = std.testing.io;
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "python-produced-policy-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("python-produced-policy-{d}", .{std.os.linux.getpid()});
     defer a.free(name);
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("python producer policy fixture cleanup failed");
@@ -3314,7 +3383,7 @@ test "accepted run requires complete local and trusted-inner-zip evidence before
     const io = std.testing.io;
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "accepted-records-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("accepted-records-{d}", .{std.os.linux.getpid()});
     defer a.free(name);
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("accepted records fixture cleanup failed");
@@ -3446,7 +3515,7 @@ test "handoff document has a fixed canonical shape and finite output limit" {
         .compatibility = .tiny_v1_legacy,
         .production_profile = null,
         .source = .{ .revision = "993e4d0d394c08202c0d0c57ea97450a19a4f394", .tree = "54f8e118146c78c24e7c802657c6ec62b268a5de" },
-        .result = .{ .relative_path = "artifacts/local_result", .bytes = 1, .sha256 = [_]u8{'a'} ** 64 },
+        .result = .{ .relative_path = "artifacts/local_result", .bytes = 1, .sha256 = @as([64]u8, @splat('a')) },
         .records = &.{},
         .artifacts = &.{},
         .runtime_inputs = &.{},
@@ -3518,7 +3587,7 @@ fn fixtureSparseImage(
     role: []const u8,
     footer: ?*const [512]u8,
 ) !std.json.Value {
-    const path = try std.fmt.allocPrint(a, "artifacts/{s}", .{role});
+    const path = try a.print("artifacts/{s}", .{role});
     const file = try root.createFile(io, path, .{ .exclusive = true, .permissions = .fromMode(0o600) });
     defer file.close(io);
     const bytes: u64 = 66 * 1024 * 1024;
@@ -3549,7 +3618,7 @@ fn trustedHistoricalFixture(comptime composition: bool) !void {
     const io = std.testing.io;
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "accepted-import-v1-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("accepted-import-v1-{d}", .{std.os.linux.getpid()});
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("import fixture cleanup failed");
     const root = try parent.openDir(io, name, .{ .iterate = true });
@@ -3557,7 +3626,7 @@ fn trustedHistoricalFixture(comptime composition: bool) !void {
     for ([_][]const u8{ "artifacts", "evidence", "boots" }) |part|
         try root.createDir(io, part, .fromMode(0o700));
     for (controller.profile.legacy_modes) |mode|
-        try root.createDir(io, try std.fmt.allocPrint(a, "boots/{s}", .{@tagName(mode)}), .fromMode(0o700));
+        try root.createDir(io, try a.print("boots/{s}", .{@tagName(mode)}), .fromMode(0o700));
     const stage_root_path = try std.fs.path.join(a, &.{ options.fixture_root, name });
     var members = std.json.Value{ .object = .empty };
     var record_hashes = std.json.Value{ .object = .empty };
@@ -3565,15 +3634,15 @@ fn trustedHistoricalFixture(comptime composition: bool) !void {
         .revision = "993e4d0d394c08202c0d0c57ea97450a19a4f394",
         .tree = "54f8e118146c78c24e7c802657c6ec62b268a5de",
     };
-    const wamr_revision = controller.custody_limits.wamr_revision;
+    const wamr_revision = controller.custody_limits.historical_wamr_revision;
     for ([_][]const u8{
         "efi",      "debug_elf", "bootinfo", "runtime",
         "compiler", "wasm",      "cwasm",    "config",
     }) |role| {
-        const artifact_path = try std.fmt.allocPrint(a, "artifacts/{s}", .{role});
+        const artifact_path = try a.print("artifacts/{s}", .{role});
         _ = try fixtureMember(a, io, root, &members, artifact_path, role);
     }
-    var footer = [_]u8{0} ** 512;
+    var footer = @as([512]u8, @splat(0));
     footer[0..8].* = "conectix".*;
     std.mem.writeInt(u32, footer[8..12], 2, .big);
     std.mem.writeInt(u32, footer[12..16], 0x10000, .big);
@@ -3637,7 +3706,7 @@ fn trustedHistoricalFixture(comptime composition: bool) !void {
         .producer_sha256 = empty_hash,
         .image = .{
             .schema_version = @as(u8, 1),
-            .miz_revision = controller.custody_limits.miz_revision,
+            .miz_revision = controller.custody_limits.historical_miz_revision,
             .efi = .{ .size = @as(u64, 3), .sha256 = image.files.@"wamr_hyperv-x86_64-efi" },
             .raw = .{ .size = @as(u64, 66 * 1024 * 1024), .sha256 = members.object.get("artifacts/raw").?.object.get("sha256").?.string },
             .vhd = .{ .size = @as(u64, 66 * 1024 * 1024 + 512), .sha256 = members.object.get("artifacts/vhd").?.object.get("sha256").?.string },
@@ -3665,14 +3734,14 @@ fn trustedHistoricalFixture(comptime composition: bool) !void {
         .{ .name = "boot-inputs.json", .value = boot_inputs },
         .{ .name = "package.json", .value = package },
     }) |item| {
-        const path = try std.fmt.allocPrint(a, "evidence/{s}", .{item.name});
+        const path = try a.print("evidence/{s}", .{item.name});
         const descriptor = try fixtureMember(a, io, root, &members, path, item.value);
         try record_hashes.object.put(a, item.name, descriptor.object.get("sha256").?);
         const role: []const u8 = if (std.mem.eql(u8, item.name, "build.json"))
             "build"
         else
             item.name[0 .. item.name.len - ".json".len];
-        const copy_path = try std.fmt.allocPrint(a, "artifacts/{s}", .{if (std.mem.eql(u8, role, "build-start"))
+        const copy_path = try a.print("artifacts/{s}", .{if (std.mem.eql(u8, role, "build-start"))
             "build_start"
         else if (std.mem.eql(u8, role, "boot-inputs"))
             "boot_inputs"
@@ -3684,7 +3753,7 @@ fn trustedHistoricalFixture(comptime composition: bool) !void {
         "adapter", "local-boot-tool", "fixtures",        "prepare",    "config",          "native-image",
         "package", "raw-x2apic",      "raw-legacy-apic", "vpc-x2apic", "vpc-legacy-apic", "inspect",
     }) |stage| {
-        const filename = try std.fmt.allocPrint(a, "command-{s}.json", .{stage});
+        const filename = try a.print("command-{s}.json", .{stage});
         const bytes = try fixtureCanonical(a, .{
             .scope = "command_diagnostic_not_acceptance",
             .stage = stage,
@@ -3694,28 +3763,26 @@ fn trustedHistoricalFixture(comptime composition: bool) !void {
             .over_limit = false,
             .known_error_markers = &[_][]const u8{},
         });
-        const path = try std.fmt.allocPrint(a, "evidence/{s}", .{filename});
+        const path = try a.print("evidence/{s}", .{filename});
         const descriptor = try fixtureMember(a, io, root, &members, path, bytes);
         try record_hashes.object.put(a, filename, descriptor.object.get("sha256").?);
     }
     var boots = std.json.Value{ .array = std.array_list.Managed(std.json.Value).init(a) };
-    const compute_json = try std.fmt.allocPrint(
-        a,
+    const compute_json = try a.print(
         "{{\"version\":1,\"workload\":\"tiny\",\"wamr_revision\":\"{s}\",\"wasm_sha256\":\"{s}\",\"cwasm_sha256\":\"{s}\",\"runtime_sha256\":\"{s}\",\"platform_status\":0,\"checks\":2,\"answer\":42,\"terminal\":1,\"detail\":2,\"reserved_bytes\":0,\"frame_bytes\":0,\"accessible_bytes\":0,\"allocation_bytes\":0,\"system_page_table_bytes\":4096,\"error_name\":\"\"}}",
         .{ wamr_revision, identity.files.@"tiny.wasm", identity.files.@"tiny.cwasm", identity.files.@"libwamr-aot.a" },
     );
     const compute_value = try std.json.parseFromSliceLeaky(std.json.Value, a, compute_json, .{});
     for (controller.profile.legacy_modes) |mode| {
         const mode_name = @tagName(mode);
-        const serial = try std.fmt.allocPrint(
-            a,
+        const serial = try a.print(
             "Hyper-V Hv#1 hypercall page enabled\nHyper-V SynIC:\nPowered by\n{s}Calling main(0, 0)\nWAMR_NATIVE_COMPUTE={s}\nWAMR_NATIVE_AOT_OK answer=42 teardown=0\n[    1.000001] Info: [libukboot] main returned 0\n",
             .{ if (mode.legacyApic()) "Using legacy xAPIC MMIO\n" else "", compute_json },
         );
-        const serial_path = try std.fmt.allocPrint(a, "boots/{s}/serial", .{mode_name});
+        const serial_path = try a.print("boots/{s}/serial", .{mode_name});
         const serial_item = try fixtureMember(a, io, root, &members, serial_path, serial);
         const image_role: []const u8 = if (std.mem.startsWith(u8, mode_name, "raw-")) "raw" else "vhd";
-        const image_pin = members.object.get(try std.fmt.allocPrint(a, "artifacts/{s}", .{image_role})).?;
+        const image_pin = members.object.get(try a.print("artifacts/{s}", .{image_role})).?;
         const image_hash = try core.contracts.parseSha256(image_pin.object.get("sha256").?.string);
         const empty_digest = try core.contracts.parseSha256(&empty_hash);
         const pins = [_]struct { size: u64, sha256: [32]u8 }{
@@ -3737,7 +3804,7 @@ fn trustedHistoricalFixture(comptime composition: bool) !void {
                 "/d/wamr-ci/wamr-native-runtime/firmware/code.fd",
                 "/d/wamr-ci/wamr-native-runtime/firmware/vars.fd",
                 "/d/wamr-ci/wamr-native-runtime/bin/qemu-system-x86_64",
-                try std.fmt.allocPrint(a, "/d/wamr-ci/wamr-native-runtime/compute/boot-{s}", .{mode_name}),
+                try a.print("/d/wamr-ci/wamr-native-runtime/compute/boot-{s}", .{mode_name}),
             ),
             .pins = pins,
         });
@@ -3756,8 +3823,8 @@ fn trustedHistoricalFixture(comptime composition: bool) !void {
             .serial_bytes = serial_item.object.get("size").?,
             .serial_sha256 = serial_item.object.get("sha256").?,
         });
-        const request_item = try fixtureMember(a, io, root, &members, try std.fmt.allocPrint(a, "boots/{s}/request", .{mode_name}), request);
-        const report_item = try fixtureMember(a, io, root, &members, try std.fmt.allocPrint(a, "boots/{s}/report", .{mode_name}), report);
+        const request_item = try fixtureMember(a, io, root, &members, try a.print("boots/{s}/request", .{mode_name}), request);
+        const report_item = try fixtureMember(a, io, root, &members, try a.print("boots/{s}/report", .{mode_name}), report);
         const pins_value = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, pins, .{}), .{});
         const report_value = try std.json.parseFromSliceLeaky(std.json.Value, a, report, .{});
         const evidence = try fixtureCanonical(a, .{
@@ -3768,10 +3835,10 @@ fn trustedHistoricalFixture(comptime composition: bool) !void {
             .report_sha256 = report_item.object.get("sha256").?,
             .compute = compute_value,
         });
-        const filename = try std.fmt.allocPrint(a, "{s}-compute.json", .{mode_name});
-        const evidence_item = try fixtureMember(a, io, root, &members, try std.fmt.allocPrint(a, "evidence/{s}", .{filename}), evidence);
+        const filename = try a.print("{s}-compute.json", .{mode_name});
+        const evidence_item = try fixtureMember(a, io, root, &members, try a.print("evidence/{s}", .{filename}), evidence);
         try record_hashes.object.put(a, filename, evidence_item.object.get("sha256").?);
-        const compute_item = try fixtureMember(a, io, root, &members, try std.fmt.allocPrint(a, "boots/{s}/compute", .{mode_name}), evidence);
+        const compute_item = try fixtureMember(a, io, root, &members, try a.print("boots/{s}/compute", .{mode_name}), evidence);
         const boot = try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, .{
             .mode = mode_name,
             .serial = serial_item,
@@ -3802,7 +3869,7 @@ fn trustedHistoricalFixture(comptime composition: bool) !void {
     };
     var artifacts = std.json.Value{ .array = std.array_list.Managed(std.json.Value).init(a) };
     for (artifact_names) |role|
-        try artifacts.array.append(try fixtureItem(a, members, try std.fmt.allocPrint(a, "artifacts/{s}", .{role})));
+        try artifacts.array.append(try fixtureItem(a, members, try a.print("artifacts/{s}", .{role})));
     var evidence = std.json.Value{ .array = std.array_list.Managed(std.json.Value).init(a) };
     const sorted = try a.dupe([]const u8, record_hashes.object.keys());
     std.mem.sort([]const u8, sorted, {}, struct {
@@ -3811,7 +3878,7 @@ fn trustedHistoricalFixture(comptime composition: bool) !void {
         }
     }.less);
     for (sorted) |entry|
-        try evidence.array.append(try fixtureItem(a, members, try std.fmt.allocPrint(a, "evidence/{s}", .{entry})));
+        try evidence.array.append(try fixtureItem(a, members, try a.print("evidence/{s}", .{entry})));
     const context = .{
         .repository = "cataggar/unikraft",
         .run_id = "1",
@@ -3861,7 +3928,7 @@ fn trustedHistoricalFixture(comptime composition: bool) !void {
     });
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, cli_success.term);
     try std.testing.expectEqualStrings(handoff, cli_success.stdout);
-    const reader_name = try std.fmt.allocPrint(a, "{s}-reader-source", .{name});
+    const reader_name = try a.print("{s}-reader-source", .{name});
     const reader_repository = try std.fs.path.join(a, &.{ options.fixture_root, reader_name });
     const cloned = try std.process.run(a, io, .{
         .argv = &.{ options.git_executable, "-c", "gc.auto=0", "-c", "maintenance.auto=false", "clone", "-q", "--depth=1", "--no-local", "--no-hardlinks", "--", options.repository_root, reader_repository },
@@ -3889,7 +3956,7 @@ fn trustedHistoricalFixture(comptime composition: bool) !void {
         std.debug.print("historical Git fixture {s}: {s}\n", .{ source.revision, seeded.stderr });
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, seeded.term);
     const self = try std.process.executablePathAlloc(io, a);
-    const reader_tools_name = try std.fmt.allocPrint(a, "{s}-reader-tools", .{name});
+    const reader_tools_name = try a.print("{s}-reader-tools", .{name});
     const reader_git = try std.fs.path.join(a, &.{ options.fixture_root, reader_tools_name, "bin/git" });
     try @import("local_acceptance_tests.zig").stageGit(a, io, reader_git);
     defer parent.deleteTree(io, reader_tools_name) catch @panic("legacy reader tools cleanup failed");
@@ -3938,7 +4005,7 @@ fn trustedHistoricalFixture(comptime composition: bool) !void {
             root.rename("saved-portable-envelope", root, "portable-bundle.json", io) catch @panic("portable envelope restore failed");
             root.rename("saved-public-envelope", root, "public-source.json", io) catch @panic("public envelope restore failed");
         }
-        const cli_run_name = try std.fmt.allocPrint(a, "{s}-private-cli", .{name});
+        const cli_run_name = try a.print("{s}-private-cli", .{name});
         const cli_output = try std.fs.path.join(a, &.{ options.fixture_root, cli_run_name });
         defer parent.deleteTree(io, cli_run_name) catch @panic("private CLI cleanup failed");
         const argv = &[_][]const u8{
@@ -4001,7 +4068,7 @@ fn trustedHistoricalFixture(comptime composition: bool) !void {
             try std.fs.path.join(a, &.{ options.fixture_root, "refused-private-origin" }),
             null,
         ));
-        const private_run_name = try std.fmt.allocPrint(a, "{s}-private-revalidation", .{name});
+        const private_run_name = try a.print("{s}-private-revalidation", .{name});
         defer parent.deleteTree(io, private_run_name) catch @panic("private revalidation cleanup failed");
         try controller.import_validator_build.runPrivate(
             a,
@@ -4078,7 +4145,7 @@ fn trustedHistoricalFixture(comptime composition: bool) !void {
     try root.deleteFile(io, "evidence/private-inspection-diagnostic.json");
     try qualifyLegacyLocalReadOnly(a, io, stage_root_path, source.revision);
     try @import("local_acceptance_tests.zig").qualify(a, io, stage_root_path);
-    const revalidated_name = try std.fmt.allocPrint(a, "{s}-native-revalidation", .{name});
+    const revalidated_name = try a.print("{s}-native-revalidation", .{name});
     const revalidated_path = try std.fs.path.join(a, &.{ options.fixture_root, revalidated_name });
     defer parent.deleteTree(io, revalidated_name) catch @panic("legacy revalidation cleanup failed");
     const revalidated = try std.process.run(a, io, .{
@@ -4098,7 +4165,7 @@ fn trustedHistoricalFixture(comptime composition: bool) !void {
         std.debug.print("legacy native revalidation: {s}\n", .{revalidated.stderr});
         if (parent.openDir(io, revalidated_name, .{})) |refused_output| {
             defer refused_output.close(io);
-            const log = refused_output.readFileAlloc(io, "private/import-native-revalidation.log", a, .limited(4096)) catch "private log unavailable";
+            const log = refused_output.readFileAlloc(io, "private/import-historical-native-revalidation.log", a, .limited(4096)) catch "private log unavailable";
             std.debug.print("legacy validator log: {s}\n", .{log});
         } else |_| {}
     }
@@ -4108,11 +4175,25 @@ fn trustedHistoricalFixture(comptime composition: bool) !void {
     const revalidated_output = try parent.openDir(io, revalidated_name, .{ .iterate = true });
     defer revalidated_output.close(io);
     try std.testing.expectEqualStrings(
-        "Compute handoff revalidated; authority=not_admitted.\n",
-        try revalidated_output.readFileAlloc(io, "private/import-native-revalidation.log", a, .limited(4096)),
+        "Historical compute handoff revalidated; authority=not_admitted.\n",
+        try revalidated_output.readFileAlloc(io, "private/import-historical-native-revalidation.log", a, .limited(4096)),
     );
-    const command = try revalidated_output.readFileAlloc(io, "evidence/command-import-native-revalidation.json", a, .limited(controller.records.max_record_bytes));
-    _ = try controller.accepted_run.validateCommandBinding(a, command, .@"import-native-revalidation", .trusted_inner_zip);
+    const command = try revalidated_output.readFileAlloc(io, "evidence/command-import-historical-native-revalidation.json", a, .limited(controller.records.max_record_bytes));
+    _ = try controller.accepted_run.validateCommandBinding(a, command, .@"import-historical-native-revalidation", .trusted_inner_zip);
+    try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBinding(a, command, .@"import-native-revalidation", .trusted_inner_zip));
+    const current_refusal = try std.process.run(a, io, .{
+        .argv = &.{
+            options.import_validator,
+            "handoff",
+            try std.fs.path.join(a, &.{ revalidated_path, "private/candidate-bundle.json" }),
+        },
+        .cwd = .{ .path = reader_repository },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, current_refusal.term);
+    try std.testing.expectEqualStrings("", current_refusal.stdout);
+    try std.testing.expectEqualStrings("WAMR direct validation refused: WrongSdk\n", current_refusal.stderr);
     try accepted.revalidate();
     try parent.deleteTree(io, revalidated_name);
 
@@ -4201,7 +4282,7 @@ fn trustedHistoricalFixture(comptime composition: bool) !void {
     try writeFixtureFile(io, root, "evidence/extra.json", "{}\n");
     try std.testing.expectError(error.UnexpectedImportedFile, accepted.revalidate());
     try root.deleteFile(io, "evidence/extra.json");
-    const serial_path = try std.fmt.allocPrint(a, "boots/{s}/serial", .{@tagName(controller.profile.legacy_modes[0])});
+    const serial_path = try a.print("boots/{s}/serial", .{@tagName(controller.profile.legacy_modes[0])});
     const changed = try root.openFile(io, serial_path, .{ .mode = .read_write, .follow_symlinks = false });
     try changed.writePositionalAll(io, "!", 0);
     changed.close(io);
@@ -4220,7 +4301,7 @@ fn trustedHistoricalFixture(comptime composition: bool) !void {
 fn qualifyLegacyLocalReadOnly(a: std.mem.Allocator, io: std.Io, stage: []const u8, revision: []const u8) !void {
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "readonly-legacy-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("readonly-legacy-{d}", .{std.os.linux.getpid()});
     const work_path = try std.fs.path.join(a, &.{ options.fixture_root, name });
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("legacy local reader cleanup failed");
@@ -4466,7 +4547,7 @@ test "v2 results bind every supervised stage; v1 remains read-only compatible" {
         "package",      "finalize-qcow2",    "derive-fixed-vhd", "inspect",         "raw-x2apic", "raw-legacy-apic",
         "qcow2-x2apic", "qcow2-legacy-apic", "vpc-x2apic",       "vpc-legacy-apic",
     }) |stage| {
-        const removed = try std.fmt.allocPrint(allocator, ",\"command-{s}.json\":\"{s}\"", .{ stage, &digest });
+        const removed = try allocator.print(",\"command-{s}.json\":\"{s}\"", .{ stage, &digest });
         defer allocator.free(removed);
         const missing = try std.mem.replaceOwned(u8, allocator, complete, removed, "");
         defer allocator.free(missing);
@@ -4474,7 +4555,7 @@ test "v2 results bind every supervised stage; v1 remains read-only compatible" {
         defer parsed.deinit();
         try std.testing.expectError(error.MissingRecord, controller.records.readResult(parsed.value()));
     }
-    const altered = try std.fmt.allocPrint(allocator, "\"command-adapter.json\":\"{s}\"", .{&digest});
+    const altered = try allocator.print("\"command-adapter.json\":\"{s}\"", .{&digest});
     defer allocator.free(altered);
     const changed = try std.mem.replaceOwned(u8, allocator, complete, altered, "\"command-adapter.json\":\"0000000000000000000000000000000000000000000000000000000000000000\"");
     defer allocator.free(changed);
@@ -4494,7 +4575,7 @@ test "embedded tracked source closure and physical/no-follow checks" {
     }
 
     const closure_hash = source.contentClosure();
-    try std.testing.expect(!std.mem.eql(u8, &closure_hash, &([_]u8{0} ** 32)));
+    try std.testing.expect(!std.mem.eql(u8, &closure_hash, &@as([32]u8, @splat(0))));
     try source.verifyPhysical(std.testing.io, std.testing.allocator, options.repository_root);
     try std.testing.expectError(error.FileNotFound, source.verifyPhysical(std.testing.io, std.testing.allocator, "/d/does-not-exist-controller"));
 }
@@ -4510,8 +4591,8 @@ test "recaptured source custody compares content, not allocated string addresses
             .files = 4,
             .directories = 2,
             .bytes = 128,
-            .content_sha256 = [_]u8{'a'} ** 64,
-            .physical_sha256 = [_]u8{'b'} ** 64,
+            .content_sha256 = @as([64]u8, @splat('a')),
+            .physical_sha256 = @as([64]u8, @splat('b')),
         },
     };
     const revision = try allocator.dupe(u8, before.revision);
@@ -4543,7 +4624,7 @@ test "frozen custody limits, component-bound roles and first excess" {
     try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024 * 1024), l.ignored_bytes);
     try std.testing.expectEqual(@as(usize, 512), l.bison_entries);
     try std.testing.expectEqual(@as(usize, 128), l.dependency_roots);
-    try std.testing.expectEqualStrings("a53205d77be3b880eb8f8b96679512ba58e2331a", l.wamr_revision);
+    try std.testing.expectEqualStrings("bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20", l.wamr_revision);
     for (l.roles, 0..) |role, index|
         try std.testing.expectEqual(index, try l.outputRole(role));
     try std.testing.expectEqual(@as(usize, 0), try l.outputRole(".d/private/file"));
@@ -4589,7 +4670,7 @@ test "physical custody snapshot has Python-compatible device and ns" {
     const after = try l.readFile(std.testing.io, source, 1024 * 1024, false);
     try std.testing.expectEqualDeep(before, after);
     try std.testing.expect(before.bytes > 0);
-    const missing = try std.fmt.allocPrint(std.testing.allocator, "{s}.gone", .{source});
+    const missing = try std.testing.allocator.print("{s}.gone", .{source});
     defer std.testing.allocator.free(missing);
     try std.testing.expectError(error.FileNotFound, l.readFile(std.testing.io, missing, 1024 * 1024, false));
 }
@@ -4642,7 +4723,7 @@ test "native clean Git custody, stable physical identities and pinned archive re
     defer allocator.free(base_path);
     const base = try std.Io.Dir.openDirAbsolute(io, base_path, .{ .iterate = true });
     defer base.close(io);
-    const name = try std.fmt.allocPrint(allocator, "custody-fixture-{d}", .{std.os.linux.getpid()});
+    const name = try allocator.print("custody-fixture-{d}", .{std.os.linux.getpid()});
     defer allocator.free(name);
     try base.createDir(io, name, .fromMode(0o700));
     defer base.deleteTree(io, name) catch @panic("controller custody fixture cleanup failed");
@@ -4822,7 +4903,7 @@ test "native clean Git custody, stable physical identities and pinned archive re
     try writeFixtureFile(io, repo, "unexpected", "not ignored");
     try std.testing.expectError(error.DirtySource, controller.source_custody.source(allocator, io, path, options.git_executable));
     for (roots.len + 1..controller.custody_limits.diagnostic_root) |index| {
-        const entry = try std.fmt.allocPrint(allocator, "inventory-{d:0>3}", .{index});
+        const entry = try allocator.print("inventory-{d:0>3}", .{index});
         defer allocator.free(entry);
         try writeFixtureFile(io, repo, entry, "");
     }
@@ -4842,7 +4923,7 @@ test "input tree deduplicates bounded symlink hash work and refuses first excess
     defer allocator.free(base_path);
     const base = try std.Io.Dir.openDirAbsolute(io, base_path, .{ .iterate = true });
     defer base.close(io);
-    const name = try std.fmt.allocPrint(allocator, "input-link-limits-{d}", .{std.os.linux.getpid()});
+    const name = try allocator.print("input-link-limits-{d}", .{std.os.linux.getpid()});
     defer allocator.free(name);
     try base.createDir(io, name, .fromMode(0o700));
     defer base.deleteTree(io, name) catch @panic("input link fixture cleanup failed");
@@ -4917,7 +4998,7 @@ test "missing input symlink target enforces the absolute 64-component boundary" 
     defer allocator.free(base_path);
     const base = try std.Io.Dir.openDirAbsolute(io, base_path, .{ .iterate = true });
     defer base.close(io);
-    const name = try std.fmt.allocPrint(allocator, "input-missing-depth-{d}", .{std.os.linux.getpid()});
+    const name = try allocator.print("input-missing-depth-{d}", .{std.os.linux.getpid()});
     defer allocator.free(name);
     try base.createDir(io, name, .fromMode(0o700));
     defer base.deleteTree(io, name) catch @panic("input depth fixture cleanup failed");
@@ -4928,7 +5009,7 @@ test "missing input symlink target enforces the absolute 64-component boundary" 
     const binding: input.Binding = .{ .role = "test", .path = path };
     var target: std.ArrayList(u8) = .empty;
     defer target.deinit(allocator);
-    const first = try std.fmt.allocPrint(allocator, "/usr/unikraft-custody-{d}", .{std.os.linux.getpid()});
+    const first = try allocator.print("/usr/unikraft-custody-{d}", .{std.os.linux.getpid()});
     defer allocator.free(first);
     try target.appendSlice(allocator, first);
     for (0..62) |_| try target.appendSlice(allocator, "/x");
@@ -4948,7 +5029,7 @@ test "native Bison production entry and sparse byte boundaries" {
     defer allocator.free(base_path);
     const base = try std.Io.Dir.openDirAbsolute(io, base_path, .{ .iterate = true });
     defer base.close(io);
-    const name = try std.fmt.allocPrint(allocator, "bison-limits-{d}", .{std.os.linux.getpid()});
+    const name = try allocator.print("bison-limits-{d}", .{std.os.linux.getpid()});
     defer allocator.free(name);
     try base.createDir(io, name, .fromMode(0o700));
     defer base.deleteTree(io, name) catch @panic("Bison limit fixture cleanup failed");
@@ -4957,7 +5038,7 @@ test "native Bison production entry and sparse byte boundaries" {
     const path = try std.fs.path.join(allocator, &.{ base_path, name });
     defer allocator.free(path);
     for (0..controller.custody_limits.bison_entries) |index| {
-        const entry = try std.fmt.allocPrint(allocator, "entry-{d:0>3}", .{index});
+        const entry = try allocator.print("entry-{d:0>3}", .{index});
         defer allocator.free(entry);
         try writeFixtureFile(io, directory, entry, "");
     }
@@ -4967,7 +5048,7 @@ test "native Bison production entry and sparse byte boundaries" {
     try writeFixtureFile(io, directory, "entry-overflow", "");
     try std.testing.expectError(error.LimitExceeded, controller.input_custody.bison(allocator, io, path));
     for (0..controller.custody_limits.bison_entries) |index| {
-        const entry = try std.fmt.allocPrint(allocator, "entry-{d:0>3}", .{index});
+        const entry = try allocator.print("entry-{d:0>3}", .{index});
         defer allocator.free(entry);
         try directory.deleteFile(io, entry);
     }
@@ -4988,7 +5069,7 @@ test "Bison and consumer v2 custody bind bytes, roles, ancestors and replacement
     defer allocator.free(base_path);
     const base = try std.Io.Dir.openDirAbsolute(io, base_path, .{ .iterate = true });
     defer base.close(io);
-    const name = try std.fmt.allocPrint(allocator, "input-fixture-{d}", .{std.os.linux.getpid()});
+    const name = try allocator.print("input-fixture-{d}", .{std.os.linux.getpid()});
     defer allocator.free(name);
     try base.createDir(io, name, .fromMode(0o700));
     defer base.deleteTree(io, name) catch @panic("input fixture cleanup failed");
@@ -5007,7 +5088,7 @@ test "Bison and consumer v2 custody bind bytes, roles, ancestors and replacement
     try std.testing.expectEqual(@as(usize, 1), bison.files);
     try std.testing.expectEqual(@as(usize, 5), bison.bytes);
     try bison_dir.symLink(io, "grammar", "alias", .{});
-    const missing_target = try std.fmt.allocPrint(allocator, "/usr/lib/unikraft-custody-{d}/missing", .{std.os.linux.getpid()});
+    const missing_target = try allocator.print("/usr/lib/unikraft-custody-{d}/missing", .{std.os.linux.getpid()});
     defer allocator.free(missing_target);
     try bison_dir.symLink(io, missing_target, "root-owned-dangling", .{});
     try std.testing.expectError(error.UnsafeBisonInput, controller.input_custody.bison(allocator, io, bison_path));
@@ -5057,7 +5138,7 @@ test "dependency custody parses pinned native ZON, tracked manifests and bounded
     var manifest_data = try core.private_files.readSensitiveFile(io, allocator, manifest_file.file, 1024 * 1024, .artifact);
     defer manifest_data.deinit();
     try dependency.pinnedManifest(allocator, manifest_data.bytes());
-    const mutated = try std.mem.replaceOwned(u8, allocator, manifest_data.bytes(), "miz-0.2.0-Z3lHlD--2gAdGiguNwbjjdjBmv2f8QlAcwHYRw1De0Sx", "miz-0.2.0-invalid");
+    const mutated = try std.mem.replaceOwned(u8, allocator, manifest_data.bytes(), controller.custody_limits.miz_package_hash, "miz-0.2.0-invalid");
     defer allocator.free(mutated);
     try std.testing.expectError(error.UnpinnedDependency, dependency.pinnedManifest(allocator, mutated));
     const sources = try dependency.sourceManifests(allocator, io, options.repository_root, options.git_executable);
@@ -5069,7 +5150,7 @@ test "dependency custody parses pinned native ZON, tracked manifests and bounded
     defer allocator.free(base_path);
     const base = try std.Io.Dir.openDirAbsolute(io, base_path, .{ .iterate = true });
     defer base.close(io);
-    const name = try std.fmt.allocPrint(allocator, "dependency-fixture-{d}", .{std.os.linux.getpid()});
+    const name = try allocator.print("dependency-fixture-{d}", .{std.os.linux.getpid()});
     defer allocator.free(name);
     try base.createDir(io, name, .fromMode(0o700));
     defer base.deleteTree(io, name) catch @panic("dependency fixture cleanup failed");
@@ -5086,7 +5167,7 @@ test "dependency custody parses pinned native ZON, tracked manifests and bounded
     const private_dir = try fixture_dir.openDir(io, "private", .{ .iterate = true });
     defer private_dir.close(io);
     try writeFixtureFile(io, private_dir, "dependency-restore.log", "restored\n");
-    const hash_line = try std.fmt.allocPrint(allocator, "{s}\n", .{controller.custody_limits.miz_package_hash});
+    const hash_line = try allocator.print("{s}\n", .{controller.custody_limits.miz_package_hash});
     defer allocator.free(hash_line);
     try writeFixtureFile(io, private_dir, "dependency-hash-000.log", hash_line);
     try restore_dir.createDir(io, "zig-pkg", .fromMode(0o700));
@@ -5180,14 +5261,14 @@ test "native ELF runtime closure retains sorted canonical dynamic-loader paths" 
     ));
     const invalid: controller.input_custody.ProductionPaths = .{
         .runtime = "/",
-        .tools = .{""} ** controller.input_custody.host_tools.len,
+        .tools = @as([controller.input_custody.host_tools.len][]const u8, @splat("")),
         .python_stdlib = "/",
     };
     try std.testing.expectError(error.UnsafePath, controller.input_custody.captureProduction(allocator, io, invalid));
 }
 
 fn inventoryNoChildren() !void {
-    var status: u32 = 0;
+    var status: i32 = 0;
     try std.testing.expectEqual(.CHILD, std.os.linux.errno(std.os.linux.waitpid(-1, &status, std.os.linux.W.NOHANG)));
 }
 
@@ -5326,15 +5407,15 @@ const RuntimeInventoryFixture = struct {
     fn init() !RuntimeInventoryFixture {
         const parent = try core.private_files.openDirectory(io, options.fixture_root, .private);
         errdefer parent.close(io);
-        const name = try std.fmt.allocPrint(a, "runtime-inventory-{d}", .{linux.getpid()});
+        const name = try a.print("runtime-inventory-{d}", .{linux.getpid()});
         errdefer a.free(name);
         try parent.createDir(io, name, .fromMode(0o700));
         errdefer parent.deleteTree(io, name) catch @panic("inventory fixture cleanup failed");
         const directory = try parent.openDir(io, name, .{ .iterate = true });
         errdefer directory.close(io);
-        const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}/executable", .{ options.fixture_root, name }, 0);
+        const path = try a.printSentinel("{s}/{s}/executable", .{ options.fixture_root, name }, 0);
         errdefer a.free(path);
-        const loader = try std.fmt.allocPrint(a, "{s}/{s}/loader", .{ options.fixture_root, name });
+        const loader = try a.print("{s}/{s}/loader", .{ options.fixture_root, name });
         errdefer a.free(loader);
         const python = try std.Io.Dir.realPathFileAbsoluteAlloc(io, "/usr/bin/python3", a);
         defer a.free(python);
@@ -5365,7 +5446,7 @@ const RuntimeInventoryFixture = struct {
             defer a.free(canonical);
             try copy(directory, "loader", canonical);
             const end = (try executable.stat(io)).size;
-            const interpreter_path = try a.dupeZ(u8, loader);
+            const interpreter_path = try a.dupeSentinel(u8, loader, 0);
             defer a.free(interpreter_path);
             try executable.writePositionalAll(io, interpreter_path[0 .. interpreter_path.len + 1], end);
             std.mem.writeInt(u64, program[8..16], end, .little);
@@ -5526,7 +5607,7 @@ test "native ELF runtime inventory cancellation retains irreversible native clea
         linux.exit_group(0);
     }
     var status: u32 = 0;
-    while (true) switch (linux.errno(linux.waitpid(@intCast(forked), &status, 0))) {
+    while (true) switch (linux.errno(linux.waitpid(@intCast(forked), @ptrCast(&status), 0))) {
         .SUCCESS => break,
         .INTR => continue,
         else => return error.InventoryFixtureReap,
@@ -5580,9 +5661,9 @@ test "source custody diagnostics cap changes at 64 without losing total" {
     const after = try allocator.alloc(source.MetadataEntry, 65);
     defer allocator.free(after);
     for (before, after, 0..) |*old, *new, i| {
-        const name = try std.fmt.allocPrint(allocator, "tracked-{d:0>3}", .{i});
-        old.* = .{ .kind = "file", .path = name, .metadata = .{0} ** 9 };
-        new.* = .{ .kind = "file", .path = name, .metadata = .{1} ** 9 };
+        const name = try allocator.print("tracked-{d:0>3}", .{i});
+        old.* = .{ .kind = "file", .path = name, .metadata = @as([9]i128, @splat(0)) };
+        new.* = .{ .kind = "file", .path = name, .metadata = @as([9]i128, @splat(1)) };
     }
     defer for (before) |item| allocator.free(item.path);
     var changes = try source.metadataChanges(allocator, before, after);
@@ -5603,7 +5684,7 @@ test "accepted build records replay at the 4 MiB boundary, not the tracked-file 
     const io = std.testing.io;
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "build-record-replay-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("build-record-replay-{d}", .{std.os.linux.getpid()});
     defer a.free(name);
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("build record fixture cleanup failed");
@@ -5649,7 +5730,7 @@ test "late cancellation refuses final build publication after record preparation
     const io = std.testing.io;
     const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "late-build-cancellation-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("late-build-cancellation-{d}", .{std.os.linux.getpid()});
     defer a.free(name);
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("late cancellation fixture cleanup failed");
@@ -5694,7 +5775,7 @@ test "installed native fixture runner is private, create-only and rejects replay
     defer a.free(cache);
     const parent = try std.Io.Dir.openDirAbsolute(io, cache, .{ .iterate = true });
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "runner-fixture-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("runner-fixture-{d}", .{std.os.linux.getpid()});
     defer a.free(name);
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("native runner fixture cleanup failed");
@@ -5774,7 +5855,7 @@ test "native command refuses changed executable after use and retains failed rec
     defer a.free(cache);
     const parent = try std.Io.Dir.openDirAbsolute(io, cache, .{ .iterate = true });
     defer parent.close(io);
-    const name = try std.fmt.allocPrint(a, "executable-swap-{d}", .{std.os.linux.getpid()});
+    const name = try a.print("executable-swap-{d}", .{std.os.linux.getpid()});
     defer a.free(name);
     try parent.createDir(io, name, .fromMode(0o700));
     defer parent.deleteTree(io, name) catch @panic("executable swap fixture cleanup failed");
@@ -5805,7 +5886,7 @@ test "native command refuses changed executable after use and retains failed rec
         try file.sync(io);
     }
     const bound_tool = executable;
-    const repeated = [_][]const u8{bound_tool} ** controller.input_custody.host_tools.len;
+    const repeated = @as([controller.input_custody.host_tools.len][]const u8, @splat(bound_tool));
     const runner_path = try std.fs.path.join(a, &.{ work, "runner" });
     defer a.free(runner_path);
     const replacement_path = try std.fs.path.join(a, &.{ work, "replacement" });

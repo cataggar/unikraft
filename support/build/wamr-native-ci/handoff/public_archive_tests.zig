@@ -381,7 +381,7 @@ const Fixture = struct {
     manifest_path: []const u8,
 
     fn init(name: []const u8, image: []const u8) !Fixture {
-        const path = try std.fmt.allocPrint(a, "{s}/public-archive-{s}", .{ options.fixture_root, name });
+        const path = try a.print("{s}/public-archive-{s}", .{ options.fixture_root, name });
         errdefer a.free(path);
         std.Io.Dir.cwd().deleteTree(io, path) catch {};
         _ = try std.Io.Dir.cwd().createDirPathStatus(io, path, .fromMode(0o700));
@@ -401,7 +401,7 @@ const Fixture = struct {
             defer a.free(relative);
             try writeFile(root, relative, view.bytes);
         }
-        const prefix = try std.fmt.allocPrint(a, "\"path\":\"{s}/", .{stage});
+        const prefix = try a.print("\"path\":\"{s}/", .{stage});
         defer a.free(prefix);
         const rooted = try std.mem.replaceOwned(u8, a, views[views.len - 2].bytes, "\"path\":\"", prefix);
         defer a.free(rooted);

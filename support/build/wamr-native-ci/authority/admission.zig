@@ -204,7 +204,7 @@ fn finish(owner: *State) !void {
     try files.absoluteFilePath(owner.command.plan);
     try files.absoluteFilePath(owner.command.authorization);
     try files.absoluteFilePath(owner.command.output);
-    const stage_path = try std.fmt.allocPrint(a, "{s}.validation.json", .{owner.command.output});
+    const stage_path = try a.print("{s}.validation.json", .{owner.command.output});
     try files.absoluteFilePath(stage_path);
     owner.plan_record = try tx.Record.open(ctx, owner.command.plan, json_limit);
     owner.authorization_record = try tx.Record.open(ctx, owner.command.authorization, json_limit);
@@ -239,8 +239,8 @@ fn finish(owner: *State) !void {
     var candidate_bytes = try owner.candidate_record.?.read(a, ctx.signal);
     defer candidate_bytes.deinit();
     try validateCandidateBytes(a, candidate_bytes.bytes());
-    inline for (std.meta.fields(compute.Tools)) |field| {
-        var tool = try HeldArtifact.open(ctx, @field(owner.plan.tools, field.name), .tool, types.runtime.max_file_bytes);
+    inline for (@typeInfo(compute.Tools).@"struct".field_names) |field_name| {
+        var tool = try HeldArtifact.open(ctx, @field(owner.plan.tools, field_name), .tool, types.runtime.max_file_bytes);
         errdefer tool.file.close(ctx.io);
         try owner.tools.append(ctx.allocator, tool);
     }
@@ -300,10 +300,10 @@ fn validateCandidateBytes(a: std.mem.Allocator, bytes: []const u8) !void {
     _ = try handoff.contracts.validateDirectComputeCandidate(document.value());
 }
 fn toolPaths(plan: types.Plan, paths: types.ToolPaths) !void {
-    inline for (std.meta.fields(compute.Tools)) |field| {
-        const path = @field(paths, field.name);
+    inline for (@typeInfo(compute.Tools).@"struct".field_names) |field_name| {
+        const path = @field(paths, field_name);
         try files.absoluteFilePath(path);
-        if (!std.mem.eql(u8, path, @field(plan.tools, field.name).path)) return error.ToolBindingMismatch;
+        if (!std.mem.eql(u8, path, @field(plan.tools, field_name).path)) return error.ToolBindingMismatch;
     }
     try files.absoluteFilePath(paths.azure_runtime);
     if (!std.mem.eql(u8, paths.azure_runtime, plan.azure_runtime_document.path)) return error.ToolBindingMismatch;
@@ -341,8 +341,8 @@ fn ownCommand(a: std.mem.Allocator, command: AdmitCommand) !AdmitCommand {
     result.plan = try a.dupe(u8, command.plan);
     result.authorization = try a.dupe(u8, command.authorization);
     result.output = try a.dupe(u8, command.output);
-    inline for (std.meta.fields(types.ToolPaths)) |field|
-        @field(result.tools, field.name) = try a.dupe(u8, @field(command.tools, field.name));
+    inline for (@typeInfo(types.ToolPaths).@"struct".field_names) |field_name|
+        @field(result.tools, field_name) = try a.dupe(u8, @field(command.tools, field_name));
     return result;
 }
 fn ownArtifact(a: std.mem.Allocator, value: types.Artifact) !types.Artifact {

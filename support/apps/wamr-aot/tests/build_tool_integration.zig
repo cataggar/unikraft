@@ -36,6 +36,44 @@ test "installed foundation executable has a stable version and bounded refusal" 
     try testing.expect(std.mem.indexOf(u8, refused.stderr, repository) == null);
 }
 
+test "native prepare refuses unbound or incorrectly hashed offline packages" {
+    const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
+    defer allocator.free(cli);
+    const fixture = try std.Io.Dir.cwd().realPathFileAlloc(io, options.prepare_fixture, allocator);
+    defer allocator.free(fixture);
+    var temporary = testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    try temporary.dir.setPermissions(io, .fromMode(0o700));
+    const archive = try sourceArchive(&temporary);
+    defer allocator.free(archive);
+    var environment = try fixtureEnvironment(fixture);
+    defer environment.deinit();
+    const unbound_repository = try fixtureRepository(&temporary, "unbound");
+    defer allocator.free(unbound_repository);
+    const unbound = try runCli(cli, &.{ cli, "prepare", "--repository", unbound_repository, "--source-archive", archive }, &environment);
+    defer allocator.free(unbound.stdout);
+    defer allocator.free(unbound.stderr);
+    try testing.expect(unbound.term == .exited and unbound.term.exited != 0);
+    const wrong_repository = try fixtureRepository(&temporary, "wrong-hash");
+    defer allocator.free(wrong_repository);
+    try environment.put("WAMR_PREPARE_FIXTURE_PACKAGE_HASH", "wrong-package-hash");
+    const wrong = try runPrepare(cli, wrong_repository, archive, .{ .name = "wrong-hash" }, &environment);
+    defer allocator.free(wrong.stdout);
+    defer allocator.free(wrong.stderr);
+    try testing.expect(wrong.term == .exited and wrong.term.exited != 0);
+    _ = environment.swapRemove("WAMR_PREPARE_FIXTURE_PACKAGE_HASH");
+    const missing_repository = try fixtureRepository(&temporary, "missing-sdk-package");
+    defer allocator.free(missing_repository);
+    try bindPreparePackages(missing_repository, &environment);
+    const packages = try build_tool.files.PrivateDirectory.open(io, environment.get("ZIG_LOCAL_PKG_DIR").?);
+    defer packages.close(io);
+    try packages.dir.deleteTree(io, build_tool.wabt_hash);
+    const missing = try runCli(cli, &.{ cli, "prepare", "--repository", missing_repository, "--source-archive", archive }, &environment);
+    defer allocator.free(missing.stdout);
+    defer allocator.free(missing.stderr);
+    try testing.expect(missing.term == .exited and missing.term.exited != 0);
+}
+
 test "native prepare and verify cover every variant with create-only output" {
     const cli = try std.Io.Dir.cwd().realPathFileAlloc(io, options.cli, allocator);
     defer allocator.free(cli);
@@ -115,6 +153,41 @@ test "native prepare and verify cover every variant with create-only output" {
             try testing.expect(fields.get("jit_mode").? == .null);
         try testing.expectEqual(case.coremark, fields.get("minimal_wasi").?.bool);
         const files = fields.get("files").?.object;
+        const manifest_path = try std.fs.path.join(allocator, &.{
+            repository, "support/apps/wamr-aot/build/workload-consumer/build.zig.zon",
+        });
+        defer allocator.free(manifest_path);
+        const manifest_bytes = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            manifest_path,
+            allocator,
+            .limited(4096),
+        );
+        defer allocator.free(manifest_bytes);
+        const manifest_source = try allocator.dupeSentinel(u8, manifest_bytes, 0);
+        defer allocator.free(manifest_source);
+        var manifest_arena = std.heap.ArenaAllocator.init(allocator);
+        defer manifest_arena.deinit();
+        var manifest_diagnostics: std.zon.parse.Diagnostics = undefined;
+        const manifest = try std.zon.parse.fromSlice(struct {
+            name: enum { wamr_workload_image },
+            version: []const u8,
+            fingerprint: u64,
+            minimum_zig_version: []const u8,
+            dependencies: struct {
+                wamr: struct { path: []const u8 },
+                translate_c: struct { url: []const u8, hash: []const u8 },
+            },
+            paths: [][]const u8,
+        }, .{
+            .gpa = allocator,
+            .arena = manifest_arena.allocator(),
+            .source = manifest_source,
+            .diagnostics = &manifest_diagnostics,
+        });
+        try testing.expectEqualStrings("../wamr-source", manifest.dependencies.wamr.path);
+        try testing.expectEqualStrings(build_tool.translate_c_url, manifest.dependencies.translate_c.url);
+        try testing.expectEqualStrings(build_tool.translate_c_hash, manifest.dependencies.translate_c.hash);
         try testing.expectEqualStrings(
             "5e43618eda26c083b511b9570d347123affd2b1a14bfc22be766e95c1c8153f8",
             files.get("tiny.wasm").?.string,
@@ -126,8 +199,7 @@ test "native prepare and verify cover every variant with create-only output" {
         const library = if (case.coremark)
             "fixture-library variant=tiny coremark=true\n"
         else
-            try std.fmt.allocPrint(
-                allocator,
+            try allocator.print(
                 "fixture-library variant={s} coremark=false\n",
                 .{case.variant},
             );
@@ -400,6 +472,7 @@ test "development checkout selection is explicit and cannot masquerade as suppor
     const git_path = try std.Io.Dir.cwd().realPathFileAlloc(io, options.git_executable, allocator);
     defer allocator.free(git_path);
     try environment.put("WAMR_CI_TOOL_GIT", git_path);
+    try bindPreparePackages(repository, &environment);
     const prepared = try runCli(
         cli,
         &.{ cli, "prepare", "--repository", repository, "--source", checkout, "--development-revision", revision },
@@ -461,6 +534,24 @@ test "portable CI config reaches only opted-in image builds" {
     const ordinary_log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
     defer allocator.free(ordinary_log);
     try testing.expect(std.mem.indexOf(u8, ordinary_log, "-Dci-portable-config=true") == null);
+    try testing.expect(std.mem.indexOf(u8, ordinary_log, "\t--system\t") != null);
+    try testing.expect(std.mem.indexOf(u8, ordinary_log, "\tfetch\t--pkg-dir\t") != null);
+
+    _ = environment.swapRemove("ZIG_LOCAL_PKG_DIR");
+    const unbound = try runCli(cli, argv, &environment);
+    defer allocator.free(unbound.stdout);
+    defer allocator.free(unbound.stderr);
+    try testing.expect(unbound.term == .exited and unbound.term.exited != 0);
+    const unbound_log = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
+    defer allocator.free(unbound_log);
+    try testing.expectEqualStrings(ordinary_log, unbound_log);
+    try environment.put("ZIG_LOCAL_PKG_DIR", bison_data);
+    try environment.put("WAMR_IMAGE_FIXTURE_PACKAGE_HASH", "wrong-package-hash");
+    const wrong_hash = try runCli(cli, argv, &environment);
+    defer allocator.free(wrong_hash.stdout);
+    defer allocator.free(wrong_hash.stderr);
+    try testing.expect(wrong_hash.term == .exited and wrong_hash.term.exited != 0);
+    _ = environment.swapRemove("WAMR_IMAGE_FIXTURE_PACKAGE_HASH");
 
     try environment.put("WAMR_CI_PORTABLE_CONFIG", "1");
     const portable = try runCli(cli, argv, &environment);
@@ -628,10 +719,9 @@ test "native image commands preserve config plans identities and failed publicat
     const log_bytes = try std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .limited(1024 * 1024));
     defer allocator.free(log_bytes);
     try testing.expect(std.mem.indexOf(u8, log_bytes, "--print-datadir") != null);
-    const root_argv = try std.fmt.allocPrint(
-        allocator,
-        "{s}\tbuild\tnative-images\t-j2\t--cache-dir\t{s}/zig_local_cache\t--global-cache-dir\t{s}/zig_global_cache",
-        .{ fixture, root_state, root_state },
+    const root_argv = try allocator.print(
+        "{s}\tbuild\tnative-images\t-j2\t--cache-dir\t{s}/zig_local_cache",
+        .{ fixture, root_state },
     );
     defer allocator.free(root_argv);
     try testing.expect(std.mem.indexOf(u8, log_bytes, root_argv) != null);
@@ -641,10 +731,14 @@ test "native image commands preserve config plans identities and failed publicat
     const root_line_start_index = if (std.mem.lastIndexOfScalar(u8, root_line, '\n')) |index| index + 1 else 0;
     var root_fields = std.mem.splitScalar(u8, root_line[root_line_start_index..], '\t');
     try testing.expectEqualStrings(repository, root_fields.next().?);
-    const expected_tmp = try std.fmt.allocPrint(allocator, "{s}/tmp", .{root_state});
+    const expected_tmp = try allocator.print("{s}/tmp", .{root_state});
     defer allocator.free(expected_tmp);
     try testing.expectEqualStrings(expected_tmp, root_fields.next().?);
-    inline for (0..5) |_| try testing.expectEqualStrings("", root_fields.next().?);
+    inline for (0..2) |_| try testing.expectEqualStrings("", root_fields.next().?);
+    const expected_global = try allocator.print("{s}/zig_global_cache", .{root_state});
+    defer allocator.free(expected_global);
+    try testing.expectEqualStrings(expected_global, root_fields.next().?);
+    inline for (0..2) |_| try testing.expectEqualStrings("", root_fields.next().?);
     const identity_file = try std.Io.Dir.openFileAbsolute(io, identity_path, .{});
     defer identity_file.close(io);
     try testing.expectEqual(
@@ -718,11 +812,10 @@ test "native image commands reject config runtime and application mutation" {
     );
     defer allocator.free(bison_data);
 
-    inline for (.{ "config", "runtime", "application" }) |mutation| {
+    inline for (.{ "config", "runtime", "application", "package" }) |mutation| {
         const repository = try imageRepository(&temporary, mutation);
         defer allocator.free(repository);
-        const log_name = try std.fmt.allocPrint(
-            allocator,
+        const log_name = try allocator.print(
             "{s}.log",
             .{mutation},
         );
@@ -827,8 +920,7 @@ test "native config refuses a supplied executable that differs from the running 
         fixture,
     );
     defer wrong.close(allocator, io);
-    const retained_path = try std.fmt.allocPrint(
-        allocator,
+    const retained_path = try allocator.print(
         "/proc/{d}/fd/{d}",
         .{ linux.getpid(), wrong.executable.file.handle },
     );
@@ -904,8 +996,7 @@ test "native config binds a supervisor snapshot to its retained physical executa
         cli,
     );
     defer tool.close(allocator, io);
-    const retained_path = try std.fmt.allocPrint(
-        allocator,
+    const retained_path = try allocator.print(
         "/proc/{d}/fd/{d}",
         .{ linux.getpid(), tool.executable.file.handle },
     );
@@ -1345,6 +1436,11 @@ fn runPrepare(
     case: PrepareCase,
     environment: *const std.process.Environ.Map,
 ) !std.process.RunResult {
+    var selected = std.process.Environ.Map.init(allocator);
+    defer selected.deinit();
+    var entries = environment.iterator();
+    while (entries.next()) |entry| try selected.put(entry.key_ptr.*, entry.value_ptr.*);
+    try bindPreparePackages(repository, &selected);
     var arguments: std.ArrayList([]const u8) = .empty;
     defer arguments.deinit(allocator);
     try arguments.appendSlice(allocator, &.{
@@ -1360,7 +1456,22 @@ fn runPrepare(
     if (case.coremark) try arguments.append(allocator, "--coremark");
     if (case.jit_mode) |mode|
         try arguments.appendSlice(allocator, &.{ "--jit-mode", mode });
-    return runCli(cli, arguments.items, environment);
+    return runCli(cli, arguments.items, &selected);
+}
+
+fn bindPreparePackages(repository: []const u8, environment: *std.process.Environ.Map) !void {
+    const parent = try build_tool.files.PrivateDirectory.open(io, std.fs.path.dirname(repository).?);
+    defer parent.close(io);
+    const packages = try build_tool.files.ensurePrivateDirectory(io, parent.dir, "prepare-packages");
+    defer packages.close(io);
+    for ([_][]const u8{ build_tool.translate_c_hash, build_tool.aro_hash, build_tool.wabt_hash, build_tool.wasip2_hash }) |name| {
+        const package = try build_tool.files.ensurePrivateDirectory(io, packages, name);
+        defer package.close(io);
+        try build_tool.files.writePrivateAtomicReplace(io, package, "build.zig", "fixture package\n");
+    }
+    const packages_path = try std.fs.path.join(allocator, &.{ std.fs.path.dirname(repository).?, "prepare-packages" });
+    defer allocator.free(packages_path);
+    try environment.put("ZIG_LOCAL_PKG_DIR", packages_path);
 }
 
 fn runCli(
@@ -1388,8 +1499,7 @@ fn fixtureEnvironment(fixture: []const u8) !std.process.Environ.Map {
 }
 
 fn fixtureRepository(temporary: *testing.TmpDir, name: []const u8) ![:0]u8 {
-    const relative = try std.fmt.allocPrint(
-        allocator,
+    const relative = try allocator.print(
         "{s}/support/apps/wamr-aot",
         .{name},
     );
@@ -1422,8 +1532,7 @@ fn fixtureRepository(temporary: *testing.TmpDir, name: []const u8) ![:0]u8 {
 }
 
 fn imageRepository(temporary: *testing.TmpDir, name: []const u8) ![:0]u8 {
-    const relative = try std.fmt.allocPrint(
-        allocator,
+    const relative = try allocator.print(
         "{s}/support/apps/wamr-aot",
         .{name},
     );
@@ -1521,6 +1630,16 @@ fn imageEnvironment(
     try environment.put("PATH", "/usr/bin:/bin");
     try environment.put("WAMR_IMAGE_FIXTURE_BISON_DATA", bison_data);
     try environment.put("WAMR_IMAGE_FIXTURE_LOG", log_path);
+    if (std.fs.path.isAbsolute(bison_data)) {
+        const packages = try build_tool.files.PrivateDirectory.open(io, bison_data);
+        defer packages.close(io);
+        for ([_][]const u8{ build_tool.translate_c_hash, build_tool.aro_hash }) |name| {
+            const directory = try build_tool.files.ensurePrivateDirectory(io, packages.dir, name);
+            defer directory.close(io);
+            try build_tool.files.writePrivateAtomicReplace(io, directory, "build.zig", "fixture package\n");
+        }
+        try environment.put("ZIG_LOCAL_PKG_DIR", bison_data);
+    }
     try environment.put(
         "WAMR_IMAGE_FIXTURE_REVISION",
         "0123456789abcdef0123456789abcdef01234567",
@@ -1660,9 +1779,9 @@ fn tamperRefusals(
         &.{ repository, "support/apps/wamr-aot/build/artifacts/identity-link.json" },
     );
     defer allocator.free(identity_link);
-    const identity_z = try allocator.dupeZ(u8, identity_path);
+    const identity_z = try allocator.dupeSentinel(u8, identity_path, 0);
     defer allocator.free(identity_z);
-    const link_z = try allocator.dupeZ(u8, identity_link);
+    const link_z = try allocator.dupeSentinel(u8, identity_link, 0);
     defer allocator.free(link_z);
     if (linux.errno(linux.linkat(
         linux.AT.FDCWD,
@@ -1789,7 +1908,7 @@ const Tar = struct {
     }
 
     fn entry(self: *Tar, name: []const u8, contents: []const u8) !void {
-        var header: [512]u8 = [_]u8{0} ** 512;
+        var header: [512]u8 = @as([512]u8, @splat(0));
         if (name.len > 100) return error.FixturePathTooLong;
         @memcpy(header[0..name.len], name);
         putOctal(header[100..108], 0o644);

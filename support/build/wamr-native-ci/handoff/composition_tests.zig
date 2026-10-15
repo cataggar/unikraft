@@ -22,7 +22,7 @@ const Workspace = struct {
     fn init(a: std.mem.Allocator, io: std.Io, label: []const u8) !Workspace {
         const parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{});
         errdefer parent.close(io);
-        const name = try std.fmt.allocPrint(a, "handoff-composition-{s}-{d}", .{ label, std.os.linux.getpid() });
+        const name = try a.print("handoff-composition-{s}-{d}", .{ label, std.os.linux.getpid() });
         try parent.createDir(io, name, .fromMode(0o700));
         const root = try parent.openDir(io, name, .{ .iterate = true });
         return .{ .a = a, .io = io, .parent = parent, .root = root, .name = name, .path = try std.fs.path.join(a, &.{ options.fixture_root, name }) };
@@ -140,7 +140,7 @@ pub fn historical(
         .run_attempt = "1",
         .source_revision = accepted.source.revision,
         .source_tree = accepted.source.tree,
-        .wamr_revision = controller.custody_limits.wamr_revision,
+        .wamr_revision = controller.custody_limits.historical_wamr_revision,
     };
     const root_bound = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ stage, "bundle.json" }), a, .limited(handoff.layout.max_json_bytes));
     var metadata = try archive.Metadata.fromRootBound(a, root_bound, stage, context);
@@ -225,20 +225,20 @@ pub fn historical(
         if (fault == .final_collision)
             try std.testing.expectEqualStrings("foreign final bundle\n", try work.read("final_collision/bundle.json"))
         else if (fault != .publication_sync and fault != .final_revalidation)
-            try work.absent(try std.fmt.allocPrint(step_a, "{s}/bundle.json", .{name}));
+            try work.absent(try step_a.print("{s}/bundle.json", .{name}));
         if (fault == .copy_sync) {
-            const copied = try work.root.openFile(io, try std.fmt.allocPrint(step_a, "{s}/{s}", .{ name, metadata.selected[0].name }), .{});
+            const copied = try work.root.openFile(io, try step_a.print("{s}/{s}", .{ name, metadata.selected[0].name }), .{});
             defer copied.close(io);
             try std.testing.expectEqual(metadata.selected[0].size, (try copied.stat(io)).size);
         }
         if (fault == .native_command) {
-            const record = try work.read("native_command/private/native-validation/evidence/command-import-native-revalidation.json");
+            const record = try work.read("native_command/private/native-validation/evidence/command-import-historical-native-revalidation.json");
             var document = try handoff.contracts.parseCanonical(step_a, record);
             defer document.deinit();
             try std.testing.expectEqual(@as(i32, 1), try core.contracts.integer(i32, document.value().object.get("exit_code").?));
             const changed = try work.read("native_command/candidate-bundle.json");
             try std.testing.expectEqual(@as(u8, '!'), changed[0]);
-            const log = try work.root.openFile(io, "native_command/private/native-validation/private/import-native-revalidation.log", .{});
+            const log = try work.root.openFile(io, "native_command/private/native-validation/private/import-historical-native-revalidation.log", .{});
             defer log.close(io);
             try std.testing.expect((try log.stat(io)).size > 0);
         }
@@ -325,8 +325,8 @@ pub fn local(a: std.mem.Allocator, io: std.Io, stage: []const u8, repository: []
         defer step_arena.deinit();
         const step_a = step_arena.allocator();
         const name = @tagName(fault);
-        const output = try work.join(try std.fmt.allocPrint(step_a, "{s}.json", .{name}));
-        const admission = try std.fmt.allocPrint(step_a, "{s}.admission.json", .{output});
+        const output = try work.join(try step_a.print("{s}.json", .{name}));
+        const admission = try step_a.print("{s}.admission.json", .{output});
         if (fault == .admission_collision or fault == .candidate_collision)
             try work.put(work.relative(if (fault == .admission_collision) admission else output), "foreign candidate product\n");
         var signal = try core.process.SignalCancellation.install();
@@ -336,7 +336,7 @@ pub fn local(a: std.mem.Allocator, io: std.Io, stage: []const u8, repository: []
             .io = io,
             .source = .{ .private_bundle = &bundle },
             .output = output,
-            .validation_output = try work.join(try std.fmt.allocPrint(step_a, "{s}-validation", .{name})),
+            .validation_output = try work.join(try step_a.print("{s}-validation", .{name})),
             .settings = .{ .attempt_id = "00000000-0000-4000-8000-000000000001" },
             .signal = &signal,
         }, .{
@@ -418,7 +418,7 @@ fn localReceipt(work: Workspace, bundle: *controller.accepted_run.PrivateBundle)
         .run_attempt = run.get("run_attempt").?.string,
         .source_revision = bundle.evidence.source.revision,
         .source_tree = bundle.evidence.source.tree,
-        .wamr_revision = controller.custody_limits.wamr_revision,
+        .wamr_revision = controller.custody_limits.historical_wamr_revision,
     };
     var metadata = try archive.Metadata.fromRootBound(work.a, bytes.bytes(), bundle.evidence.root, context);
     defer metadata.deinit();
@@ -502,7 +502,7 @@ fn privateLineage(work: Workspace, source: *controller.accepted_run.PrivateBundl
         .run_attempt = run.get("run_attempt").?.string,
         .source_revision = source.evidence.source.revision,
         .source_tree = source.evidence.source.tree,
-        .wamr_revision = controller.custody_limits.wamr_revision,
+        .wamr_revision = controller.custody_limits.historical_wamr_revision,
     });
     defer metadata.deinit();
     try work.root.createDir(work.io, "lineage-stage", .fromMode(0o700));
@@ -596,13 +596,13 @@ fn serialCases(work: Workspace, owner: *candidate.Finalized, stage: []const u8) 
         try std.testing.expectError(case.err, owner.result(try work.join(case.first), if (case.second) |second| try work.join(second) else null, null));
     }
     inline for (.{ .change_first, .replace_first, .change_second, .replace_second }) |fault| {
-        const first = try std.fmt.allocPrint(work.a, "{s}-first", .{@tagName(fault)});
-        const second = try std.fmt.allocPrint(work.a, "{s}-second", .{@tagName(fault)});
+        const first = try work.a.print("{s}-first", .{@tagName(fault)});
+        const second = try work.a.print("{s}-second", .{@tagName(fault)});
         try work.put(first, serial);
         try work.put(second, try std.mem.concat(work.a, u8, &.{ serial, serial }));
         try std.testing.expectError(error.FileChanged, candidate.Test.result(owner, try work.join(first), try work.join(second), null, fault));
         if (fault == .replace_first or fault == .replace_second) {
-            const saved = try std.fmt.allocPrint(work.a, "{s}.retained-original", .{if (fault == .replace_first) first else second});
+            const saved = try work.a.print("{s}.retained-original", .{if (fault == .replace_first) first else second});
             try std.testing.expectEqualStrings(if (fault == .replace_first) serial else try std.mem.concat(work.a, u8, &.{ serial, serial }), try work.read(saved));
         }
         try owner.revalidate(null);
@@ -614,8 +614,8 @@ fn createCandidate(work: Workspace, name: []const u8, bundle: *controller.accept
         .allocator = std.testing.allocator,
         .io = work.io,
         .source = .{ .private_bundle = bundle },
-        .output = try work.join(try std.fmt.allocPrint(work.a, "{s}/candidate.json", .{name})),
-        .validation_output = try work.join(try std.fmt.allocPrint(work.a, "{s}-validation", .{name})),
+        .output = try work.join(try work.a.print("{s}/candidate.json", .{name})),
+        .validation_output = try work.join(try work.a.print("{s}-validation", .{name})),
         .settings = .{ .attempt_id = "00000000-0000-4000-8000-000000000001" },
     });
     if (result != .success) std.debug.print("changed input candidate {s}: {any}\n", .{ name, result });
@@ -671,7 +671,7 @@ fn changedInputs(work: Workspace, owner: *candidate.Finalized, bundle: *controll
         try work.root.createDir(work.io, "changed-executable", .fromMode(0o700));
         const executable_owner = try createCandidate(work, "changed-executable", bundle);
         defer executable_owner.deinit();
-        const saved = try std.fmt.allocPrint(work.a, "{s}.composition-original", .{tools.git});
+        const saved = try work.a.print("{s}.composition-original", .{tools.git});
         try std.Io.Dir.cwd().renamePreserve(tools.git, .cwd(), saved, work.io);
         const bytes = try std.Io.Dir.cwd().readFileAlloc(work.io, saved, work.a, .limited(64 * 1024 * 1024));
         const replacement = try std.Io.Dir.cwd().createFile(work.io, tools.git, .{ .exclusive = true, .permissions = .fromMode(0o700) });

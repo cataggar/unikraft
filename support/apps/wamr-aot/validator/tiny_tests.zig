@@ -80,7 +80,7 @@ test "prepared identity requires typed pins, refuses duplicate nested keys and o
             return error.InvalidIdentityAccepted;
         } else |_| {}
     }
-    try t.expectError(error.InputTooLarge, validator.records.PreparedIdentity.parse(a, " " ** (64 * 1024 + 1)));
+    try t.expectError(error.InputTooLarge, validator.records.PreparedIdentity.parse(a, &@as([64 * 1024 + 1]u8, @splat(' '))));
 }
 
 test "shared tiny parser accepts app CoreMark, direct tiny, and normalized boot framing" {
@@ -149,7 +149,7 @@ test "exact tiny fields and envelope refuse bad types, bytes and ordering" {
     }
     try t.expectError(error.EvidenceIncomplete, validator.tiny.checkSerial(a, "", identity, .{ .scope = .direct }));
     try t.expectError(error.EvidenceIncomplete, validator.tiny.checkSerial(a, "Calling main(0, 0)\n", identity, .{ .scope = .direct }));
-    try refused("x" ** (4 * 1024 * 1024), identity, .{});
+    try refused(&@as([4 * 1024 * 1024]u8, @splat('x')), identity, .{});
     const record_at = std.mem.indexOf(u8, raw, validator.tiny.prefix).?;
     const end = std.mem.indexOfPos(u8, raw, record_at, "\n").? + 1;
     const marker_at = std.mem.indexOf(u8, raw, validator.tiny.marker).?;

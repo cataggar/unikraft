@@ -49,7 +49,7 @@ pub const fault_name = "internal-entry-fault";
 
 pub fn fileName(index: usize, buffer: *[32]u8) ![]const u8 {
     if (index >= slots) return error.InternalObservationLimit;
-    return std.fmt.bufPrint(buffer, "internal-entry-{d:0>2}", .{index});
+    return std.mem.print(buffer, "internal-entry-{d:0>2}", .{index});
 }
 
 pub const Record = struct {
@@ -68,7 +68,7 @@ pub const Record = struct {
         const json = try c.canonical(a, self);
         defer a.free(json);
         if (json.len > record_bytes) return error.InternalObservationLimit;
-        var bytes = [_]u8{0} ** record_bytes;
+        var bytes = @as([record_bytes]u8, @splat(0));
         @memcpy(bytes[0..json.len], json);
         return bytes;
     }
@@ -91,7 +91,7 @@ pub const Order = struct {
         if (phase == .runtime_begin) {
             if (self.previous != .mounts_end and self.previous != .runtime_mount_end)
                 return error.InvalidInternalSequence;
-            if (self.runtime_count >= 3 or @intFromEnum(context) != self.runtime_count + 1)
+            if (self.runtime_count >= 3 or @backingInt(context) != self.runtime_count + 1)
                 return error.InvalidInternalSequence;
             self.runtime_count += 1;
             self.context = context;
@@ -210,7 +210,7 @@ pub fn runtimeBegin() void {
         return;
     }
     var next = value.order;
-    next.advance(@enumFromInt(index + 1), .runtime_begin) catch {
+    next.advance(@fromBackingInt(@intCast(index + 1)), .runtime_begin) catch {
         fail(.invalid_sequence);
         return;
     };
@@ -270,7 +270,7 @@ pub const Collection = struct {
             .records = self.records[0..self.count],
         });
         defer a.free(json);
-        return std.fmt.bufPrint(buffer, "Namespace internal observations: {s}", .{json});
+        return std.mem.print(buffer, "Namespace internal observations: {s}", .{json});
     }
 };
 
@@ -350,14 +350,14 @@ test "namespace observations internal writer activation disarming and process gu
     try std.testing.expectEqual(@as(usize, 0), (try read(a, io, directory, .timeout)).count);
     start(a, io, temporary.dir, .timeout);
     mark(.isolation_begin);
-    inline for (@typeInfo(Phase).@"enum".fields[@intFromEnum(Phase.inventory_begin) .. @intFromEnum(Phase.validation_end) + 1]) |field|
-        mark(@enumFromInt(field.value));
+    inline for (@typeInfo(Phase).@"enum".field_values[@backingInt(Phase.inventory_begin) .. @backingInt(Phase.validation_end) + 1]) |field|
+        mark(@fromBackingInt(@intCast(field)));
     mark(.isolation_end);
     mark(.mounts_begin);
     mark(.mounts_end);
     runtimeBegin();
-    inline for (@typeInfo(Phase).@"enum".fields[@intFromEnum(Phase.inventory_begin) .. @intFromEnum(Phase.validation_end) + 1]) |field|
-        mark(@enumFromInt(field.value));
+    inline for (@typeInfo(Phase).@"enum".field_values[@backingInt(Phase.inventory_begin) .. @backingInt(Phase.validation_end) + 1]) |field|
+        mark(@fromBackingInt(@intCast(field)));
     mark(.runtime_mount_begin);
     mark(.runtime_mount_end);
     mark(.mounts_finalize_begin);

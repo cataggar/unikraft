@@ -110,7 +110,7 @@ pub fn parseWorkload(bytes: []const u8, boot: u8, input: EvidenceInput, previous
                 .vpd_code_set = try decimal(u8, parts[12]),
                 .vpd_type = try decimal(u8, parts[13]),
                 .vpd_association = try decimal(u8, parts[14]),
-                .vpd = [_]u8{'0'} ** 128,
+                .vpd = @as([128]u8, @splat('0')),
             };
             if (found.lun != input.lun or found.sectors != input.sectors or try decimal(u16, parts[10]) != 512 or
                 found.vpd_length == 0 or found.vpd_length > 64 or parts[15].len != @as(usize, found.vpd_length) * 2)
