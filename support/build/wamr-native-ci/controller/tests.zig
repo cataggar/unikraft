@@ -4292,9 +4292,14 @@ fn qualifyLegacyLocalReadOnly(a: std.mem.Allocator, io: std.Io, stage: []const u
     const directory = try controller.layout.runtime(io, runtime);
     defer directory.close(io);
     try std.testing.expectError(error.InvalidEvidence, controller.accepted_run.openAndValidateReadOnlyWithSignal(a, io, .empty, &directory, runtime, repository, null));
-    var accepted = try controller.accepted_run.openAndValidateReadOnlyWithGit(a, io, .empty, &directory, runtime, repository, git, null);
+    var run_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer run_arena.deinit();
+    var accepted = try controller.accepted_run.openAndValidateReadOnlyWithGit(run_arena.allocator(), io, .empty, &directory, runtime, repository, git, null);
     defer accepted.deinit();
     try accepted.revalidate();
+    const steady_capacity = run_arena.queryCapacity();
+    for (0..3) |_| try accepted.revalidate();
+    try std.testing.expectEqual(steady_capacity, run_arena.queryCapacity());
     try std.testing.expect(accepted.runtime_inputs.len >= 2);
     const encoded = try accepted.handoffV1();
     try std.testing.expect(std.mem.indexOf(u8, encoded, controller.accepted_run.readonly_git_role) != null);
@@ -4310,6 +4315,38 @@ fn qualifyLegacyLocalReadOnly(a: std.mem.Allocator, io: std.Io, stage: []const u
         std.debug.print("legacy local admission: {s}\n", .{emitted.stderr});
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, emitted.term);
     try std.testing.expect(std.mem.indexOf(u8, emitted.stdout, "\"context\":\"local-runtime\"") != null);
+    {
+        const efi_path = try std.fs.path.join(a, &.{ repository, "support/apps/wamr-aot/build/wamr_hyperv-x86_64-efi" });
+        const efi_file = try std.Io.Dir.openFileAbsolute(io, efi_path, .{ .mode = .read_write, .follow_symlinks = false });
+        defer efi_file.close(io);
+        var original_byte: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 1), try efi_file.readPositionalAll(io, &original_byte, 0));
+        const flipped_byte = [1]u8{original_byte[0] ^ 0xff};
+        try efi_file.writePositionalAll(io, &flipped_byte, 0);
+        try std.testing.expectError(error.EvidenceChanged, accepted.revalidate());
+        try efi_file.writePositionalAll(io, &original_byte, 0);
+        try std.testing.expectError(error.ArtifactChanged, accepted.revalidate());
+        accepted.deinit();
+        run_arena.deinit();
+        run_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        accepted = try controller.accepted_run.openAndValidateReadOnlyWithGit(run_arena.allocator(), io, .empty, &directory, runtime, repository, git, null);
+    }
+    {
+        const vhd_path = try std.fs.path.join(a, &.{ runtime, "compute/package/unikraft.vhd" });
+        const vhd_file = try std.Io.Dir.openFileAbsolute(io, vhd_path, .{ .mode = .read_write, .follow_symlinks = false });
+        defer vhd_file.close(io);
+        var original_byte: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 1), try vhd_file.readPositionalAll(io, &original_byte, 0));
+        const flipped_byte = [1]u8{original_byte[0] ^ 0xff};
+        try vhd_file.writePositionalAll(io, &flipped_byte, 0);
+        try std.testing.expectError(error.EvidenceChanged, accepted.revalidate());
+        try vhd_file.writePositionalAll(io, &original_byte, 0);
+        try std.testing.expectError(error.ArtifactChanged, accepted.revalidate());
+        accepted.deinit();
+        run_arena.deinit();
+        run_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        accepted = try controller.accepted_run.openAndValidateReadOnlyWithGit(run_arena.allocator(), io, .empty, &directory, runtime, repository, git, null);
+    }
     const tracked_path = try std.fs.path.join(a, &.{ repository, "README.md" });
     const tracked = try std.Io.Dir.openFileAbsolute(io, tracked_path, .{ .mode = .read_write, .follow_symlinks = false });
     defer tracked.close(io);
@@ -4835,6 +4872,41 @@ test "input tree deduplicates bounded symlink hash work and refuses first excess
     _ = try input.Fixture.treeWithHashLimit(allocator, io, binding, 32);
     try hash_dir.symLink(io, "../e", "extra", .{});
     try std.testing.expectError(error.LimitExceeded, input.Fixture.treeWithHashLimit(allocator, io, binding, 32));
+    {
+        try fixture_dir.createDir(io, "shared-tree", .fromMode(0o700));
+        const shared_dir = try fixture_dir.openDir(io, "shared-tree", .{ .iterate = true });
+        defer shared_dir.close(io);
+        try writeFixtureFile(io, shared_dir, "tool", "initial-tool-bytes\n");
+        try writeFixtureFile(io, shared_dir, "extra", "initial-extra-bytes\n");
+        const shared_tree_path = try std.fs.path.join(allocator, &.{ fixture_path, "shared-tree" });
+        defer allocator.free(shared_tree_path);
+        const shared_tool_path = try std.fs.path.join(allocator, &.{ shared_tree_path, "tool" });
+        defer allocator.free(shared_tool_path);
+        const file_bindings = [_]input.Binding{.{ .role = "tool:zig", .path = shared_tool_path }};
+        const tree_bindings = [_]input.Binding{.{ .role = "zig", .path = shared_tree_path }};
+        var captured = try input.capture(allocator, io, &file_bindings, &tree_bindings);
+        defer captured.deinit(allocator);
+        try input.requireSame(allocator, io, captured, &file_bindings, &tree_bindings);
+        {
+            const tool_file = try shared_dir.openFile(io, "tool", .{ .mode = .read_write, .follow_symlinks = false });
+            defer tool_file.close(io);
+            try tool_file.writePositionalAll(io, "mutated-tool-bytes\n", 0);
+        }
+        try std.testing.expectError(error.InputChanged, input.requireSame(allocator, io, captured, &file_bindings, &tree_bindings));
+        {
+            const tool_file = try shared_dir.openFile(io, "tool", .{ .mode = .read_write, .follow_symlinks = false });
+            defer tool_file.close(io);
+            try tool_file.writePositionalAll(io, "initial-tool-bytes\n", 0);
+        }
+        var recaptured = try input.capture(allocator, io, &file_bindings, &tree_bindings);
+        defer recaptured.deinit(allocator);
+        {
+            const extra_file = try shared_dir.openFile(io, "extra", .{ .mode = .read_write, .follow_symlinks = false });
+            defer extra_file.close(io);
+            try extra_file.writePositionalAll(io, "mutated-extra-bytes\n", 0);
+        }
+        try std.testing.expectError(error.InputChanged, input.requireSame(allocator, io, recaptured, &file_bindings, &tree_bindings));
+    }
 }
 
 test "missing input symlink target enforces the absolute 64-component boundary" {

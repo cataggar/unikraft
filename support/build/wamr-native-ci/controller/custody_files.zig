@@ -42,6 +42,38 @@ pub fn readFile(io: std.Io, path: []const u8, limit: u64, private: bool) !File {
     return readRetained(io, &retained, limit);
 }
 
+pub fn readFileCached(
+    io: std.Io,
+    path: []const u8,
+    limit: u64,
+    private: bool,
+    known: ?*std.AutoHashMap([9]i128, [64]u8),
+) !File {
+    var retained = try files.RetainedFile.open(io, path, if (private) .private else .artifact);
+    defer retained.close(io);
+    const before = retained.file_snapshot;
+    if (before.mode & linux.S.IFMT != linux.S.IFREG or
+        (before.uid == 0 and before.nlink == 0) or
+        (before.uid != 0 and before.nlink != 1) or
+        (before.uid != linux.geteuid() and before.uid != 0) or
+        before.mode & 0o022 != 0 or before.size > limit)
+        return error.UnsafeFile;
+    const meta = metadata(before);
+    if (known) |cache| if (cache.get(meta)) |sha256| {
+        if (!std.meta.eql(meta, metadata(try files.snapshot(retained.file))))
+            return error.FileChanged;
+        try retained.verify(io);
+        return .{
+            .bytes = before.size,
+            .sha256 = sha256,
+            .metadata = meta,
+        };
+    };
+    const file = try readRetained(io, &retained, limit);
+    if (known) |cache| try cache.put(file.metadata, file.sha256);
+    return file;
+}
+
 /// Hashes the borrowed descriptor, never a separate pathname open.
 pub fn readRetained(io: std.Io, retained: *const files.RetainedFile, limit: u64) !File {
     const before = retained.file_snapshot;

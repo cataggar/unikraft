@@ -548,6 +548,7 @@ const TreeCounter = struct {
     hash_work: usize = 0,
     hash_limit: usize = limits.input_bytes,
     identities: std.AutoHashMap([9]i128, [64]u8),
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8) = null,
     content: Sha256,
     physical_hash: Sha256,
 };
@@ -568,9 +569,17 @@ fn treeFile(io: std.Io, path: []const u8, state: *TreeCounter) !physical.File {
         return .{ .bytes = before.size, .sha256 = sha256, .metadata = metadata };
     }
     try limits.addBounded(&state.hash_work, @intCast(before.size), state.hash_limit);
+    if (state.known_files) |known| if (known.get(metadata)) |sha256| {
+        if (!std.meta.eql(metadata, physical.metadata(try files.snapshot(retained.file))))
+            return error.InputChanged;
+        try retained.verify(io);
+        try state.identities.put(metadata, sha256);
+        return .{ .bytes = before.size, .sha256 = sha256, .metadata = metadata };
+    };
     const identity = try physical.readRetained(io, &retained, limits.input_file);
     if (!std.meta.eql(identity.metadata, metadata)) return error.InputChanged;
     try state.identities.put(metadata, identity.sha256);
+    if (state.known_files) |known| try known.put(identity.metadata, identity.sha256);
     return identity;
 }
 
@@ -747,11 +756,18 @@ fn treeWalk(allocator: std.mem.Allocator, io: std.Io, root: []const u8, prefix: 
     if (!files.sameSnapshot(before, try physical.directory(io, path, false))) return error.InputChanged;
 }
 
-fn treeBounded(allocator: std.mem.Allocator, io: std.Io, binding: Binding, hash_limit: usize) !TreeRecord {
+fn treeBounded(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    binding: Binding,
+    hash_limit: usize,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+) !TreeRecord {
     if (hash_limit > limits.input_bytes) return error.LimitExceeded;
     var state: TreeCounter = .{
         .hash_limit = hash_limit,
         .identities = std.AutoHashMap([9]i128, [64]u8).init(allocator),
+        .known_files = known_files,
         .content = Sha256.init(.{}),
         .physical_hash = Sha256.init(.{}),
     };
@@ -772,12 +788,12 @@ fn treeBounded(allocator: std.mem.Allocator, io: std.Io, binding: Binding, hash_
 }
 
 pub fn tree(allocator: std.mem.Allocator, io: std.Io, binding: Binding) !TreeRecord {
-    return treeBounded(allocator, io, binding, limits.input_bytes);
+    return treeBounded(allocator, io, binding, limits.input_bytes, null);
 }
 
 pub const Fixture = struct {
     pub fn treeWithHashLimit(allocator: std.mem.Allocator, io: std.Io, binding: Binding, hash_limit: usize) !TreeRecord {
-        return treeBounded(allocator, io, binding, hash_limit);
+        return treeBounded(allocator, io, binding, hash_limit, null);
     }
 };
 
@@ -860,6 +876,18 @@ fn consumerDocument(allocator: std.mem.Allocator, custody: Custody, aggregate: b
 }
 
 pub fn capture(allocator: std.mem.Allocator, io: std.Io, file_paths: []const Binding, tree_paths: []const Binding) !Custody {
+    var known = std.AutoHashMap([9]i128, [64]u8).init(allocator);
+    defer known.deinit();
+    return captureWithKnown(allocator, io, file_paths, tree_paths, &known);
+}
+
+pub fn captureWithKnown(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    file_paths: []const Binding,
+    tree_paths: []const Binding,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+) !Custody {
     const sorted_files = try allocator.dupe(Binding, file_paths);
     defer allocator.free(sorted_files);
     const sorted_trees = try allocator.dupe(Binding, tree_paths);
@@ -879,7 +907,7 @@ pub fn capture(allocator: std.mem.Allocator, io: std.Io, file_paths: []const Bin
     for (sorted_files, 0..) |binding, index| {
         if (index != 0 and std.mem.eql(u8, binding.role, sorted_files[index - 1].role))
             return error.DuplicateInputRole;
-        const identity = try physical.readFile(io, binding.path, limits.input_file, false);
+        const identity = try physical.readFileCached(io, binding.path, limits.input_file, false, known_files);
         if (identity.bytes == 0) return error.EmptyInputFile;
         for (result.files[0..index]) |prior| {
             if (prior.metadata[0] == identity.metadata[0] and prior.metadata[1] == identity.metadata[1])
@@ -891,7 +919,7 @@ pub fn capture(allocator: std.mem.Allocator, io: std.Io, file_paths: []const Bin
     for (sorted_trees, 0..) |binding, index| {
         if (index != 0 and std.mem.eql(u8, binding.role, sorted_trees[index - 1].role))
             return error.DuplicateInputRole;
-        result.trees[index] = try tree(allocator, io, binding);
+        result.trees[index] = try treeBounded(allocator, io, binding, limits.input_bytes, known_files);
         try addAncestors(allocator, io, binding.path, &ancestors);
     }
     for (ancestors.items) |record| {
