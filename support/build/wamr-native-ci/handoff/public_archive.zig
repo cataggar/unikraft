@@ -189,8 +189,14 @@ fn addMember(a: std.mem.Allocator, members: []Member, cursor: *usize, item: std.
 pub fn verifyBytes(allocator: std.mem.Allocator, bytes: []const u8, context: Context, expected_digest: ?[32]u8) !Metadata {
     try context.validate();
     if (bytes.len > layout.max_total_bytes) return error.TooLarge;
+    return verifyBytesWithDigest(allocator, bytes, context, expected_digest, zip.sha256(bytes));
+}
+
+fn verifyBytesWithDigest(allocator: std.mem.Allocator, bytes: []const u8, context: Context, expected_digest: ?[32]u8, archive_digest: [32]u8) !Metadata {
+    try context.validate();
+    if (bytes.len > layout.max_total_bytes) return error.TooLarge;
     if (expected_digest) |digest| {
-        if (!std.mem.eql(u8, &zip.sha256(bytes), &digest)) return error.DigestMismatch;
+        if (!std.mem.eql(u8, &archive_digest, &digest)) return error.DigestMismatch;
     } else if (!profile.omitsExternalArchiveDigest(.{ .revision = context.source_revision, .tree = context.source_tree })) {
         return error.MissingArchiveDigest;
     }
@@ -218,10 +224,7 @@ pub fn verifyBytes(allocator: std.mem.Allocator, bytes: []const u8, context: Con
     }
     expected_storage[metadata.selected.len] = expectedSlice("bundle.json", metadata.bundle);
     expected_storage[metadata.selected.len + 1] = expectedSlice("public-source.json", metadata.manifest);
-    try zip.verifyArchive(bytes, .{
-        .members = expected_storage[0..views.len],
-        .archive_sha256 = expected_digest orelse zip.sha256(bytes),
-    });
+    try zip.verifyIndexedViews(views, expected_storage[0..views.len]);
     if (expected_digest == null) {
         if (metadata.compatibility != .frozen_tiny_v1) return error.MissingArchiveDigest;
         for (views) |view| {
@@ -252,12 +255,10 @@ pub const Archive = struct {
         var image = try readImage(allocator, io, &retained, cancel);
         errdefer image.deinit();
         try copy.checkCancellation(cancel);
-        var metadata = try verifyBytes(allocator, image.bytes(), context, expected_digest);
-        errdefer metadata.deinit();
         const digest = zip.sha256(image.bytes());
+        var metadata = try verifyBytesWithDigest(allocator, image.bytes(), context, expected_digest, digest);
+        errdefer metadata.deinit();
         try copy.verifyRetained(io, &retained);
-        const actual = try copy.hashRetained(io, &retained, layout.max_total_bytes, cancel);
-        try equal(&actual, &std.fmt.bytesToHex(digest, .lower));
         return .{ .allocator = allocator, .retained = retained, .image = image, .metadata = metadata, .digest = digest };
     }
 
@@ -290,7 +291,7 @@ pub const Archive = struct {
             try writeMember(io, directory.dir, name, view.bytes);
         }
         try syncDir(io, directory.dir);
-        try self.revalidate(io, cancel);
+        try copy.verifyRetained(io, &self.retained);
         var accepted = try accepted_run.openImportedStage(self.allocator, io, &directory, output_path);
         errdefer accepted.deinit();
         const path = try self.allocator.dupe(u8, output_path);
@@ -305,9 +306,10 @@ pub const Imported = struct {
     path: []const u8,
 
     pub fn revalidate(self: *Imported, io: std.Io, signal: ?*core.process.SignalCancellation) !void {
-        try self.archive.revalidate(io, if (signal) |active| active.flag() else null);
+        const cancel = if (signal) |active| active.flag() else null;
+        try self.archive.revalidate(io, cancel);
         try self.accepted.revalidateWithSignal(signal);
-        try self.archive.revalidate(io, if (signal) |active| active.flag() else null);
+        try copy.verifyRetained(io, &self.archive.retained);
     }
     pub fn deinit(self: *Imported, io: std.Io) void {
         self.accepted.deinit();
@@ -518,7 +520,6 @@ const Pack = struct {
         }
         try verifyManifest(invocation.io, manifest, manifest_digest, self.cancel());
         if (inspection) |*held_inspection| try held_inspection.verify(invocation.io, self.cancel());
-        try self.revalidate(fixture);
         try verifySourceDirectories(source_root, source_directory.dir, source_snapshot, held.items);
         self.phase = .reserved;
         const directory = try reserve(invocation.io, invocation.output_path, &self.reserved);
@@ -577,12 +578,12 @@ const Pack = struct {
         try self.revalidate(fixture);
         if (inspection) |*held_inspection| try held_inspection.verify(invocation.io, self.cancel());
         try verifyManifest(invocation.io, manifest, manifest_digest, self.cancel());
-        for (held.items) |*item| _ = try measure(invocation.io, &item.retained, item.member, self.cancel());
+        for (held.items) |*item| try copy.verifyRetained(invocation.io, &item.retained);
         try inspectTree(invocation.allocator, invocation.io, source_directory.dir, "", metadata.selected);
         try copy.verifyRoot(invocation.io, source_root, source_snapshot);
         try verifySourceDirectories(source_root, source_directory.dir, source_snapshot, held.items);
         try copy.verifyRoot(invocation.io, invocation.output_path, output_snapshot);
-        try reopened.revalidate(invocation.io, self.cancel());
+        try copy.verifyRetained(invocation.io, &reopened.retained);
         try copy.checkCancellation(self.cancel());
         if (invocation.fault == .before_parent_sync) return error.AmbiguousWrite;
         try syncDir(invocation.io, directory.dir);
@@ -601,12 +602,12 @@ const Pack = struct {
         defer invocation.allocator.free(final_path);
         var final = try files.RetainedFile.open(invocation.io, final_path, .private);
         defer final.close(invocation.io);
-        const actual = try copy.hashRetained(invocation.io, &final, layout.max_total_bytes, self.cancel());
-        try equal(&actual, &std.fmt.bytesToHex(digest, .lower));
-        try self.revalidate(fixture);
+        if (!copy.sameCustodySnapshot(reopened.retained.file_snapshot, final.file_snapshot))
+            return error.FileChanged;
+        try copy.verifyRetained(invocation.io, &final);
         if (inspection) |*held_inspection| try held_inspection.verify(invocation.io, self.cancel());
         try verifyManifest(invocation.io, manifest, manifest_digest, self.cancel());
-        for (held.items) |*item| _ = try measure(invocation.io, &item.retained, item.member, self.cancel());
+        for (held.items) |*item| try copy.verifyRetained(invocation.io, &item.retained);
         try verifySourceDirectories(source_root, source_directory.dir, source_snapshot, held.items);
         return .{ .sha256 = digest, .bytes = final.file_snapshot.size, .members = held.items.len + 2 };
     }

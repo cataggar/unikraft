@@ -92,8 +92,7 @@ fn exportRun(inv: ExportInvocation, phase: *Phase, reserved: *bool) !Outcome(arc
         if (!std.mem.eql(u8, @field(ci, key), @field(inv.context, key))) return error.ContextMismatch;
     phase.* = .private_validation;
     reserved.* = true;
-    try validation.runPrivate(inv.allocator, inv.io, &bundle, inv.validation_output, inv.signal);
-    try bundle.revalidate(inv.signal);
+    try validation.runPrivateValidated(inv.allocator, inv.io, &bundle, inv.validation_output, inv.signal);
     phase.* = .archive;
     return switch (archive.pack(.{
         .allocator = inv.allocator,
@@ -169,10 +168,19 @@ pub const ImportedProduct = struct {
     fn sourceArchive(self: *ImportedProduct) *archive.Archive {
         return if (self.download) |*owner| &owner.standalone.archive else &self.historical.?;
     }
-    fn retain(self: *ImportedProduct, path: []const u8, limit: u64, cancel: ?*const std.atomic.Value(bool)) !Held {
+        fn retain(self: *ImportedProduct, path: []const u8, limit: u64, cancel: ?*const std.atomic.Value(bool)) !Held {
         var file = try files.RetainedFile.open(self.io, path, .private);
         errdefer file.close(self.io);
         return .{ .file = file, .digest = try copy.hashRetained(self.io, &file, limit, cancel), .limit = limit };
+    }
+    fn retainCopied(self: *ImportedProduct, path: []const u8, copied: copy.Result, limit: u64, cancel: ?*const std.atomic.Value(bool)) !Held {
+        try copy.checkCancellation(cancel);
+        var file = try files.RetainedFile.open(self.io, path, .private);
+        errdefer file.close(self.io);
+        if (!copy.sameCustodySnapshot(copied.destination_snapshot, file.file_snapshot))
+            return error.CopyChanged;
+        try copy.verifyRetained(self.io, &file);
+        return .{ .file = file, .digest = copied.sha256, .limit = limit };
     }
     fn verifyHeld(self: *ImportedProduct, held: *Held, cancel: ?*const std.atomic.Value(bool)) !void {
         const digest = try copy.hashRetained(self.io, &held.file, held.limit, cancel);
@@ -183,17 +191,52 @@ pub const ImportedProduct = struct {
         try copy.checkCancellation(cancel);
         if (self.container) |*held| try self.verifyHeld(held, cancel);
         if (self.downloaded) |*owner| try owner.revalidate(self.io, signal) else if (self.materialized) |*owner|
-            try owner.revalidate(self.io, signal);
-        if (self.download) |*owner| try owner.revalidate(self.io, cancel) else if (self.historical) |*owner|
+            try owner.revalidate(self.io, signal)
+        else if (self.download) |*owner| try owner.revalidate(self.io, cancel) else if (self.historical) |*owner|
             try owner.revalidate(self.io, cancel);
-        for (self.members.items) |*held| try self.verifyHeld(held, cancel);
+        for (self.members.items) |*held| {
+            if (self.bundle != null and held.limit > layout.max_json_bytes)
+                try copy.verifyRetained(self.io, &held.file)
+            else
+                try self.verifyHeld(held, cancel);
+        }
         if (self.candidate) |*held| try self.verifyHeld(held, cancel);
         if (self.receipt) |*held| try self.verifyHeld(held, cancel);
-        if (self.native) |*owner| try owner.revalidate(self.io, self.repository, signal);
+        if (self.native) |*owner| {
+            if (self.bundle) |*bundle| {
+                if (!owner.tools.before.same(bundle.tools.before)) return error.SourceChanged;
+                try owner.revalidateOutputs(self.io);
+            } else try owner.revalidate(self.io, self.repository, signal);
+        }
         if (self.directory != null and self.candidate != null) try self.verifyOutputTree();
         for (self.sealed.items) |held|
             if (!copy.sameCustodySnapshot(held.snapshot, try copy.directorySnapshot(held.directory.dir)))
                 return error.OutputChanged;
+    }
+    fn verifyPublishedAfterOpen(self: *ImportedProduct, signal: ?*core.process.SignalCancellation) !void {
+        const cancel = if (signal) |active| active.flag() else null;
+        try copy.checkCancellation(cancel);
+        if (self.container) |*held| try copy.verifyRetained(self.io, &held.file);
+        if (self.download) |*owner| try owner.standalone.verifyDirectory(self.io);
+        try copy.verifyRetained(self.io, &self.sourceArchive().retained);
+        for (self.members.items) |*held| {
+            if (held.limit > layout.max_json_bytes)
+                try copy.verifyRetained(self.io, &held.file)
+            else
+                try self.verifyHeld(held, cancel);
+        }
+        if (self.candidate) |*held| try self.verifyHeld(held, cancel);
+        if (self.receipt) |*held| try self.verifyHeld(held, cancel);
+        if (self.native) |*owner| {
+            if (!owner.tools.before.same(self.bundle.?.tools.before)) return error.SourceChanged;
+            try owner.revalidateOutputs(self.io);
+        }
+        try self.verifyOutputTree();
+        for (self.sealed.items) |held|
+            if (!copy.sameCustodySnapshot(held.snapshot, try copy.directorySnapshot(held.directory.dir)))
+                return error.OutputChanged;
+        try self.verifyHeld(&self.final.?, cancel);
+        try self.bundle.?.manifest.verify(self.io);
     }
     pub fn revalidate(self: *ImportedProduct, signal: ?*core.process.SignalCancellation) !void {
         if (self.publication != .durable or self.bundle == null or self.final == null)
@@ -201,7 +244,6 @@ pub const ImportedProduct = struct {
         try self.verifyInputs(signal);
         try self.bundle.?.revalidate(signal);
         try self.verifyHeld(&self.final.?, if (signal) |active| active.flag() else null);
-        try self.verifyInputs(signal);
     }
     pub fn deinit(self: *ImportedProduct) void {
         if (self.bundle) |*owner| owner.deinit();
@@ -357,7 +399,7 @@ fn importRun(owner: *ImportedProduct, inv: ImportInvocation, faults: ImportFault
         owner.downloaded = try download.materialize(inv.io, stage_path, cancel)
     else
         owner.materialized = try owner.historical.?.materialize(inv.io, stage_path, cancel);
-    try owner.verifyInputs(inv.signal);
+    try copy.checkCancellation(cancel);
     owner.phase = .copied;
     var budget: copy.Budget = .{};
     for (owner.metadata().selected, 0..) |member, index| {
@@ -373,7 +415,7 @@ fn importRun(owner: *ImportedProduct, inv: ImportInvocation, faults: ImportFault
         if (copied.size != member.size or !std.mem.eql(u8, &copied.sha256, &std.fmt.bytesToHex(member.sha256, .lower)))
             return error.CopyChanged;
         const path = try a.dupe(u8, copied.path);
-        var held = try owner.retain(path, member.limit, cancel);
+        var held = try owner.retainCopied(path, copied, member.limit, cancel);
         errdefer held.file.close(inv.io);
         try owner.members.append(inv.allocator, held);
     }
@@ -403,7 +445,7 @@ fn importRun(owner: *ImportedProduct, inv: ImportInvocation, faults: ImportFault
         errdefer directory.close(inv.io);
         try owner.sealed.append(inv.allocator, .{ .directory = directory, .snapshot = try copy.directorySnapshot(directory.dir) });
     }
-    try owner.verifyInputs(inv.signal);
+    try owner.verifyOutputTree();
     owner.phase = .native_validation;
     const native_output = try std.fs.path.join(a, &.{ owner.output, "private/native-validation" });
     owner.native = if (builtin.is_test and faults.native_command_refusal)
@@ -429,7 +471,6 @@ fn importRun(owner: *ImportedProduct, inv: ImportInvocation, faults: ImportFault
             inv.tools,
             inv.signal,
         );
-    try owner.verifyInputs(inv.signal);
     owner.phase = .publication;
     try copy.checkCancellation(cancel);
     if (builtin.is_test and faults.publication_collision)
@@ -458,7 +499,7 @@ fn importRun(owner: *ImportedProduct, inv: ImportInvocation, faults: ImportFault
         try changed.writePositionalAll(inv.io, "!", 0);
         try changed.sync(inv.io);
     }
-    try owner.revalidate(inv.signal);
+    try owner.verifyPublishedAfterOpen(inv.signal);
 }
 
 pub const Test = if (builtin.is_test) struct {

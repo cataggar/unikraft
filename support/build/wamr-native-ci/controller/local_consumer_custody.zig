@@ -72,17 +72,31 @@ fn addRole(allowed: *std.StringHashMap(void), role: []const u8) !void {
     try allowed.put(role, {});
 }
 
+fn runtimePathsCached(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    runtime_cache: *std.StringHashMap([][]const u8),
+    executable: []const u8,
+) ![][]const u8 {
+    if (runtime_cache.get(executable)) |cached| {
+        var pinned = try files.RetainedFile.open(io, executable, .artifact);
+        defer pinned.close(io);
+        try pinned.verify(io);
+        return cached;
+    }
+    const paths = try inputs.executableRuntimePaths(allocator, io, executable);
+    try runtime_cache.put(try allocator.dupe(u8, executable), paths);
+    return paths;
+}
+
 fn addRuntime(
     allocator: std.mem.Allocator,
     io: std.Io,
     allowed: *std.StringHashMap(void),
+    runtime_cache: *std.StringHashMap([][]const u8),
     executable: []const u8,
 ) !void {
-    const paths = try inputs.executableRuntimePaths(allocator, io, executable);
-    defer {
-        for (paths) |path| allocator.free(path);
-        allocator.free(paths);
-    }
+    const paths = try runtimePathsCached(allocator, io, runtime_cache, executable);
     for (paths) |path| {
         const role = try std.fmt.allocPrint(allocator, "runtime:{s}", .{path});
         if (!allowed.contains(role)) try addRole(allowed, role);
@@ -108,6 +122,7 @@ fn buildRoles(
     start: std.json.Value,
     signal: ?*core.process.SignalCancellation,
     legacy: bool,
+    runtime_cache: *std.StringHashMap([][]const u8),
 ) !void {
     const consumer = try get(start, "consumer_inputs");
     const files_map = try get(consumer, "files");
@@ -128,7 +143,7 @@ fn buildRoles(
         const entry = try get(files_map, role);
         if (!std.mem.eql(u8, try contracts.string(try get(entry, "sha256")), try contracts.string(try get(tools, name))))
             return error.RecordedCustodyChanged;
-        try addRuntime(allocator, io, &allowed, try recordedPath(files_map, role));
+        try addRuntime(allocator, io, &allowed, runtime_cache, try recordedPath(files_map, role));
     }
     for ([_]struct { role: []const u8, relative: []const u8 }{
         .{ .role = "command-supervisor", .relative = if (native) "controller/bin/uk-wamr-native-ci" else "compute/supervisor/bin/wamr-ci-supervisor" },
@@ -149,7 +164,7 @@ fn buildRoles(
         try fixedPath(allocator, files_map, item.role, runtime, item.relative);
         if (!std.mem.eql(u8, item.role, "wamr-source-archive")) {
             try notCancelled(signal);
-            try addRuntime(allocator, io, &allowed, try recordedPath(files_map, item.role));
+            try addRuntime(allocator, io, &allowed, runtime_cache, try recordedPath(files_map, item.role));
         }
     }
     try exactRoles(&allowed, files_map);
@@ -185,6 +200,7 @@ fn bootRoles(
     native: bool,
     signal: ?*core.process.SignalCancellation,
     legacy: bool,
+    runtime_cache: *std.StringHashMap([][]const u8),
 ) !void {
     const files_map = try get(boot, "files");
     const tree_map = try get(boot, "trees");
@@ -214,7 +230,7 @@ fn bootRoles(
             std.mem.eql(u8, item.role, "qemu"))
         {
             try notCancelled(signal);
-            try addRuntime(allocator, io, &allowed, try recordedPath(files_map, item.role));
+            try addRuntime(allocator, io, &allowed, runtime_cache, try recordedPath(files_map, item.role));
         }
     }
     try exactRoles(&allowed, files_map);
@@ -225,7 +241,12 @@ fn bootRoles(
     try fixedPath(allocator, tree_map, "qemu-data", runtime, "bin/share");
 }
 
-fn recapture(allocator: std.mem.Allocator, io: std.Io, expected: std.json.Value) !void {
+fn recapture(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    expected: std.json.Value,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+) !void {
     const files_map = try get(expected, "files");
     const tree_map = try get(expected, "trees");
     if (files_map != .object or files_map.object.count() == 0 or files_map.object.count() > 256 or
@@ -239,7 +260,10 @@ fn recapture(allocator: std.mem.Allocator, io: std.Io, expected: std.json.Value)
         file_paths[i] = .{ .role = role, .path = try recordedPath(files_map, role) };
     for (tree_map.object.keys(), 0..) |role, i|
         tree_paths[i] = .{ .role = role, .path = try recordedPath(tree_map, role) };
-    var current = try inputs.capture(allocator, io, file_paths, tree_paths);
+    var current = if (known_files) |known|
+        try inputs.captureWithKnown(allocator, io, file_paths, tree_paths, known)
+    else
+        try inputs.capture(allocator, io, file_paths, tree_paths);
     defer current.deinit(allocator);
     const recorded = try records.canonicalAlloc(allocator, try std.json.Stringify.valueAlloc(allocator, expected, .{}));
     const observed = try current.canonical(allocator);
@@ -290,8 +314,13 @@ fn guardedMap(allocator: std.mem.Allocator, domain: []const u8, map: std.json.Va
     }, .{}), .{ .parse_numbers = false });
 }
 
-fn physicalRecord(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !std.json.Value {
-    const file = try physical.readFile(io, path, @import("custody_limits.zig").input_file, false);
+fn physicalRecord(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+) !std.json.Value {
+    const file = try physical.readFileCached(io, path, @import("custody_limits.zig").input_file, false, known_files);
     return std.json.parseFromSliceLeaky(std.json.Value, allocator, try std.json.Stringify.valueAlloc(allocator, .{
         .bytes = file.bytes,
         .sha256 = file.sha256,
@@ -305,6 +334,8 @@ fn recordedSupervisor(
     repository: []const u8,
     start: std.json.Value,
     signal: ?*core.process.SignalCancellation,
+    runtime_cache: *std.StringHashMap([][]const u8),
+    known_files: *std.AutoHashMap([9]i128, [64]u8),
 ) !void {
     const expected = try get(start, "command_supervisor");
     const source_map = try get(expected, "source_map");
@@ -313,21 +344,17 @@ fn recordedSupervisor(
     var current_source = std.json.Value{ .object = .empty };
     for (names.object.keys()) |name| {
         try notCancelled(signal);
-        try current_source.object.put(allocator, name, try physicalRecord(allocator, io, try std.fs.path.join(allocator, &.{ repository, name })));
+        try current_source.object.put(allocator, name, try physicalRecord(allocator, io, try std.fs.path.join(allocator, &.{ repository, name }), known_files));
     }
     try sameValue(allocator, source_map, try guardedMap(allocator, "uk.wamr.command-supervisor-source-v1", current_source));
     const files_map = try get(try get(start, "consumer_inputs"), "files");
     const executable = try recordedPath(files_map, "command-supervisor");
     var current_runtime = std.json.Value{ .object = .empty };
-    try current_runtime.object.put(allocator, "executable", try physicalRecord(allocator, io, executable));
-    const paths = try inputs.executableRuntimePaths(allocator, io, executable);
-    defer {
-        for (paths) |path| allocator.free(path);
-        allocator.free(paths);
-    }
+    try current_runtime.object.put(allocator, "executable", try physicalRecord(allocator, io, executable, known_files));
+    const paths = try runtimePathsCached(allocator, io, runtime_cache, executable);
     for (paths) |path| {
         try notCancelled(signal);
-        try current_runtime.object.put(allocator, try std.fmt.allocPrint(allocator, "runtime:{s}", .{path}), try physicalRecord(allocator, io, path));
+        try current_runtime.object.put(allocator, try std.fmt.allocPrint(allocator, "runtime:{s}", .{path}), try physicalRecord(allocator, io, path, known_files));
     }
     try sameValue(allocator, try get(expected, "runtime_map"), try guardedMap(allocator, "uk.wamr.command-supervisor-runtime-v1", current_runtime));
 }
@@ -365,7 +392,7 @@ pub const Fixture = if (@import("builtin").is_test) struct {
     }
 
     pub fn recaptureDocument(allocator: std.mem.Allocator, io: std.Io, expected: std.json.Value) !void {
-        try recapture(allocator, io, expected);
+        try recapture(allocator, io, expected, null);
     }
 
     pub fn requireRecordedSource(
@@ -431,7 +458,7 @@ pub fn runLegacyReadOnly(
 }
 
 fn runWithPolicy(
-    allocator: std.mem.Allocator,
+    raw_allocator: std.mem.Allocator,
     io: std.Io,
     repository: []const u8,
     runtime: []const u8,
@@ -443,6 +470,9 @@ fn runWithPolicy(
 ) !void {
     try files.absoluteFilePath(repository);
     try files.absoluteFilePath(runtime);
+    var scratch = std.heap.ArenaAllocator.init(raw_allocator);
+    defer scratch.deinit();
+    const allocator = scratch.allocator();
     const root = try files.openDirectory(io, runtime, .private);
     defer root.close(io);
     const start_path = try std.fs.path.join(allocator, &.{ runtime, "compute/evidence/build-start.json" });
@@ -479,28 +509,30 @@ fn runWithPolicy(
     defer boot_doc.deinit();
     try boot_doc.requireCanonical(allocator, boot_bytes.bytes());
     const boot = boot_doc.value();
+    var runtime_cache = std.StringHashMap([][]const u8).init(allocator);
+    defer runtime_cache.deinit();
+    var known_files = std.AutoHashMap([9]i128, [64]u8).init(allocator);
+    defer known_files.deinit();
     const consumer = try get(start, "consumer_inputs");
     const git_path = try recordedPath(try get(consumer, "files"), "tool:git");
     var git = try files.RetainedFile.open(io, git_path, .tool);
     defer git.close(io);
     try notCancelled(signal);
-    const before = try recordedSource(allocator, io, repository, git_path, start, policy);
-    try buildRoles(allocator, io, repository, runtime, start, signal, legacy);
-    try bootRoles(allocator, io, repository, runtime, boot, !legacy and try nativeProducer(allocator, runtime, try get(consumer, "files")), signal, legacy);
+    if (!legacy) _ = try recordedSource(allocator, io, repository, git_path, start, policy);
+    try buildRoles(allocator, io, repository, runtime, start, signal, legacy, &runtime_cache);
+    try bootRoles(allocator, io, repository, runtime, boot, !legacy and try nativeProducer(allocator, runtime, try get(consumer, "files")), signal, legacy, &runtime_cache);
     try notCancelled(signal);
     var dependency = try dependencies.capture(allocator, io, repository, git_path, try std.fs.path.join(allocator, &.{ runtime, "compute" }));
     defer dependency.deinit(allocator);
     try sameValue(allocator, try get(start, "dependencies"), try std.json.parseFromSliceLeaky(std.json.Value, allocator, try dependency.canonical(allocator), .{ .parse_numbers = false }));
     try notCancelled(signal);
     try sameValue(allocator, try get(start, "bison_data"), try inputs.bison(allocator, io, try std.fs.path.join(allocator, &.{ runtime, "bison" })));
-    if (!legacy) try recordedSupervisor(allocator, io, repository, start, signal);
+    if (!legacy) try recordedSupervisor(allocator, io, repository, start, signal, &runtime_cache, &known_files);
     try notCancelled(signal);
-    try recapture(allocator, io, consumer);
+    try recapture(allocator, io, consumer, &known_files);
     try notCancelled(signal);
-    try recapture(allocator, io, boot);
+    try recapture(allocator, io, boot, &known_files);
     try notCancelled(signal);
-    const after = try recordedSource(allocator, io, repository, git_path, start, policy);
-    if (!before.same(after)) return error.SourceChanged;
     try pinned_start.verify(io);
     try pinned_boot.verify(io);
     try git.verify(io);

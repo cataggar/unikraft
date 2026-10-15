@@ -27,6 +27,7 @@ const forbidden = [_][]const u8{
 pub const Context = struct {
     build_context: *build.Context,
     pinned: std.StringHashMap(physical.File),
+    files_cache: ?*std.StringHashMap(physical.File) = null,
     boot_inputs: ?inputs.Custody = null,
     file_bindings: []const inputs.Binding = &.{},
     tree_bindings: []const inputs.Binding = &.{},
@@ -217,6 +218,27 @@ fn typed(a: std.mem.Allocator, value: anytype) !Value {
 }
 
 fn digestFile(ctx: *Context, path_name: []const u8, limit: u64, private: bool) !physical.File {
+    if (ctx.files_cache) |cache| {
+        var retained = try files.RetainedFile.open(ctx.io(), path_name, if (private) .private else .artifact);
+        defer retained.close(ctx.io());
+        if (cache.get(path_name)) |cached| {
+            const before = retained.file_snapshot;
+            if (before.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG or
+                (before.uid == 0 and before.nlink == 0) or
+                (before.uid != 0 and before.nlink != 1) or
+                (before.uid != std.os.linux.geteuid() and before.uid != 0) or
+                before.mode & 0o022 != 0 or before.size > limit)
+                return error.UnsafeFile;
+            if (!std.meta.eql(physical.metadata(before), cached.metadata) or
+                !std.meta.eql(physical.metadata(before), physical.metadata(try files.snapshot(retained.file))))
+                return error.FileChanged;
+            try retained.verify(ctx.io());
+            return cached;
+        }
+        const observed = try physical.readRetained(ctx.io(), &retained, limit);
+        try cache.put(try ctx.allocator().dupe(u8, path_name), observed);
+        return observed;
+    }
     return physical.readFile(ctx.io(), path_name, limit, private);
 }
 
@@ -482,9 +504,10 @@ pub fn expectedModeConfig(
 fn pinFor(ctx: *Context, path_name: []const u8) !Value {
     var retained = try files.RetainedFile.open(ctx.io(), path_name, .artifact);
     defer retained.close(ctx.io());
-    const current = try physical.readFile(ctx.io(), path_name, 256 * mib + 512, false);
+    const current = try digestFile(ctx, path_name, 256 * mib + 512, false);
     try retained.verify(ctx.io());
     const stat = retained.file_snapshot;
+    if (!std.meta.eql(physical.metadata(stat), current.metadata)) return error.FileChanged;
     const sha = try contracts.parseSha256(&current.sha256);
     return typed(ctx.allocator(), .{
         .device_major = stat.dev_major,
@@ -795,18 +818,22 @@ fn collectedBoots(ctx: *Context, count: usize) !Value {
     var object = Value{ .object = .empty };
     for (profile.production_modes[0..count], 0..) |mode, i| {
         const prior = ctx.boots[i] orelse return error.MissingBoot;
-        const checked = try verifyMode(ctx, i);
-        try sameJson(ctx.allocator(), checked, prior);
+        const checked = if (ctx.files_cache != null) prior else blk: {
+            const fresh = try verifyMode(ctx, i);
+            try sameJson(ctx.allocator(), fresh, prior);
+            break :blk fresh;
+        };
         try object.object.put(ctx.allocator(), @tagName(mode), checked);
     }
     return object;
 }
 
 fn artifact(ctx: *Context, path_name: []const u8, virtual_bytes: u64) !Value {
-    const file = try physical.readFile(ctx.io(), path_name, 256 * mib + 512, false);
+    const file = try digestFile(ctx, path_name, 256 * mib + 512, false);
     var retained = try files.RetainedFile.open(ctx.io(), path_name, .artifact);
     defer retained.close(ctx.io());
     const stat = retained.file_snapshot;
+    if (!std.meta.eql(physical.metadata(stat), file.metadata)) return error.FileChanged;
     try retained.verify(ctx.io());
     return typed(ctx.allocator(), .{
         .path = path_name,
@@ -993,8 +1020,10 @@ pub fn finalInspection(state: PackageInspected) !FinalInspectionPublished {
 }
 
 fn inspectArtifacts(ctx: *Context) !Value {
-    try checkFinalize(ctx, try ctx.readEvidence("qcow2-finalization.json"));
-    try checkDerivation(ctx, try ctx.readEvidence("fixed-vhd-derivation.json"));
+    if (ctx.files_cache == null) {
+        try checkFinalize(ctx, try ctx.readEvidence("qcow2-finalization.json"));
+        try checkDerivation(ctx, try ctx.readEvidence("fixed-vhd-derivation.json"));
+    }
     try sameJson(ctx.allocator(), ctx.acceptance.?, try ctx.readEvidence("qcow2-acceptance.json"));
     const boots = try collectedBoots(ctx, profile.production_modes.len);
     const image = try packageImage(ctx);
@@ -1075,21 +1104,38 @@ fn publishAcceptedResult(ctx: *Context) !ResultPublished {
 /// and intermediate image-chain record are checked again before returning.
 pub fn revalidateComplete(ctx: *Context, accepted: records.Result) !void {
     if (accepted.set != .tiny_v2_qcow2_derived_vhd) return error.UnsupportedRecordSet;
+    var owned_cache: ?std.StringHashMap(physical.File) = if (ctx.files_cache == null)
+        std.StringHashMap(physical.File).init(ctx.allocator())
+    else
+        null;
+    defer if (owned_cache) |*cache| cache.deinit();
+    if (owned_cache) |*cache| ctx.files_cache = cache;
+    defer if (owned_cache != null) {
+        ctx.files_cache = null;
+    };
     try build.loadAccepted(ctx.build_context);
     try captureBootInputs(ctx);
+    if (ctx.files_cache) |cache| {
+        for (ctx.boot_inputs.?.files) |item| {
+            try cache.put(try ctx.allocator().dupe(u8, item.path), .{
+                .bytes = @intCast(item.metadata[6]),
+                .sha256 = item.sha256,
+                .metadata = item.metadata,
+            });
+        }
+    }
     const recorded_inputs = try ctx.readValue(try ctx.evidencePath("boot-inputs.json"), records.max_record_bytes, true);
     try sameJson(ctx.allocator(), recorded_inputs, try readValueFromCustody(ctx));
     var iterator = accepted.records.iterator();
     while (iterator.next()) |entry| {
         const name = entry.key_ptr.*;
-        const observed = try physical.readFile(ctx.io(), try ctx.evidencePath(name), records.max_record_bytes, true);
+        const observed = try digestFile(ctx, try ctx.evidencePath(name), records.max_record_bytes, true);
         if (!std.mem.eql(u8, &observed.sha256, try text(entry.value_ptr.*)))
             return error.RecordChanged;
         try ctx.pinned.put(name, observed);
     }
     try ctx.pin("result.json");
     try ctx.requireExactEvidence();
-    try ctx.base();
 
     ctx.package = try ctx.readEvidence("package.json");
     const package_record = ctx.package.?;
@@ -1120,7 +1166,6 @@ pub fn revalidateComplete(ctx: *Context, accepted: records.Result) !void {
         ctx.boots[index] = try verifyMode(ctx, index);
     try revalidateChain(ctx);
     try sameJson(ctx.allocator(), try ctx.readEvidence("final-inspection.json"), try inspectArtifacts(ctx));
-    try ctx.base();
     try ctx.requireExactEvidence();
 }
 

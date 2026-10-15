@@ -110,21 +110,22 @@ pub const Standalone = struct {
             .snapshot = snapshot,
             .archive = retained,
         };
-        try result.revalidate(io, cancel);
+        try result.verifyDirectory(io);
         return result;
+    }
+
+    pub fn verifyDirectory(self: *const Standalone, io: std.Io) !void {
+        try copy.verifyRoot(io, self.path, self.snapshot);
+        try exactMember(io, self.directory.dir);
+        if (!copy.sameCustodySnapshot(self.snapshot, try copy.directorySnapshot(self.directory.dir)))
+            return error.DownloadChanged;
     }
 
     pub fn revalidate(self: *const Standalone, io: std.Io, cancel: ?*const std.atomic.Value(bool)) !void {
         try copy.checkCancellation(cancel);
-        try copy.verifyRoot(io, self.path, self.snapshot);
-        try exactMember(io, self.directory.dir);
-        if (!copy.sameCustodySnapshot(self.snapshot, try copy.directorySnapshot(self.directory.dir)))
-            return error.DownloadChanged;
+        try self.verifyDirectory(io);
         try self.archive.revalidate(io, cancel);
-        try exactMember(io, self.directory.dir);
-        if (!copy.sameCustodySnapshot(self.snapshot, try copy.directorySnapshot(self.directory.dir)))
-            return error.DownloadChanged;
-        try copy.verifyRoot(io, self.path, self.snapshot);
+        try self.verifyDirectory(io);
     }
 
     pub fn deinit(self: *Standalone, io: std.Io) void {
@@ -199,14 +200,17 @@ pub const Download = struct {
     }
 
     pub fn materialize(self: *Download, io: std.Io, output_path: []const u8, cancel: ?*const std.atomic.Value(bool)) !Imported {
-        try self.revalidate(io, cancel);
+        try copy.checkCancellation(cancel);
+        try self.standalone.verifyDirectory(io);
+        if (!std.mem.eql(u8, &self.expected.inner_digest.bytes, &self.standalone.archive.digest))
+            return error.DigestMismatch;
         const root = self.standalone.path;
         if (std.mem.eql(u8, root, output_path) or
             (std.mem.startsWith(u8, output_path, root) and output_path.len > root.len and output_path[root.len] == '/'))
             return error.OutputInsideDownload;
         var stage = try self.standalone.archive.materialize(io, output_path, cancel);
         errdefer stage.deinit(io);
-        try self.revalidate(io, cancel);
+        try self.standalone.verifyDirectory(io);
         return .{ .download = self, .stage = stage };
     }
 
@@ -223,9 +227,12 @@ pub const Imported = struct {
 
     pub fn revalidate(self: *Imported, io: std.Io, signal: ?*core.process.SignalCancellation) !void {
         const cancel = if (signal) |active| active.flag() else null;
-        try self.download.revalidate(io, cancel);
+        try copy.checkCancellation(cancel);
+        try self.download.standalone.verifyDirectory(io);
+        if (!std.mem.eql(u8, &self.download.expected.inner_digest.bytes, &self.download.standalone.archive.digest))
+            return error.DigestMismatch;
         try self.stage.revalidate(io, signal);
-        try self.download.revalidate(io, cancel);
+        try self.download.standalone.verifyDirectory(io);
     }
 
     pub fn deinit(self: *Imported, io: std.Io) void {

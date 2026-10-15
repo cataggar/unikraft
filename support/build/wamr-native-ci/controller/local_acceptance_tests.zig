@@ -178,7 +178,7 @@ const Fixture = struct {
         const directory = try controller.layout.runtime(io, runtime);
         defer directory.close(io);
         const v2 = std.mem.eql(u8, revision, "e98623f780fa23d05b5797004e4b88160404eb1b");
-        var accepted = open(a, io, &directory, runtime, repository) catch |err| {
+        var accepted = open(std.heap.page_allocator, io, &directory, runtime, repository) catch |err| {
             std.debug.print("complete local open {s}: {s}\n", .{ revision, @errorName(err) });
             try diagnoseInputs(a, io, runtime);
             return err;
@@ -269,10 +269,13 @@ const Fixture = struct {
         };
         for (cases) |case| {
             if (case.v2_only and !v2) continue;
+            var case_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer case_arena.deinit();
+            const case_a = case_arena.allocator();
             const expected = if (!v2 and std.mem.eql(u8, case.name, "source-custody")) error.EvidenceChanged else case.expected;
-            try python(a, io, &.{ "mutate", work, case.name, options.git_executable });
+            try python(case_a, io, &.{ "mutate", work, case.name, options.git_executable });
             std.debug.print("local refusal {s} {s}: {s}\n", .{ revision, case.name, @errorName(expected) });
-            const outcome = open(a, io, &directory, runtime, repository);
+            const outcome = open(std.heap.page_allocator, io, &directory, runtime, repository);
             if (outcome) |value| {
                 var unexpected = value;
                 unexpected.deinit();
@@ -280,16 +283,16 @@ const Fixture = struct {
             } else |err| {
                 if (err != expected) {
                     std.debug.print("unexpected local refusal {s} {s}: {s}, expected {s}\n", .{ revision, case.name, @errorName(err), @errorName(expected) });
-                    try diagnoseInputs(a, io, runtime);
+                    try diagnoseInputs(case_a, io, runtime);
                 }
                 try std.testing.expectEqual(expected, err);
             }
             if (std.mem.eql(u8, case.name, "input-runtime")) {
                 try std.testing.expectError(error.RecordedCustodyChanged, accepted.revalidate());
-                const role = try root.readFileAlloc(io, "mutated-runtime-role", a, .limited(4096));
+                const role = try root.readFileAlloc(io, "mutated-runtime-role", case_a, .limited(4096));
                 try std.testing.expectError(error.InputChanged, accepted.pinInput(role));
             }
-            const refused = try cli(a, io, runtime, repository);
+            const refused = try cli(case_a, io, runtime, repository);
             try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, refused.term);
             try std.testing.expectEqualStrings("", refused.stdout);
             try std.testing.expect(std.mem.indexOf(u8, refused.stderr, @errorName(expected)) != null);

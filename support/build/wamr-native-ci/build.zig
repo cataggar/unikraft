@@ -181,15 +181,18 @@ pub fn build(b: *std.Build) void {
     const CompositionGroup = enum { all, faults, retention };
     controller_options.addOption(CompositionGroup, "handoff_composition_group", b.option(CompositionGroup, "handoff-composition-group", "Select a focused real-owner handoff composition group") orelse .all);
     controller_options.addOption([]const u8, "local_fixture_source", b.option([]const u8, "local-fixture-source", "Select one complete historical local fixture revision for diagnosis") orelse "");
-    controller_options.addOption([]const u8, "repository_root", std.fs.path.resolve(b.allocator, &.{ b.graph.cache.cwd, b.build_root.path orelse ".", "../../.." }) catch
-        @panic("cannot resolve source root"));
+    const repository_root = std.fs.path.resolve(b.allocator, &.{ b.graph.cache.cwd, b.build_root.path orelse ".", "../../.." }) catch
+        @panic("cannot resolve source root");
+    controller_options.addOption([]const u8, "repository_root", repository_root);
     controller_options.addOption([]const u8, "zig_executable", b.graph.zig_exe);
     controller_options.addOption([]const u8, "git_executable", b.findProgram(&.{"git"}, &.{}) catch @panic("Git required for controller custody tests"));
     controller_options.addOption([]const u8, "python_executable", b.findProgram(&.{"python3"}, &.{}) catch @panic("Python required for handoff compatibility fixtures"));
     controller_options.addOptionPath("miz_package", b.dependency("public_image", .{ .target = target, .optimize = optimize }).builder.dependency("miz_source", .{ .target = target, .optimize = optimize }).path("."));
-    controller_options.addOption([]const u8, "fixture_root", std.fs.path.resolve(b.allocator, &.{
-        b.graph.cache.cwd, b.option([]const u8, "controller-fixture-root", "Existing absolute owner-private source fixture root") orelse b.cache_root.path orelse ".",
-    }) catch @panic("cannot resolve private controller test root"));
+    const explicit_controller_fixture_root = b.option([]const u8, "controller-fixture-root", "Existing absolute owner-private source fixture root");
+    const controller_fixture_root = std.fs.path.resolve(b.allocator, &.{
+        b.graph.cache.cwd, explicit_controller_fixture_root orelse b.cache_root.path orelse ".",
+    }) catch @panic("cannot resolve private controller test root");
+    controller_options.addOption([]const u8, "fixture_root", controller_fixture_root);
     const host_core = b.createModule(.{
         .root_source_file = b.path("../../tools/hyperv/core.zig"),
         .target = b.graph.host,
@@ -520,11 +523,20 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    source_limits_tests.root_module.addOptions("test_options", controller_options);
+    const source_limits_options = b.addOptions();
+    source_limits_options.addOption([]const u8, "repository_root", repository_root);
+    source_limits_options.addOption(
+        []const u8,
+        "fixture_root",
+        if (explicit_controller_fixture_root != null)
+            controller_fixture_root
+        else
+            b.pathJoin(&.{ controller_fixture_root, "source-limits-work" }),
+    );
+    source_limits_tests.root_module.addOptions("test_options", source_limits_options);
     const source_limits_run = b.addRunArtifact(source_limits_tests);
     b.step("test-controller-limits", "Run native source-custody production boundary fixtures")
         .dependOn(&source_limits_run.step);
-    controller_run.step.dependOn(&source_limits_run.step);
     controller_step.dependOn(&source_limits_run.step);
     const fault_parity_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -626,6 +638,7 @@ pub fn build(b: *std.Build) void {
     authority_direct.addFileArg(authority_contracts.getEmittedBin());
     b.step("test-authority-direct", "Run authority fixtures with direct failure output").dependOn(&authority_direct.step);
     const authority_python_goldens = b.addSystemCommand(&.{ "python3", "-B" });
+    authority_python_goldens.setEnvironmentVariable("WAMR_AUTHORITY_CONTRACT_SCRATCH", authority_fixture_root);
     authority_python_goldens.addFileArg(b.path("tests/test_authority_contract_goldens.py"));
     const authority_step = b.step("test-authority-contracts", "Run native/Python authority contract goldens");
     authority_step.dependOn(&authority_contracts_run.step);
@@ -641,8 +654,10 @@ pub fn build(b: *std.Build) void {
     // Parallel goldens must not create ancestors of recorded controller tools.
     const contract_fixture_dirs = b.addSystemCommand(&.{ "mkdir", "-p", "-m", "0700", "--" });
     contract_fixture_dirs.has_side_effects = true;
-    for ([_][]const u8{ "tmp", "handoff-export-tests", "handoff-python-goldens", "authority-contract-work", "install-target-work" }) |name|
+    for ([_][]const u8{ "tmp", "h", "o", "z", "handoff-export-tests", "handoff-python-goldens", "authority-contract-work", "install-target-work", "source-limits-work" }) |name|
         contract_fixture_dirs.addArg(b.pathJoin(&.{ handoff_fixture_root, name }));
+    if (explicit_controller_fixture_root == null)
+        contract_fixture_dirs.addArg(b.pathJoin(&.{ controller_fixture_root, "source-limits-work" }));
     for ([_]*std.Build.Step{
         &controller_run.step,
         &controller_direct.step,
@@ -719,6 +734,12 @@ pub fn build(b: *std.Build) void {
     pipeline_step.dependOn(&pipeline_run.step);
     const fixture_build = b.step("build-controller-fixtures", "Compile controller and package-boot fixture binaries without running them");
     for ([_]*std.Build.Step.Compile{
+        log_cli,
+        supervisor_fixture,
+        wamr_aot_build.artifact("uk-wamr-aot-build"),
+        cli,
+        controller_cli,
+        native_fixtures,
         controller_tests,
         source_limits_tests,
         fault_parity_tests,
@@ -726,8 +747,14 @@ pub fn build(b: *std.Build) void {
         record_goldens,
         handoff_contracts,
         authority_contracts,
+        authority_source_check,
+        tests,
         pipeline_tests,
-    }) |artifact| fixture_build.dependOn(&artifact.step);
+    }) |artifact| {
+        fixture_build.dependOn(&artifact.step);
+        controller_run.step.dependOn(&artifact.step);
+        controller_direct.step.dependOn(&artifact.step);
+    }
     const test_step = b.step("test", "Run unit and required private compute pipeline fixtures");
     test_step.dependOn(&unit_tests.step);
     test_step.dependOn(&pipeline_run.step);
