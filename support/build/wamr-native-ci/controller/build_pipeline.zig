@@ -704,6 +704,10 @@ pub fn buildValue(context: *Context) !std.json.Value {
     try requireConsumer(context);
     try dependencies.requireDocument(context.allocator, context.io, context.repository, context.git, context.compute, context.dependency.?);
     try cancelled(context);
+    return buildValueFromCurrent(context);
+}
+
+fn buildValueFromCurrent(context: *Context) !std.json.Value {
     try verifyRuntimeIdentity(context);
     const a = context.allocator;
     const app = try join(context, &.{ context.repository, "support/apps/wamr-aot" });
@@ -846,12 +850,16 @@ pub fn loadAccepted(context: *Context) !void {
             return error.BuildStageRefused;
         context.command_records[@intFromEnum(stage)] = try physical.readFile(io, path, limits.tracked_file, true);
     }
-    try revalidateAccepted(context);
+    try requireBuildEvidence(context);
+    try revalidateAcceptedWithValue(context, try buildValueFromCurrent(context));
 }
 
 pub fn revalidateAccepted(context: *Context) !void {
+    try revalidateAcceptedWithValue(context, try buildValue(context));
+}
+
+fn revalidateAcceptedWithValue(context: *Context, value: std.json.Value) !void {
     const actual = try readAcceptedRecord(context, "build.json");
-    const value = try buildValue(context);
     const encoded = try std.json.Stringify.valueAlloc(context.allocator, value, .{});
     if (!std.mem.eql(u8, actual, try records.canonicalAlloc(context.allocator, encoded)))
         return error.BuildChanged;

@@ -224,6 +224,17 @@ pub fn verifyArchive(bytes: []const u8, expected: ExpectedArchive) ZipError!void
     if (!std.mem.eql(u8, &sha256(bytes), &expected.archive_sha256)) return error.DigestMismatch;
 }
 
+pub fn verifyIndexedViews(views: []const MemberView, members: []const ExpectedMember) ZipError!void {
+    try validateExpectedMembers(members);
+    if (views.len != members.len) return error.UnexpectedMemberCount;
+    for (views, members) |view, item| {
+        if (!std.mem.eql(u8, view.name, item.name)) return error.OrderMismatch;
+        if (view.bytes.len != item.size) return error.SizeMismatch;
+        if (item.size > item.limit) return error.TooLarge;
+        if (!std.mem.eql(u8, &sha256(view.bytes), &item.sha256)) return error.DigestMismatch;
+    }
+}
+
 pub fn validateName(name: []const u8) ZipError!void {
     if (name.len == 0 or name.len > std.math.maxInt(u16)) return error.InvalidName;
     if (name[0] == '/' or name[name.len - 1] == '/') return error.InvalidName;

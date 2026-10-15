@@ -154,6 +154,9 @@ pub fn historical(
     } };
     const Fault = enum { foreign_output, materialization, copy_sync, native_identity, native_command, publication_unknown, publication_sync, final_collision, final_revalidation };
     for (std.enums.values(Fault)) |fault| {
+        var step_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer step_arena.deinit();
+        const step_a = step_arena.allocator();
         const name = @tagName(fault);
         const output = try work.join(name);
         if (fault == .foreign_output) {
@@ -163,7 +166,7 @@ pub fn historical(
         var local_tools = tools;
         if (fault == .native_identity) local_tools.validator = options.command_fixture;
         const result = products.Test.importBundle(.{
-            .allocator = a,
+            .allocator = std.testing.allocator,
             .io = io,
             .repository = repository,
             .input = input,
@@ -216,21 +219,21 @@ pub fn historical(
         else if (fault == .materialization)
             try std.testing.expectEqualStrings("foreign materialization\n", try work.read("materialization/private/materialized/foreign"))
         else {
-            const directory = try files.Directory.open(io, try std.fs.path.join(a, &.{ output, "private/materialized" }));
+            const directory = try files.Directory.open(io, try std.fs.path.join(step_a, &.{ output, "private/materialized" }));
             directory.close(io);
         }
         if (fault == .final_collision)
             try std.testing.expectEqualStrings("foreign final bundle\n", try work.read("final_collision/bundle.json"))
         else if (fault != .publication_sync and fault != .final_revalidation)
-            try work.absent(try std.fmt.allocPrint(a, "{s}/bundle.json", .{name}));
+            try work.absent(try std.fmt.allocPrint(step_a, "{s}/bundle.json", .{name}));
         if (fault == .copy_sync) {
-            const copied = try work.root.openFile(io, try std.fmt.allocPrint(a, "{s}/{s}", .{ name, metadata.selected[0].name }), .{});
+            const copied = try work.root.openFile(io, try std.fmt.allocPrint(step_a, "{s}/{s}", .{ name, metadata.selected[0].name }), .{});
             defer copied.close(io);
             try std.testing.expectEqual(metadata.selected[0].size, (try copied.stat(io)).size);
         }
         if (fault == .native_command) {
             const record = try work.read("native_command/private/native-validation/evidence/command-import-native-revalidation.json");
-            var document = try handoff.contracts.parseCanonical(a, record);
+            var document = try handoff.contracts.parseCanonical(step_a, record);
             defer document.deinit();
             try std.testing.expectEqual(@as(i32, 1), try core.contracts.integer(i32, document.value().object.get("exit_code").?));
             const changed = try work.read("native_command/candidate-bundle.json");
@@ -240,24 +243,26 @@ pub fn historical(
             try std.testing.expect((try log.stat(io)).size > 0);
         }
     }
-    const imported = products.importBundle(.{ .allocator = a, .io = io, .repository = repository, .input = input, .output = try work.join("success"), .tools = tools });
-    if (imported != .success) std.debug.print("historical import: {any}\n", .{imported});
-    try std.testing.expect(imported == .success);
-    const owner = imported.success;
-    defer owner.deinit();
-    try owner.revalidate(null);
-    const finalized = candidate.create(.{
-        .allocator = a,
-        .io = io,
-        .source = .{ .imported_product = owner },
-        .output = try work.join("historical-candidate.json"),
-        .validation_output = try work.join("historical-candidate-validation"),
-        .settings = .{ .attempt_id = "00000000-0000-4000-8000-000000000001" },
-    });
-    if (finalized != .success) std.debug.print("historical candidate: {any}\n", .{finalized});
-    try std.testing.expect(finalized == .success);
-    defer finalized.success.deinit();
-    _ = try finalized.success.result(try std.fs.path.join(a, &.{ owner.bundle.?.evidence.root, "boots/raw-x2apic/serial" }), null, null);
+    {
+        const imported = products.importBundle(.{ .allocator = std.testing.allocator, .io = io, .repository = repository, .input = input, .output = try work.join("success"), .tools = tools });
+        if (imported != .success) std.debug.print("historical import: {any}\n", .{imported});
+        try std.testing.expect(imported == .success);
+        const owner = imported.success;
+        defer owner.deinit();
+        try owner.revalidate(null);
+        const finalized = candidate.create(.{
+            .allocator = std.testing.allocator,
+            .io = io,
+            .source = .{ .imported_product = owner },
+            .output = try work.join("historical-candidate.json"),
+            .validation_output = try work.join("historical-candidate-validation"),
+            .settings = .{ .attempt_id = "00000000-0000-4000-8000-000000000001" },
+        });
+        if (finalized != .success) std.debug.print("historical candidate: {any}\n", .{finalized});
+        try std.testing.expect(finalized == .success);
+        defer finalized.success.deinit();
+        _ = try finalized.success.result(try std.fs.path.join(a, &.{ owner.bundle.?.evidence.root, "boots/raw-x2apic/serial" }), null, null);
+    }
     try rehashedPayload(work, stage, repository, tools, context, &metadata);
 }
 
@@ -281,11 +286,11 @@ fn rehashedPayload(work: Workspace, stage: []const u8, repository: []const u8, t
     changed.bundle = try canonical(a, bundle.value());
     changed.manifest = try canonical(a, manifest.value());
     const digest = try writeArchive(work, "rehashed-payload.zip", stage, &changed, altered);
-    var verified = try archive.Archive.open(work.a, work.io, try work.join("rehashed-payload.zip"), context, digest, null);
+    var verified = try archive.Archive.open(std.testing.allocator, work.io, try work.join("rehashed-payload.zip"), context, digest, null);
     defer verified.deinit(work.io);
     const before = try work.digest("rehashed-payload.zip");
     const result = products.importBundle(.{
-        .allocator = work.a,
+        .allocator = std.testing.allocator,
         .io = work.io,
         .repository = repository,
         .input = .{ .historical_archive = .{ .path = try work.join("rehashed-payload.zip"), .context = context, .digest = .{ .bytes = digest } } },
@@ -310,25 +315,28 @@ pub fn local(a: std.mem.Allocator, io: std.Io, stage: []const u8, repository: []
     defer work.deinit();
     const directory = try files.Directory.open(io, stage);
     defer directory.close(io);
-    var bundle = try controller.accepted_run.PrivateBundle.open(a, io, &directory, stage, repository, tools, null);
+    var bundle = try controller.accepted_run.PrivateBundle.open(std.testing.allocator, io, &directory, stage, repository, tools, null);
     defer bundle.deinit();
     try localReceipt(work, &bundle);
     const manifest_before = try copy.hashRetained(io, &bundle.manifest, handoff.layout.max_json_bytes, null);
     const Fault = enum { admission_collision, candidate_collision, admission_sync, publication_unknown, publication_sync, cancellation, final_revalidation };
     for (if (options.handoff_composition_group == .retention) &.{} else std.enums.values(Fault)) |fault| {
+        var step_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer step_arena.deinit();
+        const step_a = step_arena.allocator();
         const name = @tagName(fault);
-        const output = try work.join(try std.fmt.allocPrint(a, "{s}.json", .{name}));
-        const admission = try std.fmt.allocPrint(a, "{s}.admission.json", .{output});
+        const output = try work.join(try std.fmt.allocPrint(step_a, "{s}.json", .{name}));
+        const admission = try std.fmt.allocPrint(step_a, "{s}.admission.json", .{output});
         if (fault == .admission_collision or fault == .candidate_collision)
             try work.put(work.relative(if (fault == .admission_collision) admission else output), "foreign candidate product\n");
         var signal = try core.process.SignalCancellation.install();
         defer signal.deinit();
         const result = candidate.Test.create(.{
-            .allocator = a,
+            .allocator = std.testing.allocator,
             .io = io,
             .source = .{ .private_bundle = &bundle },
             .output = output,
-            .validation_output = try work.join(try std.fmt.allocPrint(a, "{s}-validation", .{name})),
+            .validation_output = try work.join(try std.fmt.allocPrint(step_a, "{s}-validation", .{name})),
             .settings = .{ .attempt_id = "00000000-0000-4000-8000-000000000001" },
             .signal = &signal,
         }, .{
@@ -370,7 +378,7 @@ pub fn local(a: std.mem.Allocator, io: std.Io, stage: []const u8, repository: []
         if (fault == .admission_collision or fault == .candidate_collision)
             try std.testing.expectEqualStrings("foreign candidate product\n", try work.read(work.relative(if (fault == .admission_collision) admission else output)));
         if (fault != .admission_collision) {
-            var document = try handoff.contracts.parseCanonical(a, try work.read(work.relative(admission)));
+            var document = try handoff.contracts.parseCanonical(step_a, try work.read(work.relative(admission)));
             defer document.deinit();
             try handoff.contracts.validateDirectComputeAdmissionV2(document.value());
         }
@@ -378,7 +386,7 @@ pub fn local(a: std.mem.Allocator, io: std.Io, stage: []const u8, repository: []
             try work.absent(work.relative(output));
     }
     const finalized = candidate.create(.{
-        .allocator = a,
+        .allocator = std.testing.allocator,
         .io = io,
         .source = .{ .private_bundle = &bundle },
         .output = try work.join("candidate.json"),
@@ -511,7 +519,7 @@ fn privateLineage(work: Workspace, source: *controller.accepted_run.PrivateBundl
     const original = try metadata.rootBoundBundle(work.a, stage);
     try work.put("lineage-stage/bundle.json", original);
     {
-        var accepted = try controller.accepted_run.PrivateBundle.open(work.a, work.io, &directory, stage, repository, tools, null);
+        var accepted = try controller.accepted_run.PrivateBundle.open(std.testing.allocator, work.io, &directory, stage, repository, tools, null);
         defer accepted.deinit();
         try accepted.revalidate(null);
     }
@@ -556,7 +564,7 @@ fn privateLineage(work: Workspace, source: *controller.accepted_run.PrivateBundl
     defer envelope.deinit();
     _ = try handoff.contracts.validateLocalImageHandoffWithRoot(envelope.value(), stage);
     // The native image-output hash comparison preserves EvidenceChanged.
-    try std.testing.expectError(error.EvidenceChanged, controller.accepted_run.PrivateBundle.open(work.a, work.io, &directory, stage, repository, tools, null));
+    try std.testing.expectError(error.EvidenceChanged, controller.accepted_run.PrivateBundle.open(std.testing.allocator, work.io, &directory, stage, repository, tools, null));
     try std.testing.expectEqualStrings(rehashed, try work.read("lineage-stage/bundle.json"));
     try source.revalidate(null);
 }
@@ -603,7 +611,7 @@ fn serialCases(work: Workspace, owner: *candidate.Finalized, stage: []const u8) 
 
 fn createCandidate(work: Workspace, name: []const u8, bundle: *controller.accepted_run.PrivateBundle) !*candidate.Finalized {
     const result = candidate.create(.{
-        .allocator = work.a,
+        .allocator = std.testing.allocator,
         .io = work.io,
         .source = .{ .private_bundle = bundle },
         .output = try work.join(try std.fmt.allocPrint(work.a, "{s}/candidate.json", .{name})),
@@ -675,7 +683,7 @@ fn changedInputs(work: Workspace, owner: *candidate.Finalized, bundle: *controll
     }
     const directory = try files.Directory.open(work.io, bundle.evidence.root);
     defer directory.close(work.io);
-    var fresh_source = try controller.accepted_run.PrivateBundle.open(work.a, work.io, &directory, bundle.evidence.root, repository, tools, null);
+    var fresh_source = try controller.accepted_run.PrivateBundle.open(std.testing.allocator, work.io, &directory, bundle.evidence.root, repository, tools, null);
     defer fresh_source.deinit();
     try work.root.createDir(work.io, "changed-source", .fromMode(0o700));
     const source_owner = try createCandidate(work, "changed-source", &fresh_source);

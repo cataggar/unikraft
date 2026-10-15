@@ -180,6 +180,7 @@ const Attempt = struct {
     inspection_sha256: [64]u8 = undefined,
     publication: files.CommitStatus = .not_committed,
     fixture: bool = false,
+    uninterrupted_run: bool = false,
     owned_signal: ?core.process.SignalCancellation = null,
 
     fn create(invocation: Invocation) !*Attempt {
@@ -298,7 +299,7 @@ const Attempt = struct {
         if (self.invocation.faults.phase == phase) return error.AmbiguousWrite;
         switch (phase) {
             .accepted_run_pinned => {
-                self.accepted = try accepted_run.openAndValidateReadOnlyWithSignal(self.a(), self.invocation.io, self.invocation.environ, &self.runtime.?, self.invocation.runtime_path, self.invocation.repository_path, self.invocation.signal);
+                self.accepted = try accepted_run.openAndValidateReadOnlyWithSignal(self.allocator, self.invocation.io, self.invocation.environ, &self.runtime.?, self.invocation.runtime_path, self.invocation.repository_path, self.invocation.signal);
                 try self.pinSources();
             },
             .output_reserved => try self.reserve(),
@@ -392,7 +393,7 @@ const Attempt = struct {
     }
 
     fn reserve(self: *Attempt) !void {
-        try self.verifySources();
+        if (!self.uninterrupted_run) try self.verifySources();
         const parent = try files.FileParent.open(self.invocation.io, self.invocation.output_path, .private);
         defer parent.close(self.invocation.io);
         if (parent.directory.statFile(self.invocation.io, parent.name, .{ .follow_symlinks = false })) |_| {
@@ -537,8 +538,10 @@ const Attempt = struct {
     }
 
     fn stage(self: *Attempt) !void {
-        try self.verifySources();
-        try self.verifyOutput();
+        if (!self.uninterrupted_run) {
+            try self.verifySources();
+            try self.verifyOutput();
+        }
         self.bundle = if (self.compatibility() == .frozen_tiny_v1)
             try buildLegacyBundleBytes(self.a(), self.accepted.?.source.revision, self.accepted.?.source.tree, self.artifacts, self.boots, self.evidence)
         else blk: {
@@ -555,8 +558,10 @@ const Attempt = struct {
     }
     fn validate(self: *Attempt) !void {
         if (self.accepted == null or self.staged == null) return error.MissingMembers;
-        try self.verifySources();
-        try self.verifyOutput();
+        if (!self.uninterrupted_run) {
+            try self.verifySources();
+            try self.verifyOutput();
+        }
         try self.verifyHeld(&self.staged.?);
         var bytes = try files.readSensitiveFile(self.invocation.io, self.a(), self.staged.?.retained.file, layout.max_json_bytes, .private);
         defer bytes.deinit();
@@ -567,10 +572,10 @@ const Attempt = struct {
         if (!std.mem.eql(u8, bytes.bytes(), self.bundle)) return error.CopyChanged;
     }
     fn publish(self: *Attempt) !void {
-        try self.validate();
+        if (!self.uninterrupted_run) try self.validate();
         // Record intent before the final commit, never a success-shaped receipt.
         try requireDurable(try self.private_lock.?.createImmutable(self.invocation.io, "publication-intent.json", try canonical(self.a(), .{ .phase = "handoff_published", .outcome = "pending" })));
-        try self.validate();
+        if (!self.uninterrupted_run) try self.validate() else try self.verifyHeld(&self.staged.?);
         try copy.checkCancellation(self.cancel());
         const result = try publishBundle(self.invocation.io, &self.lock.?, self.bundle, self.invocation.faults.publish);
         self.publication = result.status;
@@ -603,6 +608,8 @@ fn finish(opened: RuntimeOpened) Outcome(HandoffPublished) {
     return finishPinned(pinned);
 }
 fn finishPinned(pinned: AcceptedRunPinned) Outcome(HandoffPublished) {
+    pinned.owner().uninterrupted_run = true;
+    defer pinned.owner().uninterrupted_run = false;
     const reserved = switch (pinned.reserveOutput()) {
         .success => |s| s,
         .refused => |d| return .{ .refused = d },

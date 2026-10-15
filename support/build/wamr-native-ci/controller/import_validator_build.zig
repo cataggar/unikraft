@@ -222,7 +222,7 @@ pub const PortableTools = struct {
             .before = before,
             .producer_source = producer_source,
         };
-        try result.verifyWithSignal(io, repository, local.git, signal);
+        try result.verifyExecutables(io);
         return result;
     }
 
@@ -245,7 +245,7 @@ pub const PortableTools = struct {
             if (active.flag().load(.acquire)) return error.Cancelled;
     }
 
-    fn verifyExecutables(self: *PortableTools, io: std.Io) !void {
+    pub fn verifyExecutables(self: *PortableTools, io: std.Io) !void {
         try self.git.verify(io);
         try self.controller.verify(io);
         try self.supervisor.verify(io);
@@ -309,7 +309,7 @@ fn pinLocalRuntime(
 }
 
 pub fn runPortable(
-    allocator: std.mem.Allocator,
+    raw_allocator: std.mem.Allocator,
     io: std.Io,
     accepted: *accepted_run.AcceptedRun,
     repository: []const u8,
@@ -319,6 +319,9 @@ pub fn runPortable(
 ) !void {
     if (accepted.context != .trusted_inner_zip)
         return error.InvalidContext;
+    var scratch = std.heap.ArenaAllocator.init(raw_allocator);
+    defer scratch.deinit();
+    const allocator = scratch.allocator();
     try files.absoluteFilePath(output);
     if (contained(output, accepted.root) or contained(output, repository) or
         contained(accepted.root, output) or contained(repository, output))
@@ -371,8 +374,7 @@ pub fn runPortable(
     defer pinned_candidate.close(io);
     if (!std.meta.eql(observed.metadata, physical.metadata(pinned_candidate.file_snapshot)))
         return error.CandidateChanged;
-    try authenticated.verifyWithSignal(io, repository, local.git, signal);
-    try accepted.revalidateWithSignal(signal);
+    try authenticated.verifyExecutables(io);
     _ = try revalidateHandoffCommand(allocator, io, .{
         .source_root = repository,
         .work = output,
@@ -393,7 +395,7 @@ pub fn runPortable(
 }
 
 pub fn runPrivate(
-    allocator: std.mem.Allocator,
+    raw_allocator: std.mem.Allocator,
     io: std.Io,
     bundle: *accepted_run.PrivateBundle,
     output: []const u8,
@@ -406,6 +408,25 @@ pub fn runPrivate(
         contained(bundle.evidence.root, output) or contained(bundle.evidence.repository.?, output))
         return error.AliasedOutput;
     try bundle.revalidate(signal);
+    return runPrivateValidated(raw_allocator, io, bundle, output, signal);
+}
+
+pub fn runPrivateValidated(
+    raw_allocator: std.mem.Allocator,
+    io: std.Io,
+    bundle: *accepted_run.PrivateBundle,
+    output: []const u8,
+    signal: ?*core.process.SignalCancellation,
+) !void {
+    if (bundle.evidence.context != .private_bundle or bundle.evidence.repository == null)
+        return error.InvalidContext;
+    var scratch = std.heap.ArenaAllocator.init(raw_allocator);
+    defer scratch.deinit();
+    const allocator = scratch.allocator();
+    try files.absoluteFilePath(output);
+    if (contained(output, bundle.evidence.root) or contained(output, bundle.evidence.repository.?) or
+        contained(bundle.evidence.root, output) or contained(bundle.evidence.repository.?, output))
+        return error.AliasedOutput;
     const parent_path = std.fs.path.dirname(output) orelse return error.UnsafePath;
     const name = std.fs.path.basename(output);
     try files.basename(name);
@@ -447,7 +468,8 @@ pub fn runPrivate(
             }
         } else |_| {}
     }
-    try bundle.revalidate(signal);
+    try bundle.tools.verifyExecutables(io);
+    try bundle.manifest.verify(io);
     const checked = try revalidateHandoffCommand(allocator, io, .{
         .source_root = bundle.evidence.repository.?,
         .work = output,
@@ -468,18 +490,19 @@ pub fn runPrivate(
     var command_log = try files.RetainedFile.open(io, try std.fs.path.join(allocator, &.{
         output, "private/import-native-revalidation.log",
     }), .private);
+    defer command_log.verify(io) catch {};
     defer command_log.close(io);
     const repeated = try validatedPostRun(allocator, io, output, .@"import-native-revalidation", @intCast(checked.output_bytes));
     if (!std.meta.eql(checked, repeated)) return error.CommandOutputChanged;
     try command_record.verify(io);
     try command_log.verify(io);
-    try bundle.revalidate(signal);
     try anchor.verify(io);
     try syncDirectory(io, evidence);
     try syncDirectory(io, private);
     try syncDirectory(io, work);
     try syncDirectory(io, parent);
-    try bundle.revalidate(signal);
+    try bundle.tools.verifyExecutables(io);
+    try bundle.manifest.verify(io);
     try anchor.verify(io);
     try command_record.verify(io);
     try command_log.verify(io);
@@ -492,14 +515,19 @@ pub const RetainedValidation = struct {
     held: [4]files.RetainedFile,
     digests: [4][64]u8,
 
-    pub fn revalidate(self: *RetainedValidation, io: std.Io, repository: []const u8, signal: ?*core.process.SignalCancellation) !void {
-        try self.tools.verifyWithSignal(io, repository, self.tools.git.path, signal);
+    pub fn revalidateOutputs(self: *RetainedValidation, io: std.Io) !void {
+        try self.tools.verifyExecutables(io);
         for (&self.held, &self.digests) |*file, *digest| {
             try file.verify(io);
             const observed = try physical.readRetained(io, file, records.max_record_bytes);
             if (!std.mem.eql(u8, &observed.sha256, digest)) return error.CommandOutputChanged;
         }
+        try self.tools.verifyExecutables(io);
+    }
+
+    pub fn revalidate(self: *RetainedValidation, io: std.Io, repository: []const u8, signal: ?*core.process.SignalCancellation) !void {
         try self.tools.verifyWithSignal(io, repository, self.tools.git.path, signal);
+        try self.revalidateOutputs(io);
     }
 
     pub fn deinit(self: *RetainedValidation, io: std.Io) void {
@@ -547,7 +575,6 @@ fn runImportedReaderWithFault(
     if (contained(output, accepted.root) or contained(output, repository) or
         contained(accepted.root, output) or contained(repository, output))
         return error.AliasedOutput;
-    try accepted.revalidateWithSignal(signal);
     try candidate.verify(io);
     var paths: [4][]const u8 = undefined;
     var paths_owned: usize = 0;
@@ -559,18 +586,21 @@ fn runImportedReaderWithFault(
     paths[3] = try std.process.executablePathAlloc(io, allocator);
     paths_owned += 1;
     const local: LocalTools = .{ .git = paths[0], .supervisor = paths[1], .validator = paths[2] };
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
     var start = try accepted.pinArtifact(.build_start);
     defer start.close(io);
-    var raw = try files.readSensitiveFile(io, allocator, start.file, records.max_record_bytes, .private);
+    var raw = try files.readSensitiveFile(io, a, start.file, records.max_record_bytes, .private);
     defer raw.deinit();
-    var document = try contracts.Document.parse(allocator, raw.bytes(), .{
+    var document = try contracts.Document.parse(a, raw.bytes(), .{
         .bytes = records.max_record_bytes,
         .depth = 32,
         .items = 4096,
         .tokens = 65536,
     });
     defer document.deinit();
-    try document.requireCanonical(allocator, raw.bytes());
+    try document.requireCanonical(a, raw.bytes());
     var authenticated = try PortableTools.bindImportedReader(
         allocator,
         io,
@@ -618,8 +648,8 @@ fn runImportedReaderWithFault(
         .bundle = candidate.path,
         .tools = @splat(""),
     };
-    try authenticated.verifyWithSignal(io, repository, local.git, signal);
-    const identity = try adapter.execute(allocator, io, .{
+    try authenticated.verifyExecutables(io);
+    const identity = try adapter.execute(a, io, .{
         .roots = roots,
         .stage = .@"supervisor-import-identity",
         .private_dir = private,
@@ -627,22 +657,21 @@ fn runImportedReaderWithFault(
         .cancel = if (signal) |active| active.flag() else null,
         .capture_stdout = true,
     });
-    defer allocator.free(identity.stdout);
-    const closure = try supervisor_identity.nativeSourceContentClosure(allocator);
-    const expected = try supervisor_identity.identityBytes(allocator, &closure);
-    defer allocator.free(expected);
+    defer a.free(identity.stdout);
+    const closure = try supervisor_identity.nativeSourceContentClosure(a);
+    const expected = try supervisor_identity.identityBytes(a, &closure);
+    defer a.free(expected);
     if (identity.poisoned) return error.CleanupPoisoned;
     if (!identity.accepted or identity.stderr_bytes != 0 or !std.mem.eql(u8, identity.stdout, expected))
         return error.ImportIdentityChanged;
-    _ = try validatedPostRun(allocator, io, output, .@"supervisor-import-identity", expected.len);
+    _ = try validatedPostRun(a, io, output, .@"supervisor-import-identity", expected.len);
     for ([_][]const u8{ "evidence/command-supervisor-import-identity.json", "private/supervisor-import-identity.log" }, 0..) |relative, i| {
         const pinned = try pinValidationOutput(allocator, io, output, relative);
         held[i] = pinned.file;
         digests[i] = pinned.sha256;
         held_count += 1;
     }
-    try authenticated.verifyWithSignal(io, repository, local.git, signal);
-    try accepted.revalidateWithSignal(signal);
+    try authenticated.verifyExecutables(io);
     try candidate.verify(io);
     if (@import("builtin").is_test and fault == .change_candidate_before_command) {
         const changed = try std.Io.Dir.cwd().openFile(io, candidate.path, .{ .mode = .read_write, .follow_symlinks = false });
@@ -650,8 +679,8 @@ fn runImportedReaderWithFault(
         try changed.writePositionalAll(io, "!", 0);
         try changed.sync(io);
     }
-    _ = try revalidateHandoffCommand(allocator, io, roots, private, evidence, signal);
-    try authenticated.verifyWithSignal(io, repository, local.git, signal);
+    _ = try revalidateHandoffCommand(a, io, roots, private, evidence, signal);
+    try authenticated.verifyExecutables(io);
     try accepted.revalidateWithSignal(signal);
     try candidate.verify(io);
     try start.verify(io);
@@ -672,7 +701,12 @@ fn runImportedReaderWithFault(
         .held = held,
         .digests = digests,
     };
-    try result.revalidate(io, repository, signal);
+    for (&result.held, &result.digests) |*file, *digest| {
+        try file.verify(io);
+        const observed = try physical.readRetained(io, file, records.max_record_bytes);
+        if (!std.mem.eql(u8, &observed.sha256, digest)) return error.CommandOutputChanged;
+    }
+    try result.tools.verifyExecutables(io);
     return result;
 }
 

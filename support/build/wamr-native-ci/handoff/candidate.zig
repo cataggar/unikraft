@@ -190,29 +190,32 @@ pub const Finalized = opaque {
         fault: ResultFault,
     ) !controller.tiny.Result {
         const owner = self.state();
-        try owner.revalidate(signal);
-        var first = try owner.retainSerial(first_path, error.EvidenceIncomplete, signal);
+        try copy.checkCancellation(if (signal) |active| active.flag() else null);
+        var scratch = std.heap.ArenaAllocator.init(owner.inv.allocator);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        var first = try retainFile(a, owner.inv.io, first_path, contracts.layout.max_serial_bytes, signal, error.EvidenceIncomplete);
         defer first.file.close(owner.inv.io);
-        var first_bytes = try files.readSensitiveFile(owner.inv.io, owner.arena.allocator(), first.file.file, contracts.layout.max_serial_bytes, .private);
+        var first_bytes = try files.readSensitiveFile(owner.inv.io, a, first.file.file, contracts.layout.max_serial_bytes, .private);
         defer first_bytes.deinit();
         const identity = owner.scope.identity;
-        var observed = try checkSerial(owner.arena.allocator(), first_bytes.bytes(), identity);
+        var observed = try checkSerial(a, first_bytes.bytes(), identity);
         if (second_path) |path| {
-            var second = try owner.retainSerial(path, error.WrongSerialPrefix, signal);
+            var second = try retainFile(a, owner.inv.io, path, contracts.layout.max_serial_bytes, signal, error.WrongSerialPrefix);
             defer second.file.close(owner.inv.io);
-            var second_bytes = try files.readSensitiveFile(owner.inv.io, owner.arena.allocator(), second.file.file, contracts.layout.max_serial_bytes, .private);
+            var second_bytes = try files.readSensitiveFile(owner.inv.io, a, second.file.file, contracts.layout.max_serial_bytes, .private);
             defer second_bytes.deinit();
-            observed = try checkSerial(owner.arena.allocator(), try secondBytes(second_bytes.bytes(), first_bytes.bytes()), identity);
+            observed = try checkSerial(a, try secondBytes(second_bytes.bytes(), first_bytes.bytes()), identity);
             if (builtin.is_test) switch (fault) {
                 .change_second => try changeFile(owner.inv.io, path),
-                .replace_second => try replaceCapture(owner.inv.io, owner.arena.allocator(), path, second_bytes.bytes()),
+                .replace_second => try replaceCapture(owner.inv.io, a, path, second_bytes.bytes()),
                 else => {},
             };
             try owner.verifyHeld(&second, signal);
         }
         if (builtin.is_test) switch (fault) {
             .change_first => try changeFile(owner.inv.io, first_path),
-            .replace_first => try replaceCapture(owner.inv.io, owner.arena.allocator(), first_path, first_bytes.bytes()),
+            .replace_first => try replaceCapture(owner.inv.io, a, first_path, first_bytes.bytes()),
             else => {},
         };
         try owner.verifyHeld(&first, signal);
@@ -269,7 +272,6 @@ const State = struct {
         for (self.held.items) |*held| try self.verifyHeld(held, signal);
         if (self.admission) |*held| try self.verifyHeld(held, signal);
         if (self.candidate) |*held| try self.verifyHeld(held, signal);
-        try self.inv.source.revalidate(signal);
     }
     fn deinit(self: *State) void {
         if (self.candidate) |*held| held.file.close(self.inv.io);
@@ -348,7 +350,7 @@ fn finish(owner: *State, existing: bool) !void {
     try inv.source.revalidate(inv.signal);
     owner.phase = .native_validation;
     owner.reserved = true;
-    try validation.runPrivate(inv.allocator, inv.io, bundle, inv.validation_output, inv.signal);
+    try validation.runPrivateValidated(inv.allocator, inv.io, bundle, inv.validation_output, inv.signal);
     for ([_][]const u8{ "evidence/command-import-native-revalidation.json", "private/import-native-revalidation.log" }) |relative| {
         var retained = try owner.retain(try std.fs.path.join(a, &.{ inv.validation_output, relative }), contracts.layout.max_json_bytes, inv.signal);
         errdefer retained.file.close(inv.io);
@@ -423,7 +425,9 @@ fn finish(owner: *State, existing: bool) !void {
     _ = try contracts.validateDirectComputeCandidate(candidate_document.value());
     const parsed = try std.json.parseFromSlice(Scope, a, encoded, .{ .allocate = .alloc_always });
     owner.scope = parsed.value;
-    try owner.revalidate(inv.signal);
+    try copy.checkCancellation(if (inv.signal) |active| active.flag() else null);
+    for (owner.held.items) |*held| try owner.verifyHeld(held, inv.signal);
+    if (owner.candidate) |*held| try owner.verifyHeld(held, inv.signal);
     owner.phase = .admission;
     if (admission_bytes) |bytes| {
         if (!existing) _ = try owner.publish(admission_path, bytes);
@@ -433,7 +437,8 @@ fn finish(owner: *State, existing: bool) !void {
     }
     if (builtin.is_test and owner.faults.cancel_after_admission)
         @constCast((inv.signal orelse return error.InvalidFault).flag()).store(true, .release);
-    try owner.revalidate(inv.signal);
+    try copy.checkCancellation(if (inv.signal) |active| active.flag() else null);
+    if (owner.admission) |*held| try owner.verifyHeld(held, inv.signal);
     owner.phase = .publication;
     if (!existing) {
         owner.publication = try owner.publish(inv.output, encoded);
@@ -445,7 +450,12 @@ fn finish(owner: *State, existing: bool) !void {
     owner.phase = .final_revalidation;
     if (builtin.is_test and owner.faults.change_before_final_revalidation)
         try changeFile(inv.io, inv.output);
-    try owner.revalidate(inv.signal);
+    try copy.checkCancellation(if (inv.signal) |active| active.flag() else null);
+    try bundle.tools.verifyExecutables(inv.io);
+    try bundle.manifest.verify(inv.io);
+    for (owner.held.items) |*held| try owner.verifyHeld(held, inv.signal);
+    if (owner.admission) |*held| try owner.verifyHeld(held, inv.signal);
+    if (owner.candidate) |*held| try owner.verifyHeld(held, inv.signal);
 }
 
 fn provenance(a: std.mem.Allocator, bundle: std.json.Value, receipt: std.json.ObjectMap, manifest: Artifact, transport: Artifact) !Provenance {

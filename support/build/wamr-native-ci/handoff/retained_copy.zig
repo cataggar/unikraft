@@ -362,28 +362,56 @@ pub fn hashRetained(io: std.Io, retained: *const files.RetainedFile, limit: u64,
 }
 
 pub const Scanner = struct {
+    const max_pattern_len = blk: {
+        var max_len: usize = 0;
+        for (sensitive_patterns) |pattern| {
+            std.debug.assert(pattern.len > 0 and pattern.len <= scan_tail);
+            for (pattern) |byte| std.debug.assert(byte != 0);
+            if (pattern.len > max_len) max_len = pattern.len;
+        }
+        break :blk max_len;
+    };
+
     tail: [scan_tail]u8 = undefined,
     tail_len: usize = 0,
 
     pub fn observe(self: *Scanner, chunk: []const u8) !void {
         if (chunk.len > chunk_size) return error.InvalidScanChunk;
-        var scan: [scan_tail + chunk_size]u8 = undefined;
-        @memcpy(scan[0..self.tail_len], self.tail[0..self.tail_len]);
-        @memcpy(scan[self.tail_len..][0..chunk.len], chunk);
-        for (sensitive_patterns) |pattern| {
-            if (std.mem.indexOf(u8, scan[0 .. self.tail_len + chunk.len], pattern) != null)
-                return error.SensitivePattern;
-        }
-        if (chunk.len >= scan_tail) {
-            @memcpy(self.tail[0..], chunk[chunk.len - scan_tail ..]);
-            self.tail_len = scan_tail;
-        } else {
+        if (chunk.len <= scan_tail) {
+            var scan: [2 * scan_tail]u8 = undefined;
+            @memcpy(scan[0..self.tail_len], self.tail[0..self.tail_len]);
+            @memcpy(scan[self.tail_len..][0..chunk.len], chunk);
+            for (sensitive_patterns) |pattern| {
+                if (std.mem.indexOf(u8, scan[0 .. self.tail_len + chunk.len], pattern) != null)
+                    return error.SensitivePattern;
+            }
             const keep = @min(self.tail_len, scan_tail - chunk.len);
             if (keep > 0)
                 std.mem.copyForwards(u8, self.tail[0..keep], self.tail[self.tail_len - keep .. self.tail_len]);
             @memcpy(self.tail[keep .. keep + chunk.len], chunk);
             self.tail_len = keep + chunk.len;
+            return;
         }
+        if (std.mem.allEqual(u8, chunk, 0)) {
+            self.tail_len = 0;
+            return;
+        }
+        if (self.tail_len > 0) {
+            const prefix_len = max_pattern_len - 1;
+            var boundary: [scan_tail + prefix_len]u8 = undefined;
+            @memcpy(boundary[0..self.tail_len], self.tail[0..self.tail_len]);
+            @memcpy(boundary[self.tail_len..][0..prefix_len], chunk[0..prefix_len]);
+            for (sensitive_patterns) |pattern| {
+                if (std.mem.indexOf(u8, boundary[0 .. self.tail_len + prefix_len], pattern) != null)
+                    return error.SensitivePattern;
+            }
+        }
+        for (sensitive_patterns) |pattern| {
+            if (std.mem.indexOf(u8, chunk, pattern) != null)
+                return error.SensitivePattern;
+        }
+        @memcpy(self.tail[0..], chunk[chunk.len - scan_tail ..]);
+        self.tail_len = scan_tail;
     }
 };
 

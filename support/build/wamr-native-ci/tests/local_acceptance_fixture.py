@@ -269,7 +269,7 @@ def prepare(args):
             "--system", str(miz.parent),
             "--cache-dir", str(work / "compiler-cache"), "--global-cache-dir", str(work / "global"),
             "-p", str(work / "supervisor-install"), "-Doptimize=ReleaseSafe",
-            "-Dsource-closure-sha256=" + closure, "-j1",
+            "-Dsource-closure-sha256=" + closure,
         ], capture_output=True, check=True)
         assert not built.stdout
         copy_file(work / "supervisor-install/bin/wamr-ci-supervisor",

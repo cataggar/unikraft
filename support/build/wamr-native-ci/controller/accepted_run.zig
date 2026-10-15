@@ -166,6 +166,8 @@ pub const Fixture = if (@import("builtin").is_test) struct {
 
 pub const AcceptedRun = struct {
     arena: std.heap.ArenaAllocator,
+    scratch: ?std.mem.Allocator = null,
+    in_pass_files: ?*std.StringHashMap(physical.File) = null,
     io: std.Io,
     context: EvidenceContext,
     compatibility: profile.CompatibleRecordSet,
@@ -184,6 +186,11 @@ pub const AcceptedRun = struct {
     readonly_git: ?files.RetainedFile = null,
     record_snapshots: []const RecordSnapshot = &.{},
     cleanup_snapshot: ?physical.File = null,
+    verified_legacy_vhd: ?struct {
+        raw_sha256: [64]u8,
+        vhd_sha256: [64]u8,
+        footer_sha256: [64]u8,
+    } = null,
 
     pub fn deinit(self: *AcceptedRun) void {
         if (self.readonly_git) |*git| git.close(self.io);
@@ -191,8 +198,12 @@ pub const AcceptedRun = struct {
         self.* = undefined;
     }
 
-    fn allocator(self: *AcceptedRun) std.mem.Allocator {
+    fn persistentAllocator(self: *AcceptedRun) std.mem.Allocator {
         return self.arena.allocator();
+    }
+
+    fn allocator(self: *AcceptedRun) std.mem.Allocator {
+        return self.scratch orelse self.arena.allocator();
     }
 
     fn readPin(self: *AcceptedRun, retained: *files.RetainedFile, limit: u64) !physical.File {
@@ -207,7 +218,34 @@ pub const AcceptedRun = struct {
                 return observed;
             }
         }
+        if (self.in_pass_files) |cache| {
+            const before = retained.file_snapshot;
+            if (before.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG) return error.UnsafeFile;
+            if (before.uid != std.os.linux.geteuid()) return error.UnsafeOwner;
+            if (before.mode & 0o022 != 0 or (retained.policy == .private and before.mode & 0o077 != 0))
+                return error.UnsafePermissions;
+            if (retained.policy == .private and before.nlink != 1) return error.UnsafeLinks;
+            if (before.size > limit) return error.FileTooLarge;
+            if (cache.get(retained.path)) |cached| {
+                if (std.meta.eql(physical.metadata(before), cached.metadata)) {
+                    const after = try files.snapshot(retained.file);
+                    if (!std.meta.eql(physical.metadata(before), physical.metadata(after)))
+                        return error.FileChanged;
+                    try retained.verify(self.io);
+                    return cached;
+                }
+            }
+            const observed = try physical.readRetained(self.io, retained, limit);
+            try cache.put(try self.allocator().dupe(u8, retained.path), observed);
+            return observed;
+        }
         return physical.readRetained(self.io, retained, limit);
+    }
+
+    fn readFileInPass(self: *AcceptedRun, path: []const u8, limit: u64, private: bool) !physical.File {
+        var retained = try files.RetainedFile.open(self.io, path, if (private) .private else .artifact);
+        defer retained.close(self.io);
+        return self.readPin(&retained, limit);
     }
 
     fn artifactPath(self: *AcceptedRun, role: ArtifactRole) ![]const u8 {
@@ -343,11 +381,27 @@ pub const AcceptedRun = struct {
     }
 
     pub fn revalidateWithSignal(self: *AcceptedRun, signal: ?*core.process.SignalCancellation) !void {
+        var scratch_arena: ?std.heap.ArenaAllocator = if (self.scratch == null)
+            std.heap.ArenaAllocator.init(self.arena.child_allocator)
+        else
+            null;
+        defer if (scratch_arena) |*active| active.deinit();
+        var pass_files: ?std.StringHashMap(physical.File) = if (self.in_pass_files == null)
+            std.StringHashMap(physical.File).init(if (scratch_arena) |*active| active.allocator() else self.allocator())
+        else
+            null;
+        defer if (pass_files) |*active| active.deinit();
+        const previous_scratch = self.scratch;
+        const previous_files = self.in_pass_files;
+        if (scratch_arena) |*active| self.scratch = active.allocator();
+        if (pass_files) |*active| self.in_pass_files = active;
+        defer {
+            self.scratch = previous_scratch;
+            self.in_pass_files = previous_files;
+        }
         if (self.context == .local_runtime) {
-            const legacy_source = if (self.local_read_only and self.compatibility == .tiny_v1_legacy)
-                try localLegacySource(self, signal)
-            else
-                null;
+            if (self.local_read_only and self.compatibility == .tiny_v1_legacy and oldLegacySource(self.source))
+                self.local_legacy_source = try localLegacySource(self, signal);
             if (self.compatibility == .tiny_v1_legacy)
                 try revalidateLocalLegacy(self, signal)
             else if (self.local_producer == .python)
@@ -356,11 +410,6 @@ pub const AcceptedRun = struct {
                 try revalidateLocal(self, signal);
             if (self.local_read_only)
                 try verifyImportedEvidence(self, null);
-            if (legacy_source) |before| {
-                const after = try localLegacySource(self, signal);
-                if (!before.same(after)) return error.SourceChanged;
-                self.local_legacy_source = before;
-            }
         } else if (self.context == .trusted_inner_zip) {
             try revalidateImported(self);
         } else {
@@ -450,16 +499,26 @@ pub const PrivateBundle = struct {
             .environ = null,
         };
         errdefer evidence.deinit();
+        const p = evidence.persistentAllocator();
+        evidence.root = try p.dupe(u8, root);
+        evidence.repository = try p.dupe(u8, repository);
+        var scratch = std.heap.ArenaAllocator.init(evidence.arena.child_allocator);
+        defer scratch.deinit();
+        var pass_files = std.StringHashMap(physical.File).init(scratch.allocator());
+        defer pass_files.deinit();
+        evidence.scratch = scratch.allocator();
+        evidence.in_pass_files = &pass_files;
+        defer {
+            evidence.scratch = null;
+            evidence.in_pass_files = null;
+        }
         const a = evidence.allocator();
-        evidence.root = try a.dupe(u8, root);
-        evidence.repository = try a.dupe(u8, repository);
         const expected = try files.snapshot(.{ .handle = directory.dir.handle, .flags = .{ .nonblocking = false } });
         if (!files.sameSnapshot(expected, try physical.directory(io, root, true)))
             return error.StageChanged;
-        var manifest = try files.RetainedFile.open(io, try join(a, &.{ root, "bundle.json" }), .private);
+        var manifest = try files.RetainedFile.open(io, try join(p, &.{ root, "bundle.json" }), .private);
         errdefer manifest.close(io);
         try loadResult(&evidence);
-        try revalidatePrivate(&evidence);
         try collectArtifacts(&evidence);
         const start = try canonicalFile(&evidence, try recordPath(&evidence, "build-start.json"), records.max_record_bytes);
         var authenticated = try @import("import_validator_build.zig").PortableTools.bindPrivate(
@@ -470,18 +529,19 @@ pub const PrivateBundle = struct {
             repository,
             try std.process.executablePathAlloc(io, a),
             .{
-                .git = try a.dupe(u8, tools.git),
-                .supervisor = try a.dupe(u8, tools.supervisor),
-                .validator = try a.dupe(u8, tools.validator),
+                .git = try p.dupe(u8, tools.git),
+                .supervisor = try p.dupe(u8, tools.supervisor),
+                .validator = try p.dupe(u8, tools.validator),
             },
             signal,
         );
         errdefer authenticated.deinit(io);
-        try authenticated.verifyWithSignal(io, repository, tools.git, signal);
         try manifest.verify(io);
         try evidence.revalidateWithSignal(signal);
-        try authenticated.verifyWithSignal(io, repository, tools.git, signal);
+        try authenticated.verifyExecutables(io);
         try manifest.verify(io);
+        evidence.scratch = null;
+        evidence.in_pass_files = null;
         return .{ .evidence = evidence, .manifest = manifest, .tools = authenticated };
     }
 
@@ -490,7 +550,7 @@ pub const PrivateBundle = struct {
         try self.tools.verifyWithSignal(self.evidence.io, self.evidence.repository.?, self.tools.git.path, signal);
         try self.manifest.verify(self.evidence.io);
         try self.evidence.revalidateWithSignal(signal);
-        try self.tools.verifyWithSignal(self.evidence.io, self.evidence.repository.?, self.tools.git.path, signal);
+        try self.tools.verifyExecutables(self.evidence.io);
         try self.manifest.verify(self.evidence.io);
     }
 
@@ -594,21 +654,32 @@ fn openAndValidateWithPolicy(
     const root_snapshot = try files.snapshot(.{ .handle = runtime.dir.handle, .flags = .{ .nonblocking = false } });
     const current_root = try physical.directory(io, root, true);
     if (!files.sameSnapshot(root_snapshot, current_root)) return error.RuntimeChanged;
-    accepted.root = try accepted.allocator().dupe(u8, root);
-    accepted.repository = try accepted.allocator().dupe(u8, repository);
+    const p = accepted.persistentAllocator();
+    accepted.root = try p.dupe(u8, root);
+    accepted.repository = try p.dupe(u8, repository);
+    var scratch = std.heap.ArenaAllocator.init(accepted.arena.child_allocator);
+    defer scratch.deinit();
+    var pass_files = std.StringHashMap(physical.File).init(scratch.allocator());
+    defer pass_files.deinit();
+    accepted.scratch = scratch.allocator();
+    accepted.in_pass_files = &pass_files;
+    defer {
+        accepted.scratch = null;
+        accepted.in_pass_files = null;
+    }
     try loadResult(&accepted);
     if (readonly_git) |git| {
         if (policy != .read_only or accepted.compatibility != .tiny_v1_legacy or !oldLegacySource(accepted.source))
             return error.InvalidContext;
         accepted.readonly_git = try @import("command_adapter.zig").openPinnedTool(
             io,
-            try accepted.allocator().dupe(u8, git),
+            try p.dupe(u8, git),
             readonly_git_role,
         );
         try appendCurrentToolInput(&accepted, readonly_git_role, accepted.readonly_git.?.path);
         const paths = try inputs.executableRuntimePaths(accepted.allocator(), io, accepted.readonly_git.?.path);
         for (paths) |path|
-            try appendCurrentInput(&accepted, try std.fmt.allocPrint(accepted.allocator(), "{s}{s}", .{ readonly_runtime_prefix, path }), path, false);
+            try appendCurrentInput(&accepted, try std.fmt.allocPrint(p, "{s}{s}", .{ readonly_runtime_prefix, path }), try p.dupe(u8, path), false);
     }
     if (accepted.compatibility != .tiny_v2_qcow2_derived_vhd and policy == .native_only)
         return error.UnsupportedLocalLegacyRun;
@@ -620,6 +691,8 @@ fn openAndValidateWithPolicy(
     if (accepted.local_producer == .python)
         try appendHandoffControllerInput(&accepted);
     try collectArtifacts(&accepted);
+    accepted.scratch = null;
+    accepted.in_pass_files = null;
     return accepted;
 }
 
@@ -649,10 +722,22 @@ pub fn openImportedStage(
     const stage_snapshot = try files.snapshot(.{ .handle = stage.dir.handle, .flags = .{ .nonblocking = false } });
     const current_stage = try physical.directory(io, root, true);
     if (!files.sameSnapshot(stage_snapshot, current_stage)) return error.StageChanged;
-    accepted.root = try accepted.allocator().dupe(u8, root);
+    accepted.root = try accepted.persistentAllocator().dupe(u8, root);
+    var scratch = std.heap.ArenaAllocator.init(accepted.arena.child_allocator);
+    defer scratch.deinit();
+    var pass_files = std.StringHashMap(physical.File).init(scratch.allocator());
+    defer pass_files.deinit();
+    accepted.scratch = scratch.allocator();
+    accepted.in_pass_files = &pass_files;
+    defer {
+        accepted.scratch = null;
+        accepted.in_pass_files = null;
+    }
     try loadResult(&accepted);
     try revalidateImported(&accepted);
     try collectArtifacts(&accepted);
+    accepted.scratch = null;
+    accepted.in_pass_files = null;
     return accepted;
 }
 
@@ -708,7 +793,7 @@ fn documentFileWithPolicy(self: *AcceptedRun, path: []const u8, limit: usize, ca
     const a = self.allocator();
     var retained = try files.RetainedFile.open(self.io, path, policy);
     defer retained.close(self.io);
-    _ = try physical.readRetained(self.io, &retained, limit);
+    _ = try self.readPin(&retained, limit);
     var buffer = try files.readSensitiveFile(self.io, a, retained.file, limit, policy);
     defer buffer.deinit();
     var document = try contracts.Document.parse(a, buffer.bytes(), .{
@@ -717,9 +802,11 @@ fn documentFileWithPolicy(self: *AcceptedRun, path: []const u8, limit: usize, ca
         .items = 4096,
         .tokens = 65536,
     });
-    defer document.deinit();
+    errdefer document.deinit();
     if (canonical) try document.requireCanonical(a, buffer.bytes());
     try retained.verify(self.io);
+    if (self.scratch != null) return document.value();
+    defer document.deinit();
     return std.json.parseFromSliceLeaky(std.json.Value, a, buffer.bytes(), .{
         .duplicate_field_behavior = .@"error",
         .allocate = .alloc_always,
@@ -744,6 +831,7 @@ fn resultPath(self: *AcceptedRun) ![]const u8 {
 
 fn loadResult(self: *AcceptedRun) !void {
     const a = self.allocator();
+    const p = self.persistentAllocator();
     const path = try resultPath(self);
     var retained = try files.RetainedFile.open(self.io, path, .private);
     defer retained.close(self.io);
@@ -756,7 +844,7 @@ fn loadResult(self: *AcceptedRun) !void {
         return error.InvalidRecords;
     self.compatibility = value.set;
     self.production_profile = if (value.set == .tiny_v2_qcow2_derived_vhd) .tiny_exact_v2 else null;
-    const observed = try physical.readRetained(self.io, &retained, records.max_record_bytes);
+    const observed = try self.readPin(&retained, records.max_record_bytes);
     try retained.verify(self.io);
     self.result = .{
         .relative_path = if (self.context == .local_runtime)
@@ -797,35 +885,39 @@ fn loadResult(self: *AcceptedRun) !void {
     var records_iterator = value.records.iterator();
     while (records_iterator.next()) |entry| {
         const path_name = try recordPath(self, entry.key_ptr.*);
-        const current = try physical.readFile(self.io, path_name, records.max_record_bytes, true);
+        const current = try self.readFileInPass(path_name, records.max_record_bytes, true);
         if (!std.mem.eql(u8, &current.sha256, try text(entry.value_ptr.*)))
             return error.RecordChanged;
         _ = try canonicalFile(self, path_name, records.max_record_bytes);
-        try pinned.append(a, .{
-            .name = entry.key_ptr.*,
-            .relative_path = try join(a, &.{ if (self.context == .local_runtime)
+        const record_name = try p.dupe(u8, entry.key_ptr.*);
+        try pinned.append(p, .{
+            .name = record_name,
+            .relative_path = try join(p, &.{ if (self.context == .local_runtime)
                 "runtime/compute/evidence"
             else
-                "evidence", entry.key_ptr.* }),
+                "evidence", record_name }),
             .bytes = current.bytes,
             .sha256 = current.sha256,
         });
-        try snapshots.append(a, .{ .name = entry.key_ptr.*, .metadata = current.metadata });
+        try snapshots.append(p, .{ .name = record_name, .metadata = current.metadata });
     }
     std.mem.sort(PinnedRecord, pinned.items, {}, struct {
         fn less(_: void, x: PinnedRecord, y: PinnedRecord) bool {
             return std.mem.lessThan(u8, x.name, y.name);
         }
     }.less);
-    self.records = try pinned.toOwnedSlice(a);
-    self.record_snapshots = try snapshots.toOwnedSlice(a);
+    self.records = try pinned.toOwnedSlice(p);
+    self.record_snapshots = try snapshots.toOwnedSlice(p);
     const build_value = try canonicalFile(self, try recordPath(self, "build.json"), records.max_record_bytes);
     const start_value = try canonicalFile(self, try recordPath(self, "build-start.json"), records.max_record_bytes);
     const source = try get(build_value, "source");
     const start_source = try get(start_value, "source");
     _ = try contracts.exactFields(source, &.{ "revision", "tree" });
     try sameJson(a, source, start_source);
-    self.source = .{ .revision = try text(try get(source, "revision")), .tree = try text(try get(source, "tree")) };
+    self.source = .{
+        .revision = try p.dupe(u8, try text(try get(source, "revision"))),
+        .tree = try p.dupe(u8, try text(try get(source, "tree"))),
+    };
     for ([_][]const u8{ self.source.revision, self.source.tree }) |digest| {
         if (digest.len != 40) return error.InvalidSource;
         for (digest) |byte| if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f'))
@@ -876,15 +968,16 @@ fn revalidateLocalWithSignal(self: *AcceptedRun, signal: *core.process.SignalCan
     var boot_context: boot.Context = .{
         .build_context = &context,
         .pinned = std.StringHashMap(physical.File).init(a),
+        .files_cache = self.in_pass_files,
     };
     defer boot_context.pinned.deinit();
     try boot.revalidateComplete(&boot_context, result);
     try validateCommands(self, false, false);
-    const current = try physical.readFile(self.io, try resultPath(self), records.max_record_bytes, true);
+    const current = try self.readFileInPass(try resultPath(self), records.max_record_bytes, true);
     if (!std.meta.eql(current.sha256, self.result.sha256) or current.bytes != self.result.bytes)
         return error.ResultChanged;
     for (self.records) |item| {
-        const observed = try physical.readFile(self.io, try recordPath(self, item.name), records.max_record_bytes, true);
+        const observed = try self.readFileInPass(try recordPath(self, item.name), records.max_record_bytes, true);
         if (!std.meta.eql(observed.sha256, item.sha256) or observed.bytes != item.bytes)
             return error.RecordChanged;
     }
@@ -916,16 +1009,16 @@ fn revalidateLocalPythonWithSignal(self: *AcceptedRun, signal: *core.process.Sig
         signal,
     );
     try validateCommands(self, false, true);
-    const current = try physical.readFile(self.io, try resultPath(self), records.max_record_bytes, true);
+    const current = try self.readFileInPass(try resultPath(self), records.max_record_bytes, true);
     if (!std.meta.eql(current.sha256, self.result.sha256) or current.bytes != self.result.bytes)
         return error.ResultChanged;
     for (self.records) |item| {
-        const observed = try physical.readFile(self.io, try recordPath(self, item.name), records.max_record_bytes, true);
+        const observed = try self.readFileInPass(try recordPath(self, item.name), records.max_record_bytes, true);
         if (!std.meta.eql(observed.sha256, item.sha256) or observed.bytes != item.bytes)
             return error.RecordChanged;
     }
     if (self.runtime_inputs.len == 0)
-        try collectRecordedRuntimeInputs(self);
+        try collectRecordedRuntimeInputs(self, true);
 }
 
 fn revalidateLocalLegacy(self: *AcceptedRun, signal: ?*core.process.SignalCancellation) !void {
@@ -935,7 +1028,8 @@ fn revalidateLocalLegacy(self: *AcceptedRun, signal: ?*core.process.SignalCancel
         return error.InvalidResult;
     if (!preSupervisorSource(self.source))
         return error.UnsupportedLegacySource;
-    if (self.local_read_only and !oldLegacySource(self.source))
+    const custody_checked = self.local_read_only and !oldLegacySource(self.source);
+    if (custody_checked)
         try local_consumer.runLegacyReadOnly(
             self.allocator(),
             self.io,
@@ -961,11 +1055,11 @@ fn revalidateLocalLegacy(self: *AcceptedRun, signal: ?*core.process.SignalCancel
     }
     if (count != result.records.count() + 1) return error.MissingEvidence;
     for (self.records) |item| {
-        const observed = try physical.readFile(self.io, try recordPath(self, item.name), records.max_record_bytes, true);
+        const observed = try self.readFileInPass(try recordPath(self, item.name), records.max_record_bytes, true);
         if (!std.meta.eql(observed.sha256, item.sha256) or observed.bytes != item.bytes)
             return error.RecordChanged;
     }
-    const current = try physical.readFile(self.io, try resultPath(self), records.max_record_bytes, true);
+    const current = try self.readFileInPass(try resultPath(self), records.max_record_bytes, true);
     if (!std.meta.eql(current.sha256, self.result.sha256) or current.bytes != self.result.bytes)
         return error.ResultChanged;
     const qcow2 = try join(self.allocator(), &.{ self.root, "compute/package/unikraft.qcow2" });
@@ -974,7 +1068,7 @@ fn revalidateLocalLegacy(self: *AcceptedRun, signal: ?*core.process.SignalCancel
     if (try exists(self.io, cleanup)) return error.UnsupportedLegacySource;
     try validateCommands(self, true, false);
     if (self.runtime_inputs.len == 0)
-        try collectRecordedRuntimeInputs(self);
+        try collectRecordedRuntimeInputs(self, custody_checked);
 }
 
 fn localLegacySource(self: *AcceptedRun, signal: ?*core.process.SignalCancellation) !@import("source_custody.zig").Source {
@@ -1020,20 +1114,20 @@ fn exists(io: std.Io, path: []const u8) !bool {
     return true;
 }
 
-fn collectRecordedRuntimeInputs(self: *AcceptedRun) !void {
-    const a = self.allocator();
+fn collectRecordedRuntimeInputs(self: *AcceptedRun, already_verified: bool) !void {
+    const p = self.persistentAllocator();
     var result: std.ArrayList(PinnedInput) = .empty;
     const start = try canonicalFile(self, try recordPath(self, "build-start.json"), records.max_record_bytes);
-    try collectCustodyInputs(self, try get(start, "consumer_inputs"), &result);
+    try collectCustodyInputs(self, try get(start, "consumer_inputs"), &result, already_verified);
     const boot_inputs = try canonicalFile(self, try recordPath(self, "boot-inputs.json"), records.max_record_bytes);
-    try collectCustodyInputs(self, boot_inputs, &result);
+    try collectCustodyInputs(self, boot_inputs, &result, already_verified);
     if (result.items.len > 512) return error.InputLimit;
-    self.runtime_inputs = try result.toOwnedSlice(a);
+    self.runtime_inputs = try result.toOwnedSlice(p);
 }
 
 fn appendHandoffControllerInput(self: *AcceptedRun) !void {
-    const a = self.allocator();
-    const path = try std.Io.Dir.realPathFileAbsoluteAlloc(self.io, "/proc/self/exe", a);
+    const p = self.persistentAllocator();
+    const path = try std.Io.Dir.realPathFileAbsoluteAlloc(self.io, "/proc/self/exe", p);
     try appendCurrentToolInput(self, handoff_controller_role, path);
 }
 
@@ -1042,14 +1136,14 @@ fn appendCurrentToolInput(self: *AcceptedRun, role: []const u8, path: []const u8
 }
 
 fn appendCurrentInput(self: *AcceptedRun, role: []const u8, path: []const u8, executable: bool) !void {
-    const a = self.allocator();
+    const p = self.persistentAllocator();
     for (self.runtime_inputs) |input|
         if (std.mem.eql(u8, input.role, role))
             return error.DuplicateInputRole;
-    const observed = try physical.readFile(self.io, path, limits.input_file, false);
+    const observed = try self.readFileInPass(path, limits.input_file, false);
     if (executable and @as(u64, @intCast(observed.metadata[2])) & 0o111 == 0)
         return error.UnsafeFile;
-    const updated = try a.alloc(PinnedInput, self.runtime_inputs.len + 1);
+    const updated = try p.alloc(PinnedInput, self.runtime_inputs.len + 1);
     @memcpy(updated[0..self.runtime_inputs.len], self.runtime_inputs);
     updated[self.runtime_inputs.len] = .{
         .role = role,
@@ -1067,11 +1161,76 @@ fn collectCustodyInputs(
     self: *AcceptedRun,
     expected: std.json.Value,
     result: *std.ArrayList(PinnedInput),
+    already_verified: bool,
 ) !void {
     const a = self.allocator();
+    const p = self.persistentAllocator();
     const files_value = try get(expected, "files");
     const trees_value = try get(expected, "trees");
     if (files_value != .object or trees_value != .object) return error.InvalidInputCustody;
+    if (already_verified) {
+        const file_roles = try a.dupe([]const u8, files_value.object.keys());
+        std.mem.sort([]const u8, file_roles, {}, struct {
+            fn less(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.less);
+        for (file_roles) |role| {
+            const item = files_value.object.get(role).?;
+            const path = try text(try get(item, "path"));
+            const sha_text = try text(try get(item, "sha256"));
+            if (sha_text.len != 64) return error.InvalidInputCustody;
+            var sha: [64]u8 = undefined;
+            @memcpy(&sha, sha_text);
+            const raw_meta = try get(item, "metadata");
+            if (raw_meta != .array or raw_meta.array.items.len != 9) return error.InvalidInputCustody;
+            var metadata: [9]i128 = undefined;
+            for (raw_meta.array.items, &metadata) |part, *slot| slot.* = try number(i128, part);
+            try result.append(p, .{
+                .role = try p.dupe(u8, role),
+                .path = try p.dupe(u8, path),
+                .snapshot = .{
+                    .bytes = @intCast(metadata[6]),
+                    .sha256 = sha,
+                    .metadata = metadata,
+                },
+            });
+        }
+        const tree_roles = try a.dupe([]const u8, trees_value.object.keys());
+        std.mem.sort([]const u8, tree_roles, {}, struct {
+            fn less(_: void, x: []const u8, y: []const u8) bool {
+                return std.mem.lessThan(u8, x, y);
+            }
+        }.less);
+        for (tree_roles) |role| {
+            const tree = trees_value.object.get(role).?;
+            const path = try text(try get(tree, "path"));
+            const root = physical.metadata(try physical.directory(self.io, path, false));
+            const content_text = try text(try get(tree, "content_sha256"));
+            const physical_text = try text(try get(tree, "physical_sha256"));
+            if (content_text.len != 64 or physical_text.len != 64) return error.InvalidInputCustody;
+            var content_sha: [64]u8 = undefined;
+            var physical_sha: [64]u8 = undefined;
+            @memcpy(&content_sha, content_text);
+            @memcpy(&physical_sha, physical_text);
+            try result.append(p, .{
+                .role = try std.fmt.allocPrint(p, "tree:{s}", .{role}),
+                .path = try p.dupe(u8, path),
+                .snapshot = .{
+                    .bytes = try number(u64, try get(tree, "bytes")),
+                    .sha256 = content_sha,
+                    .metadata = root,
+                    .tree = .{
+                        .files = try number(u64, try get(tree, "files")),
+                        .directories = try number(u64, try get(tree, "directories")),
+                        .symlinks = try number(u64, try get(tree, "symlinks")),
+                        .physical_sha256 = physical_sha,
+                    },
+                },
+            });
+        }
+        return;
+    }
     const file_bindings = try a.alloc(inputs.Binding, files_value.object.count());
     defer a.free(file_bindings);
     const tree_bindings = try a.alloc(inputs.Binding, trees_value.object.count());
@@ -1088,25 +1247,21 @@ fn collectCustodyInputs(
     const observed = try current.canonical(a);
     if (!std.mem.eql(u8, recorded, observed)) return error.InputChanged;
     for (current.files) |item| {
-        const observed_file = try physical.readFile(self.io, item.path, limits.input_file, false);
-        if (!std.meta.eql(observed_file.metadata, item.metadata) or
-            !std.meta.eql(observed_file.sha256, item.sha256))
-            return error.InputChanged;
-        try result.append(a, .{
-            .role = item.role,
-            .path = item.path,
+        try result.append(p, .{
+            .role = try p.dupe(u8, item.role),
+            .path = try p.dupe(u8, item.path),
             .snapshot = .{
-                .bytes = observed_file.bytes,
-                .sha256 = observed_file.sha256,
-                .metadata = observed_file.metadata,
+                .bytes = @intCast(item.metadata[6]),
+                .sha256 = item.sha256,
+                .metadata = item.metadata,
             },
         });
     }
     for (current.trees) |tree| {
         const root = physical.metadata(try physical.directory(self.io, tree.path, false));
-        try result.append(a, .{
-            .role = try std.fmt.allocPrint(a, "tree:{s}", .{tree.role}),
-            .path = tree.path,
+        try result.append(p, .{
+            .role = try std.fmt.allocPrint(p, "tree:{s}", .{tree.role}),
+            .path = try p.dupe(u8, tree.path),
             .snapshot = .{
                 .bytes = @intCast(tree.bytes),
                 .sha256 = tree.content_sha256,
@@ -1155,6 +1310,14 @@ pub fn validateLocalPostRunCommand(self: *AcceptedRun, raw: []const u8, stage: S
         return error.InvalidContext;
     if (stage == .@"handoff-inspect" and self.compatibility != .tiny_v2_qcow2_derived_vhd)
         return error.InvalidContext;
+    var scratch_arena: ?std.heap.ArenaAllocator = if (self.scratch == null)
+        std.heap.ArenaAllocator.init(self.arena.child_allocator)
+    else
+        null;
+    defer if (scratch_arena) |*active| active.deinit();
+    const previous_scratch = self.scratch;
+    if (scratch_arena) |*active| self.scratch = active.allocator();
+    defer self.scratch = previous_scratch;
     const a = self.allocator();
     var document = try contracts.Document.parse(a, raw, .{
         .bytes = records.max_record_bytes,
@@ -1214,7 +1377,7 @@ fn validateCommands(self: *AcceptedRun, legacy: bool, allow_historical_local: bo
             }
             if (self.context == .local_runtime) {
                 const log = try join(self.allocator(), &.{ self.root, "compute/private", try std.fmt.allocPrint(self.allocator(), "{s}.log", .{stage_name}) });
-                const observed = try physical.readFile(self.io, log, plan.spec(stage).output_limit + 1, true);
+                const observed = try self.readFileInPass(log, plan.spec(stage).output_limit + 1, true);
                 if (observed.bytes != try number(u64, try get(value, "bytes")))
                     return error.CommandOutputChanged;
                 try equal(&observed.sha256, try text(try get(value, "sha256")));
@@ -1321,21 +1484,25 @@ fn checkPostRunSupervisorRole(self: *AcceptedRun, binding: std.json.Value, stage
 }
 
 fn collectRuntimeInputs(self: *AcceptedRun, context: *build.Context, boot_context: *boot.Context) !void {
-    const a = self.allocator();
+    const p = self.persistentAllocator();
     var result: std.ArrayList(PinnedInput) = .empty;
     for ([_]inputs.Custody{ context.consumer.?.custody, boot_context.boot_inputs.? }) |custody| {
         for (custody.files) |item| {
-            const observed = try physical.readFile(self.io, item.path, limits.input_file, false);
-            if (!std.meta.eql(observed.metadata, item.metadata) or
-                !std.meta.eql(observed.sha256, item.sha256))
-                return error.InputChanged;
-            try result.append(a, .{ .role = item.role, .path = item.path, .snapshot = .{ .bytes = observed.bytes, .sha256 = observed.sha256, .metadata = observed.metadata } });
+            try result.append(p, .{
+                .role = try p.dupe(u8, item.role),
+                .path = try p.dupe(u8, item.path),
+                .snapshot = .{
+                    .bytes = @intCast(item.metadata[6]),
+                    .sha256 = item.sha256,
+                    .metadata = item.metadata,
+                },
+            });
         }
         for (custody.trees) |tree| {
             const root = physical.metadata(try physical.directory(self.io, tree.path, false));
-            try result.append(a, .{
-                .role = try std.fmt.allocPrint(a, "tree:{s}", .{tree.role}),
-                .path = tree.path,
+            try result.append(p, .{
+                .role = try std.fmt.allocPrint(p, "tree:{s}", .{tree.role}),
+                .path = try p.dupe(u8, tree.path),
                 .snapshot = .{
                     .bytes = tree.bytes,
                     .sha256 = tree.content_sha256,
@@ -1351,11 +1518,11 @@ fn collectRuntimeInputs(self: *AcceptedRun, context: *build.Context, boot_contex
         }
     }
     if (result.items.len > 512) return error.InputLimit;
-    self.runtime_inputs = try result.toOwnedSlice(a);
+    self.runtime_inputs = try result.toOwnedSlice(p);
 }
 
 fn collectArtifacts(self: *AcceptedRun) !void {
-    const a = self.allocator();
+    const p = self.persistentAllocator();
     var result: std.ArrayList(PinnedArtifact) = .empty;
     for (artifact_specs) |spec| {
         if (self.context == .local_runtime and spec.role == .cleanup and !self.local_read_only) continue;
@@ -1364,13 +1531,13 @@ fn collectArtifacts(self: *AcceptedRun) !void {
                 @intFromEnum(spec.role) >= @intFromEnum(ArtifactRole.qcow2_finalization_intent)))
             continue;
         const path_name = try self.artifactPath(spec.role);
-        const observed = try physical.readFile(self.io, path_name, max_artifact_bytes, self.context != .local_runtime or !spec.source);
-        try result.append(a, .{
+        const observed = try self.readFileInPass(path_name, max_artifact_bytes, self.context != .local_runtime or !spec.source);
+        try result.append(p, .{
             .role = stageRole(spec.role),
             .relative_path = if (self.context == .local_runtime)
-                try join(a, &.{ if (spec.source) "source" else "runtime", if (spec.role == .vhd and self.compatibility == .tiny_v1_legacy) "compute/package/unikraft.vhd" else spec.relative })
+                try join(p, &.{ if (spec.source) "source" else "runtime", if (spec.role == .vhd and self.compatibility == .tiny_v1_legacy) "compute/package/unikraft.vhd" else spec.relative })
             else
-                try join(a, &.{ "artifacts", stageRole(spec.role) }),
+                try join(p, &.{ "artifacts", stageRole(spec.role) }),
             .bytes = observed.bytes,
             .sha256 = observed.sha256,
             .snapshot = observed.metadata,
@@ -1379,25 +1546,25 @@ fn collectArtifacts(self: *AcceptedRun) !void {
     for (profile.modes(self.compatibility)) |mode| {
         for ([_]BootRole{ .serial, .request, .report, .compute }) |part| {
             const path_name = try bootPath(self, mode, part);
-            const observed = try physical.readFile(self.io, path_name, if (part == .serial) 4 * 1024 * 1024 else records.max_record_bytes, true);
-            const role = try std.fmt.allocPrint(a, "boot:{s}:{s}", .{ @tagName(mode), @tagName(part) });
+            const observed = try self.readFileInPass(path_name, if (part == .serial) 4 * 1024 * 1024 else records.max_record_bytes, true);
+            const role = try std.fmt.allocPrint(p, "boot:{s}:{s}", .{ @tagName(mode), @tagName(part) });
             const relative_path = if (self.context == .local_runtime)
                 (if (part == .compute)
-                    try join(a, &.{ "runtime/compute/evidence", try std.fmt.allocPrint(a, "{s}-compute.json", .{@tagName(mode)}) })
+                    try join(p, &.{ "runtime/compute/evidence", try std.fmt.allocPrint(p, "{s}-compute.json", .{@tagName(mode)}) })
                 else
-                    try join(a, &.{ "runtime/compute", try std.fmt.allocPrint(a, "boot-{s}", .{@tagName(mode)}), switch (part) {
+                    try join(p, &.{ "runtime/compute", try std.fmt.allocPrint(p, "boot-{s}", .{@tagName(mode)}), switch (part) {
                         .serial => "hyperv-efi-boot.log",
                         .request => "request.json",
                         .report => "report.json",
                         .compute => unreachable,
                     } }))
             else
-                try join(a, &.{ "boots", @tagName(mode), @tagName(part) });
-            try result.append(a, .{ .role = role, .relative_path = relative_path, .bytes = observed.bytes, .sha256 = observed.sha256, .snapshot = observed.metadata });
+                try join(p, &.{ "boots", @tagName(mode), @tagName(part) });
+            try result.append(p, .{ .role = role, .relative_path = relative_path, .bytes = observed.bytes, .sha256 = observed.sha256, .snapshot = observed.metadata });
         }
     }
     if (result.items.len > 64) return error.ArtifactLimit;
-    self.artifacts = try result.toOwnedSlice(a);
+    self.artifacts = try result.toOwnedSlice(p);
 }
 
 fn bootPath(self: *AcceptedRun, mode: profile.Mode, part: BootRole) ![]const u8 {
@@ -1537,12 +1704,12 @@ fn validateSelectedBundle(self: *AcceptedRun, portable: std.json.Value, members:
     if (accepted.set != self.compatibility or accepted.records.count() != self.records.len)
         return error.InvalidResult;
     for (self.records) |item| {
-        const current = try physical.readFile(self.io, try recordPath(self, item.name), records.max_record_bytes, true);
+        const current = try self.readFileInPass(try recordPath(self, item.name), records.max_record_bytes, true);
         if (current.bytes != item.bytes or !std.meta.eql(current.sha256, item.sha256))
             return error.RecordChanged;
         try equal(try text(accepted.records.get(item.name) orelse return error.MissingRecord), &current.sha256);
     }
-    const actual_result = try physical.readFile(self.io, try resultPath(self), records.max_record_bytes, true);
+    const actual_result = try self.readFileInPass(try resultPath(self), records.max_record_bytes, true);
     if (actual_result.bytes != self.result.bytes or
         !std.meta.eql(actual_result.sha256, self.result.sha256))
         return error.ResultChanged;
@@ -1604,7 +1771,7 @@ fn verifyBundleItem(
 ) !void {
     _ = try contracts.exactFields(item, &.{ "path", "sha256", "size" });
     try equal(try text(try get(item, "path")), if (self.context == .private_bundle) path else relative);
-    const observed = try physical.readFile(self.io, path, limit, true);
+    const observed = try self.readFileInPass(path, limit, true);
     if (observed.bytes == 0 or observed.bytes != try number(u64, try get(item, "size")))
         return error.ArtifactChanged;
     try equal(&observed.sha256, try text(try get(item, "sha256")));
@@ -1796,25 +1963,40 @@ fn verifyImportedEvidence(self: *AcceptedRun, portable: ?std.json.Value) !void {
         if (efi_file.bytes > 64 * limits.mib or raw_file.bytes != 66 * limits.mib or
             vhd_file.bytes != raw_file.bytes + 512)
             return error.PackageChanged;
-        var hash = core.Sha256.init(.{});
-        var buffer: [64 * 1024]u8 = undefined;
-        var offset: u64 = 0;
-        while (offset < raw_file.bytes) {
-            const count: usize = @intCast(@min(buffer.len, raw_file.bytes - offset));
-            if (try vhd.file.readPositionalAll(self.io, buffer[0..count], offset) != count)
-                return error.PackageChanged;
-            hash.update(buffer[0..count]);
-            offset += count;
+        if (self.verified_legacy_vhd) |cached| {
+            if (std.meta.eql(cached.raw_sha256, raw_file.sha256) and
+                std.meta.eql(cached.vhd_sha256, vhd_file.sha256))
+            {
+                try vhd.verify(self.io);
+                try equal(try text(try get(packaged, "footer_sha256")), &cached.footer_sha256);
+            } else self.verified_legacy_vhd = null;
         }
-        const prefix = std.fmt.bytesToHex(hash.finalResult(), .lower);
-        try equal(&raw_file.sha256, &prefix);
-        var footer: [512]u8 = undefined;
-        if (try vhd.file.readPositionalAll(self.io, &footer, raw_file.bytes) != footer.len)
-            return error.PackageChanged;
-        try verifyFixedVhdFooter(&footer, vhd_file.bytes);
-        try vhd.verify(self.io);
-        const footer_sha = std.fmt.bytesToHex(records.fileIdentity(&footer), .lower);
-        try equal(try text(try get(packaged, "footer_sha256")), &footer_sha);
+        if (self.verified_legacy_vhd == null) {
+            var hash = core.Sha256.init(.{});
+            var buffer: [64 * 1024]u8 = undefined;
+            var offset: u64 = 0;
+            while (offset < raw_file.bytes) {
+                const count: usize = @intCast(@min(buffer.len, raw_file.bytes - offset));
+                if (try vhd.file.readPositionalAll(self.io, buffer[0..count], offset) != count)
+                    return error.PackageChanged;
+                hash.update(buffer[0..count]);
+                offset += count;
+            }
+            const prefix = std.fmt.bytesToHex(hash.finalResult(), .lower);
+            try equal(&raw_file.sha256, &prefix);
+            var footer: [512]u8 = undefined;
+            if (try vhd.file.readPositionalAll(self.io, &footer, raw_file.bytes) != footer.len)
+                return error.PackageChanged;
+            try verifyFixedVhdFooter(&footer, vhd_file.bytes);
+            try vhd.verify(self.io);
+            const footer_sha = std.fmt.bytesToHex(records.fileIdentity(&footer), .lower);
+            try equal(try text(try get(packaged, "footer_sha256")), &footer_sha);
+            self.verified_legacy_vhd = .{
+                .raw_sha256 = raw_file.sha256,
+                .vhd_sha256 = vhd_file.sha256,
+                .footer_sha256 = footer_sha,
+            };
+        }
         try equal(try text(try get(packaged, "miz_revision")), limits.miz_revision);
         try sameJson(a, try get(packaged, "packaging"), try valueOf(a, .{
             .architecture = "x86_64",
@@ -2188,11 +2370,11 @@ fn guardedMap(a: std.mem.Allocator, value: std.json.Value, domain: []const u8) !
 }
 
 fn stagedArtifact(self: *AcceptedRun, role: ArtifactRole) !physical.File {
-    return physical.readFile(self.io, try self.artifactPath(role), if (role == .cleanup) 128 else max_artifact_bytes, self.context != .local_runtime or !isSource(role));
+    return self.readFileInPass(try self.artifactPath(role), if (role == .cleanup) 128 else max_artifact_bytes, self.context != .local_runtime or !isSource(role));
 }
 
 fn compareCopy(self: *AcceptedRun, filename: []const u8, role: ArtifactRole) !void {
-    const one = try physical.readFile(self.io, try recordPath(self, filename), records.max_record_bytes, true);
+    const one = try self.readFileInPass(try recordPath(self, filename), records.max_record_bytes, true);
     const other = try stagedArtifact(self, role);
     if (one.bytes != other.bytes or !std.meta.eql(one.sha256, other.sha256))
         return error.RecordCopyChanged;
@@ -2350,7 +2532,7 @@ fn verifyImportedBoot(self: *AcceptedRun, mode: profile.Mode, boot_inputs: std.j
     _ = try contracts.exactFields(failures, &.{ "primary", "cleanup", "recording" });
     for ([_][]const u8{ "primary", "cleanup", "recording" }) |key|
         if (try get(failures, key) != .null) return error.InvalidBootReport;
-    const raw = try physical.readFile(self.io, serial_path, 4 * 1024 * 1024, true);
+    const raw = try self.readFileInPass(serial_path, 4 * 1024 * 1024, true);
     if (raw.bytes == 0 or raw.bytes >= 4 * 1024 * 1024 or
         try number(u64, try get(report, "serial_bytes")) != raw.bytes)
         return error.SerialChanged;
@@ -2363,8 +2545,8 @@ fn verifyImportedBoot(self: *AcceptedRun, mode: profile.Mode, boot_inputs: std.j
     try equal(try text(try get(compute, "scope")), "local_native_compute_only");
     try sameJson(a, try get(compute, "report"), report);
     try sameJson(a, try get(compute, "input_pins"), pins);
-    const request_file = try physical.readFile(self.io, request_path, records.max_record_bytes, true);
-    const report_file = try physical.readFile(self.io, report_path, records.max_record_bytes, true);
+    const request_file = try self.readFileInPass(request_path, records.max_record_bytes, true);
+    const report_file = try self.readFileInPass(report_path, records.max_record_bytes, true);
     try equal(try text(try get(compute, "request_sha256")), &request_file.sha256);
     try equal(try text(try get(compute, "report_sha256")), &report_file.sha256);
     try sameJson(a, try get(compute, "compute"), try valueOf(a, parsed.compute orelse return error.InvalidComputeEvidence));
@@ -2431,8 +2613,8 @@ fn verifyBootPin(pin: std.json.Value, recorded: ?struct { metadata: std.json.Val
 }
 
 fn compareBootCopy(self: *AcceptedRun, mode: profile.Mode, name: []const u8) !void {
-    const first = try physical.readFile(self.io, try recordPath(self, name), records.max_record_bytes, true);
-    const second = try physical.readFile(self.io, try bootPath(self, mode, .compute), records.max_record_bytes, true);
+    const first = try self.readFileInPass(try recordPath(self, name), records.max_record_bytes, true);
+    const second = try self.readFileInPass(try bootPath(self, mode, .compute), records.max_record_bytes, true);
     if (first.bytes != second.bytes or !std.meta.eql(first.sha256, second.sha256))
         return error.RecordCopyChanged;
 }

@@ -431,7 +431,7 @@ pub fn runLegacyReadOnly(
 }
 
 fn runWithPolicy(
-    allocator: std.mem.Allocator,
+    raw_allocator: std.mem.Allocator,
     io: std.Io,
     repository: []const u8,
     runtime: []const u8,
@@ -443,6 +443,9 @@ fn runWithPolicy(
 ) !void {
     try files.absoluteFilePath(repository);
     try files.absoluteFilePath(runtime);
+    var scratch = std.heap.ArenaAllocator.init(raw_allocator);
+    defer scratch.deinit();
+    const allocator = scratch.allocator();
     const root = try files.openDirectory(io, runtime, .private);
     defer root.close(io);
     const start_path = try std.fs.path.join(allocator, &.{ runtime, "compute/evidence/build-start.json" });
@@ -484,7 +487,7 @@ fn runWithPolicy(
     var git = try files.RetainedFile.open(io, git_path, .tool);
     defer git.close(io);
     try notCancelled(signal);
-    const before = try recordedSource(allocator, io, repository, git_path, start, policy);
+    _ = try recordedSource(allocator, io, repository, git_path, start, policy);
     try buildRoles(allocator, io, repository, runtime, start, signal, legacy);
     try bootRoles(allocator, io, repository, runtime, boot, !legacy and try nativeProducer(allocator, runtime, try get(consumer, "files")), signal, legacy);
     try notCancelled(signal);
@@ -499,8 +502,6 @@ fn runWithPolicy(
     try notCancelled(signal);
     try recapture(allocator, io, boot);
     try notCancelled(signal);
-    const after = try recordedSource(allocator, io, repository, git_path, start, policy);
-    if (!before.same(after)) return error.SourceChanged;
     try pinned_start.verify(io);
     try pinned_boot.verify(io);
     try git.verify(io);

@@ -524,7 +524,6 @@ pub fn build(b: *std.Build) void {
     const source_limits_run = b.addRunArtifact(source_limits_tests);
     b.step("test-controller-limits", "Run native source-custody production boundary fixtures")
         .dependOn(&source_limits_run.step);
-    controller_run.step.dependOn(&source_limits_run.step);
     controller_step.dependOn(&source_limits_run.step);
     const fault_parity_tests = b.addTest(.{
         .root_module = b.createModule(.{
