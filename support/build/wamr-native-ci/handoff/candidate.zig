@@ -624,13 +624,16 @@ test "candidate empty captures retain the frozen incomplete and cumulative prefi
     defer arena.deinit();
     const a = arena.allocator();
     const io = std.testing.io;
-    const directory = try std.Io.Dir.openDirAbsolute(io, @import("test_options").fixture_root, .{});
+    var fixture_root = try std.Io.Dir.openDirAbsolute(io, @import("test_options").fixture_root, .{});
+    defer fixture_root.close(io);
+    try fixture_root.createDirPath(io, "handoff-export-tests");
+    const directory = try fixture_root.openDir(io, "handoff-export-tests", .{});
     defer directory.close(io);
     const name = try std.fmt.allocPrint(a, "candidate-empty-serial-{d}", .{std.os.linux.getpid()});
     const file = try directory.createFile(io, name, .{ .exclusive = true, .permissions = .fromMode(0o600) });
     file.close(io);
     defer directory.deleteFile(io, name) catch @panic("empty candidate capture cleanup failed");
-    const path = try std.fs.path.join(a, &.{ @import("test_options").fixture_root, name });
+    const path = try std.fs.path.join(a, &.{ @import("test_options").fixture_root, "handoff-export-tests", name });
     try std.testing.expectError(error.EvidenceIncomplete, retainFile(a, io, path, contracts.layout.max_serial_bytes, null, error.EvidenceIncomplete));
     try std.testing.expectError(error.WrongSerialPrefix, retainFile(a, io, path, contracts.layout.max_serial_bytes, null, error.WrongSerialPrefix));
     try std.testing.expectError(error.UnsafeSource, retainFile(a, io, path, contracts.layout.max_json_bytes, null, null));
