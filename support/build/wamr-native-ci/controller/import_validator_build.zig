@@ -576,6 +576,9 @@ fn runImportedReaderWithFault(
         contained(accepted.root, output) or contained(repository, output))
         return error.AliasedOutput;
     try candidate.verify(io);
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
     var paths: [4][]const u8 = undefined;
     var paths_owned: usize = 0;
     errdefer for (paths[0..paths_owned]) |path| allocator.free(path);
@@ -583,12 +586,9 @@ fn runImportedReaderWithFault(
         paths[i] = try allocator.dupe(u8, path);
         paths_owned += 1;
     }
-    paths[3] = try std.process.executablePathAlloc(io, allocator);
+    paths[3] = try allocator.dupe(u8, try std.process.executablePathAlloc(io, a));
     paths_owned += 1;
     const local: LocalTools = .{ .git = paths[0], .supervisor = paths[1], .validator = paths[2] };
-    var scratch = std.heap.ArenaAllocator.init(allocator);
-    defer scratch.deinit();
-    const a = scratch.allocator();
     var start = try accepted.pinArtifact(.build_start);
     defer start.close(io);
     var raw = try files.readSensitiveFile(io, a, start.file, records.max_record_bytes, .private);
@@ -1023,7 +1023,7 @@ pub fn revalidateHandoffCommand(
 }
 
 pub fn run(
-    allocator: std.mem.Allocator,
+    raw_allocator: std.mem.Allocator,
     io: std.Io,
     accepted: *accepted_run.AcceptedRun,
     repository: []const u8,
@@ -1034,6 +1034,9 @@ pub fn run(
     if (accepted.context != .trusted_inner_zip or
         accepted.compatibility != .tiny_v2_qcow2_derived_vhd)
         return error.InvalidContext;
+    var scratch = std.heap.ArenaAllocator.init(raw_allocator);
+    defer scratch.deinit();
+    const allocator = scratch.allocator();
     try files.absoluteFilePath(output);
     if (contained(output, accepted.root) or contained(output, repository) or
         contained(accepted.root, output) or contained(repository, output))

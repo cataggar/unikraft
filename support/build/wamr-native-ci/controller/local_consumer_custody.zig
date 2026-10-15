@@ -487,7 +487,7 @@ fn runWithPolicy(
     var git = try files.RetainedFile.open(io, git_path, .tool);
     defer git.close(io);
     try notCancelled(signal);
-    _ = try recordedSource(allocator, io, repository, git_path, start, policy);
+    if (!legacy) _ = try recordedSource(allocator, io, repository, git_path, start, policy);
     try buildRoles(allocator, io, repository, runtime, start, signal, legacy);
     try bootRoles(allocator, io, repository, runtime, boot, !legacy and try nativeProducer(allocator, runtime, try get(consumer, "files")), signal, legacy);
     try notCancelled(signal);

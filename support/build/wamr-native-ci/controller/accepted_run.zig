@@ -220,12 +220,12 @@ pub const AcceptedRun = struct {
         }
         if (self.in_pass_files) |cache| {
             const before = retained.file_snapshot;
-            if (before.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG) return error.UnsafeFile;
-            if (before.uid != std.os.linux.geteuid()) return error.UnsafeOwner;
-            if (before.mode & 0o022 != 0 or (retained.policy == .private and before.mode & 0o077 != 0))
-                return error.UnsafePermissions;
-            if (retained.policy == .private and before.nlink != 1) return error.UnsafeLinks;
-            if (before.size > limit) return error.FileTooLarge;
+            if (before.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG or
+                (before.uid == 0 and before.nlink == 0) or
+                (before.uid != 0 and before.nlink != 1) or
+                (before.uid != std.os.linux.geteuid() and before.uid != 0) or
+                before.mode & 0o022 != 0 or before.size > limit)
+                return error.UnsafeFile;
             if (cache.get(retained.path)) |cached| {
                 if (std.meta.eql(physical.metadata(before), cached.metadata)) {
                     const after = try files.snapshot(retained.file);
@@ -400,7 +400,7 @@ pub const AcceptedRun = struct {
             self.in_pass_files = previous_files;
         }
         if (self.context == .local_runtime) {
-            if (self.local_read_only and self.compatibility == .tiny_v1_legacy and oldLegacySource(self.source))
+            if (self.local_read_only and self.compatibility == .tiny_v1_legacy)
                 self.local_legacy_source = try localLegacySource(self, signal);
             if (self.compatibility == .tiny_v1_legacy)
                 try revalidateLocalLegacy(self, signal)
@@ -512,7 +512,6 @@ pub const PrivateBundle = struct {
             evidence.scratch = null;
             evidence.in_pass_files = null;
         }
-        const a = evidence.allocator();
         const expected = try files.snapshot(.{ .handle = directory.dir.handle, .flags = .{ .nonblocking = false } });
         if (!files.sameSnapshot(expected, try physical.directory(io, root, true)))
             return error.StageChanged;
@@ -527,7 +526,7 @@ pub const PrivateBundle = struct {
             &evidence,
             start,
             repository,
-            try std.process.executablePathAlloc(io, a),
+            try std.process.executablePathAlloc(io, p),
             .{
                 .git = try p.dupe(u8, tools.git),
                 .supervisor = try p.dupe(u8, tools.supervisor),

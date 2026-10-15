@@ -235,8 +235,8 @@ pub const ImportedProduct = struct {
         for (self.sealed.items) |held|
             if (!copy.sameCustodySnapshot(held.snapshot, try copy.directorySnapshot(held.directory.dir)))
                 return error.OutputChanged;
-        try self.bundle.?.manifest.verify(self.io);
         try self.verifyHeld(&self.final.?, cancel);
+        try self.bundle.?.manifest.verify(self.io);
     }
     pub fn revalidate(self: *ImportedProduct, signal: ?*core.process.SignalCancellation) !void {
         if (self.publication != .durable or self.bundle == null or self.final == null)
