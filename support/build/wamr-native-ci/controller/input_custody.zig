@@ -302,8 +302,14 @@ fn appendBinding(allocator: std.mem.Allocator, bindings: *std.ArrayList(Binding)
     try bindings.append(allocator, .{ .role = owned_role, .path = owned_path });
 }
 
-fn collectRuntime(allocator: std.mem.Allocator, io: std.Io, executable: []const u8, bindings: *std.ArrayList(Binding)) !void {
-    const paths = try executableRuntimePaths(allocator, io, executable);
+fn collectRuntime(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    executable: []const u8,
+    bindings: *std.ArrayList(Binding),
+    runtime_cache: ?*std.AutoHashMap([9]i128, [][]const u8),
+) !void {
+    const paths = try executableRuntimePathsCached(allocator, io, executable, runtime_cache);
     defer {
         for (paths) |path| allocator.free(path);
         allocator.free(paths);
@@ -320,7 +326,70 @@ fn collectRuntime(allocator: std.mem.Allocator, io: std.Io, executable: []const 
     }
 }
 
+pub fn executableRuntimePathsCached(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    executable: []const u8,
+    runtime_cache: ?*std.AutoHashMap([9]i128, [][]const u8),
+) ![][]const u8 {
+    if (runtime_cache) |cache| {
+        var pinned = try files.RetainedFile.open(io, executable, .artifact);
+        defer pinned.close(io);
+        const meta = physical.metadata(pinned.file_snapshot);
+        if (cache.get(meta)) |cached| {
+            try pinned.verify(io);
+            const copy = try allocator.alloc([]const u8, cached.len);
+            var filled: usize = 0;
+            errdefer {
+                for (copy[0..filled]) |item| allocator.free(item);
+                allocator.free(copy);
+            }
+            for (cached, 0..) |path, index| {
+                var retained = try files.RetainedFile.open(io, path, .artifact);
+                defer retained.close(io);
+                try retained.verify(io);
+                copy[index] = try allocator.dupe(u8, path);
+                filled += 1;
+            }
+            try pinned.verify(io);
+            return copy;
+        }
+        const computed = try executableRuntimePaths(allocator, io, executable);
+        errdefer {
+            for (computed) |item| allocator.free(item);
+            allocator.free(computed);
+        }
+        try pinned.verify(io);
+        if (std.meta.eql(meta, physical.metadata(try files.snapshot(pinned.file)))) {
+            const cache_alloc = cache.allocator;
+            const stored = try cache_alloc.alloc([]const u8, computed.len);
+            var stored_count: usize = 0;
+            errdefer {
+                for (stored[0..stored_count]) |item| cache_alloc.free(item);
+                cache_alloc.free(stored);
+            }
+            for (computed, 0..) |item, index| {
+                stored[index] = try cache_alloc.dupe(u8, item);
+                stored_count += 1;
+            }
+            try cache.put(meta, stored);
+        }
+        return computed;
+    }
+    return executableRuntimePaths(allocator, io, executable);
+}
+
 pub fn captureProduction(allocator: std.mem.Allocator, io: std.Io, paths: ProductionPaths) !Production {
+    return captureProductionCached(allocator, io, paths, null, null);
+}
+
+pub fn captureProductionCached(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    paths: ProductionPaths,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+    runtime_cache: ?*std.AutoHashMap([9]i128, [][]const u8),
+) !Production {
     var file_bindings: std.ArrayList(Binding) = .empty;
     errdefer {
         for (file_bindings.items) |item| {
@@ -341,7 +410,7 @@ pub fn captureProduction(allocator: std.mem.Allocator, io: std.Io, paths: Produc
         const role = try allocator.print("tool:{s}", .{name});
         defer allocator.free(role);
         try appendBinding(allocator, &file_bindings, role, path);
-        try collectRuntime(allocator, io, path, &file_bindings);
+        try collectRuntime(allocator, io, path, &file_bindings, runtime_cache);
     }
     const static_roles = [_]struct { role: []const u8, relative: []const u8 }{
         .{ .role = "command-supervisor", .relative = "controller/bin/uk-wamr-native-ci" },
@@ -357,7 +426,7 @@ pub fn captureProduction(allocator: std.mem.Allocator, io: std.Io, paths: Produc
         defer allocator.free(path);
         try appendBinding(allocator, &file_bindings, item.role, path);
         if (!std.mem.eql(u8, item.role, "wamr-source-archive"))
-            try collectRuntime(allocator, io, path, &file_bindings);
+            try collectRuntime(allocator, io, path, &file_bindings, runtime_cache);
     }
     const tree_roles = [_]struct { role: []const u8, path: []const u8 }{
         .{ .role = "bison", .path = try std.fs.path.join(allocator, &.{ paths.runtime, "bison" }) },
@@ -389,12 +458,26 @@ pub fn captureProduction(allocator: std.mem.Allocator, io: std.Io, paths: Produc
         }
         allocator.free(production.tree_bindings);
     }
-    production.custody = try capture(allocator, io, production.file_bindings, production.tree_bindings);
+    production.custody = if (known_files) |known|
+        try captureWithKnown(allocator, io, production.file_bindings, production.tree_bindings, known)
+    else
+        try capture(allocator, io, production.file_bindings, production.tree_bindings);
     return production;
 }
 
 pub fn requireProduction(allocator: std.mem.Allocator, io: std.Io, paths: ProductionPaths, expected: Custody) !void {
-    var current = try captureProduction(allocator, io, paths);
+    return requireProductionCached(allocator, io, paths, expected, null, null);
+}
+
+pub fn requireProductionCached(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    paths: ProductionPaths,
+    expected: Custody,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+    runtime_cache: ?*std.AutoHashMap([9]i128, [][]const u8),
+) !void {
+    var current = try captureProductionCached(allocator, io, paths, known_files, runtime_cache);
     defer current.deinit(allocator);
     try compareCaptured(expected, current.custody);
 }
@@ -935,10 +1018,24 @@ pub fn captureWithKnown(
 }
 
 pub fn requireSame(allocator: std.mem.Allocator, io: std.Io, expected: Custody, file_paths: []const Binding, tree_paths: []const Binding) !void {
+    return requireSameWithKnown(allocator, io, expected, file_paths, tree_paths, null);
+}
+
+pub fn requireSameWithKnown(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    expected: Custody,
+    file_paths: []const Binding,
+    tree_paths: []const Binding,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+) !void {
     if (!std.mem.eql(u8, expected.schema, "uk.wamr.consumer-input-custody") or expected.version != 2 or
         file_paths.len != expected.files.len or tree_paths.len != expected.trees.len)
         return error.InvalidInputCustody;
-    var current = try capture(allocator, io, file_paths, tree_paths);
+    var current = if (known_files) |known|
+        try captureWithKnown(allocator, io, file_paths, tree_paths, known)
+    else
+        try capture(allocator, io, file_paths, tree_paths);
     defer current.deinit(allocator);
     try compareCaptured(expected, current);
 }

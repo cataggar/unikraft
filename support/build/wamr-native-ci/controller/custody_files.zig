@@ -51,6 +51,15 @@ pub fn readFileCached(
 ) !File {
     var retained = try files.RetainedFile.open(io, path, if (private) .private else .artifact);
     defer retained.close(io);
+    return readRetainedCached(io, &retained, limit, known);
+}
+
+pub fn readRetainedCached(
+    io: std.Io,
+    retained: *const files.RetainedFile,
+    limit: u64,
+    known: ?*std.AutoHashMap([9]i128, [64]u8),
+) !File {
     const before = retained.file_snapshot;
     if (before.mode & linux.S.IFMT != linux.S.IFREG or
         (before.uid == 0 and before.nlink == 0) or
@@ -69,7 +78,7 @@ pub fn readFileCached(
             .metadata = meta,
         };
     };
-    const file = try readRetained(io, &retained, limit);
+    const file = try readRetained(io, retained, limit);
     if (known) |cache| try cache.put(file.metadata, file.sha256);
     return file;
 }
@@ -106,7 +115,80 @@ pub fn readRetained(io: std.Io, retained: *const files.RetainedFile, limit: u64)
     };
 }
 
+fn isSimpleCanonicalTuple(comptime T: type) bool {
+    const info = @typeInfo(T);
+    if (info != .@"struct" or !info.@"struct".is_tuple) return false;
+    if (info.@"struct".field_types.len > 64) return false;
+    inline for (info.@"struct".field_types) |field_type| {
+        if (!isSimpleCanonicalItem(field_type)) return false;
+    }
+    return true;
+}
+
+fn isSimpleCanonicalItem(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .bool, .int, .comptime_int => true,
+        .optional => |opt| isSimpleCanonicalItem(opt.child),
+        .pointer => |ptr| switch (ptr.size) {
+            .slice => ptr.child == u8,
+            .one => switch (@typeInfo(ptr.child)) {
+                .array => |arr| arr.child == u8,
+                else => false,
+            },
+            else => false,
+        },
+        .array => |arr| arr.child == u8 or (@typeInfo(arr.child) == .int and arr.len <= 64),
+        else => false,
+    };
+}
+
+fn validSimpleCanonicalValue(value: anytype) bool {
+    const T = @TypeOf(value);
+    return switch (@typeInfo(T)) {
+        .bool => true,
+        .int, .comptime_int => value >= std.math.minInt(i64) and value <= std.math.maxInt(u64),
+        .optional => if (value) |inner| validSimpleCanonicalValue(inner) else true,
+        .pointer => |ptr| switch (ptr.size) {
+            .slice => value.len <= 4096 and std.unicode.utf8ValidateSlice(value),
+            .one => value.len <= 4096 and std.unicode.utf8ValidateSlice(value[0..]),
+            else => false,
+        },
+        .array => |arr| if (arr.child == u8)
+            arr.len <= 4096 and std.unicode.utf8ValidateSlice(&value)
+        else blk: {
+            for (value) |elem| {
+                if (elem < std.math.minInt(i64) or elem > std.math.maxInt(u64)) break :blk false;
+            }
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
+fn validSimpleCanonicalTuple(value: anytype) bool {
+    const info = @typeInfo(@TypeOf(value)).@"struct";
+    inline for (info.field_names) |field_name| {
+        if (!validSimpleCanonicalValue(@field(value, field_name))) return false;
+    }
+    return true;
+}
+
 pub fn bind(allocator: std.mem.Allocator, hash: *Sha256, value: anytype) !void {
+    if (comptime isSimpleCanonicalTuple(@TypeOf(value))) {
+        if (validSimpleCanonicalTuple(value)) {
+            var stack_buffer: [16 * 1024]u8 = undefined;
+            var fixed = std.heap.FixedBufferAllocator.init(&stack_buffer);
+            if (std.json.Stringify.valueAlloc(fixed.allocator(), value, .{})) |bytes| {
+                if (bytes.len <= 64 * 1024) {
+                    var length: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &length, bytes.len, .big);
+                    hash.update(&length);
+                    hash.update(bytes);
+                    return;
+                }
+            } else |_| {}
+        }
+    }
     // Canonicalization's nested allocations must not accumulate in the
     // caller's long-lived acceptance arena across inventory entries.
     var scratch = std.heap.ArenaAllocator.init(allocator);

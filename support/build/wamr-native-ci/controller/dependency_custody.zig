@@ -210,6 +210,7 @@ const Stats = struct {
     bytes: usize = 0,
     content: Sha256,
     physical_hash: Sha256,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8) = null,
 };
 
 fn packageDirectory(io: std.Io, parent: std.Io.Dir, name: []const u8) !std.Io.Dir {
@@ -221,13 +222,29 @@ fn packageDirectory(io: std.Io, parent: std.Io.Dir, name: []const u8) !std.Io.Di
     return dir;
 }
 
-fn packageFile(io: std.Io, dir: std.Io.Dir, name: []const u8, before: files.Snapshot) !physical.File {
+fn packageFile(
+    io: std.Io,
+    dir: std.Io.Dir,
+    name: []const u8,
+    before: files.Snapshot,
+    known: ?*std.AutoHashMap([9]i128, [64]u8),
+) !physical.File {
     const file = try dir.openFile(io, name, .{ .follow_symlinks = false });
     defer file.close(io);
     if (before.mode & linux.S.IFMT != linux.S.IFREG or before.uid != linux.geteuid() or
         before.nlink != 1 or before.size > limits.dependency_file or
         !files.sameSnapshot(before, try files.snapshot(file)))
         return error.UnsafePackageFile;
+    const meta = physical.metadata(before);
+    if (known) |cache| if (cache.get(meta)) |sha256| {
+        if (!files.sameSnapshot(before, try files.snapshot(file)))
+            return error.PackageChanged;
+        return .{
+            .bytes = before.size,
+            .sha256 = sha256,
+            .metadata = meta,
+        };
+    };
     var hash = Sha256.init(.{});
     var buffer: [64 * 1024]u8 = undefined;
     var offset: u64 = 0;
@@ -240,10 +257,12 @@ fn packageFile(io: std.Io, dir: std.Io.Dir, name: []const u8, before: files.Snap
     if (try file.readPositionalAll(io, buffer[0..1], offset) != 0 or
         !files.sameSnapshot(before, try files.snapshot(file)))
         return error.PackageChanged;
+    const sha256 = std.fmt.bytesToHex(hash.finalResult(), .lower);
+    if (known) |cache| try cache.put(meta, sha256);
     return .{
         .bytes = before.size,
-        .sha256 = std.fmt.bytesToHex(hash.finalResult(), .lower),
-        .metadata = physical.metadata(before),
+        .sha256 = sha256,
+        .metadata = meta,
     };
 }
 
@@ -288,7 +307,7 @@ fn scan(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, prefix: []con
                 return error.UnsafePackageFile;
             try limits.addBounded(&state.files, 1, limits.dependency_entries - state.directories);
             try limits.addBounded(&state.bytes, @intCast(info.size), limits.dependency_bytes);
-            const member_record = try packageFile(io, dir, name, info);
+            const member_record = try packageFile(io, dir, name, info, state.known_files);
             if (!std.meta.eql(member_record.metadata, physical.metadata(info)))
                 return error.PackageChanged;
             try physical.bind(allocator, &state.content, .{ "file", relative, info.size, info.mode & 0o7777, member_record.sha256 });
@@ -302,11 +321,21 @@ fn scan(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, prefix: []con
         return error.PackageChanged;
 }
 
-fn inventory(allocator: std.mem.Allocator, io: std.Io, packages: std.Io.Dir, name: []const u8) !Package {
+fn inventory(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    packages: std.Io.Dir,
+    name: []const u8,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+) !Package {
     try limits.packageName(name);
     const dir = try packageDirectory(io, packages, name);
     defer dir.close(io);
-    var state: Stats = .{ .content = Sha256.init(.{}), .physical_hash = Sha256.init(.{}) };
+    var state: Stats = .{
+        .content = Sha256.init(.{}),
+        .physical_hash = Sha256.init(.{}),
+        .known_files = known_files,
+    };
     state.content.update("hyperv-native-tree-v1\x00");
     state.physical_hash.update("hyperv-native-physical-v1\x00");
     try scan(allocator, io, dir, "", &state);
@@ -346,10 +375,16 @@ fn inventory(allocator: std.mem.Allocator, io: std.Io, packages: std.Io.Dir, nam
 }
 
 pub fn packageSet(allocator: std.mem.Allocator, io: std.Io, packages: []const u8) !PackageSet {
-    return packageSetForRoot(allocator, io, packages, limits.miz_package_hash);
+    return packageSetForRoot(allocator, io, packages, limits.miz_package_hash, null);
 }
 
-fn packageSetForRoot(allocator: std.mem.Allocator, io: std.Io, packages: []const u8, root_hash: []const u8) !PackageSet {
+fn packageSetForRoot(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    packages: []const u8,
+    root_hash: []const u8,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+) !PackageSet {
     const before = try physical.directory(io, packages, true);
     const dir = try files.openDirectory(io, packages, .private);
     defer dir.close(io);
@@ -388,7 +423,7 @@ fn packageSetForRoot(allocator: std.mem.Allocator, io: std.Io, packages: []const
     var directories: usize = 0;
     var bytes: usize = 0;
     for (roots.items, 0..) |name, i| {
-        collected[i] = try inventory(allocator, io, dir, name);
+        collected[i] = try inventory(allocator, io, dir, name, known_files);
         populated += 1;
         try limits.addBounded(&files_count, collected[i].files, limits.dependency_entries);
         try limits.addBounded(&directories, collected[i].directories, limits.dependency_entries - files_count);
@@ -603,7 +638,18 @@ pub fn capture(
     git: []const u8,
     compute: []const u8,
 ) !Document {
-    return captureWithPolicy(allocator, io, repository, git, compute, false);
+    return captureWithPolicy(allocator, io, repository, git, compute, false, null);
+}
+
+pub fn captureCached(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repository: []const u8,
+    git: []const u8,
+    compute: []const u8,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+) !Document {
+    return captureWithPolicy(allocator, io, repository, git, compute, false, known_files);
 }
 
 pub fn captureRecorded(
@@ -613,7 +659,7 @@ pub fn captureRecorded(
     git: []const u8,
     compute: []const u8,
 ) !Document {
-    return captureWithPolicy(allocator, io, repository, git, compute, true);
+    return captureWithPolicy(allocator, io, repository, git, compute, true, null);
 }
 
 fn captureWithPolicy(
@@ -623,6 +669,7 @@ fn captureWithPolicy(
     git: []const u8,
     compute: []const u8,
     allow_historical: bool,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
 ) !Document {
     const build_manifest = try source.trackedManifest(allocator, io, repository, git, manifest_paths[0]);
     errdefer build_manifest.deinit(allocator);
@@ -651,7 +698,7 @@ fn captureWithPolicy(
     defer allocator.free(packages_path);
     const root_info = try physical.directory(io, packages_path, true);
     const root_hash = if (generation == .historical) limits.historical_miz_package_hash else limits.miz_package_hash;
-    var packages = try packageSetForRoot(allocator, io, packages_path, root_hash);
+    var packages = try packageSetForRoot(allocator, io, packages_path, root_hash, known_files);
     errdefer packages.deinit(allocator);
     var package_records = try allocator.alloc(PackageRecord, packages.packages.len);
     errdefer allocator.free(package_records);
@@ -763,7 +810,19 @@ pub fn requireDocument(
     compute: []const u8,
     expected: Document,
 ) !void {
-    var actual = try capture(allocator, io, repository, git, compute);
+    return requireDocumentCached(allocator, io, repository, git, compute, expected, null);
+}
+
+pub fn requireDocumentCached(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repository: []const u8,
+    git: []const u8,
+    compute: []const u8,
+    expected: Document,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+) !void {
+    var actual = try captureCached(allocator, io, repository, git, compute, known_files);
     defer actual.deinit(allocator);
     const expected_bytes = try expected.canonical(allocator);
     defer allocator.free(expected_bytes);

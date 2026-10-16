@@ -160,7 +160,14 @@ pub const Context = struct {
         try build.revalidateAccepted(&transient_build);
         const context = &transient_build;
         if (self.boot_inputs) |expected|
-            try inputs.requireSame(context.allocator, context.io, expected, self.file_bindings, self.tree_bindings);
+            try inputs.requireSameWithKnown(
+                context.allocator,
+                context.io,
+                expected,
+                self.file_bindings,
+                self.tree_bindings,
+                build.knownFiles(context),
+            );
         try self.cancelled();
     }
 };
@@ -328,7 +335,7 @@ fn captureBootInputs(ctx: *Context) !void {
         var executable = try files.RetainedFile.open(ctx.io(), binding.path, .artifact);
         defer executable.close(ctx.io());
         if (executable.file_snapshot.mode & 0o111 == 0) continue;
-        const closure = try inputs.executableRuntimePaths(a, ctx.io(), binding.path);
+        const closure = try inputs.executableRuntimePathsCached(a, ctx.io(), binding.path, build.runtimeCache(ctx.build_context));
         for (closure) |path_name| {
             var found = false;
             for (bound.items) |previous| if (std.mem.eql(u8, previous.path, path_name)) {
@@ -344,7 +351,10 @@ fn captureBootInputs(ctx: *Context) !void {
     ctx.file_bindings = try bound.toOwnedSlice(a);
     const qemu_data = try std.fs.path.join(a, &.{ ctx.build_context.runtime, "bin/share" });
     ctx.tree_bindings = try a.dupe(inputs.Binding, &.{.{ .role = "qemu-data", .path = qemu_data }});
-    ctx.boot_inputs = try inputs.capture(a, ctx.io(), ctx.file_bindings, ctx.tree_bindings);
+    ctx.boot_inputs = if (build.knownFiles(ctx.build_context)) |known|
+        try inputs.captureWithKnown(a, ctx.io(), ctx.file_bindings, ctx.tree_bindings, known)
+    else
+        try inputs.capture(a, ctx.io(), ctx.file_bindings, ctx.tree_bindings);
 }
 
 fn readValueFromCustody(ctx: *Context) !Value {
@@ -1104,6 +1114,15 @@ fn publishAcceptedResult(ctx: *Context) !ResultPublished {
 /// and intermediate image-chain record are checked again before returning.
 pub fn revalidateComplete(ctx: *Context, accepted: records.Result) !void {
     if (accepted.set != .tiny_v2_qcow2_derived_vhd) return error.UnsupportedRecordSet;
+    var custody_cache: ?build.CustodyCache = if (ctx.build_context.custody_cache == null)
+        build.CustodyCache.init(std.heap.page_allocator)
+    else
+        null;
+    defer if (custody_cache) |*cache| {
+        ctx.build_context.custody_cache = null;
+        cache.deinit();
+    };
+    if (custody_cache) |*cache| ctx.build_context.custody_cache = cache;
     var owned_cache: ?std.StringHashMap(physical.File) = if (ctx.files_cache == null)
         std.StringHashMap(physical.File).init(ctx.allocator())
     else
@@ -1312,6 +1331,15 @@ pub const testing = if (builtin.is_test) struct {
 } else struct {};
 
 pub fn run(context: *Context) !ResultPublished {
+    var custody_cache: ?build.CustodyCache = if (context.build_context.custody_cache == null)
+        build.CustodyCache.init(std.heap.page_allocator)
+    else
+        null;
+    defer if (custody_cache) |*cache| {
+        context.build_context.custody_cache = null;
+        cache.deinit();
+    };
+    if (custody_cache) |*cache| context.build_context.custody_cache = cache;
     const bound = try bindInputs(try admit(context));
     const packaged = try package(bound);
     const raw_0 = try rawX2(packaged);

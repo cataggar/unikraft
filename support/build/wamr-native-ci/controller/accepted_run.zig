@@ -168,6 +168,7 @@ pub const AcceptedRun = struct {
     arena: std.heap.ArenaAllocator,
     scratch: ?std.mem.Allocator = null,
     in_pass_files: ?*std.StringHashMap(physical.File) = null,
+    in_pass_known: ?*std.AutoHashMap([9]i128, [64]u8) = null,
     io: std.Io,
     context: EvidenceContext,
     compatibility: profile.CompatibleRecordSet,
@@ -236,11 +237,11 @@ pub const AcceptedRun = struct {
                     return cached;
                 }
             }
-            const observed = try physical.readRetained(self.io, retained, limit);
+            const observed = try physical.readRetainedCached(self.io, retained, limit, self.in_pass_known);
             try cache.put(try self.allocator().dupe(u8, retained.path), observed);
             return observed;
         }
-        return physical.readRetained(self.io, retained, limit);
+        return physical.readRetainedCached(self.io, retained, limit, self.in_pass_known);
     }
 
     fn readFileInPass(self: *AcceptedRun, path: []const u8, limit: u64, private: bool) !physical.File {
@@ -392,13 +393,21 @@ pub const AcceptedRun = struct {
         else
             null;
         defer if (pass_files) |*active| active.deinit();
+        var pass_known: ?std.AutoHashMap([9]i128, [64]u8) = if (self.in_pass_known == null)
+            std.AutoHashMap([9]i128, [64]u8).init(if (scratch_arena) |*active| active.allocator() else self.allocator())
+        else
+            null;
+        defer if (pass_known) |*active| active.deinit();
         const previous_scratch = self.scratch;
         const previous_files = self.in_pass_files;
+        const previous_known = self.in_pass_known;
         if (scratch_arena) |*active| self.scratch = active.allocator();
         if (pass_files) |*active| self.in_pass_files = active;
+        if (pass_known) |*active| self.in_pass_known = active;
         defer {
             self.scratch = previous_scratch;
             self.in_pass_files = previous_files;
+            self.in_pass_known = previous_known;
         }
         if (self.context == .local_runtime) {
             if (self.local_read_only and self.compatibility == .tiny_v1_legacy)
@@ -507,11 +516,15 @@ pub const PrivateBundle = struct {
         defer scratch.deinit();
         var pass_files = std.StringHashMap(physical.File).init(scratch.allocator());
         defer pass_files.deinit();
+        var pass_known = std.AutoHashMap([9]i128, [64]u8).init(scratch.allocator());
+        defer pass_known.deinit();
         evidence.scratch = scratch.allocator();
         evidence.in_pass_files = &pass_files;
+        evidence.in_pass_known = &pass_known;
         defer {
             evidence.scratch = null;
             evidence.in_pass_files = null;
+            evidence.in_pass_known = null;
         }
         const expected = try files.snapshot(.{ .handle = directory.dir.handle, .flags = .{ .nonblocking = false } });
         if (!files.sameSnapshot(expected, try physical.directory(io, root, true)))
@@ -542,6 +555,7 @@ pub const PrivateBundle = struct {
         try manifest.verify(io);
         evidence.scratch = null;
         evidence.in_pass_files = null;
+        evidence.in_pass_known = null;
         return .{ .evidence = evidence, .manifest = manifest, .tools = authenticated };
     }
 
@@ -661,11 +675,15 @@ fn openAndValidateWithPolicy(
     defer scratch.deinit();
     var pass_files = std.StringHashMap(physical.File).init(scratch.allocator());
     defer pass_files.deinit();
+    var pass_known = std.AutoHashMap([9]i128, [64]u8).init(scratch.allocator());
+    defer pass_known.deinit();
     accepted.scratch = scratch.allocator();
     accepted.in_pass_files = &pass_files;
+    accepted.in_pass_known = &pass_known;
     defer {
         accepted.scratch = null;
         accepted.in_pass_files = null;
+        accepted.in_pass_known = null;
     }
     try loadResult(&accepted);
     if (readonly_git) |git| {
@@ -693,6 +711,7 @@ fn openAndValidateWithPolicy(
     try collectArtifacts(&accepted);
     accepted.scratch = null;
     accepted.in_pass_files = null;
+    accepted.in_pass_known = null;
     return accepted;
 }
 
@@ -727,17 +746,22 @@ pub fn openImportedStage(
     defer scratch.deinit();
     var pass_files = std.StringHashMap(physical.File).init(scratch.allocator());
     defer pass_files.deinit();
+    var pass_known = std.AutoHashMap([9]i128, [64]u8).init(scratch.allocator());
+    defer pass_known.deinit();
     accepted.scratch = scratch.allocator();
     accepted.in_pass_files = &pass_files;
+    accepted.in_pass_known = &pass_known;
     defer {
         accepted.scratch = null;
         accepted.in_pass_files = null;
+        accepted.in_pass_known = null;
     }
     try loadResult(&accepted);
     try revalidateImported(&accepted);
     try collectArtifacts(&accepted);
     accepted.scratch = null;
     accepted.in_pass_files = null;
+    accepted.in_pass_known = null;
     return accepted;
 }
 
@@ -973,6 +997,14 @@ fn revalidateLocalWithSignal(self: *AcceptedRun, signal: *core.process.SignalCan
     if (result.set != self.compatibility or result.set != .tiny_v2_qcow2_derived_vhd)
         return error.InvalidResult;
     const compute = try join(a, &.{ self.root, "compute" });
+    var custody_cache = build.CustodyCache.init(std.heap.page_allocator);
+    defer custody_cache.deinit();
+    if (self.in_pass_known) |known| {
+        var it = known.iterator();
+        while (it.next()) |entry| {
+            try custody_cache.known_files.put(entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
     var context: build.Context = .{
         .allocator = a,
         .io = self.io,
@@ -985,6 +1017,7 @@ fn revalidateLocalWithSignal(self: *AcceptedRun, signal: *core.process.SignalCan
         .tools = undefined,
         .roots = undefined,
         .signal = signal,
+        .custody_cache = &custody_cache,
     };
     var boot_context: boot.Context = .{
         .build_context = &context,
@@ -993,6 +1026,12 @@ fn revalidateLocalWithSignal(self: *AcceptedRun, signal: *core.process.SignalCan
     };
     defer boot_context.pinned.deinit();
     try boot.revalidateComplete(&boot_context, result);
+    if (self.in_pass_known) |known| {
+        var it = custody_cache.known_files.iterator();
+        while (it.next()) |entry| {
+            try known.put(entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
     try validateCommands(self, false, false);
     const current = try self.readFileInPass(try resultPath(self), records.max_record_bytes, true);
     if (!std.meta.eql(current.sha256, self.result.sha256) or current.bytes != self.result.bytes)

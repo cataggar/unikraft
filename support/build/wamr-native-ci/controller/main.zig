@@ -125,7 +125,6 @@ pub fn main(init: std.process.Init) void {
                 root,
             ) catch |err| failed(init.io, stage, "", err);
         defer accepted.deinit();
-        accepted.revalidate() catch |err| failed(init.io, stage, "", err);
         if (command.action == .@"check-local-records") {
             std.Io.File.stdout().writeStreamingAll(init.io, "Completed native local records authenticated; authority=not_admitted.\n") catch refused(init.io);
             return;
@@ -194,7 +193,7 @@ pub fn main(init: std.process.Init) void {
             &signal,
         ) catch |err| failed(init.io, stage, "", err);
         defer bundle.deinit();
-        controller.import_validator_build.runPrivate(allocator, init.io, &bundle, command.output.?, &signal) catch |err| failed(init.io, stage, "", err);
+        controller.import_validator_build.runPrivateValidated(allocator, init.io, &bundle, command.output.?, &signal) catch |err| failed(init.io, stage, "", err);
         std.Io.File.stdout().writeStreamingAll(init.io, "Compute handoff revalidated; authority=not_admitted.\n") catch refused(init.io);
         return;
     }
@@ -293,7 +292,7 @@ pub fn main(init: std.process.Init) void {
             ) catch |err| failed(init.io, stage, "", err);
         defer accepted.deinit();
         const result = switch (command.action) {
-            .@"handoff-inspect" => controller.handoff_inspect.run(
+            .@"handoff-inspect" => controller.handoff_inspect.runValidated(
                 allocator,
                 init.io,
                 &accepted,
@@ -301,7 +300,7 @@ pub fn main(init: std.process.Init) void {
                 false,
                 &signal,
             ),
-            .@"handoff-inspect-legacy" => controller.handoff_inspect.run(
+            .@"handoff-inspect-legacy" => controller.handoff_inspect.runValidated(
                 allocator,
                 init.io,
                 &accepted,
@@ -309,14 +308,14 @@ pub fn main(init: std.process.Init) void {
                 true,
                 &signal,
             ),
-            .@"public-validator-build" => controller.public_validator_build.run(
+            .@"public-validator-build" => controller.public_validator_build.runValidated(
                 allocator,
                 init.io,
                 &accepted,
                 command.output.?,
                 &signal,
             ),
-            .@"local-handoff-revalidation" => controller.public_validator_build.revalidateHandoff(
+            .@"local-handoff-revalidation" => controller.public_validator_build.revalidateHandoffValidated(
                 allocator,
                 init.io,
                 &accepted,
