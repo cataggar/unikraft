@@ -26,6 +26,7 @@ import threading
 import time
 import uuid
 
+import hyperv_private_preflight_blob as blob_worker
 import hyperv_private_preflight_runner as host_runner
 
 
@@ -871,9 +872,42 @@ def exact_fields(value, fields, description):
     return azure.require_exact_fields(value, fields, description)
 
 
+def validate_private_blob_failure_record(value):
+    if (
+        not isinstance(value, dict)
+        or set(value) != {
+            "stage", "category", "http_status", "service_error",
+        }
+        or value["stage"] not in blob_worker.ALLOWLISTED_STAGES
+        or value["category"] not in blob_worker.ALLOWLISTED_CATEGORIES
+        or (
+            value["http_status"] is not None
+            and (
+                type(value["http_status"]) is not int
+                or not 100 <= value["http_status"] <= 599
+            )
+        )
+        or (
+            value["service_error"] is not None
+            and (
+                not isinstance(value["service_error"], str)
+                or value["service_error"]
+                not in blob_worker.ALLOWLISTED_SERVICE_ERROR_CODES
+            )
+        )
+    ):
+        raise ValueError("Private-preflight Blob failure is invalid")
+    return {
+        "stage": value["stage"],
+        "category": value["category"],
+        "http_status": value["http_status"],
+        "service_error": value["service_error"],
+    }
+
+
 def validate_private_failure_record(value):
     required = {"category", "code", "phase"}
-    optional = {"reconciliation", "cleanup", "recording"}
+    optional = {"reconciliation", "blob", "cleanup", "recording"}
     if (
         not isinstance(value, dict)
         or not required.issubset(value)
@@ -912,6 +946,9 @@ def validate_private_failure_record(value):
         )
     ):
         raise ValueError("Private-preflight reconciliation failure is invalid")
+    blob = value.get("blob")
+    if blob is not None:
+        blob = validate_private_blob_failure_record(blob)
     bounded_lists = {}
     for field, stages in (
         (
@@ -963,6 +1000,10 @@ def validate_private_failure_record(value):
         **(
             {"reconciliation": dict(reconciliation)}
             if reconciliation is not None else {}
+        ),
+        **(
+            {"blob": dict(blob)}
+            if blob is not None else {}
         ),
         **bounded_lists,
     }
@@ -4142,20 +4183,57 @@ def run_blob_worker(run, request, sas, deadline):
         raise RuntimeError(
             "Authenticated private Blob transfer exceeded its deadline"
         )
-    if process.returncode or len(stdout) > MAX_MANIFEST_BYTES:
-        raise RuntimeError("Authenticated private Blob transfer failed")
-    result = azure.parse_strict_json(stdout, "Private Blob worker result")
-    result = exact_fields(
-        result, ("schema", "result", "bytes"), "Private Blob worker result"
-    )
+    if len(stdout) > MAX_MANIFEST_BYTES:
+        raise PrivateBlobTransferError("worker", "worker-output-invalid")
+    try:
+        result = azure.parse_strict_json(stdout, "Private Blob worker result")
+    except (RuntimeError, ValueError):
+        if process.returncode:
+            raise PrivateBlobTransferError(
+                "worker", "worker-process-failed"
+            ) from None
+        raise PrivateBlobTransferError(
+            "worker", "worker-output-invalid"
+        ) from None
+    if not isinstance(result, dict):
+        raise PrivateBlobTransferError("worker", "worker-output-invalid")
+    if process.returncode:
+        if (
+            set(result) == {
+                "schema", "result", "stage", "category",
+                "http_status", "service_error",
+            }
+            and type(result["schema"]) is int
+            and result["schema"] == 1
+            and result["result"] == "FAIL"
+        ):
+            try:
+                blob_failure = validate_private_blob_failure_record({
+                    "stage": result["stage"],
+                    "category": result["category"],
+                    "http_status": result["http_status"],
+                    "service_error": result["service_error"],
+                })
+            except ValueError:
+                raise PrivateBlobTransferError(
+                    "worker", "worker-output-invalid"
+                ) from None
+            raise PrivateBlobTransferError(
+                blob_failure["stage"],
+                blob_failure["category"],
+                http_status=blob_failure["http_status"],
+                service_error=blob_failure["service_error"],
+            )
+        raise PrivateBlobTransferError("worker", "worker-output-invalid")
     if (
-        type(result["schema"]) is not int
+        set(result) != {"schema", "result", "bytes"}
+        or type(result["schema"]) is not int
         or result["schema"] != 1
         or result["result"] != "PASS"
         or type(result["bytes"]) is not int
         or result["bytes"] < 0
     ):
-        raise RuntimeError("Authenticated private Blob transfer failed")
+        raise PrivateBlobTransferError("worker", "worker-output-invalid")
     return result["bytes"]
 
 
@@ -4270,6 +4348,38 @@ def bounded_cleanup_failures(error, default_stage="cleanup"):
     return [{"stage": default_stage, **bounded_exception_record(error)}]
 
 
+class PrivateBlobTransferError(RuntimeError):
+    def __init__(
+        self, stage, category, *, http_status=None, service_error=None,
+    ):
+        self.blob_failure = validate_private_blob_failure_record({
+            "stage": stage,
+            "category": category,
+            "http_status": http_status,
+            "service_error": service_error,
+        })
+        self.failure_category = "PrivateBlobTransferError"
+        self.code = (
+            self.blob_failure["service_error"]
+            or self.blob_failure["category"]
+        )
+        details = [
+            f"stage={self.blob_failure['stage']}",
+            f"category={self.blob_failure['category']}",
+        ]
+        if self.blob_failure["http_status"] is not None:
+            details.append(f"http_status={self.blob_failure['http_status']}")
+        if self.blob_failure["service_error"] is not None:
+            details.append(
+                f"service_error={self.blob_failure['service_error']}"
+            )
+        super().__init__(
+            "Authenticated private Blob transfer failed ("
+            + ", ".join(details)
+            + ")"
+        )
+
+
 class PrivateHostDeploymentReconciliationError(RuntimeError):
     def __init__(self, primary, reconciliation):
         primary_record = bounded_exception_record(primary)
@@ -4315,6 +4425,11 @@ class PrivateFailurePipelineError(RuntimeError):
             dict(reconciliation)
             if isinstance(reconciliation, dict) else None
         )
+        blob = getattr(primary, "blob_failure", None)
+        self.blob_failure = (
+            validate_private_blob_failure_record(blob)
+            if isinstance(blob, dict) else None
+        )
         self.cleanup_failures = (
             bounded_cleanup_failures(cleanup)
             if cleanup is not None else []
@@ -4330,6 +4445,16 @@ class PrivateFailurePipelineError(RuntimeError):
                 f"{self.reconciliation_failure['category']}"
                 f"({self.reconciliation_failure['code'] or 'unclassified'})"
             )
+        if self.blob_failure is not None:
+            blob_parts = [
+                self.blob_failure["stage"],
+                self.blob_failure["category"],
+            ]
+            if self.blob_failure["http_status"] is not None:
+                blob_parts.append(str(self.blob_failure["http_status"]))
+            if self.blob_failure["service_error"] is not None:
+                blob_parts.append(self.blob_failure["service_error"])
+            parts.append("blob=" + ":".join(blob_parts))
         parts.extend(
             "cleanup="
             f"{failure['stage']}:{failure['category']}"
@@ -6413,6 +6538,9 @@ def private_failure_record(
     reconciliation = getattr(error, "reconciliation_failure", None)
     if isinstance(reconciliation, dict):
         failure["reconciliation"] = dict(reconciliation)
+    blob = getattr(error, "blob_failure", None)
+    if isinstance(blob, dict):
+        failure["blob"] = validate_private_blob_failure_record(blob)
     primary_cleanup = getattr(error, "cleanup_failures", None)
     if cleanup is not None:
         failure["cleanup"] = bounded_cleanup_failures(cleanup)

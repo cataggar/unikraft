@@ -22,10 +22,223 @@ CONTAINER = re.compile(r"[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?")
 ACCOUNT_URL = re.compile(
     r"https://[a-z0-9]{3,24}\.blob\.core\.windows\.net"
 )
+ALLOWLISTED_STAGES = frozenset((
+    "request",
+    "sdk",
+    "create-container",
+    "upload-blob",
+    "download-blob",
+    "worker",
+))
+ALLOWLISTED_CATEGORIES = frozenset((
+    "invalid-request-fields",
+    "duplicate-json-field",
+    "malformed-request",
+    "invalid-request",
+    "invalid-local-path",
+    "invalid-blob-name",
+    "invalid-size",
+    "invalid-sha256",
+    "invalid-local-input",
+    "invalid-request-file",
+    "invalid-request-contract",
+    "invalid-output-directory",
+    "download-size-limit",
+    "invalid-sas",
+    "missing-sas",
+    "local-io-error",
+    "sdk-version-mismatch",
+    "sdk-unavailable",
+    "authentication-failed",
+    "resource-not-found",
+    "resource-exists",
+    "http-response-error",
+    "service-request-error",
+    "service-response-error",
+    "blob-operation-failed",
+    "worker-output-invalid",
+    "worker-process-failed",
+))
+ALLOWLISTED_SERVICE_ERROR_CODES = frozenset((
+    "AccountIsDisabled",
+    "AuthenticationFailed",
+    "AuthorizationFailure",
+    "AuthorizationPermissionMismatch",
+    "AuthorizationProtocolMismatch",
+    "AuthorizationResourceTypeMismatch",
+    "AuthorizationServiceMismatch",
+    "AuthorizationSourceIPMismatch",
+    "BlobAlreadyExists",
+    "BlobArchived",
+    "BlobBeingRehydrated",
+    "BlobImmutableDueToLegalHold",
+    "BlobImmutableDueToPolicy",
+    "BlobNotFound",
+    "CannotVerifyCopySource",
+    "ConditionHeadersNotSupported",
+    "ConditionNotMet",
+    "ContainerAlreadyExists",
+    "ContainerBeingDeleted",
+    "ContainerDisabled",
+    "ContainerNotFound",
+    "EmptyMetadataKey",
+    "InsufficientAccountPermissions",
+    "InternalError",
+    "InvalidAuthenticationInfo",
+    "InvalidBlobOrBlock",
+    "InvalidBlobTier",
+    "InvalidBlobType",
+    "InvalidBlockId",
+    "InvalidBlockList",
+    "InvalidHeaderValue",
+    "InvalidHttpVerb",
+    "InvalidInput",
+    "InvalidMd5",
+    "InvalidMetadata",
+    "InvalidOperation",
+    "InvalidQueryParameterValue",
+    "InvalidRange",
+    "InvalidResourceName",
+    "InvalidUri",
+    "InvalidVersionForPageBlobOperation",
+    "InvalidXmlDocument",
+    "InvalidXmlNodeValue",
+    "LeaseIdMismatchWithBlobOperation",
+    "LeaseIdMismatchWithContainerOperation",
+    "LeaseIdMismatchWithLeaseOperation",
+    "LeaseIdMissing",
+    "LeaseIsBrokenAndCannotBeRenewed",
+    "LeaseIsBreakingAndCannotBeAcquired",
+    "LeaseLost",
+    "LeaseNotPresentWithBlobOperation",
+    "LeaseNotPresentWithContainerOperation",
+    "LeaseNotPresentWithLeaseOperation",
+    "MaxBlobSizeConditionNotMet",
+    "Md5Mismatch",
+    "MetadataTooLarge",
+    "MissingContentLengthHeader",
+    "MissingRequiredHeader",
+    "MissingRequiredQueryParameter",
+    "MissingRequiredXmlNode",
+    "MultipleConditionHeadersNotSupported",
+    "NoAuthenticationInformation",
+    "NoPendingCopyOperation",
+    "OperationNotAllowedOnIncrementalCopyBlob",
+    "OperationTimedOut",
+    "OutOfRangeInput",
+    "OutOfRangeQueryParameterValue",
+    "PendingCopyOperation",
+    "PreviousSnapshotCannotBeNewer",
+    "PublicAccessNotPermitted",
+    "RequestBodyTooLarge",
+    "RequestUrlFailedToParse",
+    "ResourceAlreadyExists",
+    "ResourceNotFound",
+    "ResourceTypeMismatch",
+    "SequenceNumberConditionNotMet",
+    "SequenceNumberTooLarge",
+    "ServerBusy",
+    "SnapshotCountExceeded",
+    "SnapshotOperationRateExceeded",
+    "SnapshotsPresent",
+    "SourceConditionNotMet",
+    "SystemInUse",
+    "TargetConditionNotMet",
+    "UnauthorizedBlobOverwrite",
+    "UnsupportedHeader",
+    "UnsupportedHttpVerb",
+    "UnsupportedQueryParameter",
+    "UnsupportedXmlNode",
+))
 
 
 class WorkerError(RuntimeError):
-    pass
+    def __init__(
+        self, category, *, stage="request", http_status=None,
+        service_error=None,
+    ):
+        if stage not in ALLOWLISTED_STAGES:
+            stage = "request"
+        if category not in ALLOWLISTED_CATEGORIES:
+            category = "blob-operation-failed"
+        if (
+            type(http_status) is not int
+            or not 100 <= http_status <= 599
+        ):
+            http_status = None
+        if (
+            not isinstance(service_error, str)
+            or service_error not in ALLOWLISTED_SERVICE_ERROR_CODES
+        ):
+            service_error = None
+        super().__init__(category)
+        self.stage = stage
+        self.category = category
+        self.http_status = http_status
+        self.service_error = service_error
+
+    def to_payload(self):
+        return {
+            "schema": 1,
+            "result": "FAIL",
+            "stage": self.stage,
+            "category": self.category,
+            "http_status": self.http_status,
+            "service_error": self.service_error,
+        }
+
+
+def extract_http_status(error):
+    for candidate in (
+        getattr(error, "status_code", None),
+        getattr(getattr(error, "response", None), "status_code", None),
+    ):
+        if type(candidate) is int and 100 <= candidate <= 599:
+            return candidate
+    return None
+
+
+def extract_service_error(error):
+    candidates = [
+        getattr(error, "error_code", None),
+        getattr(getattr(error, "error", None), "code", None),
+    ]
+    headers = getattr(getattr(error, "response", None), "headers", None)
+    if hasattr(headers, "get"):
+        candidates.append(headers.get("x-ms-error-code"))
+        candidates.append(headers.get("X-Ms-Error-Code"))
+    for candidate in candidates:
+        value = getattr(candidate, "value", candidate)
+        if (
+            isinstance(value, str)
+            and value in ALLOWLISTED_SERVICE_ERROR_CODES
+        ):
+            return value
+    return None
+
+
+def classify_azure_error(error, stage):
+    class_names = {cls.__name__ for cls in type(error).__mro__}
+    if "ClientAuthenticationError" in class_names:
+        category = "authentication-failed"
+    elif "ResourceNotFoundError" in class_names:
+        category = "resource-not-found"
+    elif "ResourceExistsError" in class_names:
+        category = "resource-exists"
+    elif "ServiceRequestError" in class_names:
+        category = "service-request-error"
+    elif "ServiceResponseError" in class_names:
+        category = "service-response-error"
+    elif "HttpResponseError" in class_names:
+        category = "http-response-error"
+    else:
+        category = "blob-operation-failed"
+    return WorkerError(
+        category,
+        stage=stage,
+        http_status=extract_http_status(error),
+        service_error=extract_service_error(error),
+    )
 
 
 def exact_fields(value, fields):
@@ -162,10 +375,15 @@ def load_request(path):
     return request
 
 
-def upload(client, request):
+def upload(client, request, azure_error_type=()):
     total = 0
     if request["create_container"]:
-        client.create_container(timeout=60)
+        try:
+            client.create_container(timeout=60)
+        except WorkerError:
+            raise
+        except azure_error_type as error:
+            raise classify_azure_error(error, "create-container") from None
     for raw in request["files"]:
         record = exact_fields(
             raw, ("blob", "path", "size", "sha256")
@@ -176,21 +394,26 @@ def upload(client, request):
         digest = require_sha256(record["sha256"])
         regular_fingerprint(path, size, digest)
         with path.open("rb") as source:
-            client.upload_blob(
-                name=blob,
-                data=source,
-                length=size,
-                overwrite=False,
-                validate_content=True,
-                max_concurrency=1,
-                timeout=300,
-            )
+            try:
+                client.upload_blob(
+                    name=blob,
+                    data=source,
+                    length=size,
+                    overwrite=False,
+                    validate_content=True,
+                    max_concurrency=1,
+                    timeout=300,
+                )
+            except WorkerError:
+                raise
+            except azure_error_type as error:
+                raise classify_azure_error(error, "upload-blob") from None
         regular_fingerprint(path, size, digest)
         total += size
     return total
 
 
-def download(client, request):
+def download(client, request, azure_error_type=()):
     total = 0
     for raw in request["files"]:
         record = exact_fields(raw, ("blob", "path", "maximum"))
@@ -199,25 +422,30 @@ def download(client, request):
         maximum = require_nonnegative(record["maximum"])
         if path.parent.is_symlink() or not path.parent.is_dir():
             raise WorkerError("invalid-output-directory")
-        downloader = client.download_blob(
-            blob, max_concurrency=1, timeout=300
-        )
-        written = 0
-        digest = hashlib.sha256()
         try:
-            with path.open("xb") as output:
-                os.chmod(path, 0o600)
-                for chunk in downloader.chunks():
-                    written += len(chunk)
-                    if written > maximum:
-                        raise WorkerError("download-size-limit")
-                    output.write(chunk)
-                    digest.update(chunk)
-                output.flush()
-                os.fsync(output.fileno())
-        except BaseException:
-            path.unlink(missing_ok=True)
+            downloader = client.download_blob(
+                blob, max_concurrency=1, timeout=300
+            )
+            written = 0
+            digest = hashlib.sha256()
+            try:
+                with path.open("xb") as output:
+                    os.chmod(path, 0o600)
+                    for chunk in downloader.chunks():
+                        written += len(chunk)
+                        if written > maximum:
+                            raise WorkerError("download-size-limit")
+                        output.write(chunk)
+                        digest.update(chunk)
+                    output.flush()
+                    os.fsync(output.fileno())
+            except BaseException:
+                path.unlink(missing_ok=True)
+                raise
+        except WorkerError:
             raise
+        except azure_error_type as error:
+            raise classify_azure_error(error, "download-blob") from None
         total += written
     return total
 
@@ -232,14 +460,14 @@ def execute(request, sas):
         raise WorkerError("invalid-sas")
     try:
         if version("azure-storage-blob") != SDK_VERSION:
-            raise WorkerError("sdk-version-mismatch")
+            raise WorkerError("sdk-version-mismatch", stage="sdk")
     except PackageNotFoundError:
-        raise WorkerError("sdk-unavailable") from None
+        raise WorkerError("sdk-unavailable", stage="sdk") from None
     try:
         from azure.core.exceptions import AzureError
         from azure.storage.blob import BlobServiceClient
     except ImportError:
-        raise WorkerError("sdk-unavailable") from None
+        raise WorkerError("sdk-unavailable", stage="sdk") from None
     try:
         service = BlobServiceClient(
             account_url=request["account_url"],
@@ -250,12 +478,17 @@ def execute(request, sas):
         )
         client = service.get_container_client(request["container"])
         if request["action"] == "upload":
-            return upload(client, request)
-        return download(client, request)
+            return upload(client, request, AzureError)
+        return download(client, request, AzureError)
     except WorkerError:
         raise
-    except AzureError:
-        raise WorkerError("blob-operation-failed") from None
+    except AzureError as error:
+        fallback_stage = (
+            "upload-blob"
+            if request["action"] == "upload"
+            else "download-blob"
+        )
+        raise classify_azure_error(error, fallback_stage) from None
 
 
 def main():
@@ -271,11 +504,20 @@ def main():
             "result": "PASS",
             "bytes": transferred,
         }, sort_keys=True))
-    except (KeyError, OSError, WorkerError):
-        print(json.dumps({
-            "schema": 1,
-            "result": "FAIL",
-        }, sort_keys=True))
+    except WorkerError as error:
+        print(json.dumps(error.to_payload(), sort_keys=True))
+        raise SystemExit(1)
+    except KeyError:
+        print(json.dumps(
+            WorkerError("missing-sas", stage="request").to_payload(),
+            sort_keys=True,
+        ))
+        raise SystemExit(1)
+    except OSError:
+        print(json.dumps(
+            WorkerError("local-io-error", stage="request").to_payload(),
+            sort_keys=True,
+        ))
         raise SystemExit(1)
 
 
