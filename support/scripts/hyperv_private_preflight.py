@@ -163,9 +163,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "e53045b3f0c3504fa8e46399ce66c1d2f0a688f18c8e933fb6742a238827dd09"
+            "1885e0c606766fa99745fcba3220e75f3cd2c7be2380f55e2dcc00ce4929f4b8"
         ),
-        "size": 1797722,
+        "size": 1801139,
         "files": 220,
     },
     "support/kconfig": {
@@ -404,7 +404,7 @@ GUARDED_PRODUCER_FILES = {
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
     ),
     "build.zig": (
-        "faf822da66f5616dbe949530a5f1fc303390464e6b8f95f7491c6dac2a62e068"
+        "d1ab63eb2201cec2d31fb0092acde871dfe03a29730460d5126563f2967bbd63"
     ),
     "build.zig.zon": (
         "8c9bab9a0d0c3cbd68c3b21bcfc212f7148d03c5a30ed9b3c669f1f68e886fba"
@@ -491,7 +491,7 @@ GUARDED_PRODUCER_FILES = {
         "30291f034f98c970bbf7879189e9bc4c8bc5aa5a6a19fe1ed247d508641d46a9"
     ),
     "support/build/native-image-data.zig": (
-        "9ded751a325eb43ab2d09af26c31e1cb666134bb3b36f30ca0f186cb64f4820b"
+        "94a6cf6f2e227c1bca42935911e73ae58da92bca10a8a149a976d1dd156cc9d5"
     ),
     "support/build/native-kconfig-bridge.c": (
         "457137bfa280d69f8c3c819ca059c20b76a6c5dcb190575d10a7e5b1ea05f93a"
@@ -692,7 +692,7 @@ GUARDED_PRODUCER_FILES = {
         "82e672e9659bfb4851d574c0c1ce4a48b55c415e9ffc6bc36eda57dde9e7764b"
     ),
     "support/build/native-image-graph.zig": (
-        "dc2c69e762d8030054b7670036e872d377857baf606c626c5be627e55ce38805"
+        "06495bea36159de080b392fcb6911ea31a7de1533349e82e36a9010cd26693b2"
     ),
     "support/build/native-postprocess-runner.py": (
         "3379115753b149a6f16675cb3d5f315c25bfb49bf702720cdc882470434ef0f1"
@@ -716,10 +716,10 @@ GUARDED_PRODUCER_FILES = {
         "325817c2c76a389c21358df535ac2ae0f1beb36b7e4cb73b62648d1f5faac8cc"
     ),
     "support/apps/hyperv-acceptance/Config.uk": (
-        "d44be89b16152994c03fa5fee704e6dcb411ba635263d5f3971193108a97a129"
+        "cb6f78d2b6272c00ef39d5edcd3ff843afc5acfd344a2570c64e8af6cdeefd86"
     ),
     "support/apps/hyperv-acceptance/Makefile.uk": (
-        "2e5c23e4ca47bd306a4d4ab6d75b996ccf5b6ddc885698d25f478ead40df4ac3"
+        "ed2c58c991370e5dca5e8366cda5499375dc85b63a9ee985d26eb85e5397797a"
     ),
     "support/apps/hyperv-acceptance/acceptance_protocol.c": (
         "c7b8cdd84f21e59fd93454e28ef3f99d03b17438b1d840042f852956af1237df"
@@ -734,7 +734,7 @@ GUARDED_PRODUCER_FILES = {
         "dba07b1331d6a6f02c3f017c2fabe5a0c1c03f61ffd1df7e07e49c84427d2231"
     ),
     "support/apps/hyperv-acceptance/main.c": (
-        "36591c09ecaee3a4dadb03fc194682778f386758df47fc9016f37cb0eacf9400"
+        "2de3328a8e2857942d5245de7dc4dd71072fbfb45983899fd599bc046d60581d"
     ),
     "support/apps/hyperv-acceptance/persistence.c": (
         "a0fbe85754d6072f3411a498d2c3c13b11214688a625fc70b62795639cfd49c1"

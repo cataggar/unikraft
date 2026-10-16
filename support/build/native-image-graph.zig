@@ -33,6 +33,8 @@ pub const Options = struct {
     enable_uklibparam: bool = false,
     enable_hyperv_acceptance: bool = false,
     enable_hyperv_persistence: bool = false,
+    enable_hyperv_storage_benchmark: bool = false,
+    enable_ukalloc_ifstats: bool = false,
     enable_lwip: bool = false,
     enable_ukrandom_lcpu: bool = false,
     lwip_root: ?[]const u8 = null,
@@ -222,12 +224,19 @@ fn registerLibraries(
         if (hasNetvsc(options.profile) and options.enable_hyperv_acceptance and
             std.mem.eql(u8, library.name, "apphelloworld"))
         {
+            if (options.enable_hyperv_persistence and
+                options.enable_hyperv_storage_benchmark)
+            {
+                return error.UnsupportedConfiguration;
+            }
             try registerLibrary(
                 context,
                 allocator,
                 options,
                 if (options.enable_hyperv_persistence)
                     data.x86_64_efi_hyperv_persistence_app
+                else if (options.enable_hyperv_storage_benchmark)
+                    data.x86_64_efi_hyperv_storage_benchmark_app
                 else
                     data.x86_64_efi_hyperv_acceptance_app,
                 &.{},
@@ -256,6 +265,11 @@ fn registerLibraries(
             std.mem.eql(u8, library.name, "libukplat_native"))
         {
             effective.objects = &data.x86_64_efi_native_objects;
+        }
+        if (isHyperv(options.profile) and options.enable_ukalloc_ifstats and
+            std.mem.eql(u8, library.name, "libukalloc"))
+        {
+            effective.objects = &data.x86_64_efi_ukalloc_stats_objects;
         }
         try registerLibrary(context, allocator, options, effective, &.{});
     }
@@ -1536,6 +1550,49 @@ test "Hyper-V persistence registers its separately compiled workload" {
         return;
     }
     return error.TestUnexpectedResult;
+}
+
+test "Hyper-V storage benchmark registers its separately compiled workload and alloc stats" {
+    var registered = try RegisteredGraph.init(std.testing.allocator, .{
+        .roots = .{
+            .base = "/src/unikraft",
+            .app = "/src/hyperv-acceptance",
+            .output = "/build",
+            .config = "/build/.config",
+        },
+        .profile = .@"hyperv-x86_64-efi-netvsc",
+        .enable_hyperv_acceptance = true,
+        .enable_hyperv_storage_benchmark = true,
+        .enable_ukalloc_ifstats = true,
+    });
+    defer registered.deinit();
+
+    var saw_app = false;
+    var saw_alloc_stats = false;
+    for (registered.graph.libraries) |library| {
+        if (std.mem.eql(u8, library.name, "apphelloworld")) {
+            saw_app = true;
+            try std.testing.expectEqual(@as(usize, 7), library.raw_objects.len);
+            try std.testing.expectEqualStrings(
+                "/build/apphelloworld/storage_target.o",
+                library.raw_objects[4].path,
+            );
+            try std.testing.expectEqualStrings(
+                "/build/apphelloworld/storage_benchmark.o",
+                library.raw_objects[5].path,
+            );
+        }
+        if (std.mem.eql(u8, library.name, "libukalloc")) {
+            saw_alloc_stats = true;
+            try std.testing.expectEqual(@as(usize, 3), library.raw_objects.len);
+            try std.testing.expectEqualStrings(
+                "/build/libukalloc/stats.o",
+                library.raw_objects[1].path,
+            );
+        }
+    }
+    try std.testing.expect(saw_app);
+    try std.testing.expect(saw_alloc_stats);
 }
 
 test "registered profiles match normalized Make graph fixtures" {

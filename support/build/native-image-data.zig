@@ -188,6 +188,26 @@ pub const x86_64_efi_hyperv_persistence_app = Library{
     },
 };
 
+pub const x86_64_efi_hyperv_storage_benchmark_app = Library{
+    .name = "apphelloworld",
+    .origin = .application,
+    .objects = &.{
+        "apphelloworld/main.o",
+        "apphelloworld/acceptance_protocol.o",
+        "apphelloworld/application_protocol.o",
+        "apphelloworld/application_network.o",
+        "apphelloworld/storage_target.o",
+        "apphelloworld/storage_benchmark.o",
+        "apphelloworld/libinfo.libuklibid.o",
+    },
+};
+
+pub const x86_64_efi_ukalloc_stats_objects = [_][]const u8{
+    "libukalloc/alloc.o",
+    "libukalloc/stats.o",
+    "libukalloc/libinfo.libuklibid.o",
+};
+
 pub const x86_64_efi_ukrandom = Library{
     .name = "libukrandom",
     .origin = .library,

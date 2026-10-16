@@ -46,6 +46,17 @@ config APPHYPERVACCEPTANCE_STORAGE_TOPOLOGY
 	  and verify two independent policy-2 seed manifests. No block writes,
 	  flushes, or network operations are performed by this workload.
 
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK
+	bool "Read-only guarded StorVSC block-I/O benchmark acceptance"
+	select LIBSTORVSC_LUN_DISCOVERY
+	select LIBSTORVSC_GUARDED_IO
+	select LIBUKALLOC_IFSTATS
+	help
+	  Run bounded read-only multi-slot block-I/O benchmark sweeps against
+	  the uniquely matched policy-2 seeded 4-GiB data disk at LUN 7. No
+	  block writes, flushes, or network operations are performed by this
+	  workload.
+
 endchoice
 
 config APPHYPERVACCEPTANCE_PEER_IPV4
@@ -145,6 +156,61 @@ config APPHYPERVACCEPTANCE_TOPOLOGY_NONZERO_LUN
 	int "Expected nonzero data disk LUN"
 	range 1 255
 	default 7
+
+endif
+
+if APPHYPERVACCEPTANCE_STORAGE_BENCHMARK
+
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_RUN_ID
+	string "Private 128-bit benchmark run ID (32 lowercase hex digits)"
+	default ""
+
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_DISK_ID
+	string "Private 128-bit benchmark data disk ID (32 lowercase hex digits)"
+	default ""
+
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_SECTORS
+	int "Exact benchmark data disk sector count"
+	default 8388608
+
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_SECTOR_SIZE
+	int "Exact benchmark data disk sector size"
+	default 512
+
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_IDENTITY_POLICY
+	int "Benchmark identity policy version"
+	range 2 2
+	default 2
+
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_LUN
+	int "Expected benchmark data disk LUN"
+	range 1 255
+	default 7
+
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_MAX_SLOTS
+	int "Maximum concurrent benchmark request slots"
+	range 1 32
+	default 32
+
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_MAX_TRANSFER_BYTES
+	int "Maximum benchmark request transfer size (bytes)"
+	range 4096 131072
+	default 131072
+
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_WARMUP_OPS
+	int "Uncounted warmup operations per benchmark cell"
+	range 1 1024
+	default 64
+
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_STEADY_OPS
+	int "Measured steady-state operations per trial"
+	range 1 4096
+	default 256
+
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_TRIALS
+	int "Steady-state trials per benchmark cell"
+	range 1 10
+	default 3
 
 endif
 

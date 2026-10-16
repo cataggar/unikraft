@@ -1311,6 +1311,70 @@ pub fn build(b: *std.Build) void {
         .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
     });
     storage_binding_tests.dependOn(&b.addRunArtifact(storage_binding_main_tests).step);
+    const storage_benchmark_tests = b.addExecutable(.{
+        .name = "hyperv-storage-benchmark-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .debug,
+            .link_libc = true,
+        }),
+    });
+    for (storvsc_host_include_paths) |path|
+        storage_benchmark_tests.root_module.addIncludePath(b.path(path));
+    storage_benchmark_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "support/apps/hyperv-acceptance/acceptance_protocol.c",
+            "support/apps/hyperv-acceptance/storage_benchmark.c",
+            "support/apps/hyperv-acceptance/tests/storage-benchmark-test.c",
+        },
+        .flags = &.{
+            "-std=gnu11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-DSTORVSC_HOST_TEST",
+            "-DSTORAGE_BENCHMARK_HOST_TEST",
+            "-DSTORAGE_BENCHMARK_READ_TIMEOUT_NS=50000ULL",
+            "-DSTORAGE_BENCHMARK_POLL_NS=10000ULL",
+            "-DCONFIG_LIBSTORVSC_QUEUE_DEPTH=32",
+            "-DCONFIG_LIBSTORVSC_MAX_TRANSFER_PAGES=33",
+            "-DCONFIG_LIBUKALLOC_IFSTATS=1",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK=1",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_RUN_ID=\"00112233445566778899aabbccddeeff\"",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_DISK_ID=\"102132435465768798a9bacbdcedfe0f\"",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_SECTORS=8388608",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_SECTOR_SIZE=512",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_IDENTITY_POLICY=2",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_LUN=7",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_MAX_SLOTS=32",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_MAX_TRANSFER_BYTES=131072",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_WARMUP_OPS=4",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_STEADY_OPS=8",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_TRIALS=2",
+        },
+    });
+    const run_storage_benchmark_tests = b.addRunArtifact(storage_benchmark_tests);
+    const storage_benchmark_evidence = b.createModule(.{
+        .root_source_file = b.path("support/tools/hyperv/storage_benchmark_evidence.zig"),
+        .target = b.graph.host,
+        .optimize = .debug,
+    });
+    const storage_benchmark_evidence_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/apps/hyperv-acceptance/tests/storage-benchmark-evidence-test.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+            .imports = &.{.{ .name = "storage_benchmark_evidence", .module = storage_benchmark_evidence }},
+        }),
+    });
+    const run_storage_benchmark_evidence_tests = b.addRunArtifact(storage_benchmark_evidence_tests);
+    const storage_benchmark_step = b.step(
+        "test-hyperv-storage-benchmark",
+        "Run bounded StorVSC block-I/O benchmark harness and transcript validator fixtures",
+    );
+    storage_benchmark_step.dependOn(&run_storage_benchmark_tests.step);
+    storage_benchmark_step.dependOn(&run_storage_benchmark_evidence_tests.step);
+    storage_binding_tests.dependOn(storage_benchmark_step);
     test_step.dependOn(storage_binding_tests);
     const storvsc_regression_tests = b.step(
         "test-storvsc-regression",
@@ -2067,6 +2131,17 @@ fn registerNativeGraph(
         )
     else
         false;
+    const enable_hyperv_storage_benchmark = if (config) |loaded|
+        nativeConfigEnabled(
+            loaded,
+            "CONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK",
+        )
+    else
+        false;
+    const enable_ukalloc_ifstats = if (config) |loaded|
+        nativeConfigEnabled(loaded, "CONFIG_LIBUKALLOC_IFSTATS")
+    else
+        false;
     const enable_ukrandom_lcpu = if (config) |loaded|
         nativeConfigEnabled(loaded, "CONFIG_LIBUKRANDOM_LCPU")
     else
@@ -2101,6 +2176,8 @@ fn registerNativeGraph(
         .enable_lwip = enable_lwip,
         .enable_hyperv_acceptance = enable_hyperv_acceptance,
         .enable_hyperv_persistence = enable_hyperv_persistence,
+        .enable_hyperv_storage_benchmark = enable_hyperv_storage_benchmark,
+        .enable_ukalloc_ifstats = enable_ukalloc_ifstats,
         .enable_ukrandom_lcpu = enable_ukrandom_lcpu,
         .lwip_root = lwip_root,
     }) catch |err| {
