@@ -456,12 +456,14 @@ hyperv_cpu_fini_indices(const __u64 candidates[], unsigned int candidate_count,
 		.user = (void *)(__uptr)!!host_quiesced,
 	};
 	__u64 indices[CONFIG_UKPLAT_CPU_MAXCOUNT];
+	__u8 attempted[CONFIG_UKPLAT_CPU_MAXCOUNT] = { 0 };
 	__nsec deadline = ukplat_monotonic_clock() +
 		HYPERV_CPU_STOP_TIMEOUT_NS;
 	unsigned int count;
 	unsigned int queued;
 	unsigned int waited;
 	unsigned int i;
+	int busy = 0;
 	int rc;
 	int wait_rc;
 
@@ -470,13 +472,17 @@ hyperv_cpu_fini_indices(const __u64 candidates[], unsigned int candidate_count,
 		for (i = 0; i < candidate_count; i++) {
 			if (candidates[i] >= CONFIG_UKPLAT_CPU_MAXCOUNT)
 				return -ERANGE;
+			if (attempted[candidates[i]])
+				continue;
 			if (__atomic_load_n(
 				    &hyperv_cpus[candidates[i]].state,
 				    __ATOMIC_ACQUIRE) == HYPERV_CPU_ONLINE)
 				indices[count++] = candidates[i];
 		}
 		if (!count)
-			return 0;
+			return busy ? -EBUSY : 0;
+		if (ukplat_monotonic_clock() >= deadline)
+			return -ETIMEDOUT;
 
 		queued = count;
 		rc = uk_lcpu_run(indices, &queued, &fn,
@@ -489,11 +495,17 @@ hyperv_cpu_fini_indices(const __u64 candidates[], unsigned int candidate_count,
 						HYPERV_CPU_STOP_TIMEOUT_NS);
 			if (wait_rc || waited != queued)
 				return wait_rc ? wait_rc : -ETIMEDOUT;
+			for (i = 0; i < queued; i++) {
+				attempted[indices[i]] = 1;
+				if (__atomic_load_n(
+					    &hyperv_cpus[indices[i]].state,
+					    __ATOMIC_ACQUIRE) !=
+				    HYPERV_CPU_OFFLINE)
+					busy = 1;
+			}
 		}
 		if (rc && rc != -EAGAIN)
 			return rc;
-		if (ukplat_monotonic_clock() >= deadline)
-			return -ETIMEDOUT;
 		hyperv_cpu_relax();
 	}
 }
@@ -1054,6 +1066,51 @@ int hyperv_vmbus_target_acquire(__u32 *vp_index, __u32 *generation)
 	}
 	ukplat_spin_unlock_irqrestore(&hyperv_cpu_lock, flags);
 	return -ENODEV;
+}
+
+int hyperv_vmbus_target_acquire_channel(__u32 channel_relid, __u32 *vp_index,
+					__u32 *generation)
+{
+	unsigned int online[CONFIG_UKPLAT_CPU_MAXCOUNT];
+	unsigned int online_count = 0;
+	unsigned long flags;
+	unsigned int index;
+#if CONFIG_HAVE_SMP
+	unsigned int i;
+#endif
+
+	if (!vp_index || !generation)
+		return -EINVAL;
+	ukplat_spin_lock_irqsave(&hyperv_cpu_lock, flags);
+	if (__atomic_load_n(&hyperv_time_initialized, __ATOMIC_ACQUIRE) !=
+	    HYPERV_TIME_RUNNING) {
+		ukplat_spin_unlock_irqrestore(&hyperv_cpu_lock, flags);
+		return -ENODEV;
+	}
+	if (__atomic_load_n(&hyperv_cpus[0].state, __ATOMIC_ACQUIRE) ==
+	    HYPERV_CPU_ONLINE)
+		online[online_count++] = 0;
+#if CONFIG_HAVE_SMP
+	if (__atomic_load_n(&hyperv_ap_start_state, __ATOMIC_ACQUIRE) ==
+	    HYPERV_AP_STARTED) {
+		for (i = 1; i < CONFIG_UKPLAT_CPU_MAXCOUNT; i++) {
+			if (__atomic_load_n(&hyperv_cpus[i].state,
+					    __ATOMIC_ACQUIRE) ==
+			    HYPERV_CPU_ONLINE)
+				online[online_count++] = i;
+		}
+	}
+#endif
+	if (!online_count) {
+		ukplat_spin_unlock_irqrestore(&hyperv_cpu_lock, flags);
+		return -ENODEV;
+	}
+	index = online[channel_relid % online_count];
+	hyperv_vp_refs[index]++;
+	*vp_index = hyperv_cpus[index].vp_index;
+	*generation = hyperv_cpus[index].generation;
+	ukplat_spin_unlock_irqrestore(&hyperv_cpu_lock, flags);
+	return 0;
 }
 
 void hyperv_vmbus_target_release(__u32 vp_index, __u32 generation)

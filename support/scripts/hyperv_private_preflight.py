@@ -163,9 +163,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "1885e0c606766fa99745fcba3220e75f3cd2c7be2380f55e2dcc00ce4929f4b8"
+            "1c7b20ca0f9bd81cefd1817a3954e738b05350b18294216e18095a40ef772fed"
         ),
-        "size": 1801139,
+        "size": 1815733,
         "files": 220,
     },
     "support/kconfig": {
@@ -650,10 +650,10 @@ GUARDED_PRODUCER_FILES = {
         "6be9c46611eb45dfe32ec6f6e11c279452b70db32ec95f4b00948f9f299b49b9"
     ),
     "drivers/hyperv/vmbus/vmbus_bus.c": (
-        "2e239f3738b1bcca7ab6c5f25a698586606c8df59068415162024b3783307964"
+        "b8c97d18cbf3adeb5e7c7d6fcd1e13be7dac1be1a929610747a743377d2613b5"
     ),
     "drivers/hyperv/vmbus/vmbus_channel.c": (
-        "088cc06d1db460cb52525aeee56d980a2074be5c0c0d8cdfa15eef72b656cc1c"
+        "f9d326ea708d00b670404f9572e9445ca4a207c45e30b6060e0cdf2a7a494592"
     ),
     "drivers/hyperv/vmbus/vmbus_protocol.h": (
         "c00e58790f9d8ece3518fdda9b82b02b843eccb3c2cc90002344192b554e44a9"
@@ -683,13 +683,13 @@ GUARDED_PRODUCER_FILES = {
         "5927caa03f0ff5bde3df68eb7073c93c345b9ea5920f697dafd0c0370fa39e33"
     ),
     "plat/hyperv/include/hyperv/hyperv.h": (
-        "af844d90dea4b706ad00ef50beaa0df54697a6b324888d4d41dc918ae2b57b3c"
+        "26d442af7abe6f227440b339a83e21095ebd6a51161397f5c25a509291902bd9"
     ),
     "plat/hyperv/platform.c": (
         "79b79a74cdc03c3c83bde9da212835e8367a6709d04c4ec9fee156e5139e689b"
     ),
     "plat/hyperv/time.c": (
-        "82e672e9659bfb4851d574c0c1ce4a48b55c415e9ffc6bc36eda57dde9e7764b"
+        "9e4f575fdb3f59ba7ff9278564f38919c3bd6febec4dde4af9f85f0a3e492793"
     ),
     "support/build/native-image-graph.zig": (
         "06495bea36159de080b392fcb6911ea31a7de1533349e82e36a9010cd26693b2"

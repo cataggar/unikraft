@@ -8,6 +8,7 @@
 #include <uk/arch/types.h>
 #include <uk/bits/config.h>
 #include <uk/vmbus.h>
+#include <hyperv/hyperv.h>
 #include "vmbus_channel_core.h"
 #include "vmbus_internal.h"
 #include "vmbus_protocol.h"
@@ -27,6 +28,19 @@ int vmbus_channel_host_is_free(struct vmbus_channel *channel);
 int vmbus_channel_host_is_revoked(struct vmbus_channel *channel);
 int vmbus_channel_host_attach_gpadl(struct vmbus_channel *channel,
 				    __u32 gpadl_id);
+void vmbus_channel_host_reset_targets(void);
+int vmbus_channel_host_configure_targets(__u32 online_mask,
+					 const __u32 *vp_indices,
+					 const __u32 *generations,
+					 unsigned int count);
+__u32 vmbus_channel_host_target_refs(unsigned int cpu_index);
+__u32 vmbus_channel_host_total_target_refs(void);
+int vmbus_channel_host_bump_target_generation(unsigned int cpu_index);
+void vmbus_channel_host_force_target_generation(unsigned int cpu_index,
+						__u32 generation);
+__u32 vmbus_channel_host_channel_target_vp(struct vmbus_channel *channel);
+__u32
+vmbus_channel_host_channel_target_generation(struct vmbus_channel *channel);
 void vmbus_bus_host_set_transmit_error(int error);
 int vmbus_bus_host_connection_failed(void);
 void vmbus_bus_host_clear_connection_failed(void);
@@ -39,6 +53,15 @@ unsigned int vmbus_bus_host_transmit_attempts(void);
 void vmbus_bus_host_reset_gpadl_trace(void);
 unsigned int vmbus_bus_host_gpadl_body_posts(void);
 unsigned int vmbus_bus_host_gpadl_teardown_posts(void);
+__u32 vmbus_bus_host_last_open_target_vp(void);
+void vmbus_bus_host_set_fixed_smp(int enabled);
+void vmbus_bus_host_set_cpu_index(__u64 cpu_index);
+unsigned int vmbus_bus_host_wake_isr_count(void);
+void vmbus_bus_host_prepare_worker_wake(int active);
+void hyperv_vmbus_message(const struct hyperv_message *message);
+void hyperv_vmbus_event(__u32 event);
+void hyperv_vmbus_event_word(__u32 base_event, __u64 pending);
+void vmbus_channel_schedule_event(__u32 channel_id);
 
 #ifndef VMBUS_REAL_PROTOCOL_TEST
 int vmbus_post_message(__u32 connection_id __attribute__((unused)),
@@ -269,18 +292,20 @@ int vmbus_gpadl_body(__u8 *output, size_t capacity,
 }
 
 int vmbus_open_message(__u8 *output, size_t capacity, __u32 channel_id,
-		       __u32 open_id, __u32 gpadl_id __attribute__((unused)),
-		       __u32 target_vp __attribute__((unused)),
+		       __u32 open_id, __u32 gpadl_id,
+		       __u32 target_vp,
 		       __u32 tx_pages __attribute__((unused)),
 		       const __u8 *user_data __attribute__((unused)),
 		       size_t user_data_size __attribute__((unused)))
 {
-	if (capacity < 20)
+	if (capacity < 24)
 		return -1;
 	write32(output, 5);
 	write32(output + 8, channel_id);
 	write32(output + 12, open_id);
-	return 20;
+	write32(output + 16, gpadl_id);
+	write32(output + 20, target_vp);
+	return 24;
 }
 
 int vmbus_close_message(__u8 *output, size_t capacity,
@@ -1178,6 +1203,203 @@ static int test_receive_signal_failure_preserves_packet(void)
 	return 0;
 }
 
+static int test_multi_vp_channel_target_and_quarantine(void)
+{
+	static const __u32 vp_indices[4] = { 3, 7, 8, 9 };
+	static const __u32 generations[4] = { 1, 2, 3, 4 };
+	struct vmbus_device devs[4];
+	struct vmbus_device ap1_dev = {
+		.channel_id = 45,
+		.connection_id = 145,
+		.present = 1,
+	};
+	struct vmbus_device ap2_dev = {
+		.channel_id = 46,
+		.connection_id = 146,
+		.present = 1,
+	};
+	struct vmbus_channel *ap1_chan;
+	struct vmbus_channel *ap2_chan;
+	unsigned int i;
+	int rc;
+
+	vmbus_channel_reset_all();
+	vmbus_bus_host_clear_connection_failed();
+	vmbus_bus_host_set_transmit_error(0);
+	vmbus_bus_host_reset_gpadl_trace();
+	if (vmbus_channel_host_configure_targets(0xfU, vp_indices,
+						 generations, 4))
+		return 310;
+
+	/* Open 4 channels and verify VP target distribution across 4 CPUs. */
+	for (i = 0; i < 4; i++) {
+		memset(&devs[i], 0, sizeof(devs[i]));
+		devs[i].channel_id = 40 + i;
+		devs[i].connection_id = 140 + i;
+		devs[i].present = 1;
+		vmbus_bus_host_auto_pump(1);
+		rc = vmbus_channel_open(&devs[i], 2, 2, NULL, 0);
+		vmbus_bus_host_auto_pump(0);
+		if (rc || !devs[i].channel ||
+		    vmbus_bus_host_last_open_target_vp() != vp_indices[i] ||
+		    vmbus_channel_host_channel_target_vp(devs[i].channel) !=
+			    vp_indices[i] ||
+		    vmbus_channel_host_channel_target_generation(
+			    devs[i].channel) != generations[i] ||
+		    vmbus_channel_host_target_refs(i) != 1)
+			return 311;
+	}
+	if (vmbus_channel_host_total_target_refs() != 4)
+		return 312;
+
+	/* Normal close on CPU 0 releases CPU 0's target VP reference. */
+	vmbus_bus_host_auto_pump(1);
+	rc = vmbus_channel_close(devs[0].channel);
+	vmbus_bus_host_auto_pump(0);
+	if (rc || vmbus_channel_host_target_refs(0) != 0 ||
+	    vmbus_channel_host_total_target_refs() != 3)
+		return 313;
+
+	/* Close remaining 3 channels cleanly before testing failure modes. */
+	for (i = 1; i < 4; i++) {
+		vmbus_bus_host_auto_pump(1);
+		rc = vmbus_channel_close(devs[i].channel);
+		vmbus_bus_host_auto_pump(0);
+		if (rc || vmbus_channel_host_target_refs(i) != 0)
+			return 314;
+	}
+	if (vmbus_channel_host_total_target_refs() != 0)
+		return 315;
+
+	/*
+	 * Non-BSP channel on AP 1 (channel_id 45 -> 45 % 4 == 1):
+	 * GPADL teardown timeout quarantines AP 1's target VP until
+	 * late GPADL_TORNDOWN arrives from the host.
+	 */
+	ap1_chan = vmbus_channel_host_allocate_open(&ap1_dev);
+	if (!ap1_chan ||
+	    vmbus_channel_host_channel_target_vp(ap1_chan) != vp_indices[1] ||
+	    vmbus_channel_host_target_refs(1) != 1 ||
+	    vmbus_channel_host_attach_gpadl(ap1_chan, 0x5101))
+		return 316;
+	vmbus_bus_host_auto_pump(0);
+	rc = vmbus_channel_close(ap1_chan);
+	if (rc != -ETIMEDOUT ||
+	    vmbus_channel_host_target_refs(1) != 1 ||
+	    vmbus_channel_host_bump_target_generation(1) != -EBUSY ||
+	    vmbus_channel_host_pages_used() != 4 ||
+	    vmbus_channel_host_record_count() != 1)
+		return 317;
+	torndown(0x5101);
+	if (vmbus_channel_host_target_refs(1) != 0 ||
+	    vmbus_channel_host_bump_target_generation(1) != 0 ||
+	    vmbus_channel_host_pages_used() != 0 ||
+	    vmbus_channel_host_record_count() != 0)
+		return 318;
+	vmbus_channel_host_force_target_generation(1, generations[1]);
+	vmbus_bus_host_clear_connection_failed();
+
+	/*
+	 * Non-BSP channel on AP 2 (channel_id 46 -> 46 % 4 == 2):
+	 * GPADL teardown transmit failure (-EIO) quarantines AP 2's target VP
+	 * in VMBUS_GPADL_RECORD_RESET; stray GPADL_TORNDOWN must not unpin
+	 * AP 2, and only vmbus_channel_reset_all() after host quiescence
+	 * releases AP 2's target VP reference.
+	 */
+	ap2_chan = vmbus_channel_host_allocate_open(&ap2_dev);
+	if (!ap2_chan ||
+	    vmbus_channel_host_channel_target_vp(ap2_chan) != vp_indices[2] ||
+	    vmbus_channel_host_target_refs(2) != 1 ||
+	    vmbus_channel_host_attach_gpadl(ap2_chan, 0x5102))
+		return 319;
+	vmbus_bus_host_set_transmit_error(-EIO);
+	if (vmbus_channel_rescind(46) != -EINPROGRESS ||
+	    vmbus_channel_host_target_refs(2) != 1 ||
+	    vmbus_channel_host_bump_target_generation(2) != -EBUSY)
+		return 320;
+	torndown(0x5102);
+	if (vmbus_channel_host_target_refs(2) != 1 ||
+	    vmbus_channel_host_pages_used() != 4)
+		return 321;
+	vmbus_channel_quarantine_all();
+	if (vmbus_channel_host_target_refs(2) != 1 ||
+	    vmbus_channel_host_pages_used() != 4)
+		return 322;
+	vmbus_bus_host_set_transmit_error(0);
+	vmbus_channel_reset_all();
+	vmbus_bus_host_clear_connection_failed();
+	if (vmbus_channel_host_target_refs(2) != 0 ||
+	    vmbus_channel_host_total_target_refs() != 0 ||
+	    vmbus_channel_host_pages_used() != 0 ||
+	    vmbus_channel_host_record_count() != 0)
+		return 323;
+
+	/*
+	 * Generation-mismatch guard: releasing a channel whose target CPU
+	 * generation changed does not decrement the new generation's refcount.
+	 */
+	ap2_dev.channel = NULL;
+	ap2_chan = vmbus_channel_host_allocate_open(&ap2_dev);
+	if (!ap2_chan || vmbus_channel_host_target_refs(2) != 1)
+		return 324;
+	vmbus_channel_host_force_target_generation(2, 99);
+	if (vmbus_channel_close(ap2_chan) ||
+	    vmbus_channel_host_target_refs(2) != 1)
+		return 325;
+	vmbus_channel_host_force_target_generation(2, generations[2]);
+	hyperv_vmbus_target_release(vp_indices[2], generations[2]);
+	if (vmbus_channel_host_target_refs(2) != 0)
+		return 326;
+
+	vmbus_channel_host_reset_targets();
+	return 0;
+}
+
+static int test_cross_cpu_fixed_smp_worker_wake(void)
+{
+	struct hyperv_message message = {
+		.message_type = 1,
+		.payload_size = 8,
+	};
+	unsigned int cpu;
+
+	vmbus_bus_host_prepare_worker_wake(1);
+	vmbus_bus_host_set_fixed_smp(0);
+	for (cpu = 1; cpu < 4; cpu++) {
+		vmbus_bus_host_set_cpu_index(cpu);
+		message.payload[0] = (__u8)(50 + cpu);
+		hyperv_vmbus_message(&message);
+		hyperv_vmbus_event(cpu);
+		hyperv_vmbus_event_word(64, 1ULL << cpu);
+		vmbus_channel_schedule_event(cpu);
+		if (vmbus_bus_host_wake_isr_count() != 0) {
+			vmbus_bus_host_set_cpu_index(0);
+			vmbus_bus_host_prepare_worker_wake(0);
+			return 327;
+		}
+	}
+
+	vmbus_bus_host_set_fixed_smp(1);
+	for (cpu = 1; cpu < 4; cpu++) {
+		unsigned int before = vmbus_bus_host_wake_isr_count();
+
+		vmbus_bus_host_set_cpu_index(cpu);
+		hyperv_vmbus_event(cpu);
+		hyperv_vmbus_event_word(64, 1ULL << cpu);
+		vmbus_channel_schedule_event(cpu);
+		if (vmbus_bus_host_wake_isr_count() != before + 3) {
+			vmbus_bus_host_set_fixed_smp(0);
+			vmbus_bus_host_set_cpu_index(0);
+			vmbus_bus_host_prepare_worker_wake(0);
+			return 328;
+		}
+	}
+	vmbus_bus_host_set_fixed_smp(0);
+	vmbus_bus_host_set_cpu_index(0);
+	vmbus_bus_host_prepare_worker_wake(0);
+	return 0;
+}
+
 int main(void)
 {
 #ifdef VMBUS_REAL_PROTOCOL_TEST
@@ -1192,6 +1414,12 @@ int main(void)
 	if (rc)
 		return rc;
 	rc = vmbus_bus_host_production_test();
+	if (rc)
+		return rc;
+	rc = test_multi_vp_channel_target_and_quarantine();
+	if (rc)
+		return rc;
+	rc = test_cross_cpu_fixed_smp_worker_wake();
 	if (rc)
 		return rc;
 	rc = test_data_lifetime();

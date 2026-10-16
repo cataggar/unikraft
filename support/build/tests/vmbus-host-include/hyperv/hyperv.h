@@ -17,8 +17,23 @@ static inline __u64 hyperv_reference_time(void)
 }
 static inline int hyperv_has_signal_events(void) { return 1; }
 static inline int hyperv_has_post_messages(void) { return 1; }
+#if defined(VMBUS_CHANNEL_HOST_TEST) && !defined(VMBUS_EPOCH_ONLY_HOST_TEST)
+int hyperv_vmbus_target_acquire(__u32 *vp, __u32 *generation);
+int hyperv_vmbus_target_acquire_channel(__u32 channel_relid, __u32 *vp,
+					__u32 *generation);
+void hyperv_vmbus_target_release(__u32 vp, __u32 generation);
+#else
 static inline int hyperv_vmbus_target_acquire(__u32 *vp, __u32 *generation)
 {
+	*vp = 0;
+	*generation = 1;
+	return 0;
+}
+static inline int hyperv_vmbus_target_acquire_channel(__u32 channel_relid,
+						      __u32 *vp,
+						      __u32 *generation)
+{
+	(void)channel_relid;
 	*vp = 0;
 	*generation = 1;
 	return 0;
@@ -26,3 +41,4 @@ static inline int hyperv_vmbus_target_acquire(__u32 *vp, __u32 *generation)
 static inline void hyperv_vmbus_target_release(
 	__u32 vp __attribute__((unused)),
 	__u32 generation __attribute__((unused))) {}
+#endif

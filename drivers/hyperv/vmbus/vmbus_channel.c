@@ -37,12 +37,15 @@ struct vmbus_gpadl_record {
 	__u32 gpadl_id;
 	__u32 relid;
 	__u32 byte_count;
+	__u32 target_vp;
+	__u32 target_generation;
 	__u16 page_start;
 	__u16 page_count;
 	__u8 state;
 	__u8 host_done;
 	__u8 local_drained;
 	__u8 owns_ring_pages;
+	__u8 owns_target_vp;
 	__u8 external;
 };
 
@@ -356,6 +359,14 @@ static void finalize_channel_locked(struct vmbus_channel *channel)
 			channel->tx_pages = 0;
 			channel->rx_pages = 0;
 		}
+		if (channel->target_held) {
+			record->target_vp = channel->target_vp;
+			record->target_generation = channel->target_generation;
+			record->owns_target_vp = 1;
+			channel->target_vp = 0;
+			channel->target_generation = 0;
+			channel->target_held = 0;
+		}
 		__atomic_store_n(&record->local_drained, 1, __ATOMIC_RELEASE);
 		channel->gpadl_record = 0;
 		gpadl_record_try_reclaim(record);
@@ -436,9 +447,12 @@ static struct vmbus_gpadl_record *gpadl_record_allocate(void)
 		gpadl_records[i].transaction = NULL;
 		gpadl_records[i].address = 0;
 		gpadl_records[i].byte_count = 0;
+		gpadl_records[i].target_vp = 0;
+		gpadl_records[i].target_generation = 0;
 		gpadl_records[i].host_done = 0;
 		gpadl_records[i].local_drained = 0;
 		gpadl_records[i].owns_ring_pages = 0;
+		gpadl_records[i].owns_target_vp = 0;
 		gpadl_records[i].external = 0;
 		__atomic_add_fetch(&live_gpadls, 1, __ATOMIC_RELAXED);
 		__atomic_store_n(&gpadl_records[i].state,
@@ -472,17 +486,23 @@ static void gpadl_record_release(struct vmbus_gpadl_record *record,
 		transaction_release(record->transaction);
 	if (free_pages && record->owns_ring_pages && record->page_count)
 		free_ring_pages(record->page_start, record->page_count);
+	if (free_pages && record->owns_target_vp)
+		hyperv_vmbus_target_release(record->target_vp,
+					    record->target_generation);
 	record->transaction = NULL;
 	record->channel_generation = 0;
 	record->address = 0;
 	record->gpadl_id = 0;
 	record->relid = 0;
 	record->byte_count = 0;
+	record->target_vp = 0;
+	record->target_generation = 0;
 	record->page_start = 0;
 	record->page_count = 0;
 	record->host_done = 0;
 	record->local_drained = 0;
 	record->owns_ring_pages = 0;
+	record->owns_target_vp = 0;
 	record->external = 0;
 	if (__atomic_load_n(&live_gpadls, __ATOMIC_RELAXED))
 		__atomic_sub_fetch(&live_gpadls, 1, __ATOMIC_RELAXED);
@@ -540,6 +560,14 @@ static void quarantine_channel_pages(
 	record->page_count = channel->page_count;
 	record->byte_count = (__u32)channel->page_count * VMBUS_PAGE_SIZE;
 	record->owns_ring_pages = 1;
+	if (channel->target_held) {
+		record->target_vp = channel->target_vp;
+		record->target_generation = channel->target_generation;
+		record->owns_target_vp = 1;
+		channel->target_vp = 0;
+		channel->target_generation = 0;
+		channel->target_held = 0;
+	}
 	record->transaction = transaction;
 	__atomic_store_n(&record->state,
 			 posted ? VMBUS_GPADL_RECORD_ASYNC :
@@ -844,7 +872,9 @@ static int teardown_gpadl(struct vmbus_channel *channel,
 		channel->teardown_posted = 1;
 		rc = transaction_wait(transaction, token, deadline);
 	}
-	if (!rc) {
+	if (!rc &&
+	    __atomic_load_n(&record->state, __ATOMIC_ACQUIRE) ==
+		    VMBUS_GPADL_RECORD_OWNED) {
 		transaction_release(transaction);
 		channel->gpadl_id = 0;
 		channel->gpadl_record = 0;
@@ -859,6 +889,13 @@ static int teardown_gpadl(struct vmbus_channel *channel,
 			   VMBUS_GPADL_RECORD_ASYNC ||
 		   __atomic_load_n(&record->state, __ATOMIC_ACQUIRE) ==
 			   VMBUS_GPADL_RECORD_RESET) {
+		if (!rc &&
+		    __atomic_load_n(&record->state, __ATOMIC_ACQUIRE) ==
+			    VMBUS_GPADL_RECORD_ASYNC) {
+			__atomic_store_n(&record->host_done, 1,
+					 __ATOMIC_RELEASE);
+			gpadl_record_try_reclaim(record);
+		}
 		if (record->transaction != transaction)
 			transaction_release(transaction);
 	} else {
@@ -1108,8 +1145,9 @@ static int open_channel_control(struct vmbus_channel *channel,
 	int rc;
 
 	if (!channel->target_held) {
-		rc = hyperv_vmbus_target_acquire(&channel->target_vp,
-						 &channel->target_generation);
+		rc = hyperv_vmbus_target_acquire_channel(
+			channel->relid, &channel->target_vp,
+			&channel->target_generation);
 		if (rc)
 			return rc;
 		channel->target_held = 1;
@@ -1262,6 +1300,12 @@ int vmbus_channel_open(struct vmbus_device *device, __u16 tx_pages,
 				   (size_t)rx_pages * VMBUS_PAGE_SIZE);
 	if (rc)
 		goto out_pages;
+	rc = hyperv_vmbus_target_acquire_channel(channel->relid,
+						 &channel->target_vp,
+						 &channel->target_generation);
+	if (rc)
+		goto out_pages;
+	channel->target_held = 1;
 	rc = create_gpadl(channel, &token);
 	if (rc)
 		goto out_partial_gpadl;
@@ -1273,8 +1317,13 @@ int vmbus_channel_open(struct vmbus_device *device, __u16 tx_pages,
 	if (!channel_operation_valid(&token, 0))
 		goto out_operation;
 	if (close_channel_control(channel)) {
+		struct vmbus_gpadl_record *record =
+			channel_gpadl_record(channel);
+
 		vmbus_control_fail();
-		goto out_partial_gpadl;
+		if (record)
+			quarantine_channel_pages(channel, record, NULL, 0);
+		goto out_failed;
 	}
 out_partial_gpadl:
 	if (!channel_operation_valid(&token, 0))
@@ -1326,7 +1375,16 @@ int vmbus_channel_close(struct vmbus_channel *channel)
 	unmap_rc = teardown_external_gpadls(channel, NULL, 1);
 	if (unmap_rc)
 		vmbus_control_fail();
-	rc2 = teardown_gpadl(channel, NULL);
+	if (rc && channel->gpadl_id) {
+		struct vmbus_gpadl_record *record =
+			channel_gpadl_record(channel);
+
+		if (record)
+			quarantine_channel_pages(channel, record, NULL, 0);
+		rc2 = rc;
+	} else {
+		rc2 = teardown_gpadl(channel, NULL);
+	}
 	if (!rc)
 		rc = rc2;
 	if (!rc)
@@ -2040,10 +2098,214 @@ void vmbus_channel_reset_all(void)
 }
 
 #ifdef VMBUS_CHANNEL_HOST_TEST
+#define VMBUS_HOST_MAX_TARGETS 4U
+
+struct vmbus_host_target_slot {
+	__u32 vp_index;
+	__u32 generation;
+	__u32 refs;
+	__u8 online;
+};
+
+static struct vmbus_host_target_slot host_targets[VMBUS_HOST_MAX_TARGETS] = {
+	[0] = { .vp_index = 0, .generation = 1, .refs = 0, .online = 1 },
+};
+static __spinlock host_target_lock;
+static int host_target_lock_initialized;
 static unsigned int host_release_page;
 static __u32 host_release_relid;
 static int host_release_pending;
 static struct vmbus_channel_token host_pinned_token;
+
+static void initialize_host_target_lock(void)
+{
+	if (__atomic_load_n(&host_target_lock_initialized, __ATOMIC_ACQUIRE))
+		return;
+	ukarch_spin_init(&host_target_lock);
+	__atomic_store_n(&host_target_lock_initialized, 1, __ATOMIC_RELEASE);
+}
+
+int hyperv_vmbus_target_acquire(__u32 *vp, __u32 *generation)
+{
+	unsigned long flags;
+
+	if (!vp || !generation)
+		return -EINVAL;
+	initialize_host_target_lock();
+	ukplat_spin_lock_irqsave(&host_target_lock, flags);
+	if (!host_targets[0].online) {
+		ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+		return -ENODEV;
+	}
+	host_targets[0].refs++;
+	*vp = host_targets[0].vp_index;
+	*generation = host_targets[0].generation;
+	ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+	return 0;
+}
+
+int hyperv_vmbus_target_acquire_channel(__u32 channel_relid, __u32 *vp,
+					__u32 *generation)
+{
+	unsigned int online[VMBUS_HOST_MAX_TARGETS];
+	unsigned int online_count = 0;
+	unsigned int index;
+	unsigned int i;
+	unsigned long flags;
+
+	if (!vp || !generation)
+		return -EINVAL;
+	initialize_host_target_lock();
+	ukplat_spin_lock_irqsave(&host_target_lock, flags);
+	for (i = 0; i < VMBUS_HOST_MAX_TARGETS; i++) {
+		if (host_targets[i].online)
+			online[online_count++] = i;
+	}
+	if (!online_count) {
+		ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+		return -ENODEV;
+	}
+	index = online[channel_relid % online_count];
+	host_targets[index].refs++;
+	*vp = host_targets[index].vp_index;
+	*generation = host_targets[index].generation;
+	ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+	return 0;
+}
+
+void hyperv_vmbus_target_release(__u32 vp, __u32 generation)
+{
+	unsigned int i;
+	unsigned long flags;
+
+	initialize_host_target_lock();
+	ukplat_spin_lock_irqsave(&host_target_lock, flags);
+	for (i = 0; i < VMBUS_HOST_MAX_TARGETS; i++) {
+		if (host_targets[i].vp_index != vp ||
+		    host_targets[i].generation != generation)
+			continue;
+		if (host_targets[i].refs)
+			host_targets[i].refs--;
+		break;
+	}
+	ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+}
+
+void vmbus_channel_host_reset_targets(void)
+{
+	unsigned int i;
+	unsigned long flags;
+
+	initialize_host_target_lock();
+	ukplat_spin_lock_irqsave(&host_target_lock, flags);
+	for (i = 0; i < VMBUS_HOST_MAX_TARGETS; i++) {
+		host_targets[i].vp_index = i;
+		host_targets[i].generation = i == 0 ? 1U : 0U;
+		host_targets[i].refs = 0;
+		host_targets[i].online = i == 0 ? 1U : 0U;
+	}
+	ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+}
+
+int vmbus_channel_host_configure_targets(__u32 online_mask,
+					 const __u32 *vp_indices,
+					 const __u32 *generations,
+					 unsigned int count)
+{
+	unsigned int i;
+	unsigned long flags;
+
+	if (!vp_indices || !generations || !count ||
+	    count > VMBUS_HOST_MAX_TARGETS)
+		return -EINVAL;
+	initialize_host_target_lock();
+	ukplat_spin_lock_irqsave(&host_target_lock, flags);
+	for (i = 0; i < VMBUS_HOST_MAX_TARGETS; i++) {
+		if (i < count) {
+			host_targets[i].vp_index = vp_indices[i];
+			host_targets[i].generation = generations[i];
+			host_targets[i].refs = 0;
+			host_targets[i].online =
+				(__u8)((online_mask >> i) & 1U);
+		} else {
+			host_targets[i].vp_index = i;
+			host_targets[i].generation = 0;
+			host_targets[i].refs = 0;
+			host_targets[i].online = 0;
+		}
+	}
+	ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+	return 0;
+}
+
+__u32 vmbus_channel_host_target_refs(unsigned int cpu_index)
+{
+	unsigned long flags;
+	__u32 refs = 0;
+
+	if (cpu_index >= VMBUS_HOST_MAX_TARGETS)
+		return 0;
+	initialize_host_target_lock();
+	ukplat_spin_lock_irqsave(&host_target_lock, flags);
+	refs = host_targets[cpu_index].refs;
+	ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+	return refs;
+}
+
+__u32 vmbus_channel_host_total_target_refs(void)
+{
+	unsigned int i;
+	unsigned long flags;
+	__u32 total = 0;
+
+	initialize_host_target_lock();
+	ukplat_spin_lock_irqsave(&host_target_lock, flags);
+	for (i = 0; i < VMBUS_HOST_MAX_TARGETS; i++)
+		total += host_targets[i].refs;
+	ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+	return total;
+}
+
+int vmbus_channel_host_bump_target_generation(unsigned int cpu_index)
+{
+	unsigned long flags;
+
+	if (cpu_index >= VMBUS_HOST_MAX_TARGETS)
+		return -EINVAL;
+	initialize_host_target_lock();
+	ukplat_spin_lock_irqsave(&host_target_lock, flags);
+	if (host_targets[cpu_index].refs) {
+		ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+		return -EBUSY;
+	}
+	host_targets[cpu_index].generation++;
+	ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+	return 0;
+}
+
+void vmbus_channel_host_force_target_generation(unsigned int cpu_index,
+						__u32 generation)
+{
+	unsigned long flags;
+
+	if (cpu_index >= VMBUS_HOST_MAX_TARGETS)
+		return;
+	initialize_host_target_lock();
+	ukplat_spin_lock_irqsave(&host_target_lock, flags);
+	host_targets[cpu_index].generation = generation;
+	ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+}
+
+__u32 vmbus_channel_host_channel_target_vp(struct vmbus_channel *channel)
+{
+	return channel ? channel->target_vp : UINT32_MAX;
+}
+
+__u32
+vmbus_channel_host_channel_target_generation(struct vmbus_channel *channel)
+{
+	return channel ? channel->target_generation : 0;
+}
 
 int vmbus_channel_host_release_ready(__u32 relid)
 {
@@ -2060,6 +2322,14 @@ vmbus_channel_host_allocate_open(struct vmbus_device *device)
 	channel = allocate_channel(device);
 	if (!channel || allocate_ring_pages(4, &page))
 		return NULL;
+	if (hyperv_vmbus_target_acquire_channel(channel->relid,
+						&channel->target_vp,
+						&channel->target_generation)) {
+		free_ring_pages(page, 4);
+		release_channel_object(channel);
+		return NULL;
+	}
+	channel->target_held = 1;
 	channel->page_start = page;
 	channel->page_count = 4;
 	channel->tx_pages = 2;
