@@ -805,17 +805,26 @@ local proof after the original consumer files or loader are removed.
 
 `zig build --build-file support/build/wamr-native-ci/build.zig test-controller`
 runs the native controller foundation's CLI/profile, canonical-record,
-source-closure and refusal fixtures. Build the portable executable with
-`-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=safe`. To place
+source-closure and refusal fixtures. Build the portable executable with the
+default baseline `-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=safe`,
+or explicitly opt in to the AVX2/BMI2/FMA baseline with
+`-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v3 -Doptimize=safe`. To place
 only that executable in an existing canonical, owner-only `0700` runtime,
-invoke `install-controller` with `-Dcontroller-runtime=/absolute/runtime`.
+invoke `install-controller` with `-Dcontroller-runtime=/absolute/runtime` (or
+`--prefix /absolute/prefix` for isolated toolchain verification).
 Installation creates `controller/bin/uk-wamr-native-ci` (private `0700` path
 and ELF) and refuses any preexisting slot; it does not install over a prior
-controller. The controller is always compiled for GNU/x86_64_v2, independent
-of the other package artifacts; `install-controller` additionally requires
-the explicit GNU/v2 and `safe` flags and refuses musl, v3, or an
-unspecified target before creating a slot. `describe --output json-v1`
-reports that fixed target and the embedded source-content closure without
+controller. The controller is compiled for the selected portable baseline
+(`GNU/x86_64_v2` by default or explicit `GNU/x86_64_v3`), independent
+of the runner's exact CPU model; `install-controller` requires
+an explicit `GNU/x86_64_v2` or `GNU/x86_64_v3` target with `safe` and refuses
+musl, `native`, `x86_64` (`v1`), `x86_64_v4`, feature overrides (such as
+`+avx2`), or an unspecified target before creating a slot. At startup, the
+controller evaluates host CPUID feature bits and, when built for `x86_64_v3`,
+verifies OS-enabled XMM/YMM register state via `OSXSAVE` and `XGETBV(0)`
+(`(xcr0 & 0x6) == 0x6`), failing closed without silent fallback if the host CPU
+or OS lacks the selected baseline. `describe --output json-v1`
+reports that bound target and the embedded source-content closure without
 accessing a runtime or granting boot authority.
 `describe --output target-v1` prints the same closed target arguments as one
 space-separated line, removing the selected workflow's Python JSON parser.
@@ -1103,13 +1112,25 @@ out-of-tree dependency tree and builds the internal
 supervisor's exact tracked source closure are checked before and after that
 build. The native production controller supervises commands directly through
 the shared process library and records its own embedded source closure.
-Both supervisor implementations and the public validator use the fixed
-`-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2` target with `safe`, not the
-runner's native microarchitecture. The validator's supervised command contract
-binds these exact flags; the supervisor's source closure binds the bootstrap
-selection. Rebuilding the same sources with the pinned Zig compiler and those
-flags therefore does not require the original runner CPU. Executing the tools
-still requires an x86-64 host with v2 support. Native offline fixture builds
+The historical Python reference pins `-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2`
+with `safe`, while the native production controller and public validator bind
+the selected portable baseline (`-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2` by
+default, or `-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v3` when explicitly opted in
+via `-Dcpu=x86_64_v3` / the `workflow_dispatch` `cpu_baseline` input) with
+`safe`, not the runner's native microarchitecture. The validator's supervised
+command contract (`public-validator-build` and `import-validator-build`)
+binds the exact selected `-Dcpu=` flag; the supervisor's source closure binds
+the bootstrap selection. Rebuilding the same sources with the pinned Zig
+compiler and those exact recorded flags does not require the original runner
+CPU. Executing the tools requires an x86-64 host (and OS XSAVE/YMM state for
+`x86_64_v3`) supporting the selected baseline. On AMD EPYC 9V45, opting in from
+`-Dcpu=x86_64_v2 -Doptimize=safe` to `-Dcpu=x86_64_v3 -Doptimize=safe` reduces
+64 MiB raw+QCOW2+VHD packaging (`wamr-ci-package package`) median wall time
+from `10,170.39 ms` to `4,146.39 ms` (`2.45x` speedup), SHA-256 and image
+format verification (`wamr-ci-package inspect`) median wall time from
+`4,110.67 ms` to `1,629.29 ms` (`2.52x` speedup), and boot-serial log
+validation (`uk-wamr-log-validate tiny --output json-v1`) median wall time from
+`0.689 ms` to `0.644 ms` (`1.07x` speedup). Native offline fixture builds
 below remain host-native, including on aarch64.
 `build-start.json` then embeds `uk.wamr.command-supervisor` version 1:
 the fixed protocol version plus independently recomputed source and runtime

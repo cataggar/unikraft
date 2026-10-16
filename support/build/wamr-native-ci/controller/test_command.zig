@@ -14,7 +14,7 @@ pub fn main(init: std.process.Init) void {
         std.mem.eql(u8, args[6], "--prefix") and
         std.fs.path.isAbsolute(args[7]) and
         std.mem.eql(u8, args[8], "-Dtarget=x86_64-linux-gnu") and
-        std.mem.eql(u8, args[9], "-Dcpu=x86_64_v2") and
+        (std.mem.eql(u8, args[9], "-Dcpu=x86_64_v2") or std.mem.eql(u8, args[9], "-Dcpu=x86_64_v3")) and
         std.mem.eql(u8, args[10], "-Doptimize=safe") and
         std.mem.eql(u8, args[11], "-j2") and
         std.mem.eql(u8, args[12], "install"))

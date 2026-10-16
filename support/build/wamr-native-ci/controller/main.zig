@@ -5,6 +5,11 @@ const handoff = @import("wamr_handoff");
 
 pub fn main(init: std.process.Init) void {
     _ = std.os.linux.syscall1(.umask, 0o077);
+    controller.target.requireActiveHostCpu() catch |err|
+        refusedWithMessage(init.io, switch (err) {
+            error.OsAvxStateDisabled => "host OS AVX state (XGETBV XMM/YMM) is disabled for x86_64_v3",
+            error.UnsupportedHostCpu => "host CPU does not support required x86-64 baseline",
+        });
     const allocator = init.arena.allocator();
     const args = init.minimal.args.toSlice(allocator) catch refused(init.io);
     const command = controller.cli.parse(args) catch usage(init.io);
@@ -24,9 +29,10 @@ pub fn main(init: std.process.Init) void {
         return;
     }
     if (command.action == .describe) {
+        const active_target = controller.profile.activeExecutableTarget();
         if (std.mem.eql(u8, command.output.?, "target-v1")) {
             var stdout = std.Io.File.stdout().writerStreaming(init.io, &.{});
-            for (controller.profile.executable_target, 0..) |argument, i| {
+            for (active_target, 0..) |argument, i| {
                 if (i != 0) stdout.interface.writeByte(' ') catch refused(init.io);
                 stdout.interface.writeAll(argument) catch refused(init.io);
             }
@@ -37,7 +43,7 @@ pub fn main(init: std.process.Init) void {
         const raw = std.json.Stringify.valueAlloc(allocator, .{
             .schema = "uk.wamr.native-ci-describe",
             .schema_version = 1,
-            .recorded_executable_target = controller.profile.executable_target,
+            .recorded_executable_target = active_target,
             .source_closure_sha256 = closure[0..],
         }, .{}) catch refused(init.io);
         const encoded = controller.records.canonicalAlloc(allocator, raw) catch refused(init.io);

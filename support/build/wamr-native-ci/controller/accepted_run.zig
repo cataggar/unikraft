@@ -1304,6 +1304,16 @@ pub fn validateCommandBinding(
     stage: Stage,
     context: EvidenceContext,
 ) !ValidatedCommand {
+    return validateCommandBindingForBaseline(allocator, record, stage, context, profile.activeCpuBaseline());
+}
+
+pub fn validateCommandBindingForBaseline(
+    allocator: std.mem.Allocator,
+    record: []const u8,
+    stage: Stage,
+    context: EvidenceContext,
+    baseline: profile.CpuBaseline,
+) !ValidatedCommand {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1315,7 +1325,7 @@ pub fn validateCommandBinding(
     });
     defer document.deinit();
     try document.requireCanonical(a, record);
-    return command.validate(a, document.value(), stage, context);
+    return command.validateForBaseline(a, document.value(), stage, context, baseline);
 }
 
 pub fn validateLocalHandoffCommand(self: *AcceptedRun, raw: []const u8) !ValidatedCommand {
