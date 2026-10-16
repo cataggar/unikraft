@@ -57,7 +57,34 @@ config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK
 	  block writes, flushes, or network operations are performed by this
 	  workload.
 
+config APPHYPERVACCEPTANCE_HTTP_SERVICE
+	bool "Run persistent HTTP/1.1 service workload"
+	depends on LIBLWIP && LWIP_NOTHREADS && LWIP_DHCP && LWIP_TCP && LWIP_UDP
+	depends on LWIP_RELEASE212 && LWIP_UKNETDEV && !LWIP_AUTOIFACE
+	help
+	  Run a bounded raw-lwIP HTTP/1.1 keep-alive server returning a
+	  deterministic 1 KiB payload with X-Unikraft-Boot-Id and emitting
+	  boot timing and runtime telemetry over serial.
+
 endchoice
+
+config APPHYPERVACCEPTANCE_HTTP_PORT
+	int "HTTP service TCP port"
+	range 1 65535
+	default 8080
+	depends on APPHYPERVACCEPTANCE_HTTP_SERVICE
+
+config APPHYPERVACCEPTANCE_HTTP_DURATION_MS
+	int "HTTP service active duration (ms)"
+	range 1000 86400000
+	default 360000
+	depends on APPHYPERVACCEPTANCE_HTTP_SERVICE
+
+config APPHYPERVACCEPTANCE_HTTP_MAX_CONNS
+	int "HTTP service maximum concurrent connections"
+	range 1 256
+	default 64
+	depends on APPHYPERVACCEPTANCE_HTTP_SERVICE
 
 config APPHYPERVACCEPTANCE_PEER_IPV4
 	string "Private peer IPv4 address"

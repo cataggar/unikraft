@@ -791,6 +791,20 @@ static void test_realtime_handoff(void)
 	};
 	struct hyperv_realtime_caps caps;
 	uint64_t ns = 99;
+	__u64 efi_ref_ns = 0;
+	__u64 time_init_ref_ns = 0;
+
+	reference_time = 100;
+	hyperv_clock_set_efi_sample(sample.epoch_ns, 100);
+	ukplat_time_init();
+	uk_hyperv_boot_ref_timestamps(&efi_ref_ns, &time_init_ref_ns);
+	assert(efi_ref_ns == 100ULL * 100ULL);
+	assert(time_init_ref_ns == 101ULL * 100ULL);
+	uk_hyperv_boot_ref_timestamps(NULL, &time_init_ref_ns);
+	assert(time_init_ref_ns == 101ULL * 100ULL);
+	uk_hyperv_boot_ref_timestamps(&efi_ref_ns, NULL);
+	assert(efi_ref_ns == 100ULL * 100ULL);
+	assert(hyperv_time_shutdown(0, 1) == 0);
 
 	reference_time = 100;
 	hyperv_clock_set_efi_sample(sample.epoch_ns, 100);

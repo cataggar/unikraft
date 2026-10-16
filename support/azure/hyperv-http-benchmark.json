@@ -1,0 +1,357 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]"
+    },
+    "vmSize": {
+      "type": "string",
+      "defaultValue": "Standard_D2s_v5"
+    },
+    "acceleratedNetworking": {
+      "type": "bool",
+      "defaultValue": false
+    },
+    "unikraftVmName": {
+      "type": "string",
+      "defaultValue": "unikraft-http-vm"
+    },
+    "linuxBaselineVmName": {
+      "type": "string",
+      "defaultValue": "linux-http-baseline-vm"
+    },
+    "loadgenVmName": {
+      "type": "string",
+      "defaultValue": "http-loadgen-vm"
+    },
+    "vnetName": {
+      "type": "string",
+      "defaultValue": "unikraft-http-benchmark-vnet"
+    },
+    "subnetName": {
+      "type": "string",
+      "defaultValue": "benchmark"
+    },
+    "nsgName": {
+      "type": "string",
+      "defaultValue": "unikraft-http-benchmark-nsg"
+    },
+    "unikraftPrivateIp": {
+      "type": "string",
+      "defaultValue": "10.42.0.4"
+    },
+    "linuxBaselinePrivateIp": {
+      "type": "string",
+      "defaultValue": "10.42.0.5"
+    },
+    "loadgenPrivateIp": {
+      "type": "string",
+      "defaultValue": "10.42.0.6"
+    },
+    "httpPort": {
+      "type": "int",
+      "defaultValue": 8080
+    },
+    "adminUsername": {
+      "type": "string",
+      "defaultValue": "azureuser"
+    },
+    "sshPublicKey": {
+      "type": "string"
+    },
+    "unikraftDiskId": {
+      "type": "string"
+    },
+    "linuxCustomDataBase64": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "loadgenCustomDataBase64": {
+      "type": "string",
+      "defaultValue": ""
+    },
+    "autoShutdownTime": {
+      "type": "string",
+      "defaultValue": "2300"
+    }
+  },
+  "variables": {
+    "unikraftNicName": "[format('{0}-nic', parameters('unikraftVmName'))]",
+    "linuxNicName": "[format('{0}-nic', parameters('linuxBaselineVmName'))]",
+    "loadgenNicName": "[format('{0}-nic', parameters('loadgenVmName'))]",
+    "subnetId": "[resourceId('Microsoft.Network/virtualNetworks/subnets', parameters('vnetName'), parameters('subnetName'))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2023-09-01",
+      "name": "[parameters('nsgName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "securityRules": [
+          {
+            "name": "allow-subnet-http-8080",
+            "properties": {
+              "priority": 100,
+              "protocol": "Tcp",
+              "access": "Allow",
+              "direction": "Inbound",
+              "sourceAddressPrefix": "10.42.0.0/24",
+              "sourcePortRange": "*",
+              "destinationAddressPrefix": "10.42.0.0/24",
+              "destinationPortRange": "[string(parameters('httpPort'))]"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2023-09-01",
+      "name": "[parameters('vnetName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkSecurityGroups', parameters('nsgName'))]"
+      ],
+      "properties": {
+        "addressSpace": {
+          "addressPrefixes": [
+            "10.42.0.0/24"
+          ]
+        },
+        "subnets": [
+          {
+            "name": "[parameters('subnetName')]",
+            "properties": {
+              "addressPrefix": "10.42.0.0/24",
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', parameters('nsgName'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2023-09-01",
+      "name": "[variables('unikraftNicName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', parameters('vnetName'))]"
+      ],
+      "properties": {
+        "enableAcceleratedNetworking": "[parameters('acceleratedNetworking')]",
+        "ipConfigurations": [
+          {
+            "name": "ipconfig1",
+            "properties": {
+              "privateIPAllocationMethod": "Static",
+              "privateIPAddress": "[parameters('unikraftPrivateIp')]",
+              "subnet": {
+                "id": "[variables('subnetId')]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2023-09-01",
+      "name": "[variables('linuxNicName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', parameters('vnetName'))]"
+      ],
+      "properties": {
+        "enableAcceleratedNetworking": "[parameters('acceleratedNetworking')]",
+        "ipConfigurations": [
+          {
+            "name": "ipconfig1",
+            "properties": {
+              "privateIPAllocationMethod": "Static",
+              "privateIPAddress": "[parameters('linuxBaselinePrivateIp')]",
+              "subnet": {
+                "id": "[variables('subnetId')]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2023-09-01",
+      "name": "[variables('loadgenNicName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', parameters('vnetName'))]"
+      ],
+      "properties": {
+        "enableAcceleratedNetworking": "[parameters('acceleratedNetworking')]",
+        "ipConfigurations": [
+          {
+            "name": "ipconfig1",
+            "properties": {
+              "privateIPAllocationMethod": "Static",
+              "privateIPAddress": "[parameters('loadgenPrivateIp')]",
+              "subnet": {
+                "id": "[variables('subnetId')]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines",
+      "apiVersion": "2023-09-01",
+      "name": "[parameters('unikraftVmName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkInterfaces', variables('unikraftNicName'))]"
+      ],
+      "properties": {
+        "hardwareProfile": {
+          "vmSize": "[parameters('vmSize')]"
+        },
+        "storageProfile": {
+          "osDisk": {
+            "osType": "Linux",
+            "createOption": "Attach",
+            "managedDisk": {
+              "id": "[parameters('unikraftDiskId')]"
+            }
+          }
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', variables('unikraftNicName'))]"
+            }
+          ]
+        },
+        "diagnosticsProfile": {
+          "bootDiagnostics": {
+            "enabled": true
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines",
+      "apiVersion": "2023-09-01",
+      "name": "[parameters('linuxBaselineVmName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkInterfaces', variables('linuxNicName'))]"
+      ],
+      "properties": {
+        "hardwareProfile": {
+          "vmSize": "[parameters('vmSize')]"
+        },
+        "osProfile": {
+          "computerName": "[parameters('linuxBaselineVmName')]",
+          "adminUsername": "[parameters('adminUsername')]",
+          "customData": "[if(empty(parameters('linuxCustomDataBase64')), null(), parameters('linuxCustomDataBase64'))]",
+          "linuxConfiguration": {
+            "disablePasswordAuthentication": true,
+            "ssh": {
+              "publicKeys": [
+                {
+                  "path": "[format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername'))]",
+                  "keyData": "[parameters('sshPublicKey')]"
+                }
+              ]
+            }
+          }
+        },
+        "storageProfile": {
+          "imageReference": {
+            "publisher": "Canonical",
+            "offer": "ubuntu-24_04-lts",
+            "sku": "server",
+            "version": "latest"
+          },
+          "osDisk": {
+            "createOption": "FromImage",
+            "managedDisk": {
+              "storageAccountType": "StandardSSD_LRS"
+            }
+          }
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', variables('linuxNicName'))]"
+            }
+          ]
+        },
+        "diagnosticsProfile": {
+          "bootDiagnostics": {
+            "enabled": true
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines",
+      "apiVersion": "2023-09-01",
+      "name": "[parameters('loadgenVmName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkInterfaces', variables('loadgenNicName'))]"
+      ],
+      "properties": {
+        "hardwareProfile": {
+          "vmSize": "[parameters('vmSize')]"
+        },
+        "osProfile": {
+          "computerName": "[parameters('loadgenVmName')]",
+          "adminUsername": "[parameters('adminUsername')]",
+          "customData": "[if(empty(parameters('loadgenCustomDataBase64')), null(), parameters('loadgenCustomDataBase64'))]",
+          "linuxConfiguration": {
+            "disablePasswordAuthentication": true,
+            "ssh": {
+              "publicKeys": [
+                {
+                  "path": "[format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername'))]",
+                  "keyData": "[parameters('sshPublicKey')]"
+                }
+              ]
+            }
+          }
+        },
+        "storageProfile": {
+          "imageReference": {
+            "publisher": "Canonical",
+            "offer": "ubuntu-24_04-lts",
+            "sku": "server",
+            "version": "latest"
+          },
+          "osDisk": {
+            "createOption": "FromImage",
+            "managedDisk": {
+              "storageAccountType": "StandardSSD_LRS"
+            }
+          }
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', variables('loadgenNicName'))]"
+            }
+          ]
+        },
+        "diagnosticsProfile": {
+          "bootDiagnostics": {
+            "enabled": true
+          }
+        }
+      }
+    }
+  ]
+}

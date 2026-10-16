@@ -2,6 +2,7 @@
 #include "acceptance_protocol.h"
 #ifndef HYPERV_ACCEPTANCE_BINDING_HOST_TEST
 #include "application_network.h"
+#include "http_service.h"
 #include "persistence.h"
 #include "storage_benchmark.h"
 #include "storage_target.h"
@@ -13,6 +14,7 @@
 #include <string.h>
 
 #ifndef HYPERV_ACCEPTANCE_BINDING_HOST_TEST
+#include <hyperv/hyperv.h>
 #include <uk/config.h>
 #include <uk/alloc.h>
 #include <uk/blkdev.h>
@@ -52,6 +54,13 @@
 #define HYPERV_ACCEPTANCE_BENCHMARK_ENABLED 0
 #endif
 
+#if defined(CONFIG_APPHYPERVACCEPTANCE_HTTP_SERVICE) && \
+	CONFIG_APPHYPERVACCEPTANCE_HTTP_SERVICE
+#define HYPERV_ACCEPTANCE_HTTP_SERVICE_ENABLED 1
+#else
+#define HYPERV_ACCEPTANCE_HTTP_SERVICE_ENABLED 0
+#endif
+
 #if !HYPERV_ACCEPTANCE_PERSISTENCE_ENABLED
 #define BLOCK_QUEUE_DEPTH 4U
 #define BLOCK_SECTORS_TO_READ 2U
@@ -60,7 +69,8 @@
 #define BIND_TIMEOUT_NS (3ULL * 1000000000ULL)
 #if !CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION && \
 	!HYPERV_ACCEPTANCE_TOPOLOGY_ENABLED && \
-	!HYPERV_ACCEPTANCE_BENCHMARK_ENABLED
+	!HYPERV_ACCEPTANCE_BENCHMARK_ENABLED && \
+	!HYPERV_ACCEPTANCE_HTTP_SERVICE_ENABLED
 #define NETWORK_QUEUE_DEPTH 8U
 #define NETWORK_BUFFER_SIZE 1536U
 #define DHCP_TIMEOUT_NS (8ULL * 1000000000ULL)
@@ -70,7 +80,8 @@
 #ifndef HYPERV_ACCEPTANCE_BINDING_HOST_TEST
 #if !CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION && \
 	!HYPERV_ACCEPTANCE_TOPOLOGY_ENABLED && \
-	!HYPERV_ACCEPTANCE_BENCHMARK_ENABLED
+	!HYPERV_ACCEPTANCE_BENCHMARK_ENABLED && \
+	!HYPERV_ACCEPTANCE_HTTP_SERVICE_ENABLED
 #define MAX_RX_PACKETS 256U
 
 struct rx_allocator_context {
@@ -81,7 +92,8 @@ struct rx_allocator_context {
 static struct rx_allocator_context rx_context;
 #endif
 #if !HYPERV_ACCEPTANCE_TOPOLOGY_ENABLED && \
-	!HYPERV_ACCEPTANCE_BENCHMARK_ENABLED
+	!HYPERV_ACCEPTANCE_BENCHMARK_ENABLED && \
+	!HYPERV_ACCEPTANCE_HTTP_SERVICE_ENABLED
 static struct uk_blkreq block_request;
 static _Alignas(4096) uint8_t block_buffer[
 	BLOCK_SECTORS_TO_READ * BLOCK_SECTOR_SIZE_MAX];
@@ -202,7 +214,8 @@ wait_for_target_bindings(unsigned int storage_offers,
 
 #ifndef HYPERV_ACCEPTANCE_BINDING_HOST_TEST
 #if !HYPERV_ACCEPTANCE_TOPOLOGY_ENABLED && \
-	!HYPERV_ACCEPTANCE_BENCHMARK_ENABLED
+	!HYPERV_ACCEPTANCE_BENCHMARK_ENABLED && \
+	!HYPERV_ACCEPTANCE_HTTP_SERVICE_ENABLED
 static enum hyperv_acceptance_result probe_storage(
 	unsigned int storage_offers, const struct target_binding_status *bindings)
 {
@@ -400,7 +413,8 @@ out:
 	return result;
 }
 
-#if !CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION
+#if !CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION && \
+	!HYPERV_ACCEPTANCE_HTTP_SERVICE_ENABLED
 static uint16_t allocate_rx_packets(void *argp, struct uk_netbuf *packets[],
 				    uint16_t count)
 {
@@ -706,6 +720,28 @@ int main(void)
 	result = hyperv_acceptance_storage_benchmark_probe(
 		storage_offers, bindings.storage, bindings.storage_error);
 	printf("HYPERV_STORAGE_BENCHMARK RESULT %s\n", result_name(result));
+	fflush(stdout);
+	return (int)result;
+#elif HYPERV_ACCEPTANCE_HTTP_SERVICE_ENABLED
+	enum hyperv_acceptance_result result;
+	struct target_binding_status bindings;
+	unsigned int storage_offers;
+	unsigned int network_offers;
+	__u64 t_efi_pre_exit = 0;
+	__u64 t_time_init = 0;
+	uint64_t t_vmbus_ready;
+
+	printf("HYPERV_ACCEPTANCE PLATFORM_READY PASS cpu_count=1 "
+	       "vmbus_offers=%u\n", vmbus_device_count());
+	puts("UK_HYPERV_PLATFORM_READY");
+	count_vmbus_classes(&storage_offers, &network_offers);
+	bindings = wait_for_target_bindings(0, network_offers);
+	uk_hyperv_boot_ref_timestamps(&t_efi_pre_exit, &t_time_init);
+	t_vmbus_ready = (uint64_t)t_time_init + (uint64_t)ukplat_monotonic_clock();
+	result = hyperv_acceptance_run_http_service(
+		network_offers, bindings.network, t_vmbus_ready);
+	printf("HYPERV_HTTP_SERVICE RESULT %s\n", result_name(result));
+	puts(result == HYPERV_ACCEPTANCE_PASS ? "RESULT:PASS" : "RESULT:FAIL");
 	fflush(stdout);
 	return (int)result;
 #else

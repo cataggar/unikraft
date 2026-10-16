@@ -927,6 +927,17 @@ __nsec ukplat_wall_clock(void)
 				   hyperv_reference_time());
 }
 
+void uk_hyperv_boot_ref_timestamps(__u64 *efi_ref_ns,
+				   __u64 *time_init_ref_ns)
+{
+	if (efi_ref_ns)
+		*efi_ref_ns = (__u64)(hyperv_efi_ref *
+				      HYPERV_REFERENCE_TICK_NS);
+	if (time_init_ref_ns)
+		*time_init_ref_ns = (__u64)(hyperv_boot_ref *
+					    HYPERV_REFERENCE_TICK_NS);
+}
+
 static int hyperv_cpu_wait_initializing(void)
 {
 	__u64 deadline = hyperv_reference_time() +
