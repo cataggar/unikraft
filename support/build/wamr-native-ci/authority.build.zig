@@ -95,6 +95,7 @@ pub fn testOptions(b: *std.Build, target: std.Build.ResolvedTarget, optimize: st
             .root_source_file = b.path("../../tools/hyperv/process_fixture.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = true,
         }),
     });
     const options = b.addOptions();
@@ -111,6 +112,7 @@ pub fn testOptions(b: *std.Build, target: std.Build.ResolvedTarget, optimize: st
             .root_source_file = b.path("authority/runtime_probes_fixture.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = true,
         }),
     });
     options.addOptionPath("probe_fixture", probe_fixture.getEmittedBin());
@@ -132,6 +134,7 @@ pub fn testOptions(b: *std.Build, target: std.Build.ResolvedTarget, optimize: st
             .root_source_file = b.path("package.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = true,
             .imports = &.{
                 .{ .name = "public_image", .module = image },
                 .{ .name = "package_options", .module = package_options.createModule() },
