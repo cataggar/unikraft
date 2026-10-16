@@ -587,3 +587,55 @@ protocol through the narrow input API, without SDK/controller dependencies.
 It covers valid two-boot evidence, exact accumulated prefixes, fresh-capture
 parsing (not restart attribution), phase refusal, malformed or conflicting
 evidence, identity drift, and nonzero Boot 2 mutation counters.
+
+## Opt-in bounded block-I/O performance benchmark profile
+
+Select `CONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK=y` (or copy
+`support/apps/hyperv-acceptance/storage-benchmark.defconfig` to
+`support/apps/hyperv-acceptance/.config`) for a separate, default-off,
+strictly read-only storage benchmark workload. It selects
+`CONFIG_LIBSTORVSC_LUN_DISCOVERY=y`, `CONFIG_LIBSTORVSC_GUARDED_IO=y`,
+`CONFIG_LIBUKALLOC_IFSTATS=y`, `CONFIG_LIBSTORVSC_QUEUE_DEPTH=32`, and
+`CONFIG_LIBSTORVSC_MAX_TRANSFER_PAGES=33`, without altering the default smoke,
+application-network, topology, or persistence profiles.
+
+The benchmark reuses policy-2 read-only admission
+(`uk_storvsc_session_begin_read()`) against the uniquely identified disposable
+4-GiB data disk at LUN 7 (`sectors = 8,388,608`, `sector_size = 512`), rejects
+any MBR/GPT boot-shaped disk or duplicate LUN 7 candidate, and never calls
+`uk_storvsc_session_authorize_write()` or issues write/flush requests. It
+verifies disk identity, geometry, policy-2 seed manifests at LBAs 8 and 9, and
+the deterministic fixture window at LBAs 32..47 both **before** warmup and
+**after** all steady-state trials, and validates `uk_storvsc_session_validate()`
+before every submission and after every completion.
+
+Using a pre-allocated ring of up to 32 page-aligned 128-KiB bounce buffers (and
+confirming zero dynamic allocations during steady state via `uk_alloc`
+interface stats), the harness sweeps the 48-cell matrix across:
+
+- access patterns: `seq` (sequential) and `strided` (full-span coprime LBA
+  progression across the 4-GiB disk);
+- request sizes: `4 KiB` (8 sectors), `16 KiB` (32 sectors), `64 KiB` (128
+  sectors), and `128 KiB` (256 sectors);
+- target outstanding queue depths: `QD = 1, 2, 4, 8, 16, 32`.
+
+Each trial separates discovery/setup, uncounted warmup operations, and measured
+steady-state intervals, recording three monotonic timestamps per operation
+(`t_submit`, `t_complete` inside the `uk_blkreq` completion callback, and
+`t_resume` when the poll loop processes the completed slot) and computing exact
+per-trial `p50`, `p95`, `p99`, `min`, `max`, and `mean` latency over the
+pre-allocated per-trial sample array without cross-trial percentile averaging.
+Structured serial records (`UK_HYPERV_STORAGE_BENCHMARK_BEGIN`,
+`UK_HYPERV_STORAGE_BENCHMARK_TRIAL`, `UK_HYPERV_STORAGE_BENCHMARK_CELL`,
+`UK_HYPERV_STORAGE_BENCHMARK_OK`, and `HYPERV_STORAGE_BENCHMARK FINAL PASS`) are
+validated by `support/tools/hyperv/storage_benchmark_evidence.zig`, which also
+emits JSON and Markdown baseline reports bound to commit SHA, config digest,
+image digest, transcript digest, and environment metadata.
+
+Run the host C and Zig benchmark and validator fixtures with:
+
+```sh
+sh support/apps/hyperv-acceptance/tests/storage-benchmark-test.sh
+zig build test-hyperv-storage-benchmark -j2
+```
+
