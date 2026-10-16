@@ -3598,6 +3598,22 @@ class HypervWorkflowTest(unittest.TestCase):
         workflow = (
             SUPPORT.parent / ".github/workflows/wamr-native-compute.yaml"
         ).read_text()
+        for required in (
+            "  workflow_dispatch:\n"
+            "    inputs:\n"
+            "      cpu_baseline:\n"
+            "        description: Recorded portable controller CPU baseline\n"
+            "        required: false\n"
+            "        default: x86_64_v2\n"
+            "        type: choice\n"
+            "        options:\n"
+            "          - x86_64_v2\n"
+            "          - x86_64_v3\n",
+            "WAMR_CI_CPU_BASELINE: ${{ inputs.cpu_baseline || 'x86_64_v2' }}",
+            'required_cpu_flags="cx16 popcnt sse4_1 sse4_2 ssse3 avx avx2 bmi1 bmi2 f16c fma abm movbe xsave"',
+            '-Dtarget=x86_64-linux-gnu "-Dcpu=${selected_baseline}" -Doptimize=safe',
+        ):
+            self.assertIn(required, workflow)
         step = workflow.split(
             "      - name: Record the runner CPU and portable executable target\n",
             1,
@@ -3636,7 +3652,7 @@ class HypervWorkflowTest(unittest.TestCase):
                 'test "$1" = describe && test "$2" = --output && '
                 'test "$3" = target-v1 || exit 1\n'
                 'printf "%s\\n" '
-                '\'-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2\'\n'
+                '"-Dtarget=x86_64-linux-gnu -Dcpu=${MOCK_CONTROLLER_CPU:-x86_64_v2}"\n'
             )
             controller.chmod(0o700)
             runner = root / "runner"
@@ -3644,6 +3660,7 @@ class HypervWorkflowTest(unittest.TestCase):
             environment = dict(os.environ)
             environment.pop("PYTHONDONTWRITEBYTECODE", None)
             environment.pop("PYTHONPYCACHEPREFIX", None)
+            environment.pop("WAMR_CI_CPU_BASELINE", None)
             environment["PATH"] = str(tools) + os.pathsep + environment["PATH"]
             environment["RUNNER_TEMP"] = str(runner)
             environment["WAMR_CI_CONTROLLER"] = str(controller)
@@ -3654,10 +3671,44 @@ class HypervWorkflowTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("Zig native CPU: fixture_cpu\n", result.stdout)
             self.assertIn(
+                "Selected portable CPU baseline: x86_64_v2\n",
+                result.stdout,
+            )
+            self.assertIn(
                 "Recorded supervisor/validator target: "
                 "-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2\n",
                 result.stdout,
             )
+            v3_env = dict(environment)
+            v3_env["WAMR_CI_CPU_BASELINE"] = "x86_64_v3"
+            v3_env["MOCK_CONTROLLER_CPU"] = "x86_64_v3"
+            v3_result = subprocess.run(
+                ["bash", "-c", script], cwd=repository, env=v3_env,
+                text=True, capture_output=True, timeout=30,
+            )
+            self.assertEqual(v3_result.returncode, 0, v3_result.stderr)
+            self.assertIn(
+                "Selected portable CPU baseline: x86_64_v3\n",
+                v3_result.stdout,
+            )
+            self.assertIn(
+                "Recorded supervisor/validator target: "
+                "-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v3\n",
+                v3_result.stdout,
+            )
+            for bad_baseline, mock_cpu in (
+                ("native", "x86_64_v2"),
+                ("x86_64_v4", "x86_64_v2"),
+                ("x86_64_v3", "x86_64_v2"),
+            ):
+                bad_env = dict(environment)
+                bad_env["WAMR_CI_CPU_BASELINE"] = bad_baseline
+                bad_env["MOCK_CONTROLLER_CPU"] = mock_cpu
+                bad_result = subprocess.run(
+                    ["bash", "-c", script], cwd=repository, env=bad_env,
+                    text=True, capture_output=True, timeout=30,
+                )
+                self.assertNotEqual(bad_result.returncode, 0)
             self.assertEqual(
                 sorted(str(path.relative_to(repository))
                        for path in repository.rglob("*") if path.is_file()),
@@ -3724,11 +3775,22 @@ class HypervWorkflowTest(unittest.TestCase):
                 "Artifact container digest:",
                 "Artifact ID:",
                 "Artifact URL:",
+                "Controller CPU baseline:",
+                "Recorded supervisor/validator target:",
                 "Inner ZIP bytes:",
                 "inner_zip_bytes=",
                 "GITHUB_STEP_SUMMARY",
                 "GITHUB_OUTPUT"):
             self.assertIn(required, binding)
+        self.assertEqual(workflow.count("GITHUB_STEP_SUMMARY"), 1)
+        self.assertLess(
+            workflow.index("## Exact WAMR public-source image"),
+            workflow.index("Controller CPU baseline:"),
+        )
+        self.assertLess(
+            workflow.index("## Exact WAMR public-source image"),
+            workflow.index("GITHUB_STEP_SUMMARY"),
+        )
         self.assertNotIn("id-token:", workflow)
         self.assertLess(
             workflow.index("actions/download-artifact@v4"),

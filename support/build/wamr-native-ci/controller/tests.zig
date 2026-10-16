@@ -1509,20 +1509,94 @@ test "closed production profile and historical read-only mode order" {
 
 test "portable target installer refuses musl, v3 and incomplete overrides" {
     const target = controller.target;
-    const correct = target.portableQuery();
-    try std.testing.expect(target.permitsInstall(correct, .safe));
-    try std.testing.expect(!target.permitsInstall(correct, .debug));
+    const profile = controller.profile;
+    const v2_query = target.portableQuery();
+    const v3_query = target.portableQueryFor(.x86_64_v3);
+    try std.testing.expectEqual(@as(?profile.CpuBaseline, .x86_64_v2), target.requestedBaseline(v2_query));
+    try std.testing.expectEqual(@as(?profile.CpuBaseline, .x86_64_v3), target.requestedBaseline(v3_query));
+    try std.testing.expect(target.permitsInstall(v2_query, .safe));
+    try std.testing.expect(target.permitsInstall(v3_query, .safe));
+    try std.testing.expect(!target.permitsInstall(v2_query, .debug));
+    try std.testing.expect(!target.permitsInstall(v3_query, .debug));
     try std.testing.expect(!target.permitsInstall(.{}, .safe));
     for ([_]struct { triple: []const u8, cpu: ?[]const u8 }{
         .{ .triple = "x86_64-linux-musl", .cpu = "x86_64_v2" },
-        .{ .triple = "x86_64-linux-gnu", .cpu = "x86_64_v3" },
+        .{ .triple = "x86_64-linux-musl", .cpu = "x86_64_v3" },
         .{ .triple = "x86_64-linux-gnu", .cpu = null },
+        .{ .triple = "x86_64-linux-gnu", .cpu = "native" },
+        .{ .triple = "x86_64-linux-gnu", .cpu = "baseline" },
+        .{ .triple = "x86_64-linux-gnu", .cpu = "x86_64" },
+        .{ .triple = "x86_64-linux-gnu", .cpu = "x86_64_v1" },
+        .{ .triple = "x86_64-linux-gnu", .cpu = "x86_64_v4" },
+        .{ .triple = "x86_64-linux-gnu", .cpu = "x86_64_v2+avx2" },
+        .{ .triple = "x86_64-linux-gnu", .cpu = "x86_64_v3-avx2" },
+        .{ .triple = "x86_64-linux-gnu", .cpu = "x86_64_v3+avx512f" },
     }) |bad| {
-        const query = try std.Target.Query.parse(.{
+        const query = std.Target.Query.parse(.{
             .arch_os_abi = bad.triple,
             .cpu_features = bad.cpu,
-        });
+        }) catch |err| {
+            try std.testing.expectEqual(error.UnknownCpuModel, err);
+            continue;
+        };
+        try std.testing.expectEqual(@as(?profile.CpuBaseline, null), target.requestedBaseline(query));
         try std.testing.expect(!target.permitsInstall(query, .safe));
+    }
+    const v2_host: target.HostCpuSnapshot = .{
+        .max_basic_leaf = 7,
+        .leaf1_ecx = target.leaf1_ecx_v2_mask,
+        .leaf1_edx = target.leaf1_edx_v2_mask,
+        .max_extended_leaf = 0x80000001,
+        .ext1_ecx = target.ext1_ecx_v2_mask,
+        .ext1_edx = target.ext1_edx_v2_mask,
+        .leaf7_ebx = 0,
+        .xcr0 = 0x2,
+    };
+    try target.evaluateHostCpu(.x86_64_v2, v2_host);
+    try std.testing.expectError(error.UnsupportedHostCpu, target.evaluateHostCpu(.x86_64_v3, v2_host));
+    var missing_popcnt = v2_host;
+    missing_popcnt.leaf1_ecx &= ~(@as(u32, 1) << 23);
+    try std.testing.expectError(error.UnsupportedHostCpu, target.evaluateHostCpu(.x86_64_v2, missing_popcnt));
+    const v3_host: target.HostCpuSnapshot = .{
+        .max_basic_leaf = 7,
+        .leaf1_ecx = target.leaf1_ecx_v2_mask | target.leaf1_ecx_v3_cpu_mask | target.leaf1_ecx_osxsave_bit,
+        .leaf1_edx = target.leaf1_edx_v2_mask,
+        .max_extended_leaf = 0x80000001,
+        .ext1_ecx = target.ext1_ecx_v2_mask | target.ext1_ecx_v3_mask,
+        .ext1_edx = target.ext1_edx_v2_mask,
+        .leaf7_ebx = target.leaf7_ebx_v3_mask,
+        .xcr0 = 0x7,
+    };
+    try target.evaluateHostCpu(.x86_64_v2, v3_host);
+    try target.evaluateHostCpu(.x86_64_v3, v3_host);
+    for ([_]u32{ 12, 22, 26, 28, 29 }) |bit| {
+        var missing_leaf1 = v3_host;
+        missing_leaf1.leaf1_ecx &= ~(@as(u32, 1) << @intCast(bit));
+        try std.testing.expectError(error.UnsupportedHostCpu, target.evaluateHostCpu(.x86_64_v3, missing_leaf1));
+    }
+    for ([_]u32{ 3, 5, 8 }) |bit| {
+        var missing_leaf7 = v3_host;
+        missing_leaf7.leaf7_ebx &= ~(@as(u32, 1) << @intCast(bit));
+        try std.testing.expectError(error.UnsupportedHostCpu, target.evaluateHostCpu(.x86_64_v3, missing_leaf7));
+    }
+    var missing_lzcnt = v3_host;
+    missing_lzcnt.ext1_ecx &= ~(@as(u32, 1) << 5);
+    try std.testing.expectError(error.UnsupportedHostCpu, target.evaluateHostCpu(.x86_64_v3, missing_lzcnt));
+    var no_osxsave = v3_host;
+    no_osxsave.leaf1_ecx &= ~target.leaf1_ecx_osxsave_bit;
+    try target.evaluateHostCpu(.x86_64_v2, no_osxsave);
+    try std.testing.expectError(error.OsAvxStateDisabled, target.evaluateHostCpu(.x86_64_v3, no_osxsave));
+    for ([_]u64{ 0x0, 0x1, 0x2, 0x3, 0x4, 0x5 }) |disabled_xcr0| {
+        var avx_disabled = v3_host;
+        avx_disabled.xcr0 = disabled_xcr0;
+        try target.evaluateHostCpu(.x86_64_v2, avx_disabled);
+        try std.testing.expectError(error.OsAvxStateDisabled, target.evaluateHostCpu(.x86_64_v3, avx_disabled));
+    }
+    for ([_]controller.command_plan.Stage{ .@"public-validator-build", .@"import-validator-build" }) |stage| {
+        const spec_v2 = controller.command_plan.specForBaseline(stage, .x86_64_v2);
+        const spec_v3 = controller.command_plan.specForBaseline(stage, .x86_64_v3);
+        try std.testing.expectEqualStrings("-Dcpu=x86_64_v2", spec_v2.argv[9].literal);
+        try std.testing.expectEqualStrings("-Dcpu=x86_64_v3", spec_v3.argv[9].literal);
     }
 }
 
@@ -2830,7 +2904,13 @@ test "public validator cache flag is historical import only" {
         \\i=q["argv"].index(m.ci.command_literal("--global-cache-dir"))
         \\q["argv"][i+1]=m.ci.command_path("work","unbound-cache")
         \\e.rehash_supervised_binding(bad)
-        \\sys.stdout.buffer.write(m.ci.canonical_json({"current":current,"historical":old,"tampered":bad}))
+        \\v3=copy.deepcopy(current); q=v3["supervisor"]["request"]
+        \\q["argv"]=[m.ci.command_literal("-Dcpu=x86_64_v3") if item==m.ci.command_literal("-Dcpu=x86_64_v2") else item for item in q["argv"]]
+        \\e.rehash_supervised_binding(v3)
+        \\v4=copy.deepcopy(current); q=v4["supervisor"]["request"]
+        \\q["argv"]=[m.ci.command_literal("-Dcpu=x86_64_v4") if item==m.ci.command_literal("-Dcpu=x86_64_v2") else item for item in q["argv"]]
+        \\e.rehash_supervised_binding(v4)
+        \\sys.stdout.buffer.write(m.ci.canonical_json({"current":current,"historical":old,"tampered":bad,"v3":v3,"v4":v4}))
     ;
     const witness = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/tests/test_adapter.py" });
     const response = try std.process.run(a, std.testing.io, .{
@@ -2845,6 +2925,14 @@ test "public validator cache flag is historical import only" {
     const values = try std.json.parseFromSliceLeaky(std.json.Value, a, response.stdout, .{ .duplicate_field_behavior = .@"error" });
     const current = try fixtureCanonical(a, values.object.get("current").?);
     _ = try controller.accepted_run.validateCommandBinding(a, current, .@"public-validator-build", .local_runtime);
+    _ = try controller.accepted_run.validateCommandBindingForBaseline(a, current, .@"public-validator-build", .local_runtime, .x86_64_v2);
+    try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBindingForBaseline(a, current, .@"public-validator-build", .local_runtime, .x86_64_v3));
+    const v3_record = try fixtureCanonical(a, values.object.get("v3").?);
+    _ = try controller.accepted_run.validateCommandBindingForBaseline(a, v3_record, .@"public-validator-build", .local_runtime, .x86_64_v3);
+    try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBindingForBaseline(a, v3_record, .@"public-validator-build", .local_runtime, .x86_64_v2));
+    const v4_record = try fixtureCanonical(a, values.object.get("v4").?);
+    try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBindingForBaseline(a, v4_record, .@"public-validator-build", .local_runtime, .x86_64_v2));
+    try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBindingForBaseline(a, v4_record, .@"public-validator-build", .local_runtime, .x86_64_v3));
     const historical = try fixtureCanonical(a, values.object.get("historical").?);
     _ = try controller.accepted_run.validateCommandBinding(a, historical, .@"public-validator-build", .trusted_inner_zip);
     try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBinding(a, historical, .@"public-validator-build", .local_runtime));

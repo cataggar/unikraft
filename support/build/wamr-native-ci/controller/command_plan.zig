@@ -127,6 +127,10 @@ pub fn isValidator(stage: Stage) bool {
 }
 
 pub fn spec(stage: Stage) Spec {
+    return specForBaseline(stage, profile.activeCpuBaseline());
+}
+
+pub fn specForBaseline(stage: Stage, baseline: profile.CpuBaseline) Spec {
     return switch (stage) {
         .adapter => .{ .stage = stage, .executable = "tool:zig", .seconds = 900, .output_limit = 8 * 1024 * 1024, .argv = &.{
             zig,                                                                                      .{ .literal = "build" },                               .{ .literal = "--build-file" },
@@ -165,17 +169,32 @@ pub fn spec(stage: Stage) Spec {
                 .{ .path = .{ .role = "source", .relative = "support/apps/wamr-aot/build/wamr_hyperv-x86_64-efi" } }, .{ .path = .{ .role = "compute", .relative = "package" } },
             },
         },
-        .@"public-validator-build", .@"import-validator-build" => .{
-            .stage = stage,
-            .executable = "tool:zig",
-            .seconds = 1800,
-            .output_limit = 8 * 1024 * 1024,
-            .argv = &.{
-                zig,                                                                                     .{ .literal = "build" },                                             .{ .literal = "--build-file" },
-                .{ .path = .{ .role = "source", .relative = "support/tools/hyperv/direct/build.zig" } }, .{ .literal = "--cache-dir" },                                       .{ .path = .{ .role = "work", .relative = "cache" } },
-                .{ .literal = "--prefix" },                                                              .{ .path = .{ .role = "work", .relative = "public-source/tools" } }, .{ .literal = "-Dtarget=x86_64-linux-gnu" },
-                .{ .literal = "-Dcpu=x86_64_v2" },                                                       .{ .literal = "-Doptimize=safe" },                                   .{ .literal = "-j2" },
-                .{ .literal = "install" },
+        .@"public-validator-build", .@"import-validator-build" => switch (baseline) {
+            .x86_64_v2 => .{
+                .stage = stage,
+                .executable = "tool:zig",
+                .seconds = 1800,
+                .output_limit = 8 * 1024 * 1024,
+                .argv = &.{
+                    zig,                                                                                     .{ .literal = "build" },                                             .{ .literal = "--build-file" },
+                    .{ .path = .{ .role = "source", .relative = "support/tools/hyperv/direct/build.zig" } }, .{ .literal = "--cache-dir" },                                       .{ .path = .{ .role = "work", .relative = "cache" } },
+                    .{ .literal = "--prefix" },                                                              .{ .path = .{ .role = "work", .relative = "public-source/tools" } }, .{ .literal = "-Dtarget=x86_64-linux-gnu" },
+                    .{ .literal = profile.executable_target_v2[1] },                                         .{ .literal = "-Doptimize=safe" },                                   .{ .literal = "-j2" },
+                    .{ .literal = "install" },
+                },
+            },
+            .x86_64_v3 => .{
+                .stage = stage,
+                .executable = "tool:zig",
+                .seconds = 1800,
+                .output_limit = 8 * 1024 * 1024,
+                .argv = &.{
+                    zig,                                                                                     .{ .literal = "build" },                                             .{ .literal = "--build-file" },
+                    .{ .path = .{ .role = "source", .relative = "support/tools/hyperv/direct/build.zig" } }, .{ .literal = "--cache-dir" },                                       .{ .path = .{ .role = "work", .relative = "cache" } },
+                    .{ .literal = "--prefix" },                                                              .{ .path = .{ .role = "work", .relative = "public-source/tools" } }, .{ .literal = "-Dtarget=x86_64-linux-gnu" },
+                    .{ .literal = profile.executable_target_v3[1] },                                         .{ .literal = "-Doptimize=safe" },                                   .{ .literal = "-j2" },
+                    .{ .literal = "install" },
+                },
             },
         },
         .@"supervisor-import-identity" => .{

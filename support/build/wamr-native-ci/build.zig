@@ -36,7 +36,8 @@ pub fn build(b: *std.Build) void {
     const requested_target = b.standardTargetOptionsQueryOnly(.{});
     const target = b.resolveTargetQuery(requested_target);
     const optimize = b.standardOptimizeOption(.{});
-    const portable_query = controller_target.portableQuery();
+    const selected_baseline = controller_target.requestedBaseline(requested_target) orelse .x86_64_v2;
+    const portable_query = controller_target.portableQueryFor(selected_baseline);
     const portable_target = b.resolveTargetQuery(portable_query);
     const identity_writer = b.addExecutable(.{
         .name = "wamr-validator-identity",
@@ -382,11 +383,14 @@ pub fn build(b: *std.Build) void {
     install_run.addDirectoryArg(b.graph.cwdRelativePath("."));
     install_run.addFileArg(controller_cli.getEmittedBin());
     const install_step = b.step("install-controller", "Create-only portable controller install in the private runtime");
-    if (controller_target.permitsInstall(requested_target, optimize))
-        install_step.dependOn(&install_run.step)
-    else
+    if (controller_target.permitsInstall(requested_target, optimize)) {
+        if (controller_runtime.len != 0)
+            install_step.dependOn(&install_run.step)
+        else
+            install_step.dependOn(&b.addInstallArtifact(controller_cli, .{}).step);
+    } else
         install_step.dependOn(&b.addFail(
-            "install-controller requires -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 -Doptimize=safe",
+            "install-controller requires -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 (or -Dcpu=x86_64_v3) -Doptimize=safe",
         ).step);
     const controller_tests = b.addTest(.{
         .filters = b.option([]const []const u8, "test-filter", "Select bounded controller fixtures") orelse &.{},

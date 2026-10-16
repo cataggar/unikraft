@@ -124,22 +124,38 @@ WAMR_CI_SUPERVISOR="$PWD/.d/wamr-direct/supervisor/bin/wamr-ci-supervisor" \
 
 The commands above build host-native tools for offline fixtures, including
 aarch64. For production, the native compute lane explicitly builds the recorded
-supervisor and public validator with
-`-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2`, independent of the runner CPU.
-Use those same flags when rebuilding them from the selected source with the
+supervisor and public validator with the default portable baseline
+`-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2` or, when explicitly opted in via
+`-Dcpu=x86_64_v3` (or the `workflow_dispatch` `cpu_baseline` input),
+`-Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v3`, independent of the runner CPU.
+Any other target, CPU model (`native`, `x86_64`, `x86_64_v1`, `x86_64_v4`), or
+feature override (`+avx2`) is refused. Use the exact recorded `-Dtarget=` and
+`-Dcpu=` flags from `describe --output target-v1` (and the post-import
+workflow summary) when rebuilding them from the selected source with the
 pinned Zig compiler, source-closure digest and `safe` optimization.
 Release validator builds strip path-dependent debug data, matching the
 supervisor's stripped build; debug validator builds retain it for diagnostics.
-The workflow logs both the runner's native CPU and the recorded executable
-target. That source import disables Python bytecode at interpreter startup:
-setting it inside the imported module is too late to prevent a first
-`__pycache__` write, which source custody correctly refuses.
+The workflow logs the runner's native CPU, the selected portable CPU baseline,
+and the recorded executable target, and includes the selected baseline in the
+post-import step summary (`## Exact WAMR public-source image`). That source
+import disables Python bytecode at interpreter startup: setting it inside the
+imported module is too late to prevent a first `__pycache__` write, which
+source custody correctly refuses.
 Older runs without this pin still require their logged native CPU
 as `-Dcpu=` to reproduce the accepted bytes; the pin does not change existing
 bundles. Importing, planning, admitting and running require an x86-64 operator
-host supporting the selected baseline, because those steps execute the
-recorded supervisor and local validator rather than merely comparing bytes.
-`x86_64_v2` does not imply support for every historical x86-64 CPU.
+host supporting the selected baseline (verified at startup via CPUID feature
+bits plus `OSXSAVE` and `XGETBV(0)` `(xcr0 & 0x6) == 0x6` for `x86_64_v3`,
+with no silent fallback), because those steps execute the recorded supervisor
+and local validator rather than merely comparing bytes.
+`x86_64_v2` and `x86_64_v3` do not imply support for every historical x86-64
+CPU. On AMD EPYC 9V45, `-Dcpu=x86_64_v3 -Doptimize=safe` vs
+`-Dcpu=x86_64_v2 -Doptimize=safe` improves 64 MiB raw+QCOW2+VHD packaging
+(`wamr-ci-package package`) from `10,170.39 ms` to `4,146.39 ms` median
+(`2.45x`), SHA-256 + image verification (`wamr-ci-package inspect`) from
+`4,110.67 ms` to `1,629.29 ms` median (`2.52x`), and boot-serial validation
+(`uk-wamr-log-validate tiny --output json-v1`) from `0.689 ms` to `0.644 ms`
+median (`1.07x`).
 
 Only `compute-fixture-tools` installs the **non-production** fixture
 controller/backend. They reuse the existing native fake CLI and its confined
