@@ -1,0 +1,7 @@
+.{
+    .name = .unikraft_hyperv_http_benchmark,
+    .version = "0.1.0",
+    .fingerprint = 0x817b2602359137f5,
+    .minimum_zig_version = "0.17.0",
+    .paths = .{""},
+}

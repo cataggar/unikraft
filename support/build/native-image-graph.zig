@@ -1428,14 +1428,22 @@ test "Hyper-V application networking registers pinned stack inputs" {
             std.mem.eql(u8, library.name, "libukrandom_lcpu");
     }
     const app = application orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(usize, 6), app.raw_objects.len);
+    try std.testing.expectEqual(@as(usize, 8), app.raw_objects.len);
     try std.testing.expectEqualStrings(
         "/build/apphelloworld/application_network.o",
         app.raw_objects[3].path,
     );
     try std.testing.expectEqualStrings(
-        "/build/apphelloworld/storage_target.o",
+        "/build/apphelloworld/http_protocol.o",
         app.raw_objects[4].path,
+    );
+    try std.testing.expectEqualStrings(
+        "/build/apphelloworld/http_service.o",
+        app.raw_objects[5].path,
+    );
+    try std.testing.expectEqualStrings(
+        "/build/apphelloworld/storage_target.o",
+        app.raw_objects[6].path,
     );
     const stack = lwip orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(
@@ -1510,14 +1518,14 @@ test "Hyper-V raw acceptance registers its sources without the network stack" {
     }
 
     const app = application orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(usize, 6), app.raw_objects.len);
+    try std.testing.expectEqual(@as(usize, 8), app.raw_objects.len);
     try std.testing.expectEqualStrings(
         "/build/apphelloworld/acceptance_protocol.o",
         app.raw_objects[1].path,
     );
     try std.testing.expectEqualStrings(
         "/build/apphelloworld/storage_target.o",
-        app.raw_objects[4].path,
+        app.raw_objects[6].path,
     );
 }
 
@@ -1538,14 +1546,14 @@ test "Hyper-V persistence registers its separately compiled workload" {
     for (registered.graph.libraries) |library| {
         if (!std.mem.eql(u8, library.name, "apphelloworld"))
             continue;
-        try std.testing.expectEqual(@as(usize, 7), library.raw_objects.len);
+        try std.testing.expectEqual(@as(usize, 9), library.raw_objects.len);
         try std.testing.expectEqualStrings(
             "/build/apphelloworld/storage_target.o",
-            library.raw_objects[4].path,
+            library.raw_objects[6].path,
         );
         try std.testing.expectEqualStrings(
             "/build/apphelloworld/persistence.o",
-            library.raw_objects[5].path,
+            library.raw_objects[7].path,
         );
         return;
     }

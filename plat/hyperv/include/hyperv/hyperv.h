@@ -68,6 +68,8 @@ struct hyperv_message {
 void *hyperv_hypercall_page(void);
 void *hyperv_simp_page(void);
 void *hyperv_siefp_page(void);
+void uk_hyperv_boot_ref_timestamps(__u64 *efi_ref_ns,
+				   __u64 *time_init_ref_ns);
 void *hyperv_reference_tsc_page(void);
 __u64 hyperv_guest_id_encode(__u16 build, __u32 version, __u8 os_id,
 			     __u8 os_type, __u8 open_source);

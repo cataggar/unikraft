@@ -1475,6 +1475,27 @@ pub fn build(b: *std.Build) void {
     const run_application_protocol_tests =
         b.addRunArtifact(application_protocol_tests);
     test_step.dependOn(&run_application_protocol_tests.step);
+    const http_protocol_tests = b.addExecutable(.{
+        .name = "hyperv-http-protocol-test",
+        .use_llvm = true,
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .debug,
+            .link_libc = true,
+        }),
+    });
+    http_protocol_tests.root_module.addIncludePath(
+        b.path("support/apps/hyperv-acceptance"),
+    );
+    http_protocol_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "support/apps/hyperv-acceptance/http_protocol.c",
+            "support/apps/hyperv-acceptance/tests/http-protocol-test.c",
+        },
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    const run_http_protocol_tests = b.addRunArtifact(http_protocol_tests);
+    test_step.dependOn(&run_http_protocol_tests.step);
     const network_regression_tests = b.step(
         "test-network-regression",
         "Run Hyper-V network protocols, production driver, and native profile fixtures",
@@ -1485,6 +1506,7 @@ pub fn build(b: *std.Build) void {
     network_regression_tests.dependOn(&run_vmbus_disconnect_tests.step);
     network_regression_tests.dependOn(&run_hyperv_acceptance_protocol_tests.step);
     network_regression_tests.dependOn(&run_application_protocol_tests.step);
+    network_regression_tests.dependOn(&run_http_protocol_tests.step);
     network_regression_tests.dependOn(&run_native_image_graph_tests.step);
     const platform_correctness_tests = b.addExecutable(.{
         .name = "platform-runtime-correctness-test",

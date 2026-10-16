@@ -163,9 +163,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "1c7b20ca0f9bd81cefd1817a3954e738b05350b18294216e18095a40ef772fed"
+            "734af38a3d6d9a3bdf3b5703c796ae95870631a515a3a38b384965743d49cd07"
         ),
-        "size": 1815733,
+        "size": 1816685,
         "files": 220,
     },
     "support/kconfig": {
@@ -404,7 +404,7 @@ GUARDED_PRODUCER_FILES = {
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
     ),
     "build.zig": (
-        "d1ab63eb2201cec2d31fb0092acde871dfe03a29730460d5126563f2967bbd63"
+        "b1515e3747b41d864cfbab389c89a6b577581674706f52732b351d09609298b2"
     ),
     "build.zig.zon": (
         "8c9bab9a0d0c3cbd68c3b21bcfc212f7148d03c5a30ed9b3c669f1f68e886fba"
@@ -491,7 +491,7 @@ GUARDED_PRODUCER_FILES = {
         "30291f034f98c970bbf7879189e9bc4c8bc5aa5a6a19fe1ed247d508641d46a9"
     ),
     "support/build/native-image-data.zig": (
-        "94a6cf6f2e227c1bca42935911e73ae58da92bca10a8a149a976d1dd156cc9d5"
+        "4c683a00c950c788cc579a0229789dfe0caaa9375e42d2c87ff8b3dc6361affd"
     ),
     "support/build/native-kconfig-bridge.c": (
         "457137bfa280d69f8c3c819ca059c20b76a6c5dcb190575d10a7e5b1ea05f93a"
@@ -683,16 +683,16 @@ GUARDED_PRODUCER_FILES = {
         "5927caa03f0ff5bde3df68eb7073c93c345b9ea5920f697dafd0c0370fa39e33"
     ),
     "plat/hyperv/include/hyperv/hyperv.h": (
-        "26d442af7abe6f227440b339a83e21095ebd6a51161397f5c25a509291902bd9"
+        "438f323b968205c4400f9852220119aec564feb0f4e9a2f19f04bdb39b1bea4d"
     ),
     "plat/hyperv/platform.c": (
         "79b79a74cdc03c3c83bde9da212835e8367a6709d04c4ec9fee156e5139e689b"
     ),
     "plat/hyperv/time.c": (
-        "9e4f575fdb3f59ba7ff9278564f38919c3bd6febec4dde4af9f85f0a3e492793"
+        "3eebf0a9652278526c27fcdb4ee25e74645209d284f070acb8eceb071e4259ac"
     ),
     "support/build/native-image-graph.zig": (
-        "06495bea36159de080b392fcb6911ea31a7de1533349e82e36a9010cd26693b2"
+        "73d5ff83e1a64e4e781b3b239aea679e1542b33477f71b460fac3580a57cef9a"
     ),
     "support/build/native-postprocess-runner.py": (
         "3379115753b149a6f16675cb3d5f315c25bfb49bf702720cdc882470434ef0f1"
@@ -716,10 +716,10 @@ GUARDED_PRODUCER_FILES = {
         "325817c2c76a389c21358df535ac2ae0f1beb36b7e4cb73b62648d1f5faac8cc"
     ),
     "support/apps/hyperv-acceptance/Config.uk": (
-        "cb6f78d2b6272c00ef39d5edcd3ff843afc5acfd344a2570c64e8af6cdeefd86"
+        "05be792d43d1d17d4747c09241197aa2dc46781472b6790613b6af505175877d"
     ),
     "support/apps/hyperv-acceptance/Makefile.uk": (
-        "ed2c58c991370e5dca5e8366cda5499375dc85b63a9ee985d26eb85e5397797a"
+        "7a5477d21c9e445f4e13542573b9fff5e0b14ea5aedfb6988f97a55be5d6bf17"
     ),
     "support/apps/hyperv-acceptance/acceptance_protocol.c": (
         "c7b8cdd84f21e59fd93454e28ef3f99d03b17438b1d840042f852956af1237df"
@@ -734,7 +734,7 @@ GUARDED_PRODUCER_FILES = {
         "dba07b1331d6a6f02c3f017c2fabe5a0c1c03f61ffd1df7e07e49c84427d2231"
     ),
     "support/apps/hyperv-acceptance/main.c": (
-        "2de3328a8e2857942d5245de7dc4dd71072fbfb45983899fd599bc046d60581d"
+        "ad9b5fc01b25c2be7191a8a733977df591a2b7833a01fb26a5cced1fb0a9cd8a"
     ),
     "support/apps/hyperv-acceptance/persistence.c": (
         "a0fbe85754d6072f3411a498d2c3c13b11214688a625fc70b62795639cfd49c1"
