@@ -29,6 +29,7 @@
 #include <string.h>
 static _Thread_local __u64 host_cpu_index;
 static unsigned int host_wake_isr_count;
+static int host_fixed_smp_enabled;
 #endif
 
 #define VMBUS_REFERENCE_TICKS_PER_MS	10000ULL
@@ -171,6 +172,7 @@ static unsigned int host_transmit_attempts;
 static __u32 host_gpadl_status;
 static __u32 host_gpadl_channel;
 static __u32 host_gpadl_id;
+static __u32 host_last_open_target_vp = UINT32_MAX;
 static unsigned int host_gpadl_body_posts;
 static unsigned int host_gpadl_teardown_posts;
 
@@ -333,14 +335,17 @@ static void signal_worker(void)
 	unsigned long flags;
 
 	/*
-	 * schedcoop run/sleep queues are owned by the worker CPU. AP SINT2
-	 * producers only publish into the MPSC queue/bitmap; BSP polling drains
-	 * them without mutating scheduler queues cross-CPU.
+	 * Without fixed-SMP per-scheduler IRQ spinlocks, schedcoop run/sleep
+	 * queues are owned by the worker CPU and AP SINT2 producers only
+	 * publish into the MPSC queue/bitmap. With CONFIG_LIBUKBOOT_FIXED_SMP,
+	 * uk_thread_wake_isr serializes on sched->lock and kicks the target
+	 * scheduler cross-CPU safely from ISR context.
 	 */
 #ifdef VMBUS_BUS_HOST_TEST
-	if (host_cpu_index != 0)
+	if (!__atomic_load_n(&host_fixed_smp_enabled, __ATOMIC_ACQUIRE) &&
+	    host_cpu_index != 0)
 		return;
-#else
+#elif !CONFIG_LIBUKBOOT_FIXED_SMP
 	if (uk_pcpuvar_current_get(uk_pcpuvar_cpu_idx) != 0)
 		return;
 #endif
@@ -348,7 +353,7 @@ static void signal_worker(void)
 	thread = __atomic_load_n(&worker, __ATOMIC_ACQUIRE);
 	if (thread && !__atomic_load_n(&worker_stop, __ATOMIC_ACQUIRE)) {
 #ifdef VMBUS_BUS_HOST_TEST
-		host_wake_isr_count++;
+		__atomic_add_fetch(&host_wake_isr_count, 1, __ATOMIC_RELAXED);
 #endif
 		uk_thread_wake_isr(thread);
 	}
@@ -651,7 +656,9 @@ int vmbus_control_transmit(const __u8 *message, size_t length)
 	}
 	if (host_transmit_fail_after > 0)
 		host_transmit_fail_after--;
-	if (type == 8 && length >= 16) {
+	if (type == 5 && length >= 24) {
+		host_last_open_target_vp = host_read32(message + 20);
+	} else if (type == 8 && length >= 16) {
 		host_gpadl_channel = host_read32(message + 8);
 		host_gpadl_id = host_read32(message + 12);
 	} else if (type == 9) {
@@ -2494,6 +2501,7 @@ int vmbus_channel_host_record_count(void);
 int vmbus_channel_host_live_gpadls(void);
 int vmbus_channel_host_attach_gpadl(struct vmbus_channel *channel,
 				    __u32 gpadl_id);
+void vmbus_channel_host_reset_targets(void);
 
 static void host_zero(void *pointer, size_t size)
 {
@@ -2818,8 +2826,11 @@ static void host_reset_state(void)
 	host_gpadl_status = 0;
 	host_gpadl_channel = 0;
 	host_gpadl_id = 0;
+	host_last_open_target_vp = UINT32_MAX;
 	host_gpadl_body_posts = 0;
 	host_gpadl_teardown_posts = 0;
+	__atomic_store_n(&host_fixed_smp_enabled, 0, __ATOMIC_RELEASE);
+	host_cpu_index = 0;
 	host_add_a = 0;
 	host_add_b = 0;
 	host_remove_count = 0;
@@ -2847,6 +2858,9 @@ static void host_reset_state(void)
 	ukarch_spin_init(&rx_queue_lock);
 	ukarch_spin_init(&worker_lock);
 	vmbus_channel_reset_all();
+#ifndef VMBUS_EPOCH_ONLY_HOST_TEST
+	vmbus_channel_host_reset_targets();
+#endif
 }
 
 struct host_irq_producer {
@@ -2911,6 +2925,27 @@ static int host_test_concurrent_irqs(void)
 	if (host_wake_isr_count != 1)
 		return 91;
 	(void)__atomic_exchange_n(&event_pending[1], 0, __ATOMIC_ACQ_REL);
+	__atomic_store_n(&host_fixed_smp_enabled, 1, __ATOMIC_RELEASE);
+	for (i = 1; i < 4; i++) {
+		struct hyperv_message message = { 0 };
+
+		host_cpu_index = i;
+		message.message_type = VMBUS_HV_MESSAGE_TYPE;
+		message.payload_size = 8;
+		message.payload[0] = (__u8)(20 + i);
+		hyperv_vmbus_message(&message);
+		if (host_wake_isr_count != 1 + (i * 2 - 1) ||
+		    !dequeue_message(&entry) || entry.data[0] != 20 + i)
+			return 92;
+		hyperv_vmbus_event_word(64, 1ULL << i);
+		if (host_wake_isr_count != 1 + (i * 2) ||
+		    __atomic_exchange_n(&event_pending[1], 0,
+					 __ATOMIC_ACQ_REL) != (1ULL << i))
+			return 92;
+	}
+	__atomic_store_n(&host_fixed_smp_enabled, 0, __ATOMIC_RELEASE);
+	host_cpu_index = 0;
+	host_wake_isr_count = 1;
 	{
 		static const unsigned int lengths[] = {
 			8, 196, HYPERV_MESSAGE_PAYLOAD_SIZE
@@ -4173,5 +4208,36 @@ unsigned int vmbus_bus_host_gpadl_body_posts(void)
 unsigned int vmbus_bus_host_gpadl_teardown_posts(void)
 {
 	return host_gpadl_teardown_posts;
+}
+
+__u32 vmbus_bus_host_last_open_target_vp(void)
+{
+	return host_last_open_target_vp;
+}
+
+void vmbus_bus_host_set_fixed_smp(int enabled)
+{
+	__atomic_store_n(&host_fixed_smp_enabled, enabled ? 1 : 0,
+			 __ATOMIC_RELEASE);
+}
+
+void vmbus_bus_host_set_cpu_index(__u64 cpu_index)
+{
+	host_cpu_index = cpu_index;
+}
+
+unsigned int vmbus_bus_host_wake_isr_count(void)
+{
+	return __atomic_load_n(&host_wake_isr_count, __ATOMIC_ACQUIRE);
+}
+
+void vmbus_bus_host_prepare_worker_wake(int active)
+{
+	__atomic_store_n(&rx_active, active ? 1 : 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&worker,
+			 active ? (struct uk_thread *)(uintptr_t)1 : NULL,
+			 __ATOMIC_RELEASE);
+	__atomic_store_n(&worker_stop, active ? 0 : 1, __ATOMIC_RELEASE);
+	__atomic_store_n(&host_wake_isr_count, 0, __ATOMIC_RELEASE);
 }
 #endif

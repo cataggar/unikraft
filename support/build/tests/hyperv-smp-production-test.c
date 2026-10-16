@@ -31,6 +31,12 @@ static unsigned int enable_count[4];
 static unsigned int disable_count[4];
 static void *message_pages[4];
 static void *event_pages[4];
+static int inject_sint2_message[4];
+static uint64_t inject_sint2_event_word0[4];
+static unsigned int vmbus_message_count[4];
+static uint8_t last_vmbus_message_tag[4];
+static unsigned int vmbus_event_word_count[4];
+static uint64_t last_vmbus_event_mask[4];
 static uint64_t reference_time;
 static int fail_enable_cpu = -1;
 static int order;
@@ -122,25 +128,58 @@ uint64_t hyperv_deadline_reference_ticks(uint64_t boot, uint64_t deadline)
 	return boot + deadline / 100;
 }
 int hyperv_synic_message_take_page(void *page, uint32_t sint,
-				   struct hyperv_message *message
-					   __attribute__((unused)))
+				   struct hyperv_message *message)
 {
-	message_pages[hyperv_host_cpu_index] = page;
-	return sint < 16 ? HYPERV_MESSAGE_EMPTY :
-		HYPERV_MESSAGE_INVALID_SINT;
+	unsigned int cpu = (unsigned int)hyperv_host_cpu_index;
+
+	message_pages[cpu] = page;
+	if (sint >= 16)
+		return HYPERV_MESSAGE_INVALID_SINT;
+	if (sint == 2 && inject_sint2_message[cpu]) {
+		inject_sint2_message[cpu] = 0;
+		message->message_type = 1;
+		message->payload_size = 8;
+		message->payload[0] = (uint8_t)(100 + cpu);
+		return HYPERV_MESSAGE_READY;
+	}
+	return HYPERV_MESSAGE_EMPTY;
 }
 int hyperv_synic_event_take_word_page(void *page, uint32_t sint,
 				      uint32_t word, uint64_t *value)
 {
-	event_pages[hyperv_host_cpu_index] = page;
+	unsigned int cpu = (unsigned int)hyperv_host_cpu_index;
+
+	event_pages[cpu] = page;
+	if (sint >= 16 || word >= 32) {
+		*value = 0;
+		return -1;
+	}
+	if (sint == 2 && word == 0 && inject_sint2_event_word0[cpu]) {
+		*value = inject_sint2_event_word0[cpu];
+		inject_sint2_event_word0[cpu] = 0;
+		return 0;
+	}
 	*value = 0;
-	return sint < 16 && word < 32 ? 0 : -1;
+	return 0;
 }
-void hyperv_vmbus_message(const struct hyperv_message *message
-			  __attribute__((unused))) {}
+void hyperv_vmbus_message(const struct hyperv_message *message)
+{
+	unsigned int cpu = (unsigned int)hyperv_host_cpu_index;
+
+	vmbus_message_count[cpu]++;
+	if (message && message->payload_size > 0)
+		last_vmbus_message_tag[cpu] = message->payload[0];
+}
 void hyperv_vmbus_event(uint32_t event __attribute__((unused))) {}
-void hyperv_vmbus_event_word(uint32_t base __attribute__((unused)),
-			     uint64_t pending __attribute__((unused))) {}
+void hyperv_vmbus_event_word(uint32_t base, uint64_t pending)
+{
+	unsigned int cpu = (unsigned int)hyperv_host_cpu_index;
+
+	if (base == 0 && pending) {
+		vmbus_event_word_count[cpu]++;
+		last_vmbus_event_mask[cpu] |= pending;
+	}
+}
 void hyperv_vmbus_fini(void)
 {
 	vmbus_fini_order = __atomic_add_fetch(&order, 1, __ATOMIC_RELAXED);
@@ -283,9 +322,11 @@ int uk_lcpu_start(const uint64_t *indices, unsigned int *count,
 
 void ukplat_time_init(void);
 int ukplat_lcpu_startup_hook(void);
+void ukplat_lcpu_fini_hook(void);
 int hyperv_time_shutdown(int crash, int host_quiesced);
 int hyperv_time_shutdown_error(void);
 int hyperv_vmbus_target_acquire(uint32_t *, uint32_t *);
+int hyperv_vmbus_target_acquire_channel(uint32_t, uint32_t *, uint32_t *);
 void hyperv_vmbus_target_release(uint32_t, uint32_t);
 int hyperv_time_host_message_irq(void);
 int hyperv_time_host_timer_irq(void);
@@ -310,6 +351,12 @@ static void reset_observations(void)
 		disable_count[i] = 0;
 		message_pages[i] = NULL;
 		event_pages[i] = NULL;
+		inject_sint2_message[i] = 0;
+		inject_sint2_event_word0[i] = 0;
+		vmbus_message_count[i] = 0;
+		last_vmbus_message_tag[i] = 0;
+		vmbus_event_word_count[i] = 0;
+		last_vmbus_event_mask[i] = 0;
 		deferred_start[i] = 0;
 		ap_init_result[i] = 0;
 	}
@@ -764,11 +811,148 @@ static void test_realtime_handoff(void)
 	reference_time = 0;
 }
 
+static void test_four_vcpu_channel_target_and_cross_cpu_sint2(void)
+{
+	uint32_t vp[8];
+	uint32_t generation[8];
+	uint32_t control_vp = 0;
+	uint32_t control_gen = 0;
+
+	reset_observations();
+	hyperv_host_cpu_index = 0;
+	ukplat_time_init();
+
+	/* Before APs are online, channel targets stay on BSP. */
+	assert(hyperv_vmbus_target_acquire_channel(1, &vp[0], &generation[0]) ==
+	       0);
+	assert(vp[0] == vp_indices[0] && generation[0] == 1);
+	assert(hyperv_time_host_vp_refs(0) == 1);
+	hyperv_vmbus_target_release(vp[0], generation[0]);
+	assert(hyperv_time_host_vp_refs(0) == 0);
+
+	/* Bring up all 4 vCPUs (BSP + APs 1, 2, 3). */
+	host_cpu_count = 4;
+	assert(ukplat_lcpu_startup_hook() == 0);
+	assert(start_calls == 3);
+	assert(hyperv_time_host_ap_start_state() == HOST_AP_STARTED);
+	assert(hyperv_time_host_ap_requested() == 3);
+	assert(hyperv_time_host_ap_started() == 3);
+	assert(hyperv_time_host_lifecycle_generation() == 4);
+	for (unsigned int i = 0; i < 4; i++) {
+		assert(hyperv_time_host_cpu_state(i) == HYPERV_CPU_ONLINE);
+		assert(hyperv_time_host_cpu_generation(i) == i + 1);
+		assert(hyperv_time_host_vp_refs(i) == 0);
+	}
+
+	/* Control-plane target acquire stays pinned to BSP (CPU 0). */
+	assert(hyperv_vmbus_target_acquire(&control_vp, &control_gen) == 0);
+	assert(control_vp == vp_indices[0] && control_gen == 1);
+	assert(hyperv_time_host_vp_refs(0) == 1);
+	hyperv_vmbus_target_release(control_vp, control_gen);
+	assert(hyperv_time_host_vp_refs(0) == 0);
+
+	/* Channel target acquire distributes across all 4 online CPUs. */
+	for (unsigned int relid = 0; relid < 8; relid++) {
+		unsigned int cpu = relid % 4;
+
+		assert(hyperv_vmbus_target_acquire_channel(
+			       relid, &vp[relid], &generation[relid]) == 0);
+		assert(vp[relid] == vp_indices[cpu]);
+		assert(generation[relid] == cpu + 1);
+	}
+	for (unsigned int cpu = 0; cpu < 4; cpu++)
+		assert(hyperv_time_host_vp_refs(cpu) == 2);
+
+	/* Cross-CPU SINT2 message and event delivery across all 4 CPUs. */
+	for (unsigned int cpu = 0; cpu < 4; cpu++) {
+		inject_sint2_message[cpu] = 1;
+		inject_sint2_event_word0[cpu] = 1ULL << (cpu + 4);
+		hyperv_host_cpu_index = cpu;
+		assert(hyperv_time_host_message_irq() == 1);
+		assert(message_pages[cpu] == hyperv_time_host_simp_page(cpu));
+		assert(vmbus_message_count[cpu] == 1);
+		assert(last_vmbus_message_tag[cpu] == (uint8_t)(100 + cpu));
+		assert(vmbus_event_word_count[cpu] == 1);
+		assert(last_vmbus_event_mask[cpu] == (1ULL << (cpu + 4)));
+	}
+	hyperv_host_cpu_index = 0;
+
+	/* Release all channel targets except one on AP 2 (relid 2). */
+	for (unsigned int relid = 0; relid < 8; relid++) {
+		if (relid == 2)
+			continue;
+		hyperv_vmbus_target_release(vp[relid], generation[relid]);
+	}
+	assert(hyperv_time_host_vp_refs(0) == 0);
+	assert(hyperv_time_host_vp_refs(1) == 0);
+	assert(hyperv_time_host_vp_refs(2) == 1);
+	assert(hyperv_time_host_vp_refs(3) == 0);
+
+	/* Stale generation release must not unpin AP 2. */
+	hyperv_vmbus_target_release(vp[2], generation[2] + 99);
+	assert(hyperv_time_host_vp_refs(2) == 1);
+
+	/*
+	 * Shutdown while AP 2's channel target is quarantined/pinned must keep
+	 * AP 2's SynIC online (-EBUSY) while tearing down unpinned CPUs.
+	 */
+	assert(hyperv_time_shutdown(0, 1) == 0);
+	assert(hyperv_time_shutdown_error() == -EBUSY);
+	assert(hyperv_time_host_cpu_state(0) == HYPERV_CPU_OFFLINE);
+	assert(hyperv_time_host_cpu_state(1) == HYPERV_CPU_OFFLINE);
+	assert(hyperv_time_host_cpu_state(2) == HYPERV_CPU_ONLINE);
+	assert(hyperv_time_host_cpu_state(3) == HYPERV_CPU_OFFLINE);
+	assert(disable_count[2] == 0);
+
+	/* Generation-matched release after teardown proof allows AP 2 fini. */
+	hyperv_vmbus_target_release(vp[2], generation[2]);
+	assert(hyperv_time_host_vp_refs(2) == 0);
+	hyperv_host_cpu_index = 2;
+	ukplat_lcpu_fini_hook();
+	hyperv_host_cpu_index = 0;
+	assert(hyperv_time_host_cpu_state(2) == HYPERV_CPU_OFFLINE);
+	assert(disable_count[2] == 1);
+}
+
+static void test_four_vcpu_partial_failure_and_quarantine_routing(void)
+{
+	uint32_t vp = 0;
+	uint32_t generation = 0;
+
+	reset_observations();
+	hyperv_host_cpu_index = 0;
+	ukplat_time_init();
+	host_cpu_count = 4;
+	fail_enable_cpu = 3;
+	assert(ukplat_lcpu_startup_hook() == -EIO);
+	assert(hyperv_time_host_ap_start_state() == HOST_AP_ROLLBACK_STATE);
+	assert(hyperv_time_host_ap_requested() == 3);
+	assert(hyperv_time_host_ap_started() == 3);
+	assert(hyperv_time_host_ap_attempted() == 3);
+	assert(hyperv_time_host_ap_waited() == 3);
+	for (unsigned int cpu = 1; cpu < 4; cpu++)
+		assert_ap_offline(cpu);
+
+	/*
+	 * After 4-vCPU AP startup rollback/quarantine, channel target acquire
+	 * must never route to rolled-back APs; it routes only to online BSP.
+	 */
+	for (unsigned int relid = 1; relid <= 4; relid++) {
+		assert(hyperv_vmbus_target_acquire_channel(
+			       relid, &vp, &generation) == 0);
+		assert(vp == vp_indices[0] && generation == 1);
+		hyperv_vmbus_target_release(vp, generation);
+	}
+	assert(hyperv_time_shutdown(0, 1) == 0);
+}
+
 int main(void)
 {
 	test_realtime_handoff();
 	test_single_cpu_startup_noop();
 	test_cpu_setup_routing_and_ap_shutdown();
+	test_four_vcpu_channel_target_and_cross_cpu_sint2();
+	test_four_vcpu_partial_failure_and_quarantine_routing();
 	test_partial_ap_start_rollback();
 	test_wait_timeout_rollback();
 	test_ap_init_failure_rollback();
