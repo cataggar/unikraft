@@ -410,6 +410,13 @@ pub fn build(b: *std.Build) void {
         }),
     });
     controller_tests.root_module.addOptions("test_options", controller_options);
+    const composition_handoff = handoffModule(b, b.graph.host, optimize, host_core, host_controller);
+    const host_authority = b.createModule(.{
+        .root_source_file = b.path("authority/root.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    authority_build.addImports(b, host_authority, b.graph.host, optimize, host_core, host_serial, host_validator, composition_handoff);
     const composition_module = b.createModule(.{
         .root_source_file = b.path("handoff/composition_tests.zig"),
         .target = b.graph.host,
@@ -417,7 +424,8 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "wamr_controller", .module = host_controller },
             .{ .name = "hyperv_core", .module = host_core },
-            .{ .name = "wamr_handoff", .module = handoffModule(b, b.graph.host, optimize, host_core, host_controller) },
+            .{ .name = "wamr_handoff", .module = composition_handoff },
+            .{ .name = "wamr_authority", .module = host_authority },
         },
     });
     const controller_test_options = controller_tests.root_module.import_table.get("test_options").?;

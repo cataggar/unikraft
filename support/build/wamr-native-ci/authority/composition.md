@@ -185,8 +185,13 @@ The source tests include actual COPY → physical manifest → native validator 
 copied-ELF refusal, collision retention, cancellation and explicit-context
 refusals. Synthetic ELF is not executed in that joined negative test.
 
-A genuine compatible x86 Python/Azure runtime positive and a genuine live
-imported-owner positive remain **uncovered**, explicitly distinct from source
-compilation or synthetic decision-record tests. Standalone owner acquisition,
-trusted caller migration, genuine approvals, approval consumption, deletion
-authority and cloud/hardware acceptance remain blocked separate gates.
+`test-handoff-composition` (`-Dhandoff-composition-group=retention`) also
+exercises live imported-owner composition through `handlers.run`: a real v2
+exact-download `ImportedProduct` and `candidate.create`/`candidate.open`
+`Finalized` owners drive `plan` → `record-authorization` → `admit`, while
+refusing `.private_bundle` owners, mismatched bundle/candidate/attempt/cost
+selectors, and denied authorization records. A genuine compatible x86
+Python/Azure runtime positive (with full 19-slot namespace probe execution)
+remains a separate gate, alongside standalone owner acquisition, trusted caller
+migration, genuine approvals, approval consumption, deletion authority and
+cloud/hardware acceptance.

@@ -3,6 +3,7 @@ const std = @import("std");
 const core = @import("hyperv_core");
 const controller = @import("wamr_controller");
 const handoff = @import("wamr_handoff");
+const authority = @import("wamr_authority");
 const files = core.private_files;
 const archive = handoff.public_archive;
 const products = handoff.public_products;
@@ -444,7 +445,7 @@ pub fn local(a: std.mem.Allocator, io: std.Io, stage: []const u8, repository: []
     if (options.handoff_composition_group == .faults) return;
     try privateLineage(work, &bundle, repository, tools);
     try cliCollision(work, stage, repository, tools);
-    try exactDownloadAndReopen(work, receipt, &bundle, repository, tools);
+    try exactDownloadAndReopen(work, receipt, &bundle, finalized.success, repository, tools);
     try changedInputs(work, finalized.success, &bundle, repository, tools);
 }
 
@@ -520,27 +521,28 @@ fn exactDownloadAndReopen(
     work: Workspace,
     receipt: LocalReceipt,
     bundle: *controller.accepted_run.PrivateBundle,
+    private_candidate: *candidate.Finalized,
     repository: []const u8,
     tools: controller.import_validator_build.LocalTools,
 ) !void {
     {
-        const reopened = candidate.open(.{
+        const private_reopened = candidate.open(.{
             .allocator = std.testing.allocator,
             .io = work.io,
             .source = .{ .private_bundle = bundle },
             .output = try work.join("candidate.json"),
             .validation_output = try work.join("reopen-private-validation"),
         });
-        if (reopened != .success) std.debug.print("reopen private candidate: {any}\n", .{reopened});
-        try std.testing.expect(reopened == .success);
-        defer reopened.success.deinit();
-        const inspect = try reopened.success.inspect(null);
-        try std.testing.expectEqual(@as(u8, 2), inspect.version);
-        try std.testing.expectEqual(.not_admitted, inspect.authority);
-        const meta = try reopened.success.metadata(null);
-        try std.testing.expectEqual(.private_bundle, meta.source);
-        try std.testing.expectEqual(@as(u8, 2), meta.scope.version);
-        try std.testing.expectEqualStrings("1", meta.provenance.artifact_id);
+        if (private_reopened != .success) std.debug.print("reopen private candidate: {any}\n", .{private_reopened});
+        try std.testing.expect(private_reopened == .success);
+        defer private_reopened.success.deinit();
+        const private_inspect = try private_reopened.success.inspect(null);
+        try std.testing.expectEqual(@as(u8, 2), private_inspect.version);
+        try std.testing.expectEqual(.not_admitted, private_inspect.authority);
+        const private_meta = try private_reopened.success.metadata(null);
+        try std.testing.expectEqual(.private_bundle, private_meta.source);
+        try std.testing.expectEqual(@as(u8, 2), private_meta.scope.version);
+        try std.testing.expectEqualStrings("1", private_meta.provenance.artifact_id);
     }
 
     const artifact_id = try handoff.public_transport.ArtifactId.parse("1");
@@ -553,19 +555,21 @@ fn exactDownloadAndReopen(
         .upload = upload,
         .inner_digest = .{ .bytes = receipt.inner },
     };
-    const retained = handoff.public_transport.actions_container.retainDownload(.{
-        .allocator = std.testing.allocator,
-        .io = work.io,
-        .container_path = try work.join("local-container.zip"),
-        .output_path = try work.join("local-download"),
-        .expected = expected,
-        .selection = .{ .upload = upload },
-    });
-    if (retained != .success) std.debug.print("retain local download: {any}\n", .{retained});
-    try std.testing.expect(retained == .success);
-    var retained_download = retained.success;
-    defer retained_download.deinit(work.io);
-    try retained_download.revalidate(work.io, null);
+    {
+        const retained = handoff.public_transport.actions_container.retainDownload(.{
+            .allocator = std.testing.allocator,
+            .io = work.io,
+            .container_path = try work.join("local-container.zip"),
+            .output_path = try work.join("local-download"),
+            .expected = expected,
+            .selection = .{ .upload = upload },
+        });
+        if (retained != .success) std.debug.print("retain local download: {any}\n", .{retained});
+        try std.testing.expect(retained == .success);
+        var retained_download = retained.success;
+        defer retained_download.deinit(work.io);
+        try retained_download.revalidate(work.io, null);
+    }
 
     const imported = products.importBundle(.{
         .allocator = std.testing.allocator,
@@ -602,24 +606,7 @@ fn exactDownloadAndReopen(
     try std.testing.expectEqual(@as(u8, 2), created_meta.scope.version);
     try std.testing.expectEqualStrings("1", created_meta.provenance.artifact_id);
 
-    const reopened = candidate.open(.{
-        .allocator = std.testing.allocator,
-        .io = work.io,
-        .source = .{ .imported_product = owner },
-        .output = try work.join("imported-candidate.json"),
-        .validation_output = try work.join("imported-candidate-open-validation"),
-    });
-    if (reopened != .success) std.debug.print("imported v2 candidate open: {any}\n", .{reopened});
-    try std.testing.expect(reopened == .success);
-    defer reopened.success.deinit();
-    const reopened_inspect = try reopened.success.inspect(null);
-    try std.testing.expectEqual(@as(u8, 2), reopened_inspect.version);
-    try std.testing.expectEqual(.not_admitted, reopened_inspect.authority);
-    const reopened_meta = try reopened.success.metadata(null);
-    try std.testing.expectEqual(.imported_product, reopened_meta.source);
-    try std.testing.expectEqual(@as(u8, 2), reopened_meta.scope.version);
-    try std.testing.expectEqualStrings("1", reopened_meta.provenance.artifact_id);
-    _ = try reopened.success.result(try std.fs.path.join(work.a, &.{ owner.bundle.?.evidence.root, "boots/raw-x2apic/serial" }), null, null);
+    try liveImportedAuthorityComposition(work, owner, private_candidate, created.success, tools);
 
     // Tampering with the admission sidecar before candidate.open poisons at .admission.
     {
@@ -685,6 +672,391 @@ fn exactDownloadAndReopen(
         try std.testing.expectEqual(error.CandidateBindingChanged, bad_candidate.poisoned.err);
         try std.testing.expectEqual(files.CommitStatus.not_committed, bad_candidate.poisoned.publication);
         try std.testing.expectEqualStrings(tampered_candidate, try work.read("tampered-candidate.json"));
+    }
+}
+
+fn writeModeFile(io: std.Io, directory: std.Io.Dir, name: []const u8, bytes: []const u8, mode: u32) !void {
+    const file = try directory.createFile(io, name, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    defer file.close(io);
+    try file.writeStreamingAll(io, bytes);
+    if (std.os.linux.errno(std.os.linux.fchmod(file.handle, mode)) != .SUCCESS) return error.FixtureMode;
+    try file.sync(io);
+}
+
+fn makeDirectoryRemovable(io: std.Io, directory: std.Io.Dir) !void {
+    if (std.os.linux.errno(std.os.linux.fchmod(directory.handle, 0o700)) != .SUCCESS) return error.FixtureMode;
+    var iterator = directory.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        const child = try directory.openDir(io, entry.name, .{ .iterate = true, .follow_symlinks = false });
+        defer child.close(io);
+        try makeDirectoryRemovable(io, child);
+    }
+}
+
+fn liveImportedAuthorityComposition(
+    work: Workspace,
+    owner: *products.ImportedProduct,
+    private_candidate: *candidate.Finalized,
+    created_candidate: *candidate.Finalized,
+    tools: controller.import_validator_build.LocalTools,
+) !void {
+    try work.root.createDir(work.io, "authority-work", .fromMode(0o700));
+    const authority_dir = try work.root.openDir(work.io, "authority-work", .{ .iterate = true, .follow_symlinks = false });
+    defer {
+        makeDirectoryRemovable(work.io, authority_dir) catch @panic("authority composition cleanup failed");
+        authority_dir.close(work.io);
+    }
+    for ([_][]const u8{ "runtime-source", "ledger", "records" }) |component|
+        try authority_dir.createDir(work.io, component, .fromMode(0o700));
+
+    const ctx: authority.types.Context = .{
+        .allocator = std.testing.allocator,
+        .io = work.io,
+    };
+    const tool_paths: authority.types.ToolPaths = blk: {
+        const source_dir = try authority_dir.openDir(work.io, "runtime-source", .{ .iterate = true, .follow_symlinks = false });
+        defer source_dir.close(work.io);
+        for ([_][]const u8{ "python3.11", "packages", "data" }) |component|
+            try source_dir.createDir(work.io, component, .fromMode(0o700));
+        try writeModeFile(work.io, source_dir, "launcher", "#!/bin/sh\nexit 0\n", 0o500);
+        try writeModeFile(work.io, source_dir, "python", "synthetic-interpreter\n", 0o500);
+        try writeModeFile(work.io, source_dir, "ld-synthetic.so", "synthetic-loader\n", 0o500);
+        try writeModeFile(work.io, source_dir, "uploader", "synthetic-uploader\n", 0o500);
+        {
+            const stdlib = try source_dir.openDir(work.io, "python3.11", .{ .iterate = true });
+            defer stdlib.close(work.io);
+            try stdlib.createDir(work.io, "encodings", .fromMode(0o700));
+            try writeModeFile(work.io, stdlib, "os.py", "synthetic-os\n", 0o600);
+            const encodings = try stdlib.openDir(work.io, "encodings", .{});
+            defer encodings.close(work.io);
+            try writeModeFile(work.io, encodings, "__init__.py", "synthetic-encodings\n", 0o600);
+        }
+        {
+            const packages = try source_dir.openDir(work.io, "packages", .{ .iterate = true });
+            defer packages.close(work.io);
+            try packages.createDir(work.io, "azure", .fromMode(0o700));
+            const azure = try packages.openDir(work.io, "azure", .{});
+            defer azure.close(work.io);
+            try writeModeFile(work.io, azure, "__init__.py", "synthetic-azure\n", 0o600);
+        }
+        {
+            const data = try source_dir.openDir(work.io, "data", .{});
+            defer data.close(work.io);
+            try writeModeFile(work.io, data, "fixed.txt", "synthetic-data\n", 0o600);
+        }
+
+        var loader = try files.RetainedFile.open(work.io, try work.join("authority-work/runtime-source/ld-synthetic.so"), .artifact);
+        defer loader.close(work.io);
+        const dependencies = [_]authority.types.LoaderSource{.{ .file = &loader, .executable = true }};
+        const package_roots = [_][]const u8{try work.join("authority-work/runtime-source/packages")};
+        const data_roots = [_][]const u8{try work.join("authority-work/runtime-source/data")};
+        var stage = try authority.runtime_copy.Stage.init(
+            ctx,
+            .{
+                .output = try work.join("authority-work/azure-runtime"),
+                .azure = try work.join("authority-work/runtime-source/launcher"),
+                .az_python = try work.join("authority-work/runtime-source/python"),
+                .stdlib = try work.join("authority-work/runtime-source/python3.11"),
+                .package_root = &package_roots,
+                .data_root = &data_roots,
+            },
+            .{ .dynamic_loader = &loader, .dependencies = &dependencies },
+        );
+        defer stage.deinit();
+        try std.testing.expect(stage.copyStage() == .staged);
+        const draft = try stage.manifestInputs();
+        const layout = try stage.layout();
+        const runtime_output = try authority_dir.openDir(work.io, "azure-runtime", .{});
+        defer runtime_output.close(work.io);
+        try writeModeFile(work.io, runtime_output, "azure-runtime.manifest", draft.bytes, 0o600);
+        var manifest = try files.RetainedFile.open(work.io, draft.manifest.path, .private);
+        defer manifest.close(work.io);
+        const commitments = try draft.bindManifest(ctx, &manifest);
+        const contract: authority.types.runtime.Contract = .{
+            .schema = "uk.wamr.azure-cli-runtime-closure",
+            .version = 1,
+            .canonicalization = "utf8-byte-sorted-keys-compact-lf-v1",
+            .root = layout.root,
+            .python_version = "3.11",
+            .extensions = layout.extensions,
+            .launcher = draft.launcher,
+            .interpreter = draft.interpreter,
+            .dynamic_loader = draft.dynamic_loader,
+            .manifest = draft.manifest,
+            .limits = authority.runtime_copy.canonicalLimits(),
+            .observed = draft.observed,
+            .content_sha256 = &commitments.content_sha256,
+            .metadata_sha256 = &commitments.metadata_sha256,
+            .parents_sha256 = &commitments.parents_sha256,
+            .loader_dependencies = draft.loader_dependencies,
+            .commands = &authority.types.runtime.commands,
+            .isolation = .{
+                .python_home = .closure_root,
+                .module_layout = .flat_python_home_v1,
+                .extensions = .closure_empty,
+                .dynamic_extension_install = .disabled,
+                .user_site = .disabled,
+                .site_import = .disabled,
+                .bytecode_writes = .disabled,
+                .path_environment = .forbidden,
+                .startup_hooks = .forbidden,
+                .loader_environment = .retained_readonly_root,
+                .host_loader_fallback = .forbidden,
+                .package_restore = .forbidden_after_custody,
+            },
+        };
+        const runtime_bytes = try authority.records.runtimeBytes(std.testing.allocator, contract);
+        defer std.testing.allocator.free(runtime_bytes);
+        try writeModeFile(work.io, runtime_output, "azure-runtime.json", runtime_bytes, 0o600);
+        try stage.revalidate();
+        break :blk .{
+            .azure_runtime = try work.join("authority-work/azure-runtime/azure-runtime.json"),
+            .azure = try work.a.dupe(u8, draft.launcher.path),
+            .uploader = try work.join("authority-work/runtime-source/uploader"),
+            .validator = tools.validator,
+            .supervisor = tools.supervisor,
+            .az_python = try work.a.dupe(u8, draft.interpreter.path),
+        };
+    };
+
+    const created_meta = try created_candidate.metadata(null);
+    const base_plan: authority.types.PlanCommand = .{
+        .bundle = created_meta.provenance.public_bundle.path,
+        .output = try work.join("authority-work/records/plan.json"),
+        .approval_template = try work.join("authority-work/records/template.json"),
+        .candidate_output = created_meta.candidate.path,
+        .campaign_id = "00000000-0000-4000-8000-000000000010",
+        .ledger = try work.join("authority-work/ledger"),
+        .subscription = created_meta.scope.subscription,
+        .prefix = created_meta.scope.prefix,
+        .maximum_authorized_cost_microusd = 15_000_000,
+        .attempt_id = created_meta.scope.attempt_id,
+        .ledger_id = "00000000-0000-4000-8000-000000000020",
+        .tools = tool_paths,
+    };
+
+    // A private_bundle candidate is refused before any plan or template publication.
+    {
+        const private_plan = authority.handlers.run(
+            .{ .retained = ctx, .live_finalized = private_candidate },
+            .{ .plan = base_plan },
+        );
+        try std.testing.expect(private_plan == .plan);
+        try std.testing.expect(private_plan.plan == .refused);
+        try std.testing.expectEqual(error.ImportedProductRequired, private_plan.plan.refused.err);
+        try std.testing.expectEqual(authority.plan.Publications{}, private_plan.plan.refused.outputs);
+        try work.absent("authority-work/records/plan.json");
+        try work.absent("authority-work/records/template.json");
+    }
+
+    // Mismatched bundle, candidate_output, or attempt_id is refused on the live imported owner.
+    {
+        var wrong_bundle = base_plan;
+        wrong_bundle.bundle = try work.join("candidate.json");
+        const refused_bundle = authority.handlers.run(
+            .{ .retained = ctx, .live_finalized = created_candidate },
+            .{ .plan = wrong_bundle },
+        );
+        try std.testing.expect(refused_bundle.plan == .refused);
+        try std.testing.expectEqual(error.WrongCandidate, refused_bundle.plan.refused.err);
+        try std.testing.expectEqual(authority.plan.Publications{}, refused_bundle.plan.refused.outputs);
+
+        var wrong_candidate = base_plan;
+        wrong_candidate.candidate_output = try work.join("candidate.json");
+        const refused_candidate = authority.handlers.run(
+            .{ .retained = ctx, .live_finalized = created_candidate },
+            .{ .plan = wrong_candidate },
+        );
+        try std.testing.expect(refused_candidate.plan == .refused);
+        try std.testing.expectEqual(error.WrongCandidate, refused_candidate.plan.refused.err);
+        try std.testing.expectEqual(authority.plan.Publications{}, refused_candidate.plan.refused.outputs);
+
+        var wrong_attempt = base_plan;
+        wrong_attempt.attempt_id = "00000000-0000-4000-8000-000000000099";
+        const refused_attempt = authority.handlers.run(
+            .{ .retained = ctx, .live_finalized = created_candidate },
+            .{ .plan = wrong_attempt },
+        );
+        try std.testing.expect(refused_attempt.plan == .refused);
+        try std.testing.expectEqual(error.WrongCandidate, refused_attempt.plan.refused.err);
+        try std.testing.expectEqual(authority.plan.Publications{}, refused_attempt.plan.refused.outputs);
+
+        var wrong_cost = base_plan;
+        wrong_cost.maximum_authorized_cost_microusd = 500_000;
+        const refused_cost = authority.handlers.run(
+            .{ .retained = ctx, .live_finalized = created_candidate },
+            .{ .plan = wrong_cost },
+        );
+        try std.testing.expect(refused_cost.plan == .refused);
+        try std.testing.expectEqual(error.InvalidCost, refused_cost.plan.refused.err);
+        try std.testing.expectEqual(authority.plan.Publications{}, refused_cost.plan.refused.outputs);
+    }
+
+    // Positive live imported-owner plan -> authorization -> admission composition.
+    const plan_commitments = blk: {
+        const planned = authority.handlers.run(
+            .{ .retained = ctx, .live_finalized = created_candidate },
+            .{ .plan = base_plan },
+        );
+        if (planned.plan != .success) std.debug.print("live imported plan: {any}\n", .{planned});
+        try std.testing.expect(planned.plan == .success);
+        const prepared = planned.plan.success;
+        defer prepared.deinit();
+        try prepared.revalidate();
+        const plan_res = try prepared.result();
+        try std.testing.expectEqual(.not_admitted, plan_res.plan.authority);
+        try std.testing.expectEqual(.pending, plan_res.template.decision);
+        try std.testing.expectEqualStrings("1", plan_res.plan.artifact_id);
+        break :blk .{
+            .plan_artifact = authority.types.Artifact{
+                .path = try work.a.dupe(u8, plan_res.plan_artifact.path),
+                .size = plan_res.plan_artifact.size,
+                .sha256 = try work.a.dupe(u8, plan_res.plan_artifact.sha256),
+            },
+            .template_artifact = authority.types.Artifact{
+                .path = try work.a.dupe(u8, plan_res.template_artifact.path),
+                .size = plan_res.template_artifact.size,
+                .sha256 = try work.a.dupe(u8, plan_res.template_artifact.sha256),
+            },
+            .created_unix = plan_res.plan.created_unix,
+        };
+    };
+    const now_unix: u64 = @intCast(std.Io.Clock.real.now(work.io).toSeconds());
+    const recorded_unix = @max(now_unix, plan_commitments.created_unix);
+
+    const denied_artifact: authority.types.Artifact = blk: {
+        const denied_outcome = authority.handlers.run(.{ .retained = ctx }, .{ .@"record-authorization" = .{
+            .plan = plan_commitments.plan_artifact.path,
+            .template = plan_commitments.template_artifact.path,
+            .output = try work.join("authority-work/records/authorization-denied.json"),
+            .decision = .denied,
+            .approver = "operator@example.invalid",
+            .reference = "CHG-189-DENY",
+            .recorded_unix = recorded_unix,
+            .expires_unix = recorded_unix + 1800,
+            .tools = tool_paths,
+        } });
+        if (denied_outcome.authorization != .success) std.debug.print("live denied authorization: {any}\n", .{denied_outcome});
+        try std.testing.expect(denied_outcome.authorization == .success);
+        const denied_recorded = denied_outcome.authorization.success;
+        defer denied_recorded.deinit();
+        try denied_recorded.revalidate();
+        const raw = denied_recorded.artifact();
+        break :blk .{
+            .path = try work.a.dupe(u8, raw.path),
+            .size = raw.size,
+            .sha256 = try work.a.dupe(u8, raw.sha256),
+        };
+    };
+
+    const approved_artifact: authority.types.Artifact = blk: {
+        const approved_outcome = authority.handlers.run(.{ .retained = ctx }, .{ .@"record-authorization" = .{
+            .plan = plan_commitments.plan_artifact.path,
+            .template = plan_commitments.template_artifact.path,
+            .output = try work.join("authority-work/records/authorization.json"),
+            .decision = .approved,
+            .approver = "operator@example.invalid",
+            .reference = "CHG-189-APPROVE",
+            .recorded_unix = recorded_unix,
+            .expires_unix = recorded_unix + 1800,
+            .tools = tool_paths,
+        } });
+        if (approved_outcome.authorization != .success) std.debug.print("live approved authorization: {any}\n", .{approved_outcome});
+        try std.testing.expect(approved_outcome.authorization == .success);
+        const approved_recorded = approved_outcome.authorization.success;
+        defer approved_recorded.deinit();
+        try approved_recorded.revalidate();
+        const raw = approved_recorded.artifact();
+        break :blk .{
+            .path = try work.a.dupe(u8, raw.path),
+            .size = raw.size,
+            .sha256 = try work.a.dupe(u8, raw.sha256),
+        };
+    };
+
+    // Denied authorization and private_bundle candidate are refused by admission.run.
+    {
+        const denied_admit = authority.handlers.run(
+            .{
+                .retained = ctx,
+                .live_finalized = created_candidate,
+                .plan_commitment = plan_commitments.plan_artifact,
+                .authorization_commitment = denied_artifact,
+            },
+            .{ .admit = .{
+                .plan = plan_commitments.plan_artifact.path,
+                .authorization = denied_artifact.path,
+                .output = try work.join("authority-work/records/admission-denied.json"),
+                .tools = tool_paths,
+            } },
+        );
+        try std.testing.expect(denied_admit.admission == .refused);
+        try std.testing.expectEqual(error.NotAuthorized, denied_admit.admission.refused.err);
+        try std.testing.expectEqual(files.CommitStatus.not_committed, denied_admit.admission.refused.publication);
+        try work.absent("authority-work/records/admission-denied.json");
+
+        const private_admit = authority.handlers.run(
+            .{
+                .retained = ctx,
+                .live_finalized = private_candidate,
+                .plan_commitment = plan_commitments.plan_artifact,
+                .authorization_commitment = approved_artifact,
+            },
+            .{ .admit = .{
+                .plan = plan_commitments.plan_artifact.path,
+                .authorization = approved_artifact.path,
+                .output = try work.join("authority-work/records/admission-private.json"),
+                .tools = tool_paths,
+            } },
+        );
+        try std.testing.expect(private_admit.admission == .refused);
+        try std.testing.expectEqual(error.ImportedProductRequired, private_admit.admission.refused.err);
+        try std.testing.expectEqual(files.CommitStatus.not_committed, private_admit.admission.refused.publication);
+        try work.absent("authority-work/records/admission-private.json");
+    }
+
+    const reopened = candidate.open(.{
+        .allocator = std.testing.allocator,
+        .io = work.io,
+        .source = .{ .imported_product = owner },
+        .output = try work.join("imported-candidate.json"),
+        .validation_output = try work.join("imported-candidate-open-validation"),
+    });
+    if (reopened != .success) std.debug.print("imported v2 candidate open: {any}\n", .{reopened});
+    try std.testing.expect(reopened == .success);
+    defer reopened.success.deinit();
+    const reopened_inspect = try reopened.success.inspect(null);
+    try std.testing.expectEqual(@as(u8, 2), reopened_inspect.version);
+    try std.testing.expectEqual(.not_admitted, reopened_inspect.authority);
+    const reopened_meta = try reopened.success.metadata(null);
+    try std.testing.expectEqual(.imported_product, reopened_meta.source);
+    try std.testing.expectEqual(@as(u8, 2), reopened_meta.scope.version);
+    try std.testing.expectEqualStrings("1", reopened_meta.provenance.artifact_id);
+    _ = try reopened.success.result(try std.fs.path.join(work.a, &.{ owner.bundle.?.evidence.root, "boots/raw-x2apic/serial" }), null, null);
+
+    {
+        const admitted_outcome = authority.handlers.run(
+            .{
+                .retained = ctx,
+                .live_finalized = reopened.success,
+                .plan_commitment = plan_commitments.plan_artifact,
+                .authorization_commitment = approved_artifact,
+            },
+            .{ .admit = .{
+                .plan = plan_commitments.plan_artifact.path,
+                .authorization = approved_artifact.path,
+                .output = try work.join("authority-work/records/admission.json"),
+                .tools = tool_paths,
+            } },
+        );
+        if (admitted_outcome.admission != .success) std.debug.print("live imported admission: {any}\n", .{admitted_outcome});
+        try std.testing.expect(admitted_outcome.admission == .success);
+        const admitted = admitted_outcome.admission.success;
+        defer admitted.deinit();
+        try admitted.revalidate();
+        const admission_artifact = try admitted.artifact();
+        try std.testing.expect(admission_artifact.size > 0);
     }
 }
 

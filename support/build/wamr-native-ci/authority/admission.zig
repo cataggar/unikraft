@@ -42,7 +42,7 @@ pub const Admitted = opaque {
     pub fn revalidate(self: *Admitted) !void {
         const owner = self.state();
         try owner.output.?.revalidate(owner.barrier());
-        try compute.verifyAdmission(owner.ctx.base.allocator, owner.ctx.base.io, owner.command.output, false);
+        try verifyAdmissionScratch(owner.ctx.base, owner.command.output);
         try owner.output.?.revalidate(owner.barrier());
     }
     pub fn artifact(self: *Admitted) !types.Artifact {
@@ -143,7 +143,7 @@ const State = struct {
         try copy.checkCancellation(cancel(ctx));
         const candidate = self.ctx.candidate orelse return error.MissingCandidateOwner;
         try checkOwner(ctx, candidate, self.plan);
-        try compute.verifyAuthorization(ctx.allocator, ctx.io, self.command.plan, self.command.authorization, false);
+        try verifyAuthorizationScratch(ctx, self.command.plan, self.command.authorization);
         if (self.staged) |*stage| try stage.revalidate(ctx.signal);
         try candidate.revalidate(ctx.signal);
         for (self.runtime_members.items) |*member| try member.revalidate(ctx);
@@ -269,7 +269,7 @@ fn finish(owner: *State) !void {
     const digest = std.fmt.bytesToHex(tx.hash(bytes), .lower);
     if (owner.staged.?.artifact().size != bytes.len or !std.mem.eql(u8, &digest, &owner.staged.?.sha256))
         return error.RecordChanged;
-    try compute.verifyAdmission(ctx.allocator, ctx.io, stage_path, false);
+    try verifyAdmissionScratch(ctx, stage_path);
     owner.phase = .freshness;
     try owner.revalidate();
     owner.phase = .publication;
@@ -281,8 +281,21 @@ fn finish(owner: *State) !void {
         },
     }
     owner.phase = .final_revalidation;
-    try compute.verifyAdmission(ctx.allocator, ctx.io, owner.command.output, false);
+    try verifyAdmissionScratch(ctx, owner.command.output);
     try owner.output.?.revalidate(owner.barrier());
+}
+
+fn verifyAuthorizationScratch(ctx: types.Context, plan_path: []const u8, authorization_path: []const u8) !void {
+    var sensitive = core.sensitive.Allocator{ .backing = ctx.allocator };
+    var scratch = std.heap.ArenaAllocator.init(sensitive.allocator());
+    defer scratch.deinit();
+    try compute.verifyAuthorization(scratch.allocator(), ctx.io, plan_path, authorization_path, false);
+}
+fn verifyAdmissionScratch(ctx: types.Context, path: []const u8) !void {
+    var sensitive = core.sensitive.Allocator{ .backing = ctx.allocator };
+    var scratch = std.heap.ArenaAllocator.init(sensitive.allocator());
+    defer scratch.deinit();
+    try compute.verifyAdmission(scratch.allocator(), ctx.io, path, false);
 }
 
 fn retainRuntime(owner: *State, item: types.runtime.Artifact, limit: u64) !void {
