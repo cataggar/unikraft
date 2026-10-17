@@ -20,6 +20,20 @@ pub fn revalidateHandoff(
         accepted.compatibility != .tiny_v2_qcow2_derived_vhd)
         return error.InvalidContext;
     try accepted.revalidateWithSignal(signal);
+    return revalidateHandoffValidated(allocator, io, accepted, output, signal);
+}
+
+pub fn revalidateHandoffValidated(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    accepted: *accepted_run.AcceptedRun,
+    output: []const u8,
+    signal: ?*core.process.SignalCancellation,
+) !@import("command_validation.zig").ValidatedCommand {
+    if (accepted.context != .local_runtime or accepted.repository == null or
+        accepted.local_producer != .native or
+        accepted.compatibility != .tiny_v2_qcow2_derived_vhd)
+        return error.InvalidContext;
     var roots = try handoff_inspect.bind(accepted, output);
     const build_output = try std.fs.path.join(allocator, &.{ accepted.root, "compute/public-source/validator-build" });
     const command_path = try std.fs.path.join(allocator, &.{ build_output, "evidence/command-public-validator-build.json" });
@@ -82,6 +96,19 @@ pub fn run(
         accepted.compatibility != .tiny_v2_qcow2_derived_vhd)
         return error.InvalidContext;
     try accepted.revalidateWithSignal(signal);
+    return runValidated(allocator, io, accepted, output, signal);
+}
+
+pub fn runValidated(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    accepted: *accepted_run.AcceptedRun,
+    output: []const u8,
+    signal: ?*core.process.SignalCancellation,
+) !@import("command_validation.zig").ValidatedCommand {
+    if (accepted.context != .local_runtime or accepted.repository == null or
+        accepted.compatibility != .tiny_v2_qcow2_derived_vhd)
+        return error.InvalidContext;
     const roots = try handoff_inspect.bind(accepted, output);
     var zig = try adapter.openPinnedTool(io, roots.zig, "tool:zig");
     defer zig.close(io);

@@ -16,6 +16,49 @@ const fixture_contract = @import("fixture_contract.zig");
 const profile = @import("profile.zig");
 const limits = @import("custody_limits.zig");
 
+pub const CustodyCache = struct {
+    backing: std.mem.Allocator,
+    known_files: std.AutoHashMap([9]i128, [64]u8),
+    known_git_blobs: std.AutoHashMap([9]i128, custody.CachedBlob),
+    runtime_cache: std.AutoHashMap([9]i128, [][]const u8),
+    python_stdlib_meta: ?[9]i128 = null,
+    python_stdlib_path: ?[]const u8 = null,
+
+    pub fn init(backing: std.mem.Allocator) CustodyCache {
+        return .{
+            .backing = backing,
+            .known_files = std.AutoHashMap([9]i128, [64]u8).init(backing),
+            .known_git_blobs = std.AutoHashMap([9]i128, custody.CachedBlob).init(backing),
+            .runtime_cache = std.AutoHashMap([9]i128, [][]const u8).init(backing),
+        };
+    }
+
+    pub fn deinit(self: *CustodyCache) void {
+        if (self.python_stdlib_path) |path| self.backing.free(path);
+        var it = self.runtime_cache.valueIterator();
+        while (it.next()) |paths| {
+            for (paths.*) |item| self.backing.free(item);
+            self.backing.free(paths.*);
+        }
+        self.runtime_cache.deinit();
+        self.known_git_blobs.deinit();
+        self.known_files.deinit();
+        self.* = undefined;
+    }
+};
+
+pub fn knownFiles(context: *const Context) ?*std.AutoHashMap([9]i128, [64]u8) {
+    return if (context.custody_cache) |cache| &cache.known_files else null;
+}
+
+pub fn knownGitBlobs(context: *const Context) ?*std.AutoHashMap([9]i128, custody.CachedBlob) {
+    return if (context.custody_cache) |cache| &cache.known_git_blobs else null;
+}
+
+pub fn runtimeCache(context: *const Context) ?*std.AutoHashMap([9]i128, [][]const u8) {
+    return if (context.custody_cache) |cache| &cache.runtime_cache else null;
+}
+
 pub const Context = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -28,6 +71,7 @@ pub const Context = struct {
     tools: [inputs.host_tools.len][]const u8,
     roots: plan.Roots,
     signal: *const process.SignalCancellation,
+    custody_cache: ?*CustodyCache = null,
     source: ?custody.Source = null,
     dependency: ?dependencies.Document = null,
     bootstrap_inputs: ?inputs.Custody = null,
@@ -230,7 +274,14 @@ pub fn reserve(bound: RuntimeBound) !SlotsReserved {
 pub fn captureSource(reserved: SlotsReserved) !SourceCustodied {
     const context = reserved.context;
     try cancelled(context);
-    context.source = try custody.source(context.allocator, context.io, context.repository, context.git);
+    context.source = try custody.sourceCached(
+        context.allocator,
+        context.io,
+        context.repository,
+        context.git,
+        knownGitBlobs(context),
+        knownFiles(context),
+    );
     return next(reserved, SourceCustodied);
 }
 
@@ -298,13 +349,23 @@ fn freezeBootstrapInputs(context: *Context) !void {
     trees_bound[0] = .{ .role = "bison", .path = try join(context, &.{ context.runtime, "bison" }) };
     trees_bound[1] = .{ .role = "zig", .path = std.fs.path.dirname(context.roots.zig) orelse return error.UnsafePath };
     trees_bound[2] = .{ .role = "python-stdlib", .path = try pythonStdlib(context) };
-    context.bootstrap_inputs = try inputs.capture(a, context.io, files_bound, trees_bound);
+    context.bootstrap_inputs = if (knownFiles(context)) |known|
+        try inputs.captureWithKnown(a, context.io, files_bound, trees_bound, known)
+    else
+        try inputs.capture(a, context.io, files_bound, trees_bound);
     context.bootstrap_files = files_bound;
     context.bootstrap_trees = trees_bound;
 }
 
 fn requireBootstrapInputs(context: *Context) !void {
-    try inputs.requireSame(context.allocator, context.io, context.bootstrap_inputs orelse return error.UnboundInputs, context.bootstrap_files, context.bootstrap_trees);
+    try inputs.requireSameWithKnown(
+        context.allocator,
+        context.io,
+        context.bootstrap_inputs orelse return error.UnboundInputs,
+        context.bootstrap_files,
+        context.bootstrap_trees,
+        knownFiles(context),
+    );
 }
 
 fn restoreDependencies(context: *Context) !void {
@@ -352,7 +413,7 @@ fn restoreDependencies(context: *Context) !void {
             return error.PackageHashMismatch;
     }
     context.failed_operation = "record-dependencies";
-    context.dependency = try dependencies.capture(a, io, context.repository, context.git, context.compute);
+    context.dependency = try dependencies.captureCached(a, io, context.repository, context.git, context.compute, knownFiles(context));
 }
 
 pub fn restore(state: WamrArchiveSealed) !DependenciesRestored {
@@ -372,7 +433,7 @@ pub fn bootstrap(state: DependenciesRestored) !BootstrapInputsBound {
     try custody.verifyPhysical(context.io, context.allocator, context.repository);
     try requireSource(context);
     try requireBootstrapInputs(context);
-    try dependencies.requireDocument(context.allocator, context.io, context.repository, context.git, context.compute, context.dependency.?);
+    try dependencies.requireDocumentCached(context.allocator, context.io, context.repository, context.git, context.compute, context.dependency.?, knownFiles(context));
     return next(state, BootstrapInputsBound);
 }
 
@@ -380,7 +441,7 @@ pub fn requireSource(context: *Context) !void {
     try cancelled(context);
     var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer scratch.deinit();
-    const actual = try custody.source(scratch.allocator(), context.io, context.repository, context.git);
+    const actual = try custody.sourceCached(scratch.allocator(), context.io, context.repository, context.git, knownGitBlobs(context), knownFiles(context));
     try cancelled(context);
     const before = context.source.?;
     if (!before.same(actual)) return error.SourceChanged;
@@ -392,7 +453,7 @@ fn runStage(state: anytype, selected: plan.Stage, check_consumer: bool) !void {
     try cancelled(context);
     try requireBuildEvidence(context);
     try requireSource(context);
-    try dependencies.requireDocument(context.allocator, context.io, context.repository, context.git, context.compute, context.dependency.?);
+    try dependencies.requireDocumentCached(context.allocator, context.io, context.repository, context.git, context.compute, context.dependency.?, knownFiles(context));
     if (check_consumer) try requireConsumer(context) else try requireBootstrapInputs(context);
     const private = try contextDir(context, "private");
     defer private.close(context.io);
@@ -411,7 +472,7 @@ fn runStage(state: anytype, selected: plan.Stage, check_consumer: bool) !void {
     context.command_records[@backingInt(selected)] = try physical.readFile(context.io, record_path, limits.tracked_file, true);
     try requireBuildEvidence(context);
     try requireSource(context);
-    try dependencies.requireDocument(context.allocator, context.io, context.repository, context.git, context.compute, context.dependency.?);
+    try dependencies.requireDocumentCached(context.allocator, context.io, context.repository, context.git, context.compute, context.dependency.?, knownFiles(context));
     if (check_consumer) try requireConsumer(context) else try requireBootstrapInputs(context);
 }
 
@@ -445,15 +506,41 @@ pub fn requireBuildEvidence(context: *Context) !void {
 pub fn requireConsumer(context: *Context) !void {
     try cancelled(context);
     const observed = context.consumer orelse return error.UnboundInputs;
-    try inputs.requireProduction(context.allocator, context.io, .{
+    try inputs.requireProductionCached(context.allocator, context.io, .{
         .runtime = context.runtime,
         .tools = context.tools,
         .python_stdlib = try pythonStdlib(context),
-    }, observed.custody);
+    }, observed.custody, knownFiles(context), runtimeCache(context));
     try cancelled(context);
 }
 
 fn pythonStdlib(context: *Context) ![]const u8 {
+    if (context.custody_cache) |cache| {
+        var retained = try files.RetainedFile.open(context.io, context.tools[1], .artifact);
+        defer retained.close(context.io);
+        const meta = physical.metadata(retained.file_snapshot);
+        if (cache.python_stdlib_meta) |expected_meta| {
+            if (std.meta.eql(expected_meta, meta)) {
+                if (cache.python_stdlib_path) |cached_path| {
+                    try retained.verify(context.io);
+                    _ = try physical.directory(context.io, cached_path, false);
+                    return context.allocator.dupe(u8, cached_path);
+                }
+            }
+        }
+        const computed = try inputs.pythonStdlib(
+            context.allocator,
+            context.io,
+            context.repository,
+            context.tools[1],
+            context.signal.flag(),
+        );
+        try retained.verify(context.io);
+        if (cache.python_stdlib_path) |old| cache.backing.free(old);
+        cache.python_stdlib_path = try cache.backing.dupe(u8, computed);
+        cache.python_stdlib_meta = meta;
+        return computed;
+    }
     return inputs.pythonStdlib(
         context.allocator,
         context.io,
@@ -473,11 +560,11 @@ pub fn baseline(state: LocalBootBuilt) !InputsBaselined {
     context.failed_stage = "build-start";
     try requireBuildEvidence(context);
     try requireBootstrapInputs(context);
-    context.consumer = try inputs.captureProduction(context.allocator, context.io, .{
+    context.consumer = try inputs.captureProductionCached(context.allocator, context.io, .{
         .runtime = context.runtime,
         .tools = context.tools,
         .python_stdlib = try pythonStdlib(context),
-    });
+    }, knownFiles(context), runtimeCache(context));
     try requireBootstrapInputs(context);
     const document = try buildStart(context);
     try evidence(context, "build-start.json", document);
@@ -495,7 +582,7 @@ fn buildStart(context: *Context) !std.json.Value {
     try value.object.put(a, "source_custody", try typedValue(a, origin.custody));
     var tools = std.json.Value{ .object = .empty };
     for (inputs.host_tools, context.tools) |name, path| {
-        const item = try physical.readFile(context.io, path, limits.tracked_file, false);
+        const item = try physical.readFileCached(context.io, path, limits.tracked_file, false, knownFiles(context));
         try tools.object.put(a, name, .{ .string = try a.dupe(u8, &item.sha256) });
     }
     try value.object.put(a, "tools", tools);
@@ -518,12 +605,30 @@ fn rawValue(allocator: std.mem.Allocator, raw: []const u8) !std.json.Value {
 }
 
 fn supervisorState(context: *Context) !std.json.Value {
-    return captureSupervisorState(context.allocator, context.io, context.repository, context.roots.supervisor);
+    return captureSupervisorStateCached(
+        context.allocator,
+        context.io,
+        context.repository,
+        context.roots.supervisor,
+        knownFiles(context),
+        runtimeCache(context),
+    );
 }
 
 pub fn captureSupervisorState(a: std.mem.Allocator, io: std.Io, repository: []const u8, supervisor: []const u8) !std.json.Value {
-    const source_map = try supervisorSourceMap(a, io, repository);
-    const runtime_map = try supervisorRuntimeMap(a, io, supervisor);
+    return captureSupervisorStateCached(a, io, repository, supervisor, null, null);
+}
+
+fn captureSupervisorStateCached(
+    a: std.mem.Allocator,
+    io: std.Io,
+    repository: []const u8,
+    supervisor: []const u8,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+    runtime_cache: ?*std.AutoHashMap([9]i128, [][]const u8),
+) !std.json.Value {
+    const source_map = try supervisorSourceMap(a, io, repository, known_files);
+    const runtime_map = try supervisorRuntimeMap(a, io, supervisor, known_files, runtime_cache);
     return typedValue(a, .{
         .schema = "uk.wamr.command-supervisor",
         .version = 1,
@@ -568,23 +673,34 @@ fn guardedMap(a: std.mem.Allocator, domain: []const u8, sorted: []const MapEntry
     };
 }
 
-fn supervisorSourceMap(a: std.mem.Allocator, io: std.Io, repository: []const u8) !Map {
+fn supervisorSourceMap(
+    a: std.mem.Allocator,
+    io: std.Io,
+    repository: []const u8,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+) !Map {
     var entries: std.ArrayList(MapEntry) = .empty;
     for (custody.closure) |entry| {
-        const file = try physical.readFile(io, try std.fs.path.join(a, &.{ repository, entry.name }), limits.tracked_file, false);
+        const file = try physical.readFileCached(io, try std.fs.path.join(a, &.{ repository, entry.name }), limits.tracked_file, false, known_files);
         try entries.append(a, .{ .name = entry.name, .file = file });
     }
     return guardedMap(a, "uk.wamr.command-supervisor-source-v1", entries.items);
 }
 
-fn supervisorRuntimeMap(a: std.mem.Allocator, io: std.Io, supervisor: []const u8) !Map {
+fn supervisorRuntimeMap(
+    a: std.mem.Allocator,
+    io: std.Io,
+    supervisor: []const u8,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+    runtime_cache: ?*std.AutoHashMap([9]i128, [][]const u8),
+) !Map {
     var entries: std.ArrayList(MapEntry) = .empty;
-    const binary = try physical.readFile(io, supervisor, limits.tracked_file, false);
+    const binary = try physical.readFileCached(io, supervisor, limits.tracked_file, false, known_files);
     try entries.append(a, .{ .name = "executable", .file = binary });
-    const runtime_paths = try inputs.executableRuntimePaths(a, io, supervisor);
+    const runtime_paths = try inputs.executableRuntimePathsCached(a, io, supervisor, runtime_cache);
     for (runtime_paths) |path| {
         const role = try a.print("runtime:{s}", .{path});
-        try entries.append(a, .{ .name = role, .file = try physical.readFile(io, path, limits.tracked_file, false) });
+        try entries.append(a, .{ .name = role, .file = try physical.readFileCached(io, path, limits.tracked_file, false, known_files) });
     }
     return guardedMap(a, "uk.wamr.command-supervisor-runtime-v1", entries.items);
 }
@@ -623,7 +739,7 @@ fn verifyRuntimeIdentity(context: *Context) !void {
     for ([_][]const u8{ "embedded.c", "identity.h", "libwamr-aot.a", "tiny.cwasm", "tiny.wasm", "wamr_aot.h", "wamrc" }) |name| {
         try cancelled(context);
         const digest = try core.contracts.parseSha256(try core.contracts.string(artifacts.get(name).?));
-        const file = try physical.readFile(context.io, try join(context, &.{ artifact_dir, name }), limits.tracked_file, false);
+        const file = try physical.readFileCached(context.io, try join(context, &.{ artifact_dir, name }), limits.tracked_file, false, knownFiles(context));
         if (!std.meta.eql(digest, try core.contracts.parseSha256(&file.sha256))) return error.ArtifactChanged;
     }
 }
@@ -715,7 +831,7 @@ pub fn buildValue(context: *Context) !std.json.Value {
     try requireBuildEvidence(context);
     try requireSource(context);
     try requireConsumer(context);
-    try dependencies.requireDocument(context.allocator, context.io, context.repository, context.git, context.compute, context.dependency.?);
+    try dependencies.requireDocumentCached(context.allocator, context.io, context.repository, context.git, context.compute, context.dependency.?, knownFiles(context));
     try cancelled(context);
     return buildValueFromCurrent(context);
 }
@@ -749,7 +865,7 @@ fn buildValueFromCurrent(context: *Context) !std.json.Value {
     for ([_][]const u8{ efi, efi ++ ".dbg", efi ++ ".bootinfo" }) |name| {
         try cancelled(context);
         const digest = try core.contracts.parseSha256(try core.contracts.string(image_files.object.get(name) orelse return error.InvalidImage));
-        const file = try physical.readFile(context.io, try join(context, &.{ app, "build", name }), limits.tracked_file, false);
+        const file = try physical.readFileCached(context.io, try join(context, &.{ app, "build", name }), limits.tracked_file, false, knownFiles(context));
         if (!std.meta.eql(digest, try core.contracts.parseSha256(&file.sha256))) return error.ImageChanged;
     }
     const app_sources = value.get("application_sources") orelse return error.InvalidImage;
@@ -763,7 +879,7 @@ fn buildValueFromCurrent(context: *Context) !std.json.Value {
         if (entry.name[0] == '.' or entry.kind == .directory) continue;
         const path = try join(context, &.{ app, entry.name });
         const expected = try core.contracts.parseSha256(try core.contracts.string(app_sources.object.get(entry.name) orelse return error.AppSourceChanged));
-        const actual = try physical.readFile(context.io, path, limits.tracked_file, false);
+        const actual = try physical.readFileCached(context.io, path, limits.tracked_file, false, knownFiles(context));
         if (!std.meta.eql(expected, try core.contracts.parseSha256(&actual.sha256))) return error.AppSourceChanged;
         count += 1;
     }
@@ -775,7 +891,7 @@ fn buildValueFromCurrent(context: *Context) !std.json.Value {
         const selected = try core.contracts.parseSha256(try core.contracts.string(image_tools.object.get(name) orelse return error.ImageToolsChanged));
         for (inputs.host_tools, context.tools) |known, path| {
             if (!std.mem.eql(u8, name, known)) continue;
-            const actual = try physical.readFile(context.io, path, limits.tracked_file, false);
+            const actual = try physical.readFileCached(context.io, path, limits.tracked_file, false, knownFiles(context));
             if (!std.meta.eql(selected, try core.contracts.parseSha256(&actual.sha256))) return error.ImageToolsChanged;
             break;
         }
@@ -837,13 +953,13 @@ pub fn loadAccepted(context: *Context) !void {
         .tools = context.tools,
     };
     try custody.verifyPhysical(io, a, context.repository);
-    context.source = try custody.source(a, io, context.repository, context.git);
-    context.dependency = try dependencies.capture(a, io, context.repository, context.git, context.compute);
-    context.consumer = try inputs.captureProduction(a, io, .{
+    context.source = try custody.sourceCached(a, io, context.repository, context.git, knownGitBlobs(context), knownFiles(context));
+    context.dependency = try dependencies.captureCached(a, io, context.repository, context.git, context.compute, knownFiles(context));
+    context.consumer = try inputs.captureProductionCached(a, io, .{
         .runtime = context.runtime,
         .tools = context.tools,
         .python_stdlib = try pythonStdlib(context),
-    });
+    }, knownFiles(context), runtimeCache(context));
     const reproduced = try typedValue(a, try buildStart(context));
     const encoded = try std.json.Stringify.valueAlloc(a, reproduced, .{});
     const canonical = try records.canonicalAlloc(a, encoded);
@@ -893,6 +1009,15 @@ fn countLine(bytes: []const u8, target: []const u8) usize {
 }
 
 pub fn run(context: *Context) !BuildAccepted {
+    var custody_cache: ?CustodyCache = if (context.custody_cache == null)
+        CustodyCache.init(std.heap.page_allocator)
+    else
+        null;
+    defer if (custody_cache) |*cache| {
+        context.custody_cache = null;
+        cache.deinit();
+    };
+    if (custody_cache) |*cache| context.custody_cache = cache;
     var bound = try bind(.{ .context = context });
     defer bound.runtime.close(context.io);
     var reserved = try reserve(bound);

@@ -362,6 +362,12 @@ const TrackedLinks = struct {
     }
 };
 
+pub const CachedBlob = struct {
+    oid: [64]u8,
+    oid_len: u8,
+    sha256: [64]u8,
+};
+
 fn inspectOutput(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -373,15 +379,17 @@ fn inspectOutput(
     hash: *Sha256,
     tracked_links: *TrackedLinks,
     allow_missing_roots: bool,
+    known_parent: ?std.Io.Dir,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
 ) !void {
     try limits.relative(relative, limits.ignored_path, limits.ignored_depth);
     _ = try limits.outputRole(relative);
     const path = try std.fs.path.join(allocator, &.{ repo, relative });
     defer allocator.free(path);
     const parent_path = std.fs.path.dirname(path).?;
-    const parent = try files.openDirectory(io, parent_path, .artifact);
+    const parent = if (known_parent) |existing| existing else try files.openDirectory(io, parent_path, .artifact);
     var transferred = false;
-    defer if (!transferred) parent.close(io);
+    defer if (known_parent == null and !transferred) parent.close(io);
     const named = parent.openFile(io, std.fs.path.basename(path), .{ .path_only = true, .follow_symlinks = false }) catch |err| {
         if (allow_missing_roots and err == error.FileNotFound and std.mem.eql(u8, relative, role)) {
             try physical.bind(allocator, hash, .{ "absent", relative });
@@ -423,7 +431,7 @@ fn inspectOutput(
         for (names.items) |name| {
             const child = try allocator.print("{s}/{s}", .{ relative, name });
             defer allocator.free(child);
-            try inspectOutput(allocator, io, repo, git, role, child, state, hash, tracked_links, allow_missing_roots);
+            try inspectOutput(allocator, io, repo, git, role, child, state, hash, tracked_links, allow_missing_roots, dir, known_files);
         }
         try tracked_links.verify(allocator, io, repo, git);
     } else if (kind == std.os.linux.S.IFREG) {
@@ -456,8 +464,10 @@ fn inspectOutput(
                 return error.IgnoredLinkEscapesRole;
             const tracked = target[repo.len + 1 ..];
             try limits.relative(tracked, limits.ignored_path, limits.ignored_depth);
-            _ = physical.readFile(io, target, limits.tracked_file, false) catch return error.IgnoredLinkEscapesRole;
-            try tracked_links.add(allocator, io, repo, git, tracked, parent, named, before, std.fs.path.basename(path));
+            _ = physical.readFileCached(io, target, limits.tracked_file, false, known_files) catch return error.IgnoredLinkEscapesRole;
+            const link_parent = if (known_parent != null) try files.openDirectory(io, parent_path, .artifact) else parent;
+            errdefer if (known_parent != null) link_parent.close(io);
+            try tracked_links.add(allocator, io, repo, git, tracked, link_parent, named, before, std.fs.path.basename(path));
             transferred = true;
             if (TrackedLinks.pathspec(tracked))
                 try tracked_links.verify(allocator, io, repo, git);
@@ -473,7 +483,14 @@ fn inspectOutput(
     }
 }
 
-fn ignoredState(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: []const u8, allow_missing_roots: bool) !Ignored {
+fn ignoredState(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repo: []const u8,
+    git: []const u8,
+    allow_missing_roots: bool,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+) !Ignored {
     const inventory = try gitOutput(allocator, io, repo, git, &.{
         "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z",
     }, limits.ignored_git_output, null);
@@ -500,7 +517,7 @@ fn ignoredState(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git:
     var tracked_links: TrackedLinks = .{};
     defer tracked_links.deinit(io);
     for (limits.roles) |role| {
-        try inspectOutput(allocator, io, repo, git, role, role, &state, &hash, &tracked_links, allow_missing_roots);
+        try inspectOutput(allocator, io, repo, git, role, role, &state, &hash, &tracked_links, allow_missing_roots, null, known_files);
     }
     try tracked_links.verify(allocator, io, repo, git);
     state.tracked_queries = tracked_links.queries;
@@ -549,6 +566,8 @@ fn trackedFile(
     repo: []const u8,
     entry: Tracked,
     format: []const u8,
+    known_blobs: ?*std.AutoHashMap([9]i128, CachedBlob),
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
 ) !struct { bytes: usize, sha256: [64]u8, metadata: [9]i128 } {
     const path = try std.fs.path.join(allocator, &.{ repo, entry.path });
     defer allocator.free(path);
@@ -597,6 +616,16 @@ fn trackedFile(
             (before.uid != 0 and before.uid != std.os.linux.geteuid()) or before.mode & 0o022 != 0 or
             (before.mode & 0o111 != 0) != std.mem.eql(u8, entry.mode, "100755"))
             return error.UnsafeSource;
+        const meta = physical.metadata(before);
+        if (known_blobs) |cache| if (cache.get(meta)) |cached| {
+            if (!std.meta.eql(meta, physical.metadata(try files.snapshot(retained.file))))
+                return error.SourceChanged;
+            try retained.verify(io);
+            if (cached.oid_len != entry.oid.len or !std.mem.eql(u8, cached.oid[0..cached.oid_len], entry.oid))
+                return error.SourceChanged;
+            if (known_files) |file_cache| try file_cache.put(meta, cached.sha256);
+            return .{ .bytes = @intCast(before.size), .sha256 = cached.sha256, .metadata = meta };
+        };
         raw = try allocator.alloc(u8, @intCast(before.size));
         if (try retained.file.readPositionalAll(io, raw, 0) != raw.len)
             return error.SourceChanged;
@@ -622,20 +651,53 @@ fn trackedFile(
     }
     var digest: [32]u8 = undefined;
     Sha256.hash(raw, &digest, .{});
-    return .{ .bytes = raw.len, .sha256 = std.fmt.bytesToHex(digest, .lower), .metadata = physical.metadata(before) };
+    const sha256 = std.fmt.bytesToHex(digest, .lower);
+    const meta = physical.metadata(before);
+    if (!std.mem.eql(u8, entry.mode, "120000")) {
+        if (known_blobs) |cache| {
+            var stored_oid: [64]u8 = @splat(0);
+            @memcpy(stored_oid[0..entry.oid.len], entry.oid);
+            try cache.put(meta, .{
+                .oid = stored_oid,
+                .oid_len = @intCast(entry.oid.len),
+                .sha256 = sha256,
+            });
+        }
+        if (known_files) |file_cache| try file_cache.put(meta, sha256);
+    }
+    return .{ .bytes = raw.len, .sha256 = sha256, .metadata = meta };
 }
 
 pub fn source(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: []const u8) !Source {
-    return captureSource(allocator, io, repo, git, false);
+    return captureSource(allocator, io, repo, git, false, null, null);
+}
+
+pub fn sourceCached(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repo: []const u8,
+    git: []const u8,
+    known_blobs: ?*std.AutoHashMap([9]i128, CachedBlob),
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+) !Source {
+    return captureSource(allocator, io, repo, git, false, known_blobs, known_files);
 }
 
 pub fn portableSource(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: []const u8) !Source {
-    return captureSource(allocator, io, repo, git, true);
+    return captureSource(allocator, io, repo, git, true, null, null);
 }
 
-fn captureSource(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git: []const u8, allow_missing_roots: bool) !Source {
+fn captureSource(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repo: []const u8,
+    git: []const u8,
+    allow_missing_roots: bool,
+    known_blobs: ?*std.AutoHashMap([9]i128, CachedBlob),
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+) !Source {
     _ = try directoryBefore(io, repo);
-    const ignored_before = try ignoredState(allocator, io, repo, git, allow_missing_roots);
+    const ignored_before = try ignoredState(allocator, io, repo, git, allow_missing_roots, known_files);
     try clean(allocator, io, repo, git);
     const revision = try gitLine(allocator, io, repo, git, &.{ "rev-parse", "HEAD" });
     const tree = try gitLine(allocator, io, repo, git, &.{ "rev-parse", "HEAD^{tree}" });
@@ -675,7 +737,7 @@ fn captureSource(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git
     for (names) |relative| try physical.bind(allocator, &physical_hash, .{ "directory", relative, physical.metadata(dirs.get(relative).?) });
     var bytes: usize = 0;
     for (entries) |entry| {
-        const data = try trackedFile(allocator, io, repo, entry, format);
+        const data = try trackedFile(allocator, io, repo, entry, format, known_blobs, known_files);
         try limits.addBounded(&bytes, data.bytes, limits.tracked_bytes);
         try physical.bind(allocator, &content, .{ "file", entry.path, entry.mode, entry.oid, data.bytes, data.sha256 });
         try physical.bind(allocator, &physical_hash, .{ "file", entry.path, entry.mode, entry.oid, data.bytes, data.sha256, data.metadata });
@@ -693,7 +755,7 @@ fn captureSource(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, git
     defer allocator.free(final_tree);
     if (!std.mem.eql(u8, revision, final_revision) or !std.mem.eql(u8, tree, final_tree))
         return error.SourceChanged;
-    const ignored_after = try ignoredState(allocator, io, repo, git, allow_missing_roots);
+    const ignored_after = try ignoredState(allocator, io, repo, git, allow_missing_roots, known_files);
     if (!std.meta.eql(ignored_before, ignored_after)) return error.IgnoredChanged;
     return .{
         .revision = revision,
@@ -718,7 +780,7 @@ pub const Fixture = if (@import("builtin").is_test) struct {
         return test_git_queries;
     }
     pub fn ignoredQueries(allocator: std.mem.Allocator, io: std.Io, repository: []const u8, git: []const u8) !usize {
-        return (try ignoredState(allocator, io, repository, git, false)).tracked_queries;
+        return (try ignoredState(allocator, io, repository, git, false, null)).tracked_queries;
     }
     pub fn verifyReplacedIgnoredLink(allocator: std.mem.Allocator, io: std.Io, repository: []const u8, git: []const u8, link: []const u8, tracked: []const u8) !void {
         const path = try std.fs.path.join(allocator, &.{ repository, link });
@@ -823,7 +885,7 @@ pub fn trackedManifest(
     defer allocator.free(matches);
     if (matches.len != 1 or !std.mem.eql(u8, matches[0].path, relative) or std.mem.eql(u8, matches[0].mode, "120000"))
         return error.UntrackedManifest;
-    const entry = try trackedFile(allocator, io, repo, matches[0], format);
+    const entry = try trackedFile(allocator, io, repo, matches[0], format, null, null);
     if (entry.bytes > limits.mib) return error.ManifestTooLarge;
     const path = try std.fs.path.join(allocator, &.{ repo, relative });
     defer allocator.free(path);

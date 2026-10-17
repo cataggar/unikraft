@@ -252,6 +252,8 @@ jobs:
           controller_root="${WAMR_NATIVE_CONTROLLER_ROOT:?}"
           test -d "${controller_root}"
           test ! -e "${controller_root}/controller"
+          export ZIG_GLOBAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-global-cache"
+          test -d "${ZIG_GLOBAL_CACHE_DIR}/tmp"
           mkdir -m 0700 -- "${RUNNER_TEMP}/wamr-native-controller-cache"
           ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-native-controller-cache" \
             zig build --build-file "${GITHUB_WORKSPACE}/support/build/wamr-native-ci/build.zig" \

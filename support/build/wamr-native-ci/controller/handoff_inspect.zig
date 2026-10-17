@@ -132,6 +132,19 @@ pub fn run(
     return inspected.command;
 }
 
+pub fn runValidated(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    accepted: *accepted_run.AcceptedRun,
+    output: []const u8,
+    legacy: bool,
+    signal: ?*core.process.SignalCancellation,
+) !@import("command_validation.zig").ValidatedCommand {
+    var inspected = try runRetainedValidated(allocator, io, accepted, output, legacy, signal);
+    defer inspected.deinit(io);
+    return inspected.command;
+}
+
 pub fn runRetained(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -145,6 +158,21 @@ pub fn runRetained(
     if (legacy != (accepted.compatibility == .tiny_v1_legacy))
         return error.InvalidContext;
     try accepted.revalidateWithSignal(signal);
+    return runRetainedValidated(allocator, io, accepted, output, legacy, signal);
+}
+
+pub fn runRetainedValidated(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    accepted: *accepted_run.AcceptedRun,
+    output: []const u8,
+    legacy: bool,
+    signal: ?*core.process.SignalCancellation,
+) !RetainedInspection {
+    if (accepted.context != .local_runtime or accepted.repository == null)
+        return error.InvalidContext;
+    if (legacy != (accepted.compatibility == .tiny_v1_legacy))
+        return error.InvalidContext;
     const roots = try bind(accepted, output);
     var original_tool = try files.RetainedFile.open(io, roots.package_tool, .tool);
     defer original_tool.close(io);
