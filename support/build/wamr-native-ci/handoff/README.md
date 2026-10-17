@@ -221,8 +221,10 @@ The local v2 fixture receipt binds actual fixture ZIP/container hashes, but
 confers neither a `Download` owner nor public producer acceptance. Genuine
 current public import/transport/lineage qualification remains a separate gate.
 The default runs both groups. `-Dhandoff-composition-group=faults` selects
-import/candidate publication and serial boundaries; `retention` selects
-fully rehashed private lineage, CLI collision and changed retained inputs.
+import/candidate publication, historical candidate reopen, and serial
+boundaries; `retention` selects fully rehashed private lineage, CLI collision,
+v2 exact-download container retention/import/candidate reopen, and changed
+retained inputs.
 Both use the same real owner fixtures, and neither changes native admission.
 
 Use an existing external system dependency forest, caches, temporary root and

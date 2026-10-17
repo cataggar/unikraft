@@ -262,8 +262,50 @@ pub fn historical(
         try std.testing.expect(finalized == .success);
         defer finalized.success.deinit();
         _ = try finalized.success.result(try std.fs.path.join(a, &.{ owner.bundle.?.evidence.root, "boots/raw-x2apic/serial" }), null, null);
+        try reopenHistoricalCandidate(work, owner);
     }
     try rehashedPayload(work, stage, repository, tools, context, &metadata);
+}
+
+fn reopenHistoricalCandidate(work: Workspace, owner: *products.ImportedProduct) !void {
+    const reopened = candidate.open(.{
+        .allocator = std.testing.allocator,
+        .io = work.io,
+        .source = .{ .imported_product = owner },
+        .output = try work.join("historical-candidate.json"),
+        .validation_output = try work.join("historical-candidate-open-validation"),
+    });
+    if (reopened != .success) std.debug.print("historical candidate open: {any}\n", .{reopened});
+    try std.testing.expect(reopened == .success);
+    defer reopened.success.deinit();
+    const inspect = try reopened.success.inspect(null);
+    try std.testing.expectEqual(@as(u8, 1), inspect.version);
+    try std.testing.expectEqual(.not_admitted, inspect.authority);
+    try std.testing.expectError(error.Version2Required, reopened.success.metadata(null));
+    _ = try reopened.success.result(try std.fs.path.join(work.a, &.{ owner.bundle.?.evidence.root, "boots/raw-x2apic/serial" }), null, null);
+
+    var tampered_doc = try handoff.contracts.parseCanonical(work.a, try work.read("historical-candidate.json"));
+    defer tampered_doc.deinit();
+    const bundle_ref = tampered_doc.value().object.get("bundle").?.object;
+    bundle_ref.getPtr("sha256").?.* = .{ .string = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" };
+    const tampered_bytes = try canonical(work.a, tampered_doc.value());
+    try work.put("historical-candidate-tampered.json", tampered_bytes);
+    const tampered = candidate.open(.{
+        .allocator = std.testing.allocator,
+        .io = work.io,
+        .source = .{ .imported_product = owner },
+        .output = try work.join("historical-candidate-tampered.json"),
+        .validation_output = try work.join("historical-candidate-tampered-validation"),
+    });
+    if (tampered == .success) {
+        tampered.success.deinit();
+        return error.TamperedCandidateAccepted;
+    }
+    try std.testing.expect(tampered == .poisoned);
+    try std.testing.expectEqual(candidate.Phase.publication, tampered.poisoned.phase);
+    try std.testing.expectEqual(error.CandidateBindingChanged, tampered.poisoned.err);
+    try std.testing.expectEqual(files.CommitStatus.not_committed, tampered.poisoned.publication);
+    try std.testing.expectEqualStrings(tampered_bytes, try work.read("historical-candidate-tampered.json"));
 }
 
 fn rehashedPayload(work: Workspace, stage: []const u8, repository: []const u8, tools: controller.import_validator_build.LocalTools, context: archive.Context, metadata: *archive.Metadata) !void {
@@ -317,7 +359,7 @@ pub fn local(a: std.mem.Allocator, io: std.Io, stage: []const u8, repository: []
     defer directory.close(io);
     var bundle = try controller.accepted_run.PrivateBundle.open(std.testing.allocator, io, &directory, stage, repository, tools, null);
     defer bundle.deinit();
-    try localReceipt(work, &bundle);
+    const receipt = try localReceipt(work, &bundle);
     const manifest_before = try copy.hashRetained(io, &bundle.manifest, handoff.layout.max_json_bytes, null);
     const Fault = enum { admission_collision, candidate_collision, admission_sync, publication_unknown, publication_sync, cancellation, final_revalidation };
     for (if (options.handoff_composition_group == .retention) &.{} else std.enums.values(Fault)) |fault| {
@@ -402,10 +444,17 @@ pub fn local(a: std.mem.Allocator, io: std.Io, stage: []const u8, repository: []
     if (options.handoff_composition_group == .faults) return;
     try privateLineage(work, &bundle, repository, tools);
     try cliCollision(work, stage, repository, tools);
+    try exactDownloadAndReopen(work, receipt, &bundle, repository, tools);
     try changedInputs(work, finalized.success, &bundle, repository, tools);
 }
 
-fn localReceipt(work: Workspace, bundle: *controller.accepted_run.PrivateBundle) !void {
+const LocalReceipt = struct {
+    context: archive.Context,
+    inner: [32]u8,
+    container: [32]u8,
+};
+
+fn localReceipt(work: Workspace, bundle: *controller.accepted_run.PrivateBundle) !LocalReceipt {
     var bytes = try files.readSensitiveFile(work.io, work.a, bundle.manifest.file, handoff.layout.max_json_bytes, .private);
     defer bytes.deinit();
     var document = try handoff.contracts.parseCanonical(work.a, bytes.bytes());
@@ -413,9 +462,9 @@ fn localReceipt(work: Workspace, bundle: *controller.accepted_run.PrivateBundle)
     const value = document.value().object;
     const run = value.get("run").?.object;
     const context: archive.Context = .{
-        .repository = run.get("repository").?.string,
-        .run_id = run.get("run_id").?.string,
-        .run_attempt = run.get("run_attempt").?.string,
+        .repository = try work.a.dupe(u8, run.get("repository").?.string),
+        .run_id = try work.a.dupe(u8, run.get("run_id").?.string),
+        .run_attempt = try work.a.dupe(u8, run.get("run_attempt").?.string),
         .source_revision = bundle.evidence.source.revision,
         .source_tree = bundle.evidence.source.tree,
         .wamr_revision = controller.custody_limits.historical_wamr_revision,
@@ -427,7 +476,7 @@ fn localReceipt(work: Workspace, bundle: *controller.accepted_run.PrivateBundle)
     defer source.close(work.io);
     var reader = source.reader(work.io, &.{});
     const entry: zip.Entry = .{
-        .name = "wamr-native-public-source.zip",
+        .name = handoff.public_transport.filename,
         .reader = &reader.interface,
         .size = (try source.stat(work.io)).size,
         .crc32 = try fileCrc(work.io, source, (try source.stat(work.io)).size),
@@ -460,6 +509,183 @@ fn localReceipt(work: Workspace, bundle: *controller.accepted_run.PrivateBundle)
     defer file.close(work.io);
     try file.writePositionalAll(work.io, receipt, 0);
     try file.sync(work.io);
+    return .{
+        .context = context,
+        .inner = inner,
+        .container = container_digest,
+    };
+}
+
+fn exactDownloadAndReopen(
+    work: Workspace,
+    receipt: LocalReceipt,
+    bundle: *controller.accepted_run.PrivateBundle,
+    repository: []const u8,
+    tools: controller.import_validator_build.LocalTools,
+) !void {
+    {
+        const reopened = candidate.open(.{
+            .allocator = std.testing.allocator,
+            .io = work.io,
+            .source = .{ .private_bundle = bundle },
+            .output = try work.join("candidate.json"),
+            .validation_output = try work.join("reopen-private-validation"),
+        });
+        if (reopened != .success) std.debug.print("reopen private candidate: {any}\n", .{reopened});
+        try std.testing.expect(reopened == .success);
+        defer reopened.success.deinit();
+        const inspect = try reopened.success.inspect(null);
+        try std.testing.expectEqual(@as(u8, 2), inspect.version);
+        try std.testing.expectEqual(.not_admitted, inspect.authority);
+        const meta = try reopened.success.metadata(null);
+        try std.testing.expectEqual(.private_bundle, meta.source);
+        try std.testing.expectEqual(@as(u8, 2), meta.scope.version);
+        try std.testing.expectEqualStrings("1", meta.provenance.artifact_id);
+    }
+
+    const artifact_id = try handoff.public_transport.ArtifactId.parse("1");
+    const upload: handoff.public_transport.UploadMetadata = .{
+        .context = receipt.context,
+        .artifact_id = artifact_id,
+        .container_digest = .{ .bytes = receipt.container },
+    };
+    const expected: handoff.public_transport.Expected = .{
+        .upload = upload,
+        .inner_digest = .{ .bytes = receipt.inner },
+    };
+    const retained = handoff.public_transport.actions_container.retainDownload(.{
+        .allocator = std.testing.allocator,
+        .io = work.io,
+        .container_path = try work.join("local-container.zip"),
+        .output_path = try work.join("local-download"),
+        .expected = expected,
+        .selection = .{ .upload = upload },
+    });
+    if (retained != .success) std.debug.print("retain local download: {any}\n", .{retained});
+    try std.testing.expect(retained == .success);
+    var retained_download = retained.success;
+    defer retained_download.deinit(work.io);
+    try retained_download.revalidate(work.io, null);
+
+    const imported = products.importBundle(.{
+        .allocator = std.testing.allocator,
+        .io = work.io,
+        .repository = repository,
+        .input = .{ .exact_download = .{
+            .path = try work.join("local-download"),
+            .container_path = try work.join("local-container.zip"),
+            .expected = expected,
+            .selection = .{ .upload = upload },
+        } },
+        .output = try work.join("local-imported"),
+        .tools = tools,
+    });
+    if (imported != .success) std.debug.print("exact download import: {any}\n", .{imported});
+    try std.testing.expect(imported == .success);
+    const owner = imported.success;
+    defer owner.deinit();
+    try owner.revalidate(null);
+
+    const created = candidate.create(.{
+        .allocator = std.testing.allocator,
+        .io = work.io,
+        .source = .{ .imported_product = owner },
+        .output = try work.join("imported-candidate.json"),
+        .validation_output = try work.join("imported-candidate-validation"),
+        .settings = .{ .attempt_id = "00000000-0000-4000-8000-000000000001" },
+    });
+    if (created != .success) std.debug.print("imported v2 candidate create: {any}\n", .{created});
+    try std.testing.expect(created == .success);
+    defer created.success.deinit();
+    const created_meta = try created.success.metadata(null);
+    try std.testing.expectEqual(.imported_product, created_meta.source);
+    try std.testing.expectEqual(@as(u8, 2), created_meta.scope.version);
+    try std.testing.expectEqualStrings("1", created_meta.provenance.artifact_id);
+
+    const reopened = candidate.open(.{
+        .allocator = std.testing.allocator,
+        .io = work.io,
+        .source = .{ .imported_product = owner },
+        .output = try work.join("imported-candidate.json"),
+        .validation_output = try work.join("imported-candidate-open-validation"),
+    });
+    if (reopened != .success) std.debug.print("imported v2 candidate open: {any}\n", .{reopened});
+    try std.testing.expect(reopened == .success);
+    defer reopened.success.deinit();
+    const reopened_inspect = try reopened.success.inspect(null);
+    try std.testing.expectEqual(@as(u8, 2), reopened_inspect.version);
+    try std.testing.expectEqual(.not_admitted, reopened_inspect.authority);
+    const reopened_meta = try reopened.success.metadata(null);
+    try std.testing.expectEqual(.imported_product, reopened_meta.source);
+    try std.testing.expectEqual(@as(u8, 2), reopened_meta.scope.version);
+    try std.testing.expectEqualStrings("1", reopened_meta.provenance.artifact_id);
+    _ = try reopened.success.result(try std.fs.path.join(work.a, &.{ owner.bundle.?.evidence.root, "boots/raw-x2apic/serial" }), null, null);
+
+    // Tampering with the admission sidecar before candidate.open poisons at .admission.
+    {
+        var admission_doc = try handoff.contracts.parseCanonical(work.a, try work.read("imported-candidate.json.admission.json"));
+        defer admission_doc.deinit();
+        const public_bundle = admission_doc.value().object.get("public_bundle").?.object;
+        public_bundle.getPtr("size").?.* = .{ .integer = public_bundle.get("size").?.integer + 1 };
+        const tampered_admission = try canonical(work.a, admission_doc.value());
+        try work.put("tampered-admission.json.admission.json", tampered_admission);
+
+        var candidate_doc = try handoff.contracts.parseCanonical(work.a, try work.read("imported-candidate.json"));
+        defer candidate_doc.deinit();
+        const bundle_ref = candidate_doc.value().object.get("bundle").?.object;
+        bundle_ref.getPtr("path").?.* = .{ .string = try work.join("tampered-admission.json.admission.json") };
+        const candidate_bytes = try canonical(work.a, candidate_doc.value());
+        try work.put("tampered-admission.json", candidate_bytes);
+
+        const bad_admission = candidate.open(.{
+            .allocator = std.testing.allocator,
+            .io = work.io,
+            .source = .{ .imported_product = owner },
+            .output = try work.join("tampered-admission.json"),
+            .validation_output = try work.join("tampered-admission-validation"),
+        });
+        if (bad_admission == .success) {
+            bad_admission.success.deinit();
+            return error.TamperedAdmissionAccepted;
+        }
+        try std.testing.expect(bad_admission == .poisoned);
+        try std.testing.expectEqual(candidate.Phase.admission, bad_admission.poisoned.phase);
+        try std.testing.expectEqual(error.CandidateBindingChanged, bad_admission.poisoned.err);
+        try std.testing.expectEqual(files.CommitStatus.not_committed, bad_admission.poisoned.publication);
+        try std.testing.expectEqualStrings(tampered_admission, try work.read("tampered-admission.json.admission.json"));
+    }
+
+    // Tampering with the candidate record while preserving the valid admission sidecar poisons at .publication.
+    {
+        const admission_bytes = try work.read("imported-candidate.json.admission.json");
+        try work.put("tampered-candidate.json.admission.json", admission_bytes);
+
+        var candidate_doc = try handoff.contracts.parseCanonical(work.a, try work.read("imported-candidate.json"));
+        defer candidate_doc.deinit();
+        const bundle_ref = candidate_doc.value().object.get("bundle").?.object;
+        bundle_ref.getPtr("path").?.* = .{ .string = try work.join("tampered-candidate.json.admission.json") };
+        const vhd_ref = candidate_doc.value().object.get("os_vhd").?.object;
+        vhd_ref.getPtr("sha256").?.* = .{ .string = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" };
+        const tampered_candidate = try canonical(work.a, candidate_doc.value());
+        try work.put("tampered-candidate.json", tampered_candidate);
+
+        const bad_candidate = candidate.open(.{
+            .allocator = std.testing.allocator,
+            .io = work.io,
+            .source = .{ .imported_product = owner },
+            .output = try work.join("tampered-candidate.json"),
+            .validation_output = try work.join("tampered-candidate-validation"),
+        });
+        if (bad_candidate == .success) {
+            bad_candidate.success.deinit();
+            return error.TamperedCandidateAccepted;
+        }
+        try std.testing.expect(bad_candidate == .poisoned);
+        try std.testing.expectEqual(candidate.Phase.publication, bad_candidate.poisoned.phase);
+        try std.testing.expectEqual(error.CandidateBindingChanged, bad_candidate.poisoned.err);
+        try std.testing.expectEqual(files.CommitStatus.not_committed, bad_candidate.poisoned.publication);
+        try std.testing.expectEqualStrings(tampered_candidate, try work.read("tampered-candidate.json"));
+    }
 }
 
 fn overwrite(io: std.Io, path: []const u8, bytes: []const u8) !void {
