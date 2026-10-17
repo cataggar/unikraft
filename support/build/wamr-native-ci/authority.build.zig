@@ -117,7 +117,7 @@ pub fn testOptions(b: *std.Build, target: std.Build.ResolvedTarget, optimize: st
     });
     options.addOptionPath("probe_fixture", probe_fixture.getEmittedBin());
     options.addOptionPath("validator", b.dependency("direct_validator", .{ .target = target, .optimize = .safe }).artifact("uk-wamr-direct-validate").getEmittedBin());
-    const image = b.dependency("public_image", .{ .target = target, .optimize = optimize }).module("hyperv_public_image");
+    const image = b.dependency("public_image", .{ .target = target, .optimize = .safe }).module("hyperv_public_image");
     for (b.graph.configure_dependencies.items) |*dep| switch (dep.lazy_path) {
         .src_path => |sp| if (sp.owner != b) {
             dep.lazy_path = b.graph.cwdRelativePath(
@@ -133,7 +133,7 @@ pub fn testOptions(b: *std.Build, target: std.Build.ResolvedTarget, optimize: st
         .root_module = b.createModule(.{
             .root_source_file = b.path("package.zig"),
             .target = target,
-            .optimize = optimize,
+            .optimize = .safe,
             .strip = true,
             .imports = &.{
                 .{ .name = "public_image", .module = image },
@@ -142,7 +142,6 @@ pub fn testOptions(b: *std.Build, target: std.Build.ResolvedTarget, optimize: st
         }),
     });
     options.addOptionPath("authorization_package", package.getEmittedBin());
-    options.addOptionPath("authorization_fixture", b.path("authority/authorization_fixture.py"));
     return options;
 }
 
