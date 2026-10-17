@@ -55,7 +55,7 @@ zig build --build-file authority-authorization.build.zig test \
 
 The selector also compiles the real handler in a non-test object. It does not
 install an executable. The test fixture uses the existing native image package
-producer and existing v2 lineage fixture, Python's frozen metadata scan, and
+producer, native runtime staging (`authority.runtime_copy`), and
 explicitly synthetic tool bindings/local observations. The **actual handler and
 unreplaced compute engines** process the fixtures; they are not externally
 qualified owners, real Azure runtimes, genuine decisions or hardware acceptance.
@@ -65,7 +65,7 @@ The root now exports `authorization`, and the shared source handler dispatches
 this actual operation; see [composition.md](composition.md). Module imports are
 the existing `hyperv_core`, `wamr_direct_compute`, and `wamr_handoff`; no new
 production dependency is needed. The standalone selector supplies the focused
-tests' `test_options.authorization_package` and `authorization_fixture`, in
+tests' `test_options.authorization_package`, in
 addition to the foundation fixture root/process executable options. The aggregate
 provides these through the single shared `testOptions` module.
 The frozen 196-scenario inventory and authority golden are unchanged.

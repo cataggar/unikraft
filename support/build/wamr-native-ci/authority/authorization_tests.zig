@@ -128,19 +128,9 @@ const Fixture = struct {
         self.path = try allocator.print("{s}/authorization-pipeline-{d}", .{ options.fixture_root, std.os.linux.getpid() });
         const package = try std.Io.Dir.cwd().realPathFileAlloc(io, options.authorization_package, allocator);
         const native_tool = try std.Io.Dir.cwd().realPathFileAlloc(io, options.process_fixture, allocator);
-        const generated = try std.process.run(allocator, io, .{
-            .argv = &.{ "python3", "-B", options.authorization_fixture, self.path, package, native_tool },
-            .stdout_limit = .limited(4096),
-            .stderr_limit = .limited(4096),
-        });
-        if (generated.term != .exited or generated.term.exited != 0) {
-            std.debug.print("authorization synthetic fixture failed: {s}\n", .{generated.stderr});
-            return error.FixtureFailed;
-        }
+        self.plan = try @import("test_fixtures.zig").buildAuthorizationFixture(allocator, io, self.path, package, native_tool);
         self.directory = try std.Io.Dir.openDirAbsolute(io, self.path, .{ .iterate = true });
         errdefer self.directory.close(io);
-        const bytes = try self.directory.readFileAlloc(io, "plan-seed.json", allocator, .limited(65536));
-        self.plan = (try records.parse(types.Plan, allocator, bytes)).value;
         self.plan.ledger = try types.compute.ledgerProposal(
             allocator,
             io,
@@ -200,10 +190,7 @@ const Fixture = struct {
     }
     fn deinit(self: *Fixture) void {
         self.directory.close(io);
-        const result = std.process.run(self.arena.allocator(), io, .{
-            .argv = &.{ "python3", "-B", options.authorization_fixture, "--cleanup", self.path },
-        }) catch @panic("authorization fixture cleanup failed");
-        if (result.term != .exited or result.term.exited != 0) @panic("authorization fixture cleanup failed");
+        @import("test_fixtures.zig").cleanupAuthorizationFixture(io, self.path) catch @panic("authorization fixture cleanup failed");
         self.arena.deinit();
         a.destroy(self);
     }
