@@ -894,11 +894,44 @@ fn liveImportedAuthorityComposition(
         try std.testing.expectEqual(authority.plan.Publications{}, refused_cost.plan.refused.outputs);
     }
 
-    // Positive live imported-owner plan -> authorization -> admission composition.
+    // Positive live imported-owner plan -> authorization -> admission composition via CLI parser + handlers.
+    {
+        const runtime_res = try std.process.run(work.a, work.io, .{
+            .argv = &.{ tools.validator, "azure-runtime", tool_paths.azure_runtime },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        if (runtime_res.term != .exited or runtime_res.term.exited != 0)
+            std.debug.print("direct validator azure-runtime stderr: {s}\n", .{runtime_res.stderr});
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, runtime_res.term);
+        try std.testing.expectEqualStrings("", runtime_res.stderr);
+    }
+
     const plan_commitments = blk: {
+        var parsed_plan = try authority.cli.parse(work.a, &.{
+            "plan",
+            "--bundle",                           created_meta.provenance.public_bundle.path,
+            "--output",                           try work.join("authority-work/records/plan.json"),
+            "--approval-template",                try work.join("authority-work/records/template.json"),
+            "--candidate-output",                 created_meta.candidate.path,
+            "--campaign-id",                      "00000000-0000-4000-8000-000000000010",
+            "--ledger",                           try work.join("authority-work/ledger"),
+            "--subscription",                     created_meta.scope.subscription,
+            "--prefix",                           created_meta.scope.prefix,
+            "--maximum-authorized-cost-microusd", "15000000",
+            "--attempt-id",                       created_meta.scope.attempt_id,
+            "--ledger-id",                        "00000000-0000-4000-8000-000000000020",
+            "--azure-runtime",                    tool_paths.azure_runtime,
+            "--azure",                            tool_paths.azure,
+            "--uploader",                         tool_paths.uploader,
+            "--validator",                        tool_paths.validator,
+            "--supervisor",                       tool_paths.supervisor,
+            "--az-python",                        tool_paths.az_python,
+        });
+        defer parsed_plan.deinit();
         const planned = authority.handlers.run(
             .{ .retained = ctx, .live_finalized = created_candidate },
-            .{ .plan = base_plan },
+            parsed_plan.result.command,
         );
         if (planned.plan != .success) std.debug.print("live imported plan: {any}\n", .{planned});
         try std.testing.expect(planned.plan == .success);
@@ -923,21 +956,43 @@ fn liveImportedAuthorityComposition(
             .created_unix = plan_res.plan.created_unix,
         };
     };
+    {
+        const plan_res = try std.process.run(work.a, work.io, .{
+            .argv = &.{ tools.validator, "plan", plan_commitments.plan_artifact.path, plan_commitments.template_artifact.path },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        if (plan_res.term != .exited or plan_res.term.exited != 0)
+            std.debug.print("direct validator plan stderr: {s}\n", .{plan_res.stderr});
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, plan_res.term);
+        try std.testing.expectEqualStrings("", plan_res.stderr);
+    }
+
     const now_unix: u64 = @intCast(std.Io.Clock.real.now(work.io).toSeconds());
     const recorded_unix = @max(now_unix, plan_commitments.created_unix);
+    const recorded_unix_str = try work.a.print("{d}", .{recorded_unix});
+    const expires_unix_str = try work.a.print("{d}", .{recorded_unix + 1800});
 
     const denied_artifact: authority.types.Artifact = blk: {
-        const denied_outcome = authority.handlers.run(.{ .retained = ctx }, .{ .@"record-authorization" = .{
-            .plan = plan_commitments.plan_artifact.path,
-            .template = plan_commitments.template_artifact.path,
-            .output = try work.join("authority-work/records/authorization-denied.json"),
-            .decision = .denied,
-            .approver = "operator@example.invalid",
-            .reference = "CHG-189-DENY",
-            .recorded_unix = recorded_unix,
-            .expires_unix = recorded_unix + 1800,
-            .tools = tool_paths,
-        } });
+        var parsed_denied = try authority.cli.parse(work.a, &.{
+            "record-authorization",
+            "--plan",          plan_commitments.plan_artifact.path,
+            "--template",      plan_commitments.template_artifact.path,
+            "--output",        try work.join("authority-work/records/authorization-denied.json"),
+            "--decision",      "denied",
+            "--approver",      "operator@example.invalid",
+            "--reference",     "CHG-189-DENY",
+            "--recorded-unix", recorded_unix_str,
+            "--expires-unix",  expires_unix_str,
+            "--azure-runtime", tool_paths.azure_runtime,
+            "--azure",         tool_paths.azure,
+            "--uploader",      tool_paths.uploader,
+            "--validator",     tool_paths.validator,
+            "--supervisor",    tool_paths.supervisor,
+            "--az-python",     tool_paths.az_python,
+        });
+        defer parsed_denied.deinit();
+        const denied_outcome = authority.handlers.run(.{ .retained = ctx }, parsed_denied.result.command);
         if (denied_outcome.authorization != .success) std.debug.print("live denied authorization: {any}\n", .{denied_outcome});
         try std.testing.expect(denied_outcome.authorization == .success);
         const denied_recorded = denied_outcome.authorization.success;
@@ -952,17 +1007,25 @@ fn liveImportedAuthorityComposition(
     };
 
     const approved_artifact: authority.types.Artifact = blk: {
-        const approved_outcome = authority.handlers.run(.{ .retained = ctx }, .{ .@"record-authorization" = .{
-            .plan = plan_commitments.plan_artifact.path,
-            .template = plan_commitments.template_artifact.path,
-            .output = try work.join("authority-work/records/authorization.json"),
-            .decision = .approved,
-            .approver = "operator@example.invalid",
-            .reference = "CHG-189-APPROVE",
-            .recorded_unix = recorded_unix,
-            .expires_unix = recorded_unix + 1800,
-            .tools = tool_paths,
-        } });
+        var parsed_approved = try authority.cli.parse(work.a, &.{
+            "record-authorization",
+            "--plan",          plan_commitments.plan_artifact.path,
+            "--template",      plan_commitments.template_artifact.path,
+            "--output",        try work.join("authority-work/records/authorization.json"),
+            "--decision",      "approved",
+            "--approver",      "operator@example.invalid",
+            "--reference",     "CHG-189-APPROVE",
+            "--recorded-unix", recorded_unix_str,
+            "--expires-unix",  expires_unix_str,
+            "--azure-runtime", tool_paths.azure_runtime,
+            "--azure",         tool_paths.azure,
+            "--uploader",      tool_paths.uploader,
+            "--validator",     tool_paths.validator,
+            "--supervisor",    tool_paths.supervisor,
+            "--az-python",     tool_paths.az_python,
+        });
+        defer parsed_approved.deinit();
+        const approved_outcome = authority.handlers.run(.{ .retained = ctx }, parsed_approved.result.command);
         if (approved_outcome.authorization != .success) std.debug.print("live approved authorization: {any}\n", .{approved_outcome});
         try std.testing.expect(approved_outcome.authorization == .success);
         const approved_recorded = approved_outcome.authorization.success;
@@ -975,6 +1038,36 @@ fn liveImportedAuthorityComposition(
             .sha256 = try work.a.dupe(u8, raw.sha256),
         };
     };
+    {
+        const denied_res = try std.process.run(work.a, work.io, .{
+            .argv = &.{ tools.validator, "authorization", plan_commitments.plan_artifact.path, denied_artifact.path },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        if (denied_res.term != .exited or denied_res.term.exited != 0)
+            std.debug.print("direct validator denied authorization stderr: {s}\n", .{denied_res.stderr});
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, denied_res.term);
+        try std.testing.expectEqualStrings("", denied_res.stderr);
+
+        const template_as_auth_res = try std.process.run(work.a, work.io, .{
+            .argv = &.{ tools.validator, "authorization", plan_commitments.plan_artifact.path, plan_commitments.template_artifact.path },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, template_as_auth_res.term);
+        try std.testing.expectEqualStrings("", template_as_auth_res.stdout);
+        try std.testing.expect(template_as_auth_res.stderr.len > 0);
+
+        const approved_res = try std.process.run(work.a, work.io, .{
+            .argv = &.{ tools.validator, "authorization", plan_commitments.plan_artifact.path, approved_artifact.path },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        if (approved_res.term != .exited or approved_res.term.exited != 0)
+            std.debug.print("direct validator authorization stderr: {s}\n", .{approved_res.stderr});
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, approved_res.term);
+        try std.testing.expectEqualStrings("", approved_res.stderr);
+    }
 
     // Denied authorization and private_bundle candidate are refused by admission.run.
     {
@@ -1034,9 +1127,23 @@ fn liveImportedAuthorityComposition(
     try std.testing.expectEqual(.imported_product, reopened_meta.source);
     try std.testing.expectEqual(@as(u8, 2), reopened_meta.scope.version);
     try std.testing.expectEqualStrings("1", reopened_meta.provenance.artifact_id);
-    _ = try reopened.success.result(try std.fs.path.join(work.a, &.{ owner.bundle.?.evidence.root, "boots/raw-x2apic/serial" }), null, null);
+    const serial_path = try std.fs.path.join(work.a, &.{ owner.bundle.?.evidence.root, "boots/raw-x2apic/serial" });
+    _ = try reopened.success.result(serial_path, null, null);
 
     {
+        var parsed_admit = try authority.cli.parse(work.a, &.{
+            "admit",
+            "--plan",          plan_commitments.plan_artifact.path,
+            "--authorization", approved_artifact.path,
+            "--output",        try work.join("authority-work/records/admission.json"),
+            "--azure-runtime", tool_paths.azure_runtime,
+            "--azure",         tool_paths.azure,
+            "--uploader",      tool_paths.uploader,
+            "--validator",     tool_paths.validator,
+            "--supervisor",    tool_paths.supervisor,
+            "--az-python",     tool_paths.az_python,
+        });
+        defer parsed_admit.deinit();
         const admitted_outcome = authority.handlers.run(
             .{
                 .retained = ctx,
@@ -1044,12 +1151,7 @@ fn liveImportedAuthorityComposition(
                 .plan_commitment = plan_commitments.plan_artifact,
                 .authorization_commitment = approved_artifact,
             },
-            .{ .admit = .{
-                .plan = plan_commitments.plan_artifact.path,
-                .authorization = approved_artifact.path,
-                .output = try work.join("authority-work/records/admission.json"),
-                .tools = tool_paths,
-            } },
+            parsed_admit.result.command,
         );
         if (admitted_outcome.admission != .success) std.debug.print("live imported admission: {any}\n", .{admitted_outcome});
         try std.testing.expect(admitted_outcome.admission == .success);
@@ -1058,6 +1160,27 @@ fn liveImportedAuthorityComposition(
         try admitted.revalidate();
         const admission_artifact = try admitted.artifact();
         try std.testing.expect(admission_artifact.size > 0);
+        const admission_bytes = try work.read("authority-work/records/admission.json");
+        try std.testing.expectEqualStrings(admission_bytes, try work.read("authority-work/records/admission.json.validation.json"));
+
+        for ([_][]const []const u8{
+            &.{ tools.validator, "admission", admission_artifact.path },
+            &.{ tools.validator, "stored-scope", admission_artifact.path },
+            &.{ tools.validator, "inputs", admission_artifact.path },
+            &.{ tools.validator, "ledger", admission_artifact.path, try work.join("authority-work/ledger") },
+            &.{ tools.validator, "ledger-proposal", try work.join("authority-work/ledger"), "00000000-0000-4000-8000-000000000010", "00000000-0000-4000-8000-000000000020" },
+            &.{ tools.validator, "serial", admission_artifact.path, serial_path },
+        }) |argv| {
+            const val_res = try std.process.run(work.a, work.io, .{
+                .argv = argv,
+                .stdout_limit = .limited(16 * 1024),
+                .stderr_limit = .limited(4096),
+            });
+            if (val_res.term != .exited or val_res.term.exited != 0)
+                std.debug.print("direct validator {s} stderr: {s}\n", .{ argv[1], val_res.stderr });
+            try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, val_res.term);
+            try std.testing.expectEqualStrings("", val_res.stderr);
+        }
     }
 }
 

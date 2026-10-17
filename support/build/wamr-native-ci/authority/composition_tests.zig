@@ -21,6 +21,54 @@ test "source handler dispatch never acquires missing retained authority or commi
         .reference = "not permission",
     };
     try std.testing.expectEqual(error.ApprovalExpired, authority.handlers.run(ctx, .{ .@"record-authorization" = command }).authorization.refused.err);
+
+    var parsed_prepare = try authority.cli.parse(a, &.{
+        "prepare-azure-runtime",
+        "--output=/explicit/output",
+        "--azure=/explicit/azure",
+        "--az-python=/explicit/python",
+        "--stdlib=/explicit/stdlib",
+        "--validator=/explicit/validator",
+        "--package-root=/explicit/packages",
+    });
+    defer parsed_prepare.deinit();
+    try std.testing.expectEqual(error.MissingDiscoveryContext, authority.handlers.run(ctx, parsed_prepare.result.command).prepare.refused.err);
+
+    var parsed_plan = try authority.cli.parse(a, &.{
+        "plan",
+        "--bundle=/explicit/bundle.json",
+        "--output=/explicit/plan.json",
+        "--approval-template=/explicit/template.json",
+        "--candidate-output=/explicit/candidate.json",
+        "--campaign-id=00000000-0000-4000-8000-000000000010",
+        "--ledger=/explicit/ledger",
+        "--subscription=00000000-0000-4000-8000-000000000001",
+        "--prefix=not-admitted-candidate",
+        "--maximum-authorized-cost-microusd=15000000",
+        "--azure=/explicit/azure",
+        "--uploader=/explicit/uploader",
+        "--validator=/explicit/validator",
+        "--supervisor=/explicit/supervisor",
+        "--az-python=/explicit/python",
+        "--azure-runtime=/explicit/azure-runtime.json",
+    });
+    defer parsed_plan.deinit();
+    try std.testing.expectEqual(error.MissingImportedContext, authority.handlers.run(ctx, parsed_plan.result.command).plan.refused.err);
+
+    var parsed_admit = try authority.cli.parse(a, &.{
+        "admit",
+        "--plan=/explicit/plan.json",
+        "--authorization=/explicit/authorization.json",
+        "--output=/explicit/admission.json",
+        "--azure=/explicit/azure",
+        "--uploader=/explicit/uploader",
+        "--validator=/explicit/validator",
+        "--supervisor=/explicit/supervisor",
+        "--az-python=/explicit/python",
+        "--azure-runtime=/explicit/azure-runtime.json",
+    });
+    defer parsed_admit.deinit();
+    try std.testing.expectEqual(error.MissingIndependentCommitments, authority.handlers.run(ctx, parsed_admit.result.command).admission.refused.err);
 }
 
 pub const Fixture = struct {
