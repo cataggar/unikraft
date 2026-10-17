@@ -768,7 +768,6 @@ fn liveImportedAuthorityComposition(
 
         var interpreter = try files.RetainedFile.open(work.io, try work.join("authority-work/runtime-source/python"), .tool);
         defer interpreter.close(work.io);
-        const interpreter_sha256 = try handoff.retained_copy.hashRetained(work.io, &interpreter, authority.types.runtime.max_file_bytes, null);
         var loader = try files.RetainedFile.open(work.io, loader_source_path, .artifact);
         defer loader.close(work.io);
         var alpha = try files.RetainedFile.open(work.io, try work.join("authority-work/runtime-source/libalpha.so"), .artifact);
@@ -777,103 +776,83 @@ fn liveImportedAuthorityComposition(
         defer beta.close(work.io);
         var ext = try files.RetainedFile.open(work.io, try work.join("authority-work/runtime-source/python3.11/_ext.so"), .artifact);
         defer ext.close(work.io);
+        const runtime_output_path = try work.join("authority-work/azure-runtime");
+        const launcher_source_path = try work.join("authority-work/runtime-source/launcher");
+        const python_source_path = try work.join("authority-work/runtime-source/python");
         const stdlib_root = try work.join("authority-work/runtime-source/python3.11");
-        const package_roots = [_][]const u8{try work.join("authority-work/runtime-source/packages")};
-        const data_roots = [_][]const u8{try work.join("authority-work/runtime-source/data")};
-        var discovered = try authority.runtime_probes.discover(ctx, .{
+        const package_root = try work.join("authority-work/runtime-source/packages");
+        const data_root = try work.join("authority-work/runtime-source/data");
+        const discovery: authority.runtime_probes.DiscoveryInput = .{
             .interpreter = &interpreter,
             .dynamic_loader = &loader,
             .native_roots = &.{&ext},
             .candidates = &.{ &alpha, &beta },
-        });
-        defer discovered.deinit();
-        try std.testing.expectEqual(&loader, discovered.inventory.dynamic_loader);
-        try std.testing.expectEqual(@as(usize, 3), discovered.inventory.dependencies.len);
-        try std.testing.expectEqual(@as(usize, 3), discovered.names.len);
+        };
 
-        var stage = try authority.runtime_copy.Stage.initNamed(
-            ctx,
-            .{
-                .output = try work.join("authority-work/azure-runtime"),
-                .azure = try work.join("authority-work/runtime-source/launcher"),
-                .az_python = try work.join("authority-work/runtime-source/python"),
-                .stdlib = stdlib_root,
-                .package_root = &package_roots,
-                .data_root = &data_roots,
-            },
-            discovered.inventory,
-            discovered.names,
-        );
-        defer stage.deinit();
-        try stage.bindInterpreter(&interpreter, interpreter_sha256);
-        try std.testing.expect(stage.copyStage() == .staged);
-        const draft = try stage.manifestInputs();
-        try std.testing.expectEqual(@as(usize, 3), draft.loader_dependencies.len);
-        try std.testing.expectEqual(@as(usize, 5), draft.native_files.len);
-        const layout = try stage.layout();
-        const runtime_output = try authority_dir.openDir(work.io, "azure-runtime", .{});
-        defer runtime_output.close(work.io);
-        try writeModeFile(work.io, runtime_output, "azure-runtime.manifest", draft.bytes, 0o600);
-        var manifest = try files.RetainedFile.open(work.io, draft.manifest.path, .private);
-        defer manifest.close(work.io);
-        const commitments = try draft.bindManifest(ctx, &manifest);
-        const contract: authority.types.runtime.Contract = .{
-            .schema = "uk.wamr.azure-cli-runtime-closure",
-            .version = 1,
-            .canonicalization = "utf8-byte-sorted-keys-compact-lf-v1",
-            .root = layout.root,
-            .python_version = "3.11",
-            .extensions = layout.extensions,
-            .launcher = draft.launcher,
-            .interpreter = draft.interpreter,
-            .dynamic_loader = draft.dynamic_loader,
-            .manifest = draft.manifest,
-            .limits = authority.runtime_copy.canonicalLimits(),
-            .observed = draft.observed,
-            .content_sha256 = &commitments.content_sha256,
-            .metadata_sha256 = &commitments.metadata_sha256,
-            .parents_sha256 = &commitments.parents_sha256,
-            .loader_dependencies = draft.loader_dependencies,
-            .commands = &authority.types.runtime.commands,
-            .isolation = .{
-                .python_home = .closure_root,
-                .module_layout = .flat_python_home_v1,
-                .extensions = .closure_empty,
-                .dynamic_extension_install = .disabled,
-                .user_site = .disabled,
-                .site_import = .disabled,
-                .bytecode_writes = .disabled,
-                .path_environment = .forbidden,
-                .startup_hooks = .forbidden,
-                .loader_environment = .retained_readonly_root,
-                .host_loader_fallback = .forbidden,
-                .package_restore = .forbidden_after_custody,
+        var parsed_prepare = try authority.cli.parse(std.testing.allocator, &.{
+            "prepare-azure-runtime",
+            try std.fmt.allocPrint(work.a, "--output={s}", .{runtime_output_path}),
+            try std.fmt.allocPrint(work.a, "--azure={s}", .{launcher_source_path}),
+            try std.fmt.allocPrint(work.a, "--az-python={s}", .{python_source_path}),
+            try std.fmt.allocPrint(work.a, "--stdlib={s}", .{stdlib_root}),
+            try std.fmt.allocPrint(work.a, "--validator={s}", .{tools.validator}),
+            try std.fmt.allocPrint(work.a, "--package-root={s}", .{package_root}),
+            try std.fmt.allocPrint(work.a, "--data-root={s}", .{data_root}),
+        });
+        defer parsed_prepare.deinit();
+
+        const prepare_outcome = authority.handlers.run(
+            .{ .retained = ctx, .discovery = discovery },
+            parsed_prepare.result.command,
+        ).prepare;
+        const prepare_diag = switch (prepare_outcome) {
+            .poisoned => |failure| failure,
+            .refused => return error.UnexpectedEarlyPrepareRefusal,
+            .success => |prepared| {
+                prepared.deinit();
+                return error.SyntheticRuntimeAccepted;
             },
         };
-        const copied_elf = try authority.runtime_probes.inspectCopied(ctx, .{
-            .root = try stage.root(),
-            .layout = layout,
-            .contract = contract,
-            .barrier = stage.barrier(),
-        });
-        try std.testing.expectEqual(@as(u32, 5), copied_elf.native_files);
-        try std.testing.expectEqual(@as(u16, 3), copied_elf.loader_files);
-        try std.testing.expectEqual(@as(u32, 3), copied_elf.needed_edges);
-        try std.testing.expect(copied_elf.interpreter_closure[0]);
-        try std.testing.expect(copied_elf.interpreter_closure[1]);
-        try std.testing.expect(copied_elf.interpreter_closure[2]);
-        try std.testing.expect(!copied_elf.interpreter_closure[3]);
-        const runtime_bytes = try authority.records.runtimeBytes(std.testing.allocator, contract);
-        defer std.testing.allocator.free(runtime_bytes);
-        try writeModeFile(work.io, runtime_output, "azure-runtime.json", runtime_bytes, 0o600);
-        try stage.revalidate();
+        try std.testing.expectEqual(authority.types.Phase.validation, prepare_diag.phase);
+        try std.testing.expectEqual(files.CommitStatus.durable, prepare_diag.publications.copy);
+        try std.testing.expectEqual(files.CommitStatus.durable, prepare_diag.publications.manifest);
+        try std.testing.expectEqual(files.CommitStatus.durable, prepare_diag.publications.pending);
+        try std.testing.expectEqual(files.CommitStatus.not_committed, prepare_diag.publications.validation);
+        try std.testing.expectEqual(files.CommitStatus.not_committed, prepare_diag.publications.output);
+        try std.testing.expectEqual(files.CommitStatus.durable, prepare_diag.publications.failure);
+        try std.testing.expect(prepare_diag.recording_error == null);
+        try std.testing.expectEqual(core.diagnostics.Stage.process_run, prepare_diag.failures.primary.?.stage);
+        try std.testing.expectEqual(core.diagnostics.Category.child_failed, prepare_diag.failures.primary.?.category);
+        try std.testing.expect(prepare_diag.helper_cleanup_complete);
+        try std.testing.expect(prepare_diag.native_validation != null);
+        try std.testing.expectEqual(core.process.CommandPrimary{ .exited = 0 }, prepare_diag.native_validation.?.primary);
+        try std.testing.expect(prepare_diag.native_validation.?.cleanup_complete);
+        try std.testing.expect(prepare_diag.probes != null);
+        try std.testing.expectEqual(@as(u8, 0), prepare_diag.probes.?.completed_steps);
+
+        const duplicate_prepare = authority.handlers.run(
+            .{ .retained = ctx, .discovery = discovery },
+            parsed_prepare.result.command,
+        ).prepare;
+        try std.testing.expect(duplicate_prepare == .refused);
+        try std.testing.expectEqual(error.PathAlreadyExists, duplicate_prepare.refused.err);
+        try std.testing.expectEqual(files.CommitStatus.not_committed, duplicate_prepare.refused.publications.copy);
+
+        const runtime_output = try authority_dir.openDir(work.io, "azure-runtime", .{});
+        defer runtime_output.close(work.io);
+        const pending_bytes = try work.read("authority-work/azure-runtime/azure-runtime.pending.json");
+        var parsed_contract = try authority.records.parse(authority.types.runtime.Contract, std.testing.allocator, pending_bytes);
+        defer parsed_contract.deinit();
+        try std.testing.expectEqual(@as(usize, 3), parsed_contract.value.loader_dependencies.len);
+        try std.testing.expectEqual(@as(u16, 3), parsed_contract.value.observed.loader_files);
+        try writeModeFile(work.io, runtime_output, "azure-runtime.json", pending_bytes, 0o600);
         break :blk .{
             .azure_runtime = try work.join("authority-work/azure-runtime/azure-runtime.json"),
-            .azure = try work.a.dupe(u8, draft.launcher.path),
+            .azure = try work.a.dupe(u8, parsed_contract.value.launcher.path),
             .uploader = try work.join("authority-work/runtime-source/uploader"),
             .validator = tools.validator,
             .supervisor = tools.supervisor,
-            .az_python = try work.a.dupe(u8, draft.interpreter.path),
+            .az_python = try work.a.dupe(u8, parsed_contract.value.interpreter.path),
         };
     };
 

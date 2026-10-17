@@ -188,8 +188,9 @@ refusals. Synthetic ELF is not executed in that joined negative test.
 `test-handoff-composition` (`-Dhandoff-composition-group=retention`) also
 exercises live imported-owner composition through `cli.parse` and `handlers.run`:
 a real v2 exact-download `ImportedProduct` and `candidate.create`/`candidate.open`
-`Finalized` owners drive `runtime_probes.discover` → `runtime_copy.Stage.initNamed`
-(`bindInterpreter` + `runtime_probes.inspectCopied`) → `plan` →
+`Finalized` owners drive `prepare-azure-runtime` (through COPY, manifest/pending
+publication, `uk-wamr-direct-validate azure-runtime`, `runtime_probes.inspectCopied`,
+and isolated helper synthetic-runtime refusal) → `plan` →
 `record-authorization` → `admit`, verified with `uk-wamr-direct-validate`
 (`azure-runtime`, `plan`, `authorization`, `admission`, `stored-scope`,
 `inputs`, `ledger`, `ledger-proposal`, and `serial`), while refusing
