@@ -1691,6 +1691,184 @@ fn cliPublicAndCandidateComposition(
         try std.testing.expectEqualStrings(expected_stdout, stage_res.stdout);
         try std.testing.expectEqualStrings("", stage_res.stderr);
         try std.testing.expectEqualSlices(u8, &inner_hex, &try work.digest("cli-staged-upload/tiny-aot-public-source.zip"));
+
+        const staged_upload_archive = try work.join("cli-staged-upload/tiny-aot-public-source.zip");
+        const uid = std.os.linux.geteuid();
+        const gid = std.os.linux.getegid();
+        const uid_text = try work.a.print("{d}", .{uid});
+        const gid_text = try work.a.print("{d}", .{gid});
+        const seal_cli_res = try std.process.run(work.a, work.io, .{
+            .argv = &.{
+                options.host_controller_cli,  "seal-public-source-upload",
+                "--archive",                  staged_upload_archive,
+                "--output",                   try work.join("cli-refused-sealed-upload"),
+                "--source-uid",               uid_text,
+                "--source-gid",               gid_text,
+                "--upload-gid",               gid_text,
+                "--expected-source",          receipt.context.source_revision,
+                "--expected-tree",            receipt.context.source_tree,
+                "--run-id",                   receipt.context.run_id,
+                "--run-attempt",              receipt.context.run_attempt,
+                "--expected-archive-sha256",  inner_hex[0..],
+            },
+            .cwd = .{ .path = repository },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, seal_cli_res.term);
+        try std.testing.expectEqualStrings("", seal_cli_res.stdout);
+        try std.testing.expect(std.mem.indexOf(u8, seal_cli_res.stderr, "seal-public-source-upload/inputs; cause: PrivilegeRequired; publication: not_committed") != null);
+        try work.absent("cli-refused-sealed-upload");
+
+        const wrong_owner_sealed = handoff.public_transport.publication.sealUploadForTest(.{
+            .allocator = work.a,
+            .io = work.io,
+            .source_path = staged_upload_archive,
+            .source_uid = uid + 1,
+            .source_gid = gid,
+            .upload_gid = gid,
+            .output_path = try work.join("cli-wrong-owner-sealed-upload"),
+            .context = receipt.context,
+            .inner_digest = .{ .bytes = receipt.inner },
+        });
+        try std.testing.expectEqual(handoff.public_transport.publication.Outcome{
+            .refused = .{ .phase = .inputs, .err = error.UnsafeSource, .publication = .not_committed },
+        }, wrong_owner_sealed);
+        try work.absent("cli-wrong-owner-sealed-upload");
+
+        const sealed_dir_path = try work.join("cli-sealed-upload");
+        defer if (work.root.openDir(work.io, "cli-sealed-upload", .{ .iterate = true, .follow_symlinks = false })) |dir| {
+            defer dir.close(work.io);
+            makeDirectoryRemovable(work.io, dir) catch {};
+        } else |_| {};
+        const sealed_outcome = handoff.public_transport.publication.sealUploadForTest(.{
+            .allocator = work.a,
+            .io = work.io,
+            .source_path = staged_upload_archive,
+            .source_uid = uid,
+            .source_gid = gid,
+            .upload_gid = gid,
+            .output_path = sealed_dir_path,
+            .context = receipt.context,
+            .inner_digest = .{ .bytes = receipt.inner },
+        });
+        try std.testing.expect(sealed_outcome == .success);
+        var sealed = sealed_outcome.success;
+        defer sealed.deinit(work.io);
+        try sealed.revalidate(work.io, null);
+        try std.testing.expectEqualSlices(u8, &receipt.inner, &sealed.digest);
+        try std.testing.expectEqual(@as(u32, 0o440), sealed.output.snapshot.mode & 0o7777);
+        try std.testing.expectEqual(@as(u32, 0o550), sealed.output.snapshots[sealed.output.count - 1].mode & 0o7777);
+        try std.testing.expectError(error.UnsafeFile, files.RetainedFile.open(work.io, try work.join("cli-sealed-upload/tiny-aot-public-source.zip"), .private));
+
+        var ci_env: std.process.Environ.Map = .init(work.a);
+        defer ci_env.deinit();
+        try ci_env.put("GITHUB_ACTIONS", "true");
+        try ci_env.put("GITHUB_REPOSITORY", receipt.context.repository);
+        try ci_env.put("GITHUB_JOB", "wamr-native-compute");
+        try ci_env.put("GITHUB_EVENT_NAME", "pull_request");
+        try ci_env.put("GITHUB_REPOSITORY_VISIBILITY", "public");
+        try ci_env.put("GITHUB_WORKSPACE", repository);
+        try ci_env.put("GITHUB_SHA", receipt.context.source_revision);
+        try ci_env.put("GITHUB_WORKFLOW_REF", "cataggar/unikraft/.github/workflows/wamr-native-compute.yaml@refs/heads/zig16");
+        try ci_env.put("GITHUB_RUN_ID", receipt.context.run_id);
+        try ci_env.put("GITHUB_RUN_ATTEMPT", receipt.context.run_attempt);
+
+        const archive_mismatch_res = try std.process.run(work.a, work.io, .{
+            .argv = &.{
+                options.host_controller_cli, "public-archive",
+                "--stage-root",              stage,
+                "--validation-output",       try work.join("cli-public-archive-mismatch-validation"),
+                "--output",                  try work.join("cli-public-archive-mismatch"),
+                "--git",                     tools.git,
+                "--supervisor",              options.host_controller_cli,
+                "--validator",               tools.validator,
+                "--expected-source",         receipt.context.source_revision,
+                "--expected-tree",           "0000000000000000000000000000000000000000",
+                "--run-id",                  receipt.context.run_id,
+                "--run-attempt",             receipt.context.run_attempt,
+            },
+            .cwd = .{ .path = repository },
+            .environ_map = &ci_env,
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, archive_mismatch_res.term);
+        try std.testing.expectEqualStrings("", archive_mismatch_res.stdout);
+        try std.testing.expect(std.mem.indexOf(u8, archive_mismatch_res.stderr, "public-archive/inputs; cause: ContextMismatch; publication: not_committed") != null);
+        try work.absent("cli-public-archive-mismatch-validation");
+        try work.absent("cli-public-archive-mismatch");
+
+        const archive_scope_res = try std.process.run(work.a, work.io, .{
+            .argv = &.{
+                options.host_controller_cli, "public-archive",
+                "--stage-root",              stage,
+                "--validation-output",       try work.join("cli-public-archive-scope-validation"),
+                "--output",                  try work.join("cli-public-archive-scope"),
+                "--git",                     tools.git,
+                "--supervisor",              options.host_controller_cli,
+                "--validator",               tools.validator,
+                "--expected-source",         receipt.context.source_revision,
+                "--expected-tree",           receipt.context.source_tree,
+                "--run-id",                  receipt.context.run_id,
+                "--run-attempt",             receipt.context.run_attempt,
+            },
+            .cwd = .{ .path = repository },
+            .environ_map = &ci_env,
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, archive_scope_res.term);
+        try std.testing.expectEqualStrings("", archive_scope_res.stdout);
+        try std.testing.expect(std.mem.indexOf(u8, archive_scope_res.stderr, "public-archive/archive; cause: InvalidPublicScope; publication: not_committed") != null);
+        try std.testing.expect((try work.read("cli-public-archive-scope-validation/evidence/command-import-native-revalidation.json")).len > 0);
+        try work.absent("cli-public-archive-scope");
+
+        const bundle_digest_res = try std.process.run(work.a, work.io, .{
+            .argv = &.{
+                options.host_controller_cli,  "import-public-source-bundle",
+                "--archive",                  inner_archive,
+                "--output",                   try work.join("cli-refused-bundle-digest"),
+                "--git",                      tools.git,
+                "--supervisor",               options.host_controller_cli,
+                "--validator",                tools.validator,
+                "--expected-source",          receipt.context.source_revision,
+                "--expected-tree",            receipt.context.source_tree,
+                "--run-id",                   receipt.context.run_id,
+                "--run-attempt",              receipt.context.run_attempt,
+                "--expected-archive-sha256",  "0000000000000000000000000000000000000000000000000000000000000000",
+            },
+            .cwd = .{ .path = repository },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, bundle_digest_res.term);
+        try std.testing.expectEqualStrings("", bundle_digest_res.stdout);
+        try std.testing.expect(std.mem.indexOf(u8, bundle_digest_res.stderr, "import-public-source-bundle/inputs; cause: DigestMismatch; publication: not_committed") != null);
+        try work.absent("cli-refused-bundle-digest");
+
+        const bundle_v2_res = try std.process.run(work.a, work.io, .{
+            .argv = &.{
+                options.host_controller_cli,  "import-public-source-bundle",
+                "--archive",                  inner_archive,
+                "--output",                   try work.join("cli-refused-bundle-v2"),
+                "--git",                      tools.git,
+                "--supervisor",               options.host_controller_cli,
+                "--validator",                tools.validator,
+                "--expected-source",          receipt.context.source_revision,
+                "--expected-tree",            receipt.context.source_tree,
+                "--run-id",                   receipt.context.run_id,
+                "--run-attempt",              receipt.context.run_attempt,
+                "--expected-archive-sha256",  inner_hex[0..],
+            },
+            .cwd = .{ .path = repository },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, bundle_v2_res.term);
+        try std.testing.expectEqualStrings("", bundle_v2_res.stdout);
+        try std.testing.expect(std.mem.indexOf(u8, bundle_v2_res.stderr, "import-public-source-bundle/inputs; cause: ExactDownloadRequired; publication: not_committed") != null);
+        try work.absent("cli-refused-bundle-v2");
     }
 
     // 3. CLI retain-public-source-download (mismatched selection refused; matching selection retained).
