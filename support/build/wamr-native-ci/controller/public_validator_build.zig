@@ -144,7 +144,7 @@ pub fn runValidated(
     defer allocator.free(validator_path);
     var validator = try files.RetainedFile.open(io, validator_path, .tool);
     defer validator.close(io);
-    const validator_record = try physical.readFile(io, validator_path, 64 * 1024 * 1024, false);
+    const validator_record = try physical.readFileCached(io, validator_path, 64 * 1024 * 1024, false, &accepted.ensureCustodyCache().known_files);
     if (validator_record.bytes < 20 or validator_record.bytes > 64 * 1024 * 1024 or
         !std.meta.eql(validator_record.metadata, physical.metadata(validator.file_snapshot)))
         return error.InvalidValidator;
@@ -171,9 +171,10 @@ pub fn validateCommandEvidence(
     output: []const u8,
     expected_bytes: usize,
 ) !@import("command_validation.zig").ValidatedCommand {
+    const known_files = &accepted.ensureCustodyCache().known_files;
     const record_path = try std.fs.path.join(allocator, &.{ output, "evidence/command-public-validator-build.json" });
     defer allocator.free(record_path);
-    const record = try physical.readFile(io, record_path, records.max_record_bytes, true);
+    const record = try physical.readFileCached(io, record_path, records.max_record_bytes, true, known_files);
     var pinned = try files.RetainedFile.open(io, record_path, .private);
     defer pinned.close(io);
     const raw = try allocator.alloc(u8, @intCast(record.bytes));
@@ -191,7 +192,7 @@ pub fn validateCommandEvidence(
     );
     const log_path = try std.fs.path.join(allocator, &.{ output, "private/public-validator-build.log" });
     defer allocator.free(log_path);
-    const log = try physical.readFile(io, log_path, 8 * 1024 * 1024 + 1, true);
+    const log = try physical.readFileCached(io, log_path, 8 * 1024 * 1024 + 1, true, known_files);
     if (checked.output_bytes != expected_bytes or checked.output_bytes != log.bytes or
         !std.mem.eql(u8, &checked.output_sha256, &log.sha256))
         return error.CommandOutputChanged;

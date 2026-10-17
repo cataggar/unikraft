@@ -8,6 +8,7 @@ Regenerate intentionally with:
 import argparse
 import ast
 import contextlib
+import functools
 import hashlib
 import importlib.util
 import io
@@ -112,9 +113,12 @@ def digest_bytes(data):
     return _ORIGINAL_SHA256(data).hexdigest()
 
 
+@functools.lru_cache(maxsize=None)
 def digest_label(label):
     return digest_bytes(("authority-contract:" + label).encode("utf-8"))
 
+
+@functools.lru_cache(maxsize=None)
 def native_cost_coefficients():
     source = (ROOT / "support/tools/hyperv/direct/compute.zig").read_text(encoding="utf-8")
     result = {}
@@ -185,11 +189,18 @@ class AuthorityOracle:
         SCRATCH.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.root.mkdir(mode=0o700)
         self.anchor.mkdir(mode=0o700)
+        self._anchor_str = str(self.anchor)
+        self._anchor_prefix = self._anchor_str + "/"
+        self._anchor_bytes = self._anchor_str.encode("utf-8")
 
     def logical(self, path):
         raw = os.fspath(path)
         if raw.startswith("/authority"):
             return raw
+        if raw == self._anchor_str:
+            return "/authority"
+        if raw.startswith(self._anchor_prefix) and ".." not in raw:
+            return "/authority/" + raw[len(self._anchor_prefix):]
         physical = Path(raw)
         try:
             relative = physical.resolve(strict=False).relative_to(self.anchor.resolve(strict=False))
@@ -206,8 +217,7 @@ class AuthorityOracle:
         return Path(raw)
 
     def normalize_bytes(self, data):
-        anchor = str(self.anchor).encode("utf-8")
-        return bytes(data).replace(anchor, b"/authority")
+        return bytes(data).replace(self._anchor_bytes, b"/authority")
 
     def stable_file_bytes(self, path):
         return self.normalize_bytes(self.physical(path).read_bytes())
@@ -218,15 +228,13 @@ class AuthorityOracle:
 
     def fake_lstat(self, original_lstat, path):
         physical = self.physical(path)
-        if not physical.exists():
-            return original_lstat(path)
         try:
+            real = original_lstat(physical)
             logical = self.logical(physical)
         except OSError:
             return original_lstat(path)
         if not logical.startswith("/authority"):
-            return original_lstat(path)
-        real = original_lstat(physical)
+            return real
         if stat.S_ISDIR(real.st_mode):
             mode = stat.S_IFDIR | (stat.S_IMODE(real.st_mode) or 0o500)
             size = 4096
@@ -240,7 +248,7 @@ class AuthorityOracle:
 
     def normalize_value(self, value):
         if isinstance(value, str):
-            return value.replace(str(self.anchor), "/authority")
+            return value.replace(self._anchor_str, "/authority")
         if isinstance(value, list):
             return [self.normalize_value(item) for item in value]
         if isinstance(value, dict):
@@ -803,6 +811,7 @@ def cli_surface(handoff):
     return result
 
 
+@functools.lru_cache(maxsize=None)
 def run_handoff(*args):
     env = {"PYTHONDONTWRITEBYTECODE": "1", "LC_ALL": "C"}
     completed = _ORIGINAL_SUBPROCESS_RUN(
@@ -1178,39 +1187,60 @@ def runtime_bound_probes(handoff, oracle, inputs):
     scan_file = oracle.write_input("scan-bound/file", b"real scan content\n", 0o400)
     original_lstat = Path.lstat
     scanned_digest = oracle.digest(scan_file)
+    root_stat = original_lstat(scan_root)
+    dir_stat = FakeStat(mode=stat.S_IFDIR | 0o500, size=4096, path_key="/authority/scan-bound/d")
+    reg_stat = FakeStat(mode=stat.S_IFREG | 0o400, size=1, path_key="/authority/scan-bound/f")
+    max_file_stat = FakeStat(
+        mode=stat.S_IFREG | 0o400,
+        size=handoff.AZURE_RUNTIME_MAX_FILE_BYTES,
+        path_key="/authority/scan-bound/f",
+    )
+    root_parts_len = len(scan_root.parts)
+    file_entries = tuple(
+        types.SimpleNamespace(name=f"file-{index}")
+        for index in range(handoff.AZURE_RUNTIME_MAX_FILES + 1)
+    )
+    dir_entries = tuple(
+        types.SimpleNamespace(name=f"directory-{index}")
+        for index in range(handoff.AZURE_RUNTIME_MAX_DIRECTORIES)
+    )
+    depth_entry = (types.SimpleNamespace(name="directory"),)
 
     def scan_bound(kind, count):
         @contextlib.contextmanager
         def scandir(path):
             path = Path(path)
             if kind == "files" and path == scan_root:
-                names = (f"file-{index}" for index in range(count))
+                entries = file_entries[:count]
             elif kind == "directories" and path == scan_root:
-                names = (f"directory-{index}" for index in range(count - 1))
+                entries = dir_entries[:count - 1]
             elif kind == "bytes" and path == scan_root:
-                names = (f"file-{index}" for index in range(
-                    (count + handoff.AZURE_RUNTIME_MAX_FILE_BYTES - 1) // handoff.AZURE_RUNTIME_MAX_FILE_BYTES))
+                entries = file_entries[
+                    :(count + handoff.AZURE_RUNTIME_MAX_FILE_BYTES - 1) // handoff.AZURE_RUNTIME_MAX_FILE_BYTES
+                ]
             elif kind == "depth":
-                depth = len(path.relative_to(scan_root).parts)
-                names = ("directory",) if depth < count else ()
+                depth = len(path.parts) - root_parts_len
+                entries = depth_entry if depth < count else ()
             else:
-                names = ()
-            yield (types.SimpleNamespace(name=name) for name in names)
+                entries = ()
+            yield entries
 
         def lstat(path):
             if path == scan_root:
-                return original_lstat(path)
-            relative = path.relative_to(scan_root)
-            directory = kind in ("directories", "depth")
-            size = 1
-            if kind == "bytes":
-                index = int(path.name.removeprefix("file-"))
-                size = min(handoff.AZURE_RUNTIME_MAX_FILE_BYTES,
-                           count - index * handoff.AZURE_RUNTIME_MAX_FILE_BYTES)
+                return root_stat
+            if kind in ("directories", "depth"):
+                return dir_stat
+            if kind == "files":
+                return reg_stat
+            index = int(path.name.removeprefix("file-"))
+            size = min(handoff.AZURE_RUNTIME_MAX_FILE_BYTES,
+                       count - index * handoff.AZURE_RUNTIME_MAX_FILE_BYTES)
+            if size == handoff.AZURE_RUNTIME_MAX_FILE_BYTES:
+                return max_file_stat
             return FakeStat(
-                mode=stat.S_IFDIR | 0o500 if directory else stat.S_IFREG | 0o400,
-                size=4096 if directory else size,
-                path_key="/authority/scan-bound/" + relative.as_posix())
+                mode=stat.S_IFREG | 0o400,
+                size=size,
+                path_key="/authority/scan-bound/f")
 
         # Virtual entries scale counts/sizes, but use real fixture content hashes.
         with mock.patch.object(handoff.os, "scandir", scandir), \
@@ -1218,14 +1248,28 @@ def runtime_bound_probes(handoff, oracle, inputs):
                 mock.patch.object(handoff.ci, "digest", lambda unused: scanned_digest):
             handoff._scan_azure_runtime(scan_root, scan_file, scan_file, ())
 
-    for name, limit in (
-        ("files", handoff.AZURE_RUNTIME_MAX_FILES),
-        ("directories", handoff.AZURE_RUNTIME_MAX_DIRECTORIES),
-        ("bytes", handoff.AZURE_RUNTIME_MAX_BYTES),
-        ("depth", handoff.AZURE_RUNTIME_MAX_DEPTH),
-    ):
-        probe("scan_" + name, limit,
-              lambda count, name=name: scan_bound(name, count))
+    scan_key = (
+        handoff._scan_azure_runtime.__code__.co_code,
+        handoff._scan_azure_runtime.__code__.co_consts,
+        handoff.AZURE_RUNTIME_MAX_FILES,
+        handoff.AZURE_RUNTIME_MAX_DIRECTORIES,
+        handoff.AZURE_RUNTIME_MAX_BYTES,
+        handoff.AZURE_RUNTIME_MAX_DEPTH,
+        handoff.AZURE_RUNTIME_MAX_FILE_BYTES,
+    )
+    if scan_key in _SCAN_BOUND_CACHE:
+        results.extend(_SCAN_BOUND_CACHE[scan_key])
+    else:
+        before_scan = len(results)
+        for name, limit in (
+            ("files", handoff.AZURE_RUNTIME_MAX_FILES),
+            ("directories", handoff.AZURE_RUNTIME_MAX_DIRECTORIES),
+            ("bytes", handoff.AZURE_RUNTIME_MAX_BYTES),
+            ("depth", handoff.AZURE_RUNTIME_MAX_DEPTH),
+        ):
+            probe("scan_" + name, limit,
+                  lambda count, name=name: scan_bound(name, count))
+        _SCAN_BOUND_CACHE[scan_key] = list(results[before_scan:])
 
     def file_bytes(size):
         def lstat(path):
@@ -1272,7 +1316,21 @@ def runtime_bound_probes(handoff, oracle, inputs):
     return results
 
 
+_DEFAULT_GOLDEN_CACHE = None
+_SCAN_BOUND_CACHE = {}
+_LIVE_PROBES_CACHE = {}
+_RUNTIME_BOUND_CACHE = {}
+
+
+def _func_fingerprint(func):
+    return (func.__code__.co_code, func.__code__.co_consts)
+
+
 def authority_contract_golden(handoff=None):
+    global _DEFAULT_GOLDEN_CACHE
+    use_cache = handoff is None
+    if use_cache and _DEFAULT_GOLDEN_CACHE is not None:
+        return _DEFAULT_GOLDEN_CACHE
     handoff = load("handoff") if handoff is None else handoff
     oracle = AuthorityOracle(handoff)
     oracle.reset()
@@ -1304,7 +1362,30 @@ def authority_contract_golden(handoff=None):
                 "authorization_denied": denied["authorization"],
                 "admission": admission["admission"],
             }
-            probes = derive_live_probes(handoff, oracle, base)
+            live_key = (
+                _func_fingerprint(handoff.plan),
+                _func_fingerprint(handoff.record_authorization),
+                _func_fingerprint(handoff.admission),
+                canonical_json(handoff, values["plan"]),
+                canonical_json(handoff, values["approval_template"]),
+            )
+            if live_key in _LIVE_PROBES_CACHE:
+                probes = _LIVE_PROBES_CACHE[live_key]
+            else:
+                probes = derive_live_probes(handoff, oracle, base)
+                _LIVE_PROBES_CACHE[live_key] = probes
+            runtime_bound_key = (
+                _func_fingerprint(handoff._RuntimeCopyBudget.__init__),
+                _func_fingerprint(handoff._RuntimeCopyBudget.directory),
+                _func_fingerprint(handoff._RuntimeCopyBudget.file),
+                _func_fingerprint(handoff._scan_azure_runtime),
+                _func_fingerprint(handoff.prepare_azure_runtime),
+            )
+            if runtime_bound_key in _RUNTIME_BOUND_CACHE:
+                runtime_bound_scenarios = _RUNTIME_BOUND_CACHE[runtime_bound_key]
+            else:
+                runtime_bound_scenarios = runtime_bound_probes(handoff, oracle, inputs)
+                _RUNTIME_BOUND_CACHE[runtime_bound_key] = runtime_bound_scenarios
             cost_coefficients = native_cost_coefficients()
             value = {
                 "schema": "uk.wamr.authority-contract-golden",
@@ -1369,9 +1450,12 @@ def authority_contract_golden(handoff=None):
                 "generated_ids": probes["generated_ids"],
                 "live_success_scenarios": probes["success_scenarios"],
                 "live_refusal_scenarios": probes["refusal_scenarios"],
-                "runtime_bound_scenarios": runtime_bound_probes(handoff, oracle, inputs),
+                "runtime_bound_scenarios": runtime_bound_scenarios,
             }
-            return canonical_file(value)
+            rendered = canonical_file(value)
+            if use_cache:
+                _DEFAULT_GOLDEN_CACHE = rendered
+            return rendered
     finally:
         remove_tree(oracle.root)
 
@@ -1410,11 +1494,12 @@ def scenario_inventory_golden():
 
 class AuthorityContractGoldens(unittest.TestCase):
     def test_oracle_preserves_existing_scratch_parent_contents(self):
+        global _DEFAULT_GOLDEN_CACHE
         SCRATCH.mkdir(mode=0o700, parents=True, exist_ok=True)
         marker = SCRATCH / ("retained-" + os.urandom(16).hex())
         marker.write_bytes(b"unrelated retained evidence\n")
         try:
-            authority_contract_golden()
+            _DEFAULT_GOLDEN_CACHE = authority_contract_golden(load("handoff"))
             self.assertEqual(b"unrelated retained evidence\n", marker.read_bytes())
         finally:
             marker.unlink()

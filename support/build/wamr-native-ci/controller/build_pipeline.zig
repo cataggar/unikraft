@@ -16,8 +16,97 @@ const fixture_contract = @import("fixture_contract.zig");
 const profile = @import("profile.zig");
 const limits = @import("custody_limits.zig");
 
+const shm_magic = "UKWAMRC1";
+const max_shm_files: u32 = 65536;
+const max_shm_blobs: u32 = 16384;
+const shm_min_age_ns: i128 = 100 * std.time.ns_per_ms;
+const shm_file_entry_bytes: usize = @sizeOf([9]i128) + 64;
+const shm_blob_entry_bytes: usize = @sizeOf([9]i128) + 64 + 1 + 64;
+
+var shm_serial: std.atomic.Value(u32) = .init(0);
+
+fn currentRealtimeNs() i128 {
+    var ts: std.os.linux.timespec = undefined;
+    if (std.os.linux.errno(std.os.linux.clock_gettime(.REALTIME, &ts)) != .SUCCESS or ts.sec <= 0) return 0;
+    return (@as(i128, ts.sec) * std.time.ns_per_s) + ts.nsec;
+}
+
+fn formatPathZ(buf: []u8, comptime fmt: []const u8, args: anytype) ?[*:0]const u8 {
+    if (buf.len == 0) return null;
+    const printed = std.fmt.bufPrint(buf[0 .. buf.len - 1], fmt, args) catch return null;
+    buf[printed.len] = 0;
+    return buf[0..printed.len :0].ptr;
+}
+
+pub fn loadShmInto(
+    known_files: *std.AutoHashMap([9]i128, [64]u8),
+    known_git_blobs: *std.AutoHashMap([9]i128, custody.CachedBlob),
+) void {
+    const linux = std.os.linux;
+    var path_buf: [96]u8 = undefined;
+    const shm_path = formatPathZ(&path_buf, "/dev/shm/uk-wamr-custody-cache-{d}-v1.bin", .{linux.geteuid()}) orelse return;
+    const opened = linux.openat(linux.AT.FDCWD, shm_path, .{
+        .ACCMODE = .RDONLY,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    }, 0);
+    if (linux.errno(opened) != .SUCCESS) return;
+    const fd: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(fd);
+    var stx: linux.Statx = undefined;
+    if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .BASIC_STATS, &stx)) != .SUCCESS) return;
+    if (stx.mode & linux.S.IFMT != linux.S.IFREG or stx.uid != linux.geteuid() or stx.mode & 0o077 != 0) return;
+    const max_bytes: u64 = 16 + (@as(u64, max_shm_files) * shm_file_entry_bytes) + (@as(u64, max_shm_blobs) * shm_blob_entry_bytes);
+    if (stx.size < 16 or stx.size > max_bytes) return;
+    const size: usize = @intCast(stx.size);
+    const buf = std.heap.page_allocator.alloc(u8, size) catch return;
+    defer std.heap.page_allocator.free(buf);
+    var read_total: usize = 0;
+    while (read_total < size) {
+        const rc = linux.read(fd, buf[read_total..].ptr, size - read_total);
+        if (linux.errno(rc) != .SUCCESS or rc == 0) return;
+        read_total += rc;
+    }
+    if (!std.mem.eql(u8, buf[0..8], shm_magic)) return;
+    const files_count = std.mem.readInt(u32, buf[8..12], .little);
+    const blobs_count = std.mem.readInt(u32, buf[12..16], .little);
+    if (files_count > max_shm_files or blobs_count > max_shm_blobs) return;
+    const expected_size: usize = 16 + (@as(usize, files_count) * shm_file_entry_bytes) + (@as(usize, blobs_count) * shm_blob_entry_bytes);
+    if (size != expected_size) return;
+    known_files.ensureUnusedCapacity(files_count) catch return;
+    known_git_blobs.ensureUnusedCapacity(blobs_count) catch return;
+    var offset: usize = 16;
+    var i: u32 = 0;
+    while (i < files_count) : (i += 1) {
+        var meta: [9]i128 = undefined;
+        @memcpy(std.mem.asBytes(&meta), buf[offset .. offset + @sizeOf([9]i128)]);
+        offset += @sizeOf([9]i128);
+        var sha256: [64]u8 = undefined;
+        @memcpy(&sha256, buf[offset .. offset + 64]);
+        offset += 64;
+        known_files.put(meta, sha256) catch return;
+    }
+    var j: u32 = 0;
+    while (j < blobs_count) : (j += 1) {
+        var meta: [9]i128 = undefined;
+        @memcpy(std.mem.asBytes(&meta), buf[offset .. offset + @sizeOf([9]i128)]);
+        offset += @sizeOf([9]i128);
+        var blob: custody.CachedBlob = undefined;
+        @memcpy(&blob.oid, buf[offset .. offset + 64]);
+        offset += 64;
+        blob.oid_len = buf[offset];
+        offset += 1;
+        @memcpy(&blob.sha256, buf[offset .. offset + 64]);
+        offset += 64;
+        known_git_blobs.put(meta, blob) catch return;
+    }
+}
+
 pub const CustodyCache = struct {
     backing: std.mem.Allocator,
+    init_ns: i128,
+    loaded_files_count: u32 = 0,
+    loaded_blobs_count: u32 = 0,
     known_files: std.AutoHashMap([9]i128, [64]u8),
     known_git_blobs: std.AutoHashMap([9]i128, custody.CachedBlob),
     runtime_cache: std.AutoHashMap([9]i128, [][]const u8),
@@ -25,15 +114,133 @@ pub const CustodyCache = struct {
     python_stdlib_path: ?[]const u8 = null,
 
     pub fn init(backing: std.mem.Allocator) CustodyCache {
-        return .{
+        var cache: CustodyCache = .{
             .backing = backing,
+            .init_ns = currentRealtimeNs(),
             .known_files = std.AutoHashMap([9]i128, [64]u8).init(backing),
             .known_git_blobs = std.AutoHashMap([9]i128, custody.CachedBlob).init(backing),
             .runtime_cache = std.AutoHashMap([9]i128, [][]const u8).init(backing),
         };
+        loadShmInto(&cache.known_files, &cache.known_git_blobs);
+        cache.loaded_files_count = cache.known_files.count();
+        cache.loaded_blobs_count = cache.known_git_blobs.count();
+        return cache;
+    }
+
+    pub fn flush(self: *CustodyCache) void {
+        if (self.init_ns <= shm_min_age_ns) return;
+        const cutoff_ns = self.init_ns - shm_min_age_ns;
+        var eligible_files: u32 = 0;
+        var file_it = self.known_files.iterator();
+        while (file_it.next()) |entry| {
+            const meta = entry.key_ptr.*;
+            if (meta[6] > 0 and meta[7] > 0 and meta[8] > 0 and @max(meta[7], meta[8]) < cutoff_ns) {
+                eligible_files += 1;
+            }
+        }
+        var eligible_blobs: u32 = 0;
+        var blob_it = self.known_git_blobs.iterator();
+        while (blob_it.next()) |entry| {
+            const meta = entry.key_ptr.*;
+            if (meta[6] > 0 and meta[7] > 0 and meta[8] > 0 and @max(meta[7], meta[8]) < cutoff_ns) {
+                eligible_blobs += 1;
+            }
+        }
+        if (eligible_files <= self.loaded_files_count and eligible_blobs <= self.loaded_blobs_count) return;
+        loadShmInto(&self.known_files, &self.known_git_blobs);
+        eligible_files = 0;
+        file_it = self.known_files.iterator();
+        while (file_it.next()) |entry| {
+            const meta = entry.key_ptr.*;
+            if (meta[6] > 0 and meta[7] > 0 and meta[8] > 0 and @max(meta[7], meta[8]) < cutoff_ns) {
+                if (eligible_files < max_shm_files) eligible_files += 1;
+            }
+        }
+        eligible_blobs = 0;
+        blob_it = self.known_git_blobs.iterator();
+        while (blob_it.next()) |entry| {
+            const meta = entry.key_ptr.*;
+            if (meta[6] > 0 and meta[7] > 0 and meta[8] > 0 and @max(meta[7], meta[8]) < cutoff_ns) {
+                if (eligible_blobs < max_shm_blobs) eligible_blobs += 1;
+            }
+        }
+        const total_size: usize = 16 + (@as(usize, eligible_files) * shm_file_entry_bytes) + (@as(usize, eligible_blobs) * shm_blob_entry_bytes);
+        const buf = std.heap.page_allocator.alloc(u8, total_size) catch return;
+        defer std.heap.page_allocator.free(buf);
+        @memcpy(buf[0..8], shm_magic);
+        std.mem.writeInt(u32, buf[8..12], eligible_files, .little);
+        std.mem.writeInt(u32, buf[12..16], eligible_blobs, .little);
+        var offset: usize = 16;
+        var written_files: u32 = 0;
+        file_it = self.known_files.iterator();
+        while (file_it.next()) |entry| {
+            if (written_files >= eligible_files) break;
+            const meta = entry.key_ptr.*;
+            if (meta[6] > 0 and meta[7] > 0 and meta[8] > 0 and @max(meta[7], meta[8]) < cutoff_ns) {
+                @memcpy(buf[offset .. offset + @sizeOf([9]i128)], std.mem.asBytes(&meta));
+                offset += @sizeOf([9]i128);
+                @memcpy(buf[offset .. offset + 64], entry.value_ptr);
+                offset += 64;
+                written_files += 1;
+            }
+        }
+        var written_blobs: u32 = 0;
+        blob_it = self.known_git_blobs.iterator();
+        while (blob_it.next()) |entry| {
+            if (written_blobs >= eligible_blobs) break;
+            const meta = entry.key_ptr.*;
+            if (meta[6] > 0 and meta[7] > 0 and meta[8] > 0 and @max(meta[7], meta[8]) < cutoff_ns) {
+                @memcpy(buf[offset .. offset + @sizeOf([9]i128)], std.mem.asBytes(&meta));
+                offset += @sizeOf([9]i128);
+                @memcpy(buf[offset .. offset + 64], &entry.value_ptr.oid);
+                offset += 64;
+                buf[offset] = entry.value_ptr.oid_len;
+                offset += 1;
+                @memcpy(buf[offset .. offset + 64], &entry.value_ptr.sha256);
+                offset += 64;
+                written_blobs += 1;
+            }
+        }
+        const linux = std.os.linux;
+        var path_buf: [96]u8 = undefined;
+        const shm_path = formatPathZ(&path_buf, "/dev/shm/uk-wamr-custody-cache-{d}-v1.bin", .{linux.geteuid()}) orelse return;
+        var tmp_buf: [128]u8 = undefined;
+        const serial = shm_serial.fetchAdd(1, .monotonic);
+        const tmp_path = formatPathZ(&tmp_buf, "/dev/shm/uk-wamr-custody-cache-{d}-{d}-{d}.tmp", .{
+            linux.geteuid(),
+            linux.getpid(),
+            serial,
+        }) orelse return;
+        const opened = linux.openat(linux.AT.FDCWD, tmp_path, .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .EXCL = true,
+            .NOFOLLOW = true,
+            .CLOEXEC = true,
+        }, 0o600);
+        if (linux.errno(opened) != .SUCCESS) return;
+        const fd: linux.fd_t = @intCast(opened);
+        var write_ok = true;
+        var written_total: usize = 0;
+        while (written_total < total_size) {
+            const rc = linux.write(fd, buf[written_total..].ptr, total_size - written_total);
+            if (linux.errno(rc) != .SUCCESS or rc == 0) {
+                write_ok = false;
+                break;
+            }
+            written_total += rc;
+        }
+        _ = linux.close(fd);
+        if (!write_ok or linux.errno(linux.renameat(linux.AT.FDCWD, tmp_path, linux.AT.FDCWD, shm_path)) != .SUCCESS) {
+            _ = linux.unlinkat(linux.AT.FDCWD, tmp_path, 0);
+            return;
+        }
+        self.loaded_files_count = eligible_files;
+        self.loaded_blobs_count = eligible_blobs;
     }
 
     pub fn deinit(self: *CustodyCache) void {
+        self.flush();
         if (self.python_stdlib_path) |path| self.backing.free(path);
         var it = self.runtime_cache.valueIterator();
         while (it.next()) |paths| {
@@ -469,7 +676,7 @@ fn runStage(state: anytype, selected: plan.Stage, check_consumer: bool) !void {
     if (result.poisoned) return error.CleanupPoisoned;
     if (!result.accepted) return error.StageRefused;
     const record_path = try subpath(context, try context.allocator.print("evidence/command-{s}.json", .{@tagName(selected)}));
-    context.command_records[@backingInt(selected)] = try physical.readFile(context.io, record_path, limits.tracked_file, true);
+    context.command_records[@backingInt(selected)] = try physical.readFileCached(context.io, record_path, limits.tracked_file, true, knownFiles(context));
     try requireBuildEvidence(context);
     try requireSource(context);
     try dependencies.requireDocumentCached(context.allocator, context.io, context.repository, context.git, context.compute, context.dependency.?, knownFiles(context));
@@ -484,21 +691,21 @@ pub fn requireBuildEvidence(context: *Context) !void {
         defer context.allocator.free(relative);
         const path = try subpath(context, relative);
         defer context.allocator.free(path);
-        const current = try physical.readFile(context.io, path, limits.tracked_file, true);
+        const current = try physical.readFileCached(context.io, path, limits.tracked_file, true, knownFiles(context));
         if (!std.meta.eql(current, recorded)) return error.CommandEvidenceChanged;
     }
     if (context.build_start_record) |recorded| {
         try cancelled(context);
         const path = try subpath(context, "evidence/build-start.json");
         defer context.allocator.free(path);
-        const current = try physical.readFile(context.io, path, limits.tracked_file, true);
+        const current = try physical.readFileCached(context.io, path, limits.tracked_file, true, knownFiles(context));
         if (!std.meta.eql(current, recorded)) return error.BuildStartChanged;
     }
     if (context.fixture_report) |recorded| {
         try cancelled(context);
         const path = try subpath(context, "fixtures/native-scenarios.json");
         defer context.allocator.free(path);
-        const current = try physical.readFile(context.io, path, 8192, true);
+        const current = try physical.readFileCached(context.io, path, 8192, true, knownFiles(context));
         if (!std.meta.eql(current, recorded)) return error.FixtureChanged;
     }
 }
@@ -586,7 +793,7 @@ pub fn baseline(state: LocalBootBuilt) !InputsBaselined {
     try requireBootstrapInputs(context);
     const document = try buildStart(context);
     try evidence(context, "build-start.json", document);
-    context.build_start_record = try physical.readFile(context.io, try subpath(context, "evidence/build-start.json"), limits.tracked_file, true);
+    context.build_start_record = try physical.readFileCached(context.io, try subpath(context, "evidence/build-start.json"), limits.tracked_file, true, knownFiles(context));
     try requireBuildEvidence(context);
     return next(state, InputsBaselined);
 }
@@ -982,7 +1189,7 @@ pub fn loadAccepted(context: *Context) !void {
     const encoded = try std.json.Stringify.valueAlloc(a, reproduced, .{});
     const canonical = try records.canonicalAlloc(a, encoded);
     if (!std.mem.eql(u8, expected, canonical)) return error.BuildStartChanged;
-    context.build_start_record = try physical.readFile(io, try subpath(context, "evidence/build-start.json"), limits.tracked_file, true);
+    context.build_start_record = try physical.readFileCached(io, try subpath(context, "evidence/build-start.json"), limits.tracked_file, true, knownFiles(context));
     for ([_]plan.Stage{ .adapter, .@"local-boot-tool", .fixtures, .prepare, .config, .@"native-image" }) |stage| {
         const name = try a.print("evidence/command-{s}.json", .{@tagName(stage)});
         const path = try subpath(context, name);
@@ -995,7 +1202,7 @@ pub fn loadAccepted(context: *Context) !void {
         if (!std.mem.eql(u8, try core.contracts.string(object.get("stage") orelse return error.InvalidCommand), @tagName(stage)) or
             try core.contracts.integer(i32, object.get("exit_code") orelse return error.InvalidCommand) != 0)
             return error.BuildStageRefused;
-        context.command_records[@backingInt(stage)] = try physical.readFile(io, path, limits.tracked_file, true);
+        context.command_records[@backingInt(stage)] = try physical.readFileCached(io, path, limits.tracked_file, true, knownFiles(context));
     }
     try requireBuildEvidence(context);
     try revalidateAcceptedWithValue(context, try buildValueFromCurrent(context));
