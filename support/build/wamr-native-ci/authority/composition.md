@@ -186,12 +186,14 @@ copied-ELF refusal, collision retention, cancellation and explicit-context
 refusals. Synthetic ELF is not executed in that joined negative test.
 
 `test-handoff-composition` (`-Dhandoff-composition-group=retention`) also
-exercises live imported-owner composition through `handlers.run`: a real v2
-exact-download `ImportedProduct` and `candidate.create`/`candidate.open`
-`Finalized` owners drive `plan` → `record-authorization` → `admit`, while
-refusing `.private_bundle` owners, mismatched bundle/candidate/attempt/cost
-selectors, and denied authorization records. A genuine compatible x86
-Python/Azure runtime positive (with full 19-slot namespace probe execution)
-remains a separate gate, alongside standalone owner acquisition, trusted caller
-migration, genuine approvals, approval consumption, deletion authority and
-cloud/hardware acceptance.
+exercises live imported-owner composition through `cli.parse` and `handlers.run`:
+a real v2 exact-download `ImportedProduct` and `candidate.create`/`candidate.open`
+`Finalized` owners drive `plan` → `record-authorization` → `admit`, verified
+with `uk-wamr-direct-validate` (`azure-runtime`, `plan`, `authorization`,
+`admission`, `stored-scope`, `inputs`, `ledger`, `ledger-proposal`, and
+`serial`), while refusing `.private_bundle` owners, mismatched
+bundle/candidate/attempt/cost selectors, and denied authorization records. A
+genuine compatible x86 Python/Azure runtime positive (with full 19-slot
+namespace probe execution) remains a separate gate, alongside standalone owner
+acquisition, trusted caller migration, genuine approvals, approval consumption,
+deletion authority and cloud/hardware acceptance.
