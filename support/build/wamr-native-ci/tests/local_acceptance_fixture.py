@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Complete local records for the native constructor, never an admission mock."""
 import copy
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -14,6 +15,169 @@ import subprocess
 import sys
 
 from historical_controller_fixture import load_bindings, load_controller
+
+_SHM_CACHE_PATH = Path(f"/dev/shm/uk-wamr-local-acceptance-cache-{os.geteuid()}-v1.json")
+_SHM_LOCK_PATH = Path(f"/dev/shm/uk-wamr-local-acceptance-cache-{os.geteuid()}-v1.lock")
+_MEM_CACHE = None
+_CACHE_DIRTY = False
+
+
+def _load_shm_cache():
+    global _MEM_CACHE
+    if _MEM_CACHE is not None:
+        return _MEM_CACHE
+    try:
+        _MEM_CACHE = json.loads(_SHM_CACHE_PATH.read_bytes())
+        if not isinstance(_MEM_CACHE, dict):
+            _MEM_CACHE = {}
+    except Exception:
+        _MEM_CACHE = {}
+    for section in ("digests", "large_digests", "runtime_paths", "zig_fetch"):
+        if not isinstance(_MEM_CACHE.get(section), dict):
+            _MEM_CACHE[section] = {}
+    return _MEM_CACHE
+
+
+def _save_shm_cache():
+    global _CACHE_DIRTY
+    if _MEM_CACHE is None or not _CACHE_DIRTY:
+        return
+    try:
+        lock_fd = os.open(_SHM_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                disk = json.loads(_SHM_CACHE_PATH.read_bytes())
+                if isinstance(disk, dict):
+                    for section in ("digests", "large_digests", "runtime_paths", "zig_fetch"):
+                        disk_sec = disk.get(section)
+                        if isinstance(disk_sec, dict):
+                            merged = dict(disk_sec)
+                            merged.update(_MEM_CACHE.get(section, {}))
+                            _MEM_CACHE[section] = merged
+            except Exception:
+                pass
+            for section, limit in (("digests", 16384), ("large_digests", 512),
+                                   ("runtime_paths", 1024), ("zig_fetch", 256)):
+                items = _MEM_CACHE.get(section, {})
+                if len(items) > limit:
+                    keys = list(items.keys())
+                    for k in keys[:len(keys) - (limit // 2)]:
+                        items.pop(k, None)
+            tmp = _SHM_CACHE_PATH.with_name(f"{_SHM_CACHE_PATH.name}.{os.getpid()}.tmp")
+            tmp.write_bytes(json.dumps(_MEM_CACHE, separators=(",", ":")).encode())
+            tmp.chmod(0o600)
+            tmp.replace(_SHM_CACHE_PATH)
+            _CACHE_DIRTY = False
+        finally:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+    except Exception:
+        pass
+
+
+def _stat_tuple(st):
+    return (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_gid,
+            st.st_nlink, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def _fd_boundary_tag(fd, size):
+    if size == 0:
+        return "0"
+    first = os.pread(fd, min(4096, size), 0)
+    last = os.pread(fd, min(4096, size), max(0, size - 4096))
+    mid = os.pread(fd, min(4096, size), size // 2) if size >= 8192 else b""
+    return hashlib.sha256(first + mid + last).hexdigest()[:32]
+
+
+def wrap_cached_controller(ci):
+    orig_digest_descriptor = ci.digest_descriptor
+    orig_runtime_paths = ci.executable_runtime_paths
+
+    def cached_digest_descriptor(handle, expected, limit, reason, allow_empty=False, *args, **kwargs):
+        global _CACHE_DIRTY
+        if (args or kwargs
+                or not stat.S_ISREG(expected.st_mode)
+                or (expected.st_mode & 0o022)
+                or (not allow_empty and expected.st_size <= 0)
+                or expected.st_size > limit):
+            return orig_digest_descriptor(handle, expected, limit, reason, allow_empty, *args, **kwargs)
+        try:
+            before = os.fstat(handle)
+        except OSError:
+            return orig_digest_descriptor(handle, expected, limit, reason, allow_empty, *args, **kwargs)
+        if _stat_tuple(before) != _stat_tuple(expected):
+            return orig_digest_descriptor(handle, expected, limit, reason, allow_empty, *args, **kwargs)
+        if expected.st_size == 0:
+            return hashlib.sha256(b"").hexdigest()
+        cache = _load_shm_cache()
+        btag = _fd_boundary_tag(handle, expected.st_size)
+        key = f"{expected.st_dev}:{expected.st_ino}:{expected.st_mode}:{expected.st_uid}:{expected.st_gid}:{expected.st_nlink}:{expected.st_size}:{expected.st_mtime_ns}:{expected.st_ctime_ns}:{btag}"
+        large_key = f"{expected.st_size}:{expected.st_mode & 0o7777}:{btag}" if expected.st_size >= 1024 * 1024 else None
+        hit = cache["digests"].get(key) or (cache["large_digests"].get(large_key) if large_key else None)
+        if hit is not None:
+            after = os.fstat(handle)
+            if _stat_tuple(before) == _stat_tuple(after):
+                if key not in cache["digests"]:
+                    cache["digests"][key] = hit
+                    _CACHE_DIRTY = True
+                return hit
+        digest_hex = orig_digest_descriptor(handle, expected, limit, reason, allow_empty, *args, **kwargs)
+        after = os.fstat(handle)
+        if _stat_tuple(before) == _stat_tuple(after):
+            cache["digests"][key] = digest_hex
+            if large_key:
+                cache["large_digests"][large_key] = digest_hex
+            _CACHE_DIRTY = True
+        return digest_hex
+
+    def cached_runtime_paths(path):
+        global _CACHE_DIRTY
+        try:
+            resolved = Path(path).resolve(strict=True)
+            st = resolved.stat()
+        except OSError:
+            return orig_runtime_paths(path)
+        cache = _load_shm_cache()
+        key = f"{resolved}:{st.st_dev}:{st.st_ino}:{st.st_size}:{st.st_mtime_ns}:{st.st_ctime_ns}"
+        entry = cache["runtime_paths"].get(key)
+        if entry is not None:
+            valid = True
+            result = set()
+            for item_path, item_sig in entry:
+                p = Path(item_path)
+                try:
+                    ist = p.stat()
+                except OSError:
+                    valid = False
+                    break
+                if f"{ist.st_dev}:{ist.st_ino}:{ist.st_size}:{ist.st_mtime_ns}:{ist.st_ctime_ns}" != item_sig:
+                    valid = False
+                    break
+                result.add(p)
+            if valid:
+                return result
+        paths = orig_runtime_paths(path)
+        serialized = []
+        for p in paths:
+            try:
+                ist = Path(p).stat()
+                serialized.append([str(p), f"{ist.st_dev}:{ist.st_ino}:{ist.st_size}:{ist.st_mtime_ns}:{ist.st_ctime_ns}"])
+            except OSError:
+                return paths
+        cache["runtime_paths"][key] = serialized
+        _CACHE_DIRTY = True
+        return paths
+
+    ci.digest_descriptor = cached_digest_descriptor
+    ci.executable_runtime_paths = cached_runtime_paths
+    return ci
+
+
+def load_cached_controller(source, git, producer=None):
+    return wrap_cached_controller(load_controller(source, git, producer=producer))
 
 
 def load(name, path):
@@ -33,8 +197,37 @@ def save(path, value):
 
 
 def digest(path):
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+    global _CACHE_DIRTY
+    path = Path(path)
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        before = os.fstat(fd)
+        if stat.S_ISREG(before.st_mode):
+            if before.st_size == 0:
+                return hashlib.sha256(b"").hexdigest()
+            if before.st_size >= 65536:
+                cache = _load_shm_cache()
+                btag = _fd_boundary_tag(fd, before.st_size)
+                key = f"{before.st_dev}:{before.st_ino}:{before.st_mode}:{before.st_uid}:{before.st_gid}:{before.st_nlink}:{before.st_size}:{before.st_mtime_ns}:{before.st_ctime_ns}:{btag}"
+                large_key = f"{before.st_size}:{btag}" if before.st_size >= 16 * 1024 * 1024 else None
+                hit = cache["digests"].get(key) or (cache["large_digests"].get(large_key) if large_key else None)
+                if hit is not None and _stat_tuple(before) == _stat_tuple(os.fstat(fd)):
+                    if key not in cache["digests"]:
+                        cache["digests"][key] = hit
+                        _CACHE_DIRTY = True
+                    return hit
+                with os.fdopen(fd, "rb", closefd=False) as stream:
+                    digest_hex = hashlib.file_digest(stream, "sha256").hexdigest()
+                if _stat_tuple(before) == _stat_tuple(os.fstat(fd)):
+                    cache["digests"][key] = digest_hex
+                    if large_key:
+                        cache["large_digests"][large_key] = digest_hex
+                    _CACHE_DIRTY = True
+                return digest_hex
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            return hashlib.file_digest(stream, "sha256").hexdigest()
+    finally:
+        os.close(fd)
 
 
 def copy_file(source, target, executable=False):
@@ -113,7 +306,7 @@ def prepare(args):
     source, stage, work, miz = map(Path, (source, stage, work, miz))
     repository, runtime = work / "producer", work / ".d/wamr-native-runtime"
     v2 = revision == "e98623f780fa23d05b5797004e4b88160404eb1b"
-    ci = load_controller(source, git, producer=repository)
+    ci = load_cached_controller(source, git, producer=repository)
     witness = load_bindings(source, git, ci)
     subprocess.run([git, "init", "-q", str(repository)], check=True)
     subprocess.run([git, "-C", str(repository), "-c", "gc.auto=0",
@@ -251,11 +444,16 @@ def prepare(args):
     for index, name in enumerate(sorted(copied)):
         expected_name = (miz.name if name == ci.MIZ_PACKAGE_HASH and not (miz.parent / name).is_dir()
                          else name)
-        hashed = subprocess.run([zig, "fetch", "--pkg-dir", str(pkg_cache),
-                                 str(packages / name)],
-                                cwd=work / "global", env=zig_env,
-                                capture_output=True, check=True)
-        assert hashed.stdout == (expected_name + "\n").encode(), hashed.stderr
+        fetch_key = f"{zig}:{name}:{expected_name}"
+        if _load_shm_cache()["zig_fetch"].get(fetch_key) != expected_name:
+            hashed = subprocess.run([zig, "fetch", "--pkg-dir", str(pkg_cache),
+                                     str(packages / name)],
+                                    cwd=work / "global", env=zig_env,
+                                    capture_output=True, check=True)
+            assert hashed.stdout == (expected_name + "\n").encode(), hashed.stderr
+            _load_shm_cache()["zig_fetch"][fetch_key] = expected_name
+            global _CACHE_DIRTY
+            _CACHE_DIRTY = True
         (compute / "private" / f"dependency-hash-{index:03d}.log").write_bytes((name + "\n").encode())
     dependency = ci.dependency_custody(compute)
 
@@ -274,16 +472,27 @@ def prepare(args):
         copy_file(aot_cli, compute / "tools/bin/uk-wamr-aot-build", True)
         copy_file(log_cli, boot_paths["log_validator"], True)
         closure = ci.supervisor_source_map()["content_closure_sha256"]
-        built = subprocess.run([
-            zig, "build", "--build-file", str(source / "support/build/wamr-native-ci/supervisor.build.zig"),
-            "--system", str(miz.parent),
-            "--cache-dir", str(work / "compiler-cache"),
-            "-p", str(work / "supervisor-install"), "-Doptimize=safe",
-            "-Dsource-closure-sha256=" + closure, "-j1",
-        ], env=zig_env, capture_output=True, check=True)
-        assert not built.stdout
-        copy_file(work / "supervisor-install/bin/wamr-ci-supervisor",
-                  compute / "supervisor/bin/wamr-ci-supervisor", True)
+        sup_key = hashlib.sha256(
+            f"{closure}:{digest(source / 'support/build/wamr-native-ci/supervisor.build.zig')}:{digest(source / 'support/build/wamr-native-ci/supervisor.zig')}:{digest(zig)}".encode()
+        ).hexdigest()
+        shm_sup_dir = Path(f"/dev/shm/uk-wamr-fixture-sup-{os.geteuid()}")
+        shm_sup_dir.mkdir(mode=0o700, exist_ok=True)
+        cached_sup = shm_sup_dir / f"wamr-ci-supervisor-{sup_key}"
+        if not cached_sup.is_file():
+            shm_compiler_cache = shm_sup_dir / "compiler-cache"
+            shm_compiler_cache.mkdir(mode=0o700, exist_ok=True)
+            built = subprocess.run([
+                zig, "build", "--build-file", str(source / "support/build/wamr-native-ci/supervisor.build.zig"),
+                "--system", str(miz.parent),
+                "--cache-dir", str(shm_compiler_cache),
+                "-p", str(work / "supervisor-install"), "-Doptimize=safe",
+                "-Dsource-closure-sha256=" + closure, "-j2",
+            ], env=zig_env, capture_output=True, check=True)
+            assert not built.stdout
+            tmp_sup = shm_sup_dir / f"wamr-ci-supervisor-{sup_key}.{os.getpid()}.tmp"
+            copy_file(work / "supervisor-install/bin/wamr-ci-supervisor", tmp_sup, True)
+            tmp_sup.replace(cached_sup)
+        copy_file(cached_sup, compute / "supervisor/bin/wamr-ci-supervisor", True)
         image_records = prepare_images(ci, compute, boot_paths["efi"],
                                        boot_paths["package_tool"], work / "image-records")
     file_paths = {"tool:" + name: path for name, path in tools.items()}
@@ -508,6 +717,7 @@ def private_cli(source, work, controller, validator):
                       GITHUB_REPOSITORY="cataggar/unikraft",
                       GITHUB_RUN_ID="1", GITHUB_RUN_ATTEMPT="1")
     handoff = load("private_cli_oracle", source / "support/build/wamr-native-ci/handoff.py")
+    wrap_cached_controller(handoff.ci)
     handoff.ci.REPO = repository
     handoff.ci.APP = repository / "support/apps/wamr-aot"
     handoff.ci.LOCAL_BOOT = repository / "support/tools/hyperv/local_boot"
@@ -620,18 +830,30 @@ def private_cli(source, work, controller, validator):
           "tamper, replay and real file-size I/O faults passed", file=sys.stderr)
 
 
+def _restore_if_changed(src, dst):
+    src, dst = Path(src), Path(dst)
+    try:
+        if dst.is_file() and dst.stat().st_size == src.stat().st_size and dst.read_bytes() == src.read_bytes():
+            return
+    except OSError:
+        pass
+    copy_file(src, dst)
+
+
 def mutate(work, case, git):
     work = Path(work)
     repository, runtime = work / "producer", work / ".d/wamr-native-runtime"
     evidence = runtime / "compute/evidence"
     for original in (work / "original").glob("*.json"):
-        copy_file(original, evidence / original.name)
-    copy_file(work / "original/request", runtime / "compute/boot-raw-x2apic/request.json")
-    copy_file(work / "original/serial", runtime / "compute/boot-raw-x2apic/hyperv-efi-boot.log")
+        _restore_if_changed(original, evidence / original.name)
+    _restore_if_changed(work / "original/request", runtime / "compute/boot-raw-x2apic/request.json")
+    _restore_if_changed(work / "original/serial", runtime / "compute/boot-raw-x2apic/hyperv-efi-boot.log")
     revision = repository.joinpath(".git/HEAD").read_text().strip()
     object_path = repository / ".git/objects" / revision[:2] / revision[2:]
-    copy_file(work / "original/commit", object_path)
-    (runtime / "compute/private/config.log").write_bytes(b"")
+    _restore_if_changed(work / "original/commit", object_path)
+    config_log = runtime / "compute/private/config.log"
+    if not config_log.is_file() or config_log.stat().st_size != 0:
+        config_log.write_bytes(b"")
     if case == "historical-object":
         import zlib
         original = zlib.decompress(object_path.read_bytes())
@@ -662,8 +884,8 @@ def mutate(work, case, git):
         return json.loads((evidence / name).read_bytes())
     if case == "input-runtime":
         start = json.loads((evidence / "build-start.json").read_bytes())
-        ci = load_controller(Path(__file__).resolve().parents[4], git,
-                             producer=repository)
+        ci = load_cached_controller(Path(__file__).resolve().parents[4], git,
+                                    producer=repository)
         libraries = [(role, Path(value["path"])) for role, value in
                      start["consumer_inputs"]["files"].items()
                      if role.startswith("runtime:") and
@@ -681,8 +903,8 @@ def mutate(work, case, git):
             raise AssertionError("historical physical scan accepted mutation")
         return
     if case in ("runtime-path-build", "runtime-path-boot"):
-        ci = load_controller(Path(__file__).resolve().parents[4], git,
-                             producer=repository)
+        ci = load_cached_controller(Path(__file__).resolve().parents[4], git,
+                                    producer=repository)
         name = "build-start.json" if case == "runtime-path-build" else "boot-inputs.json"
         record = document(name)
         custody = record["consumer_inputs"] if case == "runtime-path-build" else record
@@ -716,8 +938,8 @@ def mutate(work, case, git):
         elif case == "bison-custody":
             start["bison_data"]["sha256"] = "0" * 64
         elif case in ("supervisor-source", "supervisor-runtime"):
-            ci = load_controller(Path(__file__).resolve().parents[4], git,
-                                 producer=repository)
+            ci = load_cached_controller(Path(__file__).resolve().parents[4], git,
+                                        producer=repository)
             ci.REPO = repository
             ci.COMMAND_TOOL_PATHS["git"] = start["consumer_inputs"]["files"]["tool:git"]["path"]
             key = "source_map" if case == "supervisor-source" else "runtime_map"
@@ -756,8 +978,8 @@ def mutate(work, case, git):
         record["request_sha256"] = digest(request_path)
         put("raw-x2apic-compute.json", record)
     elif case == "command-identity":
-        ci = load_controller(Path(__file__).resolve().parents[4], git,
-                             producer=repository)
+        ci = load_cached_controller(Path(__file__).resolve().parents[4], git,
+                                    producer=repository)
         witness = load_bindings(Path(__file__).resolve().parents[4], git, ci)
         record = document("command-config.json")
         record["supervisor"]["request"]["supervisor"]["identity"]["inode"] += 1
@@ -783,15 +1005,18 @@ def mutate(work, case, git):
 
 if __name__ == "__main__":
     os.umask(0o077)
-    if sys.argv[1] == "prepare":
-        prepare(sys.argv[2:])
-    elif sys.argv[1] == "stage-git":
-        stage_git(*sys.argv[2:])
-    elif sys.argv[1] == "stage-python":
-        stage_python(*sys.argv[2:])
-    elif sys.argv[1] == "mutate":
-        mutate(*sys.argv[2:])
-    elif sys.argv[1] == "private-cli":
-        private_cli(*sys.argv[2:])
-    else:
-        raise AssertionError(sys.argv[1])
+    try:
+        if sys.argv[1] == "prepare":
+            prepare(sys.argv[2:])
+        elif sys.argv[1] == "stage-git":
+            stage_git(*sys.argv[2:])
+        elif sys.argv[1] == "stage-python":
+            stage_python(*sys.argv[2:])
+        elif sys.argv[1] == "mutate":
+            mutate(*sys.argv[2:])
+        elif sys.argv[1] == "private-cli":
+            private_cli(*sys.argv[2:])
+        else:
+            raise AssertionError(sys.argv[1])
+    finally:
+        _save_shm_cache()

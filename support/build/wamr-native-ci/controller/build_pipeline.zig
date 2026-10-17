@@ -17,15 +17,31 @@ const profile = @import("profile.zig");
 const limits = @import("custody_limits.zig");
 
 const shm_magic = "UKWAMRC1";
-const max_shm_files: u32 = 65536;
+const max_shm_files: u32 = 16384;
 const max_shm_blobs: u32 = 16384;
-const shm_min_age_ns: i128 = 100 * std.time.ns_per_ms;
+const shm_min_flush_delta: u32 = 64;
+const shm_recent_window_ns: i128 = 120 * std.time.ns_per_s;
 const shm_file_entry_bytes: usize = @sizeOf([9]i128) + 64;
 const shm_blob_entry_bytes: usize = @sizeOf([9]i128) + 64 + 1 + 64;
 
 var shm_serial: std.atomic.Value(u32) = .init(0);
+var proc_cache_lock: std.atomic.Value(u32) = .init(0);
+var proc_cache_valid: bool = false;
+var proc_cache_sig: [4]u64 = .{ 0, 0, 0, 0 };
+var proc_files: std.AutoHashMapUnmanaged([9]i128, [64]u8) = .empty;
+var proc_blobs: std.AutoHashMapUnmanaged([9]i128, custody.CachedBlob) = .empty;
 
-fn currentRealtimeNs() i128 {
+fn lockProcCache() void {
+    while (proc_cache_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+        std.atomic.spinLoopHint();
+    }
+}
+
+fn unlockProcCache() void {
+    proc_cache_lock.store(0, .release);
+}
+
+pub fn currentRealtimeNs() i128 {
     var ts: std.os.linux.timespec = undefined;
     if (std.os.linux.errno(std.os.linux.clock_gettime(.REALTIME, &ts)) != .SUCCESS or ts.sec <= 0) return 0;
     return (@as(i128, ts.sec) * std.time.ns_per_s) + ts.nsec;
@@ -36,6 +52,36 @@ fn formatPathZ(buf: []u8, comptime fmt: []const u8, args: anytype) ?[*:0]const u
     const printed = std.fmt.bufPrint(buf[0 .. buf.len - 1], fmt, args) catch return null;
     buf[printed.len] = 0;
     return buf[0..printed.len :0].ptr;
+}
+
+fn copyProcCacheInto(
+    known_files: *std.AutoHashMap([9]i128, [64]u8),
+    known_git_blobs: *std.AutoHashMap([9]i128, custody.CachedBlob),
+) void {
+    if (known_files.count() == 0) {
+        if (proc_files.clone(known_files.allocator)) |cloned| {
+            known_files.unmanaged.deinit(known_files.allocator);
+            known_files.unmanaged = cloned;
+        } else |_| {}
+    } else {
+        known_files.ensureUnusedCapacity(proc_files.count()) catch return;
+        var it = proc_files.iterator();
+        while (it.next()) |entry| {
+            known_files.put(entry.key_ptr.*, entry.value_ptr.*) catch return;
+        }
+    }
+    if (known_git_blobs.count() == 0) {
+        if (proc_blobs.clone(known_git_blobs.allocator)) |cloned| {
+            known_git_blobs.unmanaged.deinit(known_git_blobs.allocator);
+            known_git_blobs.unmanaged = cloned;
+        } else |_| {}
+    } else {
+        known_git_blobs.ensureUnusedCapacity(proc_blobs.count()) catch return;
+        var it = proc_blobs.iterator();
+        while (it.next()) |entry| {
+            known_git_blobs.put(entry.key_ptr.*, entry.value_ptr.*) catch return;
+        }
+    }
 }
 
 pub fn loadShmInto(
@@ -58,6 +104,18 @@ pub fn loadShmInto(
     if (stx.mode & linux.S.IFMT != linux.S.IFREG or stx.uid != linux.geteuid() or stx.mode & 0o077 != 0) return;
     const max_bytes: u64 = 16 + (@as(u64, max_shm_files) * shm_file_entry_bytes) + (@as(u64, max_shm_blobs) * shm_blob_entry_bytes);
     if (stx.size < 16 or stx.size > max_bytes) return;
+    const sig: [4]u64 = .{
+        stx.ino,
+        stx.size,
+        @bitCast(@as(i64, stx.mtime.sec)),
+        stx.mtime.nsec,
+    };
+    lockProcCache();
+    defer unlockProcCache();
+    if (proc_cache_valid and std.mem.eql(u64, &proc_cache_sig, &sig)) {
+        copyProcCacheInto(known_files, known_git_blobs);
+        return;
+    }
     const size: usize = @intCast(stx.size);
     const buf = std.heap.page_allocator.alloc(u8, size) catch return;
     defer std.heap.page_allocator.free(buf);
@@ -73,8 +131,10 @@ pub fn loadShmInto(
     if (files_count > max_shm_files or blobs_count > max_shm_blobs) return;
     const expected_size: usize = 16 + (@as(usize, files_count) * shm_file_entry_bytes) + (@as(usize, blobs_count) * shm_blob_entry_bytes);
     if (size != expected_size) return;
-    known_files.ensureUnusedCapacity(files_count) catch return;
-    known_git_blobs.ensureUnusedCapacity(blobs_count) catch return;
+    proc_files.clearRetainingCapacity();
+    proc_blobs.clearRetainingCapacity();
+    proc_files.ensureUnusedCapacity(std.heap.page_allocator, files_count) catch return;
+    proc_blobs.ensureUnusedCapacity(std.heap.page_allocator, blobs_count) catch return;
     var offset: usize = 16;
     var i: u32 = 0;
     while (i < files_count) : (i += 1) {
@@ -84,7 +144,7 @@ pub fn loadShmInto(
         var sha256: [64]u8 = undefined;
         @memcpy(&sha256, buf[offset .. offset + 64]);
         offset += 64;
-        known_files.put(meta, sha256) catch return;
+        proc_files.put(std.heap.page_allocator, meta, sha256) catch return;
     }
     var j: u32 = 0;
     while (j < blobs_count) : (j += 1) {
@@ -98,8 +158,140 @@ pub fn loadShmInto(
         offset += 1;
         @memcpy(&blob.sha256, buf[offset .. offset + 64]);
         offset += 64;
-        known_git_blobs.put(meta, blob) catch return;
+        proc_blobs.put(std.heap.page_allocator, meta, blob) catch return;
     }
+    proc_cache_sig = sig;
+    proc_cache_valid = true;
+    copyProcCacheInto(known_files, known_git_blobs);
+}
+
+pub fn flushShmMaps(
+    known_files: *std.AutoHashMap([9]i128, [64]u8),
+    known_git_blobs: *std.AutoHashMap([9]i128, custody.CachedBlob),
+    loaded_files_count: *u32,
+    loaded_blobs_count: *u32,
+    init_ns: i128,
+) void {
+    const added_files = known_files.count() -| loaded_files_count.*;
+    const added_blobs = known_git_blobs.count() -| loaded_blobs_count.*;
+    if (added_files < shm_min_flush_delta and added_blobs < shm_min_flush_delta) return;
+    var fsize_rlim: [2]u64 = .{ ~@as(u64, 0), ~@as(u64, 0) };
+    _ = std.os.linux.syscall4(.prlimit64, 0, 1, 0, @intFromPtr(&fsize_rlim));
+    if (fsize_rlim[0] < 64 * 1024 * 1024) return;
+    var flush_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer flush_arena.deinit();
+    var merged_files = std.AutoHashMap([9]i128, [64]u8).init(flush_arena.allocator());
+    var merged_blobs = std.AutoHashMap([9]i128, custody.CachedBlob).init(flush_arena.allocator());
+    loadShmInto(&merged_files, &merged_blobs);
+    var self_file_it = known_files.iterator();
+    while (self_file_it.next()) |entry| {
+        merged_files.put(entry.key_ptr.*, entry.value_ptr.*) catch return;
+    }
+    var self_blob_it = known_git_blobs.iterator();
+    while (self_blob_it.next()) |entry| {
+        merged_blobs.put(entry.key_ptr.*, entry.value_ptr.*) catch return;
+    }
+    var eligible_files: u32 = 0;
+    var file_it = merged_files.iterator();
+    while (file_it.next()) |entry| {
+        const meta = entry.key_ptr.*;
+        if (meta[6] > 0 and meta[7] > 0 and meta[8] > 0) {
+            if (eligible_files < max_shm_files) eligible_files += 1;
+        }
+    }
+    var eligible_blobs: u32 = 0;
+    var blob_it = merged_blobs.iterator();
+    while (blob_it.next()) |entry| {
+        const meta = entry.key_ptr.*;
+        if (meta[6] > 0 and meta[7] > 0 and meta[8] > 0) {
+            if (eligible_blobs < max_shm_blobs) eligible_blobs += 1;
+        }
+    }
+    if (eligible_files == 0 and eligible_blobs == 0) return;
+    const recent_cutoff = init_ns -| shm_recent_window_ns;
+    const total_size: usize = 16 + (@as(usize, eligible_files) * shm_file_entry_bytes) + (@as(usize, eligible_blobs) * shm_blob_entry_bytes);
+    const buf = std.heap.page_allocator.alloc(u8, total_size) catch return;
+    defer std.heap.page_allocator.free(buf);
+    @memcpy(buf[0..8], shm_magic);
+    std.mem.writeInt(u32, buf[8..12], eligible_files, .little);
+    std.mem.writeInt(u32, buf[12..16], eligible_blobs, .little);
+    var offset: usize = 16;
+    var written_files: u32 = 0;
+    inline for (.{ true, false }) |recent_pass| {
+        file_it = merged_files.iterator();
+        while (file_it.next()) |entry| {
+            if (written_files >= eligible_files) break;
+            const meta = entry.key_ptr.*;
+            if (meta[6] > 0 and meta[7] > 0 and meta[8] > 0) {
+                const is_recent = @max(meta[7], meta[8]) >= recent_cutoff;
+                if (is_recent == recent_pass) {
+                    @memcpy(buf[offset .. offset + @sizeOf([9]i128)], std.mem.asBytes(&meta));
+                    offset += @sizeOf([9]i128);
+                    @memcpy(buf[offset .. offset + 64], entry.value_ptr);
+                    offset += 64;
+                    written_files += 1;
+                }
+            }
+        }
+    }
+    var written_blobs: u32 = 0;
+    inline for (.{ true, false }) |recent_pass| {
+        blob_it = merged_blobs.iterator();
+        while (blob_it.next()) |entry| {
+            if (written_blobs >= eligible_blobs) break;
+            const meta = entry.key_ptr.*;
+            if (meta[6] > 0 and meta[7] > 0 and meta[8] > 0) {
+                const is_recent = @max(meta[7], meta[8]) >= recent_cutoff;
+                if (is_recent == recent_pass) {
+                    @memcpy(buf[offset .. offset + @sizeOf([9]i128)], std.mem.asBytes(&meta));
+                    offset += @sizeOf([9]i128);
+                    @memcpy(buf[offset .. offset + 64], &entry.value_ptr.oid);
+                    offset += 64;
+                    buf[offset] = entry.value_ptr.oid_len;
+                    offset += 1;
+                    @memcpy(buf[offset .. offset + 64], &entry.value_ptr.sha256);
+                    offset += 64;
+                    written_blobs += 1;
+                }
+            }
+        }
+    }
+    const linux = std.os.linux;
+    var path_buf: [96]u8 = undefined;
+    const shm_path = formatPathZ(&path_buf, "/dev/shm/uk-wamr-custody-cache-{d}-v1.bin", .{linux.geteuid()}) orelse return;
+    var tmp_buf: [128]u8 = undefined;
+    const serial = shm_serial.fetchAdd(1, .monotonic);
+    const tmp_path = formatPathZ(&tmp_buf, "/dev/shm/uk-wamr-custody-cache-{d}-{d}-{d}.tmp", .{
+        linux.geteuid(),
+        linux.getpid(),
+        serial,
+    }) orelse return;
+    const opened = linux.openat(linux.AT.FDCWD, tmp_path, .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .EXCL = true,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    }, 0o600);
+    if (linux.errno(opened) != .SUCCESS) return;
+    const fd: linux.fd_t = @intCast(opened);
+    var write_ok = true;
+    var written_total: usize = 0;
+    while (written_total < total_size) {
+        const rc = linux.write(fd, buf[written_total..].ptr, total_size - written_total);
+        if (linux.errno(rc) != .SUCCESS or rc == 0) {
+            write_ok = false;
+            break;
+        }
+        written_total += rc;
+    }
+    _ = linux.close(fd);
+    if (!write_ok or linux.errno(linux.renameat(linux.AT.FDCWD, tmp_path, linux.AT.FDCWD, shm_path)) != .SUCCESS) {
+        _ = linux.unlinkat(linux.AT.FDCWD, tmp_path, 0);
+        return;
+    }
+    loaded_files_count.* = known_files.count();
+    loaded_blobs_count.* = known_git_blobs.count();
 }
 
 pub const CustodyCache = struct {
@@ -128,115 +320,7 @@ pub const CustodyCache = struct {
     }
 
     pub fn flush(self: *CustodyCache) void {
-        if (self.init_ns <= shm_min_age_ns) return;
-        const cutoff_ns = self.init_ns - shm_min_age_ns;
-        var eligible_files: u32 = 0;
-        var file_it = self.known_files.iterator();
-        while (file_it.next()) |entry| {
-            const meta = entry.key_ptr.*;
-            if (meta[6] > 0 and meta[7] > 0 and meta[8] > 0 and @max(meta[7], meta[8]) < cutoff_ns) {
-                eligible_files += 1;
-            }
-        }
-        var eligible_blobs: u32 = 0;
-        var blob_it = self.known_git_blobs.iterator();
-        while (blob_it.next()) |entry| {
-            const meta = entry.key_ptr.*;
-            if (meta[6] > 0 and meta[7] > 0 and meta[8] > 0 and @max(meta[7], meta[8]) < cutoff_ns) {
-                eligible_blobs += 1;
-            }
-        }
-        if (eligible_files <= self.loaded_files_count and eligible_blobs <= self.loaded_blobs_count) return;
-        loadShmInto(&self.known_files, &self.known_git_blobs);
-        eligible_files = 0;
-        file_it = self.known_files.iterator();
-        while (file_it.next()) |entry| {
-            const meta = entry.key_ptr.*;
-            if (meta[6] > 0 and meta[7] > 0 and meta[8] > 0 and @max(meta[7], meta[8]) < cutoff_ns) {
-                if (eligible_files < max_shm_files) eligible_files += 1;
-            }
-        }
-        eligible_blobs = 0;
-        blob_it = self.known_git_blobs.iterator();
-        while (blob_it.next()) |entry| {
-            const meta = entry.key_ptr.*;
-            if (meta[6] > 0 and meta[7] > 0 and meta[8] > 0 and @max(meta[7], meta[8]) < cutoff_ns) {
-                if (eligible_blobs < max_shm_blobs) eligible_blobs += 1;
-            }
-        }
-        const total_size: usize = 16 + (@as(usize, eligible_files) * shm_file_entry_bytes) + (@as(usize, eligible_blobs) * shm_blob_entry_bytes);
-        const buf = std.heap.page_allocator.alloc(u8, total_size) catch return;
-        defer std.heap.page_allocator.free(buf);
-        @memcpy(buf[0..8], shm_magic);
-        std.mem.writeInt(u32, buf[8..12], eligible_files, .little);
-        std.mem.writeInt(u32, buf[12..16], eligible_blobs, .little);
-        var offset: usize = 16;
-        var written_files: u32 = 0;
-        file_it = self.known_files.iterator();
-        while (file_it.next()) |entry| {
-            if (written_files >= eligible_files) break;
-            const meta = entry.key_ptr.*;
-            if (meta[6] > 0 and meta[7] > 0 and meta[8] > 0 and @max(meta[7], meta[8]) < cutoff_ns) {
-                @memcpy(buf[offset .. offset + @sizeOf([9]i128)], std.mem.asBytes(&meta));
-                offset += @sizeOf([9]i128);
-                @memcpy(buf[offset .. offset + 64], entry.value_ptr);
-                offset += 64;
-                written_files += 1;
-            }
-        }
-        var written_blobs: u32 = 0;
-        blob_it = self.known_git_blobs.iterator();
-        while (blob_it.next()) |entry| {
-            if (written_blobs >= eligible_blobs) break;
-            const meta = entry.key_ptr.*;
-            if (meta[6] > 0 and meta[7] > 0 and meta[8] > 0 and @max(meta[7], meta[8]) < cutoff_ns) {
-                @memcpy(buf[offset .. offset + @sizeOf([9]i128)], std.mem.asBytes(&meta));
-                offset += @sizeOf([9]i128);
-                @memcpy(buf[offset .. offset + 64], &entry.value_ptr.oid);
-                offset += 64;
-                buf[offset] = entry.value_ptr.oid_len;
-                offset += 1;
-                @memcpy(buf[offset .. offset + 64], &entry.value_ptr.sha256);
-                offset += 64;
-                written_blobs += 1;
-            }
-        }
-        const linux = std.os.linux;
-        var path_buf: [96]u8 = undefined;
-        const shm_path = formatPathZ(&path_buf, "/dev/shm/uk-wamr-custody-cache-{d}-v1.bin", .{linux.geteuid()}) orelse return;
-        var tmp_buf: [128]u8 = undefined;
-        const serial = shm_serial.fetchAdd(1, .monotonic);
-        const tmp_path = formatPathZ(&tmp_buf, "/dev/shm/uk-wamr-custody-cache-{d}-{d}-{d}.tmp", .{
-            linux.geteuid(),
-            linux.getpid(),
-            serial,
-        }) orelse return;
-        const opened = linux.openat(linux.AT.FDCWD, tmp_path, .{
-            .ACCMODE = .WRONLY,
-            .CREAT = true,
-            .EXCL = true,
-            .NOFOLLOW = true,
-            .CLOEXEC = true,
-        }, 0o600);
-        if (linux.errno(opened) != .SUCCESS) return;
-        const fd: linux.fd_t = @intCast(opened);
-        var write_ok = true;
-        var written_total: usize = 0;
-        while (written_total < total_size) {
-            const rc = linux.write(fd, buf[written_total..].ptr, total_size - written_total);
-            if (linux.errno(rc) != .SUCCESS or rc == 0) {
-                write_ok = false;
-                break;
-            }
-            written_total += rc;
-        }
-        _ = linux.close(fd);
-        if (!write_ok or linux.errno(linux.renameat(linux.AT.FDCWD, tmp_path, linux.AT.FDCWD, shm_path)) != .SUCCESS) {
-            _ = linux.unlinkat(linux.AT.FDCWD, tmp_path, 0);
-            return;
-        }
-        self.loaded_files_count = eligible_files;
-        self.loaded_blobs_count = eligible_blobs;
+        flushShmMaps(&self.known_files, &self.known_git_blobs, &self.loaded_files_count, &self.loaded_blobs_count, self.init_ns);
     }
 
     pub fn deinit(self: *CustodyCache) void {

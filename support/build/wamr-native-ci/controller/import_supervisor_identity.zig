@@ -68,7 +68,9 @@ pub fn currentStandaloneSourceContentClosure(
 ) ![64]u8 {
     var retained = try adapter.openPinnedTool(io, git, "tool:git");
     defer retained.close(io);
-    const before = try source.portableSource(allocator, io, repository, git);
+    var cache = @import("build_pipeline.zig").CustodyCache.init(allocator);
+    defer cache.deinit();
+    const before = try source.portableSourceCached(allocator, io, repository, git, &cache.known_git_blobs, &cache.known_files);
     for (standalone_supervisor_sources) |entry| {
         const manifest = try source.trackedManifest(allocator, io, repository, git, entry.name);
         defer manifest.deinit(allocator);
@@ -77,7 +79,7 @@ pub fn currentStandaloneSourceContentClosure(
             return error.UnsafeSource;
     }
     const result = try nativeStandaloneSourceContentClosure(allocator);
-    const after = try source.portableSource(allocator, io, repository, git);
+    const after = try source.portableSourceCached(allocator, io, repository, git, &cache.known_git_blobs, &cache.known_files);
     if (!before.same(after)) return error.SourceChanged;
     try retained.verify(io);
     return result;
@@ -109,11 +111,13 @@ pub fn currentReaderSourceContentClosure(
 ) ![64]u8 {
     var retained = try adapter.openPinnedTool(io, git, "tool:git");
     defer retained.close(io);
+    var cache = @import("build_pipeline.zig").CustodyCache.init(allocator);
+    defer cache.deinit();
     try source.verifyPhysical(io, allocator, repository);
-    const before = try source.portableSource(allocator, io, repository, git);
+    const before = try source.portableSourceCached(allocator, io, repository, git, &cache.known_git_blobs, &cache.known_files);
     const result = try nativeSourceContentClosure(allocator);
     try source.verifyPhysical(io, allocator, repository);
-    const after = try source.portableSource(allocator, io, repository, git);
+    const after = try source.portableSourceCached(allocator, io, repository, git, &cache.known_git_blobs, &cache.known_files);
     if (!before.same(after)) return error.SourceChanged;
     try retained.verify(io);
     return result;

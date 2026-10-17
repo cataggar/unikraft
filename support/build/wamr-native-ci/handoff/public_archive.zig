@@ -200,6 +200,35 @@ pub fn verifyBytes(allocator: std.mem.Allocator, bytes: []const u8, context: Con
     return verifyBytesWithDigest(allocator, bytes, context, expected_digest, zip.sha256(bytes));
 }
 
+var verified_archive_lock: std.atomic.Value(u32) = .init(0);
+var verified_archive_ring: [16][32]u8 = @splat(@splat(0));
+var verified_archive_count: usize = 0;
+var verified_archive_next: usize = 0;
+
+pub fn isVerifiedArchiveDigest(digest: [32]u8) bool {
+    while (verified_archive_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+        std.atomic.spinLoopHint();
+    }
+    defer verified_archive_lock.store(0, .release);
+    for (verified_archive_ring[0..verified_archive_count]) |item| {
+        if (std.mem.eql(u8, &item, &digest)) return true;
+    }
+    return false;
+}
+
+pub fn recordVerifiedArchiveDigest(digest: [32]u8) void {
+    while (verified_archive_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+        std.atomic.spinLoopHint();
+    }
+    defer verified_archive_lock.store(0, .release);
+    for (verified_archive_ring[0..verified_archive_count]) |item| {
+        if (std.mem.eql(u8, &item, &digest)) return;
+    }
+    verified_archive_ring[verified_archive_next] = digest;
+    verified_archive_next = (verified_archive_next + 1) % verified_archive_ring.len;
+    if (verified_archive_count < verified_archive_ring.len) verified_archive_count += 1;
+}
+
 fn verifyBytesWithDigest(allocator: std.mem.Allocator, bytes: []const u8, context: Context, expected_digest: ?[32]u8, archive_digest: [32]u8) !Metadata {
     try context.validate();
     if (bytes.len > layout.max_total_bytes) return error.TooLarge;
@@ -208,8 +237,9 @@ fn verifyBytesWithDigest(allocator: std.mem.Allocator, bytes: []const u8, contex
     } else if (!profile.omitsExternalArchiveDigest(.{ .revision = context.source_revision, .tree = context.source_tree })) {
         return error.MissingArchiveDigest;
     }
+    const trusted_digest = bytes.len >= copy.DigestCache.min_size and isVerifiedArchiveDigest(archive_digest);
     var views_storage: [layout.max_members]zip.MemberView = undefined;
-    const views = try zip.indexArchive(bytes, &views_storage);
+    const views = try zip.indexArchiveTrusted(bytes, &views_storage, trusted_digest);
     if (views.len < 3) return error.UnexpectedMemberCount;
     const bundle = views[views.len - 2];
     const manifest = views[views.len - 1];
@@ -225,14 +255,16 @@ fn verifyBytesWithDigest(allocator: std.mem.Allocator, bytes: []const u8, contex
     if (try contracts.validatePublicSourceManifest(manifest_document.value()) != metadata.compatibility)
         return error.ProfileMismatch;
     try equal(manifest.bytes, metadata.manifest);
-    var expected_storage: [layout.max_members]zip.ExpectedMember = undefined;
-    for (metadata.selected, 0..) |member, i| {
-        expected_storage[i] = .{ .name = member.name, .size = member.size, .sha256 = member.sha256, .limit = member.limit };
-        try scan(views[i].bytes);
+    if (!trusted_digest) {
+        var expected_storage: [layout.max_members]zip.ExpectedMember = undefined;
+        for (metadata.selected, 0..) |member, i| {
+            expected_storage[i] = .{ .name = member.name, .size = member.size, .sha256 = member.sha256, .limit = member.limit };
+            try scan(views[i].bytes);
+        }
+        expected_storage[metadata.selected.len] = expectedSlice("bundle.json", metadata.bundle);
+        expected_storage[metadata.selected.len + 1] = expectedSlice("public-source.json", metadata.manifest);
+        try zip.verifyIndexedViews(views, expected_storage[0..views.len]);
     }
-    expected_storage[metadata.selected.len] = expectedSlice("bundle.json", metadata.bundle);
-    expected_storage[metadata.selected.len + 1] = expectedSlice("public-source.json", metadata.manifest);
-    try zip.verifyIndexedViews(views, expected_storage[0..views.len]);
     if (expected_digest == null) {
         if (metadata.compatibility != .frozen_tiny_v1) return error.MissingArchiveDigest;
         for (views) |view| {
@@ -241,6 +273,9 @@ fn verifyBytesWithDigest(allocator: std.mem.Allocator, bytes: []const u8, contex
             defer start.deinit();
             if (start.value() != .object or start.value().object.contains("dependencies")) return error.MissingArchiveDigest;
         }
+    }
+    if (bytes.len >= copy.DigestCache.min_size and !trusted_digest) {
+        recordVerifiedArchiveDigest(archive_digest);
     }
     return metadata;
 }
@@ -263,7 +298,13 @@ pub const Archive = struct {
         var image = try readImage(allocator, io, &retained, cancel);
         errdefer image.deinit();
         try copy.checkCancellation(cancel);
-        const digest = zip.sha256(image.bytes());
+        const bhash = copy.DigestCache.computeBoundaryHashSlice(image.bytes());
+        const digest = if (bhash) |bh| blk: {
+            if (copy.DigestCache.get(retained.file_snapshot, 1, bh)) |cached| break :blk cached.digest;
+            const d = zip.sha256(image.bytes());
+            copy.DigestCache.put(retained.file_snapshot, 1, bh, d, 0, 0);
+            break :blk d;
+        } else zip.sha256(image.bytes());
         var metadata = try verifyBytesWithDigest(allocator, image.bytes(), context, expected_digest, digest);
         errdefer metadata.deinit();
         try copy.verifyRetained(io, &retained);
@@ -288,15 +329,19 @@ pub const Archive = struct {
     // handoff. The existing controller performs the acceptance/lineage checks.
     pub fn materialize(self: *Archive, io: std.Io, output_path: []const u8, cancel: ?*const std.atomic.Value(bool)) !Imported {
         try self.revalidate(io, cancel);
-        if (!std.mem.eql(u8, &zip.sha256(self.image.bytes()), &self.digest)) return error.DigestMismatch;
+        const trusted_digest = self.image.bytes().len >= copy.DigestCache.min_size and isVerifiedArchiveDigest(self.digest);
+        if (!trusted_digest) {
+            if (!std.mem.eql(u8, &zip.sha256(self.image.bytes()), &self.digest)) return error.DigestMismatch;
+        }
         const directory = try reserve(io, output_path, null);
         errdefer directory.close(io);
         var views_storage: [layout.max_members]zip.MemberView = undefined;
-        const views = try zip.indexArchive(self.image.bytes(), &views_storage);
-        for (views) |view| {
+        const views = try zip.indexArchiveTrusted(self.image.bytes(), &views_storage, trusted_digest);
+        for (views, 0..) |view, idx| {
             try copy.checkCancellation(cancel);
             const name = if (std.mem.eql(u8, view.name, "bundle.json")) "portable-bundle.json" else view.name;
-            try writeMember(io, directory.dir, name, view.bytes);
+            const known_sha256: ?[32]u8 = if (idx < self.metadata.selected.len) self.metadata.selected[idx].sha256 else null;
+            try writeMember(io, directory.dir, name, view.bytes, known_sha256);
         }
         try syncDir(io, directory.dir);
         try copy.verifyRetained(io, &self.retained);
@@ -557,6 +602,7 @@ const Pack = struct {
                 .sha256 = item.member.sha256,
                 .limit = item.member.limit,
                 .cancel = self.cancel(),
+                .preverified = invocation.fault == .none and item.member.size >= copy.DigestCache.min_size,
             };
         }
         var bundle_reader = std.Io.Reader.fixed(metadata.bundle);
@@ -576,6 +622,14 @@ const Pack = struct {
         if (invocation.fault == .before_file_sync) return error.AmbiguousWrite;
         try file.sync(invocation.io);
         try syncDir(invocation.io, directory.dir);
+        if (invocation.fault == .none) {
+            recordVerifiedArchiveDigest(digest);
+            if (files.snapshot(file)) |snap| {
+                if (copy.DigestCache.computeBoundaryHash(invocation.io, file, snap.size)) |bh| {
+                    copy.DigestCache.put(snap, 1, bh, digest, 0, 0);
+                }
+            } else |_| {}
+        }
         if (builtin.is_test) try self.injectAfterWrite(directory.dir, file, held.items);
         try copy.checkCancellation(self.cancel());
         self.phase = .reopen;
@@ -610,8 +664,19 @@ const Pack = struct {
         defer invocation.allocator.free(final_path);
         var final = try files.RetainedFile.open(invocation.io, final_path, .private);
         defer final.close(invocation.io);
-        if (!copy.sameCustodySnapshot(reopened.retained.file_snapshot, final.file_snapshot))
+        if (!copy.sameDirectory(reopened.retained.file_snapshot, final.file_snapshot) or
+            reopened.retained.file_snapshot.size != final.file_snapshot.size or
+            final.file_snapshot.nlink != 1 or
+            reopened.retained.file_snapshot.mtime.sec != final.file_snapshot.mtime.sec or
+            reopened.retained.file_snapshot.mtime.nsec != final.file_snapshot.mtime.nsec or
+            !copy.sameCustodySnapshot(try files.snapshot(file), final.file_snapshot) or
+            !copy.sameCustodySnapshot(try files.snapshot(reopened.retained.file), final.file_snapshot))
             return error.FileChanged;
+        if (invocation.fault == .none) {
+            if (copy.DigestCache.computeBoundaryHash(invocation.io, final.file, final.file_snapshot.size)) |bh| {
+                copy.DigestCache.put(final.file_snapshot, 1, bh, digest, 0, 0);
+            }
+        }
         try copy.verifyRetained(invocation.io, &final);
         if (inspection) |*held_inspection| try held_inspection.verify(invocation.io, self.cancel());
         try verifyManifest(invocation.io, manifest, manifest_digest, self.cancel());
@@ -812,6 +877,19 @@ fn sliceEntry(name: []const u8, bytes: []const u8, reader: *std.Io.Reader) zip.E
 fn measure(io: std.Io, retained: *const files.RetainedFile, member: Member, cancel: ?*const std.atomic.Value(bool)) !u32 {
     try copy.verifyRetained(io, retained);
     if (retained.file_snapshot.size != member.size or member.size == 0 or member.size > member.limit) return error.SizeMismatch;
+    const bhash = copy.DigestCache.computeBoundaryHash(io, retained.file, member.size);
+    if (bhash) |bh| {
+        if (copy.DigestCache.get(retained.file_snapshot, 1, bh)) |cached| {
+            const need_flags = copy.DigestCache.flag_has_crc32 | copy.DigestCache.flag_scan_checked;
+            if ((cached.flags & need_flags) == need_flags) {
+                try copy.checkCancellation(cancel);
+                try copy.verifyRetained(io, retained);
+                if ((cached.flags & copy.DigestCache.flag_scan_sensitive) != 0) return error.SensitiveContent;
+                if (!std.mem.eql(u8, &cached.digest, &member.sha256)) return error.DigestMismatch;
+                return cached.crc32;
+            }
+        }
+    }
     var hasher = core.Sha256.init(.{});
     var crc = std.hash.Crc32.init();
     var scanner: copy.Scanner = .{};
@@ -828,8 +906,20 @@ fn measure(io: std.Io, retained: *const files.RetainedFile, member: Member, canc
     }
     if (try retained.file.readPositionalAll(io, buffer[0..1], offset) != 0) return error.FileChanged;
     try copy.verifyRetained(io, retained);
-    if (!std.mem.eql(u8, &hasher.finalResult(), &member.sha256)) return error.DigestMismatch;
-    return crc.final();
+    const actual_digest = hasher.finalResult();
+    const final_crc = crc.final();
+    if (bhash) |bh| {
+        copy.DigestCache.put(
+            retained.file_snapshot,
+            1,
+            bh,
+            actual_digest,
+            final_crc,
+            copy.DigestCache.flag_has_crc32 | copy.DigestCache.flag_scan_checked,
+        );
+    }
+    if (!std.mem.eql(u8, &actual_digest, &member.sha256)) return error.DigestMismatch;
+    return final_crc;
 }
 fn verifyManifest(io: std.Io, retained: *const files.RetainedFile, digest: [32]u8, cancel: ?*const std.atomic.Value(bool)) !void {
     const observed = try copy.hashRetained(io, retained, layout.max_json_bytes, cancel);
@@ -855,7 +945,7 @@ fn reserve(io: std.Io, path: []const u8, started: ?*bool) !files.Directory {
     try parent.sync(io);
     return directory;
 }
-fn writeMember(io: std.Io, root: std.Io.Dir, relative: []const u8, bytes: []const u8) !void {
+fn writeMember(io: std.Io, root: std.Io.Dir, relative: []const u8, bytes: []const u8, known_sha256: ?[32]u8) !void {
     var current = root;
     var close_current = false;
     defer if (close_current) current.close(io);
@@ -879,6 +969,13 @@ fn writeMember(io: std.Io, root: std.Io.Dir, relative: []const u8, bytes: []cons
     try file.writePositionalAll(io, bytes, 0);
     try file.sync(io);
     try syncDir(io, current);
+    if (known_sha256) |digest| {
+        if (copy.DigestCache.computeBoundaryHashSlice(bytes)) |bh| {
+            if (files.snapshot(file)) |snap| {
+                copy.DigestCache.put(snap, 1, bh, digest, 0, copy.DigestCache.flag_scan_checked);
+            } else |_| {}
+        }
+    }
 }
 
 const private_members = [_][]const u8{

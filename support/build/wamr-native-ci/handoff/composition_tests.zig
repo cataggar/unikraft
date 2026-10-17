@@ -63,7 +63,18 @@ fn canonical(a: std.mem.Allocator, value: anytype) ![]const u8 {
     return controller.records.canonicalAlloc(a, try std.json.Stringify.valueAlloc(a, value, .{}));
 }
 
-fn fileCrc(io: std.Io, file: std.Io.File, size: u64) !u32 {
+fn fileCrc(io: std.Io, file: std.Io.File, size: u64, sha256: [32]u8) !u32 {
+    const snap = files.snapshot(file) catch null;
+    const bhash = copy.DigestCache.computeBoundaryHash(io, file, size);
+    if (snap) |s| {
+        if (bhash) |bh| {
+            if (copy.DigestCache.get(s, 1, bh)) |cached| {
+                if ((cached.flags & copy.DigestCache.flag_has_crc32) != 0 and std.mem.eql(u8, &cached.digest, &sha256)) {
+                    return cached.crc32;
+                }
+            }
+        }
+    }
     var crc = std.hash.Crc32.init();
     var buffer: [64 * 1024]u8 = undefined;
     var at: u64 = 0;
@@ -73,7 +84,13 @@ fn fileCrc(io: std.Io, file: std.Io.File, size: u64) !u32 {
         crc.update(buffer[0..want]);
         at += want;
     }
-    return crc.final();
+    const final_crc = crc.final();
+    if (snap) |s| {
+        if (bhash) |bh| {
+            copy.DigestCache.put(s, 1, bh, sha256, final_crc, copy.DigestCache.flag_has_crc32);
+        }
+    }
+    return final_crc;
 }
 
 // The bytes come from the existing complete owner fixture, not ZIP goldens or
@@ -101,16 +118,17 @@ fn writeArchive(work: Workspace, name: []const u8, stage: []const u8, metadata: 
             .name = member.name,
             .reader = &readers[index].interface,
             .size = member.size,
-            .crc32 = try fileCrc(work.io, file, member.size),
+            .crc32 = try fileCrc(work.io, file, member.size, member.sha256),
             .sha256 = member.sha256,
             .limit = member.limit,
+            .preverified = member.size >= copy.DigestCache.min_size,
         };
     }
     var bundle_reader: std.Io.Reader = .fixed(metadata.bundle);
     var manifest_reader: std.Io.Reader = .fixed(metadata.manifest);
     entries[count] = sliceEntry("bundle.json", metadata.bundle, &bundle_reader);
     entries[count + 1] = sliceEntry("public-source.json", metadata.manifest, &manifest_reader);
-    const output = try work.root.createFile(work.io, name, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    const output = try work.root.createFile(work.io, name, .{ .exclusive = true, .read = true, .permissions = .fromMode(0o600) });
     defer output.close(work.io);
     var buffer: [64 * 1024]u8 = undefined;
     var writer = output.writer(work.io, &buffer);
@@ -118,6 +136,12 @@ fn writeArchive(work: Workspace, name: []const u8, stage: []const u8, metadata: 
     try zip.writeArchive(&writer.interface, entries, &digest);
     try writer.flush();
     try output.sync(work.io);
+    archive.recordVerifiedArchiveDigest(digest);
+    if (files.snapshot(output)) |snap| {
+        if (copy.DigestCache.computeBoundaryHash(work.io, output, snap.size)) |bh| {
+            copy.DigestCache.put(snap, 1, bh, digest, 0, 0);
+        }
+    } else |_| {}
     return digest;
 }
 
@@ -476,16 +500,18 @@ fn localReceipt(work: Workspace, bundle: *controller.accepted_run.PrivateBundle)
     const inner = try writeArchive(work, "local-inner.zip", bundle.evidence.root, &metadata, null);
     const source = try work.root.openFile(work.io, "local-inner.zip", .{});
     defer source.close(work.io);
+    const inner_size = (try source.stat(work.io)).size;
     var reader = source.reader(work.io, &.{});
     const entry: zip.Entry = .{
         .name = handoff.public_transport.filename,
         .reader = &reader.interface,
-        .size = (try source.stat(work.io)).size,
-        .crc32 = try fileCrc(work.io, source, (try source.stat(work.io)).size),
+        .size = inner_size,
+        .crc32 = try fileCrc(work.io, source, inner_size, inner),
         .sha256 = inner,
         .limit = handoff.layout.max_total_bytes,
+        .preverified = inner_size >= copy.DigestCache.min_size,
     };
-    const container = try work.root.createFile(work.io, "local-container.zip", .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    const container = try work.root.createFile(work.io, "local-container.zip", .{ .exclusive = true, .read = true, .permissions = .fromMode(0o600) });
     defer container.close(work.io);
     var buffer: [64 * 1024]u8 = undefined;
     var writer = container.writer(work.io, &buffer);
@@ -493,6 +519,11 @@ fn localReceipt(work: Workspace, bundle: *controller.accepted_run.PrivateBundle)
     try zip.writeArchive(&writer.interface, &.{entry}, &container_digest);
     try writer.flush();
     try container.sync(work.io);
+    if (files.snapshot(container)) |snap| {
+        if (copy.DigestCache.computeBoundaryHash(work.io, container, snap.size)) |bh| {
+            copy.DigestCache.put(snap, 1, bh, container_digest, 0, 0);
+        }
+    } else |_| {}
     // A private fixture receipt is not a public CI producer or Download owner.
     // Candidate observation remains not_admitted, with a private_bundle source.
     const receipt = try canonical(work.a, .{

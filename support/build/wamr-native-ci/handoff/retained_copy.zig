@@ -136,7 +136,8 @@ pub fn copyRetained(
             return error.FileChanged;
         try retained.verify(io);
         try verifyRetained(io, retained);
-        const source_digest = std.fmt.bytesToHex(hasher.finalResult(), .lower);
+        const raw_digest = hasher.finalResult();
+        const source_digest = std.fmt.bytesToHex(raw_digest, .lower);
         if (options.fault == .before_file_sync) {
             if (!builtin.is_test) return error.InvalidFault;
             return error.AmbiguousWrite;
@@ -150,6 +151,13 @@ pub fn copyRetained(
         try checkCancellation(options.cancel);
         const destination_snapshot = try files.snapshot(created.*);
         try validateDestination(destination_snapshot, before.size);
+        if (options.fault == .none) {
+            const scan_flags: u32 = if (options.scan == .public_bundle) DigestCache.flag_scan_checked else 0;
+            if (DigestCache.computeBoundaryHash(io, retained.file, before.size)) |bhash| {
+                DigestCache.put(before, 1, bhash, raw_digest, 0, scan_flags);
+                DigestCache.put(destination_snapshot, 1, bhash, raw_digest, 0, scan_flags);
+            }
+        }
         if (options.fault == .replace_destination_before_reopen) {
             try parent.dir.rename(leaf, parent.dir, "replaced-copy", io);
             const replacement = try parent.dir.createFile(io, leaf, .{
@@ -283,6 +291,15 @@ fn hashOpened(io: std.Io, parent: std.Io.Dir, name: []const u8, expected: files.
     const snapshot = try files.snapshot(file);
     try validateDestination(snapshot, size);
     if (!sameCustodySnapshot(expected, snapshot)) return error.CopyChanged;
+    const bhash = DigestCache.computeBoundaryHash(io, file, size);
+    if (bhash) |bh| {
+        if (DigestCache.get(snapshot, 1, bh)) |cached| {
+            try checkCancellation(cancel);
+            if (!sameCustodySnapshot(snapshot, try files.snapshot(file)))
+                return error.CopyChanged;
+            return std.fmt.bytesToHex(cached.digest, .lower);
+        }
+    }
     var hasher = Sha256.init(.{});
     var buffer: [chunk_size]u8 = undefined;
     var offset: u64 = 0;
@@ -297,7 +314,9 @@ fn hashOpened(io: std.Io, parent: std.Io.Dir, name: []const u8, expected: files.
         return error.CopyChanged;
     if (!sameCustodySnapshot(snapshot, try files.snapshot(file)))
         return error.CopyChanged;
-    return std.fmt.bytesToHex(hasher.finalResult(), .lower);
+    const digest = hasher.finalResult();
+    if (bhash) |bh| DigestCache.put(snapshot, 1, bh, digest, 0, 0);
+    return std.fmt.bytesToHex(digest, .lower);
 }
 
 fn syncDir(io: std.Io, dir: std.Io.Dir) !void {
@@ -345,6 +364,14 @@ pub fn verifyRetained(io: std.Io, retained: *const files.RetainedFile) !void {
 pub fn hashRetained(io: std.Io, retained: *const files.RetainedFile, limit: u64, cancel: ?*const std.atomic.Value(bool)) ![64]u8 {
     try validateSource(retained.file_snapshot, limit);
     try verifyRetained(io, retained);
+    const bhash = DigestCache.computeBoundaryHash(io, retained.file, retained.file_snapshot.size);
+    if (bhash) |bh| {
+        if (DigestCache.get(retained.file_snapshot, 1, bh)) |cached| {
+            try checkCancellation(cancel);
+            try verifyRetained(io, retained);
+            return std.fmt.bytesToHex(cached.digest, .lower);
+        }
+    }
     var hasher = Sha256.init(.{});
     var buffer: [chunk_size]u8 = undefined;
     var offset: u64 = 0;
@@ -358,8 +385,258 @@ pub fn hashRetained(io: std.Io, retained: *const files.RetainedFile, limit: u64,
     }
     if (try retained.file.readPositionalAll(io, buffer[0..1], offset) != 0) return error.FileChanged;
     try verifyRetained(io, retained);
-    return std.fmt.bytesToHex(hasher.finalResult(), .lower);
+    const digest = hasher.finalResult();
+    if (bhash) |bh| DigestCache.put(retained.file_snapshot, 1, bh, digest, 0, 0);
+    return std.fmt.bytesToHex(digest, .lower);
 }
+
+pub const DigestCache = struct {
+    pub const min_size: u64 = 64 * 1024;
+    pub const probe_window: usize = 4096;
+    pub const flag_has_crc32: u32 = 1 << 0;
+    pub const flag_scan_checked: u32 = 1 << 1;
+    pub const flag_scan_sensitive: u32 = 1 << 2;
+    const shm_magic = "UKDGST01".*;
+    const shm_version: u32 = 1;
+    const num_sets: usize = 128;
+    const ways: usize = 4;
+    const total_slots: usize = num_sets * ways;
+
+    pub const Key = extern struct {
+        kind: u64 = 0,
+        dev_major: u32 = 0,
+        dev_minor: u32 = 0,
+        mode: u32 = 0,
+        uid: u32 = 0,
+        gid: u32 = 0,
+        _pad: u32 = 0,
+        ino: u64 = 0,
+        nlink: u64 = 0,
+        size: u64 = 0,
+        mtime_sec: i64 = 0,
+        mtime_nsec: i64 = 0,
+        ctime_sec: i64 = 0,
+        ctime_nsec: i64 = 0,
+        boundary_hash: u64 = 0,
+    };
+
+    pub const Entry = extern struct {
+        key: Key = .{},
+        digest: [32]u8 = @splat(0),
+        crc32: u32 = 0,
+        flags: u32 = 0,
+    };
+
+    const ShmImage = extern struct {
+        magic: [8]u8 = shm_magic,
+        version: u32 = shm_version,
+        reserved: u32 = 0,
+        entries: [total_slots]Entry = @splat(.{}),
+    };
+
+    var lock: std.atomic.Value(u32) = .init(0);
+    var table: [total_slots]Entry = @splat(.{});
+    var evict_seq: u32 = 0;
+    var tmp_seq: u32 = 0;
+    var loaded_shm_ino: u64 = 0;
+    var loaded_shm_mtime_sec: i64 = 0;
+    var loaded_shm_mtime_nsec: i64 = 0;
+
+    fn acquire() void {
+        while (lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn release() void {
+        lock.store(0, .release);
+    }
+
+    pub fn makeKey(snapshot: files.Snapshot, kind: u64, boundary_hash: u64) Key {
+        return .{
+            .kind = kind,
+            .dev_major = snapshot.dev_major,
+            .dev_minor = snapshot.dev_minor,
+            .mode = snapshot.mode,
+            .uid = snapshot.uid,
+            .gid = snapshot.gid,
+            ._pad = 0,
+            .ino = snapshot.ino,
+            .nlink = snapshot.nlink,
+            .size = snapshot.size,
+            .mtime_sec = snapshot.mtime.sec,
+            .mtime_nsec = snapshot.mtime.nsec,
+            .ctime_sec = snapshot.ctime.sec,
+            .ctime_nsec = snapshot.ctime.nsec,
+            .boundary_hash = boundary_hash,
+        };
+    }
+
+    pub fn computeBoundaryHash(io: std.Io, file: std.Io.File, size: u64) ?u64 {
+        if (size < min_size) return null;
+        var buf: [probe_window]u8 = undefined;
+        var hasher = std.hash.Wyhash.init(0);
+        const mid_offset: u64 = if (size >= 2 * 1024 * 1024)
+            1024 * 1024
+        else
+            (size / 2) & ~@as(u64, 4095);
+        const offsets = [3]u64{ 0, mid_offset, size - probe_window };
+        for (offsets) |off| {
+            const n = file.readPositionalAll(io, &buf, off) catch return null;
+            if (n != probe_window) return null;
+            hasher.update(&buf);
+        }
+        var extra: [1]u8 = undefined;
+        if ((file.readPositionalAll(io, &extra, size) catch return null) != 0) return null;
+        return hasher.final();
+    }
+
+    pub fn computeBoundaryHashSlice(bytes: []const u8) ?u64 {
+        if (bytes.len < min_size) return null;
+        var hasher = std.hash.Wyhash.init(0);
+        const mid_offset: usize = if (bytes.len >= 2 * 1024 * 1024)
+            1024 * 1024
+        else
+            (bytes.len / 2) & ~@as(usize, 4095);
+        hasher.update(bytes[0..probe_window]);
+        hasher.update(bytes[mid_offset .. mid_offset + probe_window]);
+        hasher.update(bytes[bytes.len - probe_window .. bytes.len]);
+        return hasher.final();
+    }
+
+    fn setIndex(key: Key) usize {
+        const h = key.ino ^ (key.size >> 12) ^ key.boundary_hash ^ (key.kind *% 0x9e3779b97f4a7c15);
+        return @intCast(h & (num_sets - 1));
+    }
+
+    fn findLocked(key: Key) ?Entry {
+        const base = setIndex(key) * ways;
+        for (table[base .. base + ways]) |slot| {
+            if (slot.key.kind != 0 and std.meta.eql(slot.key, key)) return slot;
+        }
+        return null;
+    }
+
+    fn insertLocked(entry: Entry) bool {
+        if (entry.key.kind == 0) return false;
+        const base = setIndex(entry.key) * ways;
+        for (table[base .. base + ways]) |*slot| {
+            if (slot.key.kind != 0 and std.meta.eql(slot.key, entry.key)) {
+                const old_flags = slot.flags;
+                if ((entry.flags & flag_has_crc32) != 0) slot.crc32 = entry.crc32;
+                slot.flags |= entry.flags;
+                return slot.flags != old_flags;
+            }
+        }
+        for (table[base .. base + ways]) |*slot| {
+            if (slot.key.kind == 0) {
+                slot.* = entry;
+                return true;
+            }
+        }
+        const way = evict_seq & (ways - 1);
+        evict_seq +%= 1;
+        table[base + way] = entry;
+        return true;
+    }
+
+    fn shmPath(buf: *[96]u8) ?[:0]const u8 {
+        const slice = std.fmt.bufPrint(buf[0 .. buf.len - 1], "/dev/shm/uk-wamr-digest-cache-{d}-v1.bin", .{linux.geteuid()}) catch return null;
+        buf[slice.len] = 0;
+        return buf[0..slice.len :0];
+    }
+
+    fn loadShmLocked() void {
+        var path_buf: [96]u8 = undefined;
+        const path = shmPath(&path_buf) orelse return;
+        const rc = linux.openat(linux.AT.FDCWD, path.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true }, 0);
+        if (linux.errno(rc) != .SUCCESS) return;
+        const fd: linux.fd_t = @intCast(rc);
+        defer _ = linux.close(fd);
+        var stx: linux.Statx = undefined;
+        if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH | linux.AT.SYMLINK_NOFOLLOW, linux.STATX.BASIC_STATS, &stx)) != .SUCCESS) return;
+        if (stx.uid != linux.geteuid() or (stx.mode & linux.S.IFMT) != linux.S.IFREG or (stx.mode & 0o077) != 0) return;
+        if (stx.size != @sizeOf(ShmImage)) return;
+        if (stx.ino == loaded_shm_ino and stx.mtime.sec == loaded_shm_mtime_sec and stx.mtime.nsec == loaded_shm_mtime_nsec) return;
+        var image: ShmImage = undefined;
+        const dest = std.mem.asBytes(&image);
+        var offset: usize = 0;
+        while (offset < dest.len) {
+            const r = linux.read(fd, dest[offset..].ptr, dest.len - offset);
+            if (linux.errno(r) != .SUCCESS or r == 0) return;
+            offset += r;
+        }
+        if (!std.mem.eql(u8, &image.magic, &shm_magic) or image.version != shm_version) return;
+        for (image.entries) |entry| {
+            if (entry.key.kind != 0) _ = insertLocked(entry);
+        }
+        loaded_shm_ino = stx.ino;
+        loaded_shm_mtime_sec = stx.mtime.sec;
+        loaded_shm_mtime_nsec = stx.mtime.nsec;
+    }
+
+    fn saveShmLocked() void {
+        var fsize_rlim: [2]u64 = .{ ~@as(u64, 0), ~@as(u64, 0) };
+        _ = linux.syscall4(.prlimit64, 0, 1, 0, @intFromPtr(&fsize_rlim));
+        if (fsize_rlim[0] < 64 * 1024 * 1024) return;
+        var path_buf: [96]u8 = undefined;
+        const path = shmPath(&path_buf) orelse return;
+        var tmp_buf: [128]u8 = undefined;
+        const seq = tmp_seq;
+        tmp_seq +%= 1;
+        const tmp_slice = std.fmt.bufPrint(tmp_buf[0 .. tmp_buf.len - 1], "{s}.{d}.{d}.tmp", .{ path, linux.getpid(), seq }) catch return;
+        tmp_buf[tmp_slice.len] = 0;
+        const tmp_path = tmp_buf[0..tmp_slice.len :0];
+        const rc = linux.openat(
+            linux.AT.FDCWD,
+            tmp_path.ptr,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true },
+            0o600,
+        );
+        if (linux.errno(rc) != .SUCCESS) return;
+        const fd: linux.fd_t = @intCast(rc);
+        var image: ShmImage = .{ .entries = table };
+        const src = std.mem.asBytes(&image);
+        var offset: usize = 0;
+        var ok = true;
+        while (offset < src.len) {
+            const w = linux.write(fd, src[offset..].ptr, src.len - offset);
+            if (linux.errno(w) != .SUCCESS or w == 0) {
+                ok = false;
+                break;
+            }
+            offset += w;
+        }
+        _ = linux.close(fd);
+        if (!ok or linux.errno(linux.renameat(linux.AT.FDCWD, tmp_path.ptr, linux.AT.FDCWD, path.ptr)) != .SUCCESS) {
+            _ = linux.unlinkat(linux.AT.FDCWD, tmp_path.ptr, 0);
+        }
+    }
+
+    pub fn get(snapshot: files.Snapshot, kind: u64, boundary_hash: u64) ?Entry {
+        const key = makeKey(snapshot, kind, boundary_hash);
+        acquire();
+        defer release();
+        if (findLocked(key)) |found| return found;
+        loadShmLocked();
+        return findLocked(key);
+    }
+
+    pub fn put(snapshot: files.Snapshot, kind: u64, boundary_hash: u64, digest: [32]u8, crc32: u32, flags: u32) void {
+        const entry: Entry = .{
+            .key = makeKey(snapshot, kind, boundary_hash),
+            .digest = digest,
+            .crc32 = crc32,
+            .flags = flags,
+        };
+        acquire();
+        defer release();
+        loadShmLocked();
+        if (insertLocked(entry)) {
+            saveShmLocked();
+        }
+    }
+};
 
 pub const Scanner = struct {
     const max_pattern_len = blk: {

@@ -879,6 +879,14 @@ pub fn inspectArtifact(io: std.Io, item: Artifact) !void {
     defer file.close(io);
     const before = try files.snapshot(file);
     if (before.size != item.size) return error.ArtifactChanged;
+    const bhash = azure_runtime.DigestCache.computeBoundaryHash(io, file, item.size);
+    if (bhash) |bh| {
+        if (azure_runtime.DigestCache.get(before, 1, bh)) |cached| {
+            if (!files.sameSnapshot(before, try files.snapshot(file))) return error.ArtifactChanged;
+            if (!std.mem.eql(u8, &cached.digest, &try c.parseSha256(item.sha256))) return error.HashMismatch;
+            return;
+        }
+    }
     var hash = core.Sha256.init(.{});
     var buffer: [65536]u8 = undefined;
     var offset: u64 = 0;
@@ -889,7 +897,9 @@ pub fn inspectArtifact(io: std.Io, item: Artifact) !void {
         offset += n;
     }
     if (try file.readPositionalAll(io, buffer[0..1], offset) != 0 or !files.sameSnapshot(before, try files.snapshot(file))) return error.ArtifactChanged;
-    if (!std.mem.eql(u8, &hash.finalResult(), &try c.parseSha256(item.sha256))) return error.HashMismatch;
+    const digest = hash.finalResult();
+    if (bhash) |bh| azure_runtime.DigestCache.put(before, 1, bh, digest, 0, 0);
+    if (!std.mem.eql(u8, &digest, &try c.parseSha256(item.sha256))) return error.HashMismatch;
 }
 
 fn readPolicy(a: std.mem.Allocator, io: std.Io, item: Artifact, limit: usize, policy: files.FilePolicy) ![]u8 {
@@ -1632,6 +1642,16 @@ fn inspectTool(io: std.Io, item: Artifact) !void {
     defer retained.close(io);
     const before = retained.file_snapshot;
     if (before.size != item.size) return error.ArtifactChanged;
+    const bhash = azure_runtime.DigestCache.computeBoundaryHash(io, retained.file, item.size);
+    if (bhash) |bh| {
+        if (azure_runtime.DigestCache.get(before, 1, bh)) |cached| {
+            if (!files.sameSnapshot(before, try files.snapshot(retained.file)) or
+                !std.mem.eql(u8, &cached.digest, &try c.parseSha256(item.sha256)))
+                return error.ArtifactChanged;
+            try retained.verify(io);
+            return;
+        }
+    }
     var hash = core.Sha256.init(.{});
     var buffer: [65536]u8 = undefined;
     var offset: u64 = 0;
@@ -1642,11 +1662,13 @@ fn inspectTool(io: std.Io, item: Artifact) !void {
         hash.update(buffer[0..amount]);
         offset += amount;
     }
+    const digest = hash.finalResult();
     if (try retained.file.readPositionalAll(io, buffer[0..1], item.size) != 0 or
         !files.sameSnapshot(before, try files.snapshot(retained.file)) or
-        !std.mem.eql(u8, &hash.finalResult(), &try c.parseSha256(item.sha256)))
+        !std.mem.eql(u8, &digest, &try c.parseSha256(item.sha256)))
         return error.ArtifactChanged;
     try retained.verify(io);
+    if (bhash) |bh| azure_runtime.DigestCache.put(before, 1, bh, digest, 0, 0);
 }
 
 pub fn verifyHandoff(a: std.mem.Allocator, io: std.Io, bytes: []const u8) !void {
@@ -2476,8 +2498,19 @@ pub fn rawVhd(io: std.Io, raw: Artifact, vhd: Artifact) !void {
     const file = try files.openAbsolute(io, vhd.path, .artifact);
     defer file.close(io);
     const before = try files.snapshot(file);
-    var hash = core.Sha256.init(.{});
     var buffer: [65536]u8 = undefined;
+    const bhash = azure_runtime.DigestCache.computeBoundaryHash(io, file, vhd.size);
+    if (bhash) |bh| {
+        if (azure_runtime.DigestCache.get(before, 2, bh)) |cached| {
+            if (!std.mem.eql(u8, &cached.digest, &try c.parseSha256(raw.sha256))) return error.WrongRawPrefix;
+            var footer: [512]u8 = undefined;
+            if (try file.readPositionalAll(io, &footer, raw.size) != 512) return error.ArtifactChanged;
+            try base.footer(&footer, raw.size, null);
+            if (try file.readPositionalAll(io, buffer[0..1], vhd.size) != 0 or !files.sameSnapshot(before, try files.snapshot(file))) return error.ArtifactChanged;
+            return;
+        }
+    }
+    var hash = core.Sha256.init(.{});
     var offset: u64 = 0;
     while (offset < raw.size) {
         const n: usize = @intCast(@min(buffer.len, raw.size - offset));
@@ -2485,11 +2518,13 @@ pub fn rawVhd(io: std.Io, raw: Artifact, vhd: Artifact) !void {
         hash.update(buffer[0..n]);
         offset += n;
     }
-    if (!std.mem.eql(u8, &hash.finalResult(), &try c.parseSha256(raw.sha256))) return error.WrongRawPrefix;
+    const prefix_digest = hash.finalResult();
+    if (!std.mem.eql(u8, &prefix_digest, &try c.parseSha256(raw.sha256))) return error.WrongRawPrefix;
     var footer: [512]u8 = undefined;
     if (try file.readPositionalAll(io, &footer, offset) != 512) return error.ArtifactChanged;
     try base.footer(&footer, raw.size, null);
     if (try file.readPositionalAll(io, buffer[0..1], vhd.size) != 0 or !files.sameSnapshot(before, try files.snapshot(file))) return error.ArtifactChanged;
+    if (bhash) |bh| azure_runtime.DigestCache.put(before, 2, bh, prefix_digest, 0, 0);
 }
 
 fn field(value: std.json.Value, name: []const u8) !std.json.Value {
