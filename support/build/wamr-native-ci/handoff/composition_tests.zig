@@ -720,15 +720,34 @@ fn liveImportedAuthorityComposition(
         defer source_dir.close(work.io);
         for ([_][]const u8{ "python3.11", "packages", "data" }) |component|
             try source_dir.createDir(work.io, component, .fromMode(0o700));
+        const loader_source_path = try work.join("authority-work/runtime-source/ld-linux-x86-64.so.2");
+        const loader_elf = try syntheticElf(.{ .soname = "ld-linux-x86-64.so.2" });
+        const interpreter_elf = try syntheticElf(.{
+            .interp = loader_source_path,
+            .needed = &.{"libalpha.so"},
+        });
+        const alpha_elf = try syntheticElf(.{
+            .needed = &.{"libbeta.so"},
+            .soname = "libalpha.so",
+        });
+        const beta_elf = try syntheticElf(.{
+            .soname = "libbeta.so",
+        });
+        const ext_elf = try syntheticElf(.{
+            .needed = &.{"libbeta.so"},
+        });
         try writeModeFile(work.io, source_dir, "launcher", "#!/bin/sh\nexit 0\n", 0o500);
-        try writeModeFile(work.io, source_dir, "python", "synthetic-interpreter\n", 0o500);
-        try writeModeFile(work.io, source_dir, "ld-synthetic.so", "synthetic-loader\n", 0o500);
+        try writeModeFile(work.io, source_dir, "python", &interpreter_elf, 0o500);
+        try writeModeFile(work.io, source_dir, "ld-linux-x86-64.so.2", &loader_elf, 0o500);
+        try writeModeFile(work.io, source_dir, "libalpha.so", &alpha_elf, 0o400);
+        try writeModeFile(work.io, source_dir, "libbeta.so", &beta_elf, 0o400);
         try writeModeFile(work.io, source_dir, "uploader", "synthetic-uploader\n", 0o500);
         {
             const stdlib = try source_dir.openDir(work.io, "python3.11", .{ .iterate = true });
             defer stdlib.close(work.io);
             try stdlib.createDir(work.io, "encodings", .fromMode(0o700));
             try writeModeFile(work.io, stdlib, "os.py", "synthetic-os\n", 0o600);
+            try writeModeFile(work.io, stdlib, "_ext.so", &ext_elf, 0o400);
             const encodings = try stdlib.openDir(work.io, "encodings", .{});
             defer encodings.close(work.io);
             try writeModeFile(work.io, encodings, "__init__.py", "synthetic-encodings\n", 0o600);
@@ -747,26 +766,50 @@ fn liveImportedAuthorityComposition(
             try writeModeFile(work.io, data, "fixed.txt", "synthetic-data\n", 0o600);
         }
 
-        var loader = try files.RetainedFile.open(work.io, try work.join("authority-work/runtime-source/ld-synthetic.so"), .artifact);
+        var interpreter = try files.RetainedFile.open(work.io, try work.join("authority-work/runtime-source/python"), .tool);
+        defer interpreter.close(work.io);
+        const interpreter_sha256 = try handoff.retained_copy.hashRetained(work.io, &interpreter, authority.types.runtime.max_file_bytes, null);
+        var loader = try files.RetainedFile.open(work.io, loader_source_path, .artifact);
         defer loader.close(work.io);
-        const dependencies = [_]authority.types.LoaderSource{.{ .file = &loader, .executable = true }};
+        var alpha = try files.RetainedFile.open(work.io, try work.join("authority-work/runtime-source/libalpha.so"), .artifact);
+        defer alpha.close(work.io);
+        var beta = try files.RetainedFile.open(work.io, try work.join("authority-work/runtime-source/libbeta.so"), .artifact);
+        defer beta.close(work.io);
+        var ext = try files.RetainedFile.open(work.io, try work.join("authority-work/runtime-source/python3.11/_ext.so"), .artifact);
+        defer ext.close(work.io);
+        const stdlib_root = try work.join("authority-work/runtime-source/python3.11");
         const package_roots = [_][]const u8{try work.join("authority-work/runtime-source/packages")};
         const data_roots = [_][]const u8{try work.join("authority-work/runtime-source/data")};
-        var stage = try authority.runtime_copy.Stage.init(
+        var discovered = try authority.runtime_probes.discover(ctx, .{
+            .interpreter = &interpreter,
+            .dynamic_loader = &loader,
+            .native_roots = &.{&ext},
+            .candidates = &.{ &alpha, &beta },
+        });
+        defer discovered.deinit();
+        try std.testing.expectEqual(&loader, discovered.inventory.dynamic_loader);
+        try std.testing.expectEqual(@as(usize, 3), discovered.inventory.dependencies.len);
+        try std.testing.expectEqual(@as(usize, 3), discovered.names.len);
+
+        var stage = try authority.runtime_copy.Stage.initNamed(
             ctx,
             .{
                 .output = try work.join("authority-work/azure-runtime"),
                 .azure = try work.join("authority-work/runtime-source/launcher"),
                 .az_python = try work.join("authority-work/runtime-source/python"),
-                .stdlib = try work.join("authority-work/runtime-source/python3.11"),
+                .stdlib = stdlib_root,
                 .package_root = &package_roots,
                 .data_root = &data_roots,
             },
-            .{ .dynamic_loader = &loader, .dependencies = &dependencies },
+            discovered.inventory,
+            discovered.names,
         );
         defer stage.deinit();
+        try stage.bindInterpreter(&interpreter, interpreter_sha256);
         try std.testing.expect(stage.copyStage() == .staged);
         const draft = try stage.manifestInputs();
+        try std.testing.expectEqual(@as(usize, 3), draft.loader_dependencies.len);
+        try std.testing.expectEqual(@as(usize, 5), draft.native_files.len);
         const layout = try stage.layout();
         const runtime_output = try authority_dir.openDir(work.io, "azure-runtime", .{});
         defer runtime_output.close(work.io);
@@ -807,6 +850,19 @@ fn liveImportedAuthorityComposition(
                 .package_restore = .forbidden_after_custody,
             },
         };
+        const copied_elf = try authority.runtime_probes.inspectCopied(ctx, .{
+            .root = try stage.root(),
+            .layout = layout,
+            .contract = contract,
+            .barrier = stage.barrier(),
+        });
+        try std.testing.expectEqual(@as(u32, 5), copied_elf.native_files);
+        try std.testing.expectEqual(@as(u16, 3), copied_elf.loader_files);
+        try std.testing.expectEqual(@as(u32, 3), copied_elf.needed_edges);
+        try std.testing.expect(copied_elf.interpreter_closure[0]);
+        try std.testing.expect(copied_elf.interpreter_closure[1]);
+        try std.testing.expect(copied_elf.interpreter_closure[2]);
+        try std.testing.expect(!copied_elf.interpreter_closure[3]);
         const runtime_bytes = try authority.records.runtimeBytes(std.testing.allocator, contract);
         defer std.testing.allocator.free(runtime_bytes);
         try writeModeFile(work.io, runtime_output, "azure-runtime.json", runtime_bytes, 0o600);
@@ -966,6 +1022,19 @@ fn liveImportedAuthorityComposition(
             std.debug.print("direct validator plan stderr: {s}\n", .{plan_res.stderr});
         try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, plan_res.term);
         try std.testing.expectEqualStrings("", plan_res.stderr);
+
+        // Create-only durability: re-running plan against existing output paths is refused without mutating published records.
+        const original_plan_bytes = try work.read("authority-work/records/plan.json");
+        const original_template_bytes = try work.read("authority-work/records/template.json");
+        const duplicate_plan = authority.handlers.run(
+            .{ .retained = ctx, .live_finalized = created_candidate },
+            .{ .plan = base_plan },
+        );
+        try std.testing.expect(duplicate_plan.plan == .refused);
+        try std.testing.expectEqual(error.PathAlreadyExists, duplicate_plan.plan.refused.err);
+        try std.testing.expectEqual(authority.plan.Publications{}, duplicate_plan.plan.refused.outputs);
+        try std.testing.expectEqualStrings(original_plan_bytes, try work.read("authority-work/records/plan.json"));
+        try std.testing.expectEqualStrings(original_template_bytes, try work.read("authority-work/records/template.json"));
     }
 
     const now_unix: u64 = @intCast(std.Io.Clock.real.now(work.io).toSeconds());
@@ -1039,6 +1108,63 @@ fn liveImportedAuthorityComposition(
         };
     };
     {
+        // Create-only durability and approval window / authority-field boundary refusals for record-authorization.
+        const original_auth_bytes = try work.read("authority-work/records/authorization.json");
+        const base_auth_cmd: authority.types.AuthorizationCommand = .{
+            .plan = plan_commitments.plan_artifact.path,
+            .template = plan_commitments.template_artifact.path,
+            .output = approved_artifact.path,
+            .decision = .approved,
+            .approver = "operator@example.invalid",
+            .reference = "CHG-189-APPROVE",
+            .recorded_unix = recorded_unix,
+            .expires_unix = recorded_unix + 1800,
+            .tools = tool_paths,
+        };
+        const duplicate_auth = authority.handlers.run(.{ .retained = ctx }, .{ .@"record-authorization" = base_auth_cmd });
+        try std.testing.expect(duplicate_auth.authorization == .refused);
+        try std.testing.expectEqual(error.PathAlreadyExists, duplicate_auth.authorization.refused.err);
+        try std.testing.expectEqual(files.CommitStatus.not_committed, duplicate_auth.authorization.refused.publication);
+        try std.testing.expectEqualStrings(original_auth_bytes, try work.read("authority-work/records/authorization.json"));
+
+        const bad_auth_output = try work.join("authority-work/records/authorization-bad.json");
+        var zero_window = base_auth_cmd;
+        zero_window.output = bad_auth_output;
+        zero_window.expires_unix = recorded_unix;
+        const zero_window_res = authority.handlers.run(.{ .retained = ctx }, .{ .@"record-authorization" = zero_window });
+        try std.testing.expect(zero_window_res.authorization == .refused);
+        try std.testing.expectEqual(error.InvalidApprovalWindow, zero_window_res.authorization.refused.err);
+
+        var oversized_window = base_auth_cmd;
+        oversized_window.output = bad_auth_output;
+        oversized_window.expires_unix = recorded_unix + 3601;
+        const oversized_window_res = authority.handlers.run(.{ .retained = ctx }, .{ .@"record-authorization" = oversized_window });
+        try std.testing.expect(oversized_window_res.authorization == .refused);
+        try std.testing.expectEqual(error.InvalidApprovalWindow, oversized_window_res.authorization.refused.err);
+
+        var future_recorded = base_auth_cmd;
+        future_recorded.output = bad_auth_output;
+        future_recorded.recorded_unix = recorded_unix + 600;
+        future_recorded.expires_unix = recorded_unix + 1800;
+        const future_recorded_res = authority.handlers.run(.{ .retained = ctx }, .{ .@"record-authorization" = future_recorded });
+        try std.testing.expect(future_recorded_res.authorization == .refused);
+        try std.testing.expectEqual(error.ApprovalExpired, future_recorded_res.authorization.refused.err);
+
+        var control_approver = base_auth_cmd;
+        control_approver.output = bad_auth_output;
+        control_approver.approver = "operator\n@example.invalid";
+        const control_approver_res = authority.handlers.run(.{ .retained = ctx }, .{ .@"record-authorization" = control_approver });
+        try std.testing.expect(control_approver_res.authorization == .refused);
+        try std.testing.expectEqual(error.InvalidAuthorityField, control_approver_res.authorization.refused.err);
+
+        var empty_reference = base_auth_cmd;
+        empty_reference.output = bad_auth_output;
+        empty_reference.reference = "";
+        const empty_reference_res = authority.handlers.run(.{ .retained = ctx }, .{ .@"record-authorization" = empty_reference });
+        try std.testing.expect(empty_reference_res.authorization == .refused);
+        try std.testing.expectEqual(error.InvalidAuthorityField, empty_reference_res.authorization.refused.err);
+        try work.absent("authority-work/records/authorization-bad.json");
+
         const denied_res = try std.process.run(work.a, work.io, .{
             .argv = &.{ tools.validator, "authorization", plan_commitments.plan_artifact.path, denied_artifact.path },
             .stdout_limit = .limited(4096),
@@ -1163,6 +1289,22 @@ fn liveImportedAuthorityComposition(
         const admission_bytes = try work.read("authority-work/records/admission.json");
         try std.testing.expectEqualStrings(admission_bytes, try work.read("authority-work/records/admission.json.validation.json"));
 
+        // Create-only durability: re-running admit against existing output path is refused without mutating published admission.
+        const duplicate_admit = authority.handlers.run(
+            .{
+                .retained = ctx,
+                .live_finalized = reopened.success,
+                .plan_commitment = plan_commitments.plan_artifact,
+                .authorization_commitment = approved_artifact,
+            },
+            parsed_admit.result.command,
+        );
+        try std.testing.expect(duplicate_admit.admission == .refused);
+        try std.testing.expectEqual(error.PathAlreadyExists, duplicate_admit.admission.refused.err);
+        try std.testing.expectEqual(files.CommitStatus.not_committed, duplicate_admit.admission.refused.publication);
+        try std.testing.expectEqualStrings(admission_bytes, try work.read("authority-work/records/admission.json"));
+        try admitted.revalidate();
+
         for ([_][]const []const u8{
             &.{ tools.validator, "admission", admission_artifact.path },
             &.{ tools.validator, "stored-scope", admission_artifact.path },
@@ -1181,7 +1323,135 @@ fn liveImportedAuthorityComposition(
             try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, val_res.term);
             try std.testing.expectEqualStrings("", val_res.stderr);
         }
+
+        // Post-admission tamper detection: mismatched ledger path, mutating a bound tool, mutating the uninitialized
+        // ledger, or mutating the staged runtime is refused by Admitted.revalidate() and uk-wamr-direct-validate.
+        {
+            const wrong_ledger_res = try std.process.run(work.a, work.io, .{
+                .argv = &.{ tools.validator, "ledger", admission_artifact.path, try work.join("authority-work/records") },
+                .stdout_limit = .limited(4096),
+                .stderr_limit = .limited(4096),
+            });
+            try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, wrong_ledger_res.term);
+            try std.testing.expectEqualStrings("", wrong_ledger_res.stdout);
+            try std.testing.expect(wrong_ledger_res.stderr.len > 0);
+        }
+        {
+            const source_dir = try authority_dir.openDir(work.io, "runtime-source", .{});
+            defer source_dir.close(work.io);
+            if (std.os.linux.errno(std.os.linux.fchmodat(source_dir.handle, "uploader", 0o700)) != .SUCCESS)
+                return error.FixtureMode;
+            const uploader = try source_dir.openFile(work.io, "uploader", .{ .mode = .read_write, .follow_symlinks = false });
+            defer uploader.close(work.io);
+            try uploader.writePositionalAll(work.io, "tampered-uploader!\n", 0);
+            if (std.os.linux.errno(std.os.linux.fchmod(uploader.handle, 0o500)) != .SUCCESS)
+                return error.FixtureMode;
+            try uploader.sync(work.io);
+            try std.testing.expectError(error.ArtifactChanged, admitted.revalidate());
+            const plan_tamper_res = try std.process.run(work.a, work.io, .{
+                .argv = &.{ tools.validator, "plan", plan_commitments.plan_artifact.path, plan_commitments.template_artifact.path },
+                .stdout_limit = .limited(4096),
+                .stderr_limit = .limited(4096),
+            });
+            try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, plan_tamper_res.term);
+            try std.testing.expectEqualStrings("", plan_tamper_res.stdout);
+            try std.testing.expect(plan_tamper_res.stderr.len > 0);
+        }
+        {
+            const ledger_dir = try authority_dir.openDir(work.io, "ledger", .{});
+            defer ledger_dir.close(work.io);
+            try writeModeFile(work.io, ledger_dir, "stray.json", "{}", 0o600);
+            try std.testing.expectError(error.WrongLedgerIdentity, admitted.revalidate());
+            const ledger_tamper_res = try std.process.run(work.a, work.io, .{
+                .argv = &.{ tools.validator, "admission", admission_artifact.path },
+                .stdout_limit = .limited(4096),
+                .stderr_limit = .limited(4096),
+            });
+            try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, ledger_tamper_res.term);
+            try std.testing.expectEqualStrings("", ledger_tamper_res.stdout);
+            try std.testing.expect(ledger_tamper_res.stderr.len > 0);
+        }
+        {
+            const runtime_dir = try authority_dir.openDir(work.io, "azure-runtime", .{});
+            defer runtime_dir.close(work.io);
+            const manifest_file = try runtime_dir.openFile(work.io, "azure-runtime.manifest", .{ .mode = .read_write, .follow_symlinks = false });
+            defer manifest_file.close(work.io);
+            try manifest_file.writePositionalAll(work.io, "{\"tampered\":true}\n", 0);
+            try manifest_file.sync(work.io);
+            const runtime_tamper_res = try std.process.run(work.a, work.io, .{
+                .argv = &.{ tools.validator, "azure-runtime", try work.join("authority-work/azure-runtime/azure-runtime.json") },
+                .stdout_limit = .limited(4096),
+                .stderr_limit = .limited(4096),
+            });
+            try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, runtime_tamper_res.term);
+            try std.testing.expectEqualStrings("", runtime_tamper_res.stdout);
+            try std.testing.expect(runtime_tamper_res.stderr.len > 0);
+        }
     }
+}
+
+const SyntheticElf = struct {
+    interp: ?[]const u8 = null,
+    needed: []const []const u8 = &.{},
+    soname: ?[]const u8 = null,
+};
+
+fn writeElfInt(comptime T: type, bytes: []u8, offset: usize, value: T) void {
+    std.mem.writeInt(T, bytes[offset..][0..@sizeOf(T)], value, .little);
+}
+
+fn writeElfProgram(bytes: []u8, index: usize, kind: std.elf.PT, offset: u64, size: u64, flags: u32) void {
+    const at = 64 + index * 56;
+    writeElfInt(u32, bytes, at, @intFromEnum(kind));
+    writeElfInt(u32, bytes, at + 4, flags);
+    writeElfInt(u64, bytes, at + 8, offset);
+    writeElfInt(u64, bytes, at + 16, 0x400000 + offset);
+    writeElfInt(u64, bytes, at + 32, size);
+    writeElfInt(u64, bytes, at + 40, size);
+    writeElfInt(u64, bytes, at + 48, if (kind == .LOAD) 0x1000 else 8);
+}
+
+fn writeElfDynamicEntry(bytes: []u8, index: usize, tag: i64, value: u64) void {
+    writeElfInt(i64, bytes, 0x200 + index * 16, tag);
+    writeElfInt(u64, bytes, 0x208 + index * 16, value);
+}
+
+fn syntheticElf(config: SyntheticElf) ![2048]u8 {
+    var bytes: [2048]u8 = @splat(0);
+    @memcpy(bytes[0..7], "\x7fELF\x02\x01\x01");
+    writeElfInt(u16, &bytes, 16, 3);
+    writeElfInt(u16, &bytes, 18, @intFromEnum(std.elf.EM.X86_64));
+    writeElfInt(u32, &bytes, 20, 1);
+    writeElfInt(u64, &bytes, 24, 0x400080);
+    writeElfInt(u64, &bytes, 32, 64);
+    writeElfInt(u16, &bytes, 52, 64);
+    writeElfInt(u16, &bytes, 54, 56);
+    writeElfInt(u16, &bytes, 56, if (config.interp != null) 3 else 2);
+    writeElfProgram(&bytes, 0, .LOAD, 0, bytes.len, std.elf.PF_R | std.elf.PF_X);
+    writeElfProgram(&bytes, 1, .DYNAMIC, 0x200, 96, std.elf.PF_R);
+    if (config.interp) |interp| {
+        if (interp.len >= 256) return error.InvalidSynthetic;
+        @memcpy(bytes[0x100..][0..interp.len], interp);
+        writeElfProgram(&bytes, 2, .INTERP, 0x100, interp.len + 1, std.elf.PF_R);
+    }
+    var cursor: usize = 1;
+    var entry: usize = 2;
+    for (config.needed) |name| {
+        @memcpy(bytes[0x380 + cursor ..][0..name.len], name);
+        writeElfDynamicEntry(&bytes, entry, std.elf.DT_NEEDED, cursor);
+        cursor += name.len + 1;
+        entry += 1;
+    }
+    if (config.soname) |name| {
+        @memcpy(bytes[0x380 + cursor ..][0..name.len], name);
+        writeElfDynamicEntry(&bytes, entry, std.elf.DT_SONAME, cursor);
+        cursor += name.len + 1;
+        entry += 1;
+    }
+    if (entry >= 6) return error.InvalidSynthetic;
+    writeElfDynamicEntry(&bytes, 0, std.elf.DT_STRTAB, 0x400380);
+    writeElfDynamicEntry(&bytes, 1, std.elf.DT_STRSZ, cursor);
+    return bytes;
 }
 
 fn overwrite(io: std.Io, path: []const u8, bytes: []const u8) !void {
