@@ -1102,12 +1102,16 @@ test "strict ZIP32 name, count and limit refusals are deterministic" {
 
 test "strict ZIP32 writer streams and removes failed file output" {
     const io = std.testing.io;
-    const cwd = std.Io.Dir.cwd();
+    var fixture_root = try std.Io.Dir.openDirAbsolute(io, test_options.fixture_root, .{ .iterate = true });
+    defer fixture_root.close(io);
+    try fixture_root.createDirPath(io, "handoff-export-tests");
+    var parent = try fixture_root.openDir(io, "handoff-export-tests", .{ .iterate = true });
+    defer parent.close(io);
     const dir_name = "handoff-zip-stream-test";
-    cwd.deleteTree(io, dir_name) catch {};
-    try cwd.createDir(io, dir_name, .fromMode(0o700));
-    defer cwd.deleteTree(io, dir_name) catch {};
-    const dir = try cwd.openDir(io, dir_name, .{ .follow_symlinks = false });
+    parent.deleteTree(io, dir_name) catch {};
+    try parent.createDir(io, dir_name, .fromMode(0o700));
+    defer parent.deleteTree(io, dir_name) catch {};
+    const dir = try parent.openDir(io, dir_name, .{ .follow_symlinks = false });
     defer dir.close(io);
 
     var actual_long = std.Io.Reader.fixed("xx");

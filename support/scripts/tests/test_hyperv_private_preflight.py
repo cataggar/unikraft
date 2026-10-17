@@ -3205,6 +3205,250 @@ class PrivatePreflightBlobTest(PrivatePreflightFixture):
                     run, {}, "sv=secret", 10.5
                 )
 
+    def test_blob_worker_classifies_azure_errors_with_secret_safe_diagnostics(
+        self,
+    ):
+        class AzureError(Exception):
+            pass
+
+        class HttpResponseError(AzureError):
+            def __init__(
+                self, message, *, status_code=None, error_code=None,
+                response=None, error=None,
+            ):
+                super().__init__(message)
+                self.status_code = status_code
+                self.error_code = error_code
+                self.response = response
+                self.error = error
+
+        class ClientAuthenticationError(HttpResponseError):
+            pass
+
+        class ResourceNotFoundError(HttpResponseError):
+            pass
+
+        secret = (
+            "https://ukhvp1234567890abcd.blob.core.windows.net/preflight"
+            "?sig=private-sas /owner/private/state"
+        )
+        client = mock.Mock()
+        client.create_container.side_effect = HttpResponseError(
+            secret,
+            status_code=403,
+            error_code="AuthorizationSourceIPMismatch",
+        )
+        with self.assertRaises(blob_worker.WorkerError) as raised:
+            blob_worker.upload(
+                client,
+                {"create_container": True, "files": []},
+                AzureError,
+            )
+        payload = raised.exception.to_payload()
+        self.assertEqual(
+            payload,
+            {
+                "schema": 1,
+                "result": "FAIL",
+                "stage": "create-container",
+                "category": "http-response-error",
+                "http_status": 403,
+                "service_error": "AuthorizationSourceIPMismatch",
+            },
+        )
+        self.assertNotIn("private-sas", json.dumps(payload))
+        self.assertNotIn("ukhvp1234567890abcd", json.dumps(payload))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "input.bin"
+            source.write_bytes(b"hello")
+            digest = hashlib.sha256(b"hello").hexdigest()
+            upload_client = mock.Mock()
+            upload_client.upload_blob.side_effect = (
+                ClientAuthenticationError(
+                    secret,
+                    response=mock.Mock(
+                        status_code=403,
+                        headers={"x-ms-error-code": "AuthenticationFailed"},
+                    ),
+                )
+            )
+            with self.assertRaises(blob_worker.WorkerError) as raised:
+                blob_worker.upload(
+                    upload_client,
+                    {
+                        "create_container": False,
+                        "files": [{
+                            "blob": "input",
+                            "path": str(source),
+                            "size": 5,
+                            "sha256": digest,
+                        }],
+                    },
+                    AzureError,
+                )
+            self.assertEqual(
+                raised.exception.to_payload(),
+                {
+                    "schema": 1,
+                    "result": "FAIL",
+                    "stage": "upload-blob",
+                    "category": "authentication-failed",
+                    "http_status": 403,
+                    "service_error": "AuthenticationFailed",
+                },
+            )
+
+            output_path = root / "output.bin"
+            download_client = mock.Mock()
+            download_client.download_blob.side_effect = (
+                ResourceNotFoundError(
+                    secret,
+                    status_code=404,
+                    error=mock.Mock(code="BlobNotFound"),
+                )
+            )
+            with self.assertRaises(blob_worker.WorkerError) as raised:
+                blob_worker.download(
+                    download_client,
+                    {
+                        "files": [{
+                            "blob": "receipt",
+                            "path": str(output_path),
+                            "maximum": 64,
+                        }],
+                    },
+                    AzureError,
+                )
+            self.assertEqual(
+                raised.exception.to_payload(),
+                {
+                    "schema": 1,
+                    "result": "FAIL",
+                    "stage": "download-blob",
+                    "category": "resource-not-found",
+                    "http_status": 404,
+                    "service_error": "BlobNotFound",
+                },
+            )
+
+            unallowlisted_client = mock.Mock()
+            unallowlisted_client.create_container.side_effect = (
+                HttpResponseError(
+                    secret,
+                    status_code=True,
+                    error_code="UnlistedCode?sig=private-sas",
+                )
+            )
+            with self.assertRaises(blob_worker.WorkerError) as raised:
+                blob_worker.upload(
+                    unallowlisted_client,
+                    {"create_container": True, "files": []},
+                    AzureError,
+                )
+            self.assertEqual(
+                raised.exception.to_payload(),
+                {
+                    "schema": 1,
+                    "result": "FAIL",
+                    "stage": "create-container",
+                    "category": "http-response-error",
+                    "http_status": None,
+                    "service_error": None,
+                },
+            )
+
+    def test_run_blob_worker_propagates_bounded_failure_and_rejects_unallowlisted_output(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            @contextmanager
+            def request_file(_kind, value):
+                path = Path(temporary) / ".blob-request.json"
+                path.write_text(json.dumps(value))
+                try:
+                    yield path
+                finally:
+                    path.unlink(missing_ok=True)
+
+            run = mock.Mock()
+            run.tracked_private_json.side_effect = request_file
+            process = mock.Mock(returncode=1)
+            process.communicate.return_value = (
+                json.dumps({
+                    "schema": 1,
+                    "result": "FAIL",
+                    "stage": "upload-blob",
+                    "category": "http-response-error",
+                    "http_status": 403,
+                    "service_error": "AuthorizationSourceIPMismatch",
+                }).encode(),
+                b"stderr-secret?sig=private-sas",
+            )
+            with mock.patch.object(
+                preflight, "check_blob_dependency"
+            ), mock.patch.object(
+                preflight.subprocess, "Popen", return_value=process
+            ):
+                with self.assertRaises(
+                    preflight.PrivateBlobTransferError
+                ) as raised:
+                    preflight.run_blob_worker(
+                        run, {}, "sv=secret", time.monotonic() + 10
+                    )
+            self.assertEqual(
+                raised.exception.failure_category,
+                "PrivateBlobTransferError",
+            )
+            self.assertEqual(
+                raised.exception.code, "AuthorizationSourceIPMismatch"
+            )
+            self.assertEqual(
+                raised.exception.blob_failure,
+                {
+                    "stage": "upload-blob",
+                    "category": "http-response-error",
+                    "http_status": 403,
+                    "service_error": "AuthorizationSourceIPMismatch",
+                },
+            )
+            self.assertNotIn("private-sas", str(raised.exception))
+
+            bad_process = mock.Mock(returncode=1)
+            bad_process.communicate.return_value = (
+                json.dumps({
+                    "schema": 1,
+                    "result": "FAIL",
+                    "stage": "upload-blob",
+                    "category": "http-response-error",
+                    "http_status": 403,
+                    "service_error": "LeakedSecret?sig=private-sas",
+                }).encode(),
+                b"",
+            )
+            with mock.patch.object(
+                preflight, "check_blob_dependency"
+            ), mock.patch.object(
+                preflight.subprocess, "Popen", return_value=bad_process
+            ):
+                with self.assertRaises(
+                    preflight.PrivateBlobTransferError
+                ) as fallback:
+                    preflight.run_blob_worker(
+                        run, {}, "sv=secret", time.monotonic() + 10
+                    )
+            self.assertEqual(
+                fallback.exception.blob_failure,
+                {
+                    "stage": "worker",
+                    "category": "worker-output-invalid",
+                    "http_status": None,
+                    "service_error": None,
+                },
+            )
+            self.assertNotIn("private-sas", str(fallback.exception))
+
 
 class PrivatePreflightTemplateTest(PrivatePreflightFixture):
     def test_arm_template_is_exact_private_standard_host(self):
@@ -5263,6 +5507,71 @@ class PrivatePreflightOrderingTest(PrivatePreflightFixture):
         self.assertNotIn("private-sas", serialized)
         self.assertNotIn("primary_failure", state)
         self.assertNotIn("cleanup_failure", state)
+
+    def test_blob_transfer_failure_persists_bounded_diagnostics_in_state_and_pipeline(
+        self,
+    ):
+        blob_error = preflight.PrivateBlobTransferError(
+            "upload-blob",
+            "http-response-error",
+            http_status=403,
+            service_error="AuthorizationSourceIPMismatch",
+        )
+        cleanup = preflight.azure.AzureCliError(
+            ["group", "delete"],
+            mock.Mock(
+                returncode=1,
+                stderr=(
+                    "ERROR: (CleanupDenied) "
+                    "https://private.example/?sig=cleanup-secret"
+                ),
+            ),
+            True,
+        )
+        events, state, raised = self.execute(
+            capability_error=blob_error, cleanup_error=cleanup
+        )
+        self.assertEqual(events[-1], "cleanup")
+        self.assertIsInstance(
+            raised, preflight.PrivateFailurePipelineError
+        )
+        self.assertEqual(
+            raised.failure_category, "PrivateBlobTransferError"
+        )
+        self.assertEqual(raised.code, "AuthorizationSourceIPMismatch")
+        self.assertEqual(
+            raised.blob_failure,
+            {
+                "stage": "upload-blob",
+                "category": "http-response-error",
+                "http_status": 403,
+                "service_error": "AuthorizationSourceIPMismatch",
+            },
+        )
+        self.assertIn(
+            "blob=upload-blob:http-response-error:403:AuthorizationSourceIPMismatch",
+            str(raised),
+        )
+        self.assertEqual(
+            state["failure"],
+            {
+                "category": "PrivateBlobTransferError",
+                "code": "AuthorizationSourceIPMismatch",
+                "phase": "public-tools-staged",
+                "blob": {
+                    "stage": "upload-blob",
+                    "category": "http-response-error",
+                    "http_status": 403,
+                    "service_error": "AuthorizationSourceIPMismatch",
+                },
+                "cleanup": [{
+                    "stage": "cleanup",
+                    "category": "AzureCliError",
+                    "code": "CleanupDenied",
+                }],
+            },
+        )
+        self.assertNotIn("cleanup-secret", str(raised) + json.dumps(state["failure"]))
 
     def test_creation_reconcile_and_cleanup_codes_are_all_retained(self):
         creation = preflight.azure.AzureCliError(
