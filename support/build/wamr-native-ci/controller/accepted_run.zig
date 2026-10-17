@@ -169,6 +169,7 @@ pub const AcceptedRun = struct {
     scratch: ?std.mem.Allocator = null,
     in_pass_files: ?*std.StringHashMap(physical.File) = null,
     in_pass_known: ?*std.AutoHashMap([9]i128, [64]u8) = null,
+    custody_cache: ?build.CustodyCache = null,
     io: std.Io,
     context: EvidenceContext,
     compatibility: profile.CompatibleRecordSet,
@@ -196,8 +197,16 @@ pub const AcceptedRun = struct {
 
     pub fn deinit(self: *AcceptedRun) void {
         if (self.readonly_git) |*git| git.close(self.io);
+        if (self.custody_cache) |*cache| cache.deinit();
         self.arena.deinit();
         self.* = undefined;
+    }
+
+    pub fn ensureCustodyCache(self: *AcceptedRun) *build.CustodyCache {
+        if (self.custody_cache == null) {
+            self.custody_cache = build.CustodyCache.init(self.arena.child_allocator);
+        }
+        return &self.custody_cache.?;
     }
 
     fn persistentAllocator(self: *AcceptedRun) std.mem.Allocator {
@@ -393,17 +402,13 @@ pub const AcceptedRun = struct {
         else
             null;
         defer if (pass_files) |*active| active.deinit();
-        var pass_known: ?std.AutoHashMap([9]i128, [64]u8) = if (self.in_pass_known == null)
-            std.AutoHashMap([9]i128, [64]u8).init(if (scratch_arena) |*active| active.allocator() else self.allocator())
-        else
-            null;
-        defer if (pass_known) |*active| active.deinit();
+        const cache = self.ensureCustodyCache();
         const previous_scratch = self.scratch;
         const previous_files = self.in_pass_files;
         const previous_known = self.in_pass_known;
         if (scratch_arena) |*active| self.scratch = active.allocator();
         if (pass_files) |*active| self.in_pass_files = active;
-        if (pass_known) |*active| self.in_pass_known = active;
+        if (self.in_pass_known == null) self.in_pass_known = &cache.known_files;
         defer {
             self.scratch = previous_scratch;
             self.in_pass_files = previous_files;
@@ -516,11 +521,10 @@ pub const PrivateBundle = struct {
         defer scratch.deinit();
         var pass_files = std.StringHashMap(physical.File).init(scratch.allocator());
         defer pass_files.deinit();
-        var pass_known = std.AutoHashMap([9]i128, [64]u8).init(scratch.allocator());
-        defer pass_known.deinit();
+        const cache = evidence.ensureCustodyCache();
         evidence.scratch = scratch.allocator();
         evidence.in_pass_files = &pass_files;
-        evidence.in_pass_known = &pass_known;
+        evidence.in_pass_known = &cache.known_files;
         defer {
             evidence.scratch = null;
             evidence.in_pass_files = null;
@@ -675,11 +679,10 @@ fn openAndValidateWithPolicy(
     defer scratch.deinit();
     var pass_files = std.StringHashMap(physical.File).init(scratch.allocator());
     defer pass_files.deinit();
-    var pass_known = std.AutoHashMap([9]i128, [64]u8).init(scratch.allocator());
-    defer pass_known.deinit();
+    const cache = accepted.ensureCustodyCache();
     accepted.scratch = scratch.allocator();
     accepted.in_pass_files = &pass_files;
-    accepted.in_pass_known = &pass_known;
+    accepted.in_pass_known = &cache.known_files;
     defer {
         accepted.scratch = null;
         accepted.in_pass_files = null;
@@ -695,7 +698,7 @@ fn openAndValidateWithPolicy(
             readonly_git_role,
         );
         try appendCurrentToolInput(&accepted, readonly_git_role, accepted.readonly_git.?.path);
-        const paths = try inputs.executableRuntimePaths(accepted.allocator(), io, accepted.readonly_git.?.path);
+        const paths = try inputs.executableRuntimePathsCached(accepted.allocator(), io, accepted.readonly_git.?.path, &cache.runtime_cache);
         for (paths) |path|
             try appendCurrentInput(&accepted, try p.print("{s}{s}", .{ readonly_runtime_prefix, path }), try p.dupe(u8, path), false);
     }
@@ -746,11 +749,10 @@ pub fn openImportedStage(
     defer scratch.deinit();
     var pass_files = std.StringHashMap(physical.File).init(scratch.allocator());
     defer pass_files.deinit();
-    var pass_known = std.AutoHashMap([9]i128, [64]u8).init(scratch.allocator());
-    defer pass_known.deinit();
+    const cache = accepted.ensureCustodyCache();
     accepted.scratch = scratch.allocator();
     accepted.in_pass_files = &pass_files;
-    accepted.in_pass_known = &pass_known;
+    accepted.in_pass_known = &cache.known_files;
     defer {
         accepted.scratch = null;
         accepted.in_pass_files = null;
@@ -997,12 +999,13 @@ fn revalidateLocalWithSignal(self: *AcceptedRun, signal: *core.process.SignalCan
     if (result.set != self.compatibility or result.set != .tiny_v2_qcow2_derived_vhd)
         return error.InvalidResult;
     const compute = try join(a, &.{ self.root, "compute" });
-    var custody_cache = build.CustodyCache.init(std.heap.page_allocator);
-    defer custody_cache.deinit();
+    const custody_cache = self.ensureCustodyCache();
     if (self.in_pass_known) |known| {
-        var it = known.iterator();
-        while (it.next()) |entry| {
-            try custody_cache.known_files.put(entry.key_ptr.*, entry.value_ptr.*);
+        if (known != &custody_cache.known_files) {
+            var it = known.iterator();
+            while (it.next()) |entry| {
+                try custody_cache.known_files.put(entry.key_ptr.*, entry.value_ptr.*);
+            }
         }
     }
     var context: build.Context = .{
@@ -1017,7 +1020,7 @@ fn revalidateLocalWithSignal(self: *AcceptedRun, signal: *core.process.SignalCan
         .tools = undefined,
         .roots = undefined,
         .signal = signal,
-        .custody_cache = &custody_cache,
+        .custody_cache = custody_cache,
     };
     var boot_context: boot.Context = .{
         .build_context = &context,
@@ -1027,9 +1030,11 @@ fn revalidateLocalWithSignal(self: *AcceptedRun, signal: *core.process.SignalCan
     defer boot_context.pinned.deinit();
     try boot.revalidateComplete(&boot_context, result);
     if (self.in_pass_known) |known| {
-        var it = custody_cache.known_files.iterator();
-        while (it.next()) |entry| {
-            try known.put(entry.key_ptr.*, entry.value_ptr.*);
+        if (known != &custody_cache.known_files) {
+            var it = custody_cache.known_files.iterator();
+            while (it.next()) |entry| {
+                try known.put(entry.key_ptr.*, entry.value_ptr.*);
+            }
         }
     }
     try validateCommands(self, false, false);
@@ -1058,7 +1063,7 @@ fn revalidateLocalPythonWithSignal(self: *AcceptedRun, signal: *core.process.Sig
     const result = try records.readResult(raw);
     if (result.set != self.compatibility or result.set != .tiny_v2_qcow2_derived_vhd)
         return error.InvalidResult;
-    const recheck_custody: *const @TypeOf(local_consumer.run) = if (self.local_read_only) local_consumer.runReadOnly else local_consumer.run;
+    const recheck_custody: *const @TypeOf(local_consumer.runCached) = if (self.local_read_only) local_consumer.runReadOnlyCached else local_consumer.runCached;
     try recheck_custody(
         a,
         self.io,
@@ -1067,6 +1072,7 @@ fn revalidateLocalPythonWithSignal(self: *AcceptedRun, signal: *core.process.Sig
         try contracts.parseSha256(try text(result.records.get("build-start.json") orelse return error.MissingRecord)),
         try contracts.parseSha256(try text(result.records.get("boot-inputs.json") orelse return error.MissingRecord)),
         signal,
+        self.ensureCustodyCache(),
     );
     try validateCommands(self, false, true);
     const current = try self.readFileInPass(try resultPath(self), records.max_record_bytes, true);
@@ -1090,7 +1096,7 @@ fn revalidateLocalLegacy(self: *AcceptedRun, signal: ?*core.process.SignalCancel
         return error.UnsupportedLegacySource;
     const custody_checked = self.local_read_only and !oldLegacySource(self.source);
     if (custody_checked)
-        try local_consumer.runLegacyReadOnly(
+        try local_consumer.runLegacyReadOnlyCached(
             self.allocator(),
             self.io,
             self.repository orelse return error.InvalidContext,
@@ -1098,6 +1104,7 @@ fn revalidateLocalLegacy(self: *AcceptedRun, signal: ?*core.process.SignalCancel
             try contracts.parseSha256(try text(result.records.get("build-start.json") orelse return error.MissingRecord)),
             try contracts.parseSha256(try text(result.records.get("boot-inputs.json") orelse return error.MissingRecord)),
             signal,
+            self.ensureCustodyCache(),
         );
     const evidence_path = try join(self.allocator(), &.{ self.root, "compute/evidence" });
     const evidence = try files.openDirectory(self.io, evidence_path, .private);
@@ -1150,7 +1157,8 @@ fn localLegacySource(self: *AcceptedRun, signal: ?*core.process.SignalCancellati
     } else try text(try get(try get(try get(try get(start, "consumer_inputs"), "files"), "tool:git"), "path"));
     var retained = try @import("command_adapter.zig").openPinnedTool(self.io, git_path, "tool:git");
     defer retained.close(self.io);
-    var current = try source.portableSource(a, self.io, self.repository orelse return error.InvalidContext, retained.path);
+    const cache = self.ensureCustodyCache();
+    var current = try source.portableSourceCached(a, self.io, self.repository orelse return error.InvalidContext, retained.path, &cache.known_git_blobs, &cache.known_files);
     try equal(current.revision, self.source.revision);
     try equal(current.tree, self.source.tree);
     try equal(current.custody.object_format, "sha1");

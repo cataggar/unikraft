@@ -32,6 +32,8 @@ pub const PortableTools = struct {
     runtime: std.ArrayList(RuntimePin),
     before: source.Source,
     producer_source: ?ProducerSource = null,
+    known_blobs: std.AutoHashMap([9]i128, source.CachedBlob),
+    known_files: std.AutoHashMap([9]i128, [64]u8),
 
     const ProducerSource = struct {
         revision: [40]u8,
@@ -191,7 +193,11 @@ pub const PortableTools = struct {
             return error.ImportSupervisorChanged;
 
         try git.verify(io);
-        const before = try source.portableSource(allocator, io, repository, local.git);
+        var known_blobs = std.AutoHashMap([9]i128, source.CachedBlob).init(allocator);
+        errdefer known_blobs.deinit();
+        var known_files = std.AutoHashMap([9]i128, [64]u8).init(allocator);
+        errdefer known_files.deinit();
+        const before = try source.portableSourceCached(allocator, io, repository, local.git, &known_blobs, &known_files);
         errdefer {
             allocator.free(before.revision);
             allocator.free(before.tree);
@@ -222,6 +228,8 @@ pub const PortableTools = struct {
             .runtime = runtime,
             .before = before,
             .producer_source = producer_source,
+            .known_blobs = known_blobs,
+            .known_files = known_files,
         };
         try result.verifyExecutables(io);
         return result;
@@ -239,7 +247,7 @@ pub const PortableTools = struct {
         const a = scratch.allocator();
         try self.verifyExecutables(io);
         if (self.producer_source) |proof| try proof.verify(a, io, repository, git, signal);
-        const after = try source.portableSource(a, io, repository, git);
+        const after = try source.portableSourceCached(a, io, repository, git, &self.known_blobs, &self.known_files);
         if (!self.before.same(after)) return error.SourceChanged;
         try self.verifyExecutables(io);
         if (signal) |active|
@@ -262,6 +270,8 @@ pub const PortableTools = struct {
         for (self.runtime.items) |*entry| entry.deinit(self.allocator, io);
         self.runtime.deinit(self.allocator);
         if (self.producer_source) |proof| if (proof.map) |raw| self.allocator.free(raw);
+        self.known_blobs.deinit();
+        self.known_files.deinit();
         self.allocator.free(self.before.revision);
         self.allocator.free(self.before.tree);
         self.allocator.free(self.before.custody.object_format);
@@ -963,12 +973,18 @@ fn handoffCandidate(
     return candidate;
 }
 
-fn tree(allocator: std.mem.Allocator, io: std.Io, start: std.json.Value, zig_path: []const u8) !inputs.TreeRecord {
+fn tree(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    start: std.json.Value,
+    zig_path: []const u8,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+) !inputs.TreeRecord {
     const root = std.fs.path.dirname(zig_path) orelse return error.UnsafePath;
     const recorded = try get(try get(try get(start, "consumer_inputs"), "trees"), "zig");
     if (!std.mem.eql(u8, root, try contracts.string(try get(recorded, "path"))))
         return error.ImportedToolChanged;
-    const observed = try inputs.tree(allocator, io, .{ .role = "zig", .path = root });
+    const observed = try inputs.treeCached(allocator, io, .{ .role = "zig", .path = root }, known_files);
     if (observed.files != try contracts.integer(usize, try get(recorded, "files")) or
         observed.directories != try contracts.integer(usize, try get(recorded, "directories")) or
         observed.symlinks != try contracts.integer(usize, try get(recorded, "symlinks")) or
@@ -1129,8 +1145,9 @@ pub fn run(
         contained(zig_root, repository) or contained(repository, zig_root) or
         contained(zig_root, accepted.root) or contained(accepted.root, zig_root))
         return error.AliasedTool;
-    const compiler_before = try tree(allocator, io, start, zig.path);
-    const before = try source.source(allocator, io, repository, git.path);
+    const cache = accepted.ensureCustodyCache();
+    const compiler_before = try tree(allocator, io, start, zig.path, &cache.known_files);
+    const before = try source.sourceCached(allocator, io, repository, git.path, &cache.known_git_blobs, &cache.known_files);
     if (!std.mem.eql(u8, before.revision, accepted.source.revision) or
         !std.mem.eql(u8, before.tree, accepted.source.tree) or
         !std.mem.eql(u8, before.custody.object_format, "sha1"))
@@ -1227,9 +1244,9 @@ pub fn run(
         try pinned_candidate.?.verify(io);
     }
     try accepted.revalidateWithSignal(signal);
-    const after = try source.source(allocator, io, repository, git.path);
+    const after = try source.sourceCached(allocator, io, repository, git.path, &cache.known_git_blobs, &cache.known_files);
     if (!before.same(after)) return error.SourceChanged;
-    const compiler_after = try tree(allocator, io, start, zig.path);
+    const compiler_after = try tree(allocator, io, start, zig.path, &cache.known_files);
     if (!std.meta.eql(compiler_before.physical_sha256, compiler_after.physical_sha256))
         return error.ImportedToolChanged;
     try postRun(allocator, io, output, .@"import-validator-build", outcome.bytes);

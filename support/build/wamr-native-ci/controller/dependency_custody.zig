@@ -229,22 +229,21 @@ fn packageFile(
     before: files.Snapshot,
     known: ?*std.AutoHashMap([9]i128, [64]u8),
 ) !physical.File {
-    const file = try dir.openFile(io, name, .{ .follow_symlinks = false });
-    defer file.close(io);
     if (before.mode & linux.S.IFMT != linux.S.IFREG or before.uid != linux.geteuid() or
-        before.nlink != 1 or before.size > limits.dependency_file or
-        !files.sameSnapshot(before, try files.snapshot(file)))
+        before.nlink != 1 or before.size > limits.dependency_file)
         return error.UnsafePackageFile;
     const meta = physical.metadata(before);
     if (known) |cache| if (cache.get(meta)) |sha256| {
-        if (!files.sameSnapshot(before, try files.snapshot(file)))
-            return error.PackageChanged;
         return .{
             .bytes = before.size,
             .sha256 = sha256,
             .metadata = meta,
         };
     };
+    const file = try dir.openFile(io, name, .{ .follow_symlinks = false });
+    defer file.close(io);
+    if (!files.sameSnapshot(before, try files.snapshot(file)))
+        return error.UnsafePackageFile;
     var hash = Sha256.init(.{});
     var buffer: [64 * 1024]u8 = undefined;
     var offset: u64 = 0;
@@ -660,6 +659,17 @@ pub fn captureRecorded(
     compute: []const u8,
 ) !Document {
     return captureWithPolicy(allocator, io, repository, git, compute, true, null);
+}
+
+pub fn captureRecordedCached(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repository: []const u8,
+    git: []const u8,
+    compute: []const u8,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+) !Document {
+    return captureWithPolicy(allocator, io, repository, git, compute, true, known_files);
 }
 
 fn captureWithPolicy(

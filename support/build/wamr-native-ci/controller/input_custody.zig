@@ -549,6 +549,7 @@ fn bisonWalk(
     count: *usize,
     total: *usize,
     found: *std.ArrayList(BisonEntry),
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
 ) !void {
     const dir_path = if (prefix.len == 0) root else try std.fs.path.join(allocator, &.{ root, prefix });
     defer if (prefix.len != 0) allocator.free(dir_path);
@@ -575,11 +576,11 @@ fn bisonWalk(
         if (info.uid != linux.geteuid() or info.mode & 0o7022 != 0)
             return error.UnsafeBisonInput;
         if (info.mode & linux.S.IFMT == linux.S.IFDIR) {
-            try bisonWalk(allocator, io, root, relative, count, total, found);
+            try bisonWalk(allocator, io, root, relative, count, total, found, known_files);
         } else if (info.mode & linux.S.IFMT == linux.S.IFREG) {
             if (info.nlink != 1 or info.size > limits.bison_bytes - total.*)
                 return error.UnsafeBisonInput;
-            const identity = try physical.readFile(io, path, limits.bison_bytes - total.*, false);
+            const identity = try physical.readFileCached(io, path, limits.bison_bytes - total.*, false, known_files);
             if (!std.meta.eql(identity.metadata, physical.metadata(info))) return error.BisonChanged;
             try limits.addBounded(total, @intCast(identity.bytes), limits.bison_bytes);
             try found.append(allocator, .{ .path = relative, .bytes = @intCast(identity.bytes), .sha256 = identity.sha256 });
@@ -593,6 +594,15 @@ fn bisonWalk(
 }
 
 pub fn bison(allocator: std.mem.Allocator, io: std.Io, root: []const u8) !Bison {
+    return bisonCached(allocator, io, root, null);
+}
+
+pub fn bisonCached(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+) !Bison {
     var found: std.ArrayList(BisonEntry) = .empty;
     defer {
         for (found.items) |entry| allocator.free(entry.path);
@@ -600,7 +610,7 @@ pub fn bison(allocator: std.mem.Allocator, io: std.Io, root: []const u8) !Bison 
     }
     var count: usize = 0;
     var total: usize = 0;
-    try bisonWalk(allocator, io, root, "", &count, &total, &found);
+    try bisonWalk(allocator, io, root, "", &count, &total, &found, known_files);
     if (found.items.len == 0) return error.EmptyBisonData;
     std.mem.sort(BisonEntry, found.items, {}, struct {
         fn byPath(_: void, a: BisonEntry, b: BisonEntry) bool {
@@ -635,6 +645,49 @@ const TreeCounter = struct {
     content: Sha256,
     physical_hash: Sha256,
 };
+
+fn treeDirFile(
+    io: std.Io,
+    dir: std.Io.Dir,
+    name: []const u8,
+    before: files.Snapshot,
+    state: *TreeCounter,
+) !physical.File {
+    if (before.mode & linux.S.IFMT != linux.S.IFREG or
+        (before.uid == 0 and before.nlink == 0) or
+        (before.uid != 0 and before.nlink != 1) or
+        (before.uid != linux.geteuid() and before.uid != 0) or
+        before.mode & 0o022 != 0 or before.size > limits.input_file)
+        return error.UnsafeFile;
+    const metadata = physical.metadata(before);
+    if (state.identities.get(metadata)) |sha256| {
+        return .{ .bytes = before.size, .sha256 = sha256, .metadata = metadata };
+    }
+    try limits.addBounded(&state.hash_work, @intCast(before.size), state.hash_limit);
+    if (state.known_files) |known| if (known.get(metadata)) |sha256| {
+        try state.identities.put(metadata, sha256);
+        return .{ .bytes = before.size, .sha256 = sha256, .metadata = metadata };
+    };
+    const file = try (files.FileParent{ .directory = dir, .name = name, .policy = .artifact }).openFile(io);
+    defer file.close(io);
+    if (!files.sameSnapshot(before, try files.snapshot(file))) return error.InputChanged;
+    var digest = Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < before.size) {
+        const count = try file.readPositionalAll(io, buffer[0..@intCast(@min(buffer.len, before.size - offset))], offset);
+        if (count == 0) return error.FileChanged;
+        digest.update(buffer[0..count]);
+        offset += count;
+    }
+    if (try file.readPositionalAll(io, buffer[0..1], offset) != 0 or
+        !files.sameSnapshot(before, try files.snapshot(file)))
+        return error.FileChanged;
+    const sha256 = std.fmt.bytesToHex(digest.finalResult(), .lower);
+    try state.identities.put(metadata, sha256);
+    if (state.known_files) |known| try known.put(metadata, sha256);
+    return .{ .bytes = before.size, .sha256 = sha256, .metadata = metadata };
+}
 
 fn treeFile(io: std.Io, path: []const u8, state: *TreeCounter) !physical.File {
     var retained = try files.RetainedFile.open(io, path, .artifact);
@@ -749,15 +802,35 @@ fn bindMissingTarget(
     return error.UnsafeInputLink;
 }
 
-fn treeWalk(allocator: std.mem.Allocator, io: std.Io, root: []const u8, prefix: []const u8, state: *TreeCounter) !void {
+fn treeWalk(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    prefix: []const u8,
+    parent_dir: ?std.Io.Dir,
+    expected_snapshot: ?files.Snapshot,
+    state: *TreeCounter,
+) !void {
     try limits.relative(if (prefix.len == 0) "root" else prefix, limits.ignored_path, limits.ignored_depth);
+    const use_parent = state.known_files != null and parent_dir != null;
     const path = if (prefix.len == 0) root else try std.fs.path.join(allocator, &.{ root, prefix });
     defer if (prefix.len != 0) allocator.free(path);
-    const before = try physical.directory(io, path, false);
+    const dir = if (use_parent)
+        try parent_dir.?.openDir(io, std.fs.path.basename(prefix), .{ .follow_symlinks = false, .iterate = true })
+    else
+        try files.openDirectory(io, path, .artifact);
+    defer dir.close(io);
+    const before = if (use_parent) blk: {
+        const snap = try files.snapshot(.{ .handle = dir.handle, .flags = .{ .nonblocking = false } });
+        if (snap.mode & linux.S.IFMT != linux.S.IFDIR or
+            (snap.uid != linux.geteuid() and snap.uid != 0) or
+            snap.mode & 0o022 != 0)
+            return error.UnsafeDirectory;
+        if (expected_snapshot) |expected| if (!files.sameSnapshot(expected, snap)) return error.InputChanged;
+        break :blk snap;
+    } else try physical.directory(io, path, false);
     try limits.addBounded(&state.directories, 1, limits.input_entries - state.files - state.symlinks);
     try physical.bind(allocator, &state.physical_hash, .{ "directory", prefix, physical.metadata(before) });
-    const dir = try files.openDirectory(io, path, .artifact);
-    defer dir.close(io);
     const names = try entries(allocator, io, dir, limits.input_entries - state.files - state.directories - state.symlinks);
     defer {
         for (names) |name| allocator.free(name);
@@ -771,13 +844,25 @@ fn treeWalk(allocator: std.mem.Allocator, io: std.Io, root: []const u8, prefix: 
         defer member.close(io);
         const info = try files.snapshot(member);
         if (info.mode & linux.S.IFMT == linux.S.IFDIR) {
-            try treeWalk(allocator, io, root, relative, state);
+            try treeWalk(
+                allocator,
+                io,
+                root,
+                relative,
+                if (state.known_files != null) dir else null,
+                if (state.known_files != null) info else null,
+                state,
+            );
         } else if (info.mode & linux.S.IFMT == linux.S.IFREG) {
             try limits.addBounded(&state.files, 1, limits.input_entries - state.directories - state.symlinks);
             if (info.size > limits.input_file) return error.LimitExceeded;
-            const absolute = try std.fs.path.join(allocator, &.{ root, relative });
-            defer allocator.free(absolute);
-            const identity = try treeFile(io, absolute, state);
+            const identity = if (state.known_files != null)
+                try treeDirFile(io, dir, name, info, state)
+            else blk: {
+                const absolute = try std.fs.path.join(allocator, &.{ root, relative });
+                defer allocator.free(absolute);
+                break :blk try treeFile(io, absolute, state);
+            };
             if (!std.meta.eql(identity.metadata, physical.metadata(info))) return error.InputChanged;
             try limits.addBounded(&state.bytes, @intCast(info.size), limits.input_bytes);
             try physical.bind(allocator, &state.content, .{ "file", relative, info.size, identity.sha256 });
@@ -836,7 +921,11 @@ fn treeWalk(allocator: std.mem.Allocator, io: std.Io, root: []const u8, prefix: 
         defer again.close(io);
         if (!files.sameSnapshot(info, try files.snapshot(again))) return error.InputChanged;
     }
-    if (!files.sameSnapshot(before, try physical.directory(io, path, false))) return error.InputChanged;
+    const after = if (use_parent)
+        try files.snapshot(.{ .handle = dir.handle, .flags = .{ .nonblocking = false } })
+    else
+        try physical.directory(io, path, false);
+    if (!files.sameSnapshot(before, after)) return error.InputChanged;
 }
 
 fn treeBounded(
@@ -857,7 +946,7 @@ fn treeBounded(
     defer state.identities.deinit();
     state.content.update("uk.wamr.consumer-input-tree-content-v2\x00");
     state.physical_hash.update("uk.wamr.consumer-input-tree-physical-v2\x00");
-    try treeWalk(allocator, io, binding.path, "", &state);
+    try treeWalk(allocator, io, binding.path, "", null, null, &state);
     return .{
         .role = binding.role,
         .path = binding.path,
@@ -872,6 +961,18 @@ fn treeBounded(
 
 pub fn tree(allocator: std.mem.Allocator, io: std.Io, binding: Binding) !TreeRecord {
     return treeBounded(allocator, io, binding, limits.input_bytes, null);
+}
+
+pub fn treeCached(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    binding: Binding,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+) !TreeRecord {
+    if (known_files) |known| return treeBounded(allocator, io, binding, limits.input_bytes, known);
+    var local = std.AutoHashMap([9]i128, [64]u8).init(allocator);
+    defer local.deinit();
+    return treeBounded(allocator, io, binding, limits.input_bytes, &local);
 }
 
 pub const Fixture = struct {

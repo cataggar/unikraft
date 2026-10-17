@@ -76,8 +76,12 @@ fn runtimePathsCached(
     allocator: std.mem.Allocator,
     io: std.Io,
     runtime_cache: *std.StringHashMap([][]const u8),
+    custody_cache: ?*@import("build_pipeline.zig").CustodyCache,
     executable: []const u8,
 ) ![][]const u8 {
+    if (custody_cache) |cache| {
+        return inputs.executableRuntimePathsCached(allocator, io, executable, &cache.runtime_cache);
+    }
     if (runtime_cache.get(executable)) |cached| {
         var pinned = try files.RetainedFile.open(io, executable, .artifact);
         defer pinned.close(io);
@@ -94,9 +98,10 @@ fn addRuntime(
     io: std.Io,
     allowed: *std.StringHashMap(void),
     runtime_cache: *std.StringHashMap([][]const u8),
+    custody_cache: ?*@import("build_pipeline.zig").CustodyCache,
     executable: []const u8,
 ) !void {
-    const paths = try runtimePathsCached(allocator, io, runtime_cache, executable);
+    const paths = try runtimePathsCached(allocator, io, runtime_cache, custody_cache, executable);
     for (paths) |path| {
         const role = try allocator.print("runtime:{s}", .{path});
         if (!allowed.contains(role)) try addRole(allowed, role);
@@ -123,6 +128,7 @@ fn buildRoles(
     signal: ?*core.process.SignalCancellation,
     legacy: bool,
     runtime_cache: *std.StringHashMap([][]const u8),
+    custody_cache: ?*@import("build_pipeline.zig").CustodyCache,
 ) !void {
     const consumer = try get(start, "consumer_inputs");
     const files_map = try get(consumer, "files");
@@ -143,7 +149,7 @@ fn buildRoles(
         const entry = try get(files_map, role);
         if (!std.mem.eql(u8, try contracts.string(try get(entry, "sha256")), try contracts.string(try get(tools, name))))
             return error.RecordedCustodyChanged;
-        try addRuntime(allocator, io, &allowed, runtime_cache, try recordedPath(files_map, role));
+        try addRuntime(allocator, io, &allowed, runtime_cache, custody_cache, try recordedPath(files_map, role));
     }
     for ([_]struct { role: []const u8, relative: []const u8 }{
         .{ .role = "command-supervisor", .relative = if (native) "controller/bin/uk-wamr-native-ci" else "compute/supervisor/bin/wamr-ci-supervisor" },
@@ -164,7 +170,7 @@ fn buildRoles(
         try fixedPath(allocator, files_map, item.role, runtime, item.relative);
         if (!std.mem.eql(u8, item.role, "wamr-source-archive")) {
             try notCancelled(signal);
-            try addRuntime(allocator, io, &allowed, runtime_cache, try recordedPath(files_map, item.role));
+            try addRuntime(allocator, io, &allowed, runtime_cache, custody_cache, try recordedPath(files_map, item.role));
         }
     }
     try exactRoles(&allowed, files_map);
@@ -179,12 +185,13 @@ fn buildRoles(
     if (!std.mem.eql(u8, try recordedPath(tree_map, "zig"), zig_root))
         return error.UnexpectedInputPath;
     try notCancelled(signal);
-    const expected_stdlib = try inputs.pythonStdlib(
+    const expected_stdlib = try @import("build_pipeline.zig").pythonStdlibCached(
         allocator,
         io,
         repository,
         try recordedPath(files_map, "tool:python3"),
         if (signal) |active| active.flag() else null,
+        custody_cache,
     );
     defer allocator.free(expected_stdlib);
     if (!std.mem.eql(u8, try recordedPath(tree_map, "python-stdlib"), expected_stdlib))
@@ -201,6 +208,7 @@ fn bootRoles(
     signal: ?*core.process.SignalCancellation,
     legacy: bool,
     runtime_cache: *std.StringHashMap([][]const u8),
+    custody_cache: ?*@import("build_pipeline.zig").CustodyCache,
 ) !void {
     const files_map = try get(boot, "files");
     const tree_map = try get(boot, "trees");
@@ -230,7 +238,7 @@ fn bootRoles(
             std.mem.eql(u8, item.role, "qemu"))
         {
             try notCancelled(signal);
-            try addRuntime(allocator, io, &allowed, runtime_cache, try recordedPath(files_map, item.role));
+            try addRuntime(allocator, io, &allowed, runtime_cache, custody_cache, try recordedPath(files_map, item.role));
         }
     }
     try exactRoles(&allowed, files_map);
@@ -277,10 +285,12 @@ fn recordedSource(
     git: []const u8,
     start: std.json.Value,
     policy: SourcePolicy,
+    known_blobs: ?*std.AutoHashMap([9]i128, source.CachedBlob),
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
 ) !source.Source {
     if (policy == .compiled_producer)
         try source.verifyPhysical(io, allocator, repository);
-    const current = try source.source(allocator, io, repository, git);
+    const current = try source.sourceCached(allocator, io, repository, git, known_blobs, known_files);
     try sameValue(allocator, try get(start, "source"), .{ .revision = current.revision, .tree = current.tree });
     try sameValue(allocator, try get(start, "source_custody"), current.custody);
     return current;
@@ -335,6 +345,7 @@ fn recordedSupervisor(
     start: std.json.Value,
     signal: ?*core.process.SignalCancellation,
     runtime_cache: *std.StringHashMap([][]const u8),
+    custody_cache: ?*@import("build_pipeline.zig").CustodyCache,
     known_files: *std.AutoHashMap([9]i128, [64]u8),
 ) !void {
     const expected = try get(start, "command_supervisor");
@@ -351,7 +362,7 @@ fn recordedSupervisor(
     const executable = try recordedPath(files_map, "command-supervisor");
     var current_runtime = std.json.Value{ .object = .empty };
     try current_runtime.object.put(allocator, "executable", try physicalRecord(allocator, io, executable, known_files));
-    const paths = try runtimePathsCached(allocator, io, runtime_cache, executable);
+    const paths = try runtimePathsCached(allocator, io, runtime_cache, custody_cache, executable);
     for (paths) |path| {
         try notCancelled(signal);
         try current_runtime.object.put(allocator, try allocator.print("runtime:{s}", .{path}), try physicalRecord(allocator, io, path, known_files));
@@ -403,7 +414,7 @@ pub const Fixture = if (@import("builtin").is_test) struct {
         start: std.json.Value,
         read_only: bool,
     ) !source.Source {
-        return recordedSource(allocator, io, repository, git, start, if (read_only) .recorded_producer else .compiled_producer);
+        return recordedSource(allocator, io, repository, git, start, if (read_only) .recorded_producer else .compiled_producer, null, null);
     }
 
     pub fn exactRoleSet(allowed: *std.StringHashMap(void), map: std.json.Value) !void {
@@ -430,7 +441,20 @@ pub fn run(
     expected_boot_inputs_sha256: contracts.Sha256,
     signal: ?*core.process.SignalCancellation,
 ) !void {
-    return runWithPolicy(allocator, io, repository, runtime, expected_build_start_sha256, expected_boot_inputs_sha256, signal, .compiled_producer, false);
+    return runWithPolicy(allocator, io, repository, runtime, expected_build_start_sha256, expected_boot_inputs_sha256, signal, .compiled_producer, false, null);
+}
+
+pub fn runCached(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repository: []const u8,
+    runtime: []const u8,
+    expected_build_start_sha256: contracts.Sha256,
+    expected_boot_inputs_sha256: contracts.Sha256,
+    signal: ?*core.process.SignalCancellation,
+    custody_cache: ?*@import("build_pipeline.zig").CustodyCache,
+) !void {
+    return runWithPolicy(allocator, io, repository, runtime, expected_build_start_sha256, expected_boot_inputs_sha256, signal, .compiled_producer, false, custody_cache);
 }
 
 pub fn runReadOnly(
@@ -442,7 +466,20 @@ pub fn runReadOnly(
     expected_boot_inputs_sha256: contracts.Sha256,
     signal: ?*core.process.SignalCancellation,
 ) !void {
-    return runWithPolicy(allocator, io, repository, runtime, expected_build_start_sha256, expected_boot_inputs_sha256, signal, .recorded_producer, false);
+    return runWithPolicy(allocator, io, repository, runtime, expected_build_start_sha256, expected_boot_inputs_sha256, signal, .recorded_producer, false, null);
+}
+
+pub fn runReadOnlyCached(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repository: []const u8,
+    runtime: []const u8,
+    expected_build_start_sha256: contracts.Sha256,
+    expected_boot_inputs_sha256: contracts.Sha256,
+    signal: ?*core.process.SignalCancellation,
+    custody_cache: ?*@import("build_pipeline.zig").CustodyCache,
+) !void {
+    return runWithPolicy(allocator, io, repository, runtime, expected_build_start_sha256, expected_boot_inputs_sha256, signal, .recorded_producer, false, custody_cache);
 }
 
 pub fn runLegacyReadOnly(
@@ -454,7 +491,20 @@ pub fn runLegacyReadOnly(
     expected_boot_inputs_sha256: contracts.Sha256,
     signal: ?*core.process.SignalCancellation,
 ) !void {
-    return runWithPolicy(allocator, io, repository, runtime, expected_build_start_sha256, expected_boot_inputs_sha256, signal, .recorded_producer, true);
+    return runWithPolicy(allocator, io, repository, runtime, expected_build_start_sha256, expected_boot_inputs_sha256, signal, .recorded_producer, true, null);
+}
+
+pub fn runLegacyReadOnlyCached(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repository: []const u8,
+    runtime: []const u8,
+    expected_build_start_sha256: contracts.Sha256,
+    expected_boot_inputs_sha256: contracts.Sha256,
+    signal: ?*core.process.SignalCancellation,
+    custody_cache: ?*@import("build_pipeline.zig").CustodyCache,
+) !void {
+    return runWithPolicy(allocator, io, repository, runtime, expected_build_start_sha256, expected_boot_inputs_sha256, signal, .recorded_producer, true, custody_cache);
 }
 
 fn runWithPolicy(
@@ -467,6 +517,7 @@ fn runWithPolicy(
     signal: ?*core.process.SignalCancellation,
     policy: SourcePolicy,
     legacy: bool,
+    custody_cache: ?*@import("build_pipeline.zig").CustodyCache,
 ) !void {
     try files.absoluteFilePath(repository);
     try files.absoluteFilePath(runtime);
@@ -511,30 +562,32 @@ fn runWithPolicy(
     const boot = boot_doc.value();
     var runtime_cache = std.StringHashMap([][]const u8).init(allocator);
     defer runtime_cache.deinit();
-    var known_files = std.AutoHashMap([9]i128, [64]u8).init(allocator);
-    defer known_files.deinit();
+    var local_known_files = std.AutoHashMap([9]i128, [64]u8).init(allocator);
+    defer local_known_files.deinit();
+    const known_files: *std.AutoHashMap([9]i128, [64]u8) = if (custody_cache) |cache| &cache.known_files else &local_known_files;
+    const known_blobs = if (custody_cache) |cache| &cache.known_git_blobs else null;
     const consumer = try get(start, "consumer_inputs");
     const git_path = try recordedPath(try get(consumer, "files"), "tool:git");
     var git = try files.RetainedFile.open(io, git_path, .tool);
     defer git.close(io);
     try notCancelled(signal);
-    if (!legacy) _ = try recordedSource(allocator, io, repository, git_path, start, policy);
-    try buildRoles(allocator, io, repository, runtime, start, signal, legacy, &runtime_cache);
-    try bootRoles(allocator, io, repository, runtime, boot, !legacy and try nativeProducer(allocator, runtime, try get(consumer, "files")), signal, legacy, &runtime_cache);
+    if (!legacy) _ = try recordedSource(allocator, io, repository, git_path, start, policy, known_blobs, known_files);
+    try buildRoles(allocator, io, repository, runtime, start, signal, legacy, &runtime_cache, custody_cache);
+    try bootRoles(allocator, io, repository, runtime, boot, !legacy and try nativeProducer(allocator, runtime, try get(consumer, "files")), signal, legacy, &runtime_cache, custody_cache);
     try notCancelled(signal);
     var dependency = try if (policy == .recorded_producer)
-        dependencies.captureRecorded(allocator, io, repository, git_path, try std.fs.path.join(allocator, &.{ runtime, "compute" }))
+        dependencies.captureRecordedCached(allocator, io, repository, git_path, try std.fs.path.join(allocator, &.{ runtime, "compute" }), known_files)
     else
-        dependencies.capture(allocator, io, repository, git_path, try std.fs.path.join(allocator, &.{ runtime, "compute" }));
+        dependencies.captureCached(allocator, io, repository, git_path, try std.fs.path.join(allocator, &.{ runtime, "compute" }), known_files);
     defer dependency.deinit(allocator);
     try sameValue(allocator, try get(start, "dependencies"), try std.json.parseFromSliceLeaky(std.json.Value, allocator, try dependency.canonical(allocator), .{ .parse_numbers = false }));
     try notCancelled(signal);
-    try sameValue(allocator, try get(start, "bison_data"), try inputs.bison(allocator, io, try std.fs.path.join(allocator, &.{ runtime, "bison" })));
-    if (!legacy) try recordedSupervisor(allocator, io, repository, start, signal, &runtime_cache, &known_files);
+    try sameValue(allocator, try get(start, "bison_data"), try inputs.bisonCached(allocator, io, try std.fs.path.join(allocator, &.{ runtime, "bison" }), known_files));
+    if (!legacy) try recordedSupervisor(allocator, io, repository, start, signal, &runtime_cache, custody_cache, known_files);
     try notCancelled(signal);
-    try recapture(allocator, io, consumer, &known_files);
+    try recapture(allocator, io, consumer, known_files);
     try notCancelled(signal);
-    try recapture(allocator, io, boot, &known_files);
+    try recapture(allocator, io, boot, known_files);
     try notCancelled(signal);
     try pinned_start.verify(io);
     try pinned_boot.verify(io);

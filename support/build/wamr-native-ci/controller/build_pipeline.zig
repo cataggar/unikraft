@@ -193,7 +193,7 @@ pub fn bind(invocation: Invocation) !RuntimeBound {
     const bison_path = try join(context, &.{ context.runtime, "bison" });
     if (!std.mem.eql(u8, std.process.Environ.getPosix(context.environ, "BISON_PKGDATADIR") orelse "", bison_path))
         return error.BisonPathChanged;
-    _ = try inputs.bison(context.allocator, context.io, bison_path);
+    _ = try inputs.bisonCached(context.allocator, context.io, bison_path, knownFiles(context));
     for (inputs.host_tools, 0..) |tool, index| {
         context.tools[index] = try findTool(context, tool);
         if (std.mem.eql(u8, tool, "git")) context.git = context.tools[index];
@@ -514,39 +514,57 @@ pub fn requireConsumer(context: *Context) !void {
     try cancelled(context);
 }
 
-fn pythonStdlib(context: *Context) ![]const u8 {
-    if (context.custody_cache) |cache| {
-        var retained = try files.RetainedFile.open(context.io, context.tools[1], .artifact);
-        defer retained.close(context.io);
+pub fn pythonStdlibCached(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repository: []const u8,
+    python: []const u8,
+    cancel: ?*const std.atomic.Value(bool),
+    custody_cache: ?*CustodyCache,
+) ![]const u8 {
+    if (custody_cache) |cache| {
+        var retained = try files.RetainedFile.open(io, python, .artifact);
+        defer retained.close(io);
         const meta = physical.metadata(retained.file_snapshot);
         if (cache.python_stdlib_meta) |expected_meta| {
             if (std.meta.eql(expected_meta, meta)) {
                 if (cache.python_stdlib_path) |cached_path| {
-                    try retained.verify(context.io);
-                    _ = try physical.directory(context.io, cached_path, false);
-                    return context.allocator.dupe(u8, cached_path);
+                    try retained.verify(io);
+                    _ = try physical.directory(io, cached_path, false);
+                    return allocator.dupe(u8, cached_path);
                 }
             }
         }
         const computed = try inputs.pythonStdlib(
-            context.allocator,
-            context.io,
-            context.repository,
-            context.tools[1],
-            context.signal.flag(),
+            allocator,
+            io,
+            repository,
+            python,
+            cancel,
         );
-        try retained.verify(context.io);
+        try retained.verify(io);
         if (cache.python_stdlib_path) |old| cache.backing.free(old);
         cache.python_stdlib_path = try cache.backing.dupe(u8, computed);
         cache.python_stdlib_meta = meta;
         return computed;
     }
     return inputs.pythonStdlib(
+        allocator,
+        io,
+        repository,
+        python,
+        cancel,
+    );
+}
+
+fn pythonStdlib(context: *Context) ![]const u8 {
+    return pythonStdlibCached(
         context.allocator,
         context.io,
         context.repository,
         context.tools[1],
         context.signal.flag(),
+        context.custody_cache,
     );
 }
 
@@ -586,7 +604,7 @@ fn buildStart(context: *Context) !std.json.Value {
         try tools.object.put(a, name, .{ .string = try a.dupe(u8, &item.sha256) });
     }
     try value.object.put(a, "tools", tools);
-    try value.object.put(a, "bison_data", try typedValue(a, try inputs.bison(a, context.io, try join(context, &.{ context.runtime, "bison" }))));
+    try value.object.put(a, "bison_data", try typedValue(a, try inputs.bisonCached(a, context.io, try join(context, &.{ context.runtime, "bison" }), knownFiles(context))));
     const dep = try context.dependency.?.canonical(a);
     try value.object.put(a, "dependencies", try rawValue(a, dep));
     const consumer = try context.consumer.?.custody.canonical(a);
