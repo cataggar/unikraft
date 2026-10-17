@@ -84,9 +84,10 @@ validator also exercises malformed-plan refusal with exact child stderr/exit
 and complete cleanup. Initialized-ledger testing freezes current state separately:
 the reused pre-state constructor intentionally refuses an existing marker.
 No trusted test-only
-`Finalized` is manufactured. Genuine positive operation acceptance still needs
-a live authentic imported-product `Finalized` in its executing controller,
-plus a real prepared runtime. Shared source handler composition is now exported
-as described in [composition.md](composition.md). Genuine acceptance,
-standalone owner acquisition, caller migration, approval and cloud execution are not
-claimed by these source tests.
+`Finalized` is manufactured. Shared source handler composition is exported as
+described in [composition.md](composition.md), and `test-handoff-composition`
+(`-Dhandoff-composition-group=retention`) exercises live imported-owner `plan`
+→ `record-authorization` → `admit` composition against a real v2 exact-download
+`ImportedProduct` and `candidate.Finalized` owners. Genuine live Azure runtime
+preparation, standalone owner acquisition, caller migration, approval and cloud
+execution are not claimed by these source tests.

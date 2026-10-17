@@ -223,8 +223,9 @@ current public import/transport/lineage qualification remains a separate gate.
 The default runs both groups. `-Dhandoff-composition-group=faults` selects
 import/candidate publication, historical candidate reopen, and serial
 boundaries; `retention` selects fully rehashed private lineage, CLI collision,
-v2 exact-download container retention/import/candidate reopen, and changed
-retained inputs.
+v2 exact-download container retention/import/candidate reopen, live
+imported-owner `authority.handlers.run` (`plan` → `record-authorization` →
+`admit`) composition, and changed retained inputs.
 Both use the same real owner fixtures, and neither changes native admission.
 
 Use an existing external system dependency forest, caches, temporary root and
