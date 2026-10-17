@@ -918,7 +918,9 @@ fn Controller(comptime Hooks: type) type {
                     try self.hooks.sleep(self.io, step);
                     slept += step;
                 }
-                if (available < delay) return error.BudgetExhausted;
+                const after = try process.monotonicNanoseconds();
+                const remaining = if (budget.deadline.expires_ns > after) (budget.deadline.expires_ns - after) / std.time.ns_per_ms else 0;
+                if (available < delay or remaining < 250) return error.BudgetExhausted;
             }
             return error.SerialExhausted;
         }

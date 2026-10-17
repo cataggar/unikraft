@@ -445,6 +445,7 @@ pub fn local(a: std.mem.Allocator, io: std.Io, stage: []const u8, repository: []
     if (options.handoff_composition_group == .faults) return;
     try privateLineage(work, &bundle, repository, tools);
     try cliCollision(work, stage, repository, tools);
+    try cliPublicAndCandidateComposition(work, receipt, stage, repository, tools);
     try exactDownloadAndReopen(work, receipt, &bundle, finalized.success, repository, tools);
     try changedInputs(work, finalized.success, &bundle, repository, tools);
 }
@@ -1242,6 +1243,278 @@ fn cliCollision(work: Workspace, stage: []const u8, repository: []const u8, tool
     var admission = try handoff.contracts.parseCanonical(work.a, try work.read("cli-collision.json.admission.json"));
     defer admission.deinit();
     try handoff.contracts.validateDirectComputeAdmissionV2(admission.value());
+}
+
+fn cliPublicAndCandidateComposition(
+    work: Workspace,
+    receipt: LocalReceipt,
+    stage: []const u8,
+    repository: []const u8,
+    tools: controller.import_validator_build.LocalTools,
+) !void {
+    const inner_hex = std.fmt.bytesToHex(receipt.inner, .lower);
+    const container_hex = std.fmt.bytesToHex(receipt.container, .lower);
+    const inner_archive = try work.join("local-inner.zip");
+    const container_archive = try work.join("local-container.zip");
+
+    // 1. CLI private-validate on the exported private bundle.
+    {
+        const res = try std.process.run(work.a, work.io, .{
+            .argv = &.{
+                options.host_controller_cli, "private-validate",
+                "--stage-root",              stage,
+                "--git",                     tools.git,
+                "--supervisor",              options.host_controller_cli,
+                "--validator",               tools.validator,
+                "--output",                  try work.join("cli-private-validation"),
+            },
+            .cwd = .{ .path = repository },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        if (res.term != .exited or res.term.exited != 0)
+            std.debug.print("cli private-validate stderr: {s}\n", .{res.stderr});
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+        try std.testing.expectEqualStrings("Compute handoff revalidated; authority=not_admitted.\n", res.stdout);
+        try std.testing.expectEqualStrings("", res.stderr);
+    }
+
+    // 2. CLI verify-public-source-bundle and stage-public-source-upload.
+    {
+        const expected_stdout = try work.a.print("Public source archive SHA-256: {s}\n", .{inner_hex[0..]});
+        const verify_res = try std.process.run(work.a, work.io, .{
+            .argv = &.{
+                options.host_controller_cli,  "verify-public-source-bundle",
+                "--archive",                  inner_archive,
+                "--expected-source",          receipt.context.source_revision,
+                "--expected-tree",            receipt.context.source_tree,
+                "--run-id",                   receipt.context.run_id,
+                "--run-attempt",              receipt.context.run_attempt,
+                "--expected-archive-sha256",  inner_hex[0..],
+            },
+            .cwd = .{ .path = repository },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, verify_res.term);
+        try std.testing.expectEqualStrings(expected_stdout, verify_res.stdout);
+        try std.testing.expectEqualStrings("", verify_res.stderr);
+
+        const stage_res = try std.process.run(work.a, work.io, .{
+            .argv = &.{
+                options.host_controller_cli,  "stage-public-source-upload",
+                "--archive",                  inner_archive,
+                "--output",                   try work.join("cli-staged-upload"),
+                "--expected-source",          receipt.context.source_revision,
+                "--expected-tree",            receipt.context.source_tree,
+                "--run-id",                   receipt.context.run_id,
+                "--run-attempt",              receipt.context.run_attempt,
+                "--expected-archive-sha256",  inner_hex[0..],
+            },
+            .cwd = .{ .path = repository },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, stage_res.term);
+        try std.testing.expectEqualStrings(expected_stdout, stage_res.stdout);
+        try std.testing.expectEqualStrings("", stage_res.stderr);
+        try std.testing.expectEqualSlices(u8, &inner_hex, &try work.digest("cli-staged-upload/tiny-aot-public-source.zip"));
+    }
+
+    // 3. CLI retain-public-source-download (mismatched selection refused; matching selection retained).
+    {
+        const mismatch_res = try std.process.run(work.a, work.io, .{
+            .argv = &.{
+                options.host_controller_cli,   "retain-public-source-download",
+                "--container-archive",         container_archive,
+                "--output",                    try work.join("cli-refused-download"),
+                "--expected-source",           receipt.context.source_revision,
+                "--expected-tree",             receipt.context.source_tree,
+                "--run-id",                    receipt.context.run_id,
+                "--run-attempt",               receipt.context.run_attempt,
+                "--expected-archive-sha256",   inner_hex[0..],
+                "--artifact-id",               "1",
+                "--container-digest",          container_hex[0..],
+                "--selected-artifact-id",      "2",
+                "--selected-container-digest", container_hex[0..],
+                "--selected-source",           receipt.context.source_revision,
+                "--selected-tree",             receipt.context.source_tree,
+                "--selected-run-id",           receipt.context.run_id,
+                "--selected-run-attempt",      receipt.context.run_attempt,
+            },
+            .cwd = .{ .path = repository },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, mismatch_res.term);
+        try std.testing.expectEqualStrings("", mismatch_res.stdout);
+        try std.testing.expect(std.mem.indexOf(u8, mismatch_res.stderr, "retain-public-source-download/inputs") != null);
+        try work.absent("cli-refused-download/tiny-aot-public-source.zip");
+
+        const retain_res = try std.process.run(work.a, work.io, .{
+            .argv = &.{
+                options.host_controller_cli,   "retain-public-source-download",
+                "--container-archive",         container_archive,
+                "--output",                    try work.join("cli-retained-download"),
+                "--expected-source",           receipt.context.source_revision,
+                "--expected-tree",             receipt.context.source_tree,
+                "--run-id",                    receipt.context.run_id,
+                "--run-attempt",               receipt.context.run_attempt,
+                "--expected-archive-sha256",   inner_hex[0..],
+                "--artifact-id",               "1",
+                "--container-digest",          container_hex[0..],
+                "--selected-artifact-id",      "1",
+                "--selected-container-digest", container_hex[0..],
+                "--selected-source",           receipt.context.source_revision,
+                "--selected-tree",             receipt.context.source_tree,
+                "--selected-run-id",           receipt.context.run_id,
+                "--selected-run-attempt",      receipt.context.run_attempt,
+            },
+            .cwd = .{ .path = repository },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, retain_res.term);
+        try std.testing.expectEqualStrings("Raw public source container retained and inner ZIP verified; authority=not_admitted.\n", retain_res.stdout);
+        try std.testing.expectEqualStrings("", retain_res.stderr);
+        try std.testing.expectEqualSlices(u8, &inner_hex, &try work.digest("cli-retained-download/tiny-aot-public-source.zip"));
+    }
+
+    // 4. CLI import-public-source-download -> candidate -> candidate-inspect -> candidate-result.
+    const cli_imported = try work.join("cli-imported");
+    {
+        const import_res = try std.process.run(work.a, work.io, .{
+            .argv = &.{
+                options.host_controller_cli,   "import-public-source-download",
+                "--download-root",             try work.join("cli-retained-download"),
+                "--container-archive",         container_archive,
+                "--output",                    cli_imported,
+                "--git",                       tools.git,
+                "--supervisor",                options.host_controller_cli,
+                "--validator",                 tools.validator,
+                "--expected-source",           receipt.context.source_revision,
+                "--expected-tree",             receipt.context.source_tree,
+                "--run-id",                    receipt.context.run_id,
+                "--run-attempt",               receipt.context.run_attempt,
+                "--expected-archive-sha256",   inner_hex[0..],
+                "--artifact-id",               "1",
+                "--container-digest",          container_hex[0..],
+                "--selected-artifact-id",      "1",
+                "--selected-container-digest", container_hex[0..],
+                "--selected-source",           receipt.context.source_revision,
+                "--selected-tree",             receipt.context.source_tree,
+                "--selected-run-id",           receipt.context.run_id,
+                "--selected-run-attempt",      receipt.context.run_attempt,
+            },
+            .cwd = .{ .path = repository },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        if (import_res.term != .exited or import_res.term.exited != 0)
+            std.debug.print("cli import-public-source-download stderr: {s}\n", .{import_res.stderr});
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, import_res.term);
+        try std.testing.expectEqualStrings("Public source handoff imported; authority=not_admitted.\n", import_res.stdout);
+        try std.testing.expectEqualStrings("", import_res.stderr);
+    }
+
+    const cli_bundle = try std.fs.path.join(work.a, &.{ cli_imported, "bundle.json" });
+    const cli_candidate = try work.join("cli-imported-candidate.json");
+    {
+        const create_res = try std.process.run(work.a, work.io, .{
+            .argv = &.{
+                options.host_controller_cli, "candidate",
+                "--bundle",                  cli_bundle,
+                "--output",                  cli_candidate,
+                "--validation-output",       try work.join("cli-imported-candidate-validation"),
+                "--git",                     tools.git,
+                "--supervisor",              options.host_controller_cli,
+                "--validator",               tools.validator,
+                "--attempt-id",              "00000000-0000-4000-8000-000000000001",
+            },
+            .cwd = .{ .path = repository },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        if (create_res.term != .exited or create_res.term.exited != 0)
+            std.debug.print("cli candidate stderr: {s}\n", .{create_res.stderr});
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, create_res.term);
+        try std.testing.expectEqualStrings("Compute candidate created; authority=not_admitted.\n", create_res.stdout);
+        try std.testing.expectEqualStrings("", create_res.stderr);
+        var admission = try handoff.contracts.parseCanonical(work.a, try work.read("cli-imported-candidate.json.admission.json"));
+        defer admission.deinit();
+        try handoff.contracts.validateDirectComputeAdmissionV2(admission.value());
+
+        const inspect_res = try std.process.run(work.a, work.io, .{
+            .argv = &.{
+                options.host_controller_cli, "candidate-inspect",
+                "--bundle",                  cli_bundle,
+                "--candidate",               cli_candidate,
+                "--validation-output",       try work.join("cli-imported-inspect-validation"),
+                "--git",                     tools.git,
+                "--supervisor",              options.host_controller_cli,
+                "--validator",               tools.validator,
+            },
+            .cwd = .{ .path = repository },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        if (inspect_res.term != .exited or inspect_res.term.exited != 0)
+            std.debug.print("cli candidate-inspect stderr: {s}\n", .{inspect_res.stderr});
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, inspect_res.term);
+        try std.testing.expectEqualStrings("Compute candidate revalidated; authority=not_admitted.\n", inspect_res.stdout);
+        try std.testing.expectEqualStrings("", inspect_res.stderr);
+    }
+
+    {
+        const serial = try std.Io.Dir.cwd().readFileAlloc(work.io, try std.fs.path.join(work.a, &.{ cli_imported, "boots/raw-x2apic/serial" }), work.a, .limited(handoff.layout.max_serial_bytes));
+        try work.put("cli-serial-first", serial);
+        try work.put("cli-serial-second", try std.mem.concat(work.a, u8, &.{ serial, serial, "\x00\x00" }));
+        try work.put("cli-serial-incomplete", "Calling main(0, 0)\n");
+
+        const result_res = try std.process.run(work.a, work.io, .{
+            .argv = &.{
+                options.host_controller_cli, "candidate-result",
+                "--bundle",                  cli_bundle,
+                "--candidate",               cli_candidate,
+                "--validation-output",       try work.join("cli-imported-result-validation"),
+                "--git",                     tools.git,
+                "--supervisor",              options.host_controller_cli,
+                "--validator",               tools.validator,
+                "--serial-first",            try work.join("cli-serial-first"),
+                "--serial-second",           try work.join("cli-serial-second"),
+            },
+            .cwd = .{ .path = repository },
+            .stdout_limit = .limited(16384),
+            .stderr_limit = .limited(4096),
+        });
+        if (result_res.term != .exited or result_res.term.exited != 0)
+            std.debug.print("cli candidate-result stderr: {s}\n", .{result_res.stderr});
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result_res.term);
+        try std.testing.expectEqualStrings("", result_res.stderr);
+        const parsed_result = try std.json.parseFromSlice(controller.tiny.Result, work.a, std.mem.trim(u8, result_res.stdout, "\n"), .{ .allocate = .alloc_always });
+        try std.testing.expectEqual(@as(i32, 42), parsed_result.value.answer);
+        try std.testing.expectEqual(@as(u32, 2), parsed_result.value.checks);
+        try std.testing.expectEqual(@as(i32, 0), parsed_result.value.platform_status);
+
+        const incomplete_res = try std.process.run(work.a, work.io, .{
+            .argv = &.{
+                options.host_controller_cli, "candidate-result",
+                "--bundle",                  cli_bundle,
+                "--candidate",               cli_candidate,
+                "--validation-output",       try work.join("cli-imported-incomplete-validation"),
+                "--git",                     tools.git,
+                "--supervisor",              options.host_controller_cli,
+                "--validator",               tools.validator,
+                "--serial-first",            try work.join("cli-serial-incomplete"),
+            },
+            .cwd = .{ .path = repository },
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
+        });
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 2 }, incomplete_res.term);
+        try std.testing.expectEqualStrings("", incomplete_res.stdout);
+        try std.testing.expect(std.mem.indexOf(u8, incomplete_res.stderr, "candidate-result/serial; cause: EvidenceIncomplete; authority=not_admitted.") != null);
+    }
 }
 
 fn changedInputs(work: Workspace, owner: *candidate.Finalized, bundle: *controller.accepted_run.PrivateBundle, repository: []const u8, tools: controller.import_validator_build.LocalTools) !void {
