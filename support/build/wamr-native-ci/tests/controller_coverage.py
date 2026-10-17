@@ -47,6 +47,9 @@ NATIVE_ORACLE_SUCCESSORS = {
         "legacy handoff inspect preserves five rehashed historical refusal "
         "witnesses",
     ),
+    "public validator cache flag is historical import only": (
+        "public validator cache flag is historical import only",
+    ),
 }
 
 # Exact discovery identity/counts remain in authority/goldens/python-scenarios.

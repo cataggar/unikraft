@@ -306,6 +306,9 @@ class NativeFaultGate(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertEqual(result.stdout, b"")
             self.assertIn(b"Controller differential CLI retired", result.stderr)
+        for retired in ("source_custody_production_limits.py",
+                        "authorization_fixture.py"):
+            self.assertFalse(Path(__file__).with_name(retired).exists())
 
 
 if __name__ == "__main__":
