@@ -236,3 +236,112 @@ test "joined discovery refuses same-byte interpreter replacement before COPY acq
     try std.testing.expectEqual(core.private_files.CommitStatus.not_committed, outcome.refused.publications.output);
     try absent(fixture.dir, "output");
 }
+
+test "joined prepare with closed copied ELF tree passes native validator and copied inspection before isolated helper refuses synthetic runtime" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    const allocator = fixture.arena.allocator();
+    const loader_path = try std.fs.path.join(allocator, &.{ fixture.path, authority.runtime_probes.loader_basename });
+    try fixture.dir.deleteFile(io, "python");
+    try write(fixture.dir, "python", &(try synthetic(.{
+        .role = .interpreter,
+        .interpreter = loader_path,
+        .needed = &.{"libalpha.so"},
+    })), 0o500);
+    fixture.interpreter.close(io);
+    fixture.interpreter = try core.private_files.RetainedFile.open(io, fixture.request.az_python, .artifact);
+
+    try write(fixture.dir, "libalpha.so", &(try synthetic(.{
+        .role = .library,
+        .needed = &.{"libbeta.so"},
+        .soname = "libalpha.so",
+    })), 0o400);
+    try write(fixture.dir, "libbeta.so", &(try synthetic(.{
+        .role = .library,
+        .soname = "libbeta.so",
+    })), 0o400);
+    var alpha = try core.private_files.RetainedFile.open(io, try std.fs.path.join(allocator, &.{ fixture.path, "libalpha.so" }), .artifact);
+    defer alpha.close(io);
+    var beta = try core.private_files.RetainedFile.open(io, try std.fs.path.join(allocator, &.{ fixture.path, "libbeta.so" }), .artifact);
+    defer beta.close(io);
+
+    const library = try fixture.dir.openDir(io, "python3.11", .{ .iterate = true });
+    defer library.close(io);
+    try library.deleteFile(io, "_invalid.so");
+    try library.createDir(io, "encodings", .fromMode(0o700));
+    const encodings = try library.openDir(io, "encodings", .{});
+    defer encodings.close(io);
+    try write(encodings, "__init__.py", "source-negative encodings\n", 0o600);
+    try write(library, "_ext.so", &(try synthetic(.{
+        .role = .native_extension,
+        .needed = &.{"libbeta.so"},
+    })), 0o400);
+    var ext = try core.private_files.RetainedFile.open(io, try std.fs.path.join(allocator, &.{ fixture.request.stdlib, "_ext.so" }), .artifact);
+    defer ext.close(io);
+
+    try fixture.dir.createDir(io, "packages", .fromMode(0o700));
+    const packages = try fixture.dir.openDir(io, "packages", .{ .iterate = true });
+    defer packages.close(io);
+    try packages.createDir(io, "azure", .fromMode(0o700));
+    const azure_pkg = try packages.openDir(io, "azure", .{});
+    defer azure_pkg.close(io);
+    try write(azure_pkg, "__init__.py", "source-negative azure\n", 0o600);
+    const package_root = try std.fs.path.join(allocator, &.{ fixture.path, "packages" });
+
+    var parsed_prepare = try authority.cli.parse(a, &.{
+        "prepare-azure-runtime",
+        try std.fmt.allocPrint(allocator, "--output={s}", .{fixture.request.output}),
+        try std.fmt.allocPrint(allocator, "--azure={s}", .{fixture.request.azure}),
+        try std.fmt.allocPrint(allocator, "--az-python={s}", .{fixture.request.az_python}),
+        try std.fmt.allocPrint(allocator, "--stdlib={s}", .{fixture.request.stdlib}),
+        try std.fmt.allocPrint(allocator, "--validator={s}", .{fixture.request.validator}),
+        try std.fmt.allocPrint(allocator, "--package-root={s}", .{package_root}),
+    });
+    defer parsed_prepare.deinit();
+
+    const outcome = authority.handlers.run(.{
+        .retained = .{ .allocator = a, .io = io },
+        .discovery = .{
+            .interpreter = &fixture.interpreter,
+            .dynamic_loader = &fixture.loader,
+            .native_roots = &.{&ext},
+            .candidates = &.{ &alpha, &beta },
+        },
+    }, parsed_prepare.result.command).prepare;
+    const diagnostic = switch (outcome) {
+        .poisoned => |failure| failure,
+        .refused => return error.UnexpectedEarlyRefusal,
+        .success => |owner| {
+            owner.deinit();
+            return error.SyntheticRuntimeAccepted;
+        },
+    };
+    try std.testing.expectEqual(authority.types.Phase.validation, diagnostic.phase);
+    try std.testing.expectEqual(core.private_files.CommitStatus.durable, diagnostic.publications.copy);
+    try std.testing.expectEqual(core.private_files.CommitStatus.durable, diagnostic.publications.manifest);
+    try std.testing.expectEqual(core.private_files.CommitStatus.durable, diagnostic.publications.pending);
+    try std.testing.expectEqual(core.private_files.CommitStatus.not_committed, diagnostic.publications.validation);
+    try std.testing.expectEqual(core.private_files.CommitStatus.not_committed, diagnostic.publications.output);
+    try std.testing.expectEqual(core.private_files.CommitStatus.durable, diagnostic.publications.failure);
+    try std.testing.expect(diagnostic.recording_error == null);
+    try std.testing.expectEqual(core.diagnostics.Stage.process_run, diagnostic.failures.primary.?.stage);
+    try std.testing.expectEqual(core.diagnostics.Category.child_failed, diagnostic.failures.primary.?.category);
+    try std.testing.expect(diagnostic.failures.cleanup == null);
+    try std.testing.expect(diagnostic.helper_cleanup_complete);
+    try std.testing.expect(diagnostic.native_validation != null);
+    try std.testing.expectEqual(core.process.CommandPrimary{ .exited = 0 }, diagnostic.native_validation.?.primary);
+    try std.testing.expect(diagnostic.native_validation.?.cleanup_complete);
+    try std.testing.expect(diagnostic.probes != null);
+    try std.testing.expectEqual(@as(u8, 0), diagnostic.probes.?.completed_steps);
+    try absent(fixture.dir, "output/azure-runtime.validation.json");
+    try absent(fixture.dir, "output/azure-runtime.json");
+
+    const failure_bytes = try fixture.dir.readFileAlloc(io, "output/azure-runtime.failure.json", a, .limited(16384));
+    defer a.free(failure_bytes);
+    var failure_doc = try core.contracts.Document.parse(a, failure_bytes, authority.contracts.json_limits);
+    defer failure_doc.deinit();
+    try std.testing.expectEqualStrings("validation", failure_doc.value().object.get("phase").?.string);
+    try std.testing.expect(failure_doc.value().object.get("helper_cleanup_complete").?.bool);
+    try std.testing.expectEqualStrings("0", failure_doc.value().object.get("completed_steps").?.number_string);
+    try std.testing.expect(failure_doc.value().object.get("native_validation").?.object.get("process").?.object.get("cleanup_complete").?.bool);
+}
