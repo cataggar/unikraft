@@ -466,7 +466,7 @@ fn inspectOutput(
             try limits.relative(tracked, limits.ignored_path, limits.ignored_depth);
             _ = physical.readFileCached(io, target, limits.tracked_file, false, known_files) catch return error.IgnoredLinkEscapesRole;
             const link_parent = if (known_parent != null) try files.openDirectory(io, parent_path, .artifact) else parent;
-            errdefer if (known_parent != null) link_parent.close(io);
+            errdefer if (!transferred and known_parent != null) link_parent.close(io);
             try tracked_links.add(allocator, io, repo, git, tracked, link_parent, named, before, std.fs.path.basename(path));
             transferred = true;
             if (TrackedLinks.pathspec(tracked))
@@ -566,6 +566,7 @@ fn trackedFile(
     repo: []const u8,
     entry: Tracked,
     format: []const u8,
+    known_parent: ?std.Io.Dir,
     known_blobs: ?*std.AutoHashMap([9]i128, CachedBlob),
     known_files: ?*std.AutoHashMap([9]i128, [64]u8),
 ) !struct { bytes: usize, sha256: [64]u8, metadata: [9]i128 } {
@@ -577,8 +578,8 @@ fn trackedFile(
     defer if (retained_file) |*retained| retained.close(io);
     if (std.mem.eql(u8, entry.mode, "120000")) {
         const parent_path = std.fs.path.dirname(path).?;
-        const parent = try files.openDirectory(io, parent_path, .artifact);
-        defer parent.close(io);
+        const parent = if (known_parent) |existing| existing else try files.openDirectory(io, parent_path, .artifact);
+        defer if (known_parent == null) parent.close(io);
         const link = try parent.openFile(io, std.fs.path.basename(path), .{ .path_only = true, .follow_symlinks = false });
         defer link.close(io);
         before = try files.snapshot(link);
@@ -607,6 +608,31 @@ fn trackedFile(
         defer named.close(io);
         if (!files.sameSnapshot(before, try files.snapshot(named)) or
             !files.sameSnapshot(before, try files.snapshot(link))) return error.SourceChanged;
+    } else if (known_parent) |parent| {
+        const name = std.fs.path.basename(path);
+        const file = try (files.FileParent{ .directory = parent, .name = name, .policy = .artifact }).openFile(io);
+        defer file.close(io);
+        before = try files.snapshot(file);
+        if (before.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG or
+            before.size > limits.tracked_file or before.nlink != 1 or
+            (before.uid != 0 and before.uid != std.os.linux.geteuid()) or before.mode & 0o022 != 0 or
+            (before.mode & 0o111 != 0) != std.mem.eql(u8, entry.mode, "100755"))
+            return error.UnsafeSource;
+        const meta = physical.metadata(before);
+        if (known_blobs) |cache| if (cache.get(meta)) |cached| {
+            if (cached.oid_len != entry.oid.len or !std.mem.eql(u8, cached.oid[0..cached.oid_len], entry.oid))
+                return error.SourceChanged;
+            if (known_files) |file_cache| try file_cache.put(meta, cached.sha256);
+            return .{ .bytes = @intCast(before.size), .sha256 = cached.sha256, .metadata = meta };
+        };
+        raw = try allocator.alloc(u8, @intCast(before.size));
+        if (try file.readPositionalAll(io, raw, 0) != raw.len)
+            return error.SourceChanged;
+        const reopened = try parent.openFile(io, name, .{ .path_only = true, .follow_symlinks = false });
+        defer reopened.close(io);
+        if (!files.sameSnapshot(before, try files.snapshot(file)) or
+            !files.sameSnapshot(before, try files.snapshot(reopened)))
+            return error.SourceChanged;
     } else {
         const retained = try files.RetainedFile.open(io, path, .artifact);
         before = retained.file_snapshot;
@@ -687,6 +713,17 @@ pub fn portableSource(allocator: std.mem.Allocator, io: std.Io, repo: []const u8
     return captureSource(allocator, io, repo, git, true, null, null);
 }
 
+pub fn portableSourceCached(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repo: []const u8,
+    git: []const u8,
+    known_blobs: ?*std.AutoHashMap([9]i128, CachedBlob),
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+) !Source {
+    return captureSource(allocator, io, repo, git, true, known_blobs, known_files);
+}
+
 fn captureSource(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -736,8 +773,21 @@ fn captureSource(
     physical_hash.update("uk.wamr.git-source-physical-v1\x00");
     for (names) |relative| try physical.bind(allocator, &physical_hash, .{ "directory", relative, physical.metadata(dirs.get(relative).?) });
     var bytes: usize = 0;
+    var current_parent_rel: ?[]const u8 = null;
+    var current_parent_dir: ?std.Io.Dir = null;
+    defer if (current_parent_dir) |d| d.close(io);
     for (entries) |entry| {
-        const data = try trackedFile(allocator, io, repo, entry, format, known_blobs, known_files);
+        const rel_parent = std.fs.path.dirname(entry.path) orelse "";
+        if (current_parent_rel == null or !std.mem.eql(u8, current_parent_rel.?, rel_parent)) {
+            if (current_parent_dir) |d| d.close(io);
+            current_parent_dir = null;
+            current_parent_rel = null;
+            const parent_path = if (rel_parent.len == 0) repo else try std.fs.path.join(allocator, &.{ repo, rel_parent });
+            defer if (rel_parent.len != 0) allocator.free(parent_path);
+            current_parent_dir = try files.openDirectory(io, parent_path, .artifact);
+            current_parent_rel = rel_parent;
+        }
+        const data = try trackedFile(allocator, io, repo, entry, format, current_parent_dir, known_blobs, known_files);
         try limits.addBounded(&bytes, data.bytes, limits.tracked_bytes);
         try physical.bind(allocator, &content, .{ "file", entry.path, entry.mode, entry.oid, data.bytes, data.sha256 });
         try physical.bind(allocator, &physical_hash, .{ "file", entry.path, entry.mode, entry.oid, data.bytes, data.sha256, data.metadata });
@@ -885,7 +935,7 @@ pub fn trackedManifest(
     defer allocator.free(matches);
     if (matches.len != 1 or !std.mem.eql(u8, matches[0].path, relative) or std.mem.eql(u8, matches[0].mode, "120000"))
         return error.UntrackedManifest;
-    const entry = try trackedFile(allocator, io, repo, matches[0], format, null, null);
+    const entry = try trackedFile(allocator, io, repo, matches[0], format, null, null, null);
     if (entry.bytes > limits.mib) return error.ManifestTooLarge;
     const path = try std.fs.path.join(allocator, &.{ repo, relative });
     defer allocator.free(path);
@@ -988,12 +1038,21 @@ pub fn sourceMetadata(allocator: std.mem.Allocator, io: std.Io, repo: []const u8
         recorded[index] = .{ .kind = "directory", .path = try allocator.dupe(u8, relative), .metadata = physical.metadata(try directoryBefore(io, path)) };
         complete += 1;
     }
+    var current_parent_rel: ?[]const u8 = null;
+    var current_parent_dir: ?std.Io.Dir = null;
+    defer if (current_parent_dir) |d| d.close(io);
     for (tracked, 0..) |entry, index| {
-        const path = try std.fs.path.join(allocator, &.{ repo, entry.path });
-        defer allocator.free(path);
-        const parent = try files.openDirectory(io, std.fs.path.dirname(path).?, .artifact);
-        defer parent.close(io);
-        const member = try parent.openFile(io, std.fs.path.basename(path), .{ .path_only = true, .follow_symlinks = false });
+        const rel_parent = std.fs.path.dirname(entry.path) orelse "";
+        if (current_parent_rel == null or !std.mem.eql(u8, current_parent_rel.?, rel_parent)) {
+            if (current_parent_dir) |d| d.close(io);
+            current_parent_dir = null;
+            current_parent_rel = null;
+            const parent_path = if (rel_parent.len == 0) repo else try std.fs.path.join(allocator, &.{ repo, rel_parent });
+            defer if (rel_parent.len != 0) allocator.free(parent_path);
+            current_parent_dir = try files.openDirectory(io, parent_path, .artifact);
+            current_parent_rel = rel_parent;
+        }
+        const member = try current_parent_dir.?.openFile(io, std.fs.path.basename(entry.path), .{ .path_only = true, .follow_symlinks = false });
         defer member.close(io);
         recorded[names.len + index] = .{ .kind = "file", .path = try allocator.dupe(u8, entry.path), .metadata = physical.metadata(try files.snapshot(member)) };
         complete += 1;
