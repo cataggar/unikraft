@@ -297,17 +297,9 @@ class NativeFaultGate(unittest.TestCase):
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(b"Invalid native fault driver selection", result.stderr)
-        for action in ("local", "full"):
-            result = subprocess.run(
-                [sys.executable, "-B", str(Path(__file__).with_name(
-                    "test_differential_parity.py")), action],
-                cwd=repository, env=environment,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
-            self.assertEqual(result.returncode, 2)
-            self.assertEqual(result.stdout, b"")
-            self.assertIn(b"Controller differential CLI retired", result.stderr)
         for retired in ("source_custody_production_limits.py",
-                        "authorization_fixture.py"):
+                        "authorization_fixture.py",
+                        "test_differential_parity.py"):
             self.assertFalse(Path(__file__).with_name(retired).exists())
 
 

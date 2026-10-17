@@ -264,6 +264,7 @@ pub fn historical(
         defer finalized.success.deinit();
         _ = try finalized.success.result(try std.fs.path.join(a, &.{ owner.bundle.?.evidence.root, "boots/raw-x2apic/serial" }), null, null);
         try reopenHistoricalCandidate(work, owner);
+        try cliHistoricalBundleAndCandidate(work, repository, tools, context, input_digest);
     }
     try rehashedPayload(work, stage, repository, tools, context, &metadata);
 }
@@ -284,6 +285,43 @@ fn reopenHistoricalCandidate(work: Workspace, owner: *products.ImportedProduct) 
     try std.testing.expectEqual(.not_admitted, inspect.authority);
     try std.testing.expectError(error.Version2Required, reopened.success.metadata(null));
     _ = try reopened.success.result(try std.fs.path.join(work.a, &.{ owner.bundle.?.evidence.root, "boots/raw-x2apic/serial" }), null, null);
+
+    {
+        var parsed_plan = try authority.cli.parse(work.a, &.{
+            "plan",
+            "--bundle",                           try work.join("success/bundle.json"),
+            "--output",                           try work.join("historical-refused-plan.json"),
+            "--approval-template",                try work.join("historical-refused-template.json"),
+            "--candidate-output",                 try work.join("historical-candidate.json"),
+            "--campaign-id",                      "00000000-0000-4000-8000-000000000010",
+            "--ledger",                           try work.join("historical-refused-ledger"),
+            "--subscription",                     "00000000-0000-4000-8000-000000000004",
+            "--prefix",                           "ukwamr",
+            "--maximum-authorized-cost-microusd", "15000000",
+            "--attempt-id",                       "00000000-0000-4000-8000-000000000001",
+            "--ledger-id",                        "00000000-0000-4000-8000-000000000020",
+            "--azure-runtime",                    try work.join("historical-candidate.json"),
+            "--azure",                            options.command_fixture,
+            "--uploader",                         options.command_fixture,
+            "--validator",                        options.command_fixture,
+            "--supervisor",                       options.host_controller_cli,
+            "--az-python",                        options.python_executable,
+        });
+        defer parsed_plan.deinit();
+        const v1_plan = authority.handlers.run(
+            .{
+                .retained = .{ .allocator = std.testing.allocator, .io = work.io },
+                .live_finalized = reopened.success,
+            },
+            parsed_plan.result.command,
+        );
+        try std.testing.expect(v1_plan.plan == .refused);
+        try std.testing.expectEqual(authority.types.Phase.custody, v1_plan.plan.refused.phase);
+        try std.testing.expectEqual(error.Version2Required, v1_plan.plan.refused.err);
+        try std.testing.expectEqual(authority.plan.Publications{}, v1_plan.plan.refused.outputs);
+        try work.absent("historical-refused-plan.json");
+        try work.absent("historical-refused-template.json");
+    }
 
     var tampered_doc = try handoff.contracts.parseCanonical(work.a, try work.read("historical-candidate.json"));
     defer tampered_doc.deinit();
@@ -307,6 +345,141 @@ fn reopenHistoricalCandidate(work: Workspace, owner: *products.ImportedProduct) 
     try std.testing.expectEqual(error.CandidateBindingChanged, tampered.poisoned.err);
     try std.testing.expectEqual(files.CommitStatus.not_committed, tampered.poisoned.publication);
     try std.testing.expectEqualStrings(tampered_bytes, try work.read("historical-candidate-tampered.json"));
+}
+
+fn cliHistoricalBundleAndCandidate(
+    work: Workspace,
+    repository: []const u8,
+    tools: controller.import_validator_build.LocalTools,
+    context: archive.Context,
+    input_digest: [64]u8,
+) !void {
+    const input_archive = try work.join("input.zip");
+    const import_pinned_res = try std.process.run(work.a, work.io, .{
+        .argv = &.{
+            options.host_controller_cli,  "import-public-source-bundle",
+            "--archive",                  input_archive,
+            "--output",                   try work.join("cli-historical-imported"),
+            "--git",                      tools.git,
+            "--supervisor",               options.host_controller_cli,
+            "--validator",                tools.validator,
+            "--expected-source",          context.source_revision,
+            "--expected-tree",            context.source_tree,
+            "--run-id",                   context.run_id,
+            "--run-attempt",              context.run_attempt,
+            "--expected-archive-sha256",  input_digest[0..],
+        },
+        .cwd = .{ .path = repository },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, import_pinned_res.term);
+    try std.testing.expectEqualStrings("Public source handoff imported; authority=not_admitted.\n", import_pinned_res.stdout);
+    try std.testing.expectEqualStrings("", import_pinned_res.stderr);
+
+    const import_unpinned_res = try std.process.run(work.a, work.io, .{
+        .argv = &.{
+            options.host_controller_cli, "import-public-source-bundle",
+            "--archive",                 input_archive,
+            "--output",                  try work.join("cli-historical-imported-unpinned"),
+            "--git",                     tools.git,
+            "--supervisor",              options.host_controller_cli,
+            "--validator",               tools.validator,
+            "--expected-source",         context.source_revision,
+            "--expected-tree",           context.source_tree,
+            "--run-id",                  context.run_id,
+            "--run-attempt",             context.run_attempt,
+        },
+        .cwd = .{ .path = repository },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, import_unpinned_res.term);
+    try std.testing.expectEqualStrings("Public source handoff imported; authority=not_admitted.\n", import_unpinned_res.stdout);
+    try std.testing.expectEqualStrings("", import_unpinned_res.stderr);
+    try std.testing.expectEqualSlices(u8, &try work.digest("success/portable-bundle.json"), &try work.digest("cli-historical-imported/portable-bundle.json"));
+    try std.testing.expectEqualSlices(u8, &try work.digest("cli-historical-imported/portable-bundle.json"), &try work.digest("cli-historical-imported-unpinned/portable-bundle.json"));
+    try std.testing.expectEqualSlices(u8, &try work.digest("success/public-source.json"), &try work.digest("cli-historical-imported/public-source.json"));
+    try std.testing.expectEqualSlices(u8, &try work.digest("cli-historical-imported/public-source.json"), &try work.digest("cli-historical-imported-unpinned/public-source.json"));
+
+    const bundle_path = try work.join("cli-historical-imported/bundle.json");
+    const candidate_path = try work.join("cli-historical-candidate.json");
+    const create_res = try std.process.run(work.a, work.io, .{
+        .argv = &.{
+            options.host_controller_cli, "candidate",
+            "--bundle",                  bundle_path,
+            "--output",                  candidate_path,
+            "--validation-output",       try work.join("cli-historical-candidate-validation"),
+            "--git",                     tools.git,
+            "--supervisor",              options.host_controller_cli,
+            "--validator",               tools.validator,
+            "--attempt-id",              "00000000-0000-4000-8000-000000000099",
+        },
+        .cwd = .{ .path = repository },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, create_res.term);
+    try std.testing.expectEqualStrings("Compute candidate created; authority=not_admitted.\n", create_res.stdout);
+    try std.testing.expectEqualStrings("", create_res.stderr);
+
+    const inspect_res = try std.process.run(work.a, work.io, .{
+        .argv = &.{
+            options.host_controller_cli, "candidate-inspect",
+            "--bundle",                  bundle_path,
+            "--candidate",               candidate_path,
+            "--validation-output",       try work.join("cli-historical-candidate-inspect-validation"),
+            "--git",                     tools.git,
+            "--supervisor",              options.host_controller_cli,
+            "--validator",               tools.validator,
+        },
+        .cwd = .{ .path = repository },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, inspect_res.term);
+    try std.testing.expectEqualStrings("Compute candidate revalidated; authority=not_admitted.\n", inspect_res.stdout);
+    try std.testing.expectEqualStrings("", inspect_res.stderr);
+
+    const wrong_bundle_res = try std.process.run(work.a, work.io, .{
+        .argv = &.{
+            options.host_controller_cli, "candidate-inspect",
+            "--bundle",                  try work.join("success/bundle.json"),
+            "--candidate",               candidate_path,
+            "--validation-output",       try work.join("cli-historical-candidate-wrong-bundle-validation"),
+            "--git",                     tools.git,
+            "--supervisor",              options.host_controller_cli,
+            "--validator",               tools.validator,
+        },
+        .cwd = .{ .path = repository },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(8192),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, wrong_bundle_res.term);
+    try std.testing.expectEqualStrings("", wrong_bundle_res.stdout);
+    try std.testing.expect(std.mem.indexOf(u8, wrong_bundle_res.stderr, "CandidateBindingChanged") != null);
+
+    const result_res = try std.process.run(work.a, work.io, .{
+        .argv = &.{
+            options.host_controller_cli, "candidate-result",
+            "--bundle",                  bundle_path,
+            "--candidate",               candidate_path,
+            "--validation-output",       try work.join("cli-historical-candidate-result-validation"),
+            "--git",                     tools.git,
+            "--supervisor",              options.host_controller_cli,
+            "--validator",               tools.validator,
+            "--serial-first",            try work.join("cli-historical-imported/boots/raw-x2apic/serial"),
+        },
+        .cwd = .{ .path = repository },
+        .stdout_limit = .limited(16384),
+        .stderr_limit = .limited(4096),
+    });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result_res.term);
+    try std.testing.expectEqualStrings("", result_res.stderr);
+    const parsed_result = try std.json.parseFromSlice(controller.tiny.Result, work.a, std.mem.trim(u8, result_res.stdout, "\n"), .{ .allocate = .alloc_always });
+    try std.testing.expectEqual(@as(i32, 42), parsed_result.value.answer);
+    try std.testing.expectEqual(@as(u32, 2), parsed_result.value.checks);
+    try std.testing.expectEqual(@as(i32, 0), parsed_result.value.platform_status);
 }
 
 fn rehashedPayload(work: Workspace, stage: []const u8, repository: []const u8, tools: controller.import_validator_build.LocalTools, context: archive.Context, metadata: *archive.Metadata) !void {

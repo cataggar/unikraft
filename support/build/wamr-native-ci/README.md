@@ -1510,9 +1510,8 @@ Build options track the compiler library and repository directories as directory
 inputs. Scratch fixture roots are untracked output paths, not input files or
 directory-content dependencies.
 The neutral v1/v2 fixture constructors in `tests/controller_record_fixtures.py`
-remain available to #187/#189. `test_differential_parity.DeterministicContracts`
-is only a compatibility import of their neutral byte tests, not a controller
-comparison or an executable `local`/`full` harness. No acceptance is inferred
+remain available to #187/#189 without a controller comparison or an executable
+`local`/`full` harness. No acceptance is inferred
 from these synthetic records. The handoff/public-bundle and authority oracles
 remain in their owners until those migrations; `run.py` is not deleted here.
 
