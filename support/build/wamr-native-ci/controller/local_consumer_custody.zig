@@ -562,18 +562,22 @@ fn runWithPolicy(
     const boot = boot_doc.value();
     var runtime_cache = std.StringHashMap([][]const u8).init(allocator);
     defer runtime_cache.deinit();
-    var local_known_files = std.AutoHashMap([9]i128, [64]u8).init(allocator);
-    defer local_known_files.deinit();
-    const known_files: *std.AutoHashMap([9]i128, [64]u8) = if (custody_cache) |cache| &cache.known_files else &local_known_files;
-    const known_blobs = if (custody_cache) |cache| &cache.known_git_blobs else null;
+    var owned_cache: ?@import("build_pipeline.zig").CustodyCache = if (custody_cache == null)
+        @import("build_pipeline.zig").CustodyCache.init(std.heap.page_allocator)
+    else
+        null;
+    defer if (owned_cache) |*cache| cache.deinit();
+    const active_cache: *@import("build_pipeline.zig").CustodyCache = custody_cache orelse &owned_cache.?;
+    const known_files: *std.AutoHashMap([9]i128, [64]u8) = &active_cache.known_files;
+    const known_blobs = &active_cache.known_git_blobs;
     const consumer = try get(start, "consumer_inputs");
     const git_path = try recordedPath(try get(consumer, "files"), "tool:git");
     var git = try files.RetainedFile.open(io, git_path, .tool);
     defer git.close(io);
     try notCancelled(signal);
     if (!legacy) _ = try recordedSource(allocator, io, repository, git_path, start, policy, known_blobs, known_files);
-    try buildRoles(allocator, io, repository, runtime, start, signal, legacy, &runtime_cache, custody_cache);
-    try bootRoles(allocator, io, repository, runtime, boot, !legacy and try nativeProducer(allocator, runtime, try get(consumer, "files")), signal, legacy, &runtime_cache, custody_cache);
+    try buildRoles(allocator, io, repository, runtime, start, signal, legacy, &runtime_cache, active_cache);
+    try bootRoles(allocator, io, repository, runtime, boot, !legacy and try nativeProducer(allocator, runtime, try get(consumer, "files")), signal, legacy, &runtime_cache, active_cache);
     try notCancelled(signal);
     var dependency = try if (policy == .recorded_producer)
         dependencies.captureRecordedCached(allocator, io, repository, git_path, try std.fs.path.join(allocator, &.{ runtime, "compute" }), known_files)
@@ -583,7 +587,7 @@ fn runWithPolicy(
     try sameValue(allocator, try get(start, "dependencies"), try std.json.parseFromSliceLeaky(std.json.Value, allocator, try dependency.canonical(allocator), .{ .parse_numbers = false }));
     try notCancelled(signal);
     try sameValue(allocator, try get(start, "bison_data"), try inputs.bisonCached(allocator, io, try std.fs.path.join(allocator, &.{ runtime, "bison" }), known_files));
-    if (!legacy) try recordedSupervisor(allocator, io, repository, start, signal, &runtime_cache, custody_cache, known_files);
+    if (!legacy) try recordedSupervisor(allocator, io, repository, start, signal, &runtime_cache, active_cache, known_files);
     try notCancelled(signal);
     try recapture(allocator, io, consumer, known_files);
     try notCancelled(signal);

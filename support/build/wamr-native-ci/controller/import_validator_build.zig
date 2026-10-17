@@ -142,7 +142,12 @@ pub const PortableTools = struct {
         errdefer native.close(io);
         var validator = try adapter.openPinnedTool(io, local.validator, "input:validator");
         errdefer validator.close(io);
-        const validator_identity = try physical.readFile(io, local.validator, 64 * limits.mib, false);
+        var known_blobs = std.AutoHashMap([9]i128, source.CachedBlob).init(allocator);
+        errdefer known_blobs.deinit();
+        var known_files = std.AutoHashMap([9]i128, [64]u8).init(allocator);
+        errdefer known_files.deinit();
+        @import("build_pipeline.zig").loadShmInto(&known_files, &known_blobs);
+        const validator_identity = try physical.readFileCached(io, local.validator, 64 * limits.mib, false, &known_files);
         if (!std.mem.eql(u8, &validator_identity.sha256, @import("import_validator_identity").sha256) or
             !std.meta.eql(validator_identity.metadata, physical.metadata(validator.file_snapshot)))
             return error.InvalidValidator;
@@ -186,17 +191,13 @@ pub const PortableTools = struct {
             break :blk try supervisor_identity.verifyRuntime(allocator, io, local.supervisor, start, signal);
         };
         errdefer supervisor.deinit(allocator, io);
-        const owner = try physical.readFile(io, controller_path, 64 * limits.mib, false);
-        const supplied = try physical.readFile(io, local.supervisor, 64 * limits.mib, false);
+        const owner = try physical.readFileCached(io, controller_path, 64 * limits.mib, false, &known_files);
+        const supplied = try physical.readFileCached(io, local.supervisor, 64 * limits.mib, false, &known_files);
         if (!std.meta.eql(owner.sha256, supplied.sha256) or owner.bytes != supplied.bytes or
             !std.meta.eql(owner.metadata, physical.metadata(native.file_snapshot)))
             return error.ImportSupervisorChanged;
 
         try git.verify(io);
-        var known_blobs = std.AutoHashMap([9]i128, source.CachedBlob).init(allocator);
-        errdefer known_blobs.deinit();
-        var known_files = std.AutoHashMap([9]i128, [64]u8).init(allocator);
-        errdefer known_files.deinit();
         const before = try source.portableSourceCached(allocator, io, repository, local.git, &known_blobs, &known_files);
         errdefer {
             allocator.free(before.revision);

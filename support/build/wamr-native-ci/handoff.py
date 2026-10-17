@@ -548,12 +548,13 @@ def _parent_records(paths):
 
 
 def _runtime_role(relative, launcher, interpreter):
-    path = relative.as_posix()
+    path = relative if isinstance(relative, str) else relative.as_posix()
+    name = path.rsplit("/", 1)[-1] if isinstance(relative, str) else relative.name
     if path == launcher:
         return "launcher"
     if path == interpreter:
         return "interpreter"
-    if ".so" in relative.name:
+    if ".so" in name:
         return "native-extension"
     if path.startswith("lib/"):
         return "python-module"
@@ -586,7 +587,8 @@ def _scan_azure_runtime(root, launcher, interpreter, dependencies):
                    and not info.st_mode & 0o022,
                    "unsafe prepared Azure runtime directory")
         relative = Path(".") if relative_dir == Path(".") else relative_dir
-        records.append(("D", relative.as_posix(), info, None))
+        relative_posix = relative.as_posix()
+        records.append(("D", relative_posix, info, None))
         directories = []
         try:
             with os.scandir(current) as scan:
@@ -611,7 +613,11 @@ def _scan_azure_runtime(root, launcher, interpreter, dependencies):
                             file_count <= AZURE_RUNTIME_MAX_FILES
                             and total_bytes <= AZURE_RUNTIME_MAX_BYTES,
                             "Azure runtime closure limit exceeded")
-                        relative = child.relative_to(root).as_posix()
+                        relative = (
+                            entry.name
+                            if relative_posix == "."
+                            else f"{relative_posix}/{entry.name}"
+                        )
                         records.append(
                             ("F", relative, child_info, ci.digest(child)))
                     else:
@@ -624,6 +630,8 @@ def _scan_azure_runtime(root, launcher, interpreter, dependencies):
     content = hashlib.sha256()
     metadata = hashlib.sha256()
     manifest = [b"UK-WAMR-AZURE-RUNTIME-CLOSURE\t1\n"]
+    launcher_relative = Path(launcher).relative_to(root).as_posix()
+    interpreter_relative = Path(interpreter).relative_to(root).as_posix()
     for kind, relative, info, digest in records:
         content_size = info.st_size if kind == "F" else 0
         content.update(
@@ -631,9 +639,9 @@ def _scan_azure_runtime(root, launcher, interpreter, dependencies):
             f"{digest or '-'}\n".encode())
         metadata.update(_metadata_line("M", relative, info))
         role = _runtime_role(
-            Path(relative),
-            Path(launcher).relative_to(root).as_posix(),
-            Path(interpreter).relative_to(root).as_posix())
+            relative,
+            launcher_relative,
+            interpreter_relative)
         manifest.append((
             f"{kind}\t{role}\t{relative}\t"
             + "\t".join(map(str, _physical(info)))

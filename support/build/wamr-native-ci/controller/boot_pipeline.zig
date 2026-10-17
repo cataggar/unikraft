@@ -60,7 +60,7 @@ pub const Context = struct {
     fn pin(self: *Context, name: []const u8) !void {
         if (self.pinned.contains(name)) return error.PriorEvidence;
         const path_name = try self.evidencePath(name);
-        const observed = try physical.readFile(self.io(), path_name, records.max_record_bytes, true);
+        const observed = try physical.readFileCached(self.io(), path_name, records.max_record_bytes, true, build.knownFiles(self.build_context));
         try self.pinned.put(try self.allocator().dupe(u8, name), observed);
     }
 
@@ -68,7 +68,7 @@ pub const Context = struct {
         var iterator = self.pinned.iterator();
         while (iterator.next()) |entry| {
             try self.cancelled();
-            const observed = try physical.readFile(self.io(), try self.evidencePath(entry.key_ptr.*), records.max_record_bytes, true);
+            const observed = try physical.readFileCached(self.io(), try self.evidencePath(entry.key_ptr.*), records.max_record_bytes, true, build.knownFiles(self.build_context));
             if (!std.meta.eql(observed, entry.value_ptr.*)) return error.EvidenceChanged;
         }
     }
@@ -143,7 +143,7 @@ pub const Context = struct {
         const path_name = try self.evidencePath(name);
         const value = try self.readValue(path_name, records.max_record_bytes, true);
         const expected = self.pinned.get(name) orelse return error.MissingEvidence;
-        if (!std.meta.eql(expected, try physical.readFile(self.io(), path_name, records.max_record_bytes, true)))
+        if (!std.meta.eql(expected, try physical.readFileCached(self.io(), path_name, records.max_record_bytes, true, build.knownFiles(self.build_context))))
             return error.EvidenceChanged;
         return value;
     }
@@ -242,11 +242,11 @@ fn digestFile(ctx: *Context, path_name: []const u8, limit: u64, private: bool) !
             try retained.verify(ctx.io());
             return cached;
         }
-        const observed = try physical.readRetained(ctx.io(), &retained, limit);
+        const observed = try physical.readRetainedCached(ctx.io(), &retained, limit, build.knownFiles(ctx.build_context));
         try cache.put(try ctx.allocator().dupe(u8, path_name), observed);
         return observed;
     }
-    return physical.readFile(ctx.io(), path_name, limit, private);
+    return physical.readFileCached(ctx.io(), path_name, limit, private, build.knownFiles(ctx.build_context));
 }
 
 fn matchFile(ctx: *Context, path_name: []const u8, value: Value, limit: u64, private: bool) !physical.File {
@@ -390,7 +390,7 @@ fn runStage(ctx: *Context, stage: plan.Stage, private_record: bool) !Value {
     try ctx.base();
     const name = try ctx.allocator().print("command-{s}.json", .{@tagName(stage)});
     if (is_validator) {
-        _ = try physical.readFile(ctx.io(), try std.fs.path.join(ctx.allocator(), &.{ slot, name }), records.max_record_bytes, true);
+        _ = try physical.readFileCached(ctx.io(), try std.fs.path.join(ctx.allocator(), &.{ slot, name }), records.max_record_bytes, true, build.knownFiles(ctx.build_context));
     } else try ctx.pin(name);
     if (outcome.stdout.len == 0 or outcome.stderr_bytes != 0 and is_validator)
         return error.InvalidStageOutput;
@@ -563,7 +563,7 @@ fn checkBoot(ctx: *Context, index: usize) !CheckedBoot {
     const source = try ctx.path(try a.print("package/{s}", .{plan.bootImage(mode)}));
     for ([_][]const u8{ source, roots.ovmf_code, roots.ovmf_vars, roots.qemu }, pins.array.items) |path_name, pin|
         try sameJson(a, pin, try pinFor(ctx, path_name));
-    const launched = try physical.readFile(ctx.io(), try std.fs.path.join(a, &.{ work, "launched" }), 1, true);
+    const launched = try physical.readFileCached(ctx.io(), try std.fs.path.join(a, &.{ work, "launched" }), 1, true, build.knownFiles(ctx.build_context));
     if (launched.bytes != 0) return error.InvalidBootLaunch;
     const report = try ctx.readValue(report_path, 64 * 1024, true);
     try sameText(try field(report, "scope"), "public_local_qemu_only");
@@ -582,13 +582,13 @@ fn checkBoot(ctx: *Context, index: usize) !CheckedBoot {
     _ = try contracts.exactFields(failures, &.{ "primary", "cleanup", "recording" });
     for ([_][]const u8{ "primary", "cleanup", "recording" }) |key|
         if (try field(failures, key) != .null) return error.InvalidBootReport;
-    const serial = try physical.readFile(ctx.io(), raw_path, 4 * mib, true);
+    const serial = try physical.readFileCached(ctx.io(), raw_path, 4 * mib, true, build.knownFiles(ctx.build_context));
     if (serial.bytes == 0 or serial.bytes >= 4 * mib or
         try number(u64, try field(report, "serial_bytes")) != serial.bytes or
         !std.mem.eql(u8, try text(try field(report, "serial_sha256")), &serial.sha256))
         return error.SerialChanged;
-    const req = try physical.readFile(ctx.io(), request_path, 64 * 1024, true);
-    const rep = try physical.readFile(ctx.io(), report_path, 64 * 1024, true);
+    const req = try physical.readFileCached(ctx.io(), request_path, 64 * 1024, true, build.knownFiles(ctx.build_context));
+    const rep = try physical.readFileCached(ctx.io(), report_path, 64 * 1024, true, build.knownFiles(ctx.build_context));
     return .{
         .report = report,
         .pins = pins,
@@ -670,8 +670,8 @@ fn runMode(ctx: *Context, index: usize) !void {
     const a = ctx.allocator();
     const serial = try ctx.path(try a.print("boot-{s}/hyperv-efi-boot.log", .{@tagName(mode)}));
     const identity = ctx.build_context.roots.identity;
-    const serial_pin = try physical.readFile(ctx.io(), serial, 4 * mib, true);
-    const identity_pin = try physical.readFile(ctx.io(), identity, mib, false);
+    const serial_pin = try physical.readFileCached(ctx.io(), serial, 4 * mib, true, build.knownFiles(ctx.build_context));
+    const identity_pin = try physical.readFileCached(ctx.io(), identity, mib, false, build.knownFiles(ctx.build_context));
     ctx.build_context.roots.serial = serial;
     const validator = try runStage(ctx, if (mode.legacyApic()) .@"log-validator-legacy" else .@"log-validator-x2apic", true);
     _ = try contracts.exactFields(validator, &.{
@@ -686,8 +686,8 @@ fn runMode(ctx: *Context, index: usize) !void {
     try sameText(try field(validator, "raw_serial_sha256"), expected_hash);
     const compute = try field(validator, "compute");
     if (compute != .object) return error.InvalidValidatorResult;
-    if (!std.meta.eql(serial_pin, try physical.readFile(ctx.io(), serial, 4 * mib, true)) or
-        !std.meta.eql(identity_pin, try physical.readFile(ctx.io(), identity, mib, false)))
+    if (!std.meta.eql(serial_pin, try physical.readFileCached(ctx.io(), serial, 4 * mib, true, build.knownFiles(ctx.build_context))) or
+        !std.meta.eql(identity_pin, try physical.readFileCached(ctx.io(), identity, mib, false, build.knownFiles(ctx.build_context))))
         return error.ValidatorInputChanged;
     const checked = try checkBoot(ctx, index);
     try publishCheckedMode(ctx, index, checked, compute);
