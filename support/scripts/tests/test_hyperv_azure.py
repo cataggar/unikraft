@@ -3818,6 +3818,11 @@ class HypervWorkflowTest(unittest.TestCase):
             '--expected-archive-sha256 "$ARCHIVE_SHA256"',
             operator,
         )
+        self.assertIn(
+            "python3 -B support/tools/hyperv/direct/tests/historical_owner.py",
+            operator,
+        )
+        self.assertNotIn("support/build/wamr-native-ci/run.py", operator)
 
     def test_producer_dependency_guard_is_failure_aware_and_cancelable(self):
         workflow = (

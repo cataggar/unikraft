@@ -96,6 +96,10 @@ class HistoricalControllerFixture(unittest.TestCase):
             for successors in mapping.values():
                 for description in successors:
                     self.assertIn('test "' + description + '"', text)
+        self.assertNotIn(
+            "support/build/wamr-native-ci/tests/test_adapter.py",
+            (package / ledger.NATIVE_SOURCE).read_text(),
+        )
         inventory = json.loads(
             (package / "authority/goldens/python-scenarios.json").read_bytes())
         adapter = [name for name in inventory["scenarios"]

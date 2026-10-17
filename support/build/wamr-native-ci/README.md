@@ -936,9 +936,8 @@ host test binary directly for diagnostic errors while keeping the original
 gate failed. The host controller fixture omits debug symbols in both modes
 and uses LLVM/LLD in `debug` to stay within the unchanged 16 MiB supervisor
 identity limit. `debug` still enables its normal safety checks and assertions;
-production compiler and linker selection is unchanged. The compatibility
-`tests/source_custody_production_limits.py` launcher invokes only the native
-limit fixture; production `build` uses the installed native controller.
+production compiler and linker selection is unchanged. Production `build` uses
+the installed native controller.
 
 `build --runtime ABS --wamr-source ABS`, `boot --runtime ABS`, and
 `diagnostics --runtime ABS` are available only through the installed
@@ -2152,8 +2151,5 @@ script's frozen ignored-output constants, exact/excess 131,072-entry and
 8-GiB sparse-file limits, exact/excess 8-MiB Git ignored inventories,
 1,024-byte path, 64-component depth and 128-root diagnostic boundaries, and
 adds tracked-source entry, byte, file-size and unsafe-type boundaries. The
-compatibility `tests/source_custody_production_limits.py` entry point remains
-excluded from default discovery but now invokes only that native gate.
-It accepts the existing Zig build cache/system/optimization arguments and
-checks no Python controller constants or inventory. Prefer the direct native
-`test-controller-limits` target for protected CI.
+legacy `tests/source_custody_production_limits.py` launcher is retired;
+protected CI invokes the native `test-controller-limits` target directly.

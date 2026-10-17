@@ -2884,59 +2884,77 @@ test "public validator cache flag is historical import only" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const script =
-        \\import copy, importlib.util, sys
-        \\s=importlib.util.spec_from_file_location("witness",sys.argv[1])
-        \\m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
-        \\e=m.Evidence(); current=e.supervised_binding("public-validator-build")[0]
-        \\q=current["supervisor"]["request"]; q["argv"]=q["argv"][2:]
-        \\q["native_executable"]=copy.deepcopy(q["command_executable"])
-        \\q["timeout_ns"]=1800*1000000000
-        \\q["issued_ns"]=q["primary_deadline_ns"]-q["timeout_ns"]
-        \\current["supervisor"]["result"]["command"]["executable"]=q["native_executable"]["identity"]
-        \\e.rehash_supervised_binding(current)
-        \\old=copy.deepcopy(current); q=old["supervisor"]["request"]
-        \\i=q["argv"].index(m.ci.command_literal("--prefix"))
-        \\q["argv"][i:i]=[m.ci.command_literal("--global-cache-dir"),m.ci.command_path("work","global-cache")]
-        \\q["argv"]=[m.ci.command_literal("-Doptimize=ReleaseSafe") if item==m.ci.command_literal("-Doptimize=safe") else item for item in q["argv"]]
-        \\e.rehash_supervised_binding(old)
-        \\bad=copy.deepcopy(old); q=bad["supervisor"]["request"]
-        \\i=q["argv"].index(m.ci.command_literal("--global-cache-dir"))
-        \\q["argv"][i+1]=m.ci.command_path("work","unbound-cache")
-        \\e.rehash_supervised_binding(bad)
-        \\v3=copy.deepcopy(current); q=v3["supervisor"]["request"]
-        \\q["argv"]=[m.ci.command_literal("-Dcpu=x86_64_v3") if item==m.ci.command_literal("-Dcpu=x86_64_v2") else item for item in q["argv"]]
-        \\e.rehash_supervised_binding(v3)
-        \\v4=copy.deepcopy(current); q=v4["supervisor"]["request"]
-        \\q["argv"]=[m.ci.command_literal("-Dcpu=x86_64_v4") if item==m.ci.command_literal("-Dcpu=x86_64_v2") else item for item in q["argv"]]
-        \\e.rehash_supervised_binding(v4)
-        \\sys.stdout.buffer.write(m.ci.canonical_json({"current":current,"historical":old,"tampered":bad,"v3":v3,"v4":v4}))
-    ;
-    const witness = try std.fs.path.join(a, &.{ options.repository_root, "support/build/wamr-native-ci/tests/test_adapter.py" });
-    const response = try std.process.run(a, std.testing.io, .{
-        .argv = &.{ options.python_executable, "-B", "-c", script, witness },
-        .cwd = .{ .path = options.repository_root },
-        .stdout_limit = .limited(1024 * 1024),
-        .stderr_limit = .limited(4096),
-    });
-    if (response.term != .exited or response.term.exited != 0)
-        std.debug.print("public validator cache witness: {s}\n", .{response.stderr});
-    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, response.term);
-    const values = try std.json.parseFromSliceLeaky(std.json.Value, a, response.stdout, .{ .duplicate_field_behavior = .@"error" });
-    const current = try fixtureCanonical(a, values.object.get("current").?);
+    const historical_fixture = try historicalFixture(a);
+    var current_val = try historicalBinding(a, historical_fixture, "adapter");
+    try current_val.object.put(a, "stage", .{ .string = "public-validator-build" });
+    const supervisor = current_val.object.getPtr("supervisor").?;
+    const request = supervisor.object.getPtr("request").?;
+    const command = supervisor.object.getPtr("result").?.object.getPtr("command").?;
+    try request.object.put(a, "stage", .{ .string = "public-validator-build" });
+    const cmd_exec = request.object.get("command_executable").?;
+    try request.object.put(a, "native_executable", cmd_exec);
+    try command.object.put(a, "executable", cmd_exec.object.get("identity").?);
+    try request.object.put(a, "timeout_ns", .{ .number_string = "1800000000000" });
+    try request.object.put(a, "issued_ns", .{ .number_string = "8200000000000" });
+    const spec = controller.command_plan.spec(.@"public-validator-build");
+    try request.object.put(a, "limits", try std.json.parseFromSliceLeaky(std.json.Value, a, try std.json.Stringify.valueAlloc(a, controller.command_plan.limits(spec), .{}), .{ .parse_numbers = false }));
+    _ = request.object.getPtr("retained_executables").?.array.orderedRemove(0);
+    _ = command.object.getPtr("retained_executables").?.array.orderedRemove(0);
+    const expected_env = try controller.command_plan.environment(a, .@"public-validator-build");
+    defer controller.command_plan.freeEnvironment(a, expected_env);
+    var env_array = std.json.Value{ .array = std.array_list.Managed(std.json.Value).init(a) };
+    for (expected_env) |entry| {
+        const val_raw = switch (entry.value) {
+            .literal => |lit| try std.json.Stringify.valueAlloc(a, .{ .kind = "literal", .value = lit }, .{}),
+            .path => |p| try std.json.Stringify.valueAlloc(a, .{ .kind = "path", .role = p.role, .relative = p.relative }, .{}),
+        };
+        var env_obj = std.json.Value{ .object = .empty };
+        try env_obj.object.put(a, "name", .{ .string = entry.name });
+        try env_obj.object.put(a, "value", try std.json.parseFromSliceLeaky(std.json.Value, a, val_raw, .{ .parse_numbers = false }));
+        try env_array.array.append(env_obj);
+    }
+    try request.object.put(a, "environment", env_array);
+    var argv_array = std.json.Value{ .array = std.array_list.Managed(std.json.Value).init(a) };
+    for (spec.argv) |item| {
+        const item_raw = switch (item) {
+            .literal => |lit| try std.json.Stringify.valueAlloc(a, .{ .kind = "literal", .value = lit }, .{}),
+            .path => |p| try std.json.Stringify.valueAlloc(a, .{ .kind = "path", .role = p.role, .relative = p.relative }, .{}),
+        };
+        try argv_array.array.append(try std.json.parseFromSliceLeaky(std.json.Value, a, item_raw, .{ .parse_numbers = false }));
+    }
+    try request.object.put(a, "argv", argv_array);
+    const current = try rehashCommandRecord(a, &current_val);
     _ = try controller.accepted_run.validateCommandBinding(a, current, .@"public-validator-build", .local_runtime);
     _ = try controller.accepted_run.validateCommandBindingForBaseline(a, current, .@"public-validator-build", .local_runtime, .x86_64_v2);
     try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBindingForBaseline(a, current, .@"public-validator-build", .local_runtime, .x86_64_v3));
-    const v3_record = try fixtureCanonical(a, values.object.get("v3").?);
+
+    var v3_val = try std.json.parseFromSliceLeaky(std.json.Value, a, current, .{ .parse_numbers = false });
+    v3_val.object.getPtr("supervisor").?.object.getPtr("request").?.object.getPtr("argv").?.array.items[9] =
+        try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"kind\":\"literal\",\"value\":\"-Dcpu=x86_64_v3\"}", .{});
+    const v3_record = try rehashCommandRecord(a, &v3_val);
     _ = try controller.accepted_run.validateCommandBindingForBaseline(a, v3_record, .@"public-validator-build", .local_runtime, .x86_64_v3);
     try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBindingForBaseline(a, v3_record, .@"public-validator-build", .local_runtime, .x86_64_v2));
-    const v4_record = try fixtureCanonical(a, values.object.get("v4").?);
+
+    var v4_val = try std.json.parseFromSliceLeaky(std.json.Value, a, current, .{ .parse_numbers = false });
+    v4_val.object.getPtr("supervisor").?.object.getPtr("request").?.object.getPtr("argv").?.array.items[9] =
+        try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"kind\":\"literal\",\"value\":\"-Dcpu=x86_64_v4\"}", .{});
+    const v4_record = try rehashCommandRecord(a, &v4_val);
     try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBindingForBaseline(a, v4_record, .@"public-validator-build", .local_runtime, .x86_64_v2));
     try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBindingForBaseline(a, v4_record, .@"public-validator-build", .local_runtime, .x86_64_v3));
-    const historical = try fixtureCanonical(a, values.object.get("historical").?);
+
+    var old_val = try std.json.parseFromSliceLeaky(std.json.Value, a, current, .{ .parse_numbers = false });
+    const old_argv = &old_val.object.getPtr("supervisor").?.object.getPtr("request").?.object.getPtr("argv").?.array;
+    try old_argv.insert(6, try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"kind\":\"literal\",\"value\":\"--global-cache-dir\"}", .{}));
+    try old_argv.insert(7, try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"kind\":\"path\",\"role\":\"work\",\"relative\":\"global-cache\"}", .{}));
+    old_argv.items[12] = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"kind\":\"literal\",\"value\":\"-Doptimize=ReleaseSafe\"}", .{});
+    const historical = try rehashCommandRecord(a, &old_val);
     _ = try controller.accepted_run.validateCommandBinding(a, historical, .@"public-validator-build", .trusted_inner_zip);
     try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBinding(a, historical, .@"public-validator-build", .local_runtime));
-    const tampered = try fixtureCanonical(a, values.object.get("tampered").?);
+
+    var bad_val = try std.json.parseFromSliceLeaky(std.json.Value, a, historical, .{ .parse_numbers = false });
+    bad_val.object.getPtr("supervisor").?.object.getPtr("request").?.object.getPtr("argv").?.array.items[7] =
+        try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"kind\":\"path\",\"role\":\"work\",\"relative\":\"unbound-cache\"}", .{});
+    const tampered = try rehashCommandRecord(a, &bad_val);
     try std.testing.expectError(error.InvalidCommand, controller.accepted_run.validateCommandBinding(a, tampered, .@"public-validator-build", .trusted_inner_zip));
 }
 

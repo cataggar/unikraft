@@ -99,16 +99,8 @@ zig build --build-file support/build/wamr-native-ci/build.zig \
   -Dtest-root="$PWD/.d/wamr-direct/package-fixtures" \
   -Doptimize=safe -j2 test install
 SUPERVISOR_SOURCE_SHA256="$(
-  python3 - <<'PY'
-import importlib.util
-from pathlib import Path
-
-path = Path("support/build/wamr-native-ci/run.py").resolve()
-spec = importlib.util.spec_from_file_location("wamr_native_ci", path)
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-print(module.supervisor_source_map()["content_closure_sha256"])
-PY
+  python3 -B support/tools/hyperv/direct/tests/historical_owner.py \
+    --git "$(command -v git)"
 )"
 zig build --build-file support/build/wamr-native-ci/supervisor.build.zig \
   --system "$PWD/.d/wamr-direct/restore/zig-pkg" \
