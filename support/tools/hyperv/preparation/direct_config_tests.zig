@@ -314,3 +314,87 @@ test "direct output validation binds separate shape-only controls and refuses dr
     try changed.writePositionalAll(io, "!", 0);
     try std.testing.expectError(error.HashMismatch, dc.Test.validateFiles(a, io, fixture.directory, record, true));
 }
+
+test "direct authoritative config and purpose dispatch enforce solved direct persistence posture" {
+    const solved_meta =
+        metadata_text ++
+        "symbol\tARCH_X86_64\tbool\n" ++
+        "symbol\tPLAT_HYPERV\tbool\n" ++
+        "symbol\tARCH_ARM_64\tbool\n" ++
+        "symbol\tARCH_ARM\tbool\n" ++
+        "symbol\tARCH_X86_32\tbool\n" ++
+        "symbol\tPLAT_KVM\tbool\n" ++
+        "symbol\tPLAT_XEN\tbool\n" ++
+        "symbol\tPLAT_LINUXU\tbool\n";
+
+    const direct_fragment = try config.renderDirectPersistence(a, guard);
+    defer a.free(direct_fragment);
+    const solved_direct = try std.fmt.allocPrint(a, "{s}CONFIG_ARCH_X86_64=y\nCONFIG_PLAT_HYPERV=y\n", .{direct_fragment});
+    defer a.free(solved_direct);
+
+    try prep.inputs.validateDirectAuthoritativeConfig(a, solved_direct, solved_meta, guard);
+    try prep.inputs.validateAuthoritativeConfigForPurpose(a, solved_direct, solved_meta, guard, .persistence);
+    try std.testing.expectError(
+        error.InvalidGuardProfile,
+        prep.inputs.validateAuthoritativeConfigForPurpose(a, solved_direct, solved_meta, guard, .synthetic),
+    );
+    try std.testing.expectError(
+        error.InvalidGuardProfile,
+        prep.inputs.validateAuthoritativeConfigForPurpose(a, solved_direct, solved_meta, guard, .platform_preflight),
+    );
+
+    const seed_fragment = try config.render(a, guard);
+    defer a.free(seed_fragment);
+    const solved_seed = try std.fmt.allocPrint(a, "{s}CONFIG_ARCH_X86_64=y\nCONFIG_PLAT_HYPERV=y\nCONFIG_UKPLAT_CPU_MAXCOUNT=1\n", .{seed_fragment});
+    defer a.free(solved_seed);
+
+    try prep.inputs.validateAuthoritativeConfigForPurpose(a, solved_seed, solved_meta, guard, .synthetic);
+    try prep.inputs.validateAuthoritativeConfigForPurpose(a, solved_seed, solved_meta, guard, .platform_preflight);
+    try std.testing.expectError(
+        error.InvalidGuardProfile,
+        prep.inputs.validateDirectAuthoritativeConfig(a, solved_seed, solved_meta, guard),
+    );
+    try std.testing.expectError(
+        error.InvalidGuardProfile,
+        prep.inputs.validateAuthoritativeConfigForPurpose(a, solved_seed, solved_meta, guard, .persistence),
+    );
+
+    const bad_cpu = try std.mem.replaceOwned(u8, a, solved_direct, "CONFIG_UKPLAT_CPU_MAXCOUNT=1\n", "CONFIG_UKPLAT_CPU_MAXCOUNT=2\n");
+    defer a.free(bad_cpu);
+    try std.testing.expectError(
+        error.InvalidGuardProfile,
+        prep.inputs.validateDirectAuthoritativeConfig(a, bad_cpu, solved_meta, guard),
+    );
+
+    var same_ids = guard;
+    same_ids.disk_id = same_ids.run_id;
+    try std.testing.expectError(
+        error.IdentityCollision,
+        prep.inputs.validateDirectAuthoritativeConfig(a, solved_direct, solved_meta, same_ids),
+    );
+
+    for ([_][]const u8{
+        "CONFIG_ARCH_ARM_64=y\n",
+        "CONFIG_PLAT_KVM=y\n",
+    }) |forbidden| {
+        const bad_platform = try std.fmt.allocPrint(a, "{s}{s}", .{ solved_direct, forbidden });
+        defer a.free(bad_platform);
+        try std.testing.expectError(
+            error.InvalidSelection,
+            prep.inputs.validateDirectAuthoritativeConfig(a, bad_platform, solved_meta, guard),
+        );
+    }
+
+    try std.testing.expectError(
+        error.InvalidSelection,
+        prep.inputs.validateDirectAuthoritativeConfig(a, direct_fragment, solved_meta, guard),
+    );
+
+    const undeclared = try std.fmt.allocPrint(a, "{s}CONFIG_UNDECLARED_SYMBOL=y\n", .{solved_direct});
+    defer a.free(undeclared);
+    try std.testing.expectError(
+        error.IncompleteMetadata,
+        prep.inputs.validateDirectAuthoritativeConfig(a, undeclared, solved_meta, guard),
+    );
+}
+

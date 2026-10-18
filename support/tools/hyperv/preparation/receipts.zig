@@ -229,7 +229,11 @@ pub const Context = struct {
         try fs.requireFile(try input.record(self.allocator, self.io, expected.path, config.config_cap, .private), expected);
         const bytes = try input.read(self.allocator, self.io, expected.path, config.config_cap, .private);
         defer self.allocator.free(bytes);
-        try config.validateWithMetadata(self.allocator, bytes, self.guard, metadata);
+        if (self.purpose == .persistence) {
+            try config.validateDirectPersistenceWithMetadata(self.allocator, bytes, self.guard, metadata);
+        } else {
+            try config.validateWithMetadata(self.allocator, bytes, self.guard, metadata);
+        }
         const receipt: Receipt = .{
             .schema = .hyperv_artifact_preparation_native_v2,
             .phase = .prepared,
@@ -299,7 +303,7 @@ pub const Context = struct {
         if (!inspected.succeeded()) return error.ProducerFailed;
         const metadata_bytes = try inputs.workspace.output.read(self.allocator, self.io, "native-config/metadata.tsv", config.config_cap, .artifact);
         defer self.allocator.free(metadata_bytes);
-        try @import("inputs.zig").validateAuthoritativeConfig(self.allocator, bytes, metadata_bytes, self.guard);
+        try @import("inputs.zig").validateAuthoritativeConfigForPurpose(self.allocator, bytes, metadata_bytes, self.guard, self.purpose);
         try source.require(after, try self.verify());
         var receipt = parent.receipt;
         receipt.phase = if (step == .configure) .configured else .built;
