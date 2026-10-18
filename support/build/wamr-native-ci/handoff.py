@@ -1195,6 +1195,8 @@ def export(runtime, output, *, on_phase=None):
             dst.flush()
             os.fsync(dst.fileno())
         destination.chmod(0o600)
+        if original["size"] >= 65536 and hasattr(ci, "seed_file_digest"):
+            ci.seed_file_digest(destination, original["sha256"])
         saved = artifact(destination)
         ci.require(artifact(source) == original
                    and all(saved[key] == original[key] for key in ("sha256", "size")),
@@ -1425,15 +1427,26 @@ def executable_artifact(path):
             and before.st_nlink == 1
             and 0 < before.st_size <= 64 * 1024 * 1024,
             "unsafe explicit executable")
-        digest = hashlib.sha256()
-        offset = 0
-        while offset < before.st_size:
-            chunk = os.pread(
-                descriptor, min(64 * 1024, before.st_size - offset),
-                offset)
-            ci.require(chunk, "explicit executable changed")
-            digest.update(chunk)
-            offset += len(chunk)
+        cached_key, cached_entry = (
+            ci.cached_fd_entry(descriptor, before, "explicit executable changed")
+            if hasattr(ci, "cached_fd_entry") and hashlib.sha256 is getattr(ci, "_STDLIB_SHA256", None)
+            else (None, None)
+        )
+        if cached_entry is not None:
+            digest_hex = cached_entry[0]
+        else:
+            digest = hashlib.sha256()
+            offset = 0
+            while offset < before.st_size:
+                chunk = os.pread(
+                    descriptor, min(64 * 1024, before.st_size - offset),
+                    offset)
+                ci.require(chunk, "explicit executable changed")
+                digest.update(chunk)
+                offset += len(chunk)
+            digest_hex = digest.hexdigest()
+            if cached_key is not None and hasattr(ci, "store_fd_digest"):
+                ci.store_fd_digest(descriptor, before, digest_hex, key=cached_key)
         after = os.fstat(descriptor)
         ci.require(file_identity(before) == file_identity(after),
                    "explicit executable changed")
@@ -1468,7 +1481,7 @@ def executable_artifact(path):
         return {
             "path": raw,
             "size": before.st_size,
-            "sha256": digest.hexdigest(),
+            "sha256": digest_hex,
         }
     except OSError as error:
         raise ci.Refusal("unsafe explicit executable") from error

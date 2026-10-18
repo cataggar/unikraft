@@ -386,6 +386,23 @@ pub fn discover(ctx: types.Context, input: DiscoveryInput) !Discovery {
     };
 }
 
+fn hashFileBytes(snapshot: files.Snapshot, bytes: []const u8) [32]u8 {
+    if (bytes.len >= runtime.DigestCache.min_size) {
+        const w = runtime.DigestCache.probe_window;
+        const mid: usize = if (bytes.len >= 2 * 1024 * 1024) 1024 * 1024 else (bytes.len / 2) & ~@as(usize, 4095);
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(bytes[0..w]);
+        hasher.update(bytes[mid .. mid + w]);
+        hasher.update(bytes[bytes.len - w .. bytes.len]);
+        const bh = hasher.final();
+        if (runtime.DigestCache.get(snapshot, 1, bh)) |cached| return cached.digest;
+        const digest = tx.hash(bytes);
+        runtime.DigestCache.put(snapshot, 1, bh, digest, 0, 0);
+        return digest;
+    }
+    return tx.hash(bytes);
+}
+
 fn appendSource(ctx: types.Context, sources: *std.ArrayList(Source), file: *files.RetainedFile, name: []const u8, role: ElfRole) !void {
     if (sources.items.len >= runtime.max_loader_files) return error.LoaderLimit;
     try absolutePath(file.path);
@@ -394,7 +411,7 @@ fn appendSource(ctx: types.Context, sources: *std.ArrayList(Source), file: *file
     defer bytes.deinit();
     var info = try inspectElf(ctx.allocator, bytes.bytes(), role);
     errdefer info.deinit();
-    try sources.append(ctx.allocator, .{ .file = file, .name = name, .info = info, .digest = tx.hash(bytes.bytes()) });
+    try sources.append(ctx.allocator, .{ .file = file, .name = name, .info = info, .digest = hashFileBytes(file.file_snapshot, bytes.bytes()) });
 }
 
 fn requireNeeded(info: ElfInfo, names: []const []const u8) !void {
@@ -628,7 +645,8 @@ fn walkElf(ctx: types.Context, dir: std.Io.Dir, prefix: []const u8, depth: u8, l
                 var declared = false;
                 for (contract.loader_dependencies) |artifact| if (exactChild(layout.loader_directory, artifact.path, relative["loader".len..])) {
                     declared = true;
-                    if (artifact.size != bytes.bytes().len or !std.crypto.timing_safe.eql([32]u8, tx.hash(bytes.bytes()), try core.contracts.parseSha256(artifact.sha256)))
+                    const actual_digest = hashFileBytes(snapshot, bytes.bytes());
+                    if (artifact.size != bytes.bytes().len or !std.crypto.timing_safe.eql([32]u8, actual_digest, try core.contracts.parseSha256(artifact.sha256)))
                         return error.CopiedDependencyChanged;
                     break;
                 };

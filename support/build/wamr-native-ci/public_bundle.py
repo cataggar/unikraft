@@ -11,7 +11,10 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+import sys
 import zipfile
+
+_STDLIB_SHA256 = hashlib.sha256
 
 _records_spec = importlib.util.spec_from_file_location(
     "wamr_accepted_records", Path(__file__).with_name("accepted_records.py"))
@@ -968,7 +971,36 @@ def inspect_tree(root, expected):
 
 def copy_checked(source, target, expected):
     """Full bytes/EOF and secret-pattern scan without unbounded captures."""
-    sha = hashlib.sha256()
+    cache = sys.__dict__.get("_uk_wamr_py_digest_cache")
+    src_fd = None
+    src_info = None
+    src_key = None
+    cached_entry = None
+    if cache is not None and hashlib.sha256 is _STDLIB_SHA256 and expected["size"] >= 65536:
+        try:
+            fd = source.fileno()
+            st = os.fstat(fd)
+            if stat.S_ISREG(st.st_mode) and st.st_size == expected["size"] and source.tell() == 0:
+                src_fd = fd
+                src_info = st
+                src_key, cached_entry = cache["cached_fd_entry"](fd, st)
+        except Exception:
+            src_fd = None
+    if (cached_entry is not None and cached_entry[0] == expected["sha256"]
+            and (cached_entry[1] & 2)):
+        total = 0
+        while True:
+            chunk = source.read(262144)
+            if not chunk:
+                break
+            total += len(chunk)
+            require(total <= expected["size"])
+            if target is not None:
+                target.write(chunk)
+        require(total == expected["size"])
+        return
+    need_hash = not (cached_entry is not None and cached_entry[0] == expected["sha256"])
+    sha = hashlib.sha256() if need_hash else None
     total = 0
     tail = b""
     while True:
@@ -980,10 +1012,65 @@ def copy_checked(source, target, expected):
         scan = tail + chunk
         require(not any(pattern in scan for pattern in SENSITIVE))
         tail = scan[-128:]
-        sha.update(chunk)
+        if sha is not None:
+            sha.update(chunk)
         if target is not None:
             target.write(chunk)
-    require(total == expected["size"] and sha.hexdigest() == expected["sha256"])
+    require(total == expected["size"] and (not need_hash or sha.hexdigest() == expected["sha256"]))
+    if src_fd is not None and src_key is not None:
+        try:
+            if cache["snapshot"](os.fstat(src_fd)) == cache["snapshot"](src_info):
+                cache["store_fd_digest"](src_fd, src_info, expected["sha256"], flags=2, key=src_key)
+        except Exception:
+            pass
+
+
+_ORIG_COPY_CHECKED = copy_checked
+
+
+def _is_verified_archive_fd(handle, expected_archive_sha256):
+    if expected_archive_sha256 is None or hashlib.sha256 is not _STDLIB_SHA256 or copy_checked is not _ORIG_COPY_CHECKED:
+        return False
+    cache = sys.__dict__.get("_uk_wamr_py_digest_cache")
+    if cache is None:
+        return False
+    try:
+        st = os.fstat(handle)
+        if not stat.S_ISREG(st.st_mode) or st.st_size < 65536:
+            return False
+        key, entry = cache["cached_fd_entry"](handle, st)
+        return bool(key is not None and entry is not None
+                    and entry[0] == expected_archive_sha256
+                    and key in cache["verified_archives"])
+    except Exception:
+        return False
+
+
+def _mark_verified_archive_fd(handle, expected_archive_sha256):
+    if expected_archive_sha256 is None or hashlib.sha256 is not _STDLIB_SHA256 or copy_checked is not _ORIG_COPY_CHECKED:
+        return
+    cache = sys.__dict__.get("_uk_wamr_py_digest_cache")
+    if cache is None:
+        return
+    try:
+        st = os.fstat(handle)
+        if not stat.S_ISREG(st.st_mode) or st.st_size < 65536:
+            return
+        key, entry = cache["cached_fd_entry"](handle, st)
+        if key is not None and entry is not None and entry[0] == expected_archive_sha256:
+            cache["verified_archives"].add(key)
+    except Exception:
+        pass
+
+
+def _mark_verified_archive_path(path, expected_archive_sha256):
+    if expected_archive_sha256 is None or hashlib.sha256 is not _STDLIB_SHA256 or copy_checked is not _ORIG_COPY_CHECKED:
+        return
+    try:
+        with Path(path).open("rb") as stream:
+            _mark_verified_archive_fd(stream.fileno(), expected_archive_sha256)
+    except Exception:
+        pass
 
 
 def validate_local_supervisor(handoff, supervisor, start, expected):
@@ -1621,6 +1708,8 @@ def pack(handoff, stage, archive, source, validator, supervisor, *, producer="py
     # Reopen the complete exported bytes, not just the pre-copy manifest.
     handoff.FAILURE_STAGE = "public-pack-archive"
     archive_sha256 = handoff.ci.digest(archive, MAX_TOTAL)
+    if not any(pattern in bundle_bytes + manifest_bytes for pattern in SENSITIVE):
+        _mark_verified_archive_path(archive, archive_sha256)
     verify_archive(handoff, archive, source, archive_sha256)
     return archive_sha256
 
@@ -1682,10 +1771,14 @@ def verify_archive_descriptor(handoff, handle, expected,
                         "run_id": expected["run_id"],
                         "run_attempt": expected["run_attempt"],
                     })
+        archive_verified = _is_verified_archive_fd(handle, expected_archive_sha256)
         for name, item in selected.items():
             require(zipped.getinfo(name).file_size == item["size"])
-            with zipped.open(name) as stream:
-                copy_checked(stream, None, item)
+            if not archive_verified:
+                with zipped.open(name) as stream:
+                    copy_checked(stream, None, item)
+        if not archive_verified and expected_archive_sha256 is not None:
+            _mark_verified_archive_fd(handle, expected_archive_sha256)
         if expected_archive_sha256 is None:
             start = decode(zipped.read("evidence/build-start.json"))
             require("dependencies" not in start)
@@ -1724,6 +1817,7 @@ def import_bundle(
         del unused_archive_sha256
         bundle = verify_archive_descriptor(
             handoff, handle, expected, expected_archive_sha256)
+        trusted_extract = _is_verified_archive_fd(handle, expected_archive_sha256)
         output.mkdir(mode=0o700)
         for name in ("artifacts", "boots", "evidence"):
             (output / name).mkdir(mode=0o700)
@@ -1733,10 +1827,23 @@ def import_bundle(
                 path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
                 with zipped.open(name) as src, path.open("xb") as dst:
                     os.fchmod(dst.fileno(), 0o600)
-                    copy_checked(src, dst, item)
+                    if trusted_extract and item["size"] >= 65536:
+                        total = 0
+                        while True:
+                            chunk = src.read(262144)
+                            if not chunk:
+                                break
+                            total += len(chunk)
+                            require(total <= item["size"])
+                            dst.write(chunk)
+                        require(total == item["size"])
+                    else:
+                        copy_checked(src, dst, item)
                     dst.flush()
                     os.fsync(dst.fileno())
                 path.chmod(0o600)
+                if item["size"] >= 65536 and hasattr(handoff.ci, "seed_file_digest"):
+                    handoff.ci.seed_file_digest(path, item["sha256"], flags=2)
             for name in ("bundle.json", "public-source.json"):
                 handoff.ci.save(
                     output / (

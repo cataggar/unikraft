@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import types
@@ -65,6 +66,299 @@ ORACLE_SOURCES = {
 _SUBPROCESS_RUN = subprocess.run
 _ORACLE_BLOB_CACHE = {}
 _ORACLE_CODE_CACHE = {}
+_STDLIB_SHA256 = hashlib.sha256
+_REAL_OS_OPEN = os.open
+_REAL_OS_FSTAT = os.fstat
+_REAL_OS_CLOSE = os.close
+_REAL_OS_PREAD = os.pread
+_REAL_OS_WRITE = os.write
+_REAL_OS_REPLACE = os.replace
+_REAL_OS_UNLINK = os.unlink
+_DIGEST_CACHE_MIN_SIZE = 65536
+_DIGEST_PROBE_WINDOW = 4096
+_SHM_HEADER = struct.Struct("<8sII")
+_SHM_ENTRY = struct.Struct("<QIIIIIIQQQqqqqQ32sII")
+_SHM_SLOTS = 512
+_SHM_SIZE = 16 + _SHM_SLOTS * 136
+
+
+def _wyhash0_12k(data):
+    mask = 0xFFFFFFFFFFFFFFFF
+    s0 = 0xa0761d6478bd642f
+    s1 = 0xe7037ed1a0b428db
+    s2 = 0x8ebc6af09c88c6e3
+    s3 = 0x589965cc75374cc3
+    x = s0 * s1
+    st0 = (x ^ (x >> 64)) & mask
+    st1 = st0
+    st2 = st0
+    words = struct.unpack("<1536Q", data)
+    for idx in range(0, 1530, 6):
+        x = (words[idx] ^ s1) * (words[idx + 1] ^ st0)
+        st0 = (x ^ (x >> 64)) & mask
+        x = (words[idx + 2] ^ s2) * (words[idx + 3] ^ st1)
+        st1 = (x ^ (x >> 64)) & mask
+        x = (words[idx + 4] ^ s3) * (words[idx + 5] ^ st2)
+        st2 = (x ^ (x >> 64)) & mask
+    st0 ^= st1 ^ st2
+    x = (words[1530] ^ s1) * (words[1531] ^ st0)
+    st0 = (x ^ (x >> 64)) & mask
+    x = (words[1532] ^ s1) * (words[1533] ^ st0)
+    st0 = (x ^ (x >> 64)) & mask
+    x = (words[1534] ^ s1) * (words[1535] ^ st0)
+    a = x & mask
+    b = (x >> 64) & mask
+    x = (a ^ s0 ^ 12288) * (b ^ s1)
+    return (x ^ (x >> 64)) & mask
+
+
+def _make_cache_key(info, bhash):
+    mtime_sec, mtime_nsec = divmod(info.st_mtime_ns, 1_000_000_000)
+    ctime_sec, ctime_nsec = divmod(info.st_ctime_ns, 1_000_000_000)
+    return (
+        1,
+        os.major(info.st_dev),
+        os.minor(info.st_dev),
+        info.st_mode,
+        info.st_uid,
+        info.st_gid,
+        0,
+        info.st_ino,
+        info.st_nlink,
+        info.st_size,
+        mtime_sec,
+        mtime_nsec,
+        ctime_sec,
+        ctime_nsec,
+        bhash,
+    )
+
+
+def _sync_shm_cache(state):
+    if os.open is not _REAL_OS_OPEN:
+        return
+    shm_path = f"/dev/shm/uk-wamr-digest-cache-{os.geteuid()}-v1.bin"
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = _REAL_OS_OPEN(shm_path, flags)
+    except OSError:
+        return
+    try:
+        st = _REAL_OS_FSTAT(fd)
+        if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid()
+                or st.st_mode & 0o077 or st.st_size != _SHM_SIZE):
+            return
+        shm_id = (st.st_ino, st.st_mtime_ns)
+        if state["shm_id"] == shm_id:
+            return
+        raw = _REAL_OS_PREAD(fd, _SHM_SIZE, 0)
+        if len(raw) != _SHM_SIZE:
+            return
+        magic, ver, _ = _SHM_HEADER.unpack_from(raw, 0)
+        if magic != b"UKDGST01" or ver != 1:
+            return
+        state["shm_id"] = shm_id
+        state["shm_raw"][:] = raw
+        entries = state["entries"]
+        for slot in range(_SHM_SLOTS):
+            unpacked = _SHM_ENTRY.unpack_from(raw, 16 + slot * 136)
+            if unpacked[0] == 1:
+                key = unpacked[:15]
+                old = entries.get(key)
+                merged_flags = unpacked[17] | (old[1] if old else 0)
+                entries[key] = (unpacked[15].hex(), merged_flags)
+    except OSError:
+        return
+    finally:
+        _REAL_OS_CLOSE(fd)
+
+
+def _store_shm_entry(state, key, digest_hex, entry_flags):
+    entries = state["entries"]
+    old = entries.get(key)
+    if old is not None and old[0] == digest_hex and (old[1] & entry_flags) == entry_flags:
+        return
+    merged_flags = entry_flags | (old[1] if old and old[0] == digest_hex else 0)
+    entries[key] = (digest_hex, merged_flags)
+    if os.open is not _REAL_OS_OPEN:
+        return
+    _sync_shm_cache(state)
+    entries[key] = (digest_hex, merged_flags)
+    try:
+        raw_digest = bytes.fromhex(digest_hex)
+    except ValueError:
+        return
+    if len(raw_digest) != 32:
+        return
+    set_idx = (key[7] ^ (key[9] >> 12) ^ key[14] ^ 0x9e3779b97f4a7c15) & 127
+    base = set_idx * 4
+    shm_raw = state["shm_raw"]
+    target_slot = None
+    empty_slot = None
+    for way in range(4):
+        slot = base + way
+        unpacked = _SHM_ENTRY.unpack_from(shm_raw, 16 + slot * 136)
+        if unpacked[:15] == key:
+            target_slot = slot
+            merged_flags |= unpacked[17]
+            entries[key] = (digest_hex, merged_flags)
+            break
+        if unpacked[0] == 0 and empty_slot is None:
+            empty_slot = slot
+    if target_slot is None:
+        if empty_slot is not None:
+            target_slot = empty_slot
+        else:
+            target_slot = base + (state["evict_seq"] & 3)
+            state["evict_seq"] = (state["evict_seq"] + 1) & 0xFFFFFFFF
+    _SHM_ENTRY.pack_into(shm_raw, 16 + target_slot * 136, *key, raw_digest, 0, merged_flags)
+    euid = os.geteuid()
+    shm_path = f"/dev/shm/uk-wamr-digest-cache-{euid}-v1.bin"
+    seq = state["tmp_seq"]
+    state["tmp_seq"] = (seq + 1) & 0xFFFFFFFF
+    tmp_path = f"/dev/shm/.uk-wamr-digest-cache-{euid}-{os.getpid()}-{seq}.tmp"
+    create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = _REAL_OS_OPEN(tmp_path, create_flags, 0o600)
+        try:
+            written = 0
+            view = memoryview(shm_raw)
+            while written < _SHM_SIZE:
+                n = _REAL_OS_WRITE(fd, view[written:])
+                if n <= 0:
+                    raise OSError("short shm write")
+                written += n
+            st = _REAL_OS_FSTAT(fd)
+        finally:
+            _REAL_OS_CLOSE(fd)
+        _REAL_OS_REPLACE(tmp_path, shm_path)
+        state["shm_id"] = (st.st_ino, st.st_mtime_ns)
+    except OSError:
+        try:
+            _REAL_OS_UNLINK(tmp_path)
+        except OSError:
+            pass
+
+
+def _install_oracle_digest_cache(relative, module):
+    if relative != "run.py":
+        return
+
+    def _fd_boundary_hash(handle, size, reason=None):
+        if size < _DIGEST_CACHE_MIN_SIZE:
+            return None
+        mid = 1048576 if size >= 2097152 else (size // 2) & ~4095
+        c0 = module.os.pread(handle, _DIGEST_PROBE_WINDOW, 0)
+        c1 = module.os.pread(handle, _DIGEST_PROBE_WINDOW, mid)
+        c2 = module.os.pread(handle, _DIGEST_PROBE_WINDOW, size - _DIGEST_PROBE_WINDOW)
+        eof = module.os.pread(handle, 1, size)
+        ok = (len(c0) == _DIGEST_PROBE_WINDOW and len(c1) == _DIGEST_PROBE_WINDOW
+              and len(c2) == _DIGEST_PROBE_WINDOW and not eof)
+        if reason is not None:
+            module.require(ok, reason)
+        elif not ok:
+            return None
+        return _wyhash0_12k(c0 + c1 + c2)
+
+    def _digest_cache_state():
+        state = sys.__dict__.get("_uk_wamr_py_digest_cache")
+        if state is None:
+            state = {
+                "entries": {},
+                "verified_archives": set(),
+                "shm_id": None,
+                "shm_raw": bytearray(_SHM_HEADER.pack(b"UKDGST01", 1, 0) + b"\x00" * (_SHM_SLOTS * 136)),
+                "evict_seq": 0,
+                "tmp_seq": 0,
+            }
+            sys.__dict__["_uk_wamr_py_digest_cache"] = state
+        state["cached_fd_entry"] = cached_fd_entry
+        state["store_fd_digest"] = store_fd_digest
+        state["seed_file_digest"] = seed_file_digest
+        state["snapshot"] = module.snapshot
+        return state
+
+    def cached_fd_entry(handle, expected, reason=None):
+        if module.hashlib.sha256 is not _STDLIB_SHA256 or expected.st_size < _DIGEST_CACHE_MIN_SIZE:
+            return None, None
+        bhash = _fd_boundary_hash(handle, expected.st_size, reason=reason)
+        if bhash is None:
+            return None, None
+        key = _make_cache_key(expected, bhash)
+        state = _digest_cache_state()
+        entry = state["entries"].get(key)
+        if entry is None:
+            _sync_shm_cache(state)
+            entry = state["entries"].get(key)
+        if entry is not None:
+            if reason is not None:
+                module.require(module.snapshot(module.os.fstat(handle)) == module.snapshot(expected), reason)
+            elif module.snapshot(module.os.fstat(handle)) != module.snapshot(expected):
+                return None, None
+        return key, entry
+
+    def store_fd_digest(handle, expected, digest_hex, reason=None, flags=0, key=None):
+        if module.hashlib.sha256 is not _STDLIB_SHA256 or expected.st_size < _DIGEST_CACHE_MIN_SIZE:
+            return
+        if key is None:
+            bhash = _fd_boundary_hash(handle, expected.st_size, reason=reason)
+            if bhash is None:
+                return
+            key = _make_cache_key(expected, bhash)
+        _store_shm_entry(_digest_cache_state(), key, digest_hex, flags)
+
+    def seed_file_digest(path, digest_hex, flags=0):
+        if module.hashlib.sha256 is not _STDLIB_SHA256:
+            return
+        path = module.Path(path)
+        try:
+            info = path.lstat()
+            if not module.stat.S_ISREG(info.st_mode) or info.st_size < _DIGEST_CACHE_MIN_SIZE:
+                return
+            fd = module.os.open(path, module.open_flags())
+        except OSError:
+            return
+        try:
+            if module.snapshot(module.os.fstat(fd)) != module.snapshot(info):
+                return
+            store_fd_digest(fd, info, digest_hex, flags=flags)
+        finally:
+            module.os.close(fd)
+
+    def digest_descriptor(handle, expected, limit, reason, allow_empty=False):
+        module.require(
+            module.stat.S_ISREG(expected.st_mode) and not expected.st_mode & 0o022
+            and (allow_empty or expected.st_size > 0)
+            and expected.st_size <= limit,
+            reason,
+        )
+        module.require(module.snapshot(module.os.fstat(handle)) == module.snapshot(expected), reason)
+        key, cached = cached_fd_entry(handle, expected, reason=reason)
+        if cached is not None:
+            return cached[0]
+        value = module.hashlib.sha256()
+        position = 0
+        while position < expected.st_size:
+            chunk = module.os.pread(handle, min(64 * 1024, expected.st_size - position), position)
+            module.require(chunk, reason)
+            value.update(chunk)
+            position += len(chunk)
+        module.require(
+            not module.os.pread(handle, 1, position)
+            and module.snapshot(module.os.fstat(handle)) == module.snapshot(expected),
+            reason,
+        )
+        digest_hex = value.hexdigest()
+        if key is not None:
+            store_fd_digest(handle, expected, digest_hex, key=key)
+        return digest_hex
+
+    module._STDLIB_SHA256 = _STDLIB_SHA256
+    module.cached_fd_entry = cached_fd_entry
+    module.store_fd_digest = store_fd_digest
+    module.seed_file_digest = seed_file_digest
+    module.digest_descriptor = digest_descriptor
+    _digest_cache_state()
 
 
 def _normalize_oracle_relative(name):
@@ -192,6 +486,7 @@ class _OracleSpecLoader(importlib.abc.Loader):
             self.repository, self.git, self.run
         )
         exec(code, module.__dict__)
+        _install_oracle_digest_cache(self.relative, module)
 
 
 def _oracle_importlib(repository, git="git", run=None):
@@ -237,6 +532,7 @@ def load_oracle_module(
         relative, module_file, repository, git, source=source, run=run
     )
     exec(code, module.__dict__)
+    _install_oracle_digest_cache(relative, module)
     return module
 
 

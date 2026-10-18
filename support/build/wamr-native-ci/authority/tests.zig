@@ -38,7 +38,11 @@ test "Python authority golden is canonical and matches native literal tables" {
 fn consumeGolden(bytes: []const u8) !void {
     var document = try contracts.parseCanonical(std.testing.allocator, bytes);
     defer document.deinit();
-    const root = try c.exactFields(document.value(), &golden_fields.root);
+    try consumeGoldenValue(document.value());
+}
+
+fn consumeGoldenValue(value: std.json.Value) !void {
+    const root = try c.exactFields(value, &golden_fields.root);
     try expectLiteral(root, "schema", "uk.wamr.authority-contract-golden");
     try expectInt(root, "schema_version", @as(u8, 1));
     try expectLiteral(root, "authority_domain", "azure-execution");
@@ -154,13 +158,13 @@ test "native fixture consumer rejects scalar coercions and nested shape drift" {
 }
 
 fn rejectMutations(mutations: []const Mutation, expected: anyerror) !void {
-    var document = try contracts.parseCanonical(std.testing.allocator, golden);
+    var document = try c.Document.parse(std.testing.allocator, golden, contracts.json_limits);
     defer document.deinit();
     const allocator = document.parsed.arena.allocator();
     for (mutations) |mutation| {
         if (mutation.record) |record| {
             const entry = document.parsed.value.object.getPtr("canonical_records").?.object.getPtr(record).?;
-            var inner = try contracts.parseCanonical(std.testing.allocator, try c.string(entry.*));
+            var inner = try c.Document.parse(std.testing.allocator, try c.string(entry.*), contracts.json_limits);
             defer inner.deinit();
             try mutate(&inner.parsed.value, inner.parsed.arena.allocator(), mutation.path, mutation.value);
             entry.* = .{ .string = try inner.canonicalAlloc(allocator) };
@@ -168,9 +172,7 @@ fn rejectMutations(mutations: []const Mutation, expected: anyerror) !void {
             try mutate(&document.parsed.value, allocator, mutation.path, mutation.value);
         }
     }
-    const bytes = try document.canonicalAlloc(std.testing.allocator);
-    defer std.testing.allocator.free(bytes);
-    try std.testing.expectError(expected, consumeGolden(bytes));
+    try std.testing.expectError(expected, consumeGoldenValue(document.value()));
 }
 
 fn mutate(root: *std.json.Value, allocator: std.mem.Allocator, path: []const []const u8, value: std.json.Value) !void {

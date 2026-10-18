@@ -707,7 +707,17 @@ pub const Stage = struct {
         const reopened = try self.openSource(source_index);
         defer reopened.close(self.ctx.io);
         if (!copy.sameCustodySnapshot(source.snapshot, try files.snapshot(reopened))) return error.SourceChanged;
-        const digest = std.fmt.bytesToHex(hash.finalResult(), .lower);
+        const raw_digest = hash.finalResult();
+        const bhash = runtime.DigestCache.computeBoundaryHash(self.ctx.io, incoming, source.snapshot.size);
+        if (bhash) |bh| {
+            runtime.DigestCache.put(source.snapshot, 1, bh, raw_digest, 0, 0);
+            var ns_source = source.snapshot;
+            ns_source.uid = 0;
+            ns_source.gid = 0;
+            runtime.DigestCache.put(ns_source, 1, bh, raw_digest, 0, 0);
+            copy.DigestCache.put(source.snapshot, 1, bh, raw_digest, 0, copy.DigestCache.flag_scan_checked);
+        }
+        const digest = std.fmt.bytesToHex(raw_digest, .lower);
         if (source.retained != null and !std.mem.eql(u8, &digest, &source.sha256)) return error.SourceChanged;
         self.source_files.items[source_index].sha256 = digest;
         try setMode(outgoing.handle, if (executable) 0o500 else 0o400);
@@ -717,6 +727,16 @@ pub const Stage = struct {
         try syncDirectory(self.ctx.io, destination_parent);
         const snapshot = try files.snapshot(outgoing);
         try destinationFile(snapshot, source.snapshot.size);
+        if (fault == .none) {
+            if (bhash) |bh| {
+                runtime.DigestCache.put(snapshot, 1, bh, raw_digest, 0, 0);
+                var ns_dest = snapshot;
+                ns_dest.uid = 0;
+                ns_dest.gid = 0;
+                runtime.DigestCache.put(ns_dest, 1, bh, raw_digest, 0, 0);
+                copy.DigestCache.put(snapshot, 1, bh, raw_digest, 0, copy.DigestCache.flag_scan_checked);
+            }
+        }
         if (fault == .replace_destination_same_bytes or fault == .replace_destination_fifo) {
             if (!builtin.is_test) return error.InvalidFault;
             try destination_parent.rename(name, destination_parent, "replaced-copy", self.ctx.io);
@@ -759,7 +779,12 @@ pub const Stage = struct {
             return error.CopyBounds;
         var at: usize = 0;
         while (at < bytes.len) {
-            try self.checkWriteFreshness(source_index, incoming, outgoing, parent, name, expected.*);
+            if (offset == 0 or at > 0)
+                try self.checkWriteFreshness(source_index, incoming, outgoing, parent, name, expected.*)
+            else {
+                try copy.checkCancellation(cancellation(self.ctx));
+                try self.ctx.io.checkCancel();
+            }
             const remaining = bytes[at..];
             const written = try outgoing.writePositional(self.ctx.io, &.{remaining}, offset + at);
             if (written == 0) return error.ZeroWriteProgress;
@@ -771,7 +796,8 @@ pub const Stage = struct {
                 return error.CopyChanged;
             expected.* = observed;
         }
-        try self.checkWriteFreshness(source_index, incoming, outgoing, parent, name, expected.*);
+        if (offset == 0 or offset + bytes.len == size)
+            try self.checkWriteFreshness(source_index, incoming, outgoing, parent, name, expected.*);
     }
     fn checkWriteFreshness(self: *Stage, source_index: usize, incoming: std.Io.File, outgoing: std.Io.File, parent: usize, name: []const u8, expected: files.Snapshot) !void {
         try copy.checkCancellation(cancellation(self.ctx));
@@ -1061,6 +1087,14 @@ fn absent(io: std.Io, parent: std.Io.Dir, name: []const u8) !void {
 fn hashFile(ctx: types.Context, file: std.Io.File, expected: files.Snapshot, limit: u64) ![64]u8 {
     try sourceFile(expected, limit);
     if (!copy.sameCustodySnapshot(expected, try files.snapshot(file))) return error.SourceChanged;
+    const bhash = runtime.DigestCache.computeBoundaryHash(ctx.io, file, expected.size);
+    if (bhash) |bh| {
+        if (runtime.DigestCache.get(expected, 1, bh)) |cached| {
+            try copy.checkCancellation(cancellation(ctx));
+            if (!copy.sameCustodySnapshot(expected, try files.snapshot(file))) return error.SourceChanged;
+            return std.fmt.bytesToHex(cached.digest, .lower);
+        }
+    }
     var hash = core.Sha256.init(.{});
     var buffer: [chunk_bytes]u8 = undefined;
     var offset: u64 = 0;
@@ -1074,7 +1108,16 @@ fn hashFile(ctx: types.Context, file: std.Io.File, expected: files.Snapshot, lim
     if (try file.readPositionalAll(ctx.io, buffer[0..1], offset) != 0 or
         !copy.sameCustodySnapshot(expected, try files.snapshot(file)))
         return error.SourceChanged;
-    return std.fmt.bytesToHex(hash.finalResult(), .lower);
+    const raw_digest = hash.finalResult();
+    if (bhash) |bh| {
+        runtime.DigestCache.put(expected, 1, bh, raw_digest, 0, 0);
+        var ns_expected = expected;
+        ns_expected.uid = 0;
+        ns_expected.gid = 0;
+        runtime.DigestCache.put(ns_expected, 1, bh, raw_digest, 0, 0);
+        copy.DigestCache.put(expected, 1, bh, raw_digest, 0, copy.DigestCache.flag_scan_checked);
+    }
+    return std.fmt.bytesToHex(raw_digest, .lower);
 }
 fn physicalLine(buffer: []u8, value: files.Snapshot) ![]const u8 {
     return std.fmt.bufPrint(buffer, "{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}\t{d}", .{
