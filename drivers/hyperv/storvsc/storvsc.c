@@ -51,6 +51,8 @@
 #define STORVSC_CPU_RELAX()	__asm__ __volatile__("pause")
 #endif
 
+#define STORVSC_SYNC_SPIN_LIMIT 64U
+
 struct storvsc_device;
 struct storvsc_lun;
 
@@ -72,9 +74,9 @@ struct uk_blkdev_queue {
 struct storvsc_request_binding {
 	struct uk_blkreq *req;
 	__u64 id;
-	__u64 pfns[CONFIG_LIBSTORVSC_MAX_TRANSFER_PAGES];
 	struct storvsc_lun *lun;
 	__u8 synchronous;
+	__u64 pfns[CONFIG_LIBSTORVSC_MAX_TRANSFER_PAGES];
 };
 
 struct storvsc_lun {
@@ -89,6 +91,9 @@ struct storvsc_lun {
 	__u64 session_topology_generation;
 	__u64 session_controller_generation;
 	__u64 session_lun_generation;
+	__u64 active_slot_mask;
+	__u64 completed_slot_mask;
+	__u16 active_requests;
 	__u16 uid;
 	__u8 registered;
 	__u8 present;
@@ -121,6 +126,8 @@ struct storvsc_device {
 	__spinlock receive_lock;
 	__u32 epoch;
 	__u64 session_generation;
+	__u64 active_slot_mask;
+	__u16 active_bindings;
 	__u16 index;
 	__u16 interrupt_users;
 	__u8 initialized;
@@ -523,6 +530,84 @@ static int storvsc_send_tx(struct storvsc_device *device,
 		&range, 1, tx->packet, tx->packet_len, published);
 }
 
+static inline struct storvsc_request_binding *
+storvsc_bind_slot_locked(struct storvsc_device *device, __u16 slot, __u64 id,
+			 struct uk_blkreq *req, struct storvsc_lun *lun,
+			 __u8 synchronous)
+{
+	struct storvsc_request_binding *binding = &device->bindings[slot];
+	__u64 bit = 1ULL << slot;
+
+	binding->req = req;
+	binding->id = id;
+	binding->lun = lun;
+	binding->synchronous = synchronous;
+	if (!(device->active_slot_mask & bit))
+		device->active_bindings++;
+	device->active_slot_mask |= bit;
+	if (lun) {
+		if (!(lun->active_slot_mask & bit))
+			lun->active_requests++;
+		lun->active_slot_mask |= bit;
+		lun->completed_slot_mask &= ~bit;
+	}
+	return binding;
+}
+
+static inline void
+storvsc_release_slot_locked(struct storvsc_device *device, __u16 slot)
+{
+	struct storvsc_request_binding *binding = &device->bindings[slot];
+	struct storvsc_lun *lun = binding->lun;
+	__u64 bit = 1ULL << slot;
+
+	binding->req = NULL;
+	binding->id = 0;
+	binding->lun = NULL;
+	binding->synchronous = 0;
+	if ((device->active_slot_mask & bit) && device->active_bindings)
+		device->active_bindings--;
+	device->active_slot_mask &= ~bit;
+	if (lun) {
+		if ((lun->active_slot_mask & bit) && lun->active_requests)
+			lun->active_requests--;
+		lun->active_slot_mask &= ~bit;
+		lun->completed_slot_mask &= ~bit;
+	}
+}
+
+static inline void
+storvsc_mark_all_completed_locked(struct storvsc_device *device)
+{
+	__u64 mask = device->active_slot_mask;
+
+	while (mask) {
+		unsigned int slot = (unsigned int)__builtin_ctzll(mask);
+		struct storvsc_lun *lun = device->bindings[slot].lun;
+
+		mask &= mask - 1ULL;
+		if (lun) {
+			lun->completed_slot_mask |= 1ULL << slot;
+			lun->completion_pending = 1;
+		}
+	}
+}
+
+static inline void
+storvsc_reset_bindings_locked(struct storvsc_device *device)
+{
+	unsigned int i;
+
+	memset(device->bindings, 0, sizeof(device->bindings));
+	device->active_slot_mask = 0;
+	device->active_bindings = 0;
+	for (i = 0; i < CONFIG_LIBSTORVSC_MAX_LUNS; i++) {
+		device->luns[i].active_requests = 0;
+		device->luns[i].active_slot_mask = 0;
+		device->luns[i].completed_slot_mask = 0;
+	}
+}
+
 static int storvsc_read_event(struct storvsc_device *device,
 			      struct vmbus_channel *channel,
 			      struct storvsc_event *event)
@@ -551,6 +636,17 @@ static int storvsc_read_event(struct storvsc_device *device,
 	rc = storvsc_core_receive(device->core, packet.transaction_id,
 		device->rx_payload, malformed ? 0 : payload_length,
 		ukplat_monotonic_clock(), event);
+	if (!rc && event->kind == STORVSC_EVENT_REQUEST_COMPLETE &&
+	    event->slot < CONFIG_LIBSTORVSC_QUEUE_DEPTH) {
+		struct storvsc_request_binding *binding =
+			&device->bindings[event->slot];
+
+		if (binding->id == event->transaction_id && binding->lun) {
+			binding->lun->completed_slot_mask |=
+				1ULL << event->slot;
+			binding->lun->completion_pending = 1;
+		}
+	}
 	ukplat_spin_unlock_irqrestore(&device->lock, flags);
 	return rc;
 }
@@ -590,20 +686,11 @@ static void storvsc_process_async_event(struct storvsc_device *device,
 					const struct storvsc_event *event,
 					int *completed)
 {
-	struct storvsc_request_binding *binding;
 	unsigned long flags;
 	int wake = 0;
 
 	switch (event->kind) {
 	case STORVSC_EVENT_REQUEST_COMPLETE:
-		ukplat_spin_lock_irqsave(&device->lock, flags);
-		if (event->slot < CONFIG_LIBSTORVSC_QUEUE_DEPTH) {
-			binding = &device->bindings[event->slot];
-			if (binding->id == event->transaction_id &&
-			    binding->lun)
-				binding->lun->completion_pending = 1;
-		}
-		ukplat_spin_unlock_irqrestore(&device->lock, flags);
 		*completed = 1;
 		break;
 	case STORVSC_EVENT_RESET_COMPLETE:
@@ -867,6 +954,7 @@ static int storvsc_send_initialization(struct storvsc_device *device)
 {
 	struct storvsc_event event;
 	struct vmbus_channel *channel = storvsc_channel_get(device);
+	unsigned int spin;
 	int published;
 	int rc;
 
@@ -883,6 +971,7 @@ static int storvsc_send_initialization(struct storvsc_device *device)
 			if (rc && !published)
 				return rc;
 		}
+		spin = 0;
 		for (;;) {
 			rc = storvsc_read_event(device, channel, &event);
 			if (rc == -EAGAIN) {
@@ -890,6 +979,12 @@ static int storvsc_send_initialization(struct storvsc_device *device)
 					ukplat_monotonic_clock(), &event);
 				if (event.kind != STORVSC_EVENT_IGNORED)
 					break;
+				if (spin < STORVSC_SYNC_SPIN_LIMIT) {
+					spin++;
+					STORVSC_CPU_RELAX();
+					continue;
+				}
+				spin = 0;
 				if (uk_sched_current())
 					uk_sched_thread_sleep(
 						STORVSC_WORKER_SLEEP_NS);
@@ -897,6 +992,7 @@ static int storvsc_send_initialization(struct storvsc_device *device)
 					STORVSC_CPU_RELAX();
 				continue;
 			}
+			spin = 0;
 			if (rc)
 				return rc;
 			if (event.kind != STORVSC_EVENT_IGNORED)
@@ -926,6 +1022,7 @@ static int storvsc_execute_scsi(struct storvsc_device *device,
 	struct storvsc_event event;
 	struct storvsc_tx tx;
 	struct vmbus_channel *channel = storvsc_channel_get(device);
+	unsigned int spin;
 	int topology_changed = 0;
 	int published;
 	int rc;
@@ -940,17 +1037,16 @@ static int storvsc_execute_scsi(struct storvsc_device *device,
 		return rc;
 	if (tx.slot >= CONFIG_LIBSTORVSC_QUEUE_DEPTH)
 		return -EPROTO;
-	binding = &device->bindings[tx.slot];
-	memset(binding, 0, sizeof(*binding));
-	binding->id = tx.transaction_id;
-	binding->synchronous = 1;
+	binding = storvsc_bind_slot_locked(device, tx.slot, tx.transaction_id,
+					   NULL, NULL, 1);
 	rc = storvsc_send_tx(device, binding, &tx, buffer, &published);
 	if (rc && !published) {
 		(void)storvsc_core_abort(device->core, tx.slot,
 					 tx.transaction_id);
-		memset(binding, 0, sizeof(*binding));
+		storvsc_release_slot_locked(device, tx.slot);
 		return rc;
 	}
+	spin = 0;
 	for (;;) {
 		rc = storvsc_read_event(device, channel, &event);
 		if (rc == -EAGAIN) {
@@ -961,12 +1057,19 @@ static int storvsc_execute_scsi(struct storvsc_device *device,
 			if (event.kind == STORVSC_EVENT_INITIALIZATION_FAILED ||
 			    event.kind == STORVSC_EVENT_PROTOCOL_ERROR)
 				return event.error ? event.error : -EPROTO;
+			if (spin < STORVSC_SYNC_SPIN_LIMIT) {
+				spin++;
+				STORVSC_CPU_RELAX();
+				continue;
+			}
+			spin = 0;
 			if (uk_sched_current())
 				uk_sched_thread_sleep(STORVSC_WORKER_SLEEP_NS);
 			else
 				STORVSC_CPU_RELAX();
 			continue;
 		}
+		spin = 0;
 		if (rc)
 			return rc;
 		if (event.kind == STORVSC_EVENT_REMOVE_DEVICE)
@@ -983,7 +1086,7 @@ static int storvsc_execute_scsi(struct storvsc_device *device,
 #endif
 		rc = storvsc_core_take_completed(device->core, tx.slot,
 				tx.transaction_id, &event);
-		memset(binding, 0, sizeof(*binding));
+		storvsc_release_slot_locked(device, tx.slot);
 		if (rc)
 			return rc;
 		if (transferred)
@@ -1215,7 +1318,7 @@ static int storvsc_take_completion_locked(struct storvsc_device *device,
 	if (rc)
 		return rc;
 	*request = binding->req;
-	memset(binding, 0, sizeof(*binding));
+	storvsc_release_slot_locked(device, slot);
 	return 0;
 }
 
@@ -1223,14 +1326,18 @@ static int storvsc_take_lun_completion_locked(
 	struct storvsc_device *device, struct storvsc_lun *lun,
 	struct uk_blkreq **request, struct storvsc_event *event)
 {
-	unsigned int slot;
+	__u64 mask = lun->completed_slot_mask;
 	int rc;
 
 	*request = NULL;
-	for (slot = 0; slot < CONFIG_LIBSTORVSC_QUEUE_DEPTH; slot++) {
+	while (mask) {
+		unsigned int slot = (unsigned int)__builtin_ctzll(mask);
 		struct storvsc_request_binding *binding =
 			&device->bindings[slot];
+		__u64 bit = 1ULL << slot;
 
+		mask &= mask - 1ULL;
+		lun->completed_slot_mask &= ~bit;
 		if (!binding->id || binding->lun != lun)
 			continue;
 		rc = storvsc_core_take_completed(device->core, (__u16)slot,
@@ -1240,7 +1347,7 @@ static int storvsc_take_lun_completion_locked(
 		if (rc)
 			return rc;
 		*request = binding->req;
-		memset(binding, 0, sizeof(*binding));
+		storvsc_release_slot_locked(device, (__u16)slot);
 		return 0;
 	}
 	return -ENOENT;
@@ -1249,15 +1356,9 @@ static int storvsc_take_lun_completion_locked(
 static void storvsc_notify_completions(struct storvsc_device *device)
 {
 	unsigned long flags;
-	unsigned int i;
 
 	ukplat_spin_lock_irqsave(&device->lock, flags);
-	for (i = 0; i < CONFIG_LIBSTORVSC_QUEUE_DEPTH; i++) {
-		struct storvsc_request_binding *binding = &device->bindings[i];
-
-		if (binding->id && binding->lun)
-			binding->lun->completion_pending = 1;
-	}
+	storvsc_mark_all_completed_locked(device);
 	ukplat_spin_unlock_irqrestore(&device->lock, flags);
 	storvsc_notify_pending(device);
 }
@@ -1679,15 +1780,8 @@ static void storvsc_stop_timeout_worker(struct storvsc_device *device)
 static __u32 storvsc_lun_active_count_locked(
 	const struct storvsc_device *device, const struct storvsc_lun *lun)
 {
-	__u32 count = 0;
-	unsigned int i;
-
-	for (i = 0; i < CONFIG_LIBSTORVSC_QUEUE_DEPTH; i++) {
-		if (device->bindings[i].id &&
-		    device->bindings[i].lun == lun)
-			count++;
-	}
-	return count;
+	(void)device;
+	return lun->active_requests;
 }
 
 static int storvsc_submit(struct uk_blkdev *blkdev,
@@ -1769,11 +1863,8 @@ static int storvsc_submit(struct uk_blkdev *blkdev,
 		ukplat_spin_unlock_irqrestore(&device->lock, flags);
 		return -EPROTO;
 	}
-	binding = &device->bindings[tx.slot];
-	memset(binding, 0, sizeof(*binding));
-	binding->req = request;
-	binding->id = tx.transaction_id;
-	binding->lun = lun;
+	binding = storvsc_bind_slot_locked(device, tx.slot, tx.transaction_id,
+					   request, lun, 0);
 	device->active_sends++;
 	request->result = -EINPROGRESS;
 	ukplat_spin_unlock_irqrestore(&device->lock, flags);
@@ -1788,14 +1879,14 @@ static int storvsc_submit(struct uk_blkdev *blkdev,
 	if (rc && !published) {
 		(void)storvsc_core_abort(device->core, tx.slot,
 					 tx.transaction_id);
-		memset(binding, 0, sizeof(*binding));
+		storvsc_release_slot_locked(device, tx.slot);
 		ukplat_spin_unlock_irqrestore(&device->lock, flags);
 		if (deferred_ready)
 			storvsc_wake_timeout(device);
 		return rc == -EAGAIN ? -ENOSPC : rc;
 	}
 	active = storvsc_lun_active_count_locked(device, lun);
-	controller_active = storvsc_core_active_count(device->core);
+	controller_active = device->active_bindings;
 	ukplat_spin_unlock_irqrestore(&device->lock, flags);
 	if (rc == -ECANCELED || rc == -ENODEV)
 		(void)storvsc_schedule_fatal(device, -ENODEV);
@@ -1982,15 +2073,7 @@ static int storvsc_start(struct uk_blkdev *blkdev)
 
 static int storvsc_lun_active_locked(struct storvsc_lun *lun)
 {
-	struct storvsc_device *device = lun->controller;
-	unsigned int i;
-
-	for (i = 0; i < CONFIG_LIBSTORVSC_QUEUE_DEPTH; i++) {
-		if (device->bindings[i].id &&
-		    device->bindings[i].lun == lun)
-			return 1;
-	}
-	return 0;
+	return lun->active_requests != 0;
 }
 
 static int storvsc_stop(struct uk_blkdev *blkdev)
@@ -3042,7 +3125,7 @@ static int storvsc_add_device(struct vmbus_device *vmbus_device)
 	device->deferred_channel = NULL;
 	device->deferred_vmbus_epoch = 0;
 	device->deferred_close_deadline = 0;
-	memset(device->bindings, 0, sizeof(device->bindings));
+	storvsc_reset_bindings_locked(device);
 	storvsc_mark_luns_absent(device);
 	rc = storvsc_core_initialize(device->core, device->epoch,
 				      CONFIG_LIBSTORVSC_QUEUE_DEPTH);
