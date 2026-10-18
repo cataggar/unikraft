@@ -3622,11 +3622,13 @@ class HypervWorkflowTest(unittest.TestCase):
         self.assertTrue(all(not line or line.startswith(" " * 10)
                             for line in lines))
         script = "\n".join(line[10:] for line in lines)
+        self.assertFalse(
+            (SUPPORT.parent / "support/build/wamr-native-ci/run.py").exists()
+        )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repository = root / "source"
             for relative in (
-                "support/build/wamr-native-ci/run.py",
                 "support/tools/hyperv/process-command-v1.json",
             ):
                 target = repository / relative

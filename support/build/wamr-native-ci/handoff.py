@@ -17,9 +17,21 @@ import uuid
 import zipfile
 
 HERE = Path(__file__).resolve().parent
-spec = importlib.util.spec_from_file_location("wamr_native_ci", HERE / "run.py")
-ci = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(ci)
+if (HERE / "run.py").is_file():
+    spec = importlib.util.spec_from_file_location(
+        "wamr_native_ci", HERE / "run.py")
+    ci = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ci)
+else:
+    fixture_spec = importlib.util.spec_from_file_location(
+        "wamr_historical_controller_fixture",
+        HERE / "tests/historical_controller_fixture.py",
+    )
+    fixture = importlib.util.module_from_spec(fixture_spec)
+    fixture_spec.loader.exec_module(fixture)
+    ci = fixture.load_oracle_module(
+        "run.py", HERE.parents[2], module_name="wamr_native_ci"
+    )
 records_spec = importlib.util.spec_from_file_location(
     "wamr_accepted_records", HERE / "accepted_records.py")
 accepted_records = importlib.util.module_from_spec(records_spec)
