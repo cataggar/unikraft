@@ -1021,7 +1021,9 @@ not change those semantics or spoof unavailable-storage markers:
   group; capabilities are dropped and no-new-privileges is required.
   No device permissions, shared group database or udev rules are changed.
   Missing x86/KVM/OVMF/tools fails; there is no successful skip or TCG fallback.
-* `run.py` then checks physical request/report/raw-log bindings, the correct
+* The native controller (`uk-wamr-native-ci`, matching the frozen historical
+  `run.py` reference pinned in `historical_controller_fixture.py`) then checks
+  physical request/report/raw-log bindings, the correct
   legacy-APIC observation, and an exact ordered completion line rather than
   a substring or request echo. The app-owned checker independently requires
   answer 42, both checks (native selftest plus growth/trap), unreachable
@@ -1199,8 +1201,11 @@ Private state directories are `0700`, identity/config/diagnostic files
 are `0600`, and any failed or partial build is a refusal, never a boot,
 cloud, or workload-acceptance result. The installed native producer's
 golden/fault/integration tests are `zig build --build-file
-support/apps/wamr-aot/build.zig test-unit test-integration`; Azure
-admission, broader workload validation and final `run.py` removal remain
+support/apps/wamr-aot/build.zig test-unit test-integration`; working-tree
+`run.py` has been retired in favor of `uk-wamr-native-ci` and pinned
+`historical_controller_fixture.py` (`ORACLE_SOURCES`), while Azure
+admission, broader workload validation, and shared
+`handoff.py`/`public_bundle.py`/`accepted_records.py` retirement remain
 separate follow-up slices, not producer-side fallbacks.
 Recorded indirect executable variables are replaced inside the supervisor by
 paths to its retained descriptors. The reviewed self-reexecuting package and
