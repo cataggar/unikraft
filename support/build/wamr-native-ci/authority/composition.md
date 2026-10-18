@@ -158,6 +158,14 @@ Regressions exercise a real mode-000 identity-open denial and a real terminal
 frame followed by socket EOF while its specifically owned leader is alive.
 An emulated ABI check is not a namespace qualification when the emulator cannot
 preserve the required namespace syscalls.
+When a real x86_64 host Python and dynamic loader are available, the joined
+composition suite also stages the real interpreter, dynamic loader, and
+transitive `DT_NEEDED` DSO closure through CLI `prepare-azure-runtime`,
+verifies `uk-wamr-direct-validate azure-runtime` and
+`runtime_probes.inspectCopied` on the copied runtime tree, and executes all 19
+closed runtime probe steps (`loader_listing`, `python_version`, `imports`, and
+all 16 closed Azure CLI commands) against the copied dynamic loader and
+interpreter.
 
 Synthetic authorization and admission constructors use the shared golden-record
 fixture helper. It rebinds only the executing ledger owner and dependent exact
