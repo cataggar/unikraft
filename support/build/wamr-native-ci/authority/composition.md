@@ -204,18 +204,19 @@ refusals. Synthetic ELF is not executed in that joined negative test.
 `test-handoff-composition` (`-Dhandoff-composition-group=retention`) also
 exercises live imported-owner composition through `cli.parse` and `handlers.run`:
 a real v2 exact-download `ImportedProduct` and `candidate.create`/`candidate.open`
-`Finalized` owners drive `prepare-azure-runtime` (through COPY, manifest/pending
-publication, `uk-wamr-direct-validate azure-runtime`, `runtime_probes.inspectCopied`,
-and isolated helper synthetic-runtime refusal) → `plan` →
-`record-authorization` → `admit`, verified with `uk-wamr-direct-validate`
+`Finalized` owners drive `prepare-azure-runtime` (staging both the synthetic-ELF
+refusal fixture and, on x86_64 Linux, the real host Python interpreter,
+`PT_INTERP` dynamic loader, and transitive `DT_NEEDED` DSO closure with
+`uk-wamr-direct-validate azure-runtime`, `runtime_probes.inspectCopied`, and
+execution of all 19 closed runtime probes) → `plan` → `record-authorization` →
+`admit`, verified with `Admitted.revalidate()` and `uk-wamr-direct-validate`
 (`azure-runtime`, `plan`, `authorization`, `admission`, `stored-scope`,
 `inputs`, `ledger`, `ledger-proposal`, and `serial`), while refusing
 `.private_bundle` owners, mismatched bundle/candidate/attempt/cost selectors,
 create-only duplicate output paths (`PathAlreadyExists`), invalid approval
 windows/fields (`InvalidApprovalWindow`, `ApprovalExpired`,
 `InvalidAuthorityField`), denied authorization records, and post-admission
-ledger, bound-tool, or staged-runtime manifest tampering. A genuine compatible
-x86 Python/Azure runtime positive (with full 19-slot namespace probe execution)
-remains a separate gate, alongside standalone owner acquisition, trusted caller
-migration, genuine approvals, approval consumption, deletion authority and
-cloud/hardware acceptance.
+ledger, bound-tool, copied-DSO, or staged-runtime manifest tampering. Standalone
+owner acquisition, trusted caller migration, genuine approvals, approval
+consumption, deletion authority and cloud/hardware acceptance remain separate
+gates.

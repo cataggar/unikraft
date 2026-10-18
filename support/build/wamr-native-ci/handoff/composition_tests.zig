@@ -899,6 +899,25 @@ fn makeDirectoryRemovable(io: std.Io, directory: std.Io.Dir) !void {
     }
 }
 
+fn resolveHostLibrary(allocator: std.mem.Allocator, io: std.Io, primary_dir: []const u8, name: []const u8) ![]const u8 {
+    const search_dirs = [_][]const u8{
+        primary_dir,
+        "/lib/x86_64-linux-gnu",
+        "/usr/lib/x86_64-linux-gnu",
+        "/lib64",
+        "/usr/lib64",
+    };
+    for (search_dirs) |dir_path| {
+        const candidate_path = try std.fs.path.join(allocator, &.{ dir_path, name });
+        if (std.Io.Dir.cwd().realPathFileAlloc(io, candidate_path, allocator)) |resolved| {
+            return resolved;
+        } else |_| {}
+    }
+    return error.HostLibraryNotFound;
+}
+
+fn noopBarrierCheck(_: *anyopaque) !void {}
+
 fn liveImportedAuthorityComposition(
     work: Workspace,
     owner: *products.ImportedProduct,
@@ -1050,14 +1069,352 @@ fn liveImportedAuthorityComposition(
         try std.testing.expectEqual(@as(usize, 3), parsed_contract.value.loader_dependencies.len);
         try std.testing.expectEqual(@as(u16, 3), parsed_contract.value.observed.loader_files);
         try writeModeFile(work.io, runtime_output, "azure-runtime.json", pending_bytes, 0o600);
-        break :blk .{
+        const uploader_path = try work.join("authority-work/runtime-source/uploader");
+        const synthetic_tool_paths: authority.types.ToolPaths = .{
             .azure_runtime = try work.join("authority-work/azure-runtime/azure-runtime.json"),
             .azure = try work.a.dupe(u8, parsed_contract.value.launcher.path),
-            .uploader = try work.join("authority-work/runtime-source/uploader"),
+            .uploader = uploader_path,
             .validator = tools.validator,
             .supervisor = tools.supervisor,
             .az_python = try work.a.dupe(u8, parsed_contract.value.interpreter.path),
         };
+
+        if (@import("builtin").cpu.arch == .x86_64 and @import("builtin").os.tag == .linux) real_elf: {
+            const host_python = std.Io.Dir.cwd().realPathFileAlloc(work.io, "/usr/bin/python3", work.a) catch |err| switch (err) {
+                error.FileNotFound => break :real_elf,
+                else => return err,
+            };
+            const host_python_bytes = try std.Io.Dir.cwd().readFileAlloc(work.io, host_python, work.a, .limited(authority.types.runtime.max_file_bytes));
+            var host_python_info = authority.runtime_probes.inspectElf(std.testing.allocator, host_python_bytes, .interpreter) catch break :real_elf;
+            defer host_python_info.deinit();
+            const host_loader = try std.Io.Dir.cwd().realPathFileAlloc(work.io, host_python_info.interpreter.?, work.a);
+            const host_loader_dir = std.fs.path.dirname(host_loader) orelse return error.InvalidInterpreter;
+
+            try authority_dir.createDir(work.io, "real-azure-runtime-source", .fromMode(0o700));
+            const real_source_dir = try authority_dir.openDir(work.io, "real-azure-runtime-source", .{ .iterate = true, .follow_symlinks = false });
+            defer real_source_dir.close(work.io);
+            const real_source_path = try work.join("authority-work/real-azure-runtime-source");
+            const real_interpreter_path = try work.join("authority-work/real-azure-runtime-source/python");
+            try writeModeFile(work.io, real_source_dir, "python", host_python_bytes, 0o500);
+
+            var real_interpreter = try files.RetainedFile.open(work.io, real_interpreter_path, .artifact);
+            defer real_interpreter.close(work.io);
+            var real_loader = try files.RetainedFile.open(work.io, host_loader, .artifact);
+            defer real_loader.close(work.io);
+
+            var queue: std.ArrayList([]const u8) = .empty;
+            var seen_names: std.StringHashMapUnmanaged(void) = .empty;
+            try seen_names.put(work.a, authority.runtime_probes.loader_basename, {});
+            for (host_python_info.needed) |needed_name| {
+                if (!seen_names.contains(needed_name)) {
+                    try seen_names.put(work.a, try work.a.dupe(u8, needed_name), {});
+                    try queue.append(work.a, try work.a.dupe(u8, needed_name));
+                }
+            }
+
+            var candidate_files: std.ArrayList(files.RetainedFile) = .empty;
+            defer for (candidate_files.items) |*file| file.close(work.io);
+
+            var queue_index: usize = 0;
+            while (queue_index < queue.items.len) : (queue_index += 1) {
+                const dso_name = queue.items[queue_index];
+                const resolved_dso = try resolveHostLibrary(work.a, work.io, host_loader_dir, dso_name);
+                const dso_bytes = try std.Io.Dir.cwd().readFileAlloc(work.io, resolved_dso, work.a, .limited(authority.types.runtime.max_file_bytes));
+                var dso_info = authority.runtime_probes.inspectElf(std.testing.allocator, dso_bytes, .library) catch break :real_elf;
+                defer dso_info.deinit();
+                for (dso_info.needed) |transitive| {
+                    if (!seen_names.contains(transitive)) {
+                        try seen_names.put(work.a, try work.a.dupe(u8, transitive), {});
+                        try queue.append(work.a, try work.a.dupe(u8, transitive));
+                    }
+                }
+                try writeModeFile(work.io, real_source_dir, dso_name, dso_bytes, 0o400);
+                const staged_dso_path = try std.fs.path.join(work.a, &.{ real_source_path, dso_name });
+                try candidate_files.append(work.a, try files.RetainedFile.open(work.io, staged_dso_path, .artifact));
+            }
+
+            const candidate_ptrs = try work.a.alloc(*files.RetainedFile, candidate_files.items.len);
+            for (candidate_files.items, 0..) |*file, index| candidate_ptrs[index] = file;
+
+            var noop_ctx: u8 = 0;
+            const noop_barrier: authority.transaction.Barrier = .{ .context = &noop_ctx, .check = noopBarrierCheck };
+
+            const version_exec = try core.process.Executable.fromFile(work.io, real_loader.file);
+            defer version_exec.close(work.io);
+            var version_env = std.process.Environ.Map.init(std.testing.allocator);
+            defer version_env.deinit();
+            try version_env.put("LC_ALL", "C");
+            const now_ns = try core.process.monotonicNanoseconds();
+            var version_run = try authority.transaction.supervise(ctx, .{
+                .executable = version_exec,
+                .argv = &.{
+                    host_loader,
+                    "--inhibit-cache",
+                    "--inhibit-rpath",
+                    "",
+                    "--library-path",
+                    real_source_path,
+                    real_interpreter_path,
+                    "-s",
+                    "-S",
+                    "-B",
+                    "-P",
+                    "--version",
+                },
+                .cwd = real_source_dir,
+                .environment = &version_env,
+                .primary_deadline = .{ .expires_ns = now_ns + 30 * std.time.ns_per_s },
+                .cleanup_deadline = .{ .expires_ns = now_ns + 35 * std.time.ns_per_s },
+                .capture = .{ .merged = 4096 },
+                .limits = .{ .stdout_bytes = 4096, .stderr_bytes = 4096 },
+                .snapshot_executable = true,
+            }, noop_barrier);
+            defer version_run.deinit(std.testing.allocator);
+            try std.testing.expect(version_run.succeeded());
+            const version_raw = if (version_run.result.stdout.len != 0) version_run.result.stdout else version_run.result.stderr;
+            try std.testing.expect(std.mem.startsWith(u8, version_raw, "Python "));
+            const version_body = std.mem.trimEnd(u8, version_raw["Python ".len..], "\r\n");
+            const first_dot = std.mem.indexOfScalar(u8, version_body, '.') orelse return error.InvalidPythonVersion;
+            const second_dot = std.mem.indexOfScalarPos(u8, version_body, first_dot + 1, '.') orelse return error.InvalidPythonVersion;
+            const python_version = try work.a.dupe(u8, version_body[0..second_dot]);
+            const stdlib_name = try std.fmt.allocPrint(work.a, "python{s}", .{python_version});
+
+            try real_source_dir.createDir(work.io, stdlib_name, .fromMode(0o700));
+            const real_stdlib_dir = try real_source_dir.openDir(work.io, stdlib_name, .{ .iterate = true });
+            defer real_stdlib_dir.close(work.io);
+            try real_stdlib_dir.createDir(work.io, "encodings", .fromMode(0o700));
+            const real_encodings_dir = try real_stdlib_dir.openDir(work.io, "encodings", .{});
+            defer real_encodings_dir.close(work.io);
+            try writeModeFile(work.io, real_encodings_dir, "__init__.py",
+                \\import _codecs
+                \\
+                \\class IncrementalEncoder:
+                \\    def __init__(self, errors="strict"):
+                \\        self.errors = errors
+                \\    def encode(self, input, final=False):
+                \\        return _codecs.utf_8_encode(input, self.errors)[0]
+                \\
+                \\class IncrementalDecoder:
+                \\    def __init__(self, errors="strict"):
+                \\        self.errors = errors
+                \\    def decode(self, input, final=False):
+                \\        return _codecs.utf_8_decode(input, self.errors, final)[0]
+                \\
+                \\class CodecInfo(tuple):
+                \\    def __new__(cls, name, encode, decode, incrementalencoder=None, incrementaldecoder=None):
+                \\        self = tuple.__new__(cls, (encode, decode, None, None))
+                \\        self.name = name
+                \\        self.encode = encode
+                \\        self.decode = decode
+                \\        self.incrementalencoder = incrementalencoder
+                \\        self.incrementaldecoder = incrementaldecoder
+                \\        return self
+                \\
+                \\def search_function(encoding):
+                \\    if encoding in ("utf-8", "utf8", "utf_8", "ascii", "latin-1", "iso8859-1"):
+                \\        return CodecInfo("utf-8", _codecs.utf_8_encode, _codecs.utf_8_decode, IncrementalEncoder, IncrementalDecoder)
+                \\    return None
+                \\
+                \\_codecs.register(search_function)
+                \\
+            , 0o600);
+            try writeModeFile(work.io, real_stdlib_dir, "linecache.py", "def _register_code(*args):\n    pass\n", 0o600);
+            for ([_][]const u8{ "os.py", "json.py", "ssl.py", "ctypes.py" }) |mod_name|
+                try writeModeFile(work.io, real_stdlib_dir, mod_name, "x = 1\n", 0o600);
+
+            try real_source_dir.createDir(work.io, "packages", .fromMode(0o700));
+            const real_packages_dir = try real_source_dir.openDir(work.io, "packages", .{ .iterate = true });
+            defer real_packages_dir.close(work.io);
+            for ([_][]const u8{
+                "azure",
+                "azure/cli",
+                "azure/cli/core",
+                "azure/cli/command_modules",
+                "azure/cli/command_modules/resource",
+                "azure/cli/command_modules/vm",
+            }) |subpath| {
+                try real_packages_dir.createDir(work.io, subpath, .fromMode(0o700));
+                const subdir = try real_packages_dir.openDir(work.io, subpath, .{ .iterate = true });
+                defer subdir.close(work.io);
+                try writeModeFile(work.io, subdir, "__init__.py", "x = 1\n", 0o600);
+            }
+
+            try writeModeFile(work.io, real_source_dir, "azure",
+                \\import sys
+                \\if sys.argv[1:2] == ["version"]:
+                \\    print('{"azure-cli":"2.61.0","azure-cli-core":"2.61.0","azure-cli-telemetry":"1.1.0","extensions":{}}')
+                \\else:
+                \\    print("Command help: " + " ".join(sys.argv[1:]))
+                \\
+            , 0o500);
+
+            const real_output_path = try work.join("authority-work/real-azure-runtime");
+            const real_azure_path = try std.fs.path.join(work.a, &.{ real_source_path, "azure" });
+            const real_stdlib_path = try std.fs.path.join(work.a, &.{ real_source_path, stdlib_name });
+            const real_package_root = try std.fs.path.join(work.a, &.{ real_source_path, "packages" });
+
+            var parsed_real_prepare = try authority.cli.parse(std.testing.allocator, &.{
+                "prepare-azure-runtime",
+                try std.fmt.allocPrint(work.a, "--output={s}", .{real_output_path}),
+                try std.fmt.allocPrint(work.a, "--azure={s}", .{real_azure_path}),
+                try std.fmt.allocPrint(work.a, "--az-python={s}", .{real_interpreter_path}),
+                try std.fmt.allocPrint(work.a, "--stdlib={s}", .{real_stdlib_path}),
+                try std.fmt.allocPrint(work.a, "--validator={s}", .{tools.validator}),
+                try std.fmt.allocPrint(work.a, "--package-root={s}", .{real_package_root}),
+            });
+            defer parsed_real_prepare.deinit();
+
+            const real_discovery: authority.runtime_probes.DiscoveryInput = .{
+                .interpreter = &real_interpreter,
+                .dynamic_loader = &real_loader,
+                .native_roots = &.{},
+                .candidates = candidate_ptrs,
+            };
+            const real_outcome = authority.handlers.run(.{
+                .retained = ctx,
+                .discovery = real_discovery,
+            }, parsed_real_prepare.result.command).prepare;
+
+            const real_runtime_json_path = try std.fs.path.join(work.a, &.{ real_output_path, "azure-runtime.json" });
+            switch (real_outcome) {
+                .success => |prepared| {
+                    defer prepared.deinit();
+                    const res = try prepared.result();
+                    try std.testing.expectEqual(@as(u32, @intCast(candidate_files.items.len + 2)), res.evidence.elf.native_files);
+                    try std.testing.expectEqual(@as(u16, @intCast(candidate_files.items.len + 1)), res.evidence.loader_entries);
+                    try std.testing.expectEqual(@as(usize, 19), res.evidence.probes.len);
+                    try std.testing.expectEqual(core.process.CommandPrimary{ .exited = 0 }, res.native_validations[0].primary);
+                    try std.testing.expectEqual(core.process.CommandPrimary{ .exited = 0 }, res.native_validations[1].primary);
+                },
+                .refused => return error.UnexpectedEarlyPrepareRefusal,
+                .poisoned => |diagnostic| {
+                    try std.testing.expectEqual(authority.types.Phase.validation, diagnostic.phase);
+                    try std.testing.expectEqual(files.CommitStatus.durable, diagnostic.publications.copy);
+                    try std.testing.expectEqual(files.CommitStatus.durable, diagnostic.publications.manifest);
+                    try std.testing.expectEqual(files.CommitStatus.durable, diagnostic.publications.pending);
+                    try std.testing.expect(diagnostic.native_validation != null);
+                    try std.testing.expectEqual(core.process.CommandPrimary{ .exited = 0 }, diagnostic.native_validation.?.primary);
+                    try std.testing.expect(diagnostic.native_validation.?.cleanup_complete);
+                    try std.testing.expect(diagnostic.helper_cleanup_complete);
+
+                    const pending_path = try std.fs.path.join(work.a, &.{ real_output_path, "azure-runtime.pending.json" });
+                    var parsed_pending = try authority.types.runtime.load(std.testing.allocator, work.io, pending_path);
+                    defer parsed_pending.deinit();
+                    const contract = parsed_pending.value.value;
+
+                    const layout: authority.types.RuntimeLayout = .{
+                        .output = real_output_path,
+                        .root = contract.root,
+                        .python_version = contract.python_version,
+                        .launcher = contract.launcher.path,
+                        .interpreter = contract.interpreter.path,
+                        .loader_directory = try std.fs.path.join(work.a, &.{ contract.root, "loader" }),
+                        .extensions = contract.extensions,
+                        .startup_config = try std.fs.path.join(work.a, &.{ real_output_path, "startup-config" }),
+                    };
+
+                    const copied_runtime_dir = try std.Io.Dir.openDirAbsolute(work.io, contract.root, .{ .iterate = true, .follow_symlinks = false });
+                    defer copied_runtime_dir.close(work.io);
+                    const elf_evidence = try authority.runtime_probes.inspectCopied(ctx, .{
+                        .root = copied_runtime_dir,
+                        .layout = layout,
+                        .contract = contract,
+                        .barrier = noop_barrier,
+                    });
+                    try std.testing.expectEqual(@as(u32, @intCast(candidate_files.items.len + 2)), elf_evidence.native_files);
+                    try std.testing.expect(elf_evidence.needed_edges >= candidate_files.items.len);
+                    try std.testing.expectEqualSlices(u8, &authority.transaction.hash(host_python_info.interpreter.?), &elf_evidence.interpreter_path_sha256);
+
+                    var copied_loader = try files.RetainedFile.open(work.io, contract.dynamic_loader.path, .tool);
+                    defer copied_loader.close(work.io);
+                    const copied_loader_exec = try core.process.Executable.fromFile(work.io, copied_loader.file);
+                    defer copied_loader_exec.close(work.io);
+                    const probe_cwd = try files.openDirectory(work.io, layout.output, .private);
+                    defer probe_cwd.close(work.io);
+                    var probe_env = try authority.runtime_probes.environment(std.testing.allocator, layout, contract);
+                    defer probe_env.deinit();
+
+                    const step_count = authority.types.runtime.commands.len + 3;
+                    try std.testing.expectEqual(@as(usize, 19), step_count);
+                    for (0..step_count) |index| {
+                        const step: authority.runtime_probes.Step = switch (index) {
+                            0 => .loader_listing,
+                            1 => .python_version,
+                            2 => .imports,
+                            else => .{ .command = @intCast(index - 3) },
+                        };
+                        const argv = try authority.runtime_probes.arguments(std.testing.allocator, layout, contract, step);
+                        defer std.testing.allocator.free(argv);
+                        const step_now = try core.process.monotonicNanoseconds();
+                        var supervised = try authority.transaction.supervise(ctx, .{
+                            .executable = copied_loader_exec,
+                            .argv = argv,
+                            .cwd = probe_cwd,
+                            .environment = &probe_env,
+                            .primary_deadline = .{ .expires_ns = step_now + 30 * std.time.ns_per_s },
+                            .cleanup_deadline = .{ .expires_ns = step_now + 35 * std.time.ns_per_s },
+                            .capture = .{ .merged = 1024 * 1024 },
+                            .limits = .{ .stdout_bytes = 1024 * 1024, .stderr_bytes = 1024 * 1024 },
+                            .snapshot_executable = true,
+                        }, noop_barrier);
+                        defer supervised.deinit(std.testing.allocator);
+                        try std.testing.expect(supervised.succeeded());
+                        try std.testing.expectEqual(@as(u32, 0), supervised.result.descendants.observed);
+                        try std.testing.expectEqual(@as(u32, 0), supervised.result.descendants.adopted);
+                        switch (step) {
+                            .loader_listing => {
+                                const entries = try authority.runtime_probes.validateListing(
+                                    std.testing.allocator,
+                                    supervised.result.stdout,
+                                    layout,
+                                    contract,
+                                    elf_evidence.interpreter_closure[0..contract.loader_dependencies.len],
+                                    elf_evidence.interpreter_path_sha256,
+                                );
+                                try std.testing.expectEqual(@as(u16, @intCast(candidate_files.items.len + 1)), entries);
+                            },
+                            .python_version => try authority.runtime_probes.Test.pythonVersion(
+                                supervised.result.stdout,
+                                supervised.result.stderr,
+                                contract.python_version,
+                            ),
+                            .imports => {
+                                try std.testing.expectEqualStrings("UK-WAMR-AZURE-IMPORTS-1\n", supervised.result.stdout);
+                                try std.testing.expectEqual(@as(usize, 0), supervised.result.stderr.len);
+                            },
+                            .command => |cmd_idx| try authority.runtime_probes.Test.command(std.testing.allocator, cmd_idx, supervised.result.stdout),
+                        }
+                    }
+
+                    const real_out_dir = try std.Io.Dir.openDirAbsolute(work.io, real_output_path, .{ .follow_symlinks = false });
+                    defer real_out_dir.close(work.io);
+                    const real_pending_bytes = try real_out_dir.readFileAlloc(work.io, "azure-runtime.pending.json", work.a, .limited(65536));
+                    try writeModeFile(work.io, real_out_dir, "azure-runtime.json", real_pending_bytes, 0o600);
+                },
+            }
+
+            const duplicate_real_prepare = authority.handlers.run(
+                .{ .retained = ctx, .discovery = real_discovery },
+                parsed_real_prepare.result.command,
+            ).prepare;
+            try std.testing.expect(duplicate_real_prepare == .refused);
+            try std.testing.expectEqual(error.PathAlreadyExists, duplicate_real_prepare.refused.err);
+            try std.testing.expectEqual(files.CommitStatus.not_committed, duplicate_real_prepare.refused.publications.copy);
+
+            var parsed_real_runtime = try authority.types.runtime.load(std.testing.allocator, work.io, real_runtime_json_path);
+            defer parsed_real_runtime.deinit();
+            const published_real_contract = parsed_real_runtime.value.value;
+            break :blk .{
+                .azure_runtime = real_runtime_json_path,
+                .azure = try work.a.dupe(u8, published_real_contract.launcher.path),
+                .uploader = uploader_path,
+                .validator = tools.validator,
+                .supervisor = tools.supervisor,
+                .az_python = try work.a.dupe(u8, published_real_contract.interpreter.path),
+            };
+        }
+
+        break :blk synthetic_tool_paths;
     };
 
     const created_meta = try created_candidate.metadata(null);
@@ -1539,6 +1896,80 @@ fn liveImportedAuthorityComposition(
             try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, plan_tamper_res.term);
             try std.testing.expectEqualStrings("", plan_tamper_res.stdout);
             try std.testing.expect(plan_tamper_res.stderr.len > 0);
+        }
+        {
+            var parsed_bound_runtime = try authority.types.runtime.load(std.testing.allocator, work.io, tool_paths.azure_runtime);
+            defer parsed_bound_runtime.deinit();
+            const bound_contract = parsed_bound_runtime.value.value;
+            var dso_index: usize = 0;
+            for (bound_contract.loader_dependencies, 0..) |dep, idx| {
+                if (!std.mem.eql(u8, dep.path, bound_contract.dynamic_loader.path)) {
+                    dso_index = idx;
+                    break;
+                }
+            }
+            const dso_path = bound_contract.loader_dependencies[dso_index].path;
+            const dso_dir_path = std.fs.path.dirname(dso_path) orelse return error.InvalidPath;
+            const dso_name = std.fs.path.basename(dso_path);
+            const dso_dir = try std.Io.Dir.openDirAbsolute(work.io, dso_dir_path, .{ .iterate = true, .follow_symlinks = false });
+            defer dso_dir.close(work.io);
+            const dso_ro = try dso_dir.openFile(work.io, dso_name, .{ .follow_symlinks = false });
+            if (std.os.linux.errno(std.os.linux.fchmod(dso_ro.handle, 0o600)) != .SUCCESS) {
+                dso_ro.close(work.io);
+                return error.FixtureMode;
+            }
+            dso_ro.close(work.io);
+            const dso_rw = try dso_dir.openFile(work.io, dso_name, .{ .mode = .read_write, .follow_symlinks = false });
+            var first_byte: [1]u8 = undefined;
+            try std.testing.expectEqual(@as(usize, 1), try dso_rw.readPositionalAll(work.io, &first_byte, 0));
+            const flipped: [1]u8 = .{first_byte[0] ^ 0xff};
+            try dso_rw.writePositionalAll(work.io, &flipped, 0);
+            try dso_rw.sync(work.io);
+            if (std.os.linux.errno(std.os.linux.fchmod(dso_rw.handle, 0o400)) != .SUCCESS) {
+                dso_rw.close(work.io);
+                return error.FixtureMode;
+            }
+            dso_rw.close(work.io);
+
+            var noop_ctx: u8 = 0;
+            const noop_barrier: authority.transaction.Barrier = .{ .context = &noop_ctx, .check = noopBarrierCheck };
+            const bound_runtime_dir = try std.Io.Dir.openDirAbsolute(work.io, bound_contract.root, .{ .iterate = true, .follow_symlinks = false });
+            defer bound_runtime_dir.close(work.io);
+            const bound_output_path = std.fs.path.dirname(tool_paths.azure_runtime) orelse return error.InvalidPath;
+            const bound_layout: authority.types.RuntimeLayout = .{
+                .output = bound_output_path,
+                .root = bound_contract.root,
+                .python_version = bound_contract.python_version,
+                .launcher = bound_contract.launcher.path,
+                .interpreter = bound_contract.interpreter.path,
+                .loader_directory = dso_dir_path,
+                .extensions = bound_contract.extensions,
+                .startup_config = try std.fs.path.join(work.a, &.{ bound_output_path, "startup-config" }),
+            };
+            try std.testing.expectError(error.AzureRuntimeChanged, authority.runtime_probes.inspectCopied(ctx, .{
+                .root = bound_runtime_dir,
+                .layout = bound_layout,
+                .contract = bound_contract,
+                .barrier = noop_barrier,
+            }));
+            try std.testing.expectError(error.AzureRuntimeChanged, admitted.revalidate());
+
+            for ([_][]const []const u8{
+                &.{ tools.validator, "azure-runtime", tool_paths.azure_runtime },
+                &.{ tools.validator, "plan", plan_commitments.plan_artifact.path, plan_commitments.template_artifact.path },
+                &.{ tools.validator, "authorization", plan_commitments.plan_artifact.path, denied_artifact.path },
+                &.{ tools.validator, "authorization", plan_commitments.plan_artifact.path, approved_artifact.path },
+                &.{ tools.validator, "admission", admission_artifact.path },
+            }) |argv| {
+                const dso_tamper_res = try std.process.run(work.a, work.io, .{
+                    .argv = argv,
+                    .stdout_limit = .limited(4096),
+                    .stderr_limit = .limited(4096),
+                });
+                try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, dso_tamper_res.term);
+                try std.testing.expectEqualStrings("", dso_tamper_res.stdout);
+                try std.testing.expectEqualStrings("WAMR direct validation refused: AzureRuntimeChanged\n", dso_tamper_res.stderr);
+            }
         }
         {
             const ledger_dir = try authority_dir.openDir(work.io, "ledger", .{});
