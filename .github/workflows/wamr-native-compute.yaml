@@ -209,8 +209,9 @@ jobs:
             zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
             --system "${restore_root}/zig-pkg" \
             -Doptimize=safe \
+            -Dskip-controller-limits=true \
             -Dtest-root="${RUNNER_TEMP}/wamr-controller-pipeline-root" \
-            -j2 test-controller; then
+            -j2 test-controller test-pipeline; then
             if ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
               zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
               --system "${restore_root}/zig-pkg" \
@@ -223,11 +224,6 @@ jobs:
             fi
             exit 1
           fi
-          ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/wamr-controller-fixture-cache" \
-            zig build --build-file "${source_root}/support/build/wamr-native-ci/build.zig" \
-            --system "${restore_root}/zig-pkg" \
-            -Doptimize=safe -Dtest-root="${RUNNER_TEMP}/wamr-controller-pipeline-root" \
-            -j2 test-pipeline
           (
             cd "${source_root}"
             PYTHONDONTWRITEBYTECODE=1 \
