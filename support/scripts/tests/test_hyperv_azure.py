@@ -3818,6 +3818,8 @@ class HypervWorkflowTest(unittest.TestCase):
             workflow.index("GITHUB_STEP_SUMMARY"),
         )
         for token in (
+            'stage_upload_zip="${GITHUB_WORKSPACE}/.d/wamr-public-source-bundle/tiny-aot-public-source.zip"',
+            '"${controller}" private-export \\',
             '"${controller}" private-validate \\',
             '"${controller}" public-archive \\',
             '"${controller}" verify-public-source-bundle \\',
@@ -3828,6 +3830,9 @@ class HypervWorkflowTest(unittest.TestCase):
             '"${controller}" candidate \\',
             '"${controller}" candidate-inspect \\',
             '"${controller}" candidate-result \\',
+            '--serial-first "${native_parity}/native-import/boots/vpc-x2apic/serial" \\',
+            '--serial-second "${native_parity}/serial-second.log" \\',
+            '"${comparator}" --request "${native_parity}/compare-export-bundle.json"',
             '"${comparator}" --request "${native_parity}/compare-redownload-bundle.json"',
             '"${comparator}" --request "${native_parity}/compare-candidate.json"',
         ):

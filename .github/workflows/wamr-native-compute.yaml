@@ -885,7 +885,7 @@ jobs:
           validator=/d/wamr-ci/wamr-native-runtime/compute/public-source/validator-build/public-source/tools/bin/uk-wamr-direct-validate
           comparator="${RUNNER_TEMP}/wamr-handoff-shadow-safe-tools/bin/wamr-handoff-shadow-compare"
           handoff_stage=/d/wamr-ci/wamr-native-runtime/compute/public-source/handoff
-          stage_upload_zip=/d/wamr-ci/wamr-native-runtime/compute/public-source/stage-upload/tiny-aot-public-source.zip
+          stage_upload_zip="${GITHUB_WORKSPACE}/.d/wamr-public-source-bundle/tiny-aot-public-source.zip"
           redownloaded_inner_zip="${DOWNLOAD_DIR}/tiny-aot-public-source.zip"
           native_parity=/d/wamr-ci/wamr-native-public-parity
           native_seal=/d/wamr-native-public-source-upload
@@ -897,6 +897,9 @@ jobs:
           test ! -e "${native_parity}"
           test ! -e "${native_seal}"
           mkdir -m 700 "${native_parity}"
+          "${controller}" private-export \
+            --runtime /d/wamr-ci/wamr-native-runtime \
+            --output "${native_parity}/private-export"
           "${controller}" private-validate \
             --stage-root "${handoff_stage}" \
             --git /usr/bin/git \
@@ -1025,7 +1028,8 @@ jobs:
             --validator "${validator}" \
             --supervisor "${supervisor}" \
             --artifact-id "${ARTIFACT_ID}" \
-            --container-digest "${native_container_sha256}"
+            --container-digest "${native_container_sha256}" \
+            --native-import-revalidation
           for name in portable-bundle.json public-source.json transport.json; do
             cmp -s "${native_parity}/native-import/${name}" "${native_parity}/python-import/${name}"
           done
@@ -1040,10 +1044,10 @@ jobs:
             --supervisor "${supervisor}" \
             --validator "${validator}" \
             --attempt-id "${attempt_id}"
-          python3 support/build/wamr-native-ci/handoff.py candidate \
-            --bundle "${native_parity}/python-import/bundle.json" \
-            --output "${native_parity}/python-candidate.json" \
-            --attempt-id "${attempt_id}"
+          python3 -B -c 'from pathlib import Path; import sys; sys.path.insert(0, "support/build/wamr-native-ci"); import handoff; handoff.candidate_plan(Path(sys.argv[1]), Path(sys.argv[2]), attempt_id=sys.argv[3])' \
+            "${native_parity}/python-import/bundle.json" \
+            "${native_parity}/python-candidate.json" \
+            "${attempt_id}"
           "${controller}" candidate-inspect \
             --bundle "${native_parity}/native-import/bundle.json" \
             --candidate "${native_parity}/native-candidate.json" \
@@ -1054,6 +1058,27 @@ jobs:
           "${validator}" candidate "${native_parity}/python-candidate.json" \
             > "${native_parity}/python-inspect.stdout"
           cmp -s "${native_parity}/native-inspect.stdout" "${native_parity}/python-inspect.stdout"
+          python3 -B - "${native_parity}" <<'PY'
+          import os
+          from pathlib import Path
+          import sys
+
+          root = Path(sys.argv[1])
+          serial = (root / "native-import/boots/vpc-x2apic/serial").read_bytes()
+          for name, payload in (
+              ("serial-second.log", serial + serial + b"\x00\x00"),
+              ("serial-incomplete.log", b"Calling main(0, 0)\n"),
+          ):
+              fd = os.open(
+                  root / name,
+                  os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                  0o600,
+              )
+              with os.fdopen(fd, "wb") as handle:
+                  handle.write(payload)
+                  handle.flush()
+                  os.fsync(handle.fileno())
+          PY
           "${controller}" candidate-result \
             --bundle "${native_parity}/native-import/bundle.json" \
             --candidate "${native_parity}/native-candidate.json" \
@@ -1061,21 +1086,41 @@ jobs:
             --git /usr/bin/git \
             --supervisor "${supervisor}" \
             --validator "${validator}" \
-            --serial-first "${native_parity}/native-import/boots/vpc-x2apic/serial.log" \
-            --serial-second "${native_parity}/native-import/boots/vpc-legacy-apic/serial.log" \
+            --serial-first "${native_parity}/native-import/boots/vpc-x2apic/serial" \
+            --serial-second "${native_parity}/serial-second.log" \
             > "${native_parity}/native-result.json"
           "${validator}" serial "${native_parity}/python-candidate.json" \
-            "${native_parity}/python-import/boots/vpc-x2apic/serial.log" \
-            "${native_parity}/python-import/boots/vpc-legacy-apic/serial.log" \
+            "${native_parity}/python-import/boots/vpc-x2apic/serial" \
+            "${native_parity}/serial-second.log" \
             > "${native_parity}/python-result.json"
           cmp -s "${native_parity}/native-result.json" "${native_parity}/python-result.json"
-          python3 -B - "${native_parity}" "${imported}" <<'PY'
+          set +e
+          "${controller}" candidate-result \
+            --bundle "${native_parity}/native-import/bundle.json" \
+            --candidate "${native_parity}/native-candidate.json" \
+            --validation-output "${native_parity}/incomplete-validation" \
+            --git /usr/bin/git \
+            --supervisor "${supervisor}" \
+            --validator "${validator}" \
+            --serial-first "${native_parity}/serial-incomplete.log" \
+            > "${native_parity}/native-incomplete.stdout"
+          native_incomplete_rc=$?
+          "${validator}" serial "${native_parity}/python-candidate.json" \
+            "${native_parity}/serial-incomplete.log" \
+            > "${native_parity}/python-incomplete.stdout"
+          python_incomplete_rc=$?
+          set -e
+          test "${native_incomplete_rc}" -eq 2
+          test "${python_incomplete_rc}" -eq 2
+          test ! -s "${native_parity}/native-incomplete.stdout"
+          test ! -s "${native_parity}/python-incomplete.stdout"
+          python3 -B - "${native_parity}" "${handoff_stage}" "${imported}" <<'PY'
           import json
           import os
           from pathlib import Path
           import sys
 
-          root, imported = map(Path, sys.argv[1:])
+          root, handoff_stage, imported = map(Path, sys.argv[1:])
 
           def canonical(value):
               return (
@@ -1100,10 +1145,31 @@ jobs:
                   handle.flush()
                   os.fsync(handle.fileno())
 
+          private_export = root / "private-export"
           native_import = root / "native-import"
           python_import = root / "python-import"
           native_candidate = root / "native-candidate.json"
           python_candidate = root / "python-candidate.json"
+          write_private(
+              root / "compare-export-bundle.json",
+              canonical({
+                  "mode": "bundle",
+                  "native_roots": {
+                      "bundle": str(private_export),
+                      "candidate": str(root / "private-export-candidate.json"),
+                  },
+                  "python_roots": {
+                      "bundle": str(handoff_stage),
+                      "candidate": str(handoff_stage.parent / "candidate.json"),
+                  },
+                  "native": {
+                      "bundle": (private_export / "bundle.json").read_text(),
+                  },
+                  "python": {
+                      "bundle": (handoff_stage / "bundle.json").read_text(),
+                  },
+              }),
+          )
           write_private(
               root / "compare-redownload-bundle.json",
               canonical({
@@ -1155,6 +1221,7 @@ jobs:
               }),
           )
           PY
+          "${comparator}" --request "${native_parity}/compare-export-bundle.json"
           "${comparator}" --request "${native_parity}/compare-redownload-bundle.json"
           "${comparator}" --request "${native_parity}/compare-candidate.json"
 

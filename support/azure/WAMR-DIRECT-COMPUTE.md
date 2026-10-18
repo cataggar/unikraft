@@ -406,8 +406,7 @@ uk-wamr-native-ci candidate-result \
   --git "$GIT" \
   --supervisor "$NATIVE_CONTROLLER" \
   --validator "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" \
-  --serial-first "$PRIVATE_PARENT/FRESH-native-imported-image/boots/vpc-x2apic/serial.log" \
-  --serial-second "$PRIVATE_PARENT/FRESH-native-imported-image/boots/vpc-legacy-apic/serial.log"
+  --serial-first "$PRIVATE_PARENT/FRESH-native-imported-image/boots/vpc-x2apic/serial"
 ```
 
 The importer requires both locally reviewed native executables explicitly;
