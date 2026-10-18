@@ -771,7 +771,13 @@ test "CLI prepare-azure-runtime stages real x86_64 ELF Python closure and execut
 
     const plan_path = try std.fs.path.join(allocator, &.{ auth_chain_path, "plan.json" });
     const template_path = try std.fs.path.join(allocator, &.{ auth_chain_path, "template.json" });
+    const denied_path = try std.fs.path.join(allocator, &.{ auth_chain_path, "denied.json" });
     const approved_path = try std.fs.path.join(allocator, &.{ auth_chain_path, "approved.json" });
+    const admission_path = try std.fs.path.join(allocator, &.{ auth_chain_path, "admission.json" });
+    const serial_path = try std.fs.path.join(allocator, &.{ auth_chain_path, "boots/raw-x2apic/serial" });
+    auth_chain_dir.deleteFile(io, "denied.json") catch {};
+    auth_chain_dir.deleteFile(io, "approved.json") catch {};
+    auth_chain_dir.deleteFile(io, "admission.json") catch {};
 
     {
         const val_now = try core.process.monotonicNanoseconds();
@@ -792,6 +798,42 @@ test "CLI prepare-azure-runtime stages real x86_64 ELF Python closure and execut
     }
 
     const now_unix: i128 = std.Io.Clock.real.now(io).toSeconds();
+    const denied_artifact: authority.types.Artifact = blk: {
+        var parsed_denied = try authority.cli.parse(a, &.{
+            "record-authorization",
+            try std.fmt.allocPrint(allocator, "--plan={s}", .{plan_path}),
+            try std.fmt.allocPrint(allocator, "--template={s}", .{template_path}),
+            try std.fmt.allocPrint(allocator, "--output={s}", .{denied_path}),
+            "--decision=denied",
+            "--approver=real-elf-operator",
+            "--reference=real-elf-closure-denied-reference",
+            try std.fmt.allocPrint(allocator, "--recorded-unix={d}", .{now_unix - 1}),
+            try std.fmt.allocPrint(allocator, "--expires-unix={d}", .{now_unix + 600}),
+            try std.fmt.allocPrint(allocator, "--azure={s}", .{plan_val.tools.azure.path}),
+            try std.fmt.allocPrint(allocator, "--uploader={s}", .{plan_val.tools.uploader.path}),
+            try std.fmt.allocPrint(allocator, "--validator={s}", .{plan_val.tools.validator.path}),
+            try std.fmt.allocPrint(allocator, "--supervisor={s}", .{plan_val.tools.supervisor.path}),
+            try std.fmt.allocPrint(allocator, "--az-python={s}", .{plan_val.tools.az_python.path}),
+            try std.fmt.allocPrint(allocator, "--azure-runtime={s}", .{plan_val.azure_runtime_document.path}),
+        });
+        defer parsed_denied.deinit();
+
+        const denied_outcome = authority.handlers.run(.{ .retained = ctx }, parsed_denied.result.command).authorization;
+        const recorded_denied = switch (denied_outcome) {
+            .success => |owner| owner,
+            .refused, .poisoned => return error.RealElfDeniedAuthorizationRefused,
+        };
+        defer recorded_denied.deinit();
+        try recorded_denied.revalidate();
+        try std.testing.expectEqual(authority.types.Decision.denied, recorded_denied.value().decision);
+        const raw = recorded_denied.artifact();
+        break :blk .{
+            .path = denied_path,
+            .size = raw.size,
+            .sha256 = try allocator.dupe(u8, raw.sha256),
+        };
+    };
+
     var parsed_auth = try authority.cli.parse(a, &.{
         "record-authorization",
         try std.fmt.allocPrint(allocator, "--plan={s}", .{plan_path}),
@@ -820,11 +862,11 @@ test "CLI prepare-azure-runtime stages real x86_64 ELF Python closure and execut
     try recorded_auth.revalidate();
     try std.testing.expectEqual(authority.types.Decision.approved, recorded_auth.value().decision);
 
-    {
+    inline for (.{ denied_path, approved_path }) |auth_path| {
         const val_now = try core.process.monotonicNanoseconds();
         var val_res = try authority.transaction.supervise(ctx, .{
             .executable = validator_exec,
-            .argv = &.{ validator_path, "authorization", plan_path, approved_path },
+            .argv = &.{ validator_path, "authorization", plan_path, auth_path },
             .cwd = dir,
             .environment = &validator_env,
             .primary_deadline = .{ .expires_ns = val_now + 30 * std.time.ns_per_s },
@@ -836,6 +878,157 @@ test "CLI prepare-azure-runtime stages real x86_64 ELF Python closure and execut
         try std.testing.expect(val_res.succeeded());
         try std.testing.expectEqualStrings("", val_res.result.stdout);
         try std.testing.expectEqualStrings("", val_res.result.stderr);
+    }
+
+    {
+        const val_now = try core.process.monotonicNanoseconds();
+        var val_res = try authority.transaction.supervise(ctx, .{
+            .executable = validator_exec,
+            .argv = &.{ validator_path, "authorization", plan_path, template_path },
+            .cwd = dir,
+            .environment = &validator_env,
+            .primary_deadline = .{ .expires_ns = val_now + 30 * std.time.ns_per_s },
+            .cleanup_deadline = .{ .expires_ns = val_now + 35 * std.time.ns_per_s },
+            .limits = .{ .stdout_bytes = 4096, .stderr_bytes = 4096 },
+            .snapshot_executable = true,
+        }, noop_barrier);
+        defer val_res.deinit(a);
+        try std.testing.expect(!val_res.succeeded());
+        try std.testing.expectEqual(core.process.CommandPrimary{ .exited = 1 }, val_res.result.primary);
+        try std.testing.expectEqualStrings("", val_res.result.stdout);
+        try std.testing.expectEqualStrings("WAMR direct validation refused: UnexpectedFields\n", val_res.result.stderr);
+    }
+
+    const plan_artifact: authority.types.Artifact = .{
+        .path = plan_path,
+        .size = plan_bytes.len,
+        .sha256 = &plan_sha256,
+    };
+    const approved_artifact = recorded_auth.artifact();
+
+    // CLI admit refuses denied authorization on the real ELF closure before candidate custody.
+    {
+        const denied_admit_out = try std.fs.path.join(allocator, &.{ auth_chain_path, "denied-admission.json" });
+        var parsed_denied_admit = try authority.cli.parse(a, &.{
+            "admit",
+            try std.fmt.allocPrint(allocator, "--plan={s}", .{plan_path}),
+            try std.fmt.allocPrint(allocator, "--authorization={s}", .{denied_path}),
+            try std.fmt.allocPrint(allocator, "--output={s}", .{denied_admit_out}),
+            try std.fmt.allocPrint(allocator, "--azure={s}", .{plan_val.tools.azure.path}),
+            try std.fmt.allocPrint(allocator, "--uploader={s}", .{plan_val.tools.uploader.path}),
+            try std.fmt.allocPrint(allocator, "--validator={s}", .{plan_val.tools.validator.path}),
+            try std.fmt.allocPrint(allocator, "--supervisor={s}", .{plan_val.tools.supervisor.path}),
+            try std.fmt.allocPrint(allocator, "--az-python={s}", .{plan_val.tools.az_python.path}),
+            try std.fmt.allocPrint(allocator, "--azure-runtime={s}", .{plan_val.azure_runtime_document.path}),
+        });
+        defer parsed_denied_admit.deinit();
+        const denied_admit_outcome = authority.handlers.run(.{
+            .retained = ctx,
+            .plan_commitment = plan_artifact,
+            .authorization_commitment = denied_artifact,
+        }, parsed_denied_admit.result.command).admission;
+        try std.testing.expect(denied_admit_outcome == .refused);
+        try std.testing.expectEqual(authority.types.Phase.inputs, denied_admit_outcome.refused.phase);
+        try std.testing.expectEqual(error.NotAuthorized, denied_admit_outcome.refused.err);
+        try std.testing.expectEqual(core.private_files.CommitStatus.not_committed, denied_admit_outcome.refused.publication);
+    }
+
+    // CLI admit refuses mismatched tool bindings on the real ELF closure.
+    {
+        const bad_tool_admit_out = try std.fs.path.join(allocator, &.{ auth_chain_path, "bad-tool-admission.json" });
+        var parsed_bad_tool_admit = try authority.cli.parse(a, &.{
+            "admit",
+            try std.fmt.allocPrint(allocator, "--plan={s}", .{plan_path}),
+            try std.fmt.allocPrint(allocator, "--authorization={s}", .{approved_path}),
+            try std.fmt.allocPrint(allocator, "--output={s}", .{bad_tool_admit_out}),
+            try std.fmt.allocPrint(allocator, "--azure={s}", .{plan_val.tools.azure.path}),
+            "--uploader=/wrong/uploader",
+            try std.fmt.allocPrint(allocator, "--validator={s}", .{plan_val.tools.validator.path}),
+            try std.fmt.allocPrint(allocator, "--supervisor={s}", .{plan_val.tools.supervisor.path}),
+            try std.fmt.allocPrint(allocator, "--az-python={s}", .{plan_val.tools.az_python.path}),
+            try std.fmt.allocPrint(allocator, "--azure-runtime={s}", .{plan_val.azure_runtime_document.path}),
+        });
+        defer parsed_bad_tool_admit.deinit();
+        const bad_tool_admit_outcome = authority.handlers.run(.{
+            .retained = ctx,
+            .plan_commitment = plan_artifact,
+            .authorization_commitment = approved_artifact,
+        }, parsed_bad_tool_admit.result.command).admission;
+        try std.testing.expect(bad_tool_admit_outcome == .refused);
+        try std.testing.expectEqual(authority.types.Phase.inputs, bad_tool_admit_outcome.refused.phase);
+        try std.testing.expectEqual(error.ToolBindingMismatch, bad_tool_admit_outcome.refused.err);
+        try std.testing.expectEqual(core.private_files.CommitStatus.not_committed, bad_tool_admit_outcome.refused.publication);
+    }
+
+    // CLI admit with approved authorization and matching tool bindings validates inputs and reaches custody.
+    {
+        const no_owner_admit_out = try std.fs.path.join(allocator, &.{ auth_chain_path, "no-owner-admission.json" });
+        var parsed_admit = try authority.cli.parse(a, &.{
+            "admit",
+            try std.fmt.allocPrint(allocator, "--plan={s}", .{plan_path}),
+            try std.fmt.allocPrint(allocator, "--authorization={s}", .{approved_path}),
+            try std.fmt.allocPrint(allocator, "--output={s}", .{no_owner_admit_out}),
+            try std.fmt.allocPrint(allocator, "--azure={s}", .{plan_val.tools.azure.path}),
+            try std.fmt.allocPrint(allocator, "--uploader={s}", .{plan_val.tools.uploader.path}),
+            try std.fmt.allocPrint(allocator, "--validator={s}", .{plan_val.tools.validator.path}),
+            try std.fmt.allocPrint(allocator, "--supervisor={s}", .{plan_val.tools.supervisor.path}),
+            try std.fmt.allocPrint(allocator, "--az-python={s}", .{plan_val.tools.az_python.path}),
+            try std.fmt.allocPrint(allocator, "--azure-runtime={s}", .{plan_val.azure_runtime_document.path}),
+        });
+        defer parsed_admit.deinit();
+        const admit_outcome = authority.handlers.run(.{
+            .retained = ctx,
+            .plan_commitment = plan_artifact,
+            .authorization_commitment = approved_artifact,
+        }, parsed_admit.result.command).admission;
+        try std.testing.expect(admit_outcome == .refused);
+        try std.testing.expectEqual(authority.types.Phase.custody, admit_outcome.refused.phase);
+        try std.testing.expectEqual(error.MissingCandidateOwner, admit_outcome.refused.err);
+        try std.testing.expectEqual(core.private_files.CommitStatus.not_committed, admit_outcome.refused.publication);
+    }
+
+    // Produce canonical v2 admission.json bound to the real ELF runtime closure and validate all admission modes.
+    const admission_now_unix: u64 = @intCast(now_unix);
+    const admission_val = try authority.records.admission(
+        plan_val,
+        plan_artifact,
+        recorded_auth.value(),
+        approved_artifact,
+        admission_now_unix,
+    );
+    const admission_bytes = try authority.records.admissionBytes(allocator, admission_val, admission_now_unix);
+    try write(auth_chain_dir, "admission.json", admission_bytes, 0o600);
+
+    inline for (.{
+        &[_][]const u8{ validator_path, "admission", admission_path },
+        &[_][]const u8{ validator_path, "stored-scope", admission_path },
+        &[_][]const u8{ validator_path, "inputs", admission_path },
+        &[_][]const u8{ validator_path, "ledger", admission_path, plan_val.ledger_path },
+        &[_][]const u8{ validator_path, "ledger-proposal", plan_val.ledger_path, plan_val.campaign_id, plan_val.ledger.ledger_id },
+        &[_][]const u8{ validator_path, "serial", admission_path, serial_path },
+    }) |val_argv| {
+        const val_now = try core.process.monotonicNanoseconds();
+        var val_res = try authority.transaction.supervise(ctx, .{
+            .executable = validator_exec,
+            .argv = val_argv,
+            .cwd = dir,
+            .environment = &validator_env,
+            .primary_deadline = .{ .expires_ns = val_now + 30 * std.time.ns_per_s },
+            .cleanup_deadline = .{ .expires_ns = val_now + 35 * std.time.ns_per_s },
+            .limits = .{ .stdout_bytes = 16 * 1024, .stderr_bytes = 4096 },
+            .snapshot_executable = true,
+        }, noop_barrier);
+        defer val_res.deinit(a);
+        try std.testing.expect(val_res.succeeded());
+        try std.testing.expectEqualStrings("", val_res.result.stderr);
+        if (std.mem.eql(u8, val_argv[1], "ledger-proposal")) {
+            try std.testing.expect(std.mem.indexOf(u8, val_res.result.stdout, "\"schema\":\"uk.wamr.azure-campaign-ledger-binding\"") != null);
+        } else if (std.mem.eql(u8, val_argv[1], "serial")) {
+            try std.testing.expect(std.mem.indexOf(u8, val_res.result.stdout, "\"workload\":\"tiny\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, val_res.result.stdout, "\"answer\":42") != null);
+        } else {
+            try std.testing.expectEqualStrings("", val_res.result.stdout);
+        }
     }
 
     // Post-publication tamper refusal: mutating a copied DSO in the real ELF closure
@@ -918,7 +1111,9 @@ test "CLI prepare-azure-runtime stages real x86_64 ELF Python closure and execut
         inline for (.{
             &[_][]const u8{ validator_path, "azure-runtime", runtime_json_path },
             &[_][]const u8{ validator_path, "plan", plan_path, template_path },
+            &[_][]const u8{ validator_path, "authorization", plan_path, denied_path },
             &[_][]const u8{ validator_path, "authorization", plan_path, approved_path },
+            &[_][]const u8{ validator_path, "admission", admission_path },
         }) |val_argv| {
             const val_now = try core.process.monotonicNanoseconds();
             var val_res = try authority.transaction.supervise(ctx, .{
