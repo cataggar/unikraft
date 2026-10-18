@@ -377,15 +377,34 @@ def execute(command, output, environment):
 
 def load_oracle(repository):
     # No monkeypatching, fabricated accepted owners or exception fallback.
+    object_repository = (
+        repository
+        if (Path(repository) / ".git").exists()
+        else HERE.parents[3]
+    )
     return [
         load_oracle_module(
             name,
-            HERE.parents[3],
+            object_repository,
             producer=repository,
             module_name="shadow_frozen_" + name,
         )
         for name in ("handoff", "public_bundle")
     ]
+
+
+def assert_oracle_custody_closure(before, producer, reader):
+    require(str(HERE / "handoff_shadow.py") in before, "unbound test driver")
+    require(str(HERE / "historical_controller_fixture.py") in before,
+            "unbound frozen Python oracle closure")
+    require(str(BOUNDED_PROCESS_PATH) in before, "unbound shared capture helper")
+    for repository in (producer, reader):
+        for name in ("handoff.py", "public_bundle.py", "accepted_records.py"):
+            require(str(repository / "support/build/wamr-native-ci" / name) in before,
+                    "unbound frozen Python oracle closure")
+        run_py = repository / "support/build/wamr-native-ci/run.py"
+        if run_py.exists() or run_py.is_symlink():
+            require(str(run_py) in before, "unbound frozen Python oracle closure")
 
 
 def worker(args):
@@ -637,12 +656,7 @@ def run_stagewise(manifest_path, output_path):
             and read(runtime / "evidence/runtime-cleanup.txt", 128)
             == b"primary=0 cleanup=0\n", "genuine result/cleanup missing")
     require(all(path in before for path in tools.values()), "incomplete tool closure")
-    require(str(HERE / "handoff_shadow.py") in before, "unbound test driver")
-    require(str(BOUNDED_PROCESS_PATH) in before, "unbound shared capture helper")
-    for repository in (producer, reader):
-        for name in ("handoff.py", "public_bundle.py", "accepted_records.py", "run.py"):
-            require(str(repository / "support/build/wamr-native-ci" / name) in before,
-                    "unbound frozen Python oracle closure")
+    assert_oracle_custody_closure(before, producer, reader)
     input_before = {name: hash_file(path) for name, path in paths.items()}
     input_before["manifest"] = hash_file(manifest_path)
     download_before = snapshot(download)

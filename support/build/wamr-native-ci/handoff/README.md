@@ -426,7 +426,10 @@ The driver re-enumerates/re-hashes these live trees before and after; extras,
 removals, link/target changes, same-byte replacement and metadata changes refuse.
 Downloads, selected assets and witness product trees still forbid links.
 All producer `runtime_inputs`, result/cleanup, executable pins, test driver,
-and both original frozen Python oracle closures must be covered.
+`historical_controller_fixture.py`, `producer_objects`, and both checkouts'
+frozen Python oracle files (`handoff.py`, `public_bundle.py`,
+`accepted_records.py`, plus `run.py` when present in a pre-retirement checkout)
+must be covered.
 Use immutable source/object/input subtrees, not mutable validation/cache/output
 parents. Each inventory is bounded to 65,536 entries, depth 32, 8 GiB total
 and 2 GiB per file. Input JSON records (including custody) are also bounded to

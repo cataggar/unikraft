@@ -567,6 +567,51 @@ class ShadowWitness(unittest.TestCase):
         self.assertEqual(receipt["stdout"]["size"], 0)
         self.assertEqual(receipt["stderr"]["size"], 0)
 
+    def test_oracle_custody_closure_binds_historical_fixture_and_optional_run_py(self):
+        producer = self.root / "producer"
+        reader = self.root / "reader"
+        for repository in (producer, reader):
+            ci_dir = repository / "support/build/wamr-native-ci"
+            ci_dir.mkdir(parents=True, exist_ok=True)
+            for name in ("handoff.py", "public_bundle.py", "accepted_records.py"):
+                (ci_dir / name).write_text("# fixture\n", encoding="utf-8")
+        base_before = {
+            str(shadow.HERE / "handoff_shadow.py"): {},
+            str(shadow.HERE / "historical_controller_fixture.py"): {},
+            str(shadow.BOUNDED_PROCESS_PATH): {},
+        }
+        for repository in (producer, reader):
+            for name in ("handoff.py", "public_bundle.py", "accepted_records.py"):
+                base_before[str(repository / "support/build/wamr-native-ci" / name)] = {}
+        shadow.assert_oracle_custody_closure(base_before, producer, reader)
+        for missing_key, expected in (
+            (str(shadow.HERE / "handoff_shadow.py"), "unbound test driver"),
+            (
+                str(shadow.HERE / "historical_controller_fixture.py"),
+                "unbound frozen Python oracle closure",
+            ),
+            (str(shadow.BOUNDED_PROCESS_PATH), "unbound shared capture helper"),
+            (
+                str(producer / "support/build/wamr-native-ci/handoff.py"),
+                "unbound frozen Python oracle closure",
+            ),
+            (
+                str(reader / "support/build/wamr-native-ci/accepted_records.py"),
+                "unbound frozen Python oracle closure",
+            ),
+        ):
+            reduced = dict(base_before)
+            reduced.pop(missing_key)
+            with self.assertRaisesRegex(shadow.Refusal, expected):
+                shadow.assert_oracle_custody_closure(reduced, producer, reader)
+        legacy_run_py = producer / "support/build/wamr-native-ci/run.py"
+        legacy_run_py.write_text("# historical working-tree run.py\n", encoding="utf-8")
+        with self.assertRaisesRegex(shadow.Refusal, "unbound frozen Python oracle closure"):
+            shadow.assert_oracle_custody_closure(base_before, producer, reader)
+        with_legacy = dict(base_before)
+        with_legacy[str(legacy_run_py)] = {}
+        shadow.assert_oracle_custody_closure(with_legacy, producer, reader)
+
 
 def main():
     global COMPARATOR, PUBLICATION_PARSER, SCRATCH
