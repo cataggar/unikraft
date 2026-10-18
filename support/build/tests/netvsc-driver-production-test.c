@@ -111,6 +111,13 @@ struct mock_state {
 	unsigned int fail_send_complete;
 	unsigned int fail_rndis_init;
 	unsigned int fail_query_oid;
+	unsigned int inband_nvs_completions;
+	unsigned int rndis_init_zero_flags;
+	__u32 max_frame_size_override;
+	__u32 max_total_size_override;
+	__u32 media_connect_status_override;
+	unsigned int fail_attach_keepalive_once;
+	__u8 transfer_reserved_byte;
 	unsigned int wrong_control_id_once;
 	__u64 pending_tx[CONFIG_LIBNETVSC_TX_SLOTS * 2];
 	unsigned int pending_tx_count;
@@ -294,7 +301,8 @@ static void enqueue_completion(__u64 transaction_id, const __u8 *payload,
 
 	if (!queued || payload_length > sizeof(queued->payload))
 		abort();
-	queued->packet.type = VMBUS_PACKET_COMPLETION;
+	queued->packet.type = mock.inband_nvs_completions ?
+		VMBUS_PACKET_DATA_INBAND : VMBUS_PACKET_COMPLETION;
 	queued->packet.transaction_id = transaction_id;
 	queued->packet.payload_size = payload_length;
 	queued->payload_length = payload_length;
@@ -327,6 +335,7 @@ static void enqueue_transfer(const __u8 *message, size_t message_length,
 	queued->descriptor_length = 16;
 	queued->packet.descriptor_size = 16;
 	put16(queued->descriptor, NETVSC_NVS_RX_BUFFER_ID);
+	queued->descriptor[3] = mock.transfer_reserved_byte;
 	put32(queued->descriptor + 4, 1);
 	put32(queued->descriptor + 8, (__u32)message_length);
 	put32(queued->descriptor + 12, offset);
@@ -370,6 +379,7 @@ static void enqueue_frame_range(const __u8 *frame, size_t frame_length,
 	queued->descriptor_length = 16;
 	queued->packet.descriptor_size = 16;
 	put16(queued->descriptor, NETVSC_NVS_RX_BUFFER_ID);
+	queued->descriptor[3] = mock.transfer_reserved_byte;
 	put32(queued->descriptor + 4, 1);
 	put32(queued->descriptor + 8, range_length);
 	put32(queued->descriptor + 12, range_offset);
@@ -383,8 +393,10 @@ static void enqueue_init_complete(__u64 transaction_id, __u32 requested)
 {
 	__u8 response[MOCK_PAYLOAD] = { 0 };
 	unsigned int attempt = mock.nvs_init_attempts++;
-	__u32 status = mock.nvs_init_status ? mock.nvs_init_status :
-		(attempt < mock.nvs_accept_index ? 2 : 1);
+	__u32 reject_status = mock.nvs_init_status ? mock.nvs_init_status : 2;
+	__u32 status = attempt < mock.nvs_accept_index ? reject_status :
+		(mock.nvs_accept_index == 0 && mock.nvs_init_status ?
+		 mock.nvs_init_status : 1);
 
 	put32(response, 2);
 	put32(response + 4, requested);
@@ -442,22 +454,28 @@ static void build_query_complete(__u8 *response, size_t *response_length,
 		data_length = sizeof(current);
 		break;
 	case NETVSC_OID_GEN_MAXIMUM_FRAME_SIZE:
-		put32(scalar, 1500);
+		put32(scalar, mock.max_frame_size_override ?
+		      mock.max_frame_size_override : 1500);
 		data = scalar;
 		data_length = sizeof(scalar);
 		break;
 	case NETVSC_OID_GEN_MAXIMUM_TOTAL_SIZE:
-		put32(scalar, 1514);
+		put32(scalar, mock.max_total_size_override ?
+		      mock.max_total_size_override : 1514);
 		data = scalar;
 		data_length = sizeof(scalar);
 		break;
 	case NETVSC_OID_GEN_MEDIA_CONNECT_STATUS:
-		put32(scalar, 0);
+		put32(scalar, mock.media_connect_status_override);
 		data = scalar;
 		data_length = sizeof(scalar);
 		break;
 	default:
 		break;
+	}
+	if (oid == mock.fail_query_oid) {
+		data = NULL;
+		data_length = 0;
 	}
 	memset(response, 0, 64);
 	put32(response, NETVSC_RNDIS_QUERY_COMPLETE);
@@ -466,7 +484,7 @@ static void build_query_complete(__u8 *response, size_t *response_length,
 	put32(response + 12,
 	      oid == mock.fail_query_oid ? 0xc0000001U : 0);
 	put32(response + 16, (__u32)data_length);
-	put32(response + 20, data_length ? 16 : 0);
+	put32(response + 20, 16);
 	if (data_length)
 		memcpy(response + 24, data, data_length);
 	*response_length = 24 + data_length;
@@ -521,8 +539,8 @@ static void handle_rndis_request(__u64 transaction_id, const __u8 *request,
 		put32(response + 8, request_id);
 		put32(response + 12, mock.fail_rndis_init ? 0xc0000001U : 0);
 		put32(response + 16, 1);
-		put32(response + 20, 0);
-		put32(response + 24, 1);
+		put32(response + 20, mock.rndis_init_zero_flags ? 2 : 0);
+		put32(response + 24, mock.rndis_init_zero_flags ? 0 : 1);
 		put32(response + 28, 0);
 		put32(response + 32, 1);
 		put32(response + 36, 2048);
@@ -545,6 +563,9 @@ static void handle_rndis_request(__u64 transaction_id, const __u8 *request,
 		put32(response, NETVSC_RNDIS_KEEPALIVE_COMPLETE);
 		put32(response + 4, 16);
 		put32(response + 8, request_id);
+		put32(response + 12, mock.fail_attach_keepalive_once ?
+		      0xc0000001U : 0);
+		mock.fail_attach_keepalive_once = 0;
 		response_length = 16;
 		break;
 	case 3:
@@ -2438,11 +2459,20 @@ static int test_nvs_response_sizes_and_fallback(void)
 
 	netvsc_host_reset();
 	mock_reset();
+	mock.nvs_accept_index = 1;
+	mock.nvs_init_status = 0xffffffffU;
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	CHECK(mock.nvs_init_attempts == 2);
+	CHECK(netvsc_host_nvs_version() == NETVSC_NVS_VERSION_6);
+	netvsc_host_remove_device(&offered);
+
+	netvsc_host_reset();
+	mock_reset();
 	mock.nvs_accept_index = 0;
 	mock.nvs_init_status = 6;
 	rc = netvsc_host_add_device(&offered);
-	CHECK(rc == -EPROTO);
-	CHECK(mock.nvs_init_requests == 1);
+	CHECK(rc == -ENODEV);
+	CHECK(mock.nvs_init_requests == netvsc_nvs_version_count());
 
 	netvsc_host_reset();
 	mock_reset();
@@ -2454,6 +2484,80 @@ static int test_nvs_response_sizes_and_fallback(void)
 	mock_reset();
 	mock.nvs_accept_index = 0;
 	mock.send_response_length = 11;
+	CHECK(netvsc_host_add_device(&offered) == -EPROTO);
+	return 0;
+}
+
+static int test_vmbus60_attach_and_rx_tolerances(void)
+{
+	struct vmbus_device offered = {
+		.channel_id = 85,
+		.connection_id = 86,
+		.present = 1,
+	};
+	struct uk_netdev *netdev;
+	struct uk_netbuf *received = NULL;
+	struct mock_packet *unsolicited;
+	__u8 frame[60] = { 0x42 };
+
+	netvsc_host_reset();
+	mock_reset();
+	mock.protocol_version = 0x00060000U;
+	mock.nvs_accept_index = 1;
+	mock.nvs_init_status = 0xffffffffU;
+	mock.inband_nvs_completions = 1;
+	mock.rndis_init_zero_flags = 1;
+	mock.fail_query_oid = NETVSC_OID_GEN_MAXIMUM_FRAME_SIZE;
+	mock.media_connect_status_override = 2;
+	mock.fail_attach_keepalive_once = 1;
+	mock.transfer_reserved_byte = 0xa5;
+	unsolicited = queue_reserve();
+	CHECK(unsolicited != NULL);
+	unsolicited->packet.type = VMBUS_PACKET_DATA_INBAND;
+	unsolicited->packet.transaction_id = 0xfeedULL;
+	unsolicited->payload_length = 16;
+	unsolicited->packet.payload_size = 16;
+	put32(unsolicited->payload, 133);
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	CHECK(netvsc_host_nvs_version() == NETVSC_NVS_VERSION_6);
+	CHECK(configure_and_start(&netdev) == 0);
+	CHECK(netdev->ops->mtu_get(netdev) == 1500);
+	inject_frame(frame, sizeof(frame));
+	CHECK((netdev->rx_one(netdev, netdev->_rx_queue[0], &received) &
+	       UK_NETDEV_STATUS_SUCCESS) != 0);
+	CHECK(received != NULL && received->len == sizeof(frame));
+	CHECK(memcmp(received->data, frame, sizeof(frame)) == 0);
+	uk_netbuf_free(received);
+	netvsc_host_remove_device(&offered);
+
+	netvsc_host_reset();
+	mock_reset();
+	mock.protocol_version = 0x00060000U;
+	mock.nvs_accept_index = 1;
+	mock.inband_nvs_completions = 1;
+	mock.max_frame_size_override = 90000U;
+	mock.fail_query_oid = NETVSC_OID_GEN_MAXIMUM_TOTAL_SIZE;
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	netdev = netvsc_host_netdev();
+	CHECK(netdev->ops->mtu_get(netdev) == 1500);
+	netvsc_host_remove_device(&offered);
+
+	netvsc_host_reset();
+	mock_reset();
+	mock.protocol_version = 0x00060000U;
+	mock.nvs_accept_index = 1;
+	mock.max_frame_size_override = 1400U;
+	CHECK(netvsc_host_add_device(&offered) == 0);
+	netdev = netvsc_host_netdev();
+	CHECK(netdev->ops->mtu_get(netdev) == 1400);
+	netvsc_host_remove_device(&offered);
+
+	netvsc_host_reset();
+	mock_reset();
+	mock.protocol_version = 0x00060000U;
+	mock.nvs_accept_index = 1;
+	mock.max_frame_size_override = 60U;
+	mock.max_total_size_override = 1500U;
 	CHECK(netvsc_host_add_device(&offered) == -EPROTO);
 	return 0;
 }
@@ -2797,6 +2901,9 @@ int main(void)
 	if (rc)
 		return rc;
 	rc = test_nvs_response_sizes_and_fallback();
+	if (rc)
+		return rc;
+	rc = test_vmbus60_attach_and_rx_tolerances();
 	if (rc)
 		return rc;
 	rc = test_gpa_fallback();

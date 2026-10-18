@@ -164,9 +164,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "734af38a3d6d9a3bdf3b5703c796ae95870631a515a3a38b384965743d49cd07"
+            "be56b33917c95492a44af2c45be42002e7ffc9a63e532804d92768b0d5ccf7c9"
         ),
-        "size": 1816685,
+        "size": 1820420,
         "files": 220,
     },
     "support/kconfig": {
@@ -612,7 +612,7 @@ GUARDED_PRODUCER_FILES = {
         "9a501414e2749b031bf1fca8015d3049b9af42c74f1a0da9f514e5165e6d33cb"
     ),
     "drivers/hyperv/netvsc/netvsc.c": (
-        "f0fcc10cbdf8a7e4f439452c9d7b620ed20de3692434d85dbdc633de502b6cf4"
+        "b0a075fa064a648cdbaaa7614be2a3150b4132795042c70ca38166804462b0d9"
     ),
     "drivers/hyperv/storvsc/Config.uk": (
         "4ee6997ebb98a63bf8cc39ac219e447c5bcec0b783140d2802ba19238711b12c"

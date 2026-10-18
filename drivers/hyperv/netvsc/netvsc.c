@@ -1534,33 +1534,41 @@ static int netvsc_query_device(struct netvsc_device *device)
 	rc = netvsc_rndis_query(device, NETVSC_OID_GEN_MAXIMUM_FRAME_SIZE,
 			scalar, &length);
 	if (rc || length != sizeof(scalar)) {
-		netvsc_log_query_failure(NETVSC_OID_GEN_MAXIMUM_FRAME_SIZE,
-					 rc, length, sizeof(scalar));
-		return -EPROTO;
-	}
-	value = read_le32(scalar);
-	if (value < 68 || value > UINT16_MAX) {
-		uk_pr_err("NetVSC: RNDIS query OID %08x returned invalid "
-			  "value %u\n", NETVSC_OID_GEN_MAXIMUM_FRAME_SIZE,
-			  value);
-		return -EPROTO;
+		uk_pr_warn("NetVSC: RNDIS query OID %08x failed (%d), "
+			   "length %zu expected %zu; using default MTU %u\n",
+			   NETVSC_OID_GEN_MAXIMUM_FRAME_SIZE, rc, length,
+			   sizeof(scalar), NETVSC_DEFAULT_MTU);
+		device->max_mtu = NETVSC_DEFAULT_MTU;
+	} else {
+		value = read_le32(scalar);
+		if (value < 68U) {
+			uk_pr_warn("NetVSC: RNDIS query OID %08x returned "
+				   "invalid value %u; using default MTU %u\n",
+				   NETVSC_OID_GEN_MAXIMUM_FRAME_SIZE, value,
+				   NETVSC_DEFAULT_MTU);
+			device->max_mtu = NETVSC_DEFAULT_MTU;
+		} else if (value > UINT16_MAX) {
+			device->max_mtu = UINT16_MAX;
+		} else {
+			device->max_mtu = (__u16)value;
+		}
 	}
 	length = sizeof(scalar);
 	rc = netvsc_rndis_query(device, NETVSC_OID_GEN_MAXIMUM_TOTAL_SIZE,
 			scalar, &length);
 	if (rc || length != sizeof(scalar)) {
-		netvsc_log_query_failure(NETVSC_OID_GEN_MAXIMUM_TOTAL_SIZE,
-					 rc, length, sizeof(scalar));
-		return -EPROTO;
+		uk_pr_warn("NetVSC: RNDIS query OID %08x failed (%d), "
+			   "length %zu expected %zu; continuing with max MTU %u\n",
+			   NETVSC_OID_GEN_MAXIMUM_TOTAL_SIZE, rc, length,
+			   sizeof(scalar), device->max_mtu);
+	} else {
+		total_size = read_le32(scalar);
+		if (total_size < (__u32)device->max_mtu + NETVSC_ETH_HEADER) {
+			uk_pr_err("NetVSC: RNDIS frame/total sizes invalid: "
+				  "%u/%u\n", device->max_mtu, total_size);
+			return -EPROTO;
+		}
 	}
-	total_size = read_le32(scalar);
-	if (total_size < value ||
-	    total_size - value < NETVSC_ETH_HEADER) {
-		uk_pr_err("NetVSC: RNDIS frame/total sizes invalid: %u/%u\n",
-			  value, total_size);
-		return -EPROTO;
-	}
-	device->max_mtu = (__u16)value;
 	if (device->mtu > device->max_mtu)
 		device->mtu = device->max_mtu;
 
@@ -1569,19 +1577,28 @@ static int netvsc_query_device(struct netvsc_device *device)
 			NETVSC_OID_GEN_MEDIA_CONNECT_STATUS,
 			scalar, &length);
 	if (rc || length != sizeof(scalar)) {
-		netvsc_log_query_failure(NETVSC_OID_GEN_MEDIA_CONNECT_STATUS,
-					 rc, length, sizeof(scalar));
-		return -EPROTO;
+		uk_pr_warn("NetVSC: RNDIS query OID %08x failed (%d), "
+			   "length %zu expected %zu; assuming link up\n",
+			   NETVSC_OID_GEN_MEDIA_CONNECT_STATUS, rc, length,
+			   sizeof(scalar));
+		__atomic_store_n(&device->link_up, 1, __ATOMIC_RELEASE);
+	} else {
+		value = read_le32(scalar);
+		if (value > 1) {
+			uk_pr_warn("NetVSC: RNDIS query OID %08x returned "
+				   "unrecognized value %u; assuming link up\n",
+				   NETVSC_OID_GEN_MEDIA_CONNECT_STATUS, value);
+			__atomic_store_n(&device->link_up, 1, __ATOMIC_RELEASE);
+		} else {
+			__atomic_store_n(&device->link_up, value == 0,
+					 __ATOMIC_RELEASE);
+		}
 	}
-	value = read_le32(scalar);
-	if (value > 1) {
-		uk_pr_err("NetVSC: RNDIS query OID %08x returned invalid "
-			  "value %u\n", NETVSC_OID_GEN_MEDIA_CONNECT_STATUS,
-			  value);
-		return -EPROTO;
-	}
-	__atomic_store_n(&device->link_up, value == 0, __ATOMIC_RELEASE);
-	return netvsc_rndis_keepalive_device(device);
+	rc = netvsc_rndis_keepalive_device(device);
+	if (rc)
+		uk_pr_warn("NetVSC: initial RNDIS keepalive failed (%d); "
+			   "continuing attach\n", rc);
+	return 0;
 }
 
 static __u32 netvsc_packet_filter(const struct netvsc_device *device)
@@ -2334,6 +2351,26 @@ static void netvsc_drain_channel(struct netvsc_device *device)
 				packet.payload_size);
 			break;
 		case VMBUS_PACKET_DATA_INBAND:
+			if (packet.payload_size >= 4) {
+				__u32 message_type = 0;
+
+				if (netvsc_nvs_message_type(
+					    netvsc_payload_scratch,
+					    packet.payload_size,
+					    &message_type) == 0 &&
+				    (message_type ==
+					     NETVSC_NVS_TYPE_INIT_COMPLETE ||
+				     message_type ==
+					     NETVSC_NVS_TYPE_RECEIVE_BUFFER_COMPLETE ||
+				     message_type ==
+					     NETVSC_NVS_TYPE_SEND_BUFFER_COMPLETE ||
+				     message_type ==
+					     NETVSC_NVS_TYPE_SEND_RNDIS_COMPLETE))
+					netvsc_handle_completion(
+						device, &packet,
+						netvsc_payload_scratch,
+						packet.payload_size);
+			}
 			break;
 		default:
 			device->malformed_messages++;
