@@ -578,6 +578,7 @@ test "CLI prepare-azure-runtime stages real x86_64 ELF Python closure and execut
         },
     }, parsed_prepare.result.command).prepare;
 
+    const runtime_json_path = try std.fs.path.join(allocator, &.{ output_path, "azure-runtime.json" });
     switch (outcome) {
         .success => |prepared| {
             defer prepared.deinit();
@@ -587,7 +588,6 @@ test "CLI prepare-azure-runtime stages real x86_64 ELF Python closure and execut
             try std.testing.expectEqual(@as(usize, 19), res.evidence.probes.len);
             try std.testing.expectEqual(core.process.CommandPrimary{ .exited = 0 }, res.native_validations[0].primary);
             try std.testing.expectEqual(core.process.CommandPrimary{ .exited = 0 }, res.native_validations[1].primary);
-            return;
         },
         .refused => return error.UnexpectedEarlyRefusal,
         .poisoned => |diagnostic| {
@@ -599,95 +599,343 @@ test "CLI prepare-azure-runtime stages real x86_64 ELF Python closure and execut
             try std.testing.expectEqual(core.process.CommandPrimary{ .exited = 0 }, diagnostic.native_validation.?.primary);
             try std.testing.expect(diagnostic.native_validation.?.cleanup_complete);
             try std.testing.expect(diagnostic.helper_cleanup_complete);
+
+            const pending_path = try std.fs.path.join(allocator, &.{ output_path, "azure-runtime.pending.json" });
+            var parsed_pending = try authority.types.runtime.load(a, io, pending_path);
+            defer parsed_pending.deinit();
+            const contract = parsed_pending.value.value;
+
+            const layout: authority.types.RuntimeLayout = .{
+                .output = output_path,
+                .root = contract.root,
+                .python_version = contract.python_version,
+                .launcher = contract.launcher.path,
+                .interpreter = contract.interpreter.path,
+                .loader_directory = try std.fs.path.join(allocator, &.{ contract.root, "loader" }),
+                .extensions = contract.extensions,
+                .startup_config = try std.fs.path.join(allocator, &.{ output_path, "startup-config" }),
+            };
+
+            const runtime_dir = try std.Io.Dir.openDirAbsolute(io, contract.root, .{ .iterate = true, .follow_symlinks = false });
+            defer runtime_dir.close(io);
+            const elf_evidence = try authority.runtime_probes.inspectCopied(ctx, .{
+                .root = runtime_dir,
+                .layout = layout,
+                .contract = contract,
+                .barrier = noop_barrier,
+            });
+            try std.testing.expectEqual(@as(u32, @intCast(candidate_files.items.len + 2)), elf_evidence.native_files);
+            try std.testing.expect(elf_evidence.needed_edges >= candidate_files.items.len);
+            try std.testing.expectEqualSlices(u8, &authority.transaction.hash(host_python_info.interpreter.?), &elf_evidence.interpreter_path_sha256);
+
+            var copied_loader = try core.private_files.RetainedFile.open(io, contract.dynamic_loader.path, .tool);
+            defer copied_loader.close(io);
+            const copied_loader_exec = try core.process.Executable.fromFile(io, copied_loader.file);
+            defer copied_loader_exec.close(io);
+            const probe_cwd = try core.private_files.openDirectory(io, layout.output, .private);
+            defer probe_cwd.close(io);
+            var probe_env = try authority.runtime_probes.environment(a, layout, contract);
+            defer probe_env.deinit();
+
+            const step_count = authority.types.runtime.commands.len + 3;
+            try std.testing.expectEqual(@as(usize, 19), step_count);
+            for (0..step_count) |index| {
+                const step: authority.runtime_probes.Step = switch (index) {
+                    0 => .loader_listing,
+                    1 => .python_version,
+                    2 => .imports,
+                    else => .{ .command = @intCast(index - 3) },
+                };
+                const argv = try authority.runtime_probes.arguments(a, layout, contract, step);
+                defer a.free(argv);
+                const step_now = try core.process.monotonicNanoseconds();
+                var supervised = try authority.transaction.supervise(ctx, .{
+                    .executable = copied_loader_exec,
+                    .argv = argv,
+                    .cwd = probe_cwd,
+                    .environment = &probe_env,
+                    .primary_deadline = .{ .expires_ns = step_now + 30 * std.time.ns_per_s },
+                    .cleanup_deadline = .{ .expires_ns = step_now + 35 * std.time.ns_per_s },
+                    .capture = .{ .merged = 1024 * 1024 },
+                    .limits = .{ .stdout_bytes = 1024 * 1024, .stderr_bytes = 1024 * 1024 },
+                    .snapshot_executable = true,
+                }, noop_barrier);
+                defer supervised.deinit(a);
+                try std.testing.expect(supervised.succeeded());
+                try std.testing.expectEqual(@as(u32, 0), supervised.result.descendants.observed);
+                try std.testing.expectEqual(@as(u32, 0), supervised.result.descendants.adopted);
+                switch (step) {
+                    .loader_listing => {
+                        const entries = try authority.runtime_probes.validateListing(
+                            a,
+                            supervised.result.stdout,
+                            layout,
+                            contract,
+                            elf_evidence.interpreter_closure[0..contract.loader_dependencies.len],
+                            elf_evidence.interpreter_path_sha256,
+                        );
+                        try std.testing.expectEqual(@as(u16, @intCast(candidate_files.items.len + 1)), entries);
+                    },
+                    .python_version => try authority.runtime_probes.Test.pythonVersion(
+                        supervised.result.stdout,
+                        supervised.result.stderr,
+                        contract.python_version,
+                    ),
+                    .imports => {
+                        try std.testing.expectEqualStrings("UK-WAMR-AZURE-IMPORTS-1\n", supervised.result.stdout);
+                        try std.testing.expectEqual(@as(usize, 0), supervised.result.stderr.len);
+                    },
+                    .command => |cmd_idx| try authority.runtime_probes.Test.command(a, cmd_idx, supervised.result.stdout),
+                }
+            }
+
+            const out_dir = try std.Io.Dir.openDirAbsolute(io, output_path, .{ .follow_symlinks = false });
+            defer out_dir.close(io);
+            const pending_bytes = try out_dir.readFileAlloc(io, "azure-runtime.pending.json", allocator, .limited(65536));
+            try write(out_dir, "azure-runtime.json", pending_bytes, 0o600);
         },
     }
 
-    const pending_path = try std.fs.path.join(allocator, &.{ output_path, "azure-runtime.pending.json" });
-    var parsed_pending = try authority.types.runtime.load(a, io, pending_path);
-    defer parsed_pending.deinit();
-    const contract = parsed_pending.value.value;
+    var parsed_runtime = try authority.types.runtime.load(a, io, runtime_json_path);
+    defer parsed_runtime.deinit();
+    const published_contract = parsed_runtime.value.value;
 
-    const layout: authority.types.RuntimeLayout = .{
-        .output = output_path,
-        .root = contract.root,
-        .python_version = contract.python_version,
-        .launcher = contract.launcher.path,
-        .interpreter = contract.interpreter.path,
-        .loader_directory = try std.fs.path.join(allocator, &.{ contract.root, "loader" }),
-        .extensions = contract.extensions,
-        .startup_config = try std.fs.path.join(allocator, &.{ output_path, "startup-config" }),
-    };
+    var validator_retained = try core.private_files.RetainedFile.open(io, validator_path, .tool);
+    defer validator_retained.close(io);
+    const validator_exec = try core.process.Executable.fromFile(io, validator_retained.file);
+    defer validator_exec.close(io);
+    var validator_env = std.process.Environ.Map.init(a);
+    defer validator_env.deinit();
 
-    const runtime_dir = try std.Io.Dir.openDirAbsolute(io, contract.root, .{ .iterate = true, .follow_symlinks = false });
-    defer runtime_dir.close(io);
-    const elf_evidence = try authority.runtime_probes.inspectCopied(ctx, .{
-        .root = runtime_dir,
-        .layout = layout,
-        .contract = contract,
-        .barrier = noop_barrier,
-    });
-    try std.testing.expectEqual(@as(u32, @intCast(candidate_files.items.len + 2)), elf_evidence.native_files);
-    try std.testing.expect(elf_evidence.needed_edges >= candidate_files.items.len);
-    try std.testing.expectEqualSlices(u8, &authority.transaction.hash(host_python_info.interpreter.?), &elf_evidence.interpreter_path_sha256);
-
-    var copied_loader = try core.private_files.RetainedFile.open(io, contract.dynamic_loader.path, .tool);
-    defer copied_loader.close(io);
-    const copied_loader_exec = try core.process.Executable.fromFile(io, copied_loader.file);
-    defer copied_loader_exec.close(io);
-    const probe_cwd = try core.private_files.openDirectory(io, layout.output, .private);
-    defer probe_cwd.close(io);
-    var probe_env = try authority.runtime_probes.environment(a, layout, contract);
-    defer probe_env.deinit();
-
-    const step_count = authority.types.runtime.commands.len + 3;
-    try std.testing.expectEqual(@as(usize, 19), step_count);
-    for (0..step_count) |index| {
-        const step: authority.runtime_probes.Step = switch (index) {
-            0 => .loader_listing,
-            1 => .python_version,
-            2 => .imports,
-            else => .{ .command = @intCast(index - 3) },
-        };
-        const argv = try authority.runtime_probes.arguments(a, layout, contract, step);
-        defer a.free(argv);
-        const step_now = try core.process.monotonicNanoseconds();
-        var supervised = try authority.transaction.supervise(ctx, .{
-            .executable = copied_loader_exec,
-            .argv = argv,
-            .cwd = probe_cwd,
-            .environment = &probe_env,
-            .primary_deadline = .{ .expires_ns = step_now + 30 * std.time.ns_per_s },
-            .cleanup_deadline = .{ .expires_ns = step_now + 35 * std.time.ns_per_s },
-            .capture = .{ .merged = 1024 * 1024 },
-            .limits = .{ .stdout_bytes = 1024 * 1024, .stderr_bytes = 1024 * 1024 },
+    {
+        const val_now = try core.process.monotonicNanoseconds();
+        var val_res = try authority.transaction.supervise(ctx, .{
+            .executable = validator_exec,
+            .argv = &.{ validator_path, "azure-runtime", runtime_json_path },
+            .cwd = dir,
+            .environment = &validator_env,
+            .primary_deadline = .{ .expires_ns = val_now + 30 * std.time.ns_per_s },
+            .cleanup_deadline = .{ .expires_ns = val_now + 35 * std.time.ns_per_s },
+            .limits = .{ .stdout_bytes = 4096, .stderr_bytes = 4096 },
             .snapshot_executable = true,
         }, noop_barrier);
-        defer supervised.deinit(a);
-        try std.testing.expect(supervised.succeeded());
-        try std.testing.expectEqual(@as(u32, 0), supervised.result.descendants.observed);
-        try std.testing.expectEqual(@as(u32, 0), supervised.result.descendants.adopted);
-        switch (step) {
-            .loader_listing => {
-                const entries = try authority.runtime_probes.validateListing(
-                    a,
-                    supervised.result.stdout,
-                    layout,
-                    contract,
-                    elf_evidence.interpreter_closure[0..contract.loader_dependencies.len],
-                    elf_evidence.interpreter_path_sha256,
-                );
-                try std.testing.expectEqual(@as(u16, @intCast(candidate_files.items.len + 1)), entries);
-            },
-            .python_version => try authority.runtime_probes.Test.pythonVersion(
-                supervised.result.stdout,
-                supervised.result.stderr,
-                contract.python_version,
-            ),
-            .imports => {
-                try std.testing.expectEqualStrings("UK-WAMR-AZURE-IMPORTS-1\n", supervised.result.stdout);
-                try std.testing.expectEqual(@as(usize, 0), supervised.result.stderr.len);
-            },
-            .command => |cmd_idx| try authority.runtime_probes.Test.command(a, cmd_idx, supervised.result.stdout),
+        defer val_res.deinit(a);
+        try std.testing.expect(val_res.succeeded());
+        try std.testing.expectEqualStrings("", val_res.result.stdout);
+        try std.testing.expectEqualStrings("", val_res.result.stderr);
+        try std.testing.expectEqual(@as(u32, 0), val_res.result.descendants.observed);
+    }
+
+    const auth_chain_path = try std.fs.path.join(allocator, &.{ fixture_path, "auth-chain" });
+    const package_tool = try std.Io.Dir.cwd().realPathFileAlloc(io, options.authorization_package, allocator);
+    const native_tool = try std.Io.Dir.cwd().realPathFileAlloc(io, options.process_fixture, allocator);
+    var plan_val = try @import("test_fixtures.zig").buildAuthorizationFixture(allocator, io, auth_chain_path, package_tool, native_tool);
+    defer @import("test_fixtures.zig").cleanupAuthorizationFixture(io, auth_chain_path) catch {};
+
+    plan_val.ledger = try authority.types.compute.ledgerProposal(
+        allocator,
+        io,
+        plan_val.ledger_path,
+        plan_val.campaign_id,
+        plan_val.ledger.ledger_id,
+    );
+    const runtime_bytes = parsed_runtime.bytes.bytes();
+    const runtime_sha256 = std.fmt.bytesToHex(authority.transaction.hash(runtime_bytes), .lower);
+    plan_val.azure_runtime = published_contract;
+    plan_val.azure_runtime_document = .{
+        .path = runtime_json_path,
+        .size = runtime_bytes.len,
+        .sha256 = &runtime_sha256,
+    };
+    plan_val.tools.azure = .{
+        .path = published_contract.launcher.path,
+        .size = published_contract.launcher.size,
+        .sha256 = published_contract.launcher.sha256,
+    };
+    plan_val.tools.az_python = .{
+        .path = published_contract.interpreter.path,
+        .size = published_contract.interpreter.size,
+        .sha256 = published_contract.interpreter.sha256,
+    };
+
+    const auth_chain_dir = try std.Io.Dir.openDirAbsolute(io, auth_chain_path, .{ .follow_symlinks = false });
+    defer auth_chain_dir.close(io);
+    const plan_bytes = try authority.records.planBytes(allocator, plan_val);
+    const plan_sha256 = std.fmt.bytesToHex(authority.transaction.hash(plan_bytes), .lower);
+    const template_val = try authority.records.approvalTemplate(plan_val, &plan_sha256);
+    const template_bytes = try authority.records.templateBytes(allocator, plan_val, &plan_sha256, template_val);
+    auth_chain_dir.deleteFile(io, "plan.json") catch {};
+    auth_chain_dir.deleteFile(io, "template.json") catch {};
+    try write(auth_chain_dir, "plan.json", plan_bytes, 0o600);
+    try write(auth_chain_dir, "template.json", template_bytes, 0o600);
+
+    const plan_path = try std.fs.path.join(allocator, &.{ auth_chain_path, "plan.json" });
+    const template_path = try std.fs.path.join(allocator, &.{ auth_chain_path, "template.json" });
+    const approved_path = try std.fs.path.join(allocator, &.{ auth_chain_path, "approved.json" });
+
+    {
+        const val_now = try core.process.monotonicNanoseconds();
+        var val_res = try authority.transaction.supervise(ctx, .{
+            .executable = validator_exec,
+            .argv = &.{ validator_path, "plan", plan_path, template_path },
+            .cwd = dir,
+            .environment = &validator_env,
+            .primary_deadline = .{ .expires_ns = val_now + 30 * std.time.ns_per_s },
+            .cleanup_deadline = .{ .expires_ns = val_now + 35 * std.time.ns_per_s },
+            .limits = .{ .stdout_bytes = 4096, .stderr_bytes = 4096 },
+            .snapshot_executable = true,
+        }, noop_barrier);
+        defer val_res.deinit(a);
+        try std.testing.expect(val_res.succeeded());
+        try std.testing.expectEqualStrings("", val_res.result.stdout);
+        try std.testing.expectEqualStrings("", val_res.result.stderr);
+    }
+
+    const now_unix: i128 = std.Io.Clock.real.now(io).toSeconds();
+    var parsed_auth = try authority.cli.parse(a, &.{
+        "record-authorization",
+        try std.fmt.allocPrint(allocator, "--plan={s}", .{plan_path}),
+        try std.fmt.allocPrint(allocator, "--template={s}", .{template_path}),
+        try std.fmt.allocPrint(allocator, "--output={s}", .{approved_path}),
+        "--decision=approved",
+        "--approver=real-elf-operator",
+        "--reference=real-elf-closure-reference",
+        try std.fmt.allocPrint(allocator, "--recorded-unix={d}", .{now_unix - 1}),
+        try std.fmt.allocPrint(allocator, "--expires-unix={d}", .{now_unix + 600}),
+        try std.fmt.allocPrint(allocator, "--azure={s}", .{plan_val.tools.azure.path}),
+        try std.fmt.allocPrint(allocator, "--uploader={s}", .{plan_val.tools.uploader.path}),
+        try std.fmt.allocPrint(allocator, "--validator={s}", .{plan_val.tools.validator.path}),
+        try std.fmt.allocPrint(allocator, "--supervisor={s}", .{plan_val.tools.supervisor.path}),
+        try std.fmt.allocPrint(allocator, "--az-python={s}", .{plan_val.tools.az_python.path}),
+        try std.fmt.allocPrint(allocator, "--azure-runtime={s}", .{plan_val.azure_runtime_document.path}),
+    });
+    defer parsed_auth.deinit();
+
+    const auth_outcome = authority.handlers.run(.{ .retained = ctx }, parsed_auth.result.command).authorization;
+    const recorded_auth = switch (auth_outcome) {
+        .success => |owner| owner,
+        .refused, .poisoned => return error.RealElfAuthorizationRefused,
+    };
+    defer recorded_auth.deinit();
+    try recorded_auth.revalidate();
+    try std.testing.expectEqual(authority.types.Decision.approved, recorded_auth.value().decision);
+
+    {
+        const val_now = try core.process.monotonicNanoseconds();
+        var val_res = try authority.transaction.supervise(ctx, .{
+            .executable = validator_exec,
+            .argv = &.{ validator_path, "authorization", plan_path, approved_path },
+            .cwd = dir,
+            .environment = &validator_env,
+            .primary_deadline = .{ .expires_ns = val_now + 30 * std.time.ns_per_s },
+            .cleanup_deadline = .{ .expires_ns = val_now + 35 * std.time.ns_per_s },
+            .limits = .{ .stdout_bytes = 4096, .stderr_bytes = 4096 },
+            .snapshot_executable = true,
+        }, noop_barrier);
+        defer val_res.deinit(a);
+        try std.testing.expect(val_res.succeeded());
+        try std.testing.expectEqualStrings("", val_res.result.stdout);
+        try std.testing.expectEqualStrings("", val_res.result.stderr);
+    }
+
+    // Post-publication tamper refusal: mutating a copied DSO in the real ELF closure
+    // refuses inspectCopied, record-authorization, and uk-wamr-direct-validate.
+    {
+        var dso_index: usize = 0;
+        for (published_contract.loader_dependencies, 0..) |dep, idx| {
+            if (!std.mem.eql(u8, dep.path, published_contract.dynamic_loader.path)) {
+                dso_index = idx;
+                break;
+            }
+        }
+        const dso_path = published_contract.loader_dependencies[dso_index].path;
+        const dso_dir_path = std.fs.path.dirname(dso_path) orelse return error.InvalidPath;
+        const dso_name = std.fs.path.basename(dso_path);
+        const dso_dir = try std.Io.Dir.openDirAbsolute(io, dso_dir_path, .{ .iterate = true, .follow_symlinks = false });
+        defer dso_dir.close(io);
+        const dso_ro = try dso_dir.openFile(io, dso_name, .{ .follow_symlinks = false });
+        if (linux.errno(linux.fchmod(dso_ro.handle, 0o600)) != .SUCCESS) {
+            dso_ro.close(io);
+            return error.FixtureMode;
+        }
+        dso_ro.close(io);
+        const dso_rw = try dso_dir.openFile(io, dso_name, .{ .mode = .read_write, .follow_symlinks = false });
+        var first_byte: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 1), try dso_rw.readPositionalAll(io, &first_byte, 0));
+        const flipped: [1]u8 = .{first_byte[0] ^ 0xff};
+        try dso_rw.writePositionalAll(io, &flipped, 0);
+        try dso_rw.sync(io);
+        if (linux.errno(linux.fchmod(dso_rw.handle, 0o400)) != .SUCCESS) {
+            dso_rw.close(io);
+            return error.FixtureMode;
+        }
+        dso_rw.close(io);
+
+        const runtime_dir = try std.Io.Dir.openDirAbsolute(io, published_contract.root, .{ .iterate = true, .follow_symlinks = false });
+        defer runtime_dir.close(io);
+        const layout: authority.types.RuntimeLayout = .{
+            .output = output_path,
+            .root = published_contract.root,
+            .python_version = published_contract.python_version,
+            .launcher = published_contract.launcher.path,
+            .interpreter = published_contract.interpreter.path,
+            .loader_directory = dso_dir_path,
+            .extensions = published_contract.extensions,
+            .startup_config = try std.fs.path.join(allocator, &.{ output_path, "startup-config" }),
+        };
+        try std.testing.expectError(error.AzureRuntimeChanged, authority.runtime_probes.inspectCopied(ctx, .{
+            .root = runtime_dir,
+            .layout = layout,
+            .contract = published_contract,
+            .barrier = noop_barrier,
+        }));
+
+        const tampered_auth_path = try std.fs.path.join(allocator, &.{ auth_chain_path, "tampered-dso-approved.json" });
+        var parsed_tampered_auth = try authority.cli.parse(a, &.{
+            "record-authorization",
+            try std.fmt.allocPrint(allocator, "--plan={s}", .{plan_path}),
+            try std.fmt.allocPrint(allocator, "--template={s}", .{template_path}),
+            try std.fmt.allocPrint(allocator, "--output={s}", .{tampered_auth_path}),
+            "--decision=approved",
+            "--approver=real-elf-operator",
+            "--reference=real-elf-closure-reference",
+            try std.fmt.allocPrint(allocator, "--recorded-unix={d}", .{now_unix - 1}),
+            try std.fmt.allocPrint(allocator, "--expires-unix={d}", .{now_unix + 600}),
+            try std.fmt.allocPrint(allocator, "--azure={s}", .{plan_val.tools.azure.path}),
+            try std.fmt.allocPrint(allocator, "--uploader={s}", .{plan_val.tools.uploader.path}),
+            try std.fmt.allocPrint(allocator, "--validator={s}", .{plan_val.tools.validator.path}),
+            try std.fmt.allocPrint(allocator, "--supervisor={s}", .{plan_val.tools.supervisor.path}),
+            try std.fmt.allocPrint(allocator, "--az-python={s}", .{plan_val.tools.az_python.path}),
+            try std.fmt.allocPrint(allocator, "--azure-runtime={s}", .{plan_val.azure_runtime_document.path}),
+        });
+        defer parsed_tampered_auth.deinit();
+        const tampered_outcome = authority.handlers.run(.{ .retained = ctx }, parsed_tampered_auth.result.command).authorization;
+        try std.testing.expect(tampered_outcome == .refused);
+        try std.testing.expectEqual(authority.types.Phase.custody, tampered_outcome.refused.phase);
+        try std.testing.expectEqual(error.HashMismatch, tampered_outcome.refused.err);
+        try std.testing.expectEqual(core.private_files.CommitStatus.not_committed, tampered_outcome.refused.publication);
+
+        inline for (.{
+            &[_][]const u8{ validator_path, "azure-runtime", runtime_json_path },
+            &[_][]const u8{ validator_path, "plan", plan_path, template_path },
+            &[_][]const u8{ validator_path, "authorization", plan_path, approved_path },
+        }) |val_argv| {
+            const val_now = try core.process.monotonicNanoseconds();
+            var val_res = try authority.transaction.supervise(ctx, .{
+                .executable = validator_exec,
+                .argv = val_argv,
+                .cwd = dir,
+                .environment = &validator_env,
+                .primary_deadline = .{ .expires_ns = val_now + 30 * std.time.ns_per_s },
+                .cleanup_deadline = .{ .expires_ns = val_now + 35 * std.time.ns_per_s },
+                .limits = .{ .stdout_bytes = 4096, .stderr_bytes = 4096 },
+                .snapshot_executable = true,
+            }, noop_barrier);
+            defer val_res.deinit(a);
+            try std.testing.expect(!val_res.succeeded());
+            try std.testing.expectEqual(core.process.CommandPrimary{ .exited = 1 }, val_res.result.primary);
+            try std.testing.expectEqualStrings("", val_res.result.stdout);
+            try std.testing.expectEqualStrings("WAMR direct validation refused: AzureRuntimeChanged\n", val_res.result.stderr);
         }
     }
 }
