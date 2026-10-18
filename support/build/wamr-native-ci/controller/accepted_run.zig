@@ -246,11 +246,11 @@ pub const AcceptedRun = struct {
                     return cached;
                 }
             }
-            const observed = try physical.readRetainedCached(self.io, retained, limit, self.in_pass_known);
+            const observed = try physical.readRetainedCached(self.io, retained, limit, self.in_pass_known orelse &self.ensureCustodyCache().known_files);
             try cache.put(try self.allocator().dupe(u8, retained.path), observed);
             return observed;
         }
-        return physical.readRetainedCached(self.io, retained, limit, self.in_pass_known);
+        return physical.readRetainedCached(self.io, retained, limit, self.in_pass_known orelse &self.ensureCustodyCache().known_files);
     }
 
     fn readFileInPass(self: *AcceptedRun, path: []const u8, limit: u64, private: bool) !physical.File {
@@ -403,6 +403,7 @@ pub const AcceptedRun = struct {
             null;
         defer if (pass_files) |*active| active.deinit();
         const cache = self.ensureCustodyCache();
+        defer cache.flush();
         const previous_scratch = self.scratch;
         const previous_files = self.in_pass_files;
         const previous_known = self.in_pass_known;
@@ -712,6 +713,7 @@ fn openAndValidateWithPolicy(
     if (accepted.local_producer == .python)
         try appendHandoffControllerInput(&accepted);
     try collectArtifacts(&accepted);
+    cache.flush();
     accepted.scratch = null;
     accepted.in_pass_files = null;
     accepted.in_pass_known = null;
@@ -761,6 +763,7 @@ pub fn openImportedStage(
     try loadResult(&accepted);
     try revalidateImported(&accepted);
     try collectArtifacts(&accepted);
+    cache.flush();
     accepted.scratch = null;
     accepted.in_pass_files = null;
     accepted.in_pass_known = null;

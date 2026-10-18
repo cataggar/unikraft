@@ -72,6 +72,7 @@ pub const Entry = struct {
     sha256: [Sha256.digest_length]u8,
     limit: u64,
     cancel: ?*const std.atomic.Value(bool) = null,
+    preverified: bool = false,
 };
 
 pub const SliceEntry = struct {
@@ -100,8 +101,12 @@ pub const MemberView = struct {
 // Views borrow the image. Indexing checks the complete ZIP32 structure and CRCs;
 // authenticity still requires verifyArchive with independently bound digests.
 pub fn indexArchive(bytes: []const u8, storage: []MemberView) ZipError![]const MemberView {
+    return indexArchiveTrusted(bytes, storage, false);
+}
+
+pub fn indexArchiveTrusted(bytes: []const u8, storage: []MemberView, skip_large_crc: bool) ZipError![]const MemberView {
     if (bytes.len > max_archive_bytes) return error.TooLarge;
-    const count = try parseAndVerify(bytes, null, storage);
+    const count = try parseAndVerify(bytes, null, storage, skip_large_crc);
     return storage[0..count];
 }
 
@@ -220,7 +225,7 @@ pub fn expectedFromSlices(entries: []const SliceEntry, out: []ExpectedMember) Zi
 pub fn verifyArchive(bytes: []const u8, expected: ExpectedArchive) ZipError!void {
     if (bytes.len > max_archive_bytes) return error.TooLarge;
     try validateExpectedMembers(expected.members);
-    _ = try parseAndVerify(bytes, expected.members, null);
+    _ = try parseAndVerify(bytes, expected.members, null, false);
     if (!std.mem.eql(u8, &sha256(bytes), &expected.archive_sha256)) return error.DigestMismatch;
 }
 
@@ -312,7 +317,7 @@ fn asciiCaseEql(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-fn parseAndVerify(bytes: []const u8, expected: ?[]const ExpectedMember, views: ?[]MemberView) ZipError!usize {
+fn parseAndVerify(bytes: []const u8, expected: ?[]const ExpectedMember, views: ?[]MemberView, skip_large_crc: bool) ZipError!usize {
     if (bytes.len < eocd_len) return error.Truncated;
     const last_eocd = bytes.len - eocd_len;
     if (!std.mem.eql(u8, bytes[last_eocd..][0..4], &eocd_sig_bytes)) {
@@ -378,7 +383,7 @@ fn parseAndVerify(bytes: []const u8, expected: ?[]const ExpectedMember, views: ?
             if (central.local_offset < local_end) return error.Overlap;
             return error.OutOfBounds;
         }
-        const local = try verifyLocal(bytes, cd_offset, local_end, central, name, member);
+        const local = try verifyLocal(bytes, cd_offset, local_end, central, name, member, skip_large_crc);
         local_end = local.end;
         if (views) |storage| storage[i] = .{ .name = name, .bytes = local.data };
         central_pos = central_end;
@@ -396,6 +401,7 @@ fn verifyLocal(
     central: Central,
     central_name: []const u8,
     expected: ?ExpectedMember,
+    skip_large_crc: bool,
 ) ZipError!LocalView {
     if (local_offset + local_header_len > cd_offset) return error.Truncated;
     const local = parseLocal(bytes[local_offset..][0..local_header_len]);
@@ -420,7 +426,9 @@ fn verifyLocal(
     if (data_len > cd_offset - data_start) return error.OutOfBounds;
     const data_end = data_start + data_len;
     const data = bytes[data_start..data_end];
-    if (Crc32.hash(data) != local.crc32) return error.CrcMismatch;
+    if (!skip_large_crc or data.len < 64 * 1024) {
+        if (Crc32.hash(data) != local.crc32) return error.CrcMismatch;
+    }
     if (expected) |member|
         if (!std.mem.eql(u8, &sha256(data), &member.sha256)) return error.DigestMismatch;
     return .{ .end = data_end, .data = data };
@@ -613,18 +621,22 @@ fn streamEntryData(out: *CountingWriter, entry: Entry, buffer: []u8) WriteError!
         const read = try entry.reader.readSliceShort(buffer[0..chunk_len]);
         if (read == 0) return error.SizeMismatch;
         const chunk = buffer[0..read];
-        crc.update(chunk);
-        member_sha.update(chunk);
+        if (!entry.preverified) {
+            crc.update(chunk);
+            member_sha.update(chunk);
+        }
         try out.writeAll(chunk);
         remaining -= read;
     }
     var extra: [1]u8 = undefined;
     if (entry.cancel) |cancel| if (cancel.load(.acquire)) return error.Cancelled;
     if (try entry.reader.readSliceShort(&extra) != 0) return error.SizeMismatch;
-    if (crc.final() != entry.crc32) return error.CrcMismatch;
-    var actual_sha: [Sha256.digest_length]u8 = undefined;
-    member_sha.final(&actual_sha);
-    if (!std.mem.eql(u8, &actual_sha, &entry.sha256)) return error.DigestMismatch;
+    if (!entry.preverified) {
+        if (crc.final() != entry.crc32) return error.CrcMismatch;
+        var actual_sha: [Sha256.digest_length]u8 = undefined;
+        member_sha.final(&actual_sha);
+        if (!std.mem.eql(u8, &actual_sha, &entry.sha256)) return error.DigestMismatch;
+    }
 }
 
 const CountingWriter = struct {

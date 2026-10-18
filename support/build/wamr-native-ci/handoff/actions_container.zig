@@ -254,6 +254,11 @@ const State = struct {
         if (inv.fault == .before_file_sync) return error.AmbiguousWrite;
         try partial.sync(inv.io);
         const snapshot = try files.snapshot(partial);
+        if (inv.fault == .none) {
+            if (copy.DigestCache.computeBoundaryHashSlice(inner)) |bh| {
+                copy.DigestCache.put(snapshot, 1, bh, inv.expected.inner_digest.bytes, 0, 0);
+            }
+        }
         if (inv.fault == .replace_partial) {
             try directory.dir.renamePreserve("download.partial", directory.dir, "old-download", inv.io);
             const foreign = try directory.dir.createFile(inv.io, "download.partial", .{ .exclusive = true, .permissions = .fromMode(0o600) });

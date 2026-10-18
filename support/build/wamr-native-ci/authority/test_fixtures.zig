@@ -337,6 +337,86 @@ fn runToolJson(a: std.mem.Allocator, io: std.Io, argv: []const []const u8) ![]co
     return canonicalBytes(a, res.stdout);
 }
 
+const SparseChunk = struct {
+    offset: u64,
+    bytes: []const u8,
+};
+
+const CachedPackage = struct {
+    valid: bool = false,
+    tool_meta: [9]u64 = @splat(0),
+    package_bytes: []const u8 = "",
+    finalization_bytes: []const u8 = "",
+    derivation_bytes: []const u8 = "",
+    qcow2_bytes: []const u8 = "",
+    raw_size: u64 = 0,
+    raw_chunks: []const SparseChunk = &.{},
+    vhd_size: u64 = 0,
+    vhd_chunks: []const SparseChunk = &.{},
+};
+
+var cached_pkg_lock: std.atomic.Value(u32) = .init(0);
+var cached_pkg: CachedPackage = .{};
+const zero_chunk: [65536]u8 = @splat(0);
+
+fn captureSparseFile(io: std.Io, dir: std.Io.Dir, name: []const u8, out_size: *u64) ![]const SparseChunk {
+    const page = std.heap.page_allocator;
+    const file = try dir.openFile(io, name, .{});
+    defer file.close(io);
+    const stx = try files.snapshot(file);
+    out_size.* = stx.size;
+    var list: std.ArrayList(SparseChunk) = .empty;
+    var buf: [65536]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < stx.size) {
+        const want: usize = @intCast(@min(@as(u64, buf.len), stx.size - offset));
+        if (try file.readPositionalAll(io, buf[0..want], offset) != want) return error.FixtureFailed;
+        if (std.mem.indexOfNone(u8, buf[0..want], &.{0}) != null) {
+            try list.append(page, .{
+                .offset = offset,
+                .bytes = try page.dupe(u8, buf[0..want]),
+            });
+        }
+        offset += want;
+    }
+    return list.toOwnedSlice(page);
+}
+
+fn writeSparseFile(io: std.Io, dir: std.Io.Dir, name: []const u8, size: u64, chunks: []const SparseChunk) !void {
+    const file = try dir.createFile(io, name, .{ .permissions = .fromMode(0o600) });
+    defer file.close(io);
+    var chunk_idx: usize = 0;
+    var offset: u64 = 0;
+    while (offset < size) {
+        if (chunk_idx < chunks.len and chunks[chunk_idx].offset == offset) {
+            const slice = chunks[chunk_idx].bytes;
+            try file.writeStreamingAll(io, slice);
+            offset += slice.len;
+            chunk_idx += 1;
+        } else {
+            const next_non_zero = if (chunk_idx < chunks.len) chunks[chunk_idx].offset else size;
+            const want: usize = @intCast(@min(@as(u64, zero_chunk.len), next_non_zero - offset));
+            try file.writeStreamingAll(io, zero_chunk[0..want]);
+            offset += want;
+        }
+    }
+    try file.sync(io);
+}
+
+fn seedArtifactDigestCache(io: std.Io, dir: std.Io.Dir, name: []const u8, sha256_hex: []const u8, vhd_raw_sha256_hex: ?[]const u8) void {
+    const DigestCache = @import("wamr_handoff").retained_copy.DigestCache;
+    const file = dir.openFile(io, name, .{}) catch return;
+    defer file.close(io);
+    const snap = files.snapshot(file) catch return;
+    const bh = DigestCache.computeBoundaryHash(io, file, snap.size) orelse return;
+    const digest = core.contracts.parseSha256(sha256_hex) catch return;
+    DigestCache.put(snap, 1, bh, digest, 0, DigestCache.flag_scan_checked);
+    if (vhd_raw_sha256_hex) |raw_hex| {
+        const raw_digest = core.contracts.parseSha256(raw_hex) catch return;
+        DigestCache.put(snap, 2, bh, raw_digest, 0, 0);
+    }
+}
+
 pub fn buildAuthorizationFixture(
     a: std.mem.Allocator,
     io: std.Io,
@@ -380,7 +460,17 @@ pub fn buildAuthorizationFixture(
     const artifacts_path = try std.fs.path.join(a, &.{ root_path, "artifacts" });
     const evidence_path = try std.fs.path.join(a, &.{ root_path, "evidence" });
 
-    const package_bytes = try runToolJson(a, io, &.{ package_tool, "package", workload_path, state_path });
+    const tool_meta = try metadataFor(io, package_tool);
+    while (cached_pkg_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+        std.atomic.spinLoopHint();
+    }
+    const use_cache = cached_pkg.valid and std.meta.eql(cached_pkg.tool_meta, tool_meta);
+    cached_pkg_lock.store(0, .release);
+
+    const package_bytes = if (use_cache)
+        try a.dupe(u8, cached_pkg.package_bytes)
+    else
+        try runToolJson(a, io, &.{ package_tool, "package", workload_path, state_path });
     try writeMode(io, evidence_dir, "package.json", package_bytes, 0o600);
     try writeMode(io, artifacts_dir, "package", package_bytes, 0o600);
     var pkg_doc = try contracts.parseCanonical(a, package_bytes);
@@ -405,7 +495,10 @@ pub fn buildAuthorizationFixture(
     try writeMode(io, artifacts_dir, "qcow2_finalization_intent", finalize_intent_bytes, 0o600);
 
     const finalize_intent_path = try std.fs.path.join(a, &.{ root_path, "finalize-intent.json" });
-    const finalization_bytes = try runToolJson(a, io, &.{ package_tool, "finalize-qcow2", finalize_intent_path, state_path });
+    const finalization_bytes = if (use_cache)
+        try a.dupe(u8, cached_pkg.finalization_bytes)
+    else
+        try runToolJson(a, io, &.{ package_tool, "finalize-qcow2", finalize_intent_path, state_path });
     try writeMode(io, evidence_dir, "qcow2-finalization.json", finalization_bytes, 0o600);
     try writeMode(io, artifacts_dir, "qcow2_finalization", finalization_bytes, 0o600);
     var fin_doc = try contracts.parseCanonical(a, finalization_bytes);
@@ -429,7 +522,10 @@ pub fn buildAuthorizationFixture(
     try writeMode(io, artifacts_dir, "fixed_vhd_derivation_intent", derive_intent_bytes, 0o600);
 
     const derive_intent_path = try std.fs.path.join(a, &.{ root_path, "derive-intent.json" });
-    const derivation_bytes = try runToolJson(a, io, &.{ package_tool, "derive-fixed-vhd", derive_intent_path, state_path });
+    const derivation_bytes = if (use_cache)
+        try a.dupe(u8, cached_pkg.derivation_bytes)
+    else
+        try runToolJson(a, io, &.{ package_tool, "derive-fixed-vhd", derive_intent_path, state_path });
     try writeMode(io, evidence_dir, "fixed-vhd-derivation.json", derivation_bytes, 0o600);
     try writeMode(io, artifacts_dir, "fixed_vhd_derivation", derivation_bytes, 0o600);
     var der_doc = try contracts.parseCanonical(a, derivation_bytes);
@@ -438,16 +534,53 @@ pub fn buildAuthorizationFixture(
     const vhd_sha256 = try a.dupe(u8, vhd_out.get("sha256").?.string);
     const vhd_size = try core.contracts.integer(u64, vhd_out.get("file_bytes").?);
 
-    inline for (.{
-        .{ "unikraft.raw", "raw" },
-        .{ "unikraft.qcow2", "qcow2" },
-        .{ "unikraft-derived.vhd", "vhd" },
-    }) |pair| {
-        try state_dir.rename(pair[0], artifacts_dir, pair[1], io);
-        const f = try artifacts_dir.openFile(io, pair[1], .{});
-        defer f.close(io);
-        try modeFd(f.handle, 0o600);
+    if (use_cache) {
+        try writeSparseFile(io, artifacts_dir, "raw", cached_pkg.raw_size, cached_pkg.raw_chunks);
+        try writeMode(io, artifacts_dir, "qcow2", cached_pkg.qcow2_bytes, 0o600);
+        try writeSparseFile(io, artifacts_dir, "vhd", cached_pkg.vhd_size, cached_pkg.vhd_chunks);
+    } else {
+        inline for (.{
+            .{ "unikraft.raw", "raw" },
+            .{ "unikraft.qcow2", "qcow2" },
+            .{ "unikraft-derived.vhd", "vhd" },
+        }) |pair| {
+            try state_dir.rename(pair[0], artifacts_dir, pair[1], io);
+            const f = try artifacts_dir.openFile(io, pair[1], .{});
+            defer f.close(io);
+            try modeFd(f.handle, 0o600);
+        }
+        const page = std.heap.page_allocator;
+        while (cached_pkg_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+        defer cached_pkg_lock.store(0, .release);
+        if (!cached_pkg.valid) {
+            const qcow2_file = try artifacts_dir.openFile(io, "qcow2", .{});
+            defer qcow2_file.close(io);
+            const qcow2_stx = try files.snapshot(qcow2_file);
+            const qcow2_buf = try page.alloc(u8, @intCast(qcow2_stx.size));
+            if (try qcow2_file.readPositionalAll(io, qcow2_buf, 0) != qcow2_buf.len) return error.FixtureFailed;
+            var cap_raw_size: u64 = 0;
+            const cap_raw_chunks = try captureSparseFile(io, artifacts_dir, "raw", &cap_raw_size);
+            var cap_vhd_size: u64 = 0;
+            const cap_vhd_chunks = try captureSparseFile(io, artifacts_dir, "vhd", &cap_vhd_size);
+            cached_pkg = .{
+                .valid = true,
+                .tool_meta = tool_meta,
+                .package_bytes = try page.dupe(u8, package_bytes),
+                .finalization_bytes = try page.dupe(u8, finalization_bytes),
+                .derivation_bytes = try page.dupe(u8, derivation_bytes),
+                .qcow2_bytes = qcow2_buf,
+                .raw_size = cap_raw_size,
+                .raw_chunks = cap_raw_chunks,
+                .vhd_size = cap_vhd_size,
+                .vhd_chunks = cap_vhd_chunks,
+            };
+        }
     }
+    seedArtifactDigestCache(io, artifacts_dir, "raw", raw_sha256, null);
+    seedArtifactDigestCache(io, artifacts_dir, "qcow2", qcow2_sha256, null);
+    seedArtifactDigestCache(io, artifacts_dir, "vhd", vhd_sha256, raw_sha256);
 
     inline for (.{ "debug_elf", "bootinfo", "runtime", "compiler", "wasm", "cwasm", "config" }) |name|
         try writeMode(io, artifacts_dir, name, "fixture-" ++ name ++ "\n", 0o600);

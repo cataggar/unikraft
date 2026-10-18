@@ -736,9 +736,21 @@ fn captureSource(
     _ = try directoryBefore(io, repo);
     const ignored_before = try ignoredState(allocator, io, repo, git, allow_missing_roots, known_files);
     try clean(allocator, io, repo, git);
-    const revision = try gitLine(allocator, io, repo, git, &.{ "rev-parse", "HEAD" });
-    const tree = try gitLine(allocator, io, repo, git, &.{ "rev-parse", "HEAD^{tree}" });
-    const format = try gitLine(allocator, io, repo, git, &.{ "rev-parse", "--show-object-format" });
+    const initial_refs = try gitOutput(allocator, io, repo, git, &.{ "rev-parse", "HEAD", "HEAD^{tree}", "--show-object-format" }, 512, null);
+    defer allocator.free(initial_refs);
+    var ref_lines = std.mem.splitScalar(u8, initial_refs, '\n');
+    const rev_line = ref_lines.next() orelse return error.InvalidGitOutput;
+    const tree_line = ref_lines.next() orelse return error.InvalidGitOutput;
+    const fmt_line = ref_lines.next() orelse return error.InvalidGitOutput;
+    const trailing = ref_lines.next() orelse return error.InvalidGitOutput;
+    if (rev_line.len == 0 or tree_line.len == 0 or fmt_line.len == 0 or trailing.len != 0 or ref_lines.next() != null)
+        return error.InvalidGitOutput;
+    const revision = try allocator.dupe(u8, rev_line);
+    errdefer allocator.free(revision);
+    const tree = try allocator.dupe(u8, tree_line);
+    errdefer allocator.free(tree);
+    const format = try allocator.dupe(u8, fmt_line);
+    errdefer allocator.free(format);
     if (!std.mem.eql(u8, format, "sha1") and !std.mem.eql(u8, format, "sha256"))
         return error.InvalidGitOutput;
     const listing = try gitOutput(allocator, io, repo, git, &.{ "ls-tree", "-r", "-z", "--full-tree", "HEAD" }, 4 * limits.mib, null);
@@ -799,10 +811,14 @@ fn captureSource(
             return error.SourceChanged;
     }
     try clean(allocator, io, repo, git);
-    const final_revision = try gitLine(allocator, io, repo, git, &.{ "rev-parse", "HEAD" });
-    defer allocator.free(final_revision);
-    const final_tree = try gitLine(allocator, io, repo, git, &.{ "rev-parse", "HEAD^{tree}" });
-    defer allocator.free(final_tree);
+    const final_refs = try gitOutput(allocator, io, repo, git, &.{ "rev-parse", "HEAD", "HEAD^{tree}" }, 512, null);
+    defer allocator.free(final_refs);
+    var final_lines = std.mem.splitScalar(u8, final_refs, '\n');
+    const final_revision = final_lines.next() orelse return error.InvalidGitOutput;
+    const final_tree = final_lines.next() orelse return error.InvalidGitOutput;
+    const final_trailing = final_lines.next() orelse return error.InvalidGitOutput;
+    if (final_revision.len == 0 or final_tree.len == 0 or final_trailing.len != 0 or final_lines.next() != null)
+        return error.InvalidGitOutput;
     if (!std.mem.eql(u8, revision, final_revision) or !std.mem.eql(u8, tree, final_tree))
         return error.SourceChanged;
     const ignored_after = try ignoredState(allocator, io, repo, git, allow_missing_roots, known_files);

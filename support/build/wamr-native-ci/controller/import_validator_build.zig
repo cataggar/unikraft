@@ -32,6 +32,9 @@ pub const PortableTools = struct {
     runtime: std.ArrayList(RuntimePin),
     before: source.Source,
     producer_source: ?ProducerSource = null,
+    init_ns: i128 = 0,
+    loaded_files_count: u32 = 0,
+    loaded_blobs_count: u32 = 0,
     known_blobs: std.AutoHashMap([9]i128, source.CachedBlob),
     known_files: std.AutoHashMap([9]i128, [64]u8),
 
@@ -146,7 +149,11 @@ pub const PortableTools = struct {
         errdefer known_blobs.deinit();
         var known_files = std.AutoHashMap([9]i128, [64]u8).init(allocator);
         errdefer known_files.deinit();
-        @import("build_pipeline.zig").loadShmInto(&known_files, &known_blobs);
+        const build_pipeline = @import("build_pipeline.zig");
+        const init_ns = build_pipeline.currentRealtimeNs();
+        build_pipeline.loadShmInto(&known_files, &known_blobs);
+        var loaded_files_count: u32 = known_files.count();
+        var loaded_blobs_count: u32 = known_blobs.count();
         const validator_identity = try physical.readFileCached(io, local.validator, 64 * limits.mib, false, &known_files);
         if (!std.mem.eql(u8, &validator_identity.sha256, @import("import_validator_identity").sha256) or
             !std.meta.eql(validator_identity.metadata, physical.metadata(validator.file_snapshot)))
@@ -204,6 +211,7 @@ pub const PortableTools = struct {
             allocator.free(before.tree);
             allocator.free(before.custody.object_format);
         }
+        build_pipeline.flushShmMaps(&known_files, &known_blobs, &loaded_files_count, &loaded_blobs_count, init_ns);
         if (!std.mem.eql(u8, before.custody.object_format, "sha1") or
             (policy == .producer and (!std.mem.eql(u8, before.revision, identity.revision) or
                 !std.mem.eql(u8, before.tree, identity.tree))))
@@ -229,6 +237,9 @@ pub const PortableTools = struct {
             .runtime = runtime,
             .before = before,
             .producer_source = producer_source,
+            .init_ns = init_ns,
+            .loaded_files_count = loaded_files_count,
+            .loaded_blobs_count = loaded_blobs_count,
             .known_blobs = known_blobs,
             .known_files = known_files,
         };
@@ -250,6 +261,7 @@ pub const PortableTools = struct {
         if (self.producer_source) |proof| try proof.verify(a, io, repository, git, signal);
         const after = try source.portableSourceCached(a, io, repository, git, &self.known_blobs, &self.known_files);
         if (!self.before.same(after)) return error.SourceChanged;
+        @import("build_pipeline.zig").flushShmMaps(&self.known_files, &self.known_blobs, &self.loaded_files_count, &self.loaded_blobs_count, self.init_ns);
         try self.verifyExecutables(io);
         if (signal) |active|
             if (active.flag().load(.acquire)) return error.Cancelled;
@@ -264,6 +276,7 @@ pub const PortableTools = struct {
     }
 
     pub fn deinit(self: *PortableTools, io: std.Io) void {
+        @import("build_pipeline.zig").flushShmMaps(&self.known_files, &self.known_blobs, &self.loaded_files_count, &self.loaded_blobs_count, self.init_ns);
         self.git.close(io);
         self.controller.close(io);
         self.supervisor.deinit(self.allocator, io);

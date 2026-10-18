@@ -222,6 +222,14 @@ const Held = struct {
 
     fn hash(self: *const Held, io: std.Io, cancel: ?*const std.atomic.Value(bool)) ![32]u8 {
         try self.verify(io);
+        const bhash = copy.DigestCache.computeBoundaryHash(io, self.file, self.snapshot.size);
+        if (bhash) |bh| {
+            if (copy.DigestCache.get(self.snapshot, 1, bh)) |cached| {
+                try copy.checkCancellation(cancel);
+                try self.verify(io);
+                return cached.digest;
+            }
+        }
         var hasher = core.Sha256.init(.{});
         var buffer: [64 * 1024]u8 = undefined;
         var offset: u64 = 0;
@@ -234,7 +242,9 @@ const Held = struct {
         }
         if (try self.file.readPositionalAll(io, buffer[0..1], offset) != 0) return error.FileChanged;
         try self.verify(io);
-        return hasher.finalResult();
+        const digest = hasher.finalResult();
+        if (bhash) |bh| copy.DigestCache.put(self.snapshot, 1, bh, digest, 0, 0);
+        return digest;
     }
 
     fn deinit(self: *Held, a: std.mem.Allocator, io: std.Io) void {
@@ -358,6 +368,12 @@ const State = struct {
         if (inv.fault == .before_file_sync) return error.AmbiguousWrite;
         try destination.sync(inv.io);
         const sealed_file = try files.snapshot(destination);
+        if (inv.fault == .none) {
+            if (copy.DigestCache.computeBoundaryHashSlice(bytes)) |bh| {
+                copy.DigestCache.put(sealed_file, 1, bh, inv.inner_digest.bytes, 0, 0);
+                copy.DigestCache.put(source.snapshot, 1, bh, inv.inner_digest.bytes, 0, 0);
+            }
+        }
         if (inv.fault == .destination_replacement) {
             try directory.renamePreserve("upload.partial", directory, "old-upload", inv.io);
             const replacement = try directory.createFile(inv.io, "upload.partial", .{ .exclusive = true, .permissions = .fromMode(0o600) });
@@ -406,6 +422,11 @@ const State = struct {
             sealed_file.mtime.nsec != output.snapshot.mtime.nsec or
             !copy.sameCustodySnapshot(try files.snapshot(destination), output.snapshot))
             return error.OutputChanged;
+        if (inv.fault == .none) {
+            if (copy.DigestCache.computeBoundaryHashSlice(bytes)) |bh| {
+                copy.DigestCache.put(output.snapshot, 1, bh, inv.inner_digest.bytes, 0, 0);
+            }
+        }
         var result: SealedUpload = .{
             .allocator = inv.allocator,
             .parent = custody,

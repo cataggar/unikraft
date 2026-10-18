@@ -568,6 +568,7 @@ fn runWithPolicy(
         null;
     defer if (owned_cache) |*cache| cache.deinit();
     const active_cache: *@import("build_pipeline.zig").CustodyCache = custody_cache orelse &owned_cache.?;
+    defer active_cache.flush();
     const known_files: *std.AutoHashMap([9]i128, [64]u8) = &active_cache.known_files;
     const known_blobs = &active_cache.known_git_blobs;
     const consumer = try get(start, "consumer_inputs");
