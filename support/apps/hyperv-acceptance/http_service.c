@@ -1,9 +1,12 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "http_service.h"
 
+#ifndef HYPERV_HTTP_SERVICE_HOST_TEST
 #include <uk/config.h>
+#endif
 
-#if CONFIG_APPHYPERVACCEPTANCE_HTTP_SERVICE
+#if CONFIG_APPHYPERVACCEPTANCE_HTTP_SERVICE || \
+	defined(HYPERV_HTTP_SERVICE_HOST_TEST)
 
 #include "application_protocol.h"
 #include "http_protocol.h"
@@ -12,6 +15,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifndef HYPERV_HTTP_SERVICE_HOST_TEST
 #include <hyperv/hyperv.h>
 #include <lwip/dhcp.h>
 #include <lwip/etharp.h>
@@ -28,6 +32,7 @@
 #include <uk/sched.h>
 
 #include "netbuf.h"
+#endif
 
 #ifndef CONFIG_APPHYPERVACCEPTANCE_HTTP_PORT
 #define CONFIG_APPHYPERVACCEPTANCE_HTTP_PORT 8080
@@ -46,6 +51,9 @@
 #define HTTP_SERVICE_STATS_INTERVAL_NS (5ULL * 1000000000ULL)
 #define HTTP_SERVICE_CONN_IDLE_TIMEOUT_NS (30ULL * 1000000000ULL)
 #define HTTP_SERVICE_NETDEV_BUFFER_SIZE 2048U
+#ifndef HTTP_SERVICE_TX_POOL_SIZE
+#define HTTP_SERVICE_TX_POOL_SIZE 128U
+#endif
 #define HTTP_SERVICE_MAX_CONNS_CAP 256U
 
 #if CONFIG_APPHYPERVACCEPTANCE_HTTP_MAX_CONNS > HTTP_SERVICE_MAX_CONNS_CAP
@@ -62,6 +70,11 @@ enum http_adapter_failure {
 	HTTP_ADAPTER_INPUT_ERROR,
 };
 
+struct http_tx_pool_meta {
+	struct uk_alloc *allocator;
+	uint32_t generation;
+};
+
 struct http_bounded_adapter {
 	struct netif *netif;
 	struct uk_netdev *device;
@@ -73,6 +86,15 @@ struct http_bounded_adapter {
 	unsigned int transmit_attempts;
 	unsigned int transmit_busy;
 	uint64_t pumps;
+	struct uk_netbuf *tx_pool_free[HTTP_SERVICE_TX_POOL_SIZE];
+	unsigned int tx_pool_free_count;
+	uint32_t tx_pool_generation;
+	uint16_t tx_pool_ioalign;
+	uint16_t tx_pool_headroom;
+	uint8_t tx_pool_active;
+	unsigned int tx_pool_hits;
+	unsigned int tx_pool_misses;
+	unsigned int tx_pool_recycled;
 };
 
 struct http_tx_attempt {
@@ -80,60 +102,119 @@ struct http_tx_attempt {
 	struct uk_netbuf *buffer;
 };
 
-struct http_conn_slot {
-	struct tcp_pcb *pcb;
-	uint64_t last_active_ns;
-	size_t rx_len;
-	size_t tx_len;
-	size_t tx_sent;
-	uint8_t in_use;
-	uint8_t close_after_send;
-	uint8_t rx_buf[UK_HYPERV_HTTP_MAX_REQUEST_LEN];
-	uint8_t tx_buf[UK_HYPERV_HTTP_MAX_RESPONSE_LEN];
-};
-
-struct http_service_metrics {
-	uint64_t requests;
-	uint64_t bytes_tx;
-	uint64_t bytes_rx;
-	uint64_t total_conns;
-	uint64_t errors;
-	uint64_t status_200;
-	uint64_t status_400;
-	uint64_t status_413;
-	unsigned int active_conns;
-	unsigned int peak_conns;
-};
-
 static struct http_bounded_adapter http_adapter;
-static struct http_conn_slot http_slots[HTTP_SERVICE_POOL_SIZE];
-static struct http_service_metrics http_metrics;
-static uint8_t http_body[UK_HYPERV_HTTP_BODY_LEN];
-static char http_boot_id_hex[17];
+static uint32_t http_tx_pool_next_generation;
 
-static uint64_t mix_boot_id(uint64_t value)
+static void http_tx_pool_dtor(struct uk_netbuf *buffer)
 {
-	value += 0x9e3779b97f4a7c15ULL;
-	value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
-	value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
-	value ^= value >> 31;
-	return value ? value : 0x4859504552563031ULL;
+	struct http_tx_pool_meta *meta;
+
+	if (!buffer)
+		return;
+	meta = (struct http_tx_pool_meta *)buffer->priv;
+	if (meta && http_adapter.tx_pool_active &&
+	    meta->generation == http_adapter.tx_pool_generation &&
+	    http_adapter.tx_pool_free_count < HTTP_SERVICE_TX_POOL_SIZE) {
+		http_adapter.tx_pool_free[http_adapter.tx_pool_free_count++] =
+			buffer;
+		http_adapter.tx_pool_recycled++;
+		return;
+	}
+	if (meta && meta->allocator && buffer->_b)
+		uk_free(meta->allocator, buffer->_b);
 }
 
-static uint64_t derive_boot_id(uint64_t t_efi_pre_exit, uint64_t t_time_init,
-			       uint64_t t_vmbus_ready)
+static void http_tx_pool_init(void)
 {
-	uint64_t random_seed = 0;
-	uint64_t wall_ns = (uint64_t)ukplat_wall_clock();
-	uint64_t mono_ns = (uint64_t)ukplat_monotonic_clock();
-	uint64_t combined;
+	unsigned int i;
 
-	if (uk_random_fill_buffer(&random_seed, sizeof(random_seed)) != 0)
-		random_seed = 0;
-	combined = random_seed ^
-		   mix_boot_id(t_efi_pre_exit ^ (t_time_init << 7)) ^
-		   mix_boot_id(t_vmbus_ready ^ (wall_ns << 13) ^ mono_ns);
-	return mix_boot_id(combined);
+	http_tx_pool_next_generation++;
+	if (http_tx_pool_next_generation == 0)
+		http_tx_pool_next_generation = 1;
+	http_adapter.tx_pool_generation = http_tx_pool_next_generation;
+	http_adapter.tx_pool_ioalign = http_adapter.info.ioalign;
+	http_adapter.tx_pool_headroom = http_adapter.info.nb_encap_tx;
+	http_adapter.tx_pool_free_count = 0;
+	http_adapter.tx_pool_active = 1;
+
+	if (http_adapter.tx_pool_headroom > HTTP_SERVICE_NETDEV_BUFFER_SIZE)
+		return;
+
+	for (i = 0; i < HTTP_SERVICE_TX_POOL_SIZE; i++) {
+		struct uk_netbuf *buffer;
+		struct http_tx_pool_meta *meta;
+
+		buffer = uk_netbuf_alloc_buf(
+			http_adapter.allocator,
+			HTTP_SERVICE_NETDEV_BUFFER_SIZE,
+			http_adapter.tx_pool_ioalign,
+			http_adapter.tx_pool_headroom,
+			sizeof(*meta),
+			http_tx_pool_dtor);
+		if (!buffer)
+			break;
+		meta = (struct http_tx_pool_meta *)buffer->priv;
+		meta->allocator = http_adapter.allocator;
+		meta->generation = http_adapter.tx_pool_generation;
+		buffer->_a = NULL;
+		http_adapter.tx_pool_free[http_adapter.tx_pool_free_count++] =
+			buffer;
+	}
+}
+
+static struct uk_netbuf *http_tx_pool_acquire(uint16_t tot_len)
+{
+	uint16_t headroom = http_adapter.info.nb_encap_tx;
+	uint16_t ioalign = http_adapter.info.ioalign;
+
+	if (http_adapter.tx_pool_active &&
+	    http_adapter.tx_pool_free_count > 0 &&
+	    ioalign == http_adapter.tx_pool_ioalign &&
+	    headroom <= http_adapter.tx_pool_headroom &&
+	    headroom <= HTTP_SERVICE_NETDEV_BUFFER_SIZE &&
+	    (size_t)tot_len <=
+		    (size_t)HTTP_SERVICE_NETDEV_BUFFER_SIZE - (size_t)headroom) {
+		struct uk_netbuf *buffer =
+			http_adapter.tx_pool_free[--http_adapter.tx_pool_free_count];
+
+		buffer->next = NULL;
+		buffer->prev = NULL;
+		buffer->flags = 0;
+		buffer->data = (void *)((uintptr_t)buffer->buf + headroom);
+		buffer->len = 0;
+		buffer->csum_start = 0;
+		buffer->csum_offset = 0;
+		buffer->header_len = 0;
+		buffer->gso_size = 0;
+		uk_refcount_init(&buffer->refcount, 1);
+		http_adapter.tx_pool_hits++;
+		return buffer;
+	}
+
+	http_adapter.tx_pool_misses++;
+	if (headroom > HTTP_SERVICE_NETDEV_BUFFER_SIZE)
+		return NULL;
+	return uk_netbuf_alloc_buf(
+		http_adapter.allocator, HTTP_SERVICE_NETDEV_BUFFER_SIZE,
+		ioalign, headroom, 0, NULL);
+}
+
+static void http_adapter_release(void)
+{
+	http_adapter.tx_pool_active = 0;
+	while (http_adapter.tx_pool_free_count > 0) {
+		struct uk_netbuf *buffer =
+			http_adapter.tx_pool_free[--http_adapter.tx_pool_free_count];
+		struct http_tx_pool_meta *meta;
+
+		http_adapter.tx_pool_free[http_adapter.tx_pool_free_count] =
+			NULL;
+		if (!buffer)
+			continue;
+		meta = (struct http_tx_pool_meta *)buffer->priv;
+		if (meta && meta->allocator && buffer->_b)
+			uk_free(meta->allocator, buffer->_b);
+	}
 }
 
 static int http_tx_one(void *argument)
@@ -158,10 +239,7 @@ static err_t http_adapter_output(struct netif *netif, struct pbuf *pbuf)
 			http_adapter.failure = HTTP_ADAPTER_TX_ERROR;
 		return ERR_IF;
 	}
-	buffer = uk_netbuf_alloc_buf(
-		http_adapter.allocator, HTTP_SERVICE_NETDEV_BUFFER_SIZE,
-		http_adapter.info.ioalign,
-		http_adapter.info.nb_encap_tx, 0, NULL);
+	buffer = http_tx_pool_acquire(pbuf->tot_len);
 	if (!buffer)
 		return ERR_MEM;
 	if (pbuf->tot_len > uk_netbuf_tailroom(buffer)) {
@@ -192,6 +270,78 @@ static err_t http_adapter_output(struct netif *netif, struct pbuf *pbuf)
 		return ERR_IF;
 	}
 	return ERR_OK;
+}
+
+static int http_adapter_attach(struct netif *netif, struct uk_netdev *device)
+{
+	http_adapter_release();
+	memset(&http_adapter, 0, sizeof(http_adapter));
+	http_adapter.netif = netif;
+	http_adapter.device = device;
+	http_adapter.allocator = uk_alloc_get_default();
+	if (!http_adapter.allocator || netif->state != device)
+		return -1;
+	uk_netdev_info_get(device, &http_adapter.info);
+	http_tx_pool_init();
+	netif->linkoutput = http_adapter_output;
+	return 0;
+}
+
+#if CONFIG_APPHYPERVACCEPTANCE_HTTP_SERVICE
+
+struct http_conn_slot {
+	struct tcp_pcb *pcb;
+	uint64_t last_active_ns;
+	size_t rx_len;
+	size_t tx_len;
+	size_t tx_sent;
+	uint8_t in_use;
+	uint8_t close_after_send;
+	uint8_t rx_buf[UK_HYPERV_HTTP_MAX_REQUEST_LEN];
+	uint8_t tx_buf[UK_HYPERV_HTTP_MAX_RESPONSE_LEN];
+};
+
+struct http_service_metrics {
+	uint64_t requests;
+	uint64_t bytes_tx;
+	uint64_t bytes_rx;
+	uint64_t total_conns;
+	uint64_t errors;
+	uint64_t status_200;
+	uint64_t status_400;
+	uint64_t status_413;
+	unsigned int active_conns;
+	unsigned int peak_conns;
+};
+
+static struct http_conn_slot http_slots[HTTP_SERVICE_POOL_SIZE];
+static struct http_service_metrics http_metrics;
+static uint8_t http_body[UK_HYPERV_HTTP_BODY_LEN];
+static char http_boot_id_hex[17];
+
+static uint64_t mix_boot_id(uint64_t value)
+{
+	value += 0x9e3779b97f4a7c15ULL;
+	value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
+	value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
+	value ^= value >> 31;
+	return value ? value : 0x4859504552563031ULL;
+}
+
+static uint64_t derive_boot_id(uint64_t t_efi_pre_exit, uint64_t t_time_init,
+			       uint64_t t_vmbus_ready)
+{
+	uint64_t random_seed = 0;
+	uint64_t wall_ns = (uint64_t)ukplat_wall_clock();
+	uint64_t mono_ns = (uint64_t)ukplat_monotonic_clock();
+	uint64_t combined;
+
+	if (uk_random_fill_buffer(&random_seed, sizeof(random_seed)) != 0)
+		random_seed = 0;
+	combined = random_seed ^
+		   mix_boot_id(t_efi_pre_exit ^ (t_time_init << 7)) ^
+		   mix_boot_id(t_vmbus_ready ^ (wall_ns << 13) ^ mono_ns);
+	return mix_boot_id(combined);
 }
 
 static int http_adapter_rx_step(void *argument)
@@ -240,19 +390,6 @@ static int http_adapter_rx_step(void *argument)
 	return uk_netdev_status_more(status) ?
 	       HYPERV_ACCEPTANCE_APP_RX_MORE :
 	       HYPERV_ACCEPTANCE_APP_RX_LAST;
-}
-
-static int http_adapter_attach(struct netif *netif, struct uk_netdev *device)
-{
-	memset(&http_adapter, 0, sizeof(http_adapter));
-	http_adapter.netif = netif;
-	http_adapter.device = device;
-	http_adapter.allocator = uk_alloc_get_default();
-	if (!http_adapter.allocator || netif->state != device)
-		return -1;
-	uk_netdev_info_get(device, &http_adapter.info);
-	netif->linkoutput = http_adapter_output;
-	return 0;
 }
 
 static unsigned int http_adapter_poll(void)
@@ -631,8 +768,10 @@ static int acquire_http_lease(struct uk_netdev *device,
 	netif_set_default(netif);
 	netif_set_up(netif);
 	error = dhcp_start(netif);
-	if (error != ERR_OK)
+	if (error != ERR_OK) {
+		http_adapter_release();
 		return -1;
+	}
 
 	deadline = (uint64_t)ukplat_monotonic_clock() +
 		   HTTP_SERVICE_DHCP_TIMEOUT_NS;
@@ -640,12 +779,16 @@ static int acquire_http_lease(struct uk_netdev *device,
 		if (dhcp_supplied_address(netif))
 			break;
 		(void)http_adapter_poll();
-		if (http_adapter.failure != HTTP_ADAPTER_OK)
+		if (http_adapter.failure != HTTP_ADAPTER_OK) {
+			dhcp_stop(netif);
+			http_adapter_release();
 			return -1;
+		}
 		uk_sched_thread_sleep(1000000ULL);
 	}
 	if (!dhcp_supplied_address(netif)) {
 		dhcp_stop(netif);
+		http_adapter_release();
 		return -1;
 	}
 	*netif_out = netif;
@@ -719,6 +862,7 @@ hyperv_acceptance_run_http_service(unsigned int network_offers,
 
 	raw_pcb = tcp_new_ip_type(IPADDR_TYPE_V4);
 	if (!raw_pcb) {
+		http_adapter_release();
 		puts("HYPERV_ACCEPTANCE HTTP_SERVICE FAIL reason=tcp-new");
 		return HYPERV_ACCEPTANCE_FAIL;
 	}
@@ -727,6 +871,7 @@ hyperv_acceptance_run_http_service(unsigned int network_offers,
 		       (uint16_t)CONFIG_APPHYPERVACCEPTANCE_HTTP_PORT);
 	if (err != ERR_OK) {
 		tcp_abort(raw_pcb);
+		http_adapter_release();
 		printf("HYPERV_ACCEPTANCE HTTP_SERVICE FAIL "
 		       "reason=tcp-bind rc=%d\n", (int)err);
 		return HYPERV_ACCEPTANCE_FAIL;
@@ -735,6 +880,7 @@ hyperv_acceptance_run_http_service(unsigned int network_offers,
 		raw_pcb, (uint8_t)HTTP_SERVICE_POOL_SIZE);
 	if (!listen_pcb) {
 		tcp_abort(raw_pcb);
+		http_adapter_release();
 		puts("HYPERV_ACCEPTANCE HTTP_SERVICE FAIL reason=tcp-listen");
 		return HYPERV_ACCEPTANCE_FAIL;
 	}
@@ -779,6 +925,7 @@ hyperv_acceptance_run_http_service(unsigned int network_offers,
 
 		packets = http_adapter_poll();
 		if (http_adapter.failure != HTTP_ADAPTER_OK) {
+			http_adapter_release();
 			emit_http_service_stats(
 				"error",
 				(now_mono_ns - service_start_mono_ns) /
@@ -808,6 +955,7 @@ hyperv_acceptance_run_http_service(unsigned int network_offers,
 			close_slot_pcb(&http_slots[i]);
 	}
 	(void)tcp_close(listen_pcb);
+	http_adapter_release();
 
 	emit_http_service_stats(
 		"final",
@@ -816,6 +964,8 @@ hyperv_acceptance_run_http_service(unsigned int network_offers,
 	puts("UK_HYPERV_HTTP_SERVICE_READY");
 	return HYPERV_ACCEPTANCE_PASS;
 }
+
+#endif /* CONFIG_APPHYPERVACCEPTANCE_HTTP_SERVICE */
 
 #else
 
@@ -830,4 +980,4 @@ hyperv_acceptance_run_http_service(unsigned int network_offers,
 	return HYPERV_ACCEPTANCE_UNAVAILABLE;
 }
 
-#endif /* CONFIG_APPHYPERVACCEPTANCE_HTTP_SERVICE */
+#endif /* CONFIG_APPHYPERVACCEPTANCE_HTTP_SERVICE || HYPERV_HTTP_SERVICE_HOST_TEST */
