@@ -227,7 +227,6 @@ fn writeMode(io: std.Io, dir: std.Io.Dir, sub_path: []const u8, bytes: []const u
     defer file.close(io);
     try file.writeStreamingAll(io, bytes);
     if (mode != 0o600) try modeFd(file.handle, mode);
-    try file.sync(io);
 }
 
 fn canonicalBytes(a: std.mem.Allocator, raw: []const u8) ![]const u8 {
@@ -304,6 +303,14 @@ fn artifactFor(a: std.mem.Allocator, io: std.Io, path: []const u8, known_sha256:
     const digest = if (known_sha256) |d|
         try a.dupe(u8, d)
     else blk: {
+        const RuntimeCache = types.runtime.DigestCache;
+        const HandoffCache = @import("wamr_handoff").retained_copy.DigestCache;
+        const bhash = RuntimeCache.computeBoundaryHash(io, file, stx.size);
+        if (bhash) |bh| {
+            if (RuntimeCache.get(stx, 1, bh)) |cached| {
+                break :blk try a.dupe(u8, &std.fmt.bytesToHex(cached.digest, .lower));
+            }
+        }
         var hasher = core.Sha256.init(.{});
         var buf: [65536]u8 = undefined;
         var offset: u64 = 0;
@@ -313,7 +320,12 @@ fn artifactFor(a: std.mem.Allocator, io: std.Io, path: []const u8, known_sha256:
             hasher.update(buf[0..amount]);
             offset += amount;
         }
-        break :blk try a.dupe(u8, &std.fmt.bytesToHex(hasher.finalResult(), .lower));
+        const raw_digest = hasher.finalResult();
+        if (bhash) |bh| {
+            RuntimeCache.put(stx, 1, bh, raw_digest, 0, 0);
+            HandoffCache.put(stx, 1, bh, raw_digest, 0, HandoffCache.flag_scan_checked);
+        }
+        break :blk try a.dupe(u8, &std.fmt.bytesToHex(raw_digest, .lower));
     };
     return .{
         .path = try a.dupe(u8, path),
@@ -357,7 +369,6 @@ const CachedPackage = struct {
 
 var cached_pkg_lock: std.atomic.Value(u32) = .init(0);
 var cached_pkg: CachedPackage = .{};
-const zero_chunk: [65536]u8 = @splat(0);
 
 fn captureSparseFile(io: std.Io, dir: std.Io.Dir, name: []const u8, out_size: *u64) ![]const SparseChunk {
     const page = std.heap.page_allocator;
@@ -385,35 +396,27 @@ fn captureSparseFile(io: std.Io, dir: std.Io.Dir, name: []const u8, out_size: *u
 fn writeSparseFile(io: std.Io, dir: std.Io.Dir, name: []const u8, size: u64, chunks: []const SparseChunk) !void {
     const file = try dir.createFile(io, name, .{ .permissions = .fromMode(0o600) });
     defer file.close(io);
-    var chunk_idx: usize = 0;
-    var offset: u64 = 0;
-    while (offset < size) {
-        if (chunk_idx < chunks.len and chunks[chunk_idx].offset == offset) {
-            const slice = chunks[chunk_idx].bytes;
-            try file.writeStreamingAll(io, slice);
-            offset += slice.len;
-            chunk_idx += 1;
-        } else {
-            const next_non_zero = if (chunk_idx < chunks.len) chunks[chunk_idx].offset else size;
-            const want: usize = @intCast(@min(@as(u64, zero_chunk.len), next_non_zero - offset));
-            try file.writeStreamingAll(io, zero_chunk[0..want]);
-            offset += want;
-        }
+    for (chunks) |chunk| {
+        try file.writePositionalAll(io, chunk.bytes, chunk.offset);
     }
-    try file.sync(io);
+    if (std.os.linux.errno(std.os.linux.ftruncate(file.handle, @intCast(size))) != .SUCCESS)
+        return error.FixtureFailed;
 }
 
 fn seedArtifactDigestCache(io: std.Io, dir: std.Io.Dir, name: []const u8, sha256_hex: []const u8, vhd_raw_sha256_hex: ?[]const u8) void {
     const DigestCache = @import("wamr_handoff").retained_copy.DigestCache;
+    const RuntimeCache = types.runtime.DigestCache;
     const file = dir.openFile(io, name, .{}) catch return;
     defer file.close(io);
     const snap = files.snapshot(file) catch return;
     const bh = DigestCache.computeBoundaryHash(io, file, snap.size) orelse return;
     const digest = core.contracts.parseSha256(sha256_hex) catch return;
     DigestCache.put(snap, 1, bh, digest, 0, DigestCache.flag_scan_checked);
+    RuntimeCache.put(snap, 1, bh, digest, 0, RuntimeCache.flag_scan_checked);
     if (vhd_raw_sha256_hex) |raw_hex| {
         const raw_digest = core.contracts.parseSha256(raw_hex) catch return;
         DigestCache.put(snap, 2, bh, raw_digest, 0, 0);
+        RuntimeCache.put(snap, 2, bh, raw_digest, 0, 0);
     }
 }
 
