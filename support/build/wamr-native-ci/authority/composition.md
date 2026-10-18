@@ -165,11 +165,15 @@ verifies `uk-wamr-direct-validate azure-runtime` and
 `runtime_probes.inspectCopied` on the copied runtime tree, executes all 19
 closed runtime probe steps (`loader_listing`, `python_version`, `imports`, and
 all 16 closed Azure CLI commands) against the copied dynamic loader and
-interpreter, binds the real ELF runtime closure into v2 `plan` and CLI
-`record-authorization` with `uk-wamr-direct-validate` (`azure-runtime`, `plan`,
-and `authorization`), and verifies post-publication tamper refusal across
-`inspectCopied`, `record-authorization`, and `uk-wamr-direct-validate` when a
-copied DSO in the closure is modified.
+interpreter, binds the real ELF runtime closure into v2 `plan`, CLI
+`record-authorization` (both `denied` and `approved`), CLI `admit`
+(`NotAuthorized`, `ToolBindingMismatch`, and `MissingCandidateOwner` refusal
+lanes), and canonical v2 `admission` with `uk-wamr-direct-validate`
+(`azure-runtime`, `plan`, `authorization`, `admission`, `stored-scope`,
+`inputs`, `ledger`, `ledger-proposal`, and `serial`), and verifies
+post-publication tamper refusal across `inspectCopied`, `record-authorization`,
+and `uk-wamr-direct-validate` (`azure-runtime`, `plan`, `authorization`, and
+`admission`) when a copied DSO in the closure is modified.
 
 Synthetic authorization and admission constructors use the shared golden-record
 fixture helper. It rebinds only the executing ledger owner and dependent exact
