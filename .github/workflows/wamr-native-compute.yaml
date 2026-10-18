@@ -86,6 +86,7 @@ jobs:
           done
           sudo -n install -d -o root -g root -m 755 /d
           sudo -n install -d -o "$(id -u)" -g "$(id -g)" -m 700 /d/wamr-ci
+          sudo -n install -d -o "$(id -u)" -g "$(id -g)" -m 700 /d/wamr-ci/wamr-native-public-parity
           export PATH="/usr/bin:/bin:${PATH}"
           if ! (
             for name in bash make bison yacc flex lex m4 python3 getfacl; do
@@ -375,6 +376,15 @@ jobs:
           printf '%s\n' "${result}"
           test -s "${root}/compute/public-source/handoff/private/handoff-inspect.log"
           test -s "${root}/compute/public-source/handoff/evidence/command-handoff-inspect.json"
+          controller="${WAMR_CI_CONTROLLER:?}"
+          test -x "${controller}"
+          native_parity=/d/wamr-ci/wamr-native-public-parity
+          test -d "${native_parity}"
+          test ! -e "${native_parity}/private-export"
+          "${controller}" private-export \
+            --runtime "${root}" \
+            --output "${native_parity}/private-export"
+          test -f "${native_parity}/private-export/bundle.json"
           archive_sha256="$(
             printf '%s\n' "${result}" |
               sed -n 's/^Public source archive SHA-256: //p'
@@ -737,10 +747,16 @@ jobs:
       - name: Revalidate the trusted inner stage through the native records bridge
         timeout-minutes: 20
         env:
+          ARTIFACT_ID: ${{ steps.public_upload.outputs.artifact-id }}
+          DOWNLOAD_DIR: ${{ steps.public_redownload.outputs.destination }}
+          GITHUB_REPOSITORY_VISIBILITY: ${{ github.event.repository.private == false && 'public' || 'private' }}
+          INNER_ZIP_SHA256: ${{ steps.public_bundle.outputs.inner_zip_sha256 }}
           SOURCE_TREE: ${{ steps.public_bundle.outputs.source_tree }}
+          WAMR_CI_RUNTIME: /d/wamr-ci/wamr-native-runtime
         run: |
           set -euo pipefail
           umask 077
+          export PYTHONDONTWRITEBYTECODE=1
           imported=/d/wamr-ci/wamr-native-runtime/compute/public-source/exact-redownload/success
           stage="${RUNNER_TEMP}/wamr-inner-stage"
           output="${RUNNER_TEMP}/wamr-imported-handoff-v1.json"
@@ -877,6 +893,344 @@ jobs:
             exit 1
           fi
           test ! -e "${identity_parent}/refused-validator"
+          validator=/d/wamr-ci/wamr-native-runtime/compute/public-source/validator-build/public-source/tools/bin/uk-wamr-direct-validate
+          comparator="${RUNNER_TEMP}/wamr-handoff-shadow-safe-tools/bin/wamr-handoff-shadow-compare"
+          handoff_stage=/d/wamr-ci/wamr-native-runtime/compute/public-source/handoff
+          stage_upload_zip="${GITHUB_WORKSPACE}/.d/wamr-public-source-bundle/tiny-aot-public-source.zip"
+          redownloaded_inner_zip="${DOWNLOAD_DIR}/tiny-aot-public-source.zip"
+          native_parity=/d/wamr-ci/wamr-native-public-parity
+          native_seal=/d/wamr-native-public-source-upload
+          test -x "${validator}"
+          test -x "${comparator}"
+          test -d "${handoff_stage}"
+          test -f "${stage_upload_zip}"
+          test -f "${redownloaded_inner_zip}"
+          test -d "${native_parity}"
+          test -f "${native_parity}/private-export/bundle.json"
+          test ! -e "${native_seal}"
+          "${controller}" private-validate \
+            --stage-root "${handoff_stage}" \
+            --git /usr/bin/git \
+            --supervisor "${supervisor}" \
+            --validator "${validator}" \
+            --output "${native_parity}/private-validation"
+          "${controller}" public-archive \
+            --stage-root "${handoff_stage}" \
+            --validation-output "${native_parity}/archive-validation" \
+            --output "${native_parity}/archive" \
+            --git /usr/bin/git \
+            --supervisor "${supervisor}" \
+            --validator "${validator}" \
+            --expected-source "${GITHUB_SHA}" \
+            --expected-tree "${SOURCE_TREE}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}"
+          native_inner_zip="${native_parity}/archive/public-inner.zip"
+          test -f "${native_inner_zip}"
+          cmp -s "${native_inner_zip}" "${stage_upload_zip}"
+          cmp -s "${native_inner_zip}" "${redownloaded_inner_zip}"
+          "${controller}" verify-public-source-bundle \
+            --archive "${native_inner_zip}" \
+            --expected-source "${GITHUB_SHA}" \
+            --expected-tree "${SOURCE_TREE}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --expected-archive-sha256 "${INNER_ZIP_SHA256}"
+          "${controller}" stage-public-source-upload \
+            --archive "${native_inner_zip}" \
+            --output "${native_parity}/staged-upload" \
+            --expected-source "${GITHUB_SHA}" \
+            --expected-tree "${SOURCE_TREE}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --expected-archive-sha256 "${INNER_ZIP_SHA256}"
+          cmp -s "${native_parity}/staged-upload/tiny-aot-public-source.zip" "${native_inner_zip}"
+          sudo -n "${controller}" seal-public-source-upload \
+            --archive "${native_inner_zip}" \
+            --output "${native_seal}" \
+            --source-uid "$(id -u)" \
+            --source-gid "$(id -g)" \
+            --upload-gid "$(id -g)" \
+            --expected-source "${GITHUB_SHA}" \
+            --expected-tree "${SOURCE_TREE}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --expected-archive-sha256 "${INNER_ZIP_SHA256}"
+          cmp -s "${native_seal}/tiny-aot-public-source.zip" "${native_inner_zip}"
+          sudo -n rm -rf "${native_seal}"
+          native_container="${native_parity}/container.zip"
+          native_container_sha256="$(
+            python3 -B - "${redownloaded_inner_zip}" "${native_container}" <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import sys
+          import zipfile
+
+          inner, container = map(Path, sys.argv[1:])
+          fd = os.open(
+              container,
+              os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+              0o600,
+          )
+          with os.fdopen(fd, "wb") as raw:
+              with zipfile.ZipFile(raw, "w", compression=zipfile.ZIP_STORED) as zf:
+                  info = zipfile.ZipInfo(
+                      "tiny-aot-public-source.zip",
+                      date_time=(1980, 1, 1, 0, 0, 0),
+                  )
+                  info.compress_type = zipfile.ZIP_STORED
+                  info.create_system = 3
+                  info.external_attr = (0o100600 & 0xFFFF) << 16
+                  zf.writestr(info, inner.read_bytes())
+              raw.flush()
+              os.fsync(raw.fileno())
+          print(hashlib.sha256(container.read_bytes()).hexdigest())
+          PY
+          )"
+          "${controller}" retain-public-source-download \
+            --container-archive "${native_container}" \
+            --output "${native_parity}/retained-download" \
+            --expected-source "${GITHUB_SHA}" \
+            --expected-tree "${SOURCE_TREE}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --expected-archive-sha256 "${INNER_ZIP_SHA256}" \
+            --artifact-id "${ARTIFACT_ID}" \
+            --container-digest "${native_container_sha256}" \
+            --selected-artifact-id "${ARTIFACT_ID}" \
+            --selected-container-digest "${native_container_sha256}" \
+            --selected-source "${GITHUB_SHA}" \
+            --selected-tree "${SOURCE_TREE}" \
+            --selected-run-id "${GITHUB_RUN_ID}" \
+            --selected-run-attempt "${GITHUB_RUN_ATTEMPT}"
+          cmp -s "${native_parity}/retained-download/tiny-aot-public-source.zip" "${redownloaded_inner_zip}"
+          "${controller}" import-public-source-download \
+            --download-root "${native_parity}/retained-download" \
+            --container-archive "${native_container}" \
+            --output "${native_parity}/native-import" \
+            --git /usr/bin/git \
+            --supervisor "${supervisor}" \
+            --validator "${validator}" \
+            --expected-source "${GITHUB_SHA}" \
+            --expected-tree "${SOURCE_TREE}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --expected-archive-sha256 "${INNER_ZIP_SHA256}" \
+            --artifact-id "${ARTIFACT_ID}" \
+            --container-digest "${native_container_sha256}" \
+            --selected-artifact-id "${ARTIFACT_ID}" \
+            --selected-container-digest "${native_container_sha256}" \
+            --selected-source "${GITHUB_SHA}" \
+            --selected-tree "${SOURCE_TREE}" \
+            --selected-run-id "${GITHUB_RUN_ID}" \
+            --selected-run-attempt "${GITHUB_RUN_ATTEMPT}"
+          python3 -B support/build/wamr-native-ci/handoff.py import-public-source-bundle \
+            --archive "${native_parity}/retained-download/tiny-aot-public-source.zip" \
+            --output "${native_parity}/python-import" \
+            --expected-source "${GITHUB_SHA}" \
+            --expected-tree "${SOURCE_TREE}" \
+            --expected-archive-sha256 "${INNER_ZIP_SHA256}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --validator "${validator}" \
+            --supervisor "${supervisor}" \
+            --artifact-id "${ARTIFACT_ID}" \
+            --container-digest "${native_container_sha256}"
+          for name in portable-bundle.json public-source.json transport.json; do
+            cmp -s "${native_parity}/native-import/${name}" "${native_parity}/python-import/${name}"
+          done
+          cmp -s "${native_parity}/native-import/portable-bundle.json" "${imported}/portable-bundle.json"
+          cmp -s "${native_parity}/native-import/public-source.json" "${imported}/public-source.json"
+          attempt_id="$(python3 -B -c 'import uuid; print(uuid.uuid4())')"
+          "${controller}" candidate \
+            --bundle "${native_parity}/native-import/bundle.json" \
+            --output "${native_parity}/native-candidate.json" \
+            --validation-output "${native_parity}/candidate-validation" \
+            --git /usr/bin/git \
+            --supervisor "${supervisor}" \
+            --validator "${validator}" \
+            --attempt-id "${attempt_id}"
+          python3 -B -c 'from pathlib import Path; import sys; sys.path.insert(0, "support/build/wamr-native-ci"); import handoff; handoff.candidate_plan(Path(sys.argv[1]), Path(sys.argv[2]), attempt_id=sys.argv[3])' \
+            "${native_parity}/python-import/bundle.json" \
+            "${native_parity}/python-candidate.json" \
+            "${attempt_id}"
+          "${controller}" candidate-inspect \
+            --bundle "${native_parity}/native-import/bundle.json" \
+            --candidate "${native_parity}/native-candidate.json" \
+            --validation-output "${native_parity}/inspect-validation" \
+            --git /usr/bin/git \
+            --supervisor "${supervisor}" \
+            --validator "${validator}" > "${native_parity}/native-inspect.stdout"
+          "${validator}" candidate "${native_parity}/python-candidate.json" \
+            > "${native_parity}/python-inspect.stdout"
+          cmp -s "${native_parity}/native-inspect.stdout" "${native_parity}/python-inspect.stdout"
+          python3 -B - "${native_parity}" <<'PY'
+          import os
+          from pathlib import Path
+          import sys
+
+          root = Path(sys.argv[1])
+          serial = (root / "native-import/boots/vpc-x2apic/serial").read_bytes()
+          for name, payload in (
+              ("serial-second.log", serial + serial + b"\x00\x00"),
+              ("serial-incomplete.log", b"Calling main(0, 0)\n"),
+          ):
+              fd = os.open(
+                  root / name,
+                  os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                  0o600,
+              )
+              with os.fdopen(fd, "wb") as handle:
+                  handle.write(payload)
+                  handle.flush()
+                  os.fsync(handle.fileno())
+          PY
+          "${controller}" candidate-result \
+            --bundle "${native_parity}/native-import/bundle.json" \
+            --candidate "${native_parity}/native-candidate.json" \
+            --validation-output "${native_parity}/result-validation" \
+            --git /usr/bin/git \
+            --supervisor "${supervisor}" \
+            --validator "${validator}" \
+            --serial-first "${native_parity}/native-import/boots/vpc-x2apic/serial" \
+            --serial-second "${native_parity}/serial-second.log" \
+            > "${native_parity}/native-result.json"
+          "${validator}" serial "${native_parity}/python-candidate.json" \
+            "${native_parity}/python-import/boots/vpc-x2apic/serial" \
+            "${native_parity}/serial-second.log" \
+            > "${native_parity}/python-result.json"
+          cmp -s "${native_parity}/native-result.json" "${native_parity}/python-result.json"
+          set +e
+          "${controller}" candidate-result \
+            --bundle "${native_parity}/native-import/bundle.json" \
+            --candidate "${native_parity}/native-candidate.json" \
+            --validation-output "${native_parity}/incomplete-validation" \
+            --git /usr/bin/git \
+            --supervisor "${supervisor}" \
+            --validator "${validator}" \
+            --serial-first "${native_parity}/serial-incomplete.log" \
+            > "${native_parity}/native-incomplete.stdout"
+          native_incomplete_rc=$?
+          "${validator}" serial "${native_parity}/python-candidate.json" \
+            "${native_parity}/serial-incomplete.log" \
+            > "${native_parity}/python-incomplete.stdout"
+          python_incomplete_rc=$?
+          set -e
+          test "${native_incomplete_rc}" -eq 2
+          test "${python_incomplete_rc}" -eq 2
+          test ! -s "${native_parity}/native-incomplete.stdout"
+          test ! -s "${native_parity}/python-incomplete.stdout"
+          python3 -B - "${native_parity}" "${handoff_stage}" "${imported}" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import sys
+
+          root, handoff_stage, imported = map(Path, sys.argv[1:])
+
+          def canonical(value):
+              return (
+                  json.dumps(
+                      value,
+                      ensure_ascii=False,
+                      allow_nan=False,
+                      sort_keys=True,
+                      separators=(",", ":"),
+                  )
+                  + "\n"
+              ).encode()
+
+          def write_private(path, raw):
+              fd = os.open(
+                  path,
+                  os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                  0o600,
+              )
+              with os.fdopen(fd, "wb") as handle:
+                  handle.write(raw)
+                  handle.flush()
+                  os.fsync(handle.fileno())
+
+          private_export = root / "private-export"
+          native_import = root / "native-import"
+          python_import = root / "python-import"
+          native_candidate = root / "native-candidate.json"
+          python_candidate = root / "python-candidate.json"
+          write_private(
+              root / "compare-export-bundle.json",
+              canonical({
+                  "mode": "bundle",
+                  "native_roots": {
+                      "bundle": str(private_export),
+                      "candidate": str(root / "private-export-candidate.json"),
+                  },
+                  "python_roots": {
+                      "bundle": str(handoff_stage),
+                      "candidate": str(handoff_stage.parent / "candidate.json"),
+                  },
+                  "native": {
+                      "bundle": (private_export / "bundle.json").read_text(),
+                  },
+                  "python": {
+                      "bundle": (handoff_stage / "bundle.json").read_text(),
+                  },
+              }),
+          )
+          write_private(
+              root / "compare-redownload-bundle.json",
+              canonical({
+                  "mode": "bundle",
+                  "native_roots": {
+                      "bundle": str(native_import),
+                      "candidate": str(native_candidate),
+                  },
+                  "python_roots": {
+                      "bundle": str(imported),
+                      "candidate": str(imported.parent / "candidate.json"),
+                  },
+                  "native": {
+                      "bundle": (native_import / "bundle.json").read_text(),
+                  },
+                  "python": {
+                      "bundle": (imported / "bundle.json").read_text(),
+                  },
+              }),
+          )
+          records = {}
+          for side, import_dir, candidate_path, result_path in (
+              ("native", native_import, native_candidate, root / "native-result.json"),
+              ("python", python_import, python_candidate, root / "python-result.json"),
+          ):
+              records[side] = {
+                  "bundle": (import_dir / "bundle.json").read_text(),
+                  "transport": (import_dir / "transport.json").read_text(),
+                  "candidate": candidate_path.read_text(),
+                  "admission": Path(str(candidate_path) + ".admission.json").read_text(),
+                  "result": canonical(
+                      json.loads(result_path.read_bytes())
+                  ).decode(),
+              }
+          write_private(
+              root / "compare-candidate.json",
+              canonical({
+                  "mode": "candidate",
+                  "native_roots": {
+                      "bundle": str(native_import),
+                      "candidate": str(native_candidate),
+                  },
+                  "python_roots": {
+                      "bundle": str(python_import),
+                      "candidate": str(python_candidate),
+                  },
+                  "native": records["native"],
+                  "python": records["python"],
+              }),
+          )
+          PY
+          "${comparator}" --request "${native_parity}/compare-export-bundle.json"
+          "${comparator}" --request "${native_parity}/compare-redownload-bundle.json"
+          "${comparator}" --request "${native_parity}/compare-candidate.json"
 
       - name: Retain redacted diagnostics separately from the public-source image bundle
         if: always() && steps.native_controller.outcome == 'success'

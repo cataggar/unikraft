@@ -3817,6 +3817,35 @@ class HypervWorkflowTest(unittest.TestCase):
             workflow.index("import-public-source-bundle"),
             workflow.index("GITHUB_STEP_SUMMARY"),
         )
+        self.assertLess(
+            workflow.index("sudo -n install -d -o \"$(id -u)\" -g \"$(id -g)\" -m 700 /d/wamr-ci/wamr-native-public-parity"),
+            workflow.index('"${controller}" build --runtime "${root}"'),
+        )
+        self.assertLess(
+            workflow.index('"${controller}" private-export \\'),
+            workflow.index("upload_dir=/d/wamr-public-source-upload"),
+        )
+        for token in (
+            'stage_upload_zip="${GITHUB_WORKSPACE}/.d/wamr-public-source-bundle/tiny-aot-public-source.zip"',
+            '"${controller}" private-export \\',
+            '"${controller}" private-validate \\',
+            '"${controller}" public-archive \\',
+            '"${controller}" verify-public-source-bundle \\',
+            '"${controller}" stage-public-source-upload \\',
+            'sudo -n "${controller}" seal-public-source-upload \\',
+            '"${controller}" retain-public-source-download \\',
+            '"${controller}" import-public-source-download \\',
+            'python3 -B support/build/wamr-native-ci/handoff.py import-public-source-bundle \\',
+            '"${controller}" candidate \\',
+            '"${controller}" candidate-inspect \\',
+            '"${controller}" candidate-result \\',
+            '--serial-first "${native_parity}/native-import/boots/vpc-x2apic/serial" \\',
+            '--serial-second "${native_parity}/serial-second.log" \\',
+            '"${comparator}" --request "${native_parity}/compare-export-bundle.json"',
+            '"${comparator}" --request "${native_parity}/compare-redownload-bundle.json"',
+            '"${comparator}" --request "${native_parity}/compare-candidate.json"',
+        ):
+            self.assertIn(token, workflow)
         handoff = (
             repository / "support/build/wamr-native-ci/handoff.py"
         ).read_text()
@@ -3835,6 +3864,14 @@ class HypervWorkflowTest(unittest.TestCase):
             '--expected-archive-sha256 "$ARCHIVE_SHA256"',
             operator,
         )
+        for token in (
+            "uk-wamr-native-ci retain-public-source-download \\",
+            "uk-wamr-native-ci import-public-source-download \\",
+            "uk-wamr-native-ci candidate \\",
+            "uk-wamr-native-ci candidate-inspect \\",
+            "uk-wamr-native-ci candidate-result \\",
+        ):
+            self.assertIn(token, operator)
         self.assertIn(
             "python3 -B support/tools/hyperv/direct/tests/historical_owner.py",
             operator,
