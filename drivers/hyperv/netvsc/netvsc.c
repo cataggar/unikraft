@@ -177,6 +177,7 @@ struct netvsc_device {
 	__u32 receive_section_count;
 	__u32 send_section_size;
 	__u32 send_section_count;
+	__u32 section_next_index;
 	__u32 transaction_tombstone_next;
 	__u32 request_tombstone_next;
 	__u32 malformed_messages;
@@ -201,6 +202,9 @@ struct netvsc_device {
 	__u16 pending_ack_count;
 	__u16 operations;
 	__u16 id_reservations;
+	__u16 tx_active_count;
+	__u16 tx_reclaimable_count;
+	__u16 tx_next_slot;
 	__u16 tx_wrapper_pending;
 	__u16 quarantined_tx_count;
 	__u8 initialized;
@@ -281,23 +285,55 @@ static void netvsc_fail_channel(struct netvsc_device *device)
 	(void)vmbus_connection_fail();
 }
 
+typedef __u64 __attribute__((__may_alias__, __aligned__(1)))
+	netvsc_u64_alias_t;
+
 static void copy_bytes(void *destination, const void *source, size_t length)
 {
 	__u8 *dst = destination;
 	const __u8 *src = source;
-	size_t i;
 
-	for (i = 0; i < length; i++)
-		dst[i] = src[i];
+	while (length >= sizeof(netvsc_u64_alias_t)) {
+		*(netvsc_u64_alias_t *)dst =
+			*(const netvsc_u64_alias_t *)src;
+		dst += sizeof(netvsc_u64_alias_t);
+		src += sizeof(netvsc_u64_alias_t);
+		length -= sizeof(netvsc_u64_alias_t);
+		__asm__ __volatile__("" ::: "memory");
+	}
+	while (length--) {
+		*dst++ = *src++;
+		__asm__ __volatile__("" ::: "memory");
+	}
 }
 
 static void zero_bytes(void *destination, size_t length)
 {
 	__u8 *dst = destination;
-	size_t i;
 
-	for (i = 0; i < length; i++)
-		dst[i] = 0;
+	while (length >= sizeof(netvsc_u64_alias_t)) {
+		*(netvsc_u64_alias_t *)dst = 0;
+		dst += sizeof(netvsc_u64_alias_t);
+		length -= sizeof(netvsc_u64_alias_t);
+		__asm__ __volatile__("" ::: "memory");
+	}
+	while (length--) {
+		*dst++ = 0;
+		__asm__ __volatile__("" ::: "memory");
+	}
+}
+
+static void netvsc_tx_reset_context_locked(struct netvsc_tx_context *context)
+{
+	context->transaction_id = 0;
+	context->packet = NULL;
+	context->section_index = NETVSC_INVALID_SECTION;
+	context->range_count = 0;
+	context->pfn_count = 0;
+	context->state = NETVSC_TX_FREE;
+	context->completion_pending = 0;
+	context->completion_malformed = 0;
+	context->upper_done = 0;
 }
 
 static __u32 read_le32(const __u8 *data)
@@ -429,11 +465,7 @@ static int netvsc_generation_busy_locked(struct netvsc_device *device)
 	if (busy)
 		return 1;
 	ukplat_spin_lock_irqsave(&device->tx_lock, flags);
-	for (i = 0; i < CONFIG_LIBNETVSC_TX_SLOTS; i++)
-		if (device->tx[i].state != NETVSC_TX_FREE) {
-			busy = 1;
-			break;
-		}
+	busy = device->tx_active_count != 0;
 	ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
 	if (busy)
 		return 1;
@@ -622,29 +654,54 @@ static int netvsc_known_request(const struct netvsc_device *device, __u32 id)
 	return 0;
 }
 
+static int netvsc_send_section_allocate_locked(struct netvsc_device *device,
+					       __u32 required, __u32 *section)
+{
+	__u32 count = device->send_section_count;
+	__u32 start;
+	__u32 step;
+
+	*section = NETVSC_INVALID_SECTION;
+	if (!device->send_connected || !device->send_section_size ||
+	    !count || required > device->send_section_size)
+		return -ENOSPC;
+	start = device->section_next_index % count;
+	for (step = 0; step < count; step++) {
+		__u32 i = (start + step) % count;
+
+		if (device->section_used[i])
+			continue;
+		device->section_used[i] = 1;
+		device->section_next_index = (i + 1) % count;
+		*section = i;
+		return 0;
+	}
+	return -ENOSPC;
+}
+
+static void netvsc_send_section_release_locked(struct netvsc_device *device,
+					       __u32 section)
+{
+	if (section >= NETVSC_SECTION_LIMIT)
+		return;
+	device->section_used[section] = 0;
+	if (section < device->send_section_count &&
+	    (device->section_next_index >= device->send_section_count ||
+	     device->section_used[device->section_next_index] ||
+	     section < device->section_next_index))
+		device->section_next_index = section;
+}
+
 static int netvsc_send_section_allocate(struct netvsc_device *device,
 					__u32 required, __u32 *section)
 {
 	unsigned long flags;
-	unsigned int i;
+	int rc;
 
-	*section = NETVSC_INVALID_SECTION;
 	ukplat_spin_lock_irqsave(&device->tx_lock, flags);
-	if (!device->send_connected || !device->send_section_size ||
-	    required > device->send_section_size) {
-		ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
-		return -ENOSPC;
-	}
-	for (i = 0; i < device->send_section_count; i++) {
-		if (device->section_used[i])
-			continue;
-		device->section_used[i] = 1;
-		*section = i;
-		ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
-		return 0;
-	}
+	rc = netvsc_send_section_allocate_locked(device, required, section);
 	ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
-	return -ENOSPC;
+	return rc;
 }
 
 static void netvsc_send_section_release(struct netvsc_device *device,
@@ -656,7 +713,7 @@ static void netvsc_send_section_release(struct netvsc_device *device,
 	    section >= NETVSC_SECTION_LIMIT)
 		return;
 	ukplat_spin_lock_irqsave(&device->tx_lock, flags);
-	device->section_used[section] = 0;
+	netvsc_send_section_release_locked(device, section);
 	ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
 }
 
@@ -1402,6 +1459,7 @@ static int netvsc_connect_send_buffer(struct netvsc_device *device)
 	if (device->send_section_count > NETVSC_SECTION_LIMIT)
 		device->send_section_count = NETVSC_SECTION_LIMIT;
 	zero_bytes(device->section_used, sizeof(device->section_used));
+	device->section_next_index = 0;
 	device->send_connected = 1;
 	return 0;
 }
@@ -1668,8 +1726,12 @@ static void netvsc_tx_mark_completed_locked(
 	context->section_index = NETVSC_INVALID_SECTION;
 	context->completion_pending = 0;
 	context->state = NETVSC_TX_COMPLETED;
-	if (section < NETVSC_SECTION_LIMIT)
-		device->section_used[section] = 0;
+	if (context->upper_done) {
+		UK_ASSERT(device->tx_reclaimable_count <
+			  CONFIG_LIBNETVSC_TX_SLOTS);
+		device->tx_reclaimable_count++;
+	}
+	netvsc_send_section_release_locked(device, section);
 	(void)__atomic_add_fetch(&device->diagnostic_tx_completed, 1,
 				 __ATOMIC_RELAXED);
 	netvsc_remember_transaction(device, context->transaction_id);
@@ -1684,11 +1746,12 @@ static void netvsc_tx_reclaim_completed(struct netvsc_device *device)
 
 	ukplat_spin_lock_irqsave(&device->tx_lock, flags);
 	/* The public wrappers may still be walking any submitted chain. */
-	if (device->tx_wrapper_pending) {
+	if (device->tx_wrapper_pending || !device->tx_reclaimable_count) {
 		ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
 		return;
 	}
-	for (i = 0; i < CONFIG_LIBNETVSC_TX_SLOTS; i++) {
+	for (i = 0; i < CONFIG_LIBNETVSC_TX_SLOTS &&
+		    device->tx_reclaimable_count; i++) {
 		struct netvsc_tx_context *context = &device->tx[i];
 
 		if (context->state != NETVSC_TX_COMPLETED ||
@@ -1696,8 +1759,17 @@ static void netvsc_tx_reclaim_completed(struct netvsc_device *device)
 			continue;
 		if (context->packet)
 			packets[count++] = context->packet;
-		zero_bytes(context, sizeof(*context));
-		context->section_index = NETVSC_INVALID_SECTION;
+		netvsc_tx_reset_context_locked(context);
+		UK_ASSERT(device->tx_active_count != 0);
+		device->tx_active_count--;
+		device->tx_reclaimable_count--;
+		if (!device->tx_active_count)
+			device->tx_next_slot = 0;
+		else if (device->tx_next_slot >= CONFIG_LIBNETVSC_TX_SLOTS ||
+			 device->tx[device->tx_next_slot].state !=
+				 NETVSC_TX_FREE ||
+			 i < device->tx_next_slot)
+			device->tx_next_slot = (__u16)i;
 	}
 	ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
 	while (count)
@@ -1711,18 +1783,28 @@ static void netvsc_tx_returned(struct uk_netdev *netdev,
 	struct netvsc_device *device =
 		__containerof(netdev, struct netvsc_device, netdev);
 	unsigned long flags;
-	unsigned int i;
+	unsigned int step;
+	unsigned int start;
 	int found = 0;
 
 	UK_ASSERT(queue == &device->txq);
 	ukplat_spin_lock_irqsave(&device->tx_lock, flags);
-	for (i = 0; i < CONFIG_LIBNETVSC_TX_SLOTS; i++) {
+	start = (device->tx_next_slot + CONFIG_LIBNETVSC_TX_SLOTS - 1) %
+		CONFIG_LIBNETVSC_TX_SLOTS;
+	for (step = 0; step < CONFIG_LIBNETVSC_TX_SLOTS; step++) {
+		unsigned int i = (start + CONFIG_LIBNETVSC_TX_SLOTS - step) %
+			CONFIG_LIBNETVSC_TX_SLOTS;
 		struct netvsc_tx_context *context = &device->tx[i];
 
 		if (context->state == NETVSC_TX_FREE ||
 		    context->packet != packet || context->upper_done)
 			continue;
 		context->upper_done = 1;
+		if (context->state == NETVSC_TX_COMPLETED) {
+			UK_ASSERT(device->tx_reclaimable_count <
+				  CONFIG_LIBNETVSC_TX_SLOTS);
+			device->tx_reclaimable_count++;
+		}
 		UK_ASSERT(device->tx_wrapper_pending != 0);
 		device->tx_wrapper_pending--;
 		found = 1;
@@ -2350,33 +2432,33 @@ static int netvsc_frame_length(struct uk_netbuf *packet, __u32 *length)
 static struct netvsc_tx_context *
 netvsc_tx_allocate(struct netvsc_device *device, __u64 transaction_id)
 {
-	unsigned int i;
-	unsigned int active = 0;
+	unsigned int step;
+	unsigned int start;
 
-	for (i = 0; i < CONFIG_LIBNETVSC_TX_SLOTS; i++)
-		active += device->tx[i].state != NETVSC_TX_FREE;
-	if (active >= device->txq.descriptors)
+	if (device->tx_active_count >= device->txq.descriptors ||
+	    device->tx_active_count >= CONFIG_LIBNETVSC_TX_SLOTS)
 		return NULL;
-	for (i = 0; i < CONFIG_LIBNETVSC_TX_SLOTS; i++) {
-		if (device->tx[i].state != NETVSC_TX_FREE)
+	start = device->tx_next_slot % CONFIG_LIBNETVSC_TX_SLOTS;
+	for (step = 0; step < CONFIG_LIBNETVSC_TX_SLOTS; step++) {
+		unsigned int i = (start + step) % CONFIG_LIBNETVSC_TX_SLOTS;
+		struct netvsc_tx_context *context = &device->tx[i];
+
+		if (context->state != NETVSC_TX_FREE)
 			continue;
-		zero_bytes(&device->tx[i], sizeof(device->tx[i]));
-		device->tx[i].state = NETVSC_TX_BUILDING;
-		device->tx[i].transaction_id = transaction_id;
-		device->tx[i].section_index = NETVSC_INVALID_SECTION;
-		return &device->tx[i];
+		netvsc_tx_reset_context_locked(context);
+		context->state = NETVSC_TX_BUILDING;
+		context->transaction_id = transaction_id;
+		device->tx_active_count++;
+		device->tx_next_slot = (__u16)((i + 1) %
+					       CONFIG_LIBNETVSC_TX_SLOTS);
+		return context;
 	}
 	return NULL;
 }
 
 static int netvsc_tx_has_room(struct netvsc_device *device)
 {
-	unsigned int i;
-	unsigned int active = 0;
-
-	for (i = 0; i < CONFIG_LIBNETVSC_TX_SLOTS; i++)
-		active += device->tx[i].state != NETVSC_TX_FREE;
-	return active < device->txq.descriptors;
+	return device->tx_active_count < device->txq.descriptors;
 }
 
 static void netvsc_tx_rollback(struct netvsc_device *device,
@@ -2388,13 +2470,23 @@ static void netvsc_tx_rollback(struct netvsc_device *device,
 	ukplat_spin_lock_irqsave(&device->tx_lock, flags);
 	if (context->state == NETVSC_TX_BUILDING &&
 	    context->transaction_id == transaction_id) {
+		unsigned int slot = (unsigned int)(context - &device->tx[0]);
+
 		if (context->completion_pending)
 			netvsc_count_early_completion(device);
-		if (context->section_index < NETVSC_SECTION_LIMIT)
-			device->section_used[context->section_index] = 0;
+		netvsc_send_section_release_locked(device,
+						   context->section_index);
 		netvsc_remember_transaction(device, transaction_id);
-		zero_bytes(context, sizeof(*context));
-		context->section_index = NETVSC_INVALID_SECTION;
+		netvsc_tx_reset_context_locked(context);
+		UK_ASSERT(device->tx_active_count != 0);
+		device->tx_active_count--;
+		if (!device->tx_active_count)
+			device->tx_next_slot = 0;
+		else if (device->tx_next_slot >= CONFIG_LIBNETVSC_TX_SLOTS ||
+			 device->tx[device->tx_next_slot].state !=
+				 NETVSC_TX_FREE ||
+			 slot < device->tx_next_slot)
+			device->tx_next_slot = (__u16)slot;
 	}
 	ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
 }
@@ -2521,16 +2613,10 @@ static int netvsc_tx_one(struct uk_netdev *netdev,
 
 	if (device->send_connected &&
 	    frame_length + NETVSC_RNDIS_HEADER_SIZE <=
-		    device->send_section_size) {
-		unsigned int i;
-
-		for (i = 0; i < device->send_section_count; i++)
-			if (!device->section_used[i]) {
-				device->section_used[i] = 1;
-				section = i;
-				break;
-			}
-	}
+		    device->send_section_size)
+		(void)netvsc_send_section_allocate_locked(
+			device, frame_length + NETVSC_RNDIS_HEADER_SIZE,
+			&section);
 	context->section_index = section;
 	ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
 	netvsc_id_reservation_end(device);
@@ -2918,7 +3004,6 @@ int uk_netvsc_diagnostics_get(struct uk_netdev *netdev,
 {
 	struct netvsc_device *device;
 	unsigned long flags;
-	unsigned int i;
 
 	if (!netdev || !diagnostics)
 		return -EINVAL;
@@ -2965,9 +3050,7 @@ int uk_netvsc_diagnostics_get(struct uk_netdev *netdev,
 	ukplat_spin_unlock_irqrestore(&device->state_lock, flags);
 
 	ukplat_spin_lock_irqsave(&device->tx_lock, flags);
-	for (i = 0; i < CONFIG_LIBNETVSC_TX_SLOTS; i++)
-		diagnostics->tx_pending +=
-			device->tx[i].state != NETVSC_TX_FREE;
+	diagnostics->tx_pending = device->tx_active_count;
 	ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
 
 	ukplat_spin_lock_irqsave(&device->rx_lock, flags);
@@ -3021,14 +3104,18 @@ static void netvsc_cancel_tx(struct netvsc_device *device, int quarantine)
 			else
 				packets[count++] = device->tx[i].packet;
 		}
-		if (device->tx[i].section_index < NETVSC_SECTION_LIMIT)
-			device->section_used[device->tx[i].section_index] = 0;
+		netvsc_send_section_release_locked(device,
+						   device->tx[i].section_index);
 		netvsc_remember_transaction(device,
 					    device->tx[i].transaction_id);
 		zero_bytes(&device->tx[i], sizeof(device->tx[i]));
 		device->tx[i].section_index = NETVSC_INVALID_SECTION;
 	}
 	UK_ASSERT(device->tx_wrapper_pending == 0);
+	device->tx_active_count = 0;
+	device->tx_reclaimable_count = 0;
+	device->tx_next_slot = 0;
+	device->section_next_index = 0;
 	device->tx_wrapper_pending = 0;
 	ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
 	while (count)
@@ -3188,6 +3275,7 @@ static void netvsc_detach_host(struct netvsc_device *device, int revoked)
 	device->receive_section_count = 0;
 	device->send_section_count = 0;
 	device->send_section_size = 0;
+	device->section_next_index = 0;
 	device->recovering = 0;
 	device->failed = 0;
 	ukplat_spin_unlock_irqrestore(&device->state_lock, flags);
@@ -3447,11 +3535,12 @@ int netvsc_host_drain_pending(void)
 
 __u16 netvsc_host_tx_active(void)
 {
-	unsigned int i;
-	__u16 count = 0;
+	unsigned long flags;
+	__u16 count;
 
-	for (i = 0; i < CONFIG_LIBNETVSC_TX_SLOTS; i++)
-		count += netvsc.tx[i].state != NETVSC_TX_FREE;
+	ukplat_spin_lock_irqsave(&netvsc.tx_lock, flags);
+	count = netvsc.tx_active_count;
+	ukplat_spin_unlock_irqrestore(&netvsc.tx_lock, flags);
 	return count;
 }
 
@@ -3576,6 +3665,10 @@ void netvsc_host_reset(void)
 	netvsc.next_request = 1;
 	netvsc.next_transaction = 1;
 	netvsc.id_reservations = 0;
+	netvsc.tx_active_count = 0;
+	netvsc.tx_reclaimable_count = 0;
+	netvsc.tx_next_slot = 0;
+	netvsc.section_next_index = 0;
 	netvsc.tx_wrapper_pending = 0;
 	netvsc_clear_id_tombstones(&netvsc);
 }
