@@ -9,6 +9,8 @@ import contextlib, copy, hashlib, importlib.util, io, json, os, shutil, stat, sy
 from pathlib import Path
 from unittest import mock
 
+from historical_controller_fixture import load_oracle_module
+
 ROOT = Path(__file__).resolve().parents[4]
 WAMR_CI = ROOT / "support/build/wamr-native-ci"
 FIXTURES = WAMR_CI / "tests/fixtures/differential"
@@ -32,10 +34,7 @@ UUID = "00000000-0000-4000-8000-000000000001"
 
 
 def load(name):
-    spec = importlib.util.spec_from_file_location(name, WAMR_CI / f"{name}.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_oracle_module(name, ROOT)
 
 
 def artifact(path, size=1):
