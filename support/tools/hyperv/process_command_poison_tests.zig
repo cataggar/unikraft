@@ -1,4 +1,4 @@
-//! Separate process: command-supervisor poison is irreversible.
+//! Fork-isolated case: command-supervisor poison is irreversible.
 const std = @import("std");
 const support = @import("process_private_test_support.zig");
 const process = support.process;
@@ -7,7 +7,7 @@ const allocator = support.allocator;
 const io = support.io;
 const linux = std.os.linux;
 
-test "cleanup deadline preserves successful primary and poisons unresolved custody" {
+fn runCase() !void {
     var fixture = try support.Fixture.init();
     defer fixture.deinit();
     const path = try support.executable();
@@ -40,4 +40,8 @@ test "cleanup deadline preserves successful primary and poisons unresolved custo
         .primary_deadline = try process.Deadline.afterMilliseconds(1000),
         .cleanup_deadline = try process.Deadline.afterMilliseconds(2000),
     }));
+}
+
+test "cleanup deadline preserves successful primary and poisons unresolved custody" {
+    try support.runForked(runCase);
 }

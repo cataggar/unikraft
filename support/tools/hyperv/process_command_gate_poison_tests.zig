@@ -5,7 +5,7 @@ const testing = std.testing;
 const allocator = support.allocator;
 const io = support.io;
 
-test "unavailable gated ECHILD proof fails closed after reaping" {
+fn runCase() !void {
     var fixture = try support.Fixture.init();
     defer fixture.deinit();
     const path = try support.executable();
@@ -39,4 +39,8 @@ test "unavailable gated ECHILD proof fails closed after reaping" {
         error.UnresolvedCleanup,
         process.runCommand(allocator, io, command),
     );
+}
+
+test "unavailable gated ECHILD proof fails closed after reaping" {
+    try support.runForked(runCase);
 }

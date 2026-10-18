@@ -67,3 +67,31 @@ pub fn cancelAfter(flag: *std.atomic.Value(bool), milliseconds: u32) void {
     _ = std.os.linux.nanosleep(&duration, null);
     flag.store(true, .release);
 }
+
+fn failChild(err: anyerror) noreturn {
+    const linux = std.os.linux;
+    const name = @errorName(err);
+    _ = linux.write(2, name.ptr, name.len);
+    _ = linux.write(2, "\n", 1);
+    linux.exit_group(125);
+}
+
+pub fn runForked(comptime case: fn () anyerror!void) !void {
+    const linux = std.os.linux;
+    const forked = linux.fork();
+    if (linux.errno(forked) != .SUCCESS) return error.FixtureFork;
+    if (forked == 0) {
+        case() catch |err| failChild(err);
+        linux.exit_group(0);
+    }
+    const pid: linux.pid_t = @intCast(forked);
+    var status: u32 = 0;
+    while (true) switch (linux.errno(linux.waitpid(pid, @ptrCast(&status), 0))) {
+        .SUCCESS => break,
+        .INTR => continue,
+        else => return error.FixtureReap,
+    };
+    try std.testing.expect(linux.W.IFEXITED(status));
+    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+    try noChildren();
+}

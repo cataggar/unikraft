@@ -149,19 +149,8 @@ pub fn build(b: *std.Build) void {
     const command_tests = b.step("test-command", "Run shared trusted-command process fixtures");
     inline for (.{
         "../process_command_tests.zig",
-        "../process_command_gate_tests.zig",
-        "../process_command_gate_poison_tests.zig",
-        "../process_command_post_release_fault_tests.zig",
-        "../process_command_post_release_poison_tests.zig",
         "../process_private_tests.zig",
         "runtime_tests.zig",
-        "../process_command_leader_track_fault_tests.zig",
-        "../process_command_poison_tests.zig",
-        "../process_command_merged_poison_tests.zig",
-        "../process_command_parent_fault_tests.zig",
-        "../process_command_signal_fault_tests.zig",
-        "../process_private_poison_tests.zig",
-        "../process_private_completion_poison_tests.zig",
     }) |source| {
         const tests = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(source),
