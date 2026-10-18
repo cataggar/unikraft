@@ -555,6 +555,7 @@ pub fn build(b: *std.Build) void {
     install_target_run.step.dependOn(&controller_run.step);
     const controller_step = b.step("test-controller", "Run controller foundation unit, golden, and fault fixtures");
     controller_step.dependOn(&install_target_run.step);
+    const skip_controller_limits = b.option(bool, "skip-controller-limits", "Skip source-custody limits when already verified in the same isolated worktree") orelse false;
     const source_limits_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("controller/source_custody_limits_tests.zig"),
@@ -578,7 +579,8 @@ pub fn build(b: *std.Build) void {
     const source_limits_run = b.addRunArtifact(source_limits_tests);
     b.step("test-controller-limits", "Run native source-custody production boundary fixtures")
         .dependOn(&source_limits_run.step);
-    controller_step.dependOn(&source_limits_run.step);
+    if (!skip_controller_limits)
+        controller_step.dependOn(&source_limits_run.step);
     const fault_parity_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("controller/fault_parity_tests.zig"),
@@ -747,7 +749,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "wamr_log_validator", .module = proof_validator },
             .{ .name = "controller_source_closure", .module = proof_closure },
             .{ .name = "handoff_contracts", .module = handoffContracts(b, target, optimize, image.import_table.get("hyperv_core").?) },
-            .{ .name = "import_validator_identity", .module = validatorIdentity(b, identity_writer, b.dependency("direct_validator", .{
+            .{ .name = "import_validator_identity", .module = if (target.query.isNative()) host_identity else validatorIdentity(b, identity_writer, b.dependency("direct_validator", .{
                 .target = target,
                 .optimize = .safe,
             }).artifact("uk-wamr-direct-validate"), target) },
