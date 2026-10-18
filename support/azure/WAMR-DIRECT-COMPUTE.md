@@ -219,8 +219,10 @@ Only successful commands print the fixed private-export/revalidation line with
 `authority=not_admitted`; failures retain partial state, logs and available
 diagnostics and cannot resume or retry in place. Preserve an ambiguous visible
 publication even when its command failed.
-No public ZIP, import/transport, candidate product, workflow/local caller
-cutover, Python retirement, approval, deployment or Azure command is enabled.
+The native CLI also exposes the additive public archive, upload staging/sealing,
+raw container retention, download import, and non-authorizing candidate product
+commands documented below; workflow/local caller cutover, Python retirement,
+approval, deployment and Azure execution remain separately gated.
 
 `export` rechecks the actual source/build/tool inputs, all original result
 record hashes, each original request/report/raw serial, and a real physical
@@ -348,6 +350,64 @@ python3 support/build/wamr-native-ci/handoff.py plan \
 "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" plan \
   "$PRIVATE_PARENT/FRESH-execution-plan.json" \
   "$PRIVATE_PARENT/FRESH-approval-template.json"
+```
+
+The additive native public-source download, import and non-authorizing
+candidate product commands in `uk-wamr-native-ci` consume the same
+independently selected source, run, artifact ID, container digest and inner ZIP
+digest:
+
+```sh
+uk-wamr-native-ci retain-public-source-download \
+  --container-archive "$PRIVATE_PARENT/artifact-container.zip" \
+  --output "$PRIVATE_PARENT/FRESH-retained-download" \
+  --expected-source "$SOURCE_SHA" --expected-tree "$SOURCE_TREE" \
+  --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" \
+  --expected-archive-sha256 "$ARCHIVE_SHA256" \
+  --artifact-id "$ARTIFACT_ID" --container-digest "$CONTAINER_DIGEST" \
+  --selected-artifact-id "$ARTIFACT_ID" \
+  --selected-container-digest "$CONTAINER_DIGEST" \
+  --selected-source "$SOURCE_SHA" --selected-tree "$SOURCE_TREE" \
+  --selected-run-id "$RUN_ID" --selected-run-attempt "$RUN_ATTEMPT"
+uk-wamr-native-ci import-public-source-download \
+  --download-root "$PRIVATE_PARENT/FRESH-retained-download" \
+  --container-archive "$PRIVATE_PARENT/artifact-container.zip" \
+  --output "$PRIVATE_PARENT/FRESH-native-imported-image" \
+  --git "$GIT" \
+  --supervisor "$NATIVE_CONTROLLER" \
+  --validator "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" \
+  --expected-source "$SOURCE_SHA" --expected-tree "$SOURCE_TREE" \
+  --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" \
+  --expected-archive-sha256 "$ARCHIVE_SHA256" \
+  --artifact-id "$ARTIFACT_ID" --container-digest "$CONTAINER_DIGEST" \
+  --selected-artifact-id "$ARTIFACT_ID" \
+  --selected-container-digest "$CONTAINER_DIGEST" \
+  --selected-source "$SOURCE_SHA" --selected-tree "$SOURCE_TREE" \
+  --selected-run-id "$RUN_ID" --selected-run-attempt "$RUN_ATTEMPT"
+uk-wamr-native-ci candidate \
+  --bundle "$PRIVATE_PARENT/FRESH-native-imported-image/bundle.json" \
+  --output "$PRIVATE_PARENT/FRESH-native-candidate.json" \
+  --validation-output "$PRIVATE_PARENT/FRESH-native-candidate-validation" \
+  --git "$GIT" \
+  --supervisor "$NATIVE_CONTROLLER" \
+  --validator "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" \
+  --attempt-id "$ATTEMPT_UUID"
+uk-wamr-native-ci candidate-inspect \
+  --bundle "$PRIVATE_PARENT/FRESH-native-imported-image/bundle.json" \
+  --candidate "$PRIVATE_PARENT/FRESH-native-candidate.json" \
+  --validation-output "$PRIVATE_PARENT/FRESH-native-inspect-validation" \
+  --git "$GIT" \
+  --supervisor "$NATIVE_CONTROLLER" \
+  --validator "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate"
+uk-wamr-native-ci candidate-result \
+  --bundle "$PRIVATE_PARENT/FRESH-native-imported-image/bundle.json" \
+  --candidate "$PRIVATE_PARENT/FRESH-native-candidate.json" \
+  --validation-output "$PRIVATE_PARENT/FRESH-native-result-validation" \
+  --git "$GIT" \
+  --supervisor "$NATIVE_CONTROLLER" \
+  --validator "$PWD/.d/wamr-direct/tools/bin/uk-wamr-direct-validate" \
+  --serial-first "$PRIVATE_PARENT/FRESH-native-imported-image/boots/vpc-x2apic/serial.log" \
+  --serial-second "$PRIVATE_PARENT/FRESH-native-imported-image/boots/vpc-legacy-apic/serial.log"
 ```
 
 The importer requires both locally reviewed native executables explicitly;

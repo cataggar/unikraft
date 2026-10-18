@@ -120,7 +120,12 @@ Failures are explicit refused/poisoned outcomes with phase and publication
 durability; partially created state is non-resumable and retained.
 Authority stays `not_admitted`; there are no cloud operations, approvals,
 candidate execution, Python fallback, or production caller changes.
-The additive seal/extraction commands are source-tested adapters only.
+The additive seal/extraction, public archive, download import, and
+non-authorizing candidate commands are also exercised live in
+`wamr-native-compute.yaml` against the genuine six-boot x86/KVM public-source
+run and checked for canonical differential equality with
+`wamr-handoff-shadow-compare`, while keeping the Python caller as the primary
+publisher pending final cutover.
 Their source graph preserves the exact #263 97-entry historical candidate
 profile. Standalone-supervisor and publication-adapter inputs extend only the
 current graph. Source-name admission remains paired with pinned producer

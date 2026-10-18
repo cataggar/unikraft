@@ -3817,6 +3817,21 @@ class HypervWorkflowTest(unittest.TestCase):
             workflow.index("import-public-source-bundle"),
             workflow.index("GITHUB_STEP_SUMMARY"),
         )
+        for token in (
+            '"${controller}" private-validate \\',
+            '"${controller}" public-archive \\',
+            '"${controller}" verify-public-source-bundle \\',
+            '"${controller}" stage-public-source-upload \\',
+            'sudo -n "${controller}" seal-public-source-upload \\',
+            '"${controller}" retain-public-source-download \\',
+            '"${controller}" import-public-source-download \\',
+            '"${controller}" candidate \\',
+            '"${controller}" candidate-inspect \\',
+            '"${controller}" candidate-result \\',
+            '"${comparator}" --request "${native_parity}/compare-redownload-bundle.json"',
+            '"${comparator}" --request "${native_parity}/compare-candidate.json"',
+        ):
+            self.assertIn(token, workflow)
         handoff = (
             repository / "support/build/wamr-native-ci/handoff.py"
         ).read_text()
@@ -3835,6 +3850,14 @@ class HypervWorkflowTest(unittest.TestCase):
             '--expected-archive-sha256 "$ARCHIVE_SHA256"',
             operator,
         )
+        for token in (
+            "uk-wamr-native-ci retain-public-source-download \\",
+            "uk-wamr-native-ci import-public-source-download \\",
+            "uk-wamr-native-ci candidate \\",
+            "uk-wamr-native-ci candidate-inspect \\",
+            "uk-wamr-native-ci candidate-result \\",
+        ):
+            self.assertIn(token, operator)
         self.assertIn(
             "python3 -B support/tools/hyperv/direct/tests/historical_owner.py",
             operator,
