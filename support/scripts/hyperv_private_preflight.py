@@ -612,7 +612,7 @@ GUARDED_PRODUCER_FILES = {
         "9a501414e2749b031bf1fca8015d3049b9af42c74f1a0da9f514e5165e6d33cb"
     ),
     "drivers/hyperv/netvsc/netvsc.c": (
-        "08bdeca07921446c2993ac0a1c61963c9eb3b398948736e96f378e33ff3582c3"
+        "f0fcc10cbdf8a7e4f439452c9d7b620ed20de3692434d85dbdc633de502b6cf4"
     ),
     "drivers/hyperv/storvsc/Config.uk": (
         "4ee6997ebb98a63bf8cc39ac219e447c5bcec0b783140d2802ba19238711b12c"
