@@ -1429,3 +1429,15 @@ test "command bounds and executable identity refuse before spawn" {
     try testing.expectError(error.ExecutableIdentityChanged, process.runCommand(allocator, io, bounded));
     try support.noChildren();
 }
+
+comptime {
+    _ = @import("process_command_gate_tests.zig");
+    _ = @import("process_command_gate_poison_tests.zig");
+    _ = @import("process_command_post_release_fault_tests.zig");
+    _ = @import("process_command_post_release_poison_tests.zig");
+    _ = @import("process_command_leader_track_fault_tests.zig");
+    _ = @import("process_command_poison_tests.zig");
+    _ = @import("process_command_merged_poison_tests.zig");
+    _ = @import("process_command_parent_fault_tests.zig");
+    _ = @import("process_command_signal_fault_tests.zig");
+}

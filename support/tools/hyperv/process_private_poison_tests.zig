@@ -1,4 +1,4 @@
-//! Must run in a separate test process: supervisor poison is irreversible.
+//! Fork-isolated case: supervisor poison is irreversible.
 const std = @import("std");
 const support = @import("process_private_test_support.zig");
 const process = support.process;
@@ -7,7 +7,7 @@ const allocator = support.allocator;
 const io = support.io;
 const linux = std.os.linux;
 
-test "unresolved escaped writer poisons supervision and retains the original lock" {
+fn runCase() !void {
     var fixture = try support.Fixture.init();
     defer fixture.deinit();
     var lock = try fixture.directory.lock(io);
@@ -39,4 +39,8 @@ test "unresolved escaped writer poisons supervision and retains the original loc
     try testing.expectError(error.UnresolvedCleanup, process.runPrivate(allocator, io, &lock, "again", "again-err", options));
     lock.close(io);
     try testing.expectError(error.WouldBlock, fixture.directory.lock(io));
+}
+
+test "unresolved escaped writer poisons supervision and retains the original lock" {
+    try support.runForked(runCase);
 }

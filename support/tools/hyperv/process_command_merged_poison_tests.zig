@@ -1,4 +1,4 @@
-//! Separate process: merged capture cannot clear unresolved descendant custody.
+//! Fork-isolated case: merged capture cannot clear unresolved descendant custody.
 const std = @import("std");
 const support = @import("process_private_test_support.zig");
 const process = support.process;
@@ -7,7 +7,7 @@ const allocator = support.allocator;
 const io = support.io;
 const linux = std.os.linux;
 
-test "merged partial capture preserves cleanup deadline poison and blocks later commands" {
+fn runCase() !void {
     var fixture = try support.Fixture.init();
     defer fixture.deinit();
     const path = try support.executable();
@@ -40,4 +40,8 @@ test "merged partial capture preserves cleanup deadline poison and blocks later 
     request.primary_deadline = try process.Deadline.afterMilliseconds(1000);
     request.cleanup_deadline = try process.Deadline.afterMilliseconds(2000);
     try testing.expectError(error.UnresolvedCleanup, process.runCommand(allocator, io, request));
+}
+
+test "merged partial capture preserves cleanup deadline poison and blocks later commands" {
+    try support.runForked(runCase);
 }

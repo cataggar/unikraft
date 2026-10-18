@@ -1,4 +1,4 @@
-//! Separate process: closed-pipe completion must not bypass irreversible poison.
+//! Fork-isolated case: closed-pipe completion must not bypass irreversible poison.
 const std = @import("std");
 const support = @import("process_private_test_support.zig");
 const process = support.process;
@@ -7,7 +7,7 @@ const allocator = support.allocator;
 const io = support.io;
 const linux = std.os.linux;
 
-test "completed leader and both EOFs still refuse a live escaped writer" {
+fn runCase() !void {
     var fixture = try support.Fixture.init();
     defer fixture.deinit();
     var lock = try fixture.directory.lock(io);
@@ -40,4 +40,8 @@ test "completed leader and both EOFs still refuse a live escaped writer" {
     try testing.expectError(error.UnresolvedCleanup, process.runPrivate(allocator, io, &lock, "again", "again-err", options));
     lock.close(io);
     try testing.expectError(error.WouldBlock, fixture.directory.lock(io));
+}
+
+test "completed leader and both EOFs still refuse a live escaped writer" {
+    try support.runForked(runCase);
 }
