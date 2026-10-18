@@ -3835,6 +3835,7 @@ class HypervWorkflowTest(unittest.TestCase):
             'sudo -n "${controller}" seal-public-source-upload \\',
             '"${controller}" retain-public-source-download \\',
             '"${controller}" import-public-source-download \\',
+            'python3 -B support/build/wamr-native-ci/handoff.py import-public-source-bundle \\',
             '"${controller}" candidate \\',
             '"${controller}" candidate-inspect \\',
             '"${controller}" candidate-result \\',

@@ -756,6 +756,7 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+          export PYTHONDONTWRITEBYTECODE=1
           imported=/d/wamr-ci/wamr-native-runtime/compute/public-source/exact-redownload/success
           stage="${RUNNER_TEMP}/wamr-inner-stage"
           output="${RUNNER_TEMP}/wamr-imported-handoff-v1.json"
@@ -1024,7 +1025,7 @@ jobs:
             --selected-tree "${SOURCE_TREE}" \
             --selected-run-id "${GITHUB_RUN_ID}" \
             --selected-run-attempt "${GITHUB_RUN_ATTEMPT}"
-          python3 support/build/wamr-native-ci/handoff.py import-public-source-bundle \
+          python3 -B support/build/wamr-native-ci/handoff.py import-public-source-bundle \
             --archive "${native_parity}/retained-download/tiny-aot-public-source.zip" \
             --output "${native_parity}/python-import" \
             --expected-source "${GITHUB_SHA}" \
@@ -1035,14 +1036,13 @@ jobs:
             --validator "${validator}" \
             --supervisor "${supervisor}" \
             --artifact-id "${ARTIFACT_ID}" \
-            --container-digest "${native_container_sha256}" \
-            --native-import-revalidation
+            --container-digest "${native_container_sha256}"
           for name in portable-bundle.json public-source.json transport.json; do
             cmp -s "${native_parity}/native-import/${name}" "${native_parity}/python-import/${name}"
           done
           cmp -s "${native_parity}/native-import/portable-bundle.json" "${imported}/portable-bundle.json"
           cmp -s "${native_parity}/native-import/public-source.json" "${imported}/public-source.json"
-          attempt_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+          attempt_id="$(python3 -B -c 'import uuid; print(uuid.uuid4())')"
           "${controller}" candidate \
             --bundle "${native_parity}/native-import/bundle.json" \
             --output "${native_parity}/native-candidate.json" \
