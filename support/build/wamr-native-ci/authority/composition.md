@@ -15,8 +15,13 @@ approval consumption, Azure operation, or standalone owner acquisition.
 
 ## Operations and lifetimes
 
-* `prepare.run(types.Context, PrepareRuntime, DiscoveryInput) -> Outcome`
-  returns a heap-stable `*prepare.Prepared` only after completed preparation.
+* `prepare.run(types.Context, PrepareRuntime, DiscoveryInput) -> Outcome` and
+  `prepare.runStandalone(types.Context, PrepareRuntime) -> Outcome` return a
+  heap-stable `*prepare.Prepared` only after completed preparation. When
+  `handlers.Context.discovery` is null, `handlers.run` uses
+  `runtime_probes.StandaloneDiscovery` to acquire retained ELF custody for the
+  interpreter, `PT_INTERP` dynamic loader, tree `.so` roots, and transitive
+  `DT_NEEDED` candidates from the `PrepareRuntime` CLI paths.
   `result()`, `revalidate()` and `deinit()` retain the original finite deadline,
   source/destination custody, both native validator runs, real probe evidence,
   manifest and all published records. Results borrow through `deinit()`.

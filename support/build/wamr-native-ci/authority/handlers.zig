@@ -26,7 +26,7 @@ pub fn run(ctx: Context, command: types.Command) Outcome {
         .@"prepare-azure-runtime" => |request| .{ .prepare = if (ctx.discovery) |discovery|
             prepare.run(ctx.retained, request, discovery)
         else
-            .{ .refused = .{ .phase = .inputs, .err = error.MissingDiscoveryContext } } },
+            prepare.runStandalone(ctx.retained, request) },
         .plan => |request| .{ .plan = if (ctx.live_finalized) |owner|
             plan.run(ctx.retained, request, owner)
         else

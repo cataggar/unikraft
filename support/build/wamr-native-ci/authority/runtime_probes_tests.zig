@@ -422,6 +422,103 @@ test "native source hard links and sparse over-limit DSOs cannot enter inventory
     try t.expectError(error.InvalidNativeSource, probes.discover(ctx, input));
 }
 
+test "standalone CLI discovery extracts PT_INTERP native roots and transitive DT_NEEDED closure" {
+    const fixture = try Fixture.init();
+    defer fixture.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const loader_path = try std.fs.path.join(allocator, &.{ fixture.path, probes.loader_basename });
+    try fixture.write(probes.loader_basename, &(try synthetic(.{ .role = .loader, .soname = probes.loader_basename })));
+    try fixture.write("python", &(try synthetic(.{
+        .role = .interpreter,
+        .interpreter = loader_path,
+        .needed = &.{"libalpha.so"},
+    })));
+    try fixture.write("azure", "#!/usr/bin/python3\n");
+    try fixture.write("validator", "\x7fELF");
+    try fixture.write("libalpha.so", &(try synthetic(.{
+        .role = .library,
+        .needed = &.{"libbeta.so"},
+        .soname = "libalpha.so",
+    })));
+    try fixture.write("libbeta.so", &(try synthetic(.{
+        .role = .library,
+        .soname = "libbeta.so",
+    })));
+
+    try fixture.dir.createDir(io, "python3.11", .fromMode(0o700));
+    const stdlib_dir = try fixture.dir.openDir(io, "python3.11", .{ .iterate = true });
+    defer stdlib_dir.close(io);
+    const ext_file = try stdlib_dir.createFile(io, "_ssl.so", .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    defer ext_file.close(io);
+    try ext_file.writeStreamingAll(io, &(try synthetic(.{
+        .role = .native_extension,
+        .needed = &.{"libgamma.so"},
+    })));
+
+    try fixture.dir.createDir(io, "packages", .fromMode(0o700));
+    const pkg_dir = try fixture.dir.openDir(io, "packages", .{ .iterate = true });
+    defer pkg_dir.close(io);
+    const pkg_ext = try pkg_dir.createFile(io, "_pkg.so", .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    defer pkg_ext.close(io);
+    try pkg_ext.writeStreamingAll(io, &(try synthetic(.{
+        .role = .native_extension,
+        .needed = &.{"libbeta.so"},
+    })));
+
+    try fixture.dir.createDir(io, "data", .fromMode(0o700));
+    try fixture.dir.createDir(io, "ext-libs", .fromMode(0o700));
+    const ext_libs = try fixture.dir.openDir(io, "ext-libs", .{ .iterate = true });
+    defer ext_libs.close(io);
+    const gamma_file = try ext_libs.createFile(io, "libgamma.so.1.0", .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    defer gamma_file.close(io);
+    try gamma_file.writeStreamingAll(io, &(try synthetic(.{
+        .role = .library,
+        .needed = &.{"libbeta.so"},
+        .soname = "libgamma.so",
+    })));
+
+    const gamma_path = try std.fs.path.join(allocator, &.{ fixture.path, "ext-libs", "libgamma.so.1.0" });
+    const request: types.PrepareRuntime = .{
+        .output = try std.fs.path.join(allocator, &.{ fixture.path, "output" }),
+        .azure = try std.fs.path.join(allocator, &.{ fixture.path, "azure" }),
+        .az_python = try std.fs.path.join(allocator, &.{ fixture.path, "python" }),
+        .stdlib = try std.fs.path.join(allocator, &.{ fixture.path, "python3.11" }),
+        .validator = try std.fs.path.join(allocator, &.{ fixture.path, "validator" }),
+        .package_root = &.{try std.fs.path.join(allocator, &.{ fixture.path, "packages" })},
+        .data_root = &.{try std.fs.path.join(allocator, &.{ fixture.path, "data" })},
+        .native_dependency = &.{gamma_path},
+    };
+    const ctx: types.Context = .{ .allocator = a, .io = io };
+    var standalone = try probes.StandaloneDiscovery.init(ctx, request);
+    defer standalone.deinit(io);
+    try t.expectEqualStrings(request.az_python, standalone.input.interpreter.path);
+    try t.expectEqualStrings(loader_path, standalone.input.dynamic_loader.path);
+    try t.expectEqual(@as(usize, 2), standalone.input.native_roots.len);
+
+    var discovered = try probes.discover(ctx, standalone.input);
+    defer discovered.deinit();
+    try t.expectEqual(@as(usize, 5), discovered.inventory.dependencies.len);
+
+    var missing_req = request;
+    missing_req.native_dependency = &.{};
+    try t.expectError(error.MissingDependency, probes.StandaloneDiscovery.init(ctx, missing_req));
+
+    var dup_req = request;
+    dup_req.native_dependency = &.{ gamma_path, gamma_path };
+    try t.expectError(error.DuplicateSource, probes.StandaloneDiscovery.init(ctx, dup_req));
+
+    var bad_path_req = request;
+    bad_path_req.az_python = "relative/python";
+    try t.expectError(error.UnsafePath, probes.StandaloneDiscovery.init(ctx, bad_path_req));
+
+    var missing_py_req = request;
+    missing_py_req.az_python = try std.fs.path.join(allocator, &.{ fixture.path, "missing-python" });
+    try t.expectError(error.FileNotFound, probes.StandaloneDiscovery.init(ctx, missing_py_req));
+}
+
 test "copied structural home refuses mutable modes lib64 substitution and missing stdlib" {
     const fixture = try Fixture.init();
     defer fixture.deinit();
