@@ -448,7 +448,7 @@ GUARDED_PRODUCER_FILES = {
         "b21ed97379de228acf41ecc4d5929058dc85368a009a6e0abf742bc5d3096c17"
     ),
     "drivers/hyperv/storvsc/storvsc.c": (
-        "1df869b7064df4c912fbe2254091573aa1da0be892390fdf50f6165d4aefb658"
+        "349095cf3ae98f6fe7d802b1f43d0ea617ba6d359f1a05c3629cdfeb54318c88"
     ),
     "drivers/hyperv/storvsc/storvsc_core.h": (
         "8422dd6de969b13a533fe0291a7019442712ae9b7f6177420e6fd4df22860ab7"
