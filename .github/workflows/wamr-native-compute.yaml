@@ -86,6 +86,7 @@ jobs:
           done
           sudo -n install -d -o root -g root -m 755 /d
           sudo -n install -d -o "$(id -u)" -g "$(id -g)" -m 700 /d/wamr-ci
+          sudo -n install -d -o "$(id -u)" -g "$(id -g)" -m 700 /d/wamr-ci/wamr-native-public-parity
           export PATH="/usr/bin:/bin:${PATH}"
           if ! (
             for name in bash make bison yacc flex lex m4 python3 getfacl; do
@@ -375,6 +376,15 @@ jobs:
           printf '%s\n' "${result}"
           test -s "${root}/compute/public-source/handoff/private/handoff-inspect.log"
           test -s "${root}/compute/public-source/handoff/evidence/command-handoff-inspect.json"
+          controller="${WAMR_CI_CONTROLLER:?}"
+          test -x "${controller}"
+          native_parity=/d/wamr-ci/wamr-native-public-parity
+          test -d "${native_parity}"
+          test ! -e "${native_parity}/private-export"
+          "${controller}" private-export \
+            --runtime "${root}" \
+            --output "${native_parity}/private-export"
+          test -f "${native_parity}/private-export/bundle.json"
           archive_sha256="$(
             printf '%s\n' "${result}" |
               sed -n 's/^Public source archive SHA-256: //p'
@@ -894,12 +904,9 @@ jobs:
           test -d "${handoff_stage}"
           test -f "${stage_upload_zip}"
           test -f "${redownloaded_inner_zip}"
-          test ! -e "${native_parity}"
+          test -d "${native_parity}"
+          test -f "${native_parity}/private-export/bundle.json"
           test ! -e "${native_seal}"
-          mkdir -m 700 "${native_parity}"
-          "${controller}" private-export \
-            --runtime /d/wamr-ci/wamr-native-runtime \
-            --output "${native_parity}/private-export"
           "${controller}" private-validate \
             --stage-root "${handoff_stage}" \
             --git /usr/bin/git \

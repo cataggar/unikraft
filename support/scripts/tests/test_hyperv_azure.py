@@ -3817,6 +3817,14 @@ class HypervWorkflowTest(unittest.TestCase):
             workflow.index("import-public-source-bundle"),
             workflow.index("GITHUB_STEP_SUMMARY"),
         )
+        self.assertLess(
+            workflow.index("sudo -n install -d -o \"$(id -u)\" -g \"$(id -g)\" -m 700 /d/wamr-ci/wamr-native-public-parity"),
+            workflow.index('"${controller}" build --runtime "${root}"'),
+        )
+        self.assertLess(
+            workflow.index('"${controller}" private-export \\'),
+            workflow.index("upload_dir=/d/wamr-public-source-upload"),
+        )
         for token in (
             'stage_upload_zip="${GITHUB_WORKSPACE}/.d/wamr-public-source-bundle/tiny-aot-public-source.zip"',
             '"${controller}" private-export \\',
