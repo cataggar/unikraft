@@ -407,8 +407,9 @@ without self-hashing. Historical four-mode v1 is read-only; there is no
 caller-selected downgrade. `diagnostics --runtime ABS` emits allowlisted
 redacted observations only, never acceptance. The protected production
 workflow now invokes the installed portable controller for build, boot and
-diagnostics; `run.py` remains temporarily for the unmigrated #187/#189 oracles and
-historical compatibility reader until its later removal slices.
+diagnostics; `support/build/wamr-native-ci/run.py` has been retired from the
+working tree while historical Git-blob witnesses remain authenticated by
+object ID and SHA-256.
 
 ## Native record-consumer bridge (Python still performs the handoff)
 
@@ -1512,15 +1513,16 @@ directory-content dependencies.
 The neutral v1/v2 fixture constructors in `tests/controller_record_fixtures.py`
 remain available to #187/#189 without a controller comparison or an executable
 `local`/`full` harness. No acceptance is inferred
-from these synthetic records. The handoff/public-bundle and authority oracles
-remain in their owners until those migrations; `run.py` is not deleted here.
+from these synthetic records. `support/build/wamr-native-ci/run.py` has been
+retired from the working tree while historical Git-blob witnesses remain
+authenticated by object ID and SHA-256.
 
 The controller-only oracle split is recorded in
 `tests/controller_coverage.py`: five production-limit scenarios have native
 exact/excess successors; five native command/source-identity cases no longer
 execute Python. Their neutral command vectors come from the immutable
 `e98623f780fa23d05b5797004e4b88160404eb1b` Git blobs, authenticated separately
-by SHA256, not the current physical `run.py` or mixed `test_adapter.py`.
+by SHA256, not a working-tree `run.py` or mixed `test_adapter.py`.
 Native tests apply and fully rehash mutations themselves. Fixture records
 remain diagnostics, not owner/admission or genuine guest evidence.
 

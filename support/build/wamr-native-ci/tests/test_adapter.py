@@ -34,14 +34,24 @@ SUPERVISOR_PATH = (
     if SUPERVISOR is not None else None)
 
 
+def _historical_controller_fixture():
+    fixture_spec = importlib.util.spec_from_file_location(
+        "wamr_historical_controller_fixture",
+        HERE / "tests/historical_controller_fixture.py",
+    )
+    fixture = importlib.util.module_from_spec(fixture_spec)
+    fixture_spec.loader.exec_module(fixture)
+    return fixture
+
+
 def load_legacy_oracles():
     """Keep native acquisition collection independent of the mixed owner lane."""
     global ci, public_bundle, ENV_COMMAND_TOOL_PATHS
     if "ci" in globals():
         return
-    spec = importlib.util.spec_from_file_location("wamr_ci", HERE / "run.py")
-    controller = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(controller)
+    controller = _historical_controller_fixture().load_oracle_module(
+        "run.py", HERE.parents[2], module_name="wamr_ci"
+    )
     bundle_spec = importlib.util.spec_from_file_location(
         "wamr_public_bundle", HERE / "public_bundle.py")
     bundle = importlib.util.module_from_spec(bundle_spec)
@@ -2564,7 +2574,6 @@ class Contract(unittest.TestCase):
             ci.APP / "README.md",
             ci.APP / "WORKLOADS.md",
             ci.APP / "Config.uk",
-            ci.HERE / "run.py",
             ci.HERE / "README.md",
             ci.REPO / ".github/workflows/wamr-native-compute.yaml",
         )
@@ -2573,6 +2582,7 @@ class Contract(unittest.TestCase):
                 text = path.read_text()
                 self.assertNotIn("prepare.py", text)
                 self.assertNotIn("build-image.py", text)
+        self.assertFalse((ci.HERE / "run.py").exists())
         self.assertFalse((ci.APP / "prepare.py").exists())
         self.assertFalse((ci.APP / "build-image.py").exists())
         self.assertFalse((ci.APP / "tests/test_prepare_differential.py").exists())
@@ -5524,7 +5534,11 @@ source/generated/
             ci.COMMAND_SUPERVISOR_PATH = original
 
     def test_only_dependency_and_supervisor_construction_request_bootstrap(self):
-        tree = ast.parse((HERE / "run.py").read_text())
+        tree = ast.parse(
+            _historical_controller_fixture().oracle_source(
+                "run.py", HERE.parents[2]
+            )
+        )
         observed = []
 
         class Calls(ast.NodeVisitor):
