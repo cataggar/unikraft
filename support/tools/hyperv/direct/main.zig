@@ -284,6 +284,44 @@ pub fn inspectConfig(allocator: std.mem.Allocator, bytes: []const u8, parameters
     try prep.config.validateDirectPersistence(allocator, projected.written(), parameters.guard());
 }
 
+pub fn inspectConfigWithMetadata(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    parameters: prep.seed.Parameters,
+    metadata: *const prep.config.Metadata,
+) !void {
+    return prep.inputs.validateDirectAuthoritativeConfig(allocator, bytes, parameters.guard(), metadata);
+}
+
+fn requireBundleArtifact(actual: Artifact, expected: prep.contracts.File) !void {
+    if (actual.size != expected.size) return error.InvalidArtifact;
+    const sha = try prep.contracts.sha(actual.sha256);
+    if (!std.crypto.timing_safe.eql(prep.contracts.Sha, sha, expected.sha256)) return error.HashMismatch;
+}
+
+pub fn requirePreparedBundle(scope: Scope, bundle: prep.production_local.DirectPersistenceBundle) !void {
+    try scope.validate();
+    const parameters = try scope.parameters();
+    if (!std.meta.eql(parameters.guard(), bundle.guard)) return error.IdentityChanged;
+    const paths = [_][]const u8{
+        scope.os_vhd.path,
+        scope.seed_raw.path,
+        scope.seed_vhd.path,
+        scope.manifest.path,
+        scope.config.path,
+    };
+    for (paths, 0..) |left, idx| {
+        for (paths[idx + 1 ..]) |right| {
+            if (std.mem.eql(u8, left, right)) return error.InvalidArtifact;
+        }
+    }
+    try requireBundleArtifact(scope.os_vhd, bundle.os_vhd);
+    try requireBundleArtifact(scope.seed_raw, bundle.seed_raw);
+    try requireBundleArtifact(scope.seed_vhd, bundle.seed_vhd);
+    try requireBundleArtifact(scope.manifest, bundle.manifest);
+    try requireBundleArtifact(scope.config, bundle.solved_config);
+}
+
 pub fn inspect(allocator: std.mem.Allocator, io: std.Io, scope: Scope) !void {
     const parameters = try scope.parameters();
     const manifest = try readArtifact(allocator, io, scope.manifest);

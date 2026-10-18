@@ -5,6 +5,7 @@ const c = @import("contracts.zig");
 const fs = @import("files.zig");
 const config = @import("config.zig");
 const direct_config = @import("direct_config.zig");
+const original_seed = @import("original_seed.zig");
 const provenance = @import("provenance.zig");
 const source = @import("source.zig");
 const producer = @import("producer.zig");
@@ -199,6 +200,20 @@ pub const DirectConfiguration = struct {
     initial_metadata: c.File,
     solved_config: c.File,
     solved_metadata: c.File,
+};
+
+pub const DirectPersistenceBundle = struct {
+    guard: config.Guard,
+    commitments: admission.Commitments,
+    os_vhd: c.File,
+    seed_raw: c.File,
+    seed_vhd: c.File,
+    manifest: c.File,
+    original_config: c.File,
+    derived_config: c.File,
+    solved_config: c.File,
+    original_production_sha256: c.Sha,
+    derivation_sha256: c.Sha,
 };
 
 pub const DirectFacade = struct {
@@ -422,6 +437,67 @@ pub fn loadDirectPersistence(
         try inspectionConfig(loaded.chain[0].receipt.config_before.path, derivation_parsed.value.derived_config),
     );
     return loaded;
+}
+
+pub fn verifyDirectPersistenceRecords(
+    guard: config.Guard,
+    commitments: admission.Commitments,
+    receipt: receipts.Receipt,
+    initial_config: c.File,
+    derivation: direct_config.Record,
+    derivation_sha256: c.Sha,
+    original: original_seed.Record,
+    original_production_sha256: c.Sha,
+) !DirectPersistenceBundle {
+    try requireDirectGuard(guard);
+    try requireDirectPurpose(receipt.purpose);
+    if (receipt.phase != .packaged) return error.InvalidPhase;
+    if (!std.meta.eql(receipt.guard, guard) or !std.meta.eql(original.guard, guard)) return error.IdentityChanged;
+    _ = try c.sha(&derivation_sha256);
+    _ = try c.sha(&original_production_sha256);
+    try validateDerivationRecord(derivation, guard);
+    if (!std.meta.eql(derivation.original.production_record.sha256, original_production_sha256)) return error.HashMismatch;
+    try fs.requireFile(original.manifest, derivation.original.manifest);
+    try fs.requireFile(original.original_config, derivation.original.config);
+    try fs.requireFile(original.raw, derivation.original.raw);
+    try fs.requireFile(original.vhd, derivation.original.vhd);
+    if (original.raw.size != original_seed.logical_size or original.vhd.size != original_seed.logical_size + 512) return error.InvalidImageLength;
+    try fs.requireFile(initial_config, try inspectionConfig(initial_config.path, derivation.derived_config));
+    const packaging = receipt.packaging orelse return error.MissingPackaging;
+    if (packaging.vhd.size < 1024 * 1024 + 512 or packaging.vhd.size > c.total_cap + 512 or (packaging.vhd.size - 512) % (1024 * 1024) != 0) return error.InvalidImageLength;
+    if (!std.meta.eql(commitments.vhd_sha256, packaging.vhd.sha256) or !std.meta.eql(commitments.raw_sha256, packaging.raw.sha256) or !std.meta.eql(commitments.solved_config_sha256, receipt.config_after.sha256)) return error.HashMismatch;
+    return .{
+        .guard = guard,
+        .commitments = commitments,
+        .os_vhd = packaging.vhd,
+        .seed_raw = original.raw,
+        .seed_vhd = original.vhd,
+        .manifest = original.manifest,
+        .original_config = original.original_config,
+        .derived_config = derivation.derived_config,
+        .solved_config = receipt.config_after,
+        .original_production_sha256 = original_production_sha256,
+        .derivation_sha256 = derivation_sha256,
+    };
+}
+
+pub fn bundleFromLoaded(
+    loaded: *const admission.Loaded,
+    derivation: direct_config.Record,
+    derivation_sha256: c.Sha,
+    original: original_seed.Record,
+    original_production_sha256: c.Sha,
+) !DirectPersistenceBundle {
+    return verifyDirectPersistenceRecords(
+        loaded.input.receipt.guard,
+        loaded.commitments,
+        loaded.input.receipt,
+        loaded.chain[0].receipt.config_before,
+        derivation,
+        derivation_sha256,
+        original,
+        original_production_sha256,
+    );
 }
 
 fn requirePurpose(purpose: c.Purpose) !void {
@@ -674,6 +750,8 @@ test "production local direct persistence facade and configuration validation" {
         DirectFacade.package,
         DirectFacade.generate,
         loadDirectPersistence,
+        verifyDirectPersistenceRecords,
+        bundleFromLoaded,
     }) |entry| {
         var pointer: *const @TypeOf(entry) = &entry;
         std.mem.doNotOptimizeAway(&pointer);
@@ -822,6 +900,319 @@ test "production local direct persistence facade and configuration validation" {
     try writeConfigurationFixture(fixture.dir, "expected.config", seed_initial, 0o600);
     facade.configuration.solved_config = try directory.record(a, io, "expected.config", config.config_cap, .private);
     try std.testing.expectError(error.InvalidGuardProfile, facade.requireConfiguration(true));
+}
+
+test "production local direct persistence bundle binds original seed derivation and packaged commitments" {
+    const guard: config.Guard = .{
+        .run_id = "11111111111111111111111111111111".*,
+        .disk_id = "22222222222222222222222222222222".*,
+        .sectors = config.persistence_sectors,
+        .lun = 7,
+    };
+    const original_production_sha256 = c.digest("original-production-record");
+    const derivation_sha256 = c.digest("direct-derivation-record");
+    const original: original_seed.Record = .{
+        .guard = guard,
+        .raw = .{
+            .path = "original.raw",
+            .sha256 = c.digest("original-raw"),
+            .size = original_seed.logical_size,
+            .mode = 0o600,
+        },
+        .vhd = .{
+            .path = "original.vhd",
+            .sha256 = c.digest("original-vhd"),
+            .size = original_seed.logical_size + 512,
+            .mode = 0o600,
+        },
+        .manifest = .{
+            .path = "original.json",
+            .sha256 = c.digest("original-manifest"),
+            .size = 256,
+            .mode = 0o600,
+        },
+        .original_config = .{
+            .path = "original.config",
+            .sha256 = c.digest("original-config"),
+            .size = 512,
+            .mode = 0o600,
+        },
+    };
+    const derived_config: c.File = .{
+        .path = direct_config.config_name,
+        .sha256 = c.digest("derived-direct-config"),
+        .size = 540,
+        .mode = 0o600,
+    };
+    const derivation: direct_config.Record = .{
+        .guard = guard,
+        .original = .{
+            .production_record = .{
+                .path = original_seed.record_name,
+                .sha256 = original_production_sha256,
+                .size = 1024,
+                .mode = 0o600,
+            },
+            .manifest = original.manifest,
+            .config = original.original_config,
+            .raw = original.raw,
+            .vhd = original.vhd,
+        },
+        .derived_config = derived_config,
+    };
+    const initial_config: c.File = .{
+        .path = "workspace.config",
+        .sha256 = derived_config.sha256,
+        .size = derived_config.size,
+        .mode = 0o600,
+    };
+    const solved_config: c.File = .{
+        .path = "workspace.config",
+        .sha256 = c.digest("solved-direct-config"),
+        .size = 4096,
+        .mode = 0o600,
+    };
+    const os_raw: c.File = .{
+        .path = "acceptance.raw",
+        .sha256 = c.digest("os-raw"),
+        .size = c.image_bytes,
+        .mode = 0o600,
+    };
+    const os_vhd: c.File = .{
+        .path = "acceptance.vhd",
+        .sha256 = c.digest("os-vhd"),
+        .size = c.image_bytes + 512,
+        .mode = 0o600,
+    };
+    var packaging: @import("package.zig").PackageReport = undefined;
+    packaging.raw = os_raw;
+    packaging.vhd = os_vhd;
+    var receipt: receipts.Receipt = undefined;
+    receipt.purpose = .persistence;
+    receipt.phase = .packaged;
+    receipt.guard = guard;
+    receipt.config_before = solved_config;
+    receipt.config_after = solved_config;
+    receipt.packaging = packaging;
+    const commitments: admission.Commitments = .{
+        .scheme = .reviewed_provenance_projection_v1,
+        .guarded_producer_sha256 = c.digest("provenance"),
+        .producer_executable_sha256 = c.digest("producer"),
+        .engine_executable_sha256 = c.digest("engine"),
+        .packaged_receipt_sha256 = c.digest("packaged-receipt"),
+        .selection_sha256 = c.digest("selection"),
+        .input_sha256 = c.digest("input"),
+        .solved_config_sha256 = solved_config.sha256,
+        .raw_sha256 = os_raw.sha256,
+        .vhd_sha256 = os_vhd.sha256,
+    };
+
+    const bundle = try verifyDirectPersistenceRecords(
+        guard,
+        commitments,
+        receipt,
+        initial_config,
+        derivation,
+        derivation_sha256,
+        original,
+        original_production_sha256,
+    );
+    try std.testing.expectEqualDeep(guard, bundle.guard);
+    try std.testing.expectEqualDeep(commitments, bundle.commitments);
+    try std.testing.expectEqualDeep(os_vhd, bundle.os_vhd);
+    try std.testing.expectEqualDeep(original.raw, bundle.seed_raw);
+    try std.testing.expectEqualDeep(original.vhd, bundle.seed_vhd);
+    try std.testing.expectEqualDeep(original.manifest, bundle.manifest);
+    try std.testing.expectEqualDeep(original.original_config, bundle.original_config);
+    try std.testing.expectEqualDeep(derived_config, bundle.derived_config);
+    try std.testing.expectEqualDeep(solved_config, bundle.solved_config);
+    try std.testing.expectEqualDeep(original_production_sha256, bundle.original_production_sha256);
+    try std.testing.expectEqualDeep(derivation_sha256, bundle.derivation_sha256);
+
+    var loaded: admission.Loaded = undefined;
+    loaded.input.receipt = receipt;
+    loaded.commitments = commitments;
+    loaded.chain[0].receipt.config_before = initial_config;
+    const from_loaded = try bundleFromLoaded(&loaded, derivation, derivation_sha256, original, original_production_sha256);
+    try std.testing.expectEqualDeep(bundle, from_loaded);
+
+    // Reject guard collisions and wrong geometry
+    var bad_guard = guard;
+    bad_guard.disk_id = bad_guard.run_id;
+    try std.testing.expectError(
+        error.IdentityCollision,
+        verifyDirectPersistenceRecords(bad_guard, commitments, receipt, initial_config, derivation, derivation_sha256, original, original_production_sha256),
+    );
+    bad_guard = guard;
+    bad_guard.sectors = 4096;
+    try std.testing.expectError(
+        error.WrongPurposeGeometry,
+        verifyDirectPersistenceRecords(bad_guard, commitments, receipt, initial_config, derivation, derivation_sha256, original, original_production_sha256),
+    );
+
+    // Reject wrong purpose or phase or missing packaging
+    for ([_]c.Purpose{ .platform_preflight, .synthetic }) |purpose| {
+        var bad_receipt = receipt;
+        bad_receipt.purpose = purpose;
+        try std.testing.expectError(
+            error.ProductionPurposeRequired,
+            verifyDirectPersistenceRecords(guard, commitments, bad_receipt, initial_config, derivation, derivation_sha256, original, original_production_sha256),
+        );
+    }
+    for ([_]c.Phase{ .prepared, .configured, .built }) |phase| {
+        var bad_receipt = receipt;
+        bad_receipt.phase = phase;
+        try std.testing.expectError(
+            error.InvalidPhase,
+            verifyDirectPersistenceRecords(guard, commitments, bad_receipt, initial_config, derivation, derivation_sha256, original, original_production_sha256),
+        );
+    }
+    {
+        var bad_receipt = receipt;
+        bad_receipt.packaging = null;
+        try std.testing.expectError(
+            error.MissingPackaging,
+            verifyDirectPersistenceRecords(guard, commitments, bad_receipt, initial_config, derivation, derivation_sha256, original, original_production_sha256),
+        );
+    }
+
+    // Reject guard identity drift across receipt, original seed, and derivation record
+    {
+        var bad_receipt = receipt;
+        bad_receipt.guard.run_id = "33333333333333333333333333333333".*;
+        try std.testing.expectError(
+            error.IdentityChanged,
+            verifyDirectPersistenceRecords(guard, commitments, bad_receipt, initial_config, derivation, derivation_sha256, original, original_production_sha256),
+        );
+    }
+    {
+        var bad_original = original;
+        bad_original.guard.disk_id = "44444444444444444444444444444444".*;
+        try std.testing.expectError(
+            error.IdentityChanged,
+            verifyDirectPersistenceRecords(guard, commitments, receipt, initial_config, derivation, derivation_sha256, bad_original, original_production_sha256),
+        );
+    }
+    {
+        var bad_derivation = derivation;
+        bad_derivation.guard.run_id = "55555555555555555555555555555555".*;
+        try std.testing.expectError(
+            error.IdentityChanged,
+            verifyDirectPersistenceRecords(guard, commitments, receipt, initial_config, bad_derivation, derivation_sha256, original, original_production_sha256),
+        );
+    }
+
+    // Reject invalid or mismatched record digests
+    try std.testing.expectError(
+        error.InvalidSha256,
+        verifyDirectPersistenceRecords(guard, commitments, receipt, initial_config, derivation, @splat('?'), original, original_production_sha256),
+    );
+    try std.testing.expectError(
+        error.InvalidSha256,
+        verifyDirectPersistenceRecords(guard, commitments, receipt, initial_config, derivation, derivation_sha256, original, @splat('?')),
+    );
+    try std.testing.expectError(
+        error.HashMismatch,
+        verifyDirectPersistenceRecords(guard, commitments, receipt, initial_config, derivation, derivation_sha256, original, c.digest("other-production-record")),
+    );
+
+    // Reject mismatched original raw/VHD/manifest/config bindings
+    {
+        var bad_original = original;
+        bad_original.manifest.sha256 = c.digest("tampered-manifest");
+        try std.testing.expectError(
+            error.HashMismatch,
+            verifyDirectPersistenceRecords(guard, commitments, receipt, initial_config, derivation, derivation_sha256, bad_original, original_production_sha256),
+        );
+    }
+    {
+        var bad_original = original;
+        bad_original.original_config.sha256 = c.digest("tampered-original-config");
+        try std.testing.expectError(
+            error.HashMismatch,
+            verifyDirectPersistenceRecords(guard, commitments, receipt, initial_config, derivation, derivation_sha256, bad_original, original_production_sha256),
+        );
+    }
+    {
+        var bad_original = original;
+        bad_original.raw.sha256 = c.digest("tampered-raw");
+        try std.testing.expectError(
+            error.HashMismatch,
+            verifyDirectPersistenceRecords(guard, commitments, receipt, initial_config, derivation, derivation_sha256, bad_original, original_production_sha256),
+        );
+    }
+    {
+        var bad_original = original;
+        bad_original.vhd.sha256 = c.digest("tampered-vhd");
+        try std.testing.expectError(
+            error.HashMismatch,
+            verifyDirectPersistenceRecords(guard, commitments, receipt, initial_config, derivation, derivation_sha256, bad_original, original_production_sha256),
+        );
+    }
+
+    // Reject invalid data raw/VHD and OS VHD sizes
+    {
+        var bad_original = original;
+        var bad_derivation = derivation;
+        bad_original.raw.size = original_seed.logical_size - 512;
+        bad_derivation.original.raw.size = bad_original.raw.size;
+        try std.testing.expectError(
+            error.InvalidImageLength,
+            verifyDirectPersistenceRecords(guard, commitments, receipt, initial_config, bad_derivation, derivation_sha256, bad_original, original_production_sha256),
+        );
+    }
+    {
+        var bad_original = original;
+        var bad_derivation = derivation;
+        bad_original.vhd.size = original_seed.logical_size;
+        bad_derivation.original.vhd.size = bad_original.vhd.size;
+        try std.testing.expectError(
+            error.InvalidImageLength,
+            verifyDirectPersistenceRecords(guard, commitments, receipt, initial_config, bad_derivation, derivation_sha256, bad_original, original_production_sha256),
+        );
+    }
+    for ([_]u64{ 512, 1024 * 1024, 1024 * 1024 + 513, c.total_cap + 1024 }) |bad_os_size| {
+        var bad_receipt = receipt;
+        bad_receipt.packaging.?.vhd.size = bad_os_size;
+        try std.testing.expectError(
+            error.InvalidImageLength,
+            verifyDirectPersistenceRecords(guard, commitments, bad_receipt, initial_config, derivation, derivation_sha256, original, original_production_sha256),
+        );
+    }
+
+    // Reject mismatched initial derived config and commitment hashes
+    {
+        var bad_initial = initial_config;
+        bad_initial.sha256 = c.digest("wrong-initial-config");
+        try std.testing.expectError(
+            error.HashMismatch,
+            verifyDirectPersistenceRecords(guard, commitments, receipt, bad_initial, derivation, derivation_sha256, original, original_production_sha256),
+        );
+    }
+    {
+        var bad_commitments = commitments;
+        bad_commitments.vhd_sha256 = c.digest("wrong-vhd");
+        try std.testing.expectError(
+            error.HashMismatch,
+            verifyDirectPersistenceRecords(guard, bad_commitments, receipt, initial_config, derivation, derivation_sha256, original, original_production_sha256),
+        );
+    }
+    {
+        var bad_commitments = commitments;
+        bad_commitments.raw_sha256 = c.digest("wrong-raw");
+        try std.testing.expectError(
+            error.HashMismatch,
+            verifyDirectPersistenceRecords(guard, bad_commitments, receipt, initial_config, derivation, derivation_sha256, original, original_production_sha256),
+        );
+    }
+    {
+        var bad_commitments = commitments;
+        bad_commitments.solved_config_sha256 = c.digest("wrong-solved-config");
+        try std.testing.expectError(
+            error.HashMismatch,
+            verifyDirectPersistenceRecords(guard, bad_commitments, receipt, initial_config, derivation, derivation_sha256, original, original_production_sha256),
+        );
+    }
 }
 
 fn writeConfigurationFixture(directory: std.Io.Dir, path: []const u8, bytes: []const u8, mode: u16) !void {

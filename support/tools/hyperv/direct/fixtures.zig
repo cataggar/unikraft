@@ -175,6 +175,161 @@ pub fn main() !void {
     const no_discovery = try std.mem.replaceOwned(u8, a, config, "CONFIG_LIBSTORVSC_LUN_DISCOVERY=y", "CONFIG_LIBSTORVSC_LUN_DISCOVERY=n");
     defer a.free(no_discovery);
     if (validation.inspectConfig(a, no_discovery, parameters)) |_| return error.AcceptedMissingDiscovery else |err| try expect(err == error.InvalidGuardProfile);
+
+    const metadata_bytes =
+        "unikraft-native-config-metadata-v1\n" ++
+        "symbol\tAPPHYPERVACCEPTANCE\tbool\n" ++
+        "symbol\tAPPHYPERVACCEPTANCE_PERSISTENCE\tbool\n" ++
+        "symbol\tAPPHYPERVACCEPTANCE_NETWORK_APPLICATION\tbool\n" ++
+        "symbol\tAPPHYPERVACCEPTANCE_PERSISTENCE_RUN_ID\tstring\n" ++
+        "symbol\tAPPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID\tstring\n" ++
+        "symbol\tAPPHYPERVACCEPTANCE_PERSISTENCE_SECTORS\tint\n" ++
+        "symbol\tAPPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE\tint\n" ++
+        "symbol\tAPPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY\tint\n" ++
+        "symbol\tAPPHYPERVACCEPTANCE_PERSISTENCE_LUN\tint\n" ++
+        "symbol\tLIBSTORVSC\tbool\n" ++
+        "symbol\tLIBSTORVSC_LUN_DISCOVERY\tbool\n" ++
+        "symbol\tLIBSTORVSC_GUARDED_IO\tbool\n" ++
+        "symbol\tLIBSTORVSC_MAX_DEVICES\tint\n" ++
+        "symbol\tLIBSTORVSC_MAX_LUNS\tint\n" ++
+        "symbol\tARCH_X86_64\tbool\n" ++
+        "symbol\tPLAT_HYPERV\tbool\n" ++
+        "symbol\tUKPLAT_CPU_MAXCOUNT\tint\n";
+    var metadata = try prep.config.Metadata.parse(a, metadata_bytes);
+    defer metadata.deinit();
+    try validation.inspectConfigWithMetadata(a, config, parameters, &metadata);
+    const undeclared_cfg = try std.mem.concat(a, u8, &.{ config, "CONFIG_UNDECLARED_DIRECT_SYMBOL=y\n" });
+    defer a.free(undeclared_cfg);
+    if (validation.inspectConfigWithMetadata(a, undeclared_cfg, parameters, &metadata)) |_| return error.AcceptedUndeclaredSymbol else |err| try expect(err == error.IncompleteMetadata);
+    const legacy_full_cfg = try std.mem.concat(a, u8, &.{ "CONFIG_ARCH_X86_64=y\nCONFIG_PLAT_HYPERV=y\nCONFIG_UKPLAT_CPU_MAXCOUNT=1\n", legacy_guard });
+    defer a.free(legacy_full_cfg);
+    if (validation.inspectConfigWithMetadata(a, legacy_full_cfg, parameters, &metadata)) |_| return error.AcceptedLegacyMaxLuns else |err| try expect(err == error.InvalidGuardProfile);
+
+    const os_vhd_sha = prep.contracts.digest("os-vhd");
+    const seed_raw_sha = prep.contracts.digest("seed-raw");
+    const seed_vhd_sha = prep.contracts.digest("seed-vhd");
+    const manifest_sha = prep.contracts.digest("manifest");
+    const solved_cfg_sha = prep.contracts.digest("solved-config");
+    const other_sha = prep.contracts.digest("other-artifact");
+    const valid_scope: validation.Scope = .{
+        .schema = "uk.hyperv.direct-two-boot",
+        .version = 1,
+        .approval = .{
+            .destructive_data_disk = true,
+            .direct_specialized_gen2 = true,
+            .two_boots_only = true,
+            .cleanup_owned_group = true,
+            .original_seed_reviewed = true,
+            .guarded_native_image_reviewed = true,
+            .expires_unix = 1900000000,
+        },
+        .attempt_id = "11111111-2222-3333-4444-555555555555",
+        .subscription = "66666666-7777-8888-9999-aaaaaaaaaaaa",
+        .location = "eastus2",
+        .prefix = "ukhvdirect",
+        .vm_size = "Standard_D2s_v5",
+        .run_id = &parameters.run_id,
+        .disk_id = &parameters.disk_id,
+        .controller = .SCSI,
+        .lun = 7,
+        .sectors = 8388608,
+        .sector_size = 512,
+        .serial_mode = .azure_cumulative,
+        .runtime_seconds = 600,
+        .cleanup_seconds = 300,
+        .operation_seconds = 120,
+        .poll_seconds = 5,
+        .os_vhd = .{ .path = "/private/acceptance.vhd", .size = 64 * 1024 * 1024 + 512, .sha256 = &os_vhd_sha },
+        .seed_raw = .{ .path = "/private/original.raw", .size = 4294967296, .sha256 = &seed_raw_sha },
+        .seed_vhd = .{ .path = "/private/original.vhd", .size = 4294967808, .sha256 = &seed_vhd_sha },
+        .manifest = .{ .path = "/private/original.json", .size = 512, .sha256 = &manifest_sha },
+        .config = .{ .path = "/private/solved.config", .size = 4096, .sha256 = &solved_cfg_sha },
+    };
+    const valid_bundle: prep.production_local.DirectPersistenceBundle = .{
+        .guard = parameters.guard(),
+        .commitments = .{
+            .scheme = .reviewed_provenance_projection_v1,
+            .guarded_producer_sha256 = prep.contracts.digest("provenance"),
+            .producer_executable_sha256 = prep.contracts.digest("producer"),
+            .engine_executable_sha256 = prep.contracts.digest("engine"),
+            .packaged_receipt_sha256 = prep.contracts.digest("packaged-receipt"),
+            .selection_sha256 = prep.contracts.digest("selection"),
+            .input_sha256 = prep.contracts.digest("input"),
+            .solved_config_sha256 = solved_cfg_sha,
+            .raw_sha256 = prep.contracts.digest("os-raw"),
+            .vhd_sha256 = os_vhd_sha,
+        },
+        .os_vhd = .{ .path = "acceptance.vhd", .size = valid_scope.os_vhd.size, .sha256 = os_vhd_sha, .mode = 0o600 },
+        .seed_raw = .{ .path = "original.raw", .size = valid_scope.seed_raw.size, .sha256 = seed_raw_sha, .mode = 0o600 },
+        .seed_vhd = .{ .path = "original.vhd", .size = valid_scope.seed_vhd.size, .sha256 = seed_vhd_sha, .mode = 0o600 },
+        .manifest = .{ .path = "original.json", .size = valid_scope.manifest.size, .sha256 = manifest_sha, .mode = 0o600 },
+        .original_config = .{ .path = "original.config", .size = 512, .sha256 = prep.contracts.digest("original-config"), .mode = 0o600 },
+        .derived_config = .{ .path = "direct.config", .size = 540, .sha256 = prep.contracts.digest("derived-config"), .mode = 0o600 },
+        .solved_config = .{ .path = "workspace.config", .size = valid_scope.config.size, .sha256 = solved_cfg_sha, .mode = 0o600 },
+        .original_production_sha256 = prep.contracts.digest("original-production"),
+        .derivation_sha256 = prep.contracts.digest("derivation"),
+    };
+    try validation.requirePreparedBundle(valid_scope, valid_bundle);
+    {
+        var bad_bundle = valid_bundle;
+        bad_bundle.guard.run_id = "abababababababababababababababab".*;
+        if (validation.requirePreparedBundle(valid_scope, bad_bundle)) |_| return error.AcceptedWrongBundleGuard else |err| try expect(err == error.IdentityChanged);
+    }
+    {
+        var bad_scope = valid_scope;
+        bad_scope.os_vhd.size += 1024 * 1024;
+        if (validation.requirePreparedBundle(bad_scope, valid_bundle)) |_| return error.AcceptedWrongOsVhdSize else |err| try expect(err == error.InvalidArtifact);
+    }
+    {
+        var bad_scope = valid_scope;
+        bad_scope.os_vhd.sha256 = &other_sha;
+        if (validation.requirePreparedBundle(bad_scope, valid_bundle)) |_| return error.AcceptedWrongOsVhdSha else |err| try expect(err == error.HashMismatch);
+    }
+    {
+        var bad_bundle = valid_bundle;
+        bad_bundle.seed_raw.size -= 512;
+        if (validation.requirePreparedBundle(valid_scope, bad_bundle)) |_| return error.AcceptedWrongSeedRawSize else |err| try expect(err == error.InvalidArtifact);
+    }
+    {
+        var bad_scope = valid_scope;
+        bad_scope.seed_raw.sha256 = &other_sha;
+        if (validation.requirePreparedBundle(bad_scope, valid_bundle)) |_| return error.AcceptedWrongSeedRawSha else |err| try expect(err == error.HashMismatch);
+    }
+    {
+        var bad_bundle = valid_bundle;
+        bad_bundle.seed_vhd.size += 512;
+        if (validation.requirePreparedBundle(valid_scope, bad_bundle)) |_| return error.AcceptedWrongSeedVhdSize else |err| try expect(err == error.InvalidArtifact);
+    }
+    {
+        var bad_scope = valid_scope;
+        bad_scope.seed_vhd.sha256 = &other_sha;
+        if (validation.requirePreparedBundle(bad_scope, valid_bundle)) |_| return error.AcceptedWrongSeedVhdSha else |err| try expect(err == error.HashMismatch);
+    }
+    {
+        var bad_scope = valid_scope;
+        bad_scope.manifest.size += 1;
+        if (validation.requirePreparedBundle(bad_scope, valid_bundle)) |_| return error.AcceptedWrongManifestSize else |err| try expect(err == error.InvalidArtifact);
+    }
+    {
+        var bad_scope = valid_scope;
+        bad_scope.manifest.sha256 = &other_sha;
+        if (validation.requirePreparedBundle(bad_scope, valid_bundle)) |_| return error.AcceptedWrongManifestSha else |err| try expect(err == error.HashMismatch);
+    }
+    {
+        var bad_scope = valid_scope;
+        bad_scope.config.size += 1;
+        if (validation.requirePreparedBundle(bad_scope, valid_bundle)) |_| return error.AcceptedWrongConfigSize else |err| try expect(err == error.InvalidArtifact);
+    }
+    {
+        var bad_scope = valid_scope;
+        bad_scope.config.sha256 = &other_sha;
+        if (validation.requirePreparedBundle(bad_scope, valid_bundle)) |_| return error.AcceptedWrongConfigSha else |err| try expect(err == error.HashMismatch);
+    }
+    {
+        var bad_scope = valid_scope;
+        bad_scope.config.path = bad_scope.manifest.path;
+        if (validation.requirePreparedBundle(bad_scope, valid_bundle)) |_| return error.AcceptedDuplicateArtifactPath else |err| try expect(err == error.InvalidArtifact);
+    }
     var tail: [512]u8 = @splat(0);
     @memcpy(tail[0..8], "conectix");
     std.mem.writeInt(u32, tail[8..12], 2, .big);

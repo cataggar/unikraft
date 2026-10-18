@@ -347,6 +347,19 @@ keeping `Configuration`, `Facade`, and `load` unchanged for
   `.packaged` in `input.json`, verifies that `derivation` in `bindings.config`
   is bound as a staged control file and matches both `guard` and
   `chain[0].receipt.config_before`, and delegates to `admission.load`.
+- `production_local.DirectPersistenceBundle`,
+  `production_local.verifyDirectPersistenceRecords`, and
+  `production_local.bundleFromLoaded` bind the packaged `.persistence`
+  commitments and receipt (`acceptance.vhd` and solved `.config`) to
+  `direct_config.Record` (`derivation.json` + `direct.config`) and
+  `original_seed.Record` (`production.json` + `original.raw`, `original.vhd`,
+  `original.json`, and `original.config`) under one non-colliding
+  8388608-sector LUN-7 guard identity.
+- `support/tools/hyperv/direct/main.zig` exposes `inspectConfigWithMetadata`
+  for metadata-aware solved-config validation and `requirePreparedBundle` to
+  bind a direct-two-boot `Scope` (`os_vhd`, `seed_raw`, `seed_vhd`,
+  `manifest`, and `config`) to a verified `DirectPersistenceBundle` with
+  distinct artifact paths and matching sizes, digests, and guard identity.
 
 This seam alone produces no reviewed material or Azure-ready handoff. A real
 current-source producer/package/input/load run still needs independently
