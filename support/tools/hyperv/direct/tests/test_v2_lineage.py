@@ -44,17 +44,34 @@ def remove_sealed_tree(path):
 
 
 class LineageV2(unittest.TestCase):
+    _shared_runtime_root = None
+    _shared_runtime_tools = None
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._shared_runtime_root is not None:
+            remove_sealed_tree(cls._shared_runtime_root)
+            cls._shared_runtime_root = None
+            cls._shared_runtime_tools = None
+        super().tearDownClass()
+
     def setUp(self):
         self.root = REPO / ".d" / ("v2-lineage-" + uuid.uuid4().hex)
         fixture.build(self.root, PACKAGE)
         self.addCleanup(remove_sealed_tree, self.root)
         self.azure_runtime_tools = None
 
-    def runtime_tools(self, stem=""):
-        if not stem and self.azure_runtime_tools is not None:
-            return self.azure_runtime_tools
-        prefix = stem + "-" if stem else ""
-        source = self.root / (prefix + "azure-launcher-source")
+    def _ensure_shared_runtime(self):
+        cls = type(self)
+        if cls._shared_runtime_tools is not None:
+            return cls._shared_runtime_tools
+        if cls._shared_runtime_root is not None:
+            remove_sealed_tree(cls._shared_runtime_root)
+        shared_root = REPO / ".d" / (
+            "v2-lineage-shared-runtime-" + uuid.uuid4().hex)
+        shared_root.mkdir(mode=0o700)
+        cls._shared_runtime_root = shared_root
+        source = shared_root / "azure-launcher-source"
         source.write_text(
             "#!/usr/bin/python3\n"
             "import os, sys\n"
@@ -108,7 +125,7 @@ class LineageV2(unittest.TestCase):
             "raise SystemExit(29)\n")
         source.chmod(0o700)
         version = f"python{sys.version_info.major}.{sys.version_info.minor}"
-        stdlib = self.root / (prefix + "stdlib-source") / version
+        stdlib = shared_root / "stdlib-source" / version
         stdlib.mkdir(parents=True, mode=0o700)
         shutil.copytree(
             Path(sysconfig.get_path("stdlib")) / "encodings",
@@ -118,15 +135,14 @@ class LineageV2(unittest.TestCase):
             Path(sysconfig.get_config_var("DESTSHARED")).glob("*.so"))))
         shutil.copyfile(native_source, native)
         native.chmod(0o600)
-        loader_fixture = self.root / (prefix + "loader-fixture.so")
+        loader_fixture = shared_root / "loader-fixture.so"
         shutil.copyfile(native_source, loader_fixture)
         loader_fixture.chmod(0o500)
-        output = self.root / (prefix + "azure-runtime")
+        output = shared_root / "azure-runtime"
         handoff.prepare_azure_runtime(
             output, source, Path(sys.executable).resolve(strict=True), stdlib,
             native_dependencies=(loader_fixture,),
             validator=VALIDATOR)
-        (self.root / "expect-descriptor").write_text("required\n")
         closure = fixture.read(output / "azure-runtime.json")
         self.assertEqual(
             closure["isolation"]["host_loader_fallback"], "forbidden")
@@ -134,7 +150,7 @@ class LineageV2(unittest.TestCase):
             set(handoff._elf_dynamic(closure["interpreter"]["path"])),
             {Path(item["path"]).name
              for item in closure["loader_dependencies"]})
-        result = dict(
+        cls._shared_runtime_tools = dict(
             azure=Path(closure["launcher"]["path"]),
             uploader=VALIDATOR,
             validator=VALIDATOR,
@@ -142,9 +158,82 @@ class LineageV2(unittest.TestCase):
             az_python=Path(closure["interpreter"]["path"]),
             azure_runtime=output / "azure-runtime.json",
         )
+        return cls._shared_runtime_tools
+
+    def runtime_tools(self, stem=""):
+        if not stem and self.azure_runtime_tools is not None:
+            return self.azure_runtime_tools
+        shared_tools = self._ensure_shared_runtime()
+        (self.root / "expect-descriptor").write_text("required\n")
         if not stem:
-            self.azure_runtime_tools = result
-        return result
+            self.azure_runtime_tools = dict(shared_tools)
+            return self.azure_runtime_tools
+        cls = type(self)
+        shared_output = cls._shared_runtime_root / "azure-runtime"
+        shared_closure = fixture.read(shared_output / "azure-runtime.json")
+        prefix = stem + "-"
+        output = self.root / (prefix + "azure-runtime")
+        output.mkdir(mode=0o700)
+        runtime = output / "runtime"
+        shutil.copytree(shared_output / "runtime", runtime)
+        for current, names, file_names in os.walk(
+                runtime, topdown=False, followlinks=False):
+            for name in file_names:
+                path = Path(current) / name
+                mode = 0o500 if path.stat().st_mode & 0o111 else 0o400
+                path.chmod(mode)
+            for name in names:
+                (Path(current) / name).chmod(0o500)
+            Path(current).chmod(0o500)
+        (output / "startup-config").mkdir(mode=0o700)
+        launcher = runtime / "bootstrap/azure-cli"
+        interpreter = runtime / "bin/python"
+        loader_directory = runtime / "loader"
+        dependencies = sorted(loader_directory.iterdir(), key=str)
+        dynamic_loader = (
+            loader_directory / Path(shared_closure["dynamic_loader"]["path"]).name)
+        manifest = output / "azure-runtime.manifest"
+        record = output / "azure-runtime.json"
+        scan = handoff._scan_azure_runtime(
+            runtime, launcher, interpreter, dependencies)
+        with manifest.open("xb") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            for manifest_record in scan["records"]:
+                stream.write(manifest_record)
+        manifest_info = manifest.lstat()
+        manifest_digest = handoff.ci.digest(manifest)
+        scan["content"].update(
+            f"C\tA\t{manifest}\t{manifest_info.st_size}\t"
+            f"{manifest_digest}\n".encode())
+        scan["metadata"].update(
+            handoff._metadata_line("A", str(manifest), manifest_info))
+        value = dict(
+            shared_closure,
+            root=str(runtime),
+            extensions=str(runtime / "extensions"),
+            launcher=handoff.executable_artifact(launcher),
+            interpreter=handoff.executable_artifact(interpreter),
+            dynamic_loader=handoff.executable_artifact(dynamic_loader),
+            manifest=handoff.artifact(manifest),
+            observed=scan["observed"],
+            content_sha256=scan["content"].hexdigest(),
+            metadata_sha256=scan["metadata"].hexdigest(),
+            parents_sha256=scan["parents_sha256"],
+            loader_dependencies=scan["loader_dependencies"],
+        )
+        raw_record = handoff.ci.compact_json(value, newline=True)
+        with record.open("xb") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(raw_record)
+        handoff.native_validate(VALIDATOR, "azure-runtime", record)
+        return dict(
+            azure=launcher,
+            uploader=VALIDATOR,
+            validator=VALIDATOR,
+            supervisor=SUPERVISOR,
+            az_python=interpreter,
+            azure_runtime=record,
+        )
 
     def validate(self, command="handoff", path=None, status=0):
         path = path or self.root / "bundle.json"

@@ -227,6 +227,17 @@ def serial(boot=1, value=None):
 
 
 class Compute(unittest.TestCase):
+    _shared_runtime_root = None
+    _shared_azure_runtime = None
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._shared_runtime_root is not None:
+            remove_sealed_tree(cls._shared_runtime_root)
+            cls._shared_runtime_root = None
+            cls._shared_azure_runtime = None
+        super().tearDownClass()
+
     def setUp(self):
         for path in (VALIDATOR, FAKE, CONTROLLER):
             self.assertTrue(path.is_file())
@@ -256,82 +267,102 @@ class Compute(unittest.TestCase):
     def azure_runtime(self):
         if self.prepared_azure_runtime is not None:
             return self.prepared_azure_runtime
-        launcher = self.root / "preflight-azure-source"
-        launcher.write_text(
-            "#!/usr/bin/python3\n"
-            "import os, sys\n"
-            "for key in ('AZ_PYTHON', 'PYTHONPATH', 'PYTHONSTARTUP',"
-            " 'PYTHONUSERBASE', 'LD_PRELOAD', 'LD_LIBRARY_PATH'):\n"
-            " if key in os.environ: raise SystemExit(31)\n"
-            "if os.environ.get('PYTHONDONTWRITEBYTECODE') != '1':"
-            " raise SystemExit(32)\n"
-            "extension_dir = os.environ.get('AZURE_EXTENSION_DIR', '')\n"
-            "if (os.environ.get('AZURE_EXTENSION_USE_DYNAMIC_INSTALL') != 'no'"
-            " or not os.path.isdir(extension_dir)"
-            " or os.listdir(extension_dir)):\n"
-            " raise SystemExit(34)\n"
-            "if os.path.exists(os.path.join(os.environ['HOME'],"
-            " 'expect-descriptor')) and not __file__.startswith("
-            "'/proc/self/fd/'):\n"
-            " raise SystemExit(33)\n"
-            "if os.path.exists(os.path.join(os.environ['HOME'],"
-            " 'expect-descriptor')):\n"
-            " if not os.environ.get('PYTHONHOME', '').startswith("
-            "'/proc/self/fd/'):\n"
-            "  raise SystemExit(35)\n"
-            " try:\n"
-            "  open(__file__, 'ab').close()\n"
-            " except OSError:\n"
-            "  pass\n"
-            " else:\n"
-            "  raise SystemExit(36)\n"
-            " try:\n"
-            "  host_libraries = os.listdir('/lib')\n"
-            " except OSError:\n"
-            "  host_libraries = []\n"
-            " if host_libraries:\n"
-            "  raise SystemExit(37)\n"
-            "control = os.path.join(os.environ['HOME'], 'cli-version-control')\n"
-            "try:\n"
-            " fd = os.open(control, os.O_RDONLY)\n"
-            " try:\n"
-            "  value = os.read(fd, 64)\n"
-            " finally:\n"
-            "  os.close(fd)\n"
-            "except FileNotFoundError:\n"
-            " value = b''\n"
-            "if value == b'fail':\n"
-            " raise SystemExit(29)\n"
-            "if value == b'malformed':\n"
-            " print('{')\n"
-            " raise SystemExit(0)\n"
-            "print('{\"azure-cli\":\"2.75.0\","
-            "\"azure-cli-core\":\"2.75.0\","
-            "\"azure-cli-telemetry\":\"1.1.0\",\"extensions\":{}}')\n")
-        launcher.chmod(0o700)
+        cls = type(self)
         version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        if cls._shared_azure_runtime is None:
+            if cls._shared_runtime_root is not None:
+                remove_sealed_tree(cls._shared_runtime_root)
+            shared_root = REPO / ".d" / (
+                "compute-shared-runtime-" + uuid.uuid4().hex)
+            shared_root.mkdir(mode=0o700)
+            cls._shared_runtime_root = shared_root
+            shared_launcher = shared_root / "preflight-azure-source"
+            shared_launcher.write_text(
+                "#!/usr/bin/python3\n"
+                "import os, sys\n"
+                "for key in ('AZ_PYTHON', 'PYTHONPATH', 'PYTHONSTARTUP',"
+                " 'PYTHONUSERBASE', 'LD_PRELOAD', 'LD_LIBRARY_PATH'):\n"
+                " if key in os.environ: raise SystemExit(31)\n"
+                "if os.environ.get('PYTHONDONTWRITEBYTECODE') != '1':"
+                " raise SystemExit(32)\n"
+                "extension_dir = os.environ.get('AZURE_EXTENSION_DIR', '')\n"
+                "if (os.environ.get('AZURE_EXTENSION_USE_DYNAMIC_INSTALL') != 'no'"
+                " or not os.path.isdir(extension_dir)"
+                " or os.listdir(extension_dir)):\n"
+                " raise SystemExit(34)\n"
+                "if os.path.exists(os.path.join(os.environ['HOME'],"
+                " 'expect-descriptor')) and not __file__.startswith("
+                "'/proc/self/fd/'):\n"
+                " raise SystemExit(33)\n"
+                "if os.path.exists(os.path.join(os.environ['HOME'],"
+                " 'expect-descriptor')):\n"
+                " if not os.environ.get('PYTHONHOME', '').startswith("
+                "'/proc/self/fd/'):\n"
+                "  raise SystemExit(35)\n"
+                " try:\n"
+                "  open(__file__, 'ab').close()\n"
+                " except OSError:\n"
+                "  pass\n"
+                " else:\n"
+                "  raise SystemExit(36)\n"
+                " try:\n"
+                "  host_libraries = os.listdir('/lib')\n"
+                " except OSError:\n"
+                "  host_libraries = []\n"
+                " if host_libraries:\n"
+                "  raise SystemExit(37)\n"
+                "control = os.path.join(os.environ['HOME'], 'cli-version-control')\n"
+                "try:\n"
+                " fd = os.open(control, os.O_RDONLY)\n"
+                " try:\n"
+                "  value = os.read(fd, 64)\n"
+                " finally:\n"
+                "  os.close(fd)\n"
+                "except FileNotFoundError:\n"
+                " value = b''\n"
+                "if value == b'fail':\n"
+                " raise SystemExit(29)\n"
+                "if value == b'malformed':\n"
+                " print('{')\n"
+                " raise SystemExit(0)\n"
+                "print('{\"azure-cli\":\"2.75.0\","
+                "\"azure-cli-core\":\"2.75.0\","
+                "\"azure-cli-telemetry\":\"1.1.0\",\"extensions\":{}}')\n")
+            shared_launcher.chmod(0o700)
+            shared_stdlib = shared_root / "preflight-stdlib" / version
+            shared_stdlib.mkdir(parents=True, mode=0o700)
+            shutil.copytree(
+                Path(sysconfig.get_path("stdlib")) / "encodings",
+                shared_stdlib / "encodings")
+            output = shared_root / "preflight-azure-runtime"
+            handoff.prepare_azure_runtime(
+                output, shared_launcher,
+                Path(sys.executable).resolve(strict=True),
+                shared_stdlib, validator=VALIDATOR)
+            value = read(output / "azure-runtime.json")
+            self.assertEqual(
+                value["isolation"]["host_loader_fallback"], "forbidden")
+            self.assertLessEqual(
+                set(handoff._elf_dynamic(value["interpreter"]["path"])),
+                {Path(item["path"]).name
+                 for item in value["loader_dependencies"]})
+            cls._shared_azure_runtime = (
+                Path(value["launcher"]["path"]),
+                Path(value["interpreter"]["path"]),
+                output / "azure-runtime.json",
+            )
+        launcher = self.root / "preflight-azure-source"
+        shutil.copyfile(
+            cls._shared_runtime_root / "preflight-azure-source", launcher)
+        launcher.chmod(0o700)
         stdlib = self.root / "preflight-stdlib" / version
         stdlib.mkdir(parents=True, mode=0o700)
         shutil.copytree(
-            Path(sysconfig.get_path("stdlib")) / "encodings",
+            cls._shared_runtime_root / "preflight-stdlib" / version
+            / "encodings",
             stdlib / "encodings")
-        output = self.root / "preflight-azure-runtime"
-        handoff.prepare_azure_runtime(
-            output, launcher, Path(sys.executable).resolve(strict=True),
-            stdlib, validator=VALIDATOR)
         (self.root / "expect-descriptor").write_text("required\n")
-        value = read(output / "azure-runtime.json")
-        self.assertEqual(
-            value["isolation"]["host_loader_fallback"], "forbidden")
-        self.assertLessEqual(
-            set(handoff._elf_dynamic(value["interpreter"]["path"])),
-            {Path(item["path"]).name
-             for item in value["loader_dependencies"]})
-        self.prepared_azure_runtime = (
-            Path(value["launcher"]["path"]),
-            Path(value["interpreter"]["path"]),
-            output / "azure-runtime.json",
-        )
+        self.prepared_azure_runtime = cls._shared_azure_runtime
         return self.prepared_azure_runtime
 
     def validate(self, command, *args, status=0):

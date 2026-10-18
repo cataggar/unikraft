@@ -2434,14 +2434,19 @@ class HistoricalFixtureOwnerTest(unittest.TestCase):
         packages = self.root / "packages"
         packages.mkdir(mode=0o700)
         zig = Path(shutil.which("true")).resolve()
-        for failing_stage in (
-            "materialize",
-            "closure",
-            "supervisor",
-            "identity",
+        private_cache = self.root / "shared-global-cache"
+        private_cache.mkdir(mode=0o700)
+        public_cache = self.root / "public-global-cache"
+        public_cache.mkdir(mode=0o777)
+        for failing_stage, env_cache, expected_cache in (
+            ("materialize", str(private_cache), None),
+            ("closure", str(private_cache), str(private_cache)),
+            ("supervisor", str(public_cache), None),
+            ("identity", "", None),
         ):
             with self.subTest(stage=failing_stage):
                 work = self.root / ("failure-" + failing_stage)
+                expected = expected_cache or str(work / "global")
                 real_materialize = historical_owner.materialize
 
                 def materialize(
@@ -2458,8 +2463,16 @@ class HistoricalFixtureOwnerTest(unittest.TestCase):
                     owner,
                     environment,
                     fail=failing_stage,
+                    expected_global=expected,
                 ):
-                    del environment
+                    self.assertTrue((root / "global").is_dir())
+                    if stage in ("closure", "supervisor"):
+                        self.assertEqual(
+                            environment["ZIG_GLOBAL_CACHE_DIR"],
+                            expected_global,
+                        )
+                        self.assertIn("-j2", command)
+                        self.assertNotIn("-j1", command)
                     (root / (stage + ".stderr")).write_bytes(
                         b"retained synthetic failure diagnostic\n"
                     )
@@ -2480,7 +2493,9 @@ class HistoricalFixtureOwnerTest(unittest.TestCase):
                         output.chmod(0o700)
                     return b""
 
-                with mock.patch.object(
+                with mock.patch.dict(
+                    os.environ, {"ZIG_GLOBAL_CACHE_DIR": env_cache}
+                ), mock.patch.object(
                     historical_owner, "materialize", side_effect=materialize
                 ), mock.patch.object(
                     historical_owner, "run_stage", side_effect=run_stage

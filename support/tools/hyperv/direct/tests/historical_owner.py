@@ -537,12 +537,19 @@ def prepare(repository, root, git, zig, packages):
             "supervisor",
         ):
             (root / name).mkdir(mode=0o700)
+        global_cache = root / "global"
+        ambient_global_cache = os.environ.get("ZIG_GLOBAL_CACHE_DIR")
+        if ambient_global_cache:
+            try:
+                global_cache = private(ambient_global_cache)
+            except (OSError, ValueError):
+                global_cache = root / "global"
         environment = {
             **git_environment(),
             "HOME": str(root / "home"),
             "TMPDIR": str(root / "tmp"),
             "PYTHONDONTWRITEBYTECODE": "1",
-            "ZIG_GLOBAL_CACHE_DIR": str(root / "global"),
+            "ZIG_GLOBAL_CACHE_DIR": str(global_cache),
             "PATH": str(Path(git).parent) + ":/usr/bin:/bin",
         }
         common = [
@@ -551,7 +558,7 @@ def prepare(repository, root, git, zig, packages):
             "--system",
             packages,
             "-Doptimize=safe",
-            "-j1",
+            "-j2",
         ]
         stage = "closure"
         for name, path in (("git", git), ("zig", zig)):
