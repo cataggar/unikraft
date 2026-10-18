@@ -14,7 +14,11 @@ import struct
 import subprocess
 import sys
 
-from historical_controller_fixture import load_bindings, load_controller
+from historical_controller_fixture import (
+    load_bindings,
+    load_controller,
+    load_oracle_module,
+)
 
 _SHM_CACHE_PATH = Path(f"/dev/shm/uk-wamr-local-acceptance-cache-{os.geteuid()}-v1.json")
 _SHM_LOCK_PATH = Path(f"/dev/shm/uk-wamr-local-acceptance-cache-{os.geteuid()}-v1.lock")
@@ -716,7 +720,12 @@ def private_cli(source, work, controller, validator):
     os.environ.update(WAMR_CI_CONTROLLER=controller,
                       GITHUB_REPOSITORY="cataggar/unikraft",
                       GITHUB_RUN_ID="1", GITHUB_RUN_ATTEMPT="1")
-    handoff = load("private_cli_oracle", source / "support/build/wamr-native-ci/handoff.py")
+    handoff = load_oracle_module(
+        "handoff",
+        source,
+        producer=repository,
+        module_name="private_cli_oracle",
+    )
     wrap_cached_controller(handoff.ci)
     handoff.ci.REPO = repository
     handoff.ci.APP = repository / "support/apps/wamr-aot"

@@ -20,6 +20,8 @@ MAX_ENTRIES = 65536
 MAX_RECORD = 2 * 1024 * 1024
 MAX_LOG = 8 * 1024 * 1024
 TIMEOUT = 2400
+from historical_controller_fixture import load_oracle_module
+
 HERE = Path(__file__).resolve().parent
 BOUNDED_PROCESS_PATH = HERE.parents[3] / "support/tools/hyperv/direct/tests/bounded_process.py"
 _bounded_spec = importlib.util.spec_from_file_location("wamr_shadow_bounded_process", BOUNDED_PROCESS_PATH)
@@ -375,15 +377,15 @@ def execute(command, output, environment):
 
 def load_oracle(repository):
     # No monkeypatching, fabricated accepted owners or exception fallback.
-    modules = []
-    for name in ("handoff", "public_bundle"):
-        spec = importlib.util.spec_from_file_location(
-            "shadow_frozen_" + name,
-            repository / "support/build/wamr-native-ci" / (name + ".py"))
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        modules.append(module)
-    return modules
+    return [
+        load_oracle_module(
+            name,
+            HERE.parents[3],
+            producer=repository,
+            module_name="shadow_frozen_" + name,
+        )
+        for name in ("handoff", "public_bundle")
+    ]
 
 
 def worker(args):

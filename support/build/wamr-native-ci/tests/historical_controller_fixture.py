@@ -4,12 +4,15 @@ import argparse
 import ast
 import copy
 import hashlib
+import importlib.abc
+import importlib.util
 import json
 import os
 from pathlib import Path
 import shutil
 import stat
 import subprocess
+import sys
 import types
 
 REVISION = "e98623f780fa23d05b5797004e4b88160404eb1b"
@@ -36,6 +39,222 @@ STAGES = (
     "derive-fixed-vhd", "vpc-x2apic", "vpc-legacy-apic", "inspect",
     "log-validator-x2apic", "log-validator-legacy",
 )
+ORACLE_REVISION = "c72bd80b024694590912259fb88a4ba06e84f0a2"
+ORACLE_SOURCES = {
+    "run.py": (
+        "bbd27d611f1d52e610e8588138c8a4e6b3903392",
+        "5c0335859329a9131defd84bbfe967cfa9009754de1a93807dd7ef9a3fdc0227",
+    ),
+    "accepted_records.py": (
+        "7ff60b1eb83c3ff343885d47d11299d146b1b312",
+        "8ded5b670d89620544c02bb9ad0e1f8ac7a9757207d5b05555d7abbebcff9d84",
+    ),
+    "public_bundle.py": (
+        "0915fdad81109e9afdf171ae07c927100aaefda1",
+        "68734d9db7ac38eaa41efe6b1c393199033360c5683ab9d26f2fb34ea8ea4536",
+    ),
+    "handoff.py": (
+        "b84b58341248297cd1807dfb21eab4d363b3c060",
+        "a8a9eaae6ba41fa7b0643c2af6711f48f7c97e27e13cd9c8bdb5811560edf7d2",
+    ),
+    COMMAND_CONTRACT: (
+        "ad73db8f74d76dfb14a39969b2b0ec8f4bd73419",
+        "ee1e038f6538beecac8a09d4d52a6c601a9ca1f503fd70a3753bd8d2e3ac904b",
+    ),
+}
+_SUBPROCESS_RUN = subprocess.run
+_ORACLE_BLOB_CACHE = {}
+_ORACLE_CODE_CACHE = {}
+
+
+def _normalize_oracle_relative(name):
+    if name == COMMAND_CONTRACT or name.endswith(".py"):
+        return name
+    return name + ".py"
+
+
+def oracle_blob(repository=None, relative="handoff.py", git="git", *, run=None):
+    relative = _normalize_oracle_relative(relative)
+    repository = (
+        Path(__file__).resolve().parents[4]
+        if repository is None
+        else Path(repository).resolve()
+    )
+    key = (str(repository), str(git), relative)
+    if run is None and key in _ORACLE_BLOB_CACHE:
+        return _ORACLE_BLOB_CACHE[key]
+    oid, expected = ORACLE_SOURCES[relative]
+    environment = {
+        "PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1",
+    }
+    executable = (
+        shutil.which(str(git), path=environment["PATH"])
+        or shutil.which(str(git))
+    )
+    if executable is None:
+        raise RuntimeError("explicit historical oracle Git unavailable")
+    runner = _SUBPROCESS_RUN if run is None else run
+    argv = [executable, "-C", str(repository), "-c", "core.fsmonitor=false"]
+    path = relative if relative == COMMAND_CONTRACT else PACKAGE + "/" + relative
+    selected = runner(
+        argv + ["rev-parse", ORACLE_REVISION + ":" + path],
+        env=environment, capture_output=True, timeout=30, check=True,
+    ).stdout
+    if selected != (oid + "\n").encode("ascii"):
+        raise RuntimeError("historical oracle blob identity changed")
+    raw = runner(
+        argv + ["cat-file", "blob", oid], env=environment,
+        capture_output=True, timeout=30, check=True,
+    ).stdout
+    if len(raw) > 1024 * 1024 or hashlib.sha256(raw).hexdigest() != expected:
+        raise RuntimeError("historical oracle source authentication failed")
+    if run is None:
+        _ORACLE_BLOB_CACHE[key] = raw
+    return raw
+
+
+def oracle_source(name, repository=None, git="git", *, run=None):
+    return oracle_blob(repository, name, git, run=run).decode("utf-8")
+
+
+def _compile_oracle_code(
+    relative, module_file, repository=None, git="git", *, source=None, run=None
+):
+    relative = _normalize_oracle_relative(relative)
+    repository = (
+        Path(__file__).resolve().parents[4]
+        if repository is None
+        else Path(repository).resolve()
+    )
+    key = (str(repository), str(git), relative, str(module_file))
+    if source is None and run is None and key in _ORACLE_CODE_CACHE:
+        return _ORACLE_CODE_CACHE[key]
+    raw_source = (
+        oracle_source(relative, repository, git, run=run)
+        if source is None
+        else source
+    )
+    tree = ast.parse(raw_source, filename=str(module_file))
+    for index, node in enumerate(tree.body):
+        if (
+            isinstance(node, ast.Import)
+            and len(node.names) == 1
+            and node.names[0].name == "importlib.util"
+            and node.names[0].asname is None
+        ):
+            tree.body[index] = ast.copy_location(ast.Pass(), node)
+    if relative == "run.py":
+        contract = oracle_source(COMMAND_CONTRACT, repository, git, run=run)
+        assignments = [
+            node for node in tree.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(name, ast.Name)
+                    and name.id == "COMMAND_CONTRACT"
+                    for name in node.targets)
+        ]
+        if len(assignments) != 1:
+            raise RuntimeError("historical oracle protocol schema binding changed")
+        assignments[0].value = ast.Call(
+            func=ast.Attribute(value=ast.Name(id="json", ctx=ast.Load()),
+                               attr="loads", ctx=ast.Load()),
+            args=[ast.Constant(value=contract)], keywords=[],
+        )
+    ast.fix_missing_locations(tree)
+    code = compile(tree, str(module_file), "exec")
+    if source is None and run is None:
+        _ORACLE_CODE_CACHE[key] = code
+    return code
+
+
+class _OracleSpecLoader(importlib.abc.Loader):
+    def __init__(self, relative, origin, repository, git, run):
+        self.relative = relative
+        self.origin = str(origin)
+        self.repository = repository
+        self.git = git
+        self.run = run
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        module.__file__ = self.origin
+        code = _compile_oracle_code(
+            self.relative,
+            self.origin,
+            self.repository,
+            self.git,
+            run=self.run,
+        )
+        module.__dict__["importlib"] = _oracle_importlib(
+            self.repository, self.git, self.run
+        )
+        exec(code, module.__dict__)
+
+
+def _oracle_importlib(repository, git="git", run=None):
+    def spec_from_file_location(name, location, *args, **kwargs):
+        path = Path(location)
+        if path.name in ORACLE_SOURCES and path.name.endswith(".py"):
+            loader = _OracleSpecLoader(path.name, path, repository, git, run)
+            return importlib.util.spec_from_loader(name, loader, origin=str(path))
+        return importlib.util.spec_from_file_location(
+            name, location, *args, **kwargs
+        )
+
+    util = types.SimpleNamespace(
+        spec_from_file_location=spec_from_file_location,
+        module_from_spec=importlib.util.module_from_spec,
+        spec_from_loader=importlib.util.spec_from_loader,
+    )
+    return types.SimpleNamespace(util=util)
+
+
+def load_oracle_module(
+    name,
+    repository=None,
+    *,
+    producer=None,
+    source=None,
+    git="git",
+    run=None,
+    module_name=None,
+):
+    relative = _normalize_oracle_relative(name)
+    repository = (
+        Path(__file__).resolve().parents[4]
+        if repository is None
+        else Path(repository).resolve()
+    )
+    target = repository if producer is None else Path(producer)
+    module_file = str(target / PACKAGE / relative)
+    module = types.ModuleType(module_name or relative.removesuffix(".py"))
+    module.__file__ = module_file
+    module.__dict__["importlib"] = _oracle_importlib(repository, git, run)
+    code = _compile_oracle_code(
+        relative, module_file, repository, git, source=source, run=run
+    )
+    exec(code, module.__dict__)
+    return module
+
+
+def run_oracle_cli(name="handoff", repository=None, git="git"):
+    relative = _normalize_oracle_relative(name)
+    repository = (
+        Path(__file__).resolve().parents[4]
+        if repository is None
+        else Path(repository).resolve()
+    )
+    module_file = str(repository / PACKAGE / relative)
+    sys.argv[0] = module_file
+    module = types.ModuleType("__main__")
+    module.__file__ = module_file
+    module.__dict__["importlib"] = _oracle_importlib(repository, git, None)
+    sys.modules["__main__"] = module
+    code = _compile_oracle_code(relative, module_file, repository, git)
+    exec(code, module.__dict__)
 
 
 def git_blob(repository, git, relative):

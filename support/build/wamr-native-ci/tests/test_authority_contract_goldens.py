@@ -23,6 +23,8 @@ import types
 import unittest
 from unittest import mock
 
+from historical_controller_fixture import load_oracle_module, oracle_source
+
 ROOT = Path(__file__).resolve().parents[4]
 WAMR_CI = ROOT / "support/build/wamr-native-ci"
 GOLDEN = WAMR_CI / "authority/goldens/contracts.json"
@@ -88,13 +90,7 @@ def remove_tree(path):
 
 
 def load(name, source=None):
-    spec = importlib.util.spec_from_file_location(name, WAMR_CI / f"{name}.py")
-    module = importlib.util.module_from_spec(spec)
-    if source is None:
-        spec.loader.exec_module(module)
-    else:
-        exec(compile(source, str(WAMR_CI / f"{name}.py"), "exec"), module.__dict__)
-    return module
+    return load_oracle_module(name, ROOT, source=source)
 
 
 def canonical_file(value):
@@ -813,9 +809,19 @@ def cli_surface(handoff):
 
 @functools.lru_cache(maxsize=None)
 def run_handoff(*args):
-    env = {"PYTHONDONTWRITEBYTECODE": "1", "LC_ALL": "C"}
+    env = {
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "LC_ALL": "C",
+        "PYTHONPATH": str(WAMR_CI / "tests"),
+    }
     completed = _ORIGINAL_SUBPROCESS_RUN(
-        [sys.executable, "-B", str(WAMR_CI / "handoff.py"), *args],
+        [
+            sys.executable,
+            "-B",
+            "-c",
+            "from historical_controller_fixture import run_oracle_cli; run_oracle_cli('handoff')",
+            *args,
+        ],
         cwd=ROOT,
         env=env,
         stdin=subprocess.DEVNULL,
@@ -1578,7 +1584,7 @@ class AuthorityContractMutations(unittest.TestCase):
     report = False
 
     def test_representative_behavioral_mutations_fail_golden_verification(self):
-        source = (WAMR_CI / "handoff.py").read_text(encoding="utf-8")
+        source = oracle_source("handoff", ROOT)
         expected = GOLDEN.read_text(encoding="utf-8")
         for name, function, before, after in BEHAVIORAL_MUTATIONS + BOUNDARY_MUTATIONS:
             with self.subTest(mutation=name):
