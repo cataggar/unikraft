@@ -155,26 +155,61 @@ fn validateRing(total_size: usize) ?usize {
     return data_size;
 }
 
-fn ringCopyTo(base: [*]u8, data_size: usize, index: usize, src: []const u8) usize {
-    var cursor = index;
-    for (src) |byte| {
-        @as(*volatile u8, @ptrCast(base + page_size + cursor)).* = byte;
-        cursor += 1;
-        if (cursor == data_size)
-            cursor = 0;
+fn copySlice(dst: []u8, src: []const u8) void {
+    var i: usize = 0;
+    while (i + 32 <= src.len) : (i += 32) {
+        @memcpy(dst[i..][0..32], src[i..][0..32]);
+        asm volatile ("" ::: .{ .memory = true });
     }
-    return cursor;
+    if (i + 16 <= src.len) {
+        @memcpy(dst[i..][0..16], src[i..][0..16]);
+        i += 16;
+    }
+    if (i + 8 <= src.len) {
+        @memcpy(dst[i..][0..8], src[i..][0..8]);
+        i += 8;
+    }
+    if (i + 4 <= src.len) {
+        @memcpy(dst[i..][0..4], src[i..][0..4]);
+        i += 4;
+    }
+    if (i + 2 <= src.len) {
+        @memcpy(dst[i..][0..2], src[i..][0..2]);
+        i += 2;
+    }
+    if (i < src.len) {
+        dst[i] = src[i];
+    }
+}
+
+fn ringCopyTo(base: [*]u8, data_size: usize, index: usize, src: []const u8) usize {
+    const ring_data = (base + page_size)[0..data_size];
+    var pos: usize = index % data_size;
+    var rem = src;
+    while (rem.len > 0) {
+        const chunk = @min(rem.len, data_size - pos);
+        copySlice(ring_data[pos .. pos + chunk], rem[0..chunk]);
+        pos += chunk;
+        if (pos == data_size)
+            pos = 0;
+        rem = rem[chunk..];
+    }
+    return pos;
 }
 
 fn ringCopyFrom(base: [*]u8, data_size: usize, index: usize, dst: []u8) usize {
-    var cursor = index;
-    for (dst) |*byte| {
-        byte.* = @as(*volatile u8, @ptrCast(base + page_size + cursor)).*;
-        cursor += 1;
-        if (cursor == data_size)
-            cursor = 0;
+    const ring_data = (base + page_size)[0..data_size];
+    var pos: usize = index % data_size;
+    var rem = dst;
+    while (rem.len > 0) {
+        const chunk = @min(rem.len, data_size - pos);
+        copySlice(rem[0..chunk], ring_data[pos .. pos + chunk]);
+        pos += chunk;
+        if (pos == data_size)
+            pos = 0;
+        rem = rem[chunk..];
     }
-    return cursor;
+    return pos;
 }
 
 fn writable(read: u32, write: u32, size: u32) ?u32 {
@@ -300,20 +335,13 @@ fn ringWrite(
     put16(&header, 6, flags);
     put64(&header, 8, transaction_id);
 
+    const zero_padding = @as([8]u8, @splat(0));
     var cursor: usize = old_write;
     cursor = ringCopyTo(base, data_size_usize, cursor, &header);
     cursor = ringCopyTo(base, data_size_usize, cursor, descriptor[0..descriptor_size]);
-    const padding = payload_off - desc_end;
-    for (0..padding) |_| {
-        const zero_byte = [_]u8{0};
-        cursor = ringCopyTo(base, data_size_usize, cursor, &zero_byte);
-    }
+    cursor = ringCopyTo(base, data_size_usize, cursor, zero_padding[0 .. payload_off - desc_end]);
     cursor = ringCopyTo(base, data_size_usize, cursor, payload[0..payload_size]);
-    const tail_padding = packet_size - packet_end;
-    for (0..tail_padding) |_| {
-        const zero_byte = [_]u8{0};
-        cursor = ringCopyTo(base, data_size_usize, cursor, &zero_byte);
-    }
+    cursor = ringCopyTo(base, data_size_usize, cursor, zero_padding[0 .. packet_size - packet_end]);
     var footer: [8]u8 = undefined;
     zeroBytes(&footer);
     put64(&footer, 0, @as(u64, old_write) << 32);
@@ -635,6 +663,41 @@ test "ring reserved byte and exact boundary" {
         @backingInt(RingResult.no_space),
         vmbus_ring_write(ring.ptr, ring.len, 6, 0, 1, payload[0..0].ptr, 0, &payload, payload.len, &signal),
     );
+}
+
+test "ringCopyTo and ringCopyFrom handle zero length non-wrapping and boundary wrap" {
+    const ring = testRing(2);
+    _ = vmbus_ring_initialize(ring.ptr, ring.len);
+    const data_size = ring.len - page_size;
+
+    var empty: [0]u8 = .{};
+    try std.testing.expectEqual(@as(usize, 17), ringCopyTo(ring.ptr, data_size, 17, &empty));
+    try std.testing.expectEqual(@as(usize, 0), ringCopyTo(ring.ptr, data_size, data_size, &empty));
+    try std.testing.expectEqual(@as(usize, 17), ringCopyFrom(ring.ptr, data_size, 17, &empty));
+    try std.testing.expectEqual(@as(usize, 0), ringCopyFrom(ring.ptr, data_size, data_size, &empty));
+
+    var src: [95]u8 = undefined;
+    for (&src, 0..) |*byte, i| byte.* = @truncate(i * 7 + 3);
+    var dst: [95]u8 = @splat(0);
+
+    try std.testing.expectEqual(@as(usize, 100 + src.len), ringCopyTo(ring.ptr, data_size, 100, &src));
+    try std.testing.expectEqual(@as(usize, 100 + dst.len), ringCopyFrom(ring.ptr, data_size, 100, &dst));
+    try std.testing.expectEqualSlices(u8, &src, &dst);
+
+    @memset(&dst, 0);
+    const exact_start = data_size - src.len;
+    try std.testing.expectEqual(@as(usize, 0), ringCopyTo(ring.ptr, data_size, exact_start, &src));
+    try std.testing.expectEqual(@as(usize, 0), ringCopyFrom(ring.ptr, data_size, exact_start, &dst));
+    try std.testing.expectEqualSlices(u8, &src, &dst);
+
+    @memset(&dst, 0);
+    const wrap_start = data_size - 37;
+    const expected_end = src.len - 37;
+    try std.testing.expectEqual(expected_end, ringCopyTo(ring.ptr, data_size, wrap_start, &src));
+    try std.testing.expectEqualSlices(u8, src[0..37], ring[page_size + wrap_start .. page_size + data_size]);
+    try std.testing.expectEqualSlices(u8, src[37..], ring[page_size .. page_size + expected_end]);
+    try std.testing.expectEqual(expected_end, ringCopyFrom(ring.ptr, data_size, wrap_start, &dst));
+    try std.testing.expectEqualSlices(u8, &src, &dst);
 }
 
 test "ring empty write read and notification suppression" {
