@@ -73,14 +73,38 @@ comptime {
 }
 
 fn zero(object: anytype) void {
-    const bytes: [*]volatile u8 = @ptrCast(object);
-    for (0..@sizeOf(@TypeOf(object.*))) |i|
-        bytes[i] = 0;
+    zeroBytes(std.mem.asBytes(object));
 }
 
 fn zeroBytes(bytes: []u8) void {
-    for (0..bytes.len) |i|
-        @as(*volatile u8, @ptrCast(&bytes[i])).* = 0;
+    var i: usize = 0;
+    while (i + 128 <= bytes.len) : (i += 128) {
+        @memset(bytes[i..][0..128], 0);
+        asm volatile ("" ::: .{ .memory = true });
+    }
+    while (i + 32 <= bytes.len) : (i += 32) {
+        @memset(bytes[i..][0..32], 0);
+        asm volatile ("" ::: .{ .memory = true });
+    }
+    if (i + 16 <= bytes.len) {
+        @memset(bytes[i..][0..16], 0);
+        i += 16;
+    }
+    if (i + 8 <= bytes.len) {
+        @memset(bytes[i..][0..8], 0);
+        i += 8;
+    }
+    if (i + 4 <= bytes.len) {
+        @memset(bytes[i..][0..4], 0);
+        i += 4;
+    }
+    if (i + 2 <= bytes.len) {
+        @memset(bytes[i..][0..2], 0);
+        i += 2;
+    }
+    if (i < bytes.len) {
+        bytes[i] = 0;
+    }
 }
 
 fn align8(value: usize) ?usize {
@@ -90,36 +114,27 @@ fn align8(value: usize) ?usize {
 }
 
 fn put16(dst: []u8, off: usize, value: u16) void {
-    dst[off] = @truncate(value);
-    dst[off + 1] = @truncate(value >> 8);
+    std.mem.writeInt(u16, dst[off..][0..2], value, .little);
 }
 
 fn put32(dst: []u8, off: usize, value: u32) void {
-    for (0..4) |i|
-        dst[off + i] = @truncate(value >> @intCast(i * 8));
+    std.mem.writeInt(u32, dst[off..][0..4], value, .little);
 }
 
 fn put64(dst: []u8, off: usize, value: u64) void {
-    for (0..8) |i|
-        dst[off + i] = @truncate(value >> @intCast(i * 8));
+    std.mem.writeInt(u64, dst[off..][0..8], value, .little);
 }
 
 fn get16(src: []const u8, off: usize) u16 {
-    return @as(u16, src[off]) | (@as(u16, src[off + 1]) << 8);
+    return std.mem.readInt(u16, src[off..][0..2], .little);
 }
 
 fn get32(src: []const u8, off: usize) u32 {
-    var value: u32 = 0;
-    for (0..4) |i|
-        value |= @as(u32, src[off + i]) << @intCast(i * 8);
-    return value;
+    return std.mem.readInt(u32, src[off..][0..4], .little);
 }
 
 fn get64(src: []const u8, off: usize) u64 {
-    var value: u64 = 0;
-    for (0..8) |i|
-        value |= @as(u64, src[off + i]) << @intCast(i * 8);
-    return value;
+    return std.mem.readInt(u64, src[off..][0..8], .little);
 }
 
 fn headerPtr(base: [*]u8, offset: usize) *u32 {
@@ -157,6 +172,10 @@ fn validateRing(total_size: usize) ?usize {
 
 fn copySlice(dst: []u8, src: []const u8) void {
     var i: usize = 0;
+    while (i + 128 <= src.len) : (i += 128) {
+        @memcpy(dst[i..][0..128], src[i..][0..128]);
+        asm volatile ("" ::: .{ .memory = true });
+    }
     while (i + 32 <= src.len) : (i += 32) {
         @memcpy(dst[i..][0..32], src[i..][0..32]);
         asm volatile ("" ::: .{ .memory = true });
@@ -184,7 +203,7 @@ fn copySlice(dst: []u8, src: []const u8) void {
 
 fn ringCopyTo(base: [*]u8, data_size: usize, index: usize, src: []const u8) usize {
     const ring_data = (base + page_size)[0..data_size];
-    var pos: usize = index % data_size;
+    var pos: usize = if (index < data_size) index else index % data_size;
     var rem = src;
     while (rem.len > 0) {
         const chunk = @min(rem.len, data_size - pos);
@@ -199,7 +218,7 @@ fn ringCopyTo(base: [*]u8, data_size: usize, index: usize, src: []const u8) usiz
 
 fn ringCopyFrom(base: [*]u8, data_size: usize, index: usize, dst: []u8) usize {
     const ring_data = (base + page_size)[0..data_size];
-    var pos: usize = index % data_size;
+    var pos: usize = if (index < data_size) index else index % data_size;
     var rem = dst;
     while (rem.len > 0) {
         const chunk = @min(rem.len, data_size - pos);
@@ -270,8 +289,7 @@ fn validateTransferPagesDescriptor(desc: []const u8) bool {
 
 export fn vmbus_ring_initialize(base: [*]u8, total_size: usize) callconv(.c) c_int {
     _ = validateRing(total_size) orelse return @backingInt(RingResult.invalid_ring);
-    for (0..total_size) |i|
-        @as(*volatile u8, @ptrCast(base + i)).* = 0;
+    zeroBytes(base[0..total_size]);
     storeHeader(base, 64, pending_size_feature, .release);
     return @backingInt(RingResult.ok);
 }
@@ -326,7 +344,6 @@ fn ringWrite(
     }
 
     var header: [packet_header_size]u8 = undefined;
-    zeroBytes(&header);
     put16(&header, 0, packet_type);
     put16(&header, 2, @intCast(payload_off / 8));
     put16(&header, 4, @intCast(packet_size / 8));
@@ -336,12 +353,15 @@ fn ringWrite(
     const zero_padding = @as([8]u8, @splat(0));
     var cursor: usize = old_write;
     cursor = ringCopyTo(base, data_size_usize, cursor, &header);
-    cursor = ringCopyTo(base, data_size_usize, cursor, descriptor[0..descriptor_size]);
-    cursor = ringCopyTo(base, data_size_usize, cursor, zero_padding[0 .. payload_off - desc_end]);
-    cursor = ringCopyTo(base, data_size_usize, cursor, payload[0..payload_size]);
-    cursor = ringCopyTo(base, data_size_usize, cursor, zero_padding[0 .. packet_size - packet_end]);
+    if (descriptor_size != 0) {
+        cursor = ringCopyTo(base, data_size_usize, cursor, descriptor[0..descriptor_size]);
+        cursor = ringCopyTo(base, data_size_usize, cursor, zero_padding[0 .. payload_off - desc_end]);
+    }
+    if (payload_size != 0) {
+        cursor = ringCopyTo(base, data_size_usize, cursor, payload[0..payload_size]);
+        cursor = ringCopyTo(base, data_size_usize, cursor, zero_padding[0 .. packet_size - packet_end]);
+    }
     var footer: [8]u8 = undefined;
-    zeroBytes(&footer);
     put64(&footer, 0, @as(u64, old_write) << 32);
     cursor = ringCopyTo(base, data_size_usize, cursor, &footer);
 
@@ -413,10 +433,14 @@ fn ringRead(
     if (descriptor_size > descriptor_capacity or payload_size > payload_capacity)
         return @backingInt(RingResult.output_small);
 
-    var cursor = (read + packet_header_size) % data_size_usize;
-    cursor = ringCopyFrom(base, data_size_usize, cursor, descriptor_out[0..descriptor_size]);
-    cursor = (read + payload_off) % data_size_usize;
-    _ = ringCopyFrom(base, data_size_usize, cursor, payload_out[0..payload_size]);
+    if (descriptor_size != 0) {
+        const desc_cursor = (read + packet_header_size) % data_size_usize;
+        _ = ringCopyFrom(base, data_size_usize, desc_cursor, descriptor_out[0..descriptor_size]);
+    }
+    if (payload_size != 0) {
+        const payload_cursor = (read + payload_off) % data_size_usize;
+        _ = ringCopyFrom(base, data_size_usize, payload_cursor, payload_out[0..payload_size]);
+    }
     if (raw_type == @backingInt(PacketType.data_using_gpa_direct) and
         !validateGpaDirectDescriptor(descriptor_out[0..descriptor_size]))
         return @backingInt(RingResult.malformed);

@@ -249,45 +249,55 @@ fn clearAction(action: *Action) void {
 }
 
 fn zeroObject(object: anytype) void {
-    const bytes: [*]volatile u8 = @ptrCast(object);
-    for (0..@sizeOf(@TypeOf(object.*))) |i|
+    const bytes = std.mem.asBytes(object);
+    var i: usize = 0;
+    while (i + 32 <= bytes.len) : (i += 32) {
+        @memset(bytes[i..][0..32], 0);
+        asm volatile ("" ::: .{ .memory = true });
+    }
+    if (i + 16 <= bytes.len) {
+        @memset(bytes[i..][0..16], 0);
+        i += 16;
+    }
+    if (i + 8 <= bytes.len) {
+        @memset(bytes[i..][0..8], 0);
+        i += 8;
+    }
+    if (i + 4 <= bytes.len) {
+        @memset(bytes[i..][0..4], 0);
+        i += 4;
+    }
+    if (i + 2 <= bytes.len) {
+        @memset(bytes[i..][0..2], 0);
+        i += 2;
+    }
+    if (i < bytes.len) {
         bytes[i] = 0;
+    }
 }
 
 fn putU16(bytes: []u8, offset: usize, value: u16) void {
-    bytes[offset] = @truncate(value);
-    bytes[offset + 1] = @truncate(value >> 8);
+    std.mem.writeInt(u16, bytes[offset..][0..2], value, .little);
 }
 
 fn putU32(bytes: []u8, offset: usize, value: u32) void {
-    bytes[offset] = @truncate(value);
-    bytes[offset + 1] = @truncate(value >> 8);
-    bytes[offset + 2] = @truncate(value >> 16);
-    bytes[offset + 3] = @truncate(value >> 24);
+    std.mem.writeInt(u32, bytes[offset..][0..4], value, .little);
 }
 
 fn putU64(bytes: []u8, offset: usize, value: u64) void {
-    for (0..8) |i|
-        bytes[offset + i] = @truncate(value >> @intCast(i * 8));
+    std.mem.writeInt(u64, bytes[offset..][0..8], value, .little);
 }
 
 fn readU16(bytes: []const u8, offset: usize) u16 {
-    return @as(u16, bytes[offset]) |
-        (@as(u16, bytes[offset + 1]) << 8);
+    return std.mem.readInt(u16, bytes[offset..][0..2], .little);
 }
 
 fn readU32(bytes: []const u8, offset: usize) u32 {
-    return @as(u32, bytes[offset]) |
-        (@as(u32, bytes[offset + 1]) << 8) |
-        (@as(u32, bytes[offset + 2]) << 16) |
-        (@as(u32, bytes[offset + 3]) << 24);
+    return std.mem.readInt(u32, bytes[offset..][0..4], .little);
 }
 
 fn readU64(bytes: []const u8, offset: usize) u64 {
-    var value: u64 = 0;
-    for (0..8) |i|
-        value |= @as(u64, bytes[offset + i]) << @intCast(i * 8);
-    return value;
+    return std.mem.readInt(u64, bytes[offset..][0..8], .little);
 }
 
 pub fn decodeGuid(wire: []const u8) ?Guid {

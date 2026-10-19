@@ -19,6 +19,7 @@
 #include "vmbus_signal_policy.h"
 
 #define VMBUS_PAGE_SIZE			4096U
+#define VMBUS_CHANNEL_RELID_LIMIT	2048U
 #define VMBUS_CONTROL_TICKS_PER_MS	10000ULL
 #define VMBUS_CONTROL_WAIT_NS		1000000ULL
 enum vmbus_gpadl_record_state {
@@ -85,6 +86,7 @@ struct vmbus_channel {
 };
 
 static struct vmbus_channel channels[CONFIG_LIBVMBUS_MAX_DEVICES];
+static struct vmbus_channel *channel_by_relid[VMBUS_CHANNEL_RELID_LIMIT];
 static struct vmbus_channel_transaction
 	transactions[CONFIG_LIBVMBUS_MAX_TRANSACTIONS];
 static struct vmbus_gpadl_record
@@ -243,6 +245,16 @@ static struct vmbus_channel *find_channel(__u32 channel_id)
 {
 	unsigned int i;
 
+	if (channel_id < VMBUS_CHANNEL_RELID_LIMIT) {
+		struct vmbus_channel *channel = __atomic_load_n(
+			&channel_by_relid[channel_id], __ATOMIC_ACQUIRE);
+
+		if (channel &&
+		    __atomic_load_n(&channel->state, __ATOMIC_ACQUIRE) !=
+			    CHANNEL_FREE &&
+		    channel->relid == channel_id)
+			return channel;
+	}
 	for (i = 0; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++)
 		if (__atomic_load_n(&channels[i].state, __ATOMIC_ACQUIRE) !=
 			    CHANNEL_FREE &&
@@ -289,6 +301,9 @@ static struct vmbus_channel *allocate_channel(struct vmbus_device *device)
 		channels[i].rescinded = 0;
 		__atomic_store_n(&channels[i].state, CHANNEL_ALLOCATED,
 				 __ATOMIC_RELEASE);
+		if (device->channel_id < VMBUS_CHANNEL_RELID_LIMIT)
+			__atomic_store_n(&channel_by_relid[device->channel_id],
+					 &channels[i], __ATOMIC_RELEASE);
 		device->channel = &channels[i];
 		ukplat_spin_unlock_irqrestore(&channels[i].lifetime_lock,
 					     flags);
@@ -301,6 +316,14 @@ static void release_channel_object_locked(struct vmbus_channel *channel)
 {
 	if (channel->device && channel->device->channel == channel)
 		channel->device->channel = NULL;
+	if (channel->relid < VMBUS_CHANNEL_RELID_LIMIT) {
+		struct vmbus_channel *expected = channel;
+
+		(void)__atomic_compare_exchange_n(
+			&channel_by_relid[channel->relid],
+			&expected, NULL, 0,
+			__ATOMIC_RELEASE, __ATOMIC_RELAXED);
+	}
 	channel->device = NULL;
 	channel->tx_ring = NULL;
 	channel->rx_ring = NULL;
@@ -1633,9 +1656,9 @@ static int channel_send_gpa_direct(
 			const void *payload, size_t payload_size,
 			int *published)
 {
-	__u8 descriptor[8 + VMBUS_GPA_DIRECT_MAX_RANGES * 8 +
-			VMBUS_GPA_DIRECT_MAX_PFNS * 8];
-	size_t offset = 8;
+	__u64 descriptor_words[1 + VMBUS_GPA_DIRECT_MAX_RANGES +
+			       VMBUS_GPA_DIRECT_MAX_PFNS];
+	size_t word_offset = 1;
 	unsigned int range_index;
 	unsigned int pfn_index;
 	unsigned int total_pfns = 0;
@@ -1659,36 +1682,24 @@ static int channel_send_gpa_direct(
 			return -EINVAL;
 		covered = (__u64)ranges[range_index].byte_offset +
 			ranges[range_index].byte_count;
-		required_pfns = (covered + VMBUS_PAGE_SIZE - 1) /
-			VMBUS_PAGE_SIZE;
+		required_pfns = (covered + VMBUS_PAGE_SIZE - 1) >> 12;
 		if (!ranges[range_index].byte_count ||
 		    required_pfns != ranges[range_index].pfn_count)
 			return -EINVAL;
-		descriptor[offset++] = (__u8)ranges[range_index].byte_count;
-		descriptor[offset++] = (__u8)(ranges[range_index].byte_count >> 8);
-		descriptor[offset++] = (__u8)(ranges[range_index].byte_count >> 16);
-		descriptor[offset++] = (__u8)(ranges[range_index].byte_count >> 24);
-		descriptor[offset++] = (__u8)ranges[range_index].byte_offset;
-		descriptor[offset++] = (__u8)(ranges[range_index].byte_offset >> 8);
-		descriptor[offset++] = (__u8)(ranges[range_index].byte_offset >> 16);
-		descriptor[offset++] = (__u8)(ranges[range_index].byte_offset >> 24);
+		descriptor_words[word_offset++] =
+			(__u64)ranges[range_index].byte_count |
+			((__u64)ranges[range_index].byte_offset << 32);
 		for (pfn_index = 0;
-		     pfn_index < ranges[range_index].pfn_count; pfn_index++) {
-			__u64 pfn = ranges[range_index].pfns[pfn_index];
-			unsigned int byte;
-
-			for (byte = 0; byte < 8; byte++)
-				descriptor[offset++] = (__u8)(pfn >> (byte * 8));
-		}
+		     pfn_index < ranges[range_index].pfn_count; pfn_index++)
+			descriptor_words[word_offset++] =
+				ranges[range_index].pfns[pfn_index];
 		total_pfns += ranges[range_index].pfn_count;
 	}
-	descriptor[0] = descriptor[1] = descriptor[2] = descriptor[3] = 0;
-	descriptor[4] = (__u8)range_count;
-	descriptor[5] = (__u8)(range_count >> 8);
-	descriptor[6] = (__u8)(range_count >> 16);
-	descriptor[7] = (__u8)(range_count >> 24);
+	descriptor_words[0] = (__u64)range_count << 32;
 	return channel_send(channel, VMBUS_PACKET_DATA_USING_GPA_DIRECT,
-			    flags, transaction_id, descriptor, offset,
+			    flags, transaction_id,
+			    (const __u8 *)descriptor_words,
+			    word_offset * sizeof(__u64),
 			    payload, payload_size, published);
 }
 

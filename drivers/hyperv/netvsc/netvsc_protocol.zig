@@ -164,40 +164,54 @@ comptime {
 }
 
 fn zeroBytes(bytes: []u8) void {
-    for (bytes) |*byte|
-        @as(*volatile u8, @ptrCast(byte)).* = 0;
+    var i: usize = 0;
+    while (i + 32 <= bytes.len) : (i += 32) {
+        @memset(bytes[i..][0..32], 0);
+        asm volatile ("" ::: .{ .memory = true });
+    }
+    if (i + 16 <= bytes.len) {
+        @memset(bytes[i..][0..16], 0);
+        i += 16;
+    }
+    if (i + 8 <= bytes.len) {
+        @memset(bytes[i..][0..8], 0);
+        i += 8;
+    }
+    if (i + 4 <= bytes.len) {
+        @memset(bytes[i..][0..4], 0);
+        i += 4;
+    }
+    if (i + 2 <= bytes.len) {
+        @memset(bytes[i..][0..2], 0);
+        i += 2;
+    }
+    if (i < bytes.len) {
+        bytes[i] = 0;
+    }
 }
 
 fn zeroObject(object: anytype) void {
-    const bytes: [*]volatile u8 = @ptrCast(object);
-    for (0..@sizeOf(@TypeOf(object.*))) |i|
-        bytes[i] = 0;
+    zeroBytes(std.mem.asBytes(object));
 }
 
 fn put16(dst: []u8, offset: usize, value: u16) void {
-    dst[offset] = @truncate(value);
-    dst[offset + 1] = @truncate(value >> 8);
+    std.mem.writeInt(u16, dst[offset..][0..2], value, .little);
 }
 
 fn put32(dst: []u8, offset: usize, value: u32) void {
-    for (0..4) |i|
-        dst[offset + i] = @truncate(value >> @intCast(i * 8));
+    std.mem.writeInt(u32, dst[offset..][0..4], value, .little);
 }
 
 fn put64(dst: []u8, offset: usize, value: u64) void {
-    for (0..8) |i|
-        dst[offset + i] = @truncate(value >> @intCast(i * 8));
+    std.mem.writeInt(u64, dst[offset..][0..8], value, .little);
 }
 
 fn get16(src: []const u8, offset: usize) u16 {
-    return @as(u16, src[offset]) | (@as(u16, src[offset + 1]) << 8);
+    return std.mem.readInt(u16, src[offset..][0..2], .little);
 }
 
 fn get32(src: []const u8, offset: usize) u32 {
-    var value: u32 = 0;
-    for (0..4) |i|
-        value |= @as(u32, src[offset + i]) << @intCast(i * 8);
-    return value;
+    return std.mem.readInt(u32, src[offset..][0..4], .little);
 }
 
 fn addUsize(a: usize, b: usize) ?usize {
