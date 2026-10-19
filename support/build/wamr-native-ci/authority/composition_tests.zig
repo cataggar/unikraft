@@ -69,6 +69,37 @@ test "source handler dispatch never acquires missing retained authority or commi
     });
     defer parsed_admit.deinit();
     try std.testing.expectEqual(error.MissingIndependentCommitments, authority.handlers.run(ctx, parsed_admit.result.command).admission.refused.err);
+    try std.testing.expectEqual(error.MissingIndependentCommitments, authority.handlers.run(.{
+        .retained = ctx.retained,
+        .plan_commitment = .{ .path = "/explicit/plan.json", .size = 1, .sha256 = "0000000000000000000000000000000000000000000000000000000000000000" },
+    }, parsed_admit.result.command).admission.refused.err);
+    try std.testing.expectEqual(error.MissingIndependentCommitments, authority.handlers.run(.{
+        .retained = ctx.retained,
+        .authorization_commitment = .{ .path = "/explicit/authorization.json", .size = 1, .sha256 = "0000000000000000000000000000000000000000000000000000000000000000" },
+    }, parsed_admit.result.command).admission.refused.err);
+
+    var unimported: @import("wamr_handoff").public_products.ImportedProduct = .{
+        .allocator = a,
+        .io = io,
+        .arena = std.heap.ArenaAllocator.init(a),
+    };
+    defer unimported.arena.deinit();
+    const refused_create = authority.handlers.createCandidate(
+        ctx.retained,
+        .{ .product = &unimported, .validation_output = "/explicit/validation" },
+        "/explicit/candidate.json",
+    );
+    try std.testing.expect(refused_create == .refused);
+    try std.testing.expectEqual(error.ImportNotPublished, refused_create.refused.err);
+    try std.testing.expectEqual(core.private_files.CommitStatus.not_committed, refused_create.refused.publication);
+    const refused_open = authority.handlers.openCandidate(
+        ctx.retained,
+        .{ .product = &unimported, .validation_output = "/explicit/validation" },
+        "/explicit/candidate.json",
+    );
+    try std.testing.expect(refused_open == .refused);
+    try std.testing.expectEqual(error.ImportNotPublished, refused_open.refused.err);
+    try std.testing.expectEqual(core.private_files.CommitStatus.not_committed, refused_open.refused.publication);
 }
 
 pub const Fixture = struct {
@@ -928,6 +959,12 @@ test "CLI prepare-azure-runtime stages real x86_64 ELF Python closure and execut
         try std.testing.expectEqualStrings("", val_res.result.stderr);
     }
 
+    const plan_artifact: authority.types.Artifact = .{
+        .path = plan_path,
+        .size = plan_bytes.len,
+        .sha256 = &plan_sha256,
+    };
+
     const now_unix: i128 = std.Io.Clock.real.now(io).toSeconds();
     const denied_artifact: authority.types.Artifact = blk: {
         var parsed_denied = try authority.cli.parse(a, &.{
@@ -957,6 +994,31 @@ test "CLI prepare-azure-runtime stages real x86_64 ELF Python closure and execut
         defer recorded_denied.deinit();
         try recorded_denied.revalidate();
         try std.testing.expectEqual(authority.types.Decision.denied, recorded_denied.value().decision);
+
+        const denied_admit_out = try std.fs.path.join(allocator, &.{ auth_chain_path, "denied-owner-admission.json" });
+        var parsed_denied_owner_admit = try authority.cli.parse(a, &.{
+            "admit",
+            try std.fmt.allocPrint(allocator, "--plan={s}", .{plan_path}),
+            try std.fmt.allocPrint(allocator, "--authorization={s}", .{denied_path}),
+            try std.fmt.allocPrint(allocator, "--output={s}", .{denied_admit_out}),
+            try std.fmt.allocPrint(allocator, "--azure={s}", .{plan_val.tools.azure.path}),
+            try std.fmt.allocPrint(allocator, "--uploader={s}", .{plan_val.tools.uploader.path}),
+            try std.fmt.allocPrint(allocator, "--validator={s}", .{plan_val.tools.validator.path}),
+            try std.fmt.allocPrint(allocator, "--supervisor={s}", .{plan_val.tools.supervisor.path}),
+            try std.fmt.allocPrint(allocator, "--az-python={s}", .{plan_val.tools.az_python.path}),
+            try std.fmt.allocPrint(allocator, "--azure-runtime={s}", .{plan_val.azure_runtime_document.path}),
+        });
+        defer parsed_denied_owner_admit.deinit();
+        const denied_owner_admit = authority.handlers.run(.{
+            .retained = ctx,
+            .plan_commitment = plan_artifact,
+            .recorded_authorization = recorded_denied,
+        }, parsed_denied_owner_admit.result.command).admission;
+        try std.testing.expect(denied_owner_admit == .refused);
+        try std.testing.expectEqual(authority.types.Phase.inputs, denied_owner_admit.refused.phase);
+        try std.testing.expectEqual(error.NotAuthorized, denied_owner_admit.refused.err);
+        try std.testing.expectEqual(core.private_files.CommitStatus.not_committed, denied_owner_admit.refused.publication);
+
         const raw = recorded_denied.artifact();
         break :blk .{
             .path = denied_path,
@@ -1030,11 +1092,6 @@ test "CLI prepare-azure-runtime stages real x86_64 ELF Python closure and execut
         try std.testing.expectEqualStrings("WAMR direct validation refused: UnexpectedFields\n", val_res.result.stderr);
     }
 
-    const plan_artifact: authority.types.Artifact = .{
-        .path = plan_path,
-        .size = plan_bytes.len,
-        .sha256 = &plan_sha256,
-    };
     const approved_artifact = recorded_auth.artifact();
 
     // CLI admit refuses denied authorization on the real ELF closure before candidate custody.
@@ -1083,7 +1140,7 @@ test "CLI prepare-azure-runtime stages real x86_64 ELF Python closure and execut
         const bad_tool_admit_outcome = authority.handlers.run(.{
             .retained = ctx,
             .plan_commitment = plan_artifact,
-            .authorization_commitment = approved_artifact,
+            .recorded_authorization = recorded_auth,
         }, parsed_bad_tool_admit.result.command).admission;
         try std.testing.expect(bad_tool_admit_outcome == .refused);
         try std.testing.expectEqual(authority.types.Phase.inputs, bad_tool_admit_outcome.refused.phase);
@@ -1110,7 +1167,7 @@ test "CLI prepare-azure-runtime stages real x86_64 ELF Python closure and execut
         const admit_outcome = authority.handlers.run(.{
             .retained = ctx,
             .plan_commitment = plan_artifact,
-            .authorization_commitment = approved_artifact,
+            .recorded_authorization = recorded_auth,
         }, parsed_admit.result.command).admission;
         try std.testing.expect(admit_outcome == .refused);
         try std.testing.expectEqual(authority.types.Phase.custody, admit_outcome.refused.phase);
@@ -1238,6 +1295,30 @@ test "CLI prepare-azure-runtime stages real x86_64 ELF Python closure and execut
         try std.testing.expectEqual(authority.types.Phase.custody, tampered_outcome.refused.phase);
         try std.testing.expectEqual(error.HashMismatch, tampered_outcome.refused.err);
         try std.testing.expectEqual(core.private_files.CommitStatus.not_committed, tampered_outcome.refused.publication);
+
+        const tampered_admit_path = try std.fs.path.join(allocator, &.{ auth_chain_path, "tampered-dso-admission.json" });
+        var parsed_tampered_admit = try authority.cli.parse(a, &.{
+            "admit",
+            try std.fmt.allocPrint(allocator, "--plan={s}", .{plan_path}),
+            try std.fmt.allocPrint(allocator, "--authorization={s}", .{approved_path}),
+            try std.fmt.allocPrint(allocator, "--output={s}", .{tampered_admit_path}),
+            try std.fmt.allocPrint(allocator, "--azure={s}", .{plan_val.tools.azure.path}),
+            try std.fmt.allocPrint(allocator, "--uploader={s}", .{plan_val.tools.uploader.path}),
+            try std.fmt.allocPrint(allocator, "--validator={s}", .{plan_val.tools.validator.path}),
+            try std.fmt.allocPrint(allocator, "--supervisor={s}", .{plan_val.tools.supervisor.path}),
+            try std.fmt.allocPrint(allocator, "--az-python={s}", .{plan_val.tools.az_python.path}),
+            try std.fmt.allocPrint(allocator, "--azure-runtime={s}", .{plan_val.azure_runtime_document.path}),
+        });
+        defer parsed_tampered_admit.deinit();
+        const tampered_admit_outcome = authority.handlers.run(.{
+            .retained = ctx,
+            .plan_commitment = plan_artifact,
+            .recorded_authorization = recorded_auth,
+        }, parsed_tampered_admit.result.command).admission;
+        try std.testing.expect(tampered_admit_outcome == .refused);
+        try std.testing.expectEqual(authority.types.Phase.inputs, tampered_admit_outcome.refused.phase);
+        try std.testing.expectEqual(error.FileChanged, tampered_admit_outcome.refused.err);
+        try std.testing.expectEqual(core.private_files.CommitStatus.not_committed, tampered_admit_outcome.refused.publication);
 
         inline for (.{
             &[_][]const u8{ validator_path, "azure-runtime", runtime_json_path },

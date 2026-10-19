@@ -795,14 +795,15 @@ fn exactDownloadAndReopen(
     defer owner.deinit();
     try owner.revalidate(null);
 
-    const created = candidate.create(.{
-        .allocator = std.testing.allocator,
-        .io = work.io,
-        .source = .{ .imported_product = owner },
-        .output = try work.join("imported-candidate.json"),
-        .validation_output = try work.join("imported-candidate-validation"),
-        .settings = .{ .attempt_id = "00000000-0000-4000-8000-000000000001" },
-    });
+    const created = authority.handlers.createCandidate(
+        .{ .allocator = std.testing.allocator, .io = work.io },
+        .{
+            .product = owner,
+            .validation_output = try work.join("imported-candidate-validation"),
+            .settings = .{ .attempt_id = "00000000-0000-4000-8000-000000000001" },
+        },
+        try work.join("imported-candidate.json"),
+    );
     if (created != .success) std.debug.print("imported v2 candidate create: {any}\n", .{created});
     try std.testing.expect(created == .success);
     defer created.success.deinit();
@@ -931,7 +932,7 @@ fn liveImportedAuthorityComposition(
         makeDirectoryRemovable(work.io, authority_dir) catch @panic("authority composition cleanup failed");
         authority_dir.close(work.io);
     }
-    for ([_][]const u8{ "runtime-source", "ledger", "records" }) |component|
+    for ([_][]const u8{ "runtime-source", "ledger", "records", "admissions" }) |component|
         try authority_dir.createDir(work.io, component, .fromMode(0o700));
 
     const ctx: authority.types.Context = .{
@@ -1097,8 +1098,6 @@ fn liveImportedAuthorityComposition(
             const real_interpreter_path = try work.join("authority-work/real-azure-runtime-source/python");
             try writeModeFile(work.io, real_source_dir, "python", host_python_bytes, 0o500);
 
-            var real_interpreter = try files.RetainedFile.open(work.io, real_interpreter_path, .artifact);
-            defer real_interpreter.close(work.io);
             var real_loader = try files.RetainedFile.open(work.io, host_loader, .artifact);
             defer real_loader.close(work.io);
 
@@ -1132,9 +1131,6 @@ fn liveImportedAuthorityComposition(
                 const staged_dso_path = try std.fs.path.join(work.a, &.{ real_source_path, dso_name });
                 try candidate_files.append(work.a, try files.RetainedFile.open(work.io, staged_dso_path, .artifact));
             }
-
-            const candidate_ptrs = try work.a.alloc(*files.RetainedFile, candidate_files.items.len);
-            for (candidate_files.items, 0..) |*file, index| candidate_ptrs[index] = file;
 
             var noop_ctx: u8 = 0;
             const noop_barrier: authority.transaction.Barrier = .{ .context = &noop_ctx, .check = noopBarrierCheck };
@@ -1264,16 +1260,10 @@ fn liveImportedAuthorityComposition(
             });
             defer parsed_real_prepare.deinit();
 
-            const real_discovery: authority.runtime_probes.DiscoveryInput = .{
-                .interpreter = &real_interpreter,
-                .dynamic_loader = &real_loader,
-                .native_roots = &.{},
-                .candidates = candidate_ptrs,
-            };
-            const real_outcome = authority.handlers.run(.{
-                .retained = ctx,
-                .discovery = real_discovery,
-            }, parsed_real_prepare.result.command).prepare;
+            const real_outcome = authority.handlers.run(
+                .{ .retained = ctx },
+                parsed_real_prepare.result.command,
+            ).prepare;
 
             const real_runtime_json_path = try std.fs.path.join(work.a, &.{ real_output_path, "azure-runtime.json" });
             switch (real_outcome) {
@@ -1394,7 +1384,7 @@ fn liveImportedAuthorityComposition(
             }
 
             const duplicate_real_prepare = authority.handlers.run(
-                .{ .retained = ctx, .discovery = real_discovery },
+                .{ .retained = ctx },
                 parsed_real_prepare.result.command,
             ).prepare;
             try std.testing.expect(duplicate_real_prepare == .refused);
@@ -1503,7 +1493,7 @@ fn liveImportedAuthorityComposition(
         try std.testing.expectEqualStrings("", runtime_res.stderr);
     }
 
-    const plan_commitments = blk: {
+    const prepared = blk: {
         var parsed_plan = try authority.cli.parse(work.a, &.{
             "plan",
             "--bundle",                           created_meta.provenance.public_bundle.path,
@@ -1531,9 +1521,11 @@ fn liveImportedAuthorityComposition(
         );
         if (planned.plan != .success) std.debug.print("live imported plan: {any}\n", .{planned});
         try std.testing.expect(planned.plan == .success);
-        const prepared = planned.plan.success;
-        defer prepared.deinit();
-        try prepared.revalidate();
+        break :blk planned.plan.success;
+    };
+    defer prepared.deinit();
+    try prepared.revalidate();
+    const plan_commitments = blk: {
         const plan_res = try prepared.result();
         try std.testing.expectEqual(.not_admitted, plan_res.plan.authority);
         try std.testing.expectEqual(.pending, plan_res.template.decision);
@@ -1608,6 +1600,24 @@ fn liveImportedAuthorityComposition(
         defer denied_recorded.deinit();
         try denied_recorded.revalidate();
         const raw = denied_recorded.artifact();
+        const denied_admit = authority.handlers.run(
+            .{
+                .retained = ctx,
+                .live_finalized = created_candidate,
+                .prepared_plan = prepared,
+                .recorded_authorization = denied_recorded,
+            },
+            .{ .admit = .{
+                .plan = plan_commitments.plan_artifact.path,
+                .authorization = raw.path,
+                .output = try work.join("authority-work/admissions/admission-denied-owner.json"),
+                .tools = tool_paths,
+            } },
+        );
+        try std.testing.expect(denied_admit.admission == .refused);
+        try std.testing.expectEqual(error.NotAuthorized, denied_admit.admission.refused.err);
+        try std.testing.expectEqual(files.CommitStatus.not_committed, denied_admit.admission.refused.publication);
+        try work.absent("authority-work/admissions/admission-denied-owner.json");
         break :blk .{
             .path = try work.a.dupe(u8, raw.path),
             .size = raw.size,
@@ -1615,7 +1625,7 @@ fn liveImportedAuthorityComposition(
         };
     };
 
-    const approved_artifact: authority.types.Artifact = blk: {
+    const approved_recorded = blk: {
         var parsed_approved = try authority.cli.parse(work.a, &.{
             "record-authorization",
             "--plan",          plan_commitments.plan_artifact.path,
@@ -1637,9 +1647,11 @@ fn liveImportedAuthorityComposition(
         const approved_outcome = authority.handlers.run(.{ .retained = ctx }, parsed_approved.result.command);
         if (approved_outcome.authorization != .success) std.debug.print("live approved authorization: {any}\n", .{approved_outcome});
         try std.testing.expect(approved_outcome.authorization == .success);
-        const approved_recorded = approved_outcome.authorization.success;
-        defer approved_recorded.deinit();
-        try approved_recorded.revalidate();
+        break :blk approved_outcome.authorization.success;
+    };
+    defer approved_recorded.deinit();
+    try approved_recorded.revalidate();
+    const approved_artifact: authority.types.Artifact = blk: {
         const raw = approved_recorded.artifact();
         break :blk .{
             .path = try work.a.dupe(u8, raw.path),
@@ -1741,48 +1753,49 @@ fn liveImportedAuthorityComposition(
             .{
                 .retained = ctx,
                 .live_finalized = created_candidate,
-                .plan_commitment = plan_commitments.plan_artifact,
+                .prepared_plan = prepared,
                 .authorization_commitment = denied_artifact,
             },
             .{ .admit = .{
                 .plan = plan_commitments.plan_artifact.path,
                 .authorization = denied_artifact.path,
-                .output = try work.join("authority-work/records/admission-denied.json"),
+                .output = try work.join("authority-work/admissions/admission-denied.json"),
                 .tools = tool_paths,
             } },
         );
         try std.testing.expect(denied_admit.admission == .refused);
         try std.testing.expectEqual(error.NotAuthorized, denied_admit.admission.refused.err);
         try std.testing.expectEqual(files.CommitStatus.not_committed, denied_admit.admission.refused.publication);
-        try work.absent("authority-work/records/admission-denied.json");
+        try work.absent("authority-work/admissions/admission-denied.json");
 
         const private_admit = authority.handlers.run(
             .{
                 .retained = ctx,
                 .live_finalized = private_candidate,
-                .plan_commitment = plan_commitments.plan_artifact,
-                .authorization_commitment = approved_artifact,
+                .prepared_plan = prepared,
+                .recorded_authorization = approved_recorded,
             },
             .{ .admit = .{
                 .plan = plan_commitments.plan_artifact.path,
                 .authorization = approved_artifact.path,
-                .output = try work.join("authority-work/records/admission-private.json"),
+                .output = try work.join("authority-work/admissions/admission-private.json"),
                 .tools = tool_paths,
             } },
         );
         try std.testing.expect(private_admit.admission == .refused);
         try std.testing.expectEqual(error.ImportedProductRequired, private_admit.admission.refused.err);
         try std.testing.expectEqual(files.CommitStatus.not_committed, private_admit.admission.refused.publication);
-        try work.absent("authority-work/records/admission-private.json");
+        try work.absent("authority-work/admissions/admission-private.json");
     }
 
-    const reopened = candidate.open(.{
-        .allocator = std.testing.allocator,
-        .io = work.io,
-        .source = .{ .imported_product = owner },
-        .output = try work.join("imported-candidate.json"),
-        .validation_output = try work.join("imported-candidate-open-validation"),
-    });
+    const reopened = authority.handlers.openCandidate(
+        ctx,
+        .{
+            .product = owner,
+            .validation_output = try work.join("imported-candidate-open-validation"),
+        },
+        try work.join("imported-candidate.json"),
+    );
     if (reopened != .success) std.debug.print("imported v2 candidate open: {any}\n", .{reopened});
     try std.testing.expect(reopened == .success);
     defer reopened.success.deinit();
@@ -1801,7 +1814,7 @@ fn liveImportedAuthorityComposition(
             "admit",
             "--plan",          plan_commitments.plan_artifact.path,
             "--authorization", approved_artifact.path,
-            "--output",        try work.join("authority-work/records/admission.json"),
+            "--output",        try work.join("authority-work/admissions/admission.json"),
             "--azure-runtime", tool_paths.azure_runtime,
             "--azure",         tool_paths.azure,
             "--uploader",      tool_paths.uploader,
@@ -1814,8 +1827,8 @@ fn liveImportedAuthorityComposition(
             .{
                 .retained = ctx,
                 .live_finalized = reopened.success,
-                .plan_commitment = plan_commitments.plan_artifact,
-                .authorization_commitment = approved_artifact,
+                .prepared_plan = prepared,
+                .recorded_authorization = approved_recorded,
             },
             parsed_admit.result.command,
         );
@@ -1826,23 +1839,23 @@ fn liveImportedAuthorityComposition(
         try admitted.revalidate();
         const admission_artifact = try admitted.artifact();
         try std.testing.expect(admission_artifact.size > 0);
-        const admission_bytes = try work.read("authority-work/records/admission.json");
-        try std.testing.expectEqualStrings(admission_bytes, try work.read("authority-work/records/admission.json.validation.json"));
+        const admission_bytes = try work.read("authority-work/admissions/admission.json");
+        try std.testing.expectEqualStrings(admission_bytes, try work.read("authority-work/admissions/admission.json.validation.json"));
 
         // Create-only durability: re-running admit against existing output path is refused without mutating published admission.
         const duplicate_admit = authority.handlers.run(
             .{
                 .retained = ctx,
                 .live_finalized = reopened.success,
-                .plan_commitment = plan_commitments.plan_artifact,
-                .authorization_commitment = approved_artifact,
+                .prepared_plan = prepared,
+                .recorded_authorization = approved_recorded,
             },
             parsed_admit.result.command,
         );
         try std.testing.expect(duplicate_admit.admission == .refused);
         try std.testing.expectEqual(error.PathAlreadyExists, duplicate_admit.admission.refused.err);
         try std.testing.expectEqual(files.CommitStatus.not_committed, duplicate_admit.admission.refused.publication);
-        try std.testing.expectEqualStrings(admission_bytes, try work.read("authority-work/records/admission.json"));
+        try std.testing.expectEqualStrings(admission_bytes, try work.read("authority-work/admissions/admission.json"));
         try admitted.revalidate();
 
         for ([_][]const []const u8{
@@ -1888,6 +1901,25 @@ fn liveImportedAuthorityComposition(
                 return error.FixtureMode;
             try uploader.sync(work.io);
             try std.testing.expectError(error.ArtifactChanged, admitted.revalidate());
+            const tampered_owner_admit = authority.handlers.run(
+                .{
+                    .retained = ctx,
+                    .live_finalized = reopened.success,
+                    .prepared_plan = prepared,
+                    .recorded_authorization = approved_recorded,
+                },
+                .{ .admit = .{
+                    .plan = plan_commitments.plan_artifact.path,
+                    .authorization = approved_artifact.path,
+                    .output = try work.join("authority-work/admissions/admission-tampered-uploader.json"),
+                    .tools = tool_paths,
+                } },
+            );
+            try std.testing.expect(tampered_owner_admit.admission == .refused);
+            try std.testing.expectEqual(authority.types.Phase.inputs, tampered_owner_admit.admission.refused.phase);
+            try std.testing.expectEqual(error.FileChanged, tampered_owner_admit.admission.refused.err);
+            try std.testing.expectEqual(files.CommitStatus.not_committed, tampered_owner_admit.admission.refused.publication);
+            try work.absent("authority-work/admissions/admission-tampered-uploader.json");
             const plan_tamper_res = try std.process.run(work.a, work.io, .{
                 .argv = &.{ tools.validator, "plan", plan_commitments.plan_artifact.path, plan_commitments.template_artifact.path },
                 .stdout_limit = .limited(4096),
