@@ -391,8 +391,8 @@ jobs:
           "${controller}" local-handoff-revalidation \
             --runtime "${root}" \
             --output "${root}/compute/public-source/handoff-revalidation"
-          test -s "${root}/compute/public-source/handoff-revalidation/private/local-handoff-revalidation.log"
-          test -s "${root}/compute/public-source/handoff-revalidation/evidence/command-local-handoff-revalidation.json"
+          test -s "${root}/compute/public-source/handoff-revalidation/private/import-native-revalidation.log"
+          test -s "${root}/compute/public-source/handoff-revalidation/evidence/command-import-native-revalidation.json"
           native_parity=/d/wamr-ci/wamr-native-public-parity
           test -d "${native_parity}"
           test ! -e "${native_parity}/private-export"
