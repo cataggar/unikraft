@@ -11,7 +11,7 @@ const options = @import("test_options");
 test "source handler dispatch never acquires missing retained authority or commitments" {
     const ctx: authority.handlers.Context = .{ .retained = .{ .allocator = a, .io = io } };
     try std.testing.expectEqual(error.MissingImportedContext, authority.handlers.run(ctx, .{ .plan = .{} }).plan.refused.err);
-    try std.testing.expectEqual(error.MissingDiscoveryContext, authority.handlers.run(ctx, .{ .@"prepare-azure-runtime" = .{} }).prepare.refused.err);
+    try std.testing.expectEqual(error.UnsafePath, authority.handlers.run(ctx, .{ .@"prepare-azure-runtime" = .{} }).prepare.refused.err);
     try std.testing.expectEqual(error.MissingIndependentCommitments, authority.handlers.run(ctx, .{ .admit = .{} }).admission.refused.err);
     const now: i128 = std.Io.Clock.real.now(io).toSeconds();
     const command: authority.types.AuthorizationCommand = .{
@@ -32,7 +32,7 @@ test "source handler dispatch never acquires missing retained authority or commi
         "--package-root=/explicit/packages",
     });
     defer parsed_prepare.deinit();
-    try std.testing.expectEqual(error.MissingDiscoveryContext, authority.handlers.run(ctx, parsed_prepare.result.command).prepare.refused.err);
+    try std.testing.expectEqual(error.FileNotFound, authority.handlers.run(ctx, parsed_prepare.result.command).prepare.refused.err);
 
     var parsed_plan = try authority.cli.parse(a, &.{
         "plan",
@@ -356,6 +356,58 @@ test "joined prepare with closed copied ELF tree passes native validator and cop
     try std.testing.expect(failure_doc.value().object.get("helper_cleanup_complete").?.bool);
     try std.testing.expectEqualStrings("0", failure_doc.value().object.get("completed_steps").?.number_string);
     try std.testing.expect(failure_doc.value().object.get("native_validation").?.object.get("process").?.object.get("cleanup_complete").?.bool);
+
+    const standalone_output = try std.fs.path.join(allocator, &.{ fixture.path, "output-standalone" });
+    const beta_path = try std.fs.path.join(allocator, &.{ fixture.path, "libbeta.so" });
+    var standalone_parsed = try authority.cli.parse(a, &.{
+        "prepare-azure-runtime",
+        try std.fmt.allocPrint(allocator, "--output={s}", .{standalone_output}),
+        try std.fmt.allocPrint(allocator, "--azure={s}", .{fixture.request.azure}),
+        try std.fmt.allocPrint(allocator, "--az-python={s}", .{fixture.request.az_python}),
+        try std.fmt.allocPrint(allocator, "--stdlib={s}", .{fixture.request.stdlib}),
+        try std.fmt.allocPrint(allocator, "--validator={s}", .{fixture.request.validator}),
+        try std.fmt.allocPrint(allocator, "--package-root={s}", .{package_root}),
+        try std.fmt.allocPrint(allocator, "--native-dependency={s}", .{beta_path}),
+    });
+    defer standalone_parsed.deinit();
+
+    const standalone_outcome = authority.handlers.run(.{
+        .retained = .{ .allocator = a, .io = io },
+    }, standalone_parsed.result.command).prepare;
+    const standalone_diag = switch (standalone_outcome) {
+        .poisoned => |failure| failure,
+        .refused => return error.UnexpectedEarlyRefusal,
+        .success => |owner| {
+            owner.deinit();
+            return error.SyntheticRuntimeAccepted;
+        },
+    };
+    try std.testing.expectEqual(authority.types.Phase.validation, standalone_diag.phase);
+    try std.testing.expectEqual(core.private_files.CommitStatus.durable, standalone_diag.publications.copy);
+    try std.testing.expectEqual(core.private_files.CommitStatus.durable, standalone_diag.publications.manifest);
+    try std.testing.expectEqual(core.private_files.CommitStatus.durable, standalone_diag.publications.pending);
+    try std.testing.expectEqual(core.private_files.CommitStatus.not_committed, standalone_diag.publications.output);
+    try std.testing.expectEqual(core.private_files.CommitStatus.durable, standalone_diag.publications.failure);
+    try std.testing.expect(standalone_diag.native_validation != null);
+    try std.testing.expectEqual(core.process.CommandPrimary{ .exited = 0 }, standalone_diag.native_validation.?.primary);
+    try absent(fixture.dir, "output-standalone/azure-runtime.json");
+
+    try fixture.dir.deleteFile(io, "libbeta.so");
+    var missing_dep_parsed = try authority.cli.parse(a, &.{
+        "prepare-azure-runtime",
+        try std.fmt.allocPrint(allocator, "--output={s}-missing", .{standalone_output}),
+        try std.fmt.allocPrint(allocator, "--azure={s}", .{fixture.request.azure}),
+        try std.fmt.allocPrint(allocator, "--az-python={s}", .{fixture.request.az_python}),
+        try std.fmt.allocPrint(allocator, "--stdlib={s}", .{fixture.request.stdlib}),
+        try std.fmt.allocPrint(allocator, "--validator={s}", .{fixture.request.validator}),
+        try std.fmt.allocPrint(allocator, "--package-root={s}", .{package_root}),
+    });
+    defer missing_dep_parsed.deinit();
+    const missing_dep_outcome = authority.handlers.run(.{
+        .retained = .{ .allocator = a, .io = io },
+    }, missing_dep_parsed.result.command).prepare;
+    try std.testing.expectEqual(error.MissingDependency, missing_dep_outcome.refused.err);
+    try absent(fixture.dir, "output-standalone-missing");
 }
 
 fn resolveHostLibrary(allocator: std.mem.Allocator, primary_dir: []const u8, name: []const u8) ![]const u8 {
@@ -511,22 +563,12 @@ test "CLI prepare-azure-runtime stages real x86_64 ELF Python closure and execut
 
     try writeWithDigest(dir, "python", cached_elf.python_bytes, 0o500, cached_elf.python_digest);
 
-    var interpreter = try core.private_files.RetainedFile.open(io, interpreter_path, .artifact);
-    defer interpreter.close(io);
     var loader = try core.private_files.RetainedFile.open(io, host_loader, .artifact);
     defer loader.close(io);
 
-    var candidate_files: std.ArrayList(core.private_files.RetainedFile) = .empty;
-    defer for (candidate_files.items) |*file| file.close(io);
-
     for (cached_elf.dsos) |dso| {
         try writeWithDigest(dir, dso.name, dso.bytes, 0o400, dso.digest);
-        const staged_dso_path = try std.fs.path.join(allocator, &.{ fixture_path, dso.name });
-        try candidate_files.append(allocator, try core.private_files.RetainedFile.open(io, staged_dso_path, .artifact));
     }
-
-    var candidate_ptrs = try allocator.alloc(*core.private_files.RetainedFile, candidate_files.items.len);
-    for (candidate_files.items, 0..) |*file, index| candidate_ptrs[index] = file;
 
     const ctx: authority.types.Context = .{ .allocator = a, .io = io };
     try core.process.initialize();
@@ -665,12 +707,6 @@ test "CLI prepare-azure-runtime stages real x86_64 ELF Python closure and execut
 
     const outcome = authority.handlers.run(.{
         .retained = ctx,
-        .discovery = .{
-            .interpreter = &interpreter,
-            .dynamic_loader = &loader,
-            .native_roots = &.{},
-            .candidates = candidate_ptrs,
-        },
     }, parsed_prepare.result.command).prepare;
 
     const runtime_json_path = try std.fs.path.join(allocator, &.{ output_path, "azure-runtime.json" });
@@ -678,8 +714,8 @@ test "CLI prepare-azure-runtime stages real x86_64 ELF Python closure and execut
         .success => |prepared| {
             defer prepared.deinit();
             const res = try prepared.result();
-            try std.testing.expectEqual(@as(u32, @intCast(candidate_files.items.len + 2)), res.evidence.elf.native_files);
-            try std.testing.expectEqual(@as(u16, @intCast(candidate_files.items.len + 1)), res.evidence.loader_entries);
+            try std.testing.expectEqual(@as(u32, @intCast(cached_elf.dsos.len + 2)), res.evidence.elf.native_files);
+            try std.testing.expectEqual(@as(u16, @intCast(cached_elf.dsos.len + 1)), res.evidence.loader_entries);
             try std.testing.expectEqual(@as(usize, 19), res.evidence.probes.len);
             try std.testing.expectEqual(core.process.CommandPrimary{ .exited = 0 }, res.native_validations[0].primary);
             try std.testing.expectEqual(core.process.CommandPrimary{ .exited = 0 }, res.native_validations[1].primary);
@@ -719,8 +755,8 @@ test "CLI prepare-azure-runtime stages real x86_64 ELF Python closure and execut
                 .contract = contract,
                 .barrier = noop_barrier,
             });
-            try std.testing.expectEqual(@as(u32, @intCast(candidate_files.items.len + 2)), elf_evidence.native_files);
-            try std.testing.expect(elf_evidence.needed_edges >= candidate_files.items.len);
+            try std.testing.expectEqual(@as(u32, @intCast(cached_elf.dsos.len + 2)), elf_evidence.native_files);
+            try std.testing.expect(elf_evidence.needed_edges >= cached_elf.dsos.len);
             try std.testing.expectEqualSlices(u8, &authority.transaction.hash(cached_elf.interpreter_str), &elf_evidence.interpreter_path_sha256);
 
             var copied_loader = try core.private_files.RetainedFile.open(io, contract.dynamic_loader.path, .tool);
@@ -769,7 +805,7 @@ test "CLI prepare-azure-runtime stages real x86_64 ELF Python closure and execut
                             elf_evidence.interpreter_closure[0..contract.loader_dependencies.len],
                             elf_evidence.interpreter_path_sha256,
                         );
-                        try std.testing.expectEqual(@as(u16, @intCast(candidate_files.items.len + 1)), entries);
+                        try std.testing.expectEqual(@as(u16, @intCast(cached_elf.dsos.len + 1)), entries);
                     },
                     .python_version => try authority.runtime_probes.Test.pythonVersion(
                         supervised.result.stdout,

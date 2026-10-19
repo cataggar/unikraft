@@ -272,10 +272,18 @@ const State = struct {
             return supervised.freshness orelse error.NativeRuntimeValidationFailed;
         }
     }
-    fn perform(self: *State, request: types.PrepareRuntime, discovery_input: probes.DiscoveryInput, hooks: ?*const Test.Hooks) !void {
-        if (!std.mem.eql(u8, request.az_python, discovery_input.interpreter.path))
-            return error.DiscoveryInterpreterMismatch;
+    fn perform(self: *State, request: types.PrepareRuntime, explicit_discovery: ?probes.DiscoveryInput, hooks: ?*const Test.Hooks) !void {
+        if (explicit_discovery) |discovery_input| {
+            if (!std.mem.eql(u8, request.az_python, discovery_input.interpreter.path))
+                return error.DiscoveryInterpreterMismatch;
+        }
         try files.absoluteFilePath(request.validator);
+        var standalone: ?probes.StandaloneDiscovery = if (explicit_discovery == null)
+            try probes.StandaloneDiscovery.init(self.ctx, request)
+        else
+            null;
+        defer if (standalone) |*owned| owned.deinit(self.ctx.io);
+        const discovery_input = explicit_discovery orelse standalone.?.input;
         const interpreter_digest = try retained_copy.hashRetained(self.ctx.io, discovery_input.interpreter, copy.canonicalLimits().file_bytes, if (self.ctx.signal) |s| s.flag() else null);
         var discovery = try probes.discover(self.ctx, discovery_input);
         defer discovery.deinit();
@@ -515,7 +523,11 @@ pub fn run(ctx: types.Context, request: types.PrepareRuntime, discovery: probes.
     return runImpl(ctx, request, discovery, null);
 }
 
-fn runImpl(ctx: types.Context, request: types.PrepareRuntime, discovery: probes.DiscoveryInput, hooks: ?*const Test.Hooks) Outcome {
+pub fn runStandalone(ctx: types.Context, request: types.PrepareRuntime) Outcome {
+    return runImpl(ctx, request, null, null);
+}
+
+fn runImpl(ctx: types.Context, request: types.PrepareRuntime, discovery: ?probes.DiscoveryInput, hooks: ?*const Test.Hooks) Outcome {
     const owner = ctx.allocator.create(State) catch |err|
         return .{ .refused = .{ .phase = .inputs, .err = err } };
     owner.* = .{

@@ -272,6 +272,374 @@ pub const DiscoveryInput = struct {
     /// (libz.so.1 -> libz.so.1.2.13). Omitted only for basename-named sources.
     candidate_names: ?[]const []const u8 = null,
 };
+pub const StandaloneDiscovery = struct {
+    allocator: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
+    retained: std.ArrayList(*files.RetainedFile) = .empty,
+    input: DiscoveryInput = undefined,
+
+    pub fn deinit(self: *StandaloneDiscovery, io: std.Io) void {
+        for (self.retained.items) |file| file.close(io);
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    pub fn init(ctx: types.Context, request: types.PrepareRuntime) !StandaloneDiscovery {
+        try checkCancellation(ctx);
+        try absolutePath(request.output);
+        try absolutePath(request.azure);
+        try absolutePath(request.az_python);
+        try absolutePath(request.stdlib);
+        try absolutePath(request.validator);
+        for (request.package_root) |path| try absolutePath(path);
+        for (request.data_root) |path| try absolutePath(path);
+        for (request.native_dependency, 0..) |path, index| {
+            try absolutePath(path);
+            for (request.native_dependency[0..index]) |prior|
+                if (std.mem.eql(u8, path, prior)) return error.DuplicateSource;
+        }
+
+        var self: StandaloneDiscovery = .{
+            .allocator = ctx.allocator,
+            .arena = std.heap.ArenaAllocator.init(ctx.allocator),
+        };
+        errdefer self.deinit(ctx.io);
+        const arena = self.arena.allocator();
+
+        var opened_by_path: std.StringHashMapUnmanaged(*files.RetainedFile) = .empty;
+        const interpreter = try self.openRetained(ctx.io, &opened_by_path, request.az_python);
+        var interpreter_bytes = try readRetained(ctx, interpreter);
+        defer interpreter_bytes.deinit();
+        var interpreter_info = try inspectElf(arena, interpreter_bytes.bytes(), .interpreter);
+        defer interpreter_info.deinit();
+
+        const loader_path = try std.Io.Dir.cwd().realPathFileAlloc(ctx.io, interpreter_info.interpreter.?, arena);
+        try absolutePath(loader_path);
+        if (!std.mem.eql(u8, std.fs.path.basename(loader_path), loader_basename))
+            return error.InvalidLoaderSource;
+        const dynamic_loader = try self.openRetained(ctx.io, &opened_by_path, loader_path);
+
+        var native_roots: std.ArrayList(*files.RetainedFile) = .empty;
+        var needed_queue: std.ArrayList([]const u8) = .empty;
+        var queued_names: std.StringHashMapUnmanaged(void) = .empty;
+        try queued_names.put(arena, loader_basename, {});
+
+        try self.scanSourceTree(ctx, &opened_by_path, &native_roots, &needed_queue, &queued_names, request.stdlib);
+        for (request.package_root) |root_path|
+            try self.scanSourceTree(ctx, &opened_by_path, &native_roots, &needed_queue, &queued_names, root_path);
+        for (request.data_root) |root_path|
+            try self.scanSourceTree(ctx, &opened_by_path, &native_roots, &needed_queue, &queued_names, root_path);
+
+        for (interpreter_info.needed) |needed_name|
+            try enqueueNeeded(arena, &needed_queue, &queued_names, needed_name);
+
+        var candidates: std.ArrayList(*files.RetainedFile) = .empty;
+        var candidate_names: std.ArrayList([]const u8) = .empty;
+        var satisfied_names: std.StringHashMapUnmanaged(void) = .empty;
+        try satisfied_names.put(arena, loader_basename, {});
+        var soname_providers: std.StringHashMapUnmanaged(*files.RetainedFile) = .empty;
+
+        for (request.native_dependency) |dep_path| {
+            if (candidates.items.len >= runtime.max_loader_files) return error.LoaderLimit;
+            const dep_file = try self.openRetained(ctx.io, &opened_by_path, dep_path);
+            const dep_basename = std.fs.path.basename(dep_path);
+            try dependencyName(dep_basename);
+            var dep_bytes = try readRetained(ctx, dep_file);
+            defer dep_bytes.deinit();
+            var dep_info = try inspectElf(
+                arena,
+                dep_bytes.bytes(),
+                if (std.mem.eql(u8, dep_basename, loader_basename)) .loader else .library,
+            );
+            defer dep_info.deinit();
+            for (dep_info.needed) |needed_name|
+                try enqueueNeeded(arena, &needed_queue, &queued_names, needed_name);
+            const owned_name = try arena.dupe(u8, dep_basename);
+            try candidates.append(arena, dep_file);
+            try candidate_names.append(arena, owned_name);
+            try satisfied_names.put(arena, owned_name, {});
+            if (dep_info.soname) |soname| {
+                if (!std.mem.eql(u8, soname, dep_basename) and !soname_providers.contains(soname)) {
+                    try soname_providers.put(arena, try arena.dupe(u8, soname), dep_file);
+                }
+            }
+        }
+
+        var search_dirs: std.ArrayList([]const u8) = .empty;
+        for (request.native_dependency) |dep_path| {
+            if (std.fs.path.dirname(dep_path)) |dir_path|
+                try addSearchDir(arena, &search_dirs, request, dir_path);
+        }
+        if (std.fs.path.dirname(request.az_python)) |py_dir| {
+            try addSearchDir(arena, &search_dirs, request, py_dir);
+            try addSearchDir(arena, &search_dirs, request, try std.fs.path.join(arena, &.{ py_dir, "lib" }));
+            if (std.fs.path.dirname(py_dir)) |prefix| {
+                if (!std.mem.eql(u8, prefix, "/")) {
+                    try addSearchDir(arena, &search_dirs, request, try std.fs.path.join(arena, &.{ prefix, "lib" }));
+                    try addSearchDir(arena, &search_dirs, request, try std.fs.path.join(arena, &.{ prefix, "lib64" }));
+                }
+            }
+        }
+        if (std.fs.path.dirname(request.stdlib)) |stdlib_parent|
+            try addSearchDir(arena, &search_dirs, request, stdlib_parent);
+        if (std.fs.path.dirname(interpreter_info.interpreter.?)) |interp_dir|
+            try addSearchDir(arena, &search_dirs, request, interp_dir);
+        if (std.fs.path.dirname(loader_path)) |loader_dir|
+            try addSearchDir(arena, &search_dirs, request, loader_dir);
+        if (isSystemLoaderPath(interpreter_info.interpreter.?)) {
+            for ([_][]const u8{
+                "/lib/x86_64-linux-gnu",
+                "/usr/lib/x86_64-linux-gnu",
+                "/lib64",
+                "/usr/lib64",
+                "/lib",
+                "/usr/lib",
+            }) |sys_dir| {
+                try addSearchDir(arena, &search_dirs, request, sys_dir);
+            }
+        }
+
+        var cursor: usize = 0;
+        while (cursor < needed_queue.items.len) : (cursor += 1) {
+            try checkCancellation(ctx);
+            const needed_name = needed_queue.items[cursor];
+            try dependencyName(needed_name);
+            if (satisfied_names.contains(needed_name)) continue;
+            if (candidates.items.len >= runtime.max_loader_files) return error.LoaderLimit;
+
+            if (soname_providers.get(needed_name)) |provider| {
+                const owned_name = try arena.dupe(u8, needed_name);
+                try candidates.append(arena, provider);
+                try candidate_names.append(arena, owned_name);
+                try satisfied_names.put(arena, owned_name, {});
+                continue;
+            }
+
+            const resolved_path = (try self.resolveCandidatePath(
+                ctx,
+                &opened_by_path,
+                request,
+                search_dirs.items,
+                needed_name,
+            )) orelse return error.MissingDependency;
+            const dso_file = try self.openRetained(ctx.io, &opened_by_path, resolved_path);
+            var dso_bytes = try readRetained(ctx, dso_file);
+            defer dso_bytes.deinit();
+            var dso_info = try inspectElf(arena, dso_bytes.bytes(), .library);
+            defer dso_info.deinit();
+            for (dso_info.needed) |transitive|
+                try enqueueNeeded(arena, &needed_queue, &queued_names, transitive);
+            const owned_name = try arena.dupe(u8, needed_name);
+            try candidates.append(arena, dso_file);
+            try candidate_names.append(arena, owned_name);
+            try satisfied_names.put(arena, owned_name, {});
+        }
+
+        self.input = .{
+            .interpreter = interpreter,
+            .dynamic_loader = dynamic_loader,
+            .native_roots = try native_roots.toOwnedSlice(arena),
+            .candidates = try candidates.toOwnedSlice(arena),
+            .candidate_names = try candidate_names.toOwnedSlice(arena),
+        };
+        return self;
+    }
+
+    fn openRetained(
+        self: *StandaloneDiscovery,
+        io: std.Io,
+        opened_by_path: *std.StringHashMapUnmanaged(*files.RetainedFile),
+        path: []const u8,
+    ) !*files.RetainedFile {
+        if (opened_by_path.get(path)) |existing| return existing;
+        const arena = self.arena.allocator();
+        const owned_path = try arena.dupe(u8, path);
+        const ptr = try arena.create(files.RetainedFile);
+        ptr.* = try files.RetainedFile.open(io, owned_path, .artifact);
+        errdefer ptr.close(io);
+        try self.retained.append(arena, ptr);
+        try opened_by_path.put(arena, owned_path, ptr);
+        return ptr;
+    }
+
+    fn scanSourceTree(
+        self: *StandaloneDiscovery,
+        ctx: types.Context,
+        opened_by_path: *std.StringHashMapUnmanaged(*files.RetainedFile),
+        native_roots: *std.ArrayList(*files.RetainedFile),
+        needed_queue: *std.ArrayList([]const u8),
+        queued_names: *std.StringHashMapUnmanaged(void),
+        root_path: []const u8,
+    ) !void {
+        var root_dir = try files.openDirectory(ctx.io, root_path, .artifact);
+        defer root_dir.close(ctx.io);
+        try self.scanSourceDir(ctx, opened_by_path, native_roots, needed_queue, queued_names, root_dir, root_path, 0);
+    }
+
+    fn scanSourceDir(
+        self: *StandaloneDiscovery,
+        ctx: types.Context,
+        opened_by_path: *std.StringHashMapUnmanaged(*files.RetainedFile),
+        native_roots: *std.ArrayList(*files.RetainedFile),
+        needed_queue: *std.ArrayList([]const u8),
+        queued_names: *std.StringHashMapUnmanaged(void),
+        dir: std.Io.Dir,
+        dir_path: []const u8,
+        depth: usize,
+    ) !void {
+        try checkCancellation(ctx);
+        if (depth > runtime.max_depth) return error.RuntimeLimit;
+        const arena = self.arena.allocator();
+        var names: std.ArrayList([]const u8) = .empty;
+        var iterator = dir.iterate();
+        while (try iterator.next(ctx.io)) |entry| {
+            try checkCancellation(ctx);
+            try files.basename(entry.name);
+            if (!std.unicode.utf8ValidateSlice(entry.name)) return error.UnsafePath;
+            try names.append(arena, try arena.dupe(u8, entry.name));
+        }
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn less(_: void, left: []const u8, right: []const u8) bool {
+                return std.mem.order(u8, left, right) == .lt;
+            }
+        }.less);
+        for (names.items) |name| {
+            try checkCancellation(ctx);
+            const path_file = try dir.openFile(ctx.io, name, .{ .path_only = true, .follow_symlinks = false });
+            defer path_file.close(ctx.io);
+            const before = try files.snapshot(path_file);
+            switch (before.mode & std.os.linux.S.IFMT) {
+                std.os.linux.S.IFDIR => {
+                    var child_dir = try dir.openDir(ctx.io, name, .{ .iterate = true, .follow_symlinks = false });
+                    defer child_dir.close(ctx.io);
+                    const child_path = try std.fs.path.join(arena, &.{ dir_path, name });
+                    try self.scanSourceDir(ctx, opened_by_path, native_roots, needed_queue, queued_names, child_dir, child_path, depth + 1);
+                },
+                std.os.linux.S.IFREG => {
+                    if (std.mem.indexOf(u8, name, ".so") != null) {
+                        if (native_roots.items.len >= runtime.max_files) return error.LoaderLimit;
+                        const member_path = try std.fs.path.join(arena, &.{ dir_path, name });
+                        if (opened_by_path.contains(member_path)) return error.DuplicateSource;
+                        const retained = try self.openRetained(ctx.io, opened_by_path, member_path);
+                        try native_roots.append(arena, retained);
+                        var bytes = try readRetained(ctx, retained);
+                        defer bytes.deinit();
+                        if (std.mem.startsWith(u8, bytes.bytes(), "\x7fELF")) {
+                            var info = try inspectElf(arena, bytes.bytes(), .native_extension);
+                            defer info.deinit();
+                            for (info.needed) |needed_name|
+                                try enqueueNeeded(arena, needed_queue, queued_names, needed_name);
+                        }
+                    }
+                },
+                else => return error.UnsafeSource,
+            }
+        }
+    }
+
+    fn resolveCandidatePath(
+        self: *StandaloneDiscovery,
+        ctx: types.Context,
+        opened_by_path: *std.StringHashMapUnmanaged(*files.RetainedFile),
+        request: types.PrepareRuntime,
+        search_dirs: []const []const u8,
+        needed_name: []const u8,
+    ) !?[]const u8 {
+        const arena = self.arena.allocator();
+        for (search_dirs) |dir_path| {
+            const candidate = try std.fs.path.join(arena, &.{ dir_path, needed_name });
+            const resolved = std.Io.Dir.cwd().realPathFileAlloc(ctx.io, candidate, arena) catch continue;
+            if (!isDisjointFromTrees(request, resolved)) continue;
+            try absolutePath(resolved);
+            return resolved;
+        }
+        for (search_dirs) |dir_path| {
+            if (isSystemLoaderPath(dir_path)) continue;
+            var dir = std.Io.Dir.openDirAbsolute(ctx.io, dir_path, .{ .iterate = true }) catch continue;
+            defer dir.close(ctx.io);
+            var entries: std.ArrayList([]const u8) = .empty;
+            var it = dir.iterate();
+            while (it.next(ctx.io) catch null) |entry| {
+                if (std.mem.indexOf(u8, entry.name, ".so") == null) continue;
+                try entries.append(arena, try arena.dupe(u8, entry.name));
+            }
+            std.mem.sort([]const u8, entries.items, {}, struct {
+                fn less(_: void, left: []const u8, right: []const u8) bool {
+                    return std.mem.order(u8, left, right) == .lt;
+                }
+            }.less);
+            for (entries.items) |entry_name| {
+                const candidate = try std.fs.path.join(arena, &.{ dir_path, entry_name });
+                const resolved = std.Io.Dir.cwd().realPathFileAlloc(ctx.io, candidate, arena) catch continue;
+                if (!isDisjointFromTrees(request, resolved)) continue;
+                if (std.mem.eql(u8, resolved, request.az_python) or std.mem.eql(u8, resolved, request.azure)) continue;
+                absolutePath(resolved) catch continue;
+                const dso = self.openRetained(ctx.io, opened_by_path, resolved) catch continue;
+                var bytes = readRetained(ctx, dso) catch continue;
+                defer bytes.deinit();
+                if (!std.mem.startsWith(u8, bytes.bytes(), "\x7fELF")) continue;
+                var info = inspectElf(arena, bytes.bytes(), .library) catch continue;
+                defer info.deinit();
+                if (info.soname) |soname| {
+                    if (std.mem.eql(u8, soname, needed_name)) return resolved;
+                }
+            }
+        }
+        return null;
+    }
+};
+
+fn enqueueNeeded(
+    arena: std.mem.Allocator,
+    needed_queue: *std.ArrayList([]const u8),
+    queued_names: *std.StringHashMapUnmanaged(void),
+    name: []const u8,
+) !void {
+    if (queued_names.contains(name)) return;
+    const owned = try arena.dupe(u8, name);
+    try queued_names.put(arena, owned, {});
+    try needed_queue.append(arena, owned);
+}
+
+fn pathContains(parent: []const u8, child: []const u8) bool {
+    return std.mem.eql(u8, parent, child) or
+        (child.len > parent.len and std.mem.startsWith(u8, child, parent) and child[parent.len] == '/');
+}
+
+fn isDisjointFromTrees(request: types.PrepareRuntime, path: []const u8) bool {
+    if (pathContains(request.output, path) or pathContains(path, request.output)) return false;
+    if (pathContains(request.stdlib, path) or pathContains(path, request.stdlib)) return false;
+    for (request.package_root) |root_path|
+        if (pathContains(root_path, path) or pathContains(path, root_path)) return false;
+    for (request.data_root) |root_path|
+        if (pathContains(root_path, path) or pathContains(path, root_path)) return false;
+    return true;
+}
+
+fn isSystemLoaderPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "/lib") or
+        std.mem.eql(u8, path, "/lib64") or
+        std.mem.eql(u8, path, "/usr/lib") or
+        std.mem.eql(u8, path, "/usr/lib64") or
+        std.mem.startsWith(u8, path, "/lib/") or
+        std.mem.startsWith(u8, path, "/lib64/") or
+        std.mem.startsWith(u8, path, "/usr/lib/") or
+        std.mem.startsWith(u8, path, "/usr/lib64/");
+}
+
+fn addSearchDir(
+    arena: std.mem.Allocator,
+    search_dirs: *std.ArrayList([]const u8),
+    request: types.PrepareRuntime,
+    dir_path: []const u8,
+) !void {
+    if (dir_path.len < 2 or dir_path[0] != '/') return;
+    if (pathContains(request.output, dir_path) or pathContains(request.stdlib, dir_path)) return;
+    for (request.package_root) |root_path| if (pathContains(root_path, dir_path)) return;
+    for (request.data_root) |root_path| if (pathContains(root_path, dir_path)) return;
+    for (search_dirs.items) |existing| if (std.mem.eql(u8, existing, dir_path)) return;
+    try search_dirs.append(arena, try arena.dupe(u8, dir_path));
+}
 pub const Discovery = struct {
     allocator: std.mem.Allocator,
     inventory: types.LoaderInventory,
