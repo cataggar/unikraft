@@ -146,10 +146,13 @@ The explicit direct guest profile uses `CONFIG_LIBSTORVSC_MAX_DEVICES=2`,
 `CONFIG_LIBSTORVSC_MAX_LUNS=2`, `CONFIG_LIBSTORVSC_LUN_DISCOVERY=y` (REPORT
 LUNS), and guarded I/O. `MAX_LUNS` counts retained identities per controller,
 not the largest numeric LUN address; two slots therefore support the original
-LUN 7 seed without alteration. The new pure
+LUN 7 seed without alteration. The pure
 `prep.config.validateDirectPersistence` check admits this exact direct
-profile; legacy preparation render/validation still require their original
-eight-slot profile and are not reinterpreted or silently normalized.
+profile, and `prep.persistence_config` (`prepare-direct-persistence-image` and
+`package-direct-persistence-bundle`) renders, solves, verifies, and binds this
+direct two-slot LUN-discovery persistence profile (#88), while legacy
+preparation render/validation still require their original eight-slot profile
+and are not reinterpreted or silently normalized.
 The guest driver/workload must actually support this direct target. A
 platform-only marker, read-only smoke test, or old nested receipt cannot
 establish target readiness.
