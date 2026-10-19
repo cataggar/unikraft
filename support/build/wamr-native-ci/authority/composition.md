@@ -6,12 +6,19 @@ contracts, CLI parser, types, records and transaction library.
 
 `handlers.run(handlers.Context, types.Command)` dispatches the **real** library
 operations. Its context explicitly carries retained allocator/I/O/cancellation,
-optional live imported `candidate.Finalized`, independently acquired plan and
-authorization artifact commitments, and explicit retained ELF discovery inputs.
-Missing context is refusal, not a request to recover an owner from JSON, PATH,
-the executing program's name, a receipt, or a selected directory. There is no
-installed authority command, Python fallback, frozen flag change, ledger claim,
-approval consumption, Azure operation, or standalone owner acquisition.
+optional live imported `candidate.Finalized`, either independently acquired plan
+and authorization artifact commitments (`plan_commitment`,
+`authorization_commitment`) or retained `*plan.Prepared` /
+`*authorization.Recorded` owners (`prepared_plan`, `recorded_authorization`),
+and optional explicit retained ELF discovery inputs (`discovery`).
+`handlers.createCandidate(types.Context, handlers.CandidateSource, output)` and
+`handlers.openCandidate(types.Context, handlers.CandidateSource, output)` bind a
+live `*handoff.public_products.ImportedProduct` into `candidate.create` /
+`candidate.open` (`*candidate.Finalized`). Missing context is refusal, not a
+request to recover an owner from JSON, PATH, the executing program's name, a
+receipt, or a selected directory. There is no installed authority command,
+Python fallback, frozen flag change, ledger claim, approval consumption, Azure
+operation, or standalone owner acquisition.
 
 ## Operations and lifetimes
 
@@ -31,8 +38,14 @@ approval consumption, Azure operation, or standalone owner acquisition.
   `Outcome(*Recorded)`, with `value/artifact/revalidate/deinit`. A current denied
   decision is a valid record, never admission.
 * `admission.run(admission.Context, AdmitCommand)` requires the live imported
-  owner and independent plan/authorization commitments. It returns
-  `*Admitted` with `artifact/revalidate/deinit`, not permission consumption.
+  owner and independent plan/authorization commitments. When dispatched via
+  `handlers.run`, `.admit` resolves `plan_commitment` from
+  `ctx.plan_commitment` or `ctx.prepared_plan.?.result().plan_artifact` and
+  `authorization_commitment` from `ctx.authorization_commitment` or
+  `ctx.recorded_authorization.?.revalidate()` + `.artifact()`, refusing at
+  `.inputs` on revalidation failure or `error.MissingIndependentCommitments`.
+  It returns `*Admitted` with `artifact/revalidate/deinit`, not permission
+  consumption.
 
 The trusted caller retains genuine imported ownership and cancellation/I/O for
 the corresponding operation's complete lifetime. `Stage.initNamed` takes its
@@ -207,21 +220,24 @@ copied-ELF refusal, collision retention, cancellation and explicit-context
 refusals. Synthetic ELF is not executed in that joined negative test.
 
 `test-handoff-composition` (`-Dhandoff-composition-group=retention`) also
-exercises live imported-owner composition through `cli.parse` and `handlers.run`:
+exercises live imported-owner composition through `cli.parse`,
+`handlers.createCandidate`, `handlers.openCandidate`, and `handlers.run`:
 a real v2 exact-download `ImportedProduct` and `candidate.create`/`candidate.open`
 `Finalized` owners drive `prepare-azure-runtime` (staging both the synthetic-ELF
-refusal fixture and, on x86_64 Linux, the real host Python interpreter,
-`PT_INTERP` dynamic loader, and transitive `DT_NEEDED` DSO closure with
-`uk-wamr-direct-validate azure-runtime`, `runtime_probes.inspectCopied`, and
-execution of all 19 closed runtime probes) → `plan` → `record-authorization` →
-`admit`, verified with `Admitted.revalidate()` and `uk-wamr-direct-validate`
-(`azure-runtime`, `plan`, `authorization`, `admission`, `stored-scope`,
-`inputs`, `ledger`, `ledger-proposal`, and `serial`), while refusing
-`.private_bundle` owners, mismatched bundle/candidate/attempt/cost selectors,
-create-only duplicate output paths (`PathAlreadyExists`), invalid approval
-windows/fields (`InvalidApprovalWindow`, `ApprovalExpired`,
-`InvalidAuthorityField`), denied authorization records, and post-admission
-ledger, bound-tool, copied-DSO, or staged-runtime manifest tampering. Standalone
-owner acquisition, trusted caller migration, genuine approvals, approval
-consumption, deletion authority and cloud/hardware acceptance remain separate
-gates.
+refusal fixture and, on x86_64 Linux with `discovery == null`, standalone ELF
+discovery of the real host Python interpreter, `PT_INTERP` dynamic loader, and
+transitive `DT_NEEDED` DSO closure with `uk-wamr-direct-validate azure-runtime`,
+`runtime_probes.inspectCopied`, and execution of all 19 closed runtime probes) →
+`plan` → `record-authorization` → `admit` (resolving plan/authorization
+commitments directly from retained `*plan.Prepared` and
+`*authorization.Recorded` owners), verified with `Admitted.revalidate()` and
+`uk-wamr-direct-validate` (`azure-runtime`, `plan`, `authorization`,
+`admission`, `stored-scope`, `inputs`, `ledger`, `ledger-proposal`, and
+`serial`), while refusing `.private_bundle` owners, mismatched
+bundle/candidate/attempt/cost selectors, create-only duplicate output paths
+(`PathAlreadyExists`), invalid approval windows/fields (`InvalidApprovalWindow`,
+`ApprovalExpired`, `InvalidAuthorityField`), denied authorization records, and
+post-admission ledger, bound-tool, copied-DSO, or staged-runtime manifest
+tampering. Standalone owner acquisition, trusted caller migration, genuine
+approvals, approval consumption, deletion authority and cloud/hardware
+acceptance remain separate gates.
