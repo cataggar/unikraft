@@ -4003,7 +4003,7 @@ class HypervWorkflowTest(unittest.TestCase):
             'sudo -n "${controller}" seal-public-source-upload \\',
             '"${controller}" retain-public-source-download \\',
             '"${controller}" import-public-source-download \\',
-            'python3 -B support/build/wamr-native-ci/handoff.py import-public-source-bundle \\',
+            'python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff import-public-source-bundle \\',
             '"${controller}" candidate \\',
             '"${controller}" candidate-inspect \\',
             '"${controller}" candidate-result \\',
@@ -4045,6 +4045,13 @@ class HypervWorkflowTest(unittest.TestCase):
             operator,
         )
         self.assertNotIn("support/build/wamr-native-ci/run.py", operator)
+        for retired in (
+            "support/build/wamr-native-ci/handoff.py",
+            "support/build/wamr-native-ci/public_bundle.py",
+            "support/build/wamr-native-ci/accepted_records.py",
+        ):
+            self.assertNotIn(retired, workflow)
+            self.assertNotIn(retired, operator)
 
     def test_producer_dependency_guard_is_failure_aware_and_cancelable(self):
         workflow = (

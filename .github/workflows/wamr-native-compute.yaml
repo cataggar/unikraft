@@ -372,7 +372,7 @@ jobs:
           export PYTHONDONTWRITEBYTECODE=1
           zig_dir="$(dirname "$(readlink -f "$(command -v zig)")")"
           export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
-          result="$(python3 support/build/wamr-native-ci/handoff.py public-source-bundle)"
+          result="$(python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff public-source-bundle)"
           printf '%s\n' "${result}"
           test -s "${root}/compute/public-source/handoff/private/handoff-inspect.log"
           test -s "${root}/compute/public-source/handoff/evidence/command-handoff-inspect.json"
@@ -469,7 +469,7 @@ jobs:
               os.close(source_fd)
           PY
           verified="$(
-            python3 support/build/wamr-native-ci/handoff.py \
+            python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff \
               verify-public-source-bundle \
               --archive "${upload_file}" \
               --expected-source "${GITHUB_SHA}" \
@@ -581,7 +581,7 @@ jobs:
               os.close(handle)
           PY
           verified="$(
-            python3 support/build/wamr-native-ci/handoff.py \
+            python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff \
               verify-public-source-bundle \
               --archive "${archive}" \
               --expected-source "${GITHUB_SHA}" \
@@ -606,7 +606,7 @@ jobs:
           mkdir -m 700 "${import_root}"
           validator="${root}/compute/public-source/validator-build/public-source/tools/bin/uk-wamr-direct-validate"
           supervisor="${root}/controller/bin/uk-wamr-native-ci"
-          python3 support/build/wamr-native-ci/handoff.py \
+          python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff \
             import-public-source-bundle \
             --archive "${archive}" \
             --output "${import_root}/success" \
@@ -623,12 +623,12 @@ jobs:
           native_revalidation="${import_root}/success-native-identity/revalidation"
           test -s "${native_revalidation}/private/import-native-revalidation.log"
           test -s "${native_revalidation}/evidence/command-import-native-revalidation.json"
-          python3 support/build/wamr-native-ci/handoff.py candidate \
+          python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff candidate \
             --bundle "${import_root}/success/bundle.json" \
             --output "${import_root}/candidate-scope.json"
           "${validator}" candidate "${import_root}/candidate-scope.json"
           if WAMR_CI_SUPERVISOR="${supervisor}" \
-            python3 support/build/wamr-native-ci/handoff.py \
+            python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff \
               import-public-source-bundle \
               --archive "${archive}" \
               --output "${import_root}/ambient-refused" \
@@ -669,7 +669,7 @@ jobs:
             if [[ "${case}" == wrong-tool ]]; then
               candidate="${validator}"
             fi
-            if python3 support/build/wamr-native-ci/handoff.py \
+            if python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff \
               import-public-source-bundle \
               --archive "${archive}" \
               --output "${import_root}/${case}-refused" \
@@ -1025,7 +1025,7 @@ jobs:
             --selected-tree "${SOURCE_TREE}" \
             --selected-run-id "${GITHUB_RUN_ID}" \
             --selected-run-attempt "${GITHUB_RUN_ATTEMPT}"
-          python3 -B support/build/wamr-native-ci/handoff.py import-public-source-bundle \
+          python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff import-public-source-bundle \
             --archive "${native_parity}/retained-download/tiny-aot-public-source.zip" \
             --output "${native_parity}/python-import" \
             --expected-source "${GITHUB_SHA}" \
@@ -1051,7 +1051,7 @@ jobs:
             --supervisor "${supervisor}" \
             --validator "${validator}" \
             --attempt-id "${attempt_id}"
-          python3 -B -c 'from pathlib import Path; import sys; sys.path.insert(0, "support/build/wamr-native-ci"); import handoff; handoff.candidate_plan(Path(sys.argv[1]), Path(sys.argv[2]), attempt_id=sys.argv[3])' \
+          python3 -B -c 'from pathlib import Path; import sys; sys.path.insert(0, "support/build/wamr-native-ci/tests"); from historical_controller_fixture import load_oracle_module; handoff = load_oracle_module("handoff"); handoff.candidate_plan(Path(sys.argv[1]), Path(sys.argv[2]), attempt_id=sys.argv[3])' \
             "${native_parity}/python-import/bundle.json" \
             "${native_parity}/python-candidate.json" \
             "${attempt_id}"
