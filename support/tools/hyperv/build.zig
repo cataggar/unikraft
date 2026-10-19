@@ -42,13 +42,17 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption(?[]const u8, "test_root", test_root);
     options.addOptionPath("process_fixture", fixture.getEmittedBin());
-    const host_core = b.createModule(.{
-        .root_source_file = b.path("core.zig"),
-        .target = b.graph.host,
-        .optimize = optimize,
-    });
-    if (b.graph.host.result.cpu.arch == .x86_64)
-        host_core.addAssemblyFile(b.path("sha256_clear_upper.S"));
+    const is_native_target = target.query.isNative();
+    const host_core = if (is_native_target) core else blk: {
+        const mod = b.createModule(.{
+            .root_source_file = b.path("core.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        });
+        if (b.graph.host.result.cpu.arch == .x86_64)
+            mod.addAssemblyFile(b.path("sha256_clear_upper.S"));
+        break :blk mod;
+    };
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests.zig"),
@@ -78,7 +82,7 @@ pub fn build(b: *std.Build) void {
     if (test_root) |path| transfer_run.setCwd(.{ .cwd_relative = path });
     const transfer_step = b.step("test-transfer", "Run offline streaming transfer fixtures");
     transfer_step.dependOn(&transfer_run.step);
-    const host_aggregate = b.createModule(.{
+    const host_aggregate = if (is_native_target) aggregate else b.createModule(.{
         .root_source_file = b.path("root.zig"),
         .target = b.graph.host,
         .optimize = optimize,
@@ -87,7 +91,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "hyperv_transfer", .module = host_transfer },
         },
     });
-    const host_cli = b.addExecutable(.{
+    const host_cli = if (is_native_target) cli else b.addExecutable(.{
         .name = "hyperv-cli-fixture",
         .root_module = b.createModule(.{
             .root_source_file = b.path("main.zig"),
