@@ -416,6 +416,7 @@ jobs:
             echo "Invalid public-source tree" >&2
             exit 1
           fi
+          chmod 700 "${GITHUB_WORKSPACE}/.d"
           "${controller}" stage-public-source-upload \
             --archive "${root}/compute/public-source/archive/public-inner.zip" \
             --output "${GITHUB_WORKSPACE}/.d/wamr-public-source-bundle" \
