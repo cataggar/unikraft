@@ -612,7 +612,7 @@ GUARDED_PRODUCER_FILES = {
         "9a501414e2749b031bf1fca8015d3049b9af42c74f1a0da9f514e5165e6d33cb"
     ),
     "drivers/hyperv/netvsc/netvsc.c": (
-        "7a346fffd3354a6c9e0371ee447a19997cf4fec77bd0a6d0880d85523939cec2"
+        "a6b720932810383c70f6638823768d4bb562db68f95cef33730a49dff4f71f30"
     ),
     "drivers/hyperv/storvsc/Config.uk": (
         "4ee6997ebb98a63bf8cc39ac219e447c5bcec0b783140d2802ba19238711b12c"
@@ -633,7 +633,7 @@ GUARDED_PRODUCER_FILES = {
         "8422dd6de969b13a533fe0291a7019442712ae9b7f6177420e6fd4df22860ab7"
     ),
     "drivers/hyperv/storvsc/storvsc_core.zig": (
-        "059b4a6bae2c6ee12503b07e082351dfba7acdc806f31863f6e6b7bf199f1998"
+        "6d965abdc3f573d61ffd1bcc44db779af4e8165aa5defa569e55086a0273c359"
     ),
     "drivers/hyperv/vmbus/Config.uk": (
         "05a880a38a10e130510fafbfa786f080d3da1413feb84ca7fc2a068c04a4d069"

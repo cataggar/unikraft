@@ -250,6 +250,9 @@ const Core = struct {
     control_id: u64 = 0,
     control_deadline: u64 = 0,
     control_timeout_ns: u64 = 0,
+    free_mask: u64 = 0,
+    in_flight_mask: u64 = 0,
+    completed_mask: u64 = 0,
     contexts: [max_contexts]RequestContext =
         @splat(.{}),
 };
@@ -346,9 +349,38 @@ fn coreFrom(storage: *align(core_storage_align) anyopaque) *Core {
 }
 
 fn zeroObject(object: anytype) void {
+    const size = @sizeOf(@TypeOf(object.*));
     const bytes: [*]volatile u8 = @ptrCast(object);
-    for (0..@sizeOf(@TypeOf(object.*))) |i|
-        bytes[i] = 0;
+    const Word = u64;
+    var index: usize = 0;
+    while (size - index >= 32) : (index += 32) {
+        const words: [*]align(1) volatile Word = @ptrCast(bytes + index);
+        words[0] = 0;
+        words[1] = 0;
+        words[2] = 0;
+        words[3] = 0;
+        asm volatile ("" ::: .{ .memory = true });
+    }
+    while (size - index >= 8) : (index += 8) {
+        const word: *align(1) volatile Word = @ptrCast(bytes + index);
+        word.* = 0;
+        asm volatile ("" ::: .{ .memory = true });
+    }
+    while (index < size) : (index += 1) {
+        bytes[index] = 0;
+        asm volatile ("" ::: .{ .memory = true });
+    }
+}
+
+fn slotBit(slot: usize) u64 {
+    return @as(u64, 1) << @intCast(slot);
+}
+
+fn queueDepthMask(queue_depth: u16) u64 {
+    return if (queue_depth >= 64)
+        std.math.maxInt(u64)
+    else
+        (@as(u64, 1) << @intCast(queue_depth)) - 1;
 }
 
 fn clearEvent(event: *Event) void {
@@ -358,61 +390,43 @@ fn clearEvent(event: *Event) void {
 }
 
 fn putLe16(bytes: []u8, offset: usize, value: u16) void {
-    bytes[offset] = @truncate(value);
-    bytes[offset + 1] = @truncate(value >> 8);
+    std.mem.writeInt(u16, bytes[offset..][0..2], value, .little);
 }
 
 fn putLe32(bytes: []u8, offset: usize, value: u32) void {
-    for (0..4) |i|
-        bytes[offset + i] = @truncate(value >> @intCast(i * 8));
+    std.mem.writeInt(u32, bytes[offset..][0..4], value, .little);
 }
 
 fn getLe16(bytes: []const u8, offset: usize) u16 {
-    return @as(u16, bytes[offset]) |
-        (@as(u16, bytes[offset + 1]) << 8);
+    return std.mem.readInt(u16, bytes[offset..][0..2], .little);
 }
 
 fn getLe32(bytes: []const u8, offset: usize) u32 {
-    var value: u32 = 0;
-    for (0..4) |i|
-        value |= @as(u32, bytes[offset + i]) << @intCast(i * 8);
-    return value;
+    return std.mem.readInt(u32, bytes[offset..][0..4], .little);
 }
 
 fn putBe16(bytes: []u8, offset: usize, value: u16) void {
-    bytes[offset] = @truncate(value >> 8);
-    bytes[offset + 1] = @truncate(value);
+    std.mem.writeInt(u16, bytes[offset..][0..2], value, .big);
 }
 
 fn putBe32(bytes: []u8, offset: usize, value: u32) void {
-    for (0..4) |i|
-        bytes[offset + i] =
-            @truncate(value >> @intCast((3 - i) * 8));
+    std.mem.writeInt(u32, bytes[offset..][0..4], value, .big);
 }
 
 fn putBe64(bytes: []u8, offset: usize, value: u64) void {
-    for (0..8) |i|
-        bytes[offset + i] =
-            @truncate(value >> @intCast((7 - i) * 8));
+    std.mem.writeInt(u64, bytes[offset..][0..8], value, .big);
 }
 
 fn getBe16(bytes: []const u8, offset: usize) u16 {
-    return (@as(u16, bytes[offset]) << 8) |
-        @as(u16, bytes[offset + 1]);
+    return std.mem.readInt(u16, bytes[offset..][0..2], .big);
 }
 
 fn getBe32(bytes: []const u8, offset: usize) u32 {
-    var value: u32 = 0;
-    for (0..4) |i|
-        value = (value << 8) | bytes[offset + i];
-    return value;
+    return std.mem.readInt(u32, bytes[offset..][0..4], .big);
 }
 
 fn getBe64(bytes: []const u8, offset: usize) u64 {
-    var value: u64 = 0;
-    for (0..8) |i|
-        value = (value << 8) | bytes[offset + i];
-    return value;
+    return std.mem.readInt(u64, bytes[offset..][0..8], .big);
 }
 
 fn addSaturating(a: u64, b: u64) u64 {
@@ -496,6 +510,7 @@ fn failInitialization(core: *Core, event: *Event, err: c_int) void {
 }
 
 fn completeRequest(
+    core: *Core,
     context: *RequestContext,
     slot: usize,
     event: *Event,
@@ -505,6 +520,7 @@ fn completeRequest(
     scsi_status: u8,
     sense: []const u8,
 ) void {
+    const bit = slotBit(slot);
     context.result = result;
     context.transferred = transferred;
     context.srb_status = srb_status;
@@ -513,6 +529,8 @@ fn completeRequest(
     for (0..context.sense.len) |i|
         context.sense[i] = if (i < context.sense_len) sense[i] else 0;
     context.state = .completed;
+    core.in_flight_mask &= ~bit;
+    core.completed_mask |= bit;
 
     clearEvent(event);
     event.kind = .request_complete;
@@ -578,9 +596,10 @@ fn srbError(raw: u8) c_int {
 }
 
 fn findContext(core: *Core, id: u64) ?usize {
-    for (0..core.queue_depth) |slot| {
-        if (core.contexts[slot].state != .free and
-            core.contexts[slot].id == id)
+    var mask = core.in_flight_mask | core.completed_mask;
+    while (mask != 0) : (mask &= mask - 1) {
+        const slot: usize = @ctz(mask);
+        if (core.contexts[slot].id == id)
             return slot;
     }
     return null;
@@ -605,6 +624,7 @@ fn parseRequestCompletion(
     }
     if (!completionPacketSizeValid(payload.len)) {
         completeRequest(
+            core,
             context,
             slot,
             event,
@@ -618,6 +638,7 @@ fn parseRequestCompletion(
     }
     if (getLe32(payload, 0) != @backingInt(Operation.complete_io)) {
         completeRequest(
+            core,
             context,
             slot,
             event,
@@ -640,6 +661,7 @@ fn parseRequestCompletion(
             28 + @as(usize, sense_len) > payload.len))
     {
         completeRequest(
+            core,
             context,
             slot,
             event,
@@ -692,6 +714,7 @@ fn parseRequestCompletion(
         }
     }
     completeRequest(
+        core,
         context,
         slot,
         event,
@@ -722,6 +745,7 @@ export fn storvsc_core_initialize(
     core.queue_depth = queue_depth;
     core.packet_size = legacy_packet_size;
     core.sense_size = 18;
+    core.free_mask = queueDepthMask(queue_depth);
     return 0;
 }
 
@@ -913,9 +937,11 @@ export fn storvsc_core_tick(
         }
         return 0;
     }
-    for (0..core.queue_depth) |slot| {
+    var mask = core.in_flight_mask;
+    while (mask != 0) : (mask &= mask - 1) {
+        const slot: usize = @ctz(mask);
         const context = &core.contexts[slot];
-        if (context.state == .in_flight and now >= context.deadline) {
+        if (now >= context.deadline) {
             event.kind = .request_timeout;
             event.err = -etimedout;
             event.transaction_id = context.id;
@@ -950,13 +976,13 @@ fn allocateContext(
         return -einval;
     }
 
-    var slot: usize = 0;
-    while (slot < core.queue_depth and
-        core.contexts[slot].state != .free) : (slot += 1)
-    {}
-    if (slot == core.queue_depth)
+    if (core.free_mask == 0)
         return -enospc;
+    const slot: usize = @ctz(core.free_mask);
     const id = allocateId(core) orelse return -enospc;
+    const bit = slotBit(slot);
+    core.free_mask &= ~bit;
+    core.in_flight_mask |= bit;
     var context = &core.contexts[slot];
     zeroObject(context);
     context.id = id;
@@ -1268,6 +1294,9 @@ export fn storvsc_core_abort(
     const context = &core.contexts[slot];
     if (context.state != .in_flight or context.id != transaction_id)
         return -enoent;
+    const bit = slotBit(slot);
+    core.in_flight_mask &= ~bit;
+    core.free_mask |= bit;
     zeroObject(context);
     return 0;
 }
@@ -1277,16 +1306,17 @@ export fn storvsc_core_cancel_all(
     result: c_int,
 ) callconv(.c) u32 {
     const core = coreFrom(storage);
-    var count: u32 = 0;
-    for (0..core.queue_depth) |slot| {
+    var mask = core.in_flight_mask;
+    const count: u32 = @popCount(mask);
+    while (mask != 0) : (mask &= mask - 1) {
+        const slot: usize = @ctz(mask);
         const context = &core.contexts[slot];
-        if (context.state != .in_flight)
-            continue;
         context.result = result;
         context.transferred = 0;
         context.state = .completed;
-        count += 1;
     }
+    core.completed_mask |= core.in_flight_mask;
+    core.in_flight_mask = 0;
     return count;
 }
 
@@ -1295,13 +1325,10 @@ export fn storvsc_core_next_completed(
     slot_out: *u16,
 ) callconv(.c) c_int {
     const core = coreFrom(storage);
-    for (0..core.queue_depth) |slot| {
-        if (core.contexts[slot].state == .completed) {
-            slot_out.* = @intCast(slot);
-            return 0;
-        }
-    }
-    return -enoent;
+    if (core.completed_mask == 0)
+        return -enoent;
+    slot_out.* = @intCast(@ctz(core.completed_mask));
+    return 0;
 }
 
 export fn storvsc_core_take_completed(
@@ -1317,6 +1344,9 @@ export fn storvsc_core_take_completed(
     const context = &core.contexts[slot];
     if (context.state != .completed or context.id != transaction_id)
         return -enoent;
+    const bit = slotBit(slot);
+    core.completed_mask &= ~bit;
+    core.free_mask |= bit;
     event.kind = .request_complete;
     event.err = context.result;
     event.transaction_id = context.id;
@@ -1335,20 +1365,14 @@ export fn storvsc_core_active_count(
     storage: *align(core_storage_align) anyopaque,
 ) callconv(.c) u32 {
     const core = coreFrom(storage);
-    var count: u32 = 0;
-    for (0..core.queue_depth) |slot| {
-        if (core.contexts[slot].state != .free) {
-            count += 1;
-        }
-    }
-    return count;
+    return @popCount(core.in_flight_mask | core.completed_mask);
 }
 
 export fn storvsc_core_free_count(
     storage: *align(core_storage_align) anyopaque,
 ) callconv(.c) u32 {
     const core = coreFrom(storage);
-    return core.queue_depth - storvsc_core_active_count(storage);
+    return @popCount(core.free_mask);
 }
 
 export fn storvsc_core_set_transfer_limit(
