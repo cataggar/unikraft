@@ -272,9 +272,11 @@ fn rdtsc() u64 {
 }
 
 fn zeroSharedPage(page: *[4096]u8) void {
-    for (0..page.len) |i|
-        @as(*volatile u8, @ptrCast(&page[i])).* = 0;
-    asm volatile ("" ::: .{ .memory = true });
+    var i: usize = 0;
+    while (i < page.len) : (i += 64) {
+        @memset(page[i..][0..64], 0);
+        asm volatile ("" ::: .{ .memory = true });
+    }
 }
 
 fn programPageMsr(msr: u32, gpa: u64) bool {
@@ -679,10 +681,10 @@ export fn hyperv_synic_message_take_page(
         return @backingInt(MessageResult.invalid_payload);
     }
 
-    const src: [*]const volatile u8 = @ptrCast(slot);
-    const dst: [*]u8 = @ptrCast(output);
-    for (0..@sizeOf(Message)) |i|
-        dst[i] = src[i];
+    const src_words: [*]const volatile u64 = @ptrCast(slot);
+    const dst_words: [*]u64 = @ptrCast(output);
+    for (0..@sizeOf(Message) / @sizeOf(u64)) |i|
+        dst_words[i] = src_words[i];
 
     const flags_ptr: *const u8 = @ptrCast(@volatileCast(&slot.flags));
     completeMessageSlot(message_type_ptr, flags_ptr, writeSynicEom);

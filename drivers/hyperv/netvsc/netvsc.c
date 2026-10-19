@@ -293,6 +293,24 @@ static void copy_bytes(void *destination, const void *source, size_t length)
 	__u8 *dst = destination;
 	const __u8 *src = source;
 
+	while (length >= 8 * sizeof(netvsc_u64_alias_t)) {
+		const netvsc_u64_alias_t *s =
+			(const netvsc_u64_alias_t *)src;
+		netvsc_u64_alias_t *d = (netvsc_u64_alias_t *)dst;
+
+		d[0] = s[0];
+		d[1] = s[1];
+		d[2] = s[2];
+		d[3] = s[3];
+		d[4] = s[4];
+		d[5] = s[5];
+		d[6] = s[6];
+		d[7] = s[7];
+		dst += 8 * sizeof(netvsc_u64_alias_t);
+		src += 8 * sizeof(netvsc_u64_alias_t);
+		length -= 8 * sizeof(netvsc_u64_alias_t);
+		__asm__ __volatile__("" ::: "memory");
+	}
 	while (length >= sizeof(netvsc_u64_alias_t)) {
 		*(netvsc_u64_alias_t *)dst =
 			*(const netvsc_u64_alias_t *)src;
@@ -311,6 +329,21 @@ static void zero_bytes(void *destination, size_t length)
 {
 	__u8 *dst = destination;
 
+	while (length >= 8 * sizeof(netvsc_u64_alias_t)) {
+		netvsc_u64_alias_t *d = (netvsc_u64_alias_t *)dst;
+
+		d[0] = 0;
+		d[1] = 0;
+		d[2] = 0;
+		d[3] = 0;
+		d[4] = 0;
+		d[5] = 0;
+		d[6] = 0;
+		d[7] = 0;
+		dst += 8 * sizeof(netvsc_u64_alias_t);
+		length -= 8 * sizeof(netvsc_u64_alias_t);
+		__asm__ __volatile__("" ::: "memory");
+	}
 	while (length >= sizeof(netvsc_u64_alias_t)) {
 		*(netvsc_u64_alias_t *)dst = 0;
 		dst += sizeof(netvsc_u64_alias_t);

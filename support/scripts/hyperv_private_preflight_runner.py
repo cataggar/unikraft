@@ -433,7 +433,7 @@ GUARDED_PRODUCER_FILES = {
         "9a501414e2749b031bf1fca8015d3049b9af42c74f1a0da9f514e5165e6d33cb"
     ),
     "drivers/hyperv/netvsc/netvsc.c": (
-        "b0a075fa064a648cdbaaa7614be2a3150b4132795042c70ca38166804462b0d9"
+        "7a346fffd3354a6c9e0371ee447a19997cf4fec77bd0a6d0880d85523939cec2"
     ),
     "drivers/hyperv/storvsc/Config.uk": (
         "4ee6997ebb98a63bf8cc39ac219e447c5bcec0b783140d2802ba19238711b12c"
@@ -475,13 +475,13 @@ GUARDED_PRODUCER_FILES = {
         "b8c97d18cbf3adeb5e7c7d6fcd1e13be7dac1be1a929610747a743377d2613b5"
     ),
     "drivers/hyperv/vmbus/vmbus_channel.c": (
-        "f9d326ea708d00b670404f9572e9445ca4a207c45e30b6060e0cdf2a7a494592"
+        "555aa558c7afc8bd9635a5f01ca8aa08a3a6d35cd1e5161723f0e7a4febc2714"
     ),
     "drivers/hyperv/vmbus/vmbus_protocol.h": (
         "c00e58790f9d8ece3518fdda9b82b02b843eccb3c2cc90002344192b554e44a9"
     ),
     "drivers/hyperv/vmbus/vmbus_protocol.zig": (
-        "4fe45a6d38535195d5433fc557ab7f3f8e4ec61ef1c21230429decb319224f87"
+        "eb99df0d2e6d9356de88fa2eefe62f347721da544f0404f59daab4f76f5fd8f5"
     ),
     "lib/uktimeconv/include/uk/timeconv.h": (
         "022634efc8985d508279fead89c925268df5cd290551d41c2f2aabbeb2e5dd5f"
@@ -496,7 +496,7 @@ GUARDED_PRODUCER_FILES = {
         "d73b989cc28c7884e4f26156fad52dd92847ed71ff45dba17a12d2feb9120990"
     ),
     "plat/hyperv/hyperv_runtime.zig": (
-        "fc12400e185046f5aa8bb7469a68824d3e47ca855f9487f662e600206d9605a2"
+        "9df0e53263210a4a4790f547e7f1c51dca6acd7257abeb00c083ac34ed7a5dd6"
     ),
     "plat/hyperv/include/hyperv/clock.h": (
         "378e4b267ca5330d5a7a1fd9da306d1fd59244528e15560d1ef8842ce26eea35"
