@@ -52,9 +52,12 @@ A fresh configuration at the initial revision exposed missing legacy-APIC
 support on `Standard_D2as_v5`; [#81][amd-irq] is now resolved by the correction
 and both-family runs above. Another `Standard_D2s_v5` host using VMBus 6.0 and
 VMStor 6.0 passed platform/storage but rejected NetVSC binding with `EPROTO`
-([#82][netvsc-variant]). The successful smoke runs are not blanket coverage of
-every Azure host variant, and the legacy-APIC path is restricted to single-CPU
-Hyper-V configurations.
+([#82][netvsc-variant]); VMBus 6.0 / NVS 6.x attach and transfer-page
+compatibility tolerances and the four-boot local preflight gate on
+`hyperv-azure.py run` are now integrated ([#82][netvsc-variant]). The
+successful smoke runs still do not imply blanket coverage of every Azure host
+variant, and the legacy-APIC path remains restricted to single-CPU Hyper-V
+configurations.
 
 Retain each run's private `state.json`, `packaging.json`, `acceptance.json`,
 and serial logs for its exact image fingerprints and outcome. Do not publish

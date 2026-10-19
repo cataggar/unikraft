@@ -399,12 +399,10 @@ def assert_oracle_custody_closure(before, producer, reader):
             "unbound frozen Python oracle closure")
     require(str(BOUNDED_PROCESS_PATH) in before, "unbound shared capture helper")
     for repository in (producer, reader):
-        for name in ("handoff.py", "public_bundle.py", "accepted_records.py"):
-            require(str(repository / "support/build/wamr-native-ci" / name) in before,
-                    "unbound frozen Python oracle closure")
-        run_py = repository / "support/build/wamr-native-ci/run.py"
-        if run_py.exists() or run_py.is_symlink():
-            require(str(run_py) in before, "unbound frozen Python oracle closure")
+        for name in ("handoff.py", "public_bundle.py", "accepted_records.py", "run.py"):
+            oracle_py = repository / "support/build/wamr-native-ci" / name
+            if oracle_py.exists() or oracle_py.is_symlink():
+                require(str(oracle_py) in before, "unbound frozen Python oracle closure")
 
 
 def worker(args):

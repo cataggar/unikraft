@@ -1207,11 +1207,15 @@ are `0600`, and any failed or partial build is a refusal, never a boot,
 cloud, or workload-acceptance result. The installed native producer's
 golden/fault/integration tests are `zig build --build-file
 support/apps/wamr-aot/build.zig test-unit test-integration`; working-tree
-`run.py` has been retired in favor of `uk-wamr-native-ci` and pinned
-`historical_controller_fixture.py` (`ORACLE_SOURCES`), while Azure
-admission, broader workload validation, and shared
-`handoff.py`/`public_bundle.py`/`accepted_records.py` retirement remain
-separate follow-up slices, not producer-side fallbacks.
+`support/build/wamr-native-ci/{run.py,handoff.py,public_bundle.py,accepted_records.py}`
+are retired, with `support/build/wamr-native-ci/tests/historical_controller_fixture.py`
+serving as the authenticated Git-blob oracle loader (`ORACLE_SOURCES` at
+`c72bd80b024694590912259fb88a4ba06e84f0a2`) for differential shadow parity and
+historical fixture tests while `uk-wamr-native-ci` and
+`support/build/wamr-native-ci/authority/root.zig` (`authority/handlers.zig`)
+own the native implementation; Azure execution beyond local admission and
+broader workload validation remain separate follow-up slices, not producer-side
+fallbacks.
 Recorded indirect executable variables are replaced inside the supervisor by
 paths to its retained descriptors. The reviewed self-reexecuting package and
 local-boot tools ignore inherited retained-self values unless the original
