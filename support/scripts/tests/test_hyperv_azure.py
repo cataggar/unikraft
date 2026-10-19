@@ -663,6 +663,164 @@ class HypervAzurePreparedImageTransferTest(unittest.TestCase):
                     state_dir, root / "cloud-state", self.source()
                 )
 
+    def test_run_prepared_enforces_local_four_boot_raw_and_vhd_gate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_dir, _ = self.make_prepared(root)
+            state_path = state_dir / "state.json"
+            baseline_state = json.loads(state_path.read_text())
+            azure.validate_prepared_run_provenance(baseline_state, state_dir)
+            with mock.patch.object(
+                azure, "check_upload_dependencies",
+                side_effect=RuntimeError("dependency gate reached"),
+            ), mock.patch.object(azure, "check_subscription") as subscription:
+                with self.assertRaisesRegex(RuntimeError, "dependency gate reached"):
+                    azure.run_prepared(state_dir, "io", 300, False)
+            subscription.assert_not_called()
+
+            for broken_modes in (
+                None,
+                {
+                    "raw": {"x2apic": False, "legacy-apic": True},
+                    "vhd": {"x2apic": True, "legacy-apic": True},
+                },
+                {
+                    "raw": {"x2apic": True, "legacy-apic": True},
+                    "vhd": {"x2apic": True, "legacy-apic": False},
+                },
+            ):
+                with self.subTest(broken_modes=broken_modes):
+                    mutated = copy.deepcopy(baseline_state)
+                    if broken_modes is None:
+                        del mutated["local_platform_boot_modes"]
+                    else:
+                        mutated["local_platform_boot_modes"] = broken_modes
+                    azure.save_json(state_path, mutated)
+                    with mock.patch.object(
+                        azure, "check_upload_dependencies"
+                    ) as dependencies, mock.patch.object(
+                        azure, "check_subscription"
+                    ) as subscription:
+                        with self.assertRaisesRegex(
+                            ValueError, "four-boot local image"
+                        ):
+                            azure.run_prepared(state_dir, "io", 300, False)
+                    dependencies.assert_not_called()
+                    subscription.assert_not_called()
+            azure.save_json(state_path, baseline_state)
+
+            raw = state_dir / "unikraft.raw"
+            original_raw = raw.read_bytes()
+            raw.unlink()
+            with mock.patch.object(
+                azure, "check_upload_dependencies"
+            ) as dependencies, mock.patch.object(
+                azure, "check_subscription"
+            ) as subscription:
+                with self.assertRaisesRegex(ValueError, "regular, non-symlink"):
+                    azure.run_prepared(state_dir, "io", 300, False)
+            dependencies.assert_not_called()
+            subscription.assert_not_called()
+
+            raw.write_bytes(original_raw + b"x")
+            with mock.patch.object(
+                azure, "check_upload_dependencies"
+            ) as dependencies, mock.patch.object(
+                azure, "check_subscription"
+            ) as subscription:
+                with self.assertRaisesRegex(ValueError, "unexpected size"):
+                    azure.run_prepared(state_dir, "io", 300, False)
+            dependencies.assert_not_called()
+            subscription.assert_not_called()
+
+            raw.write_bytes(b"x" + original_raw[1:])
+            with mock.patch.object(
+                azure, "check_upload_dependencies"
+            ) as dependencies, mock.patch.object(
+                azure, "check_subscription"
+            ) as subscription:
+                with self.assertRaisesRegex(
+                    ValueError, "raw_sha256 no longer matches"
+                ):
+                    azure.run_prepared(state_dir, "io", 300, False)
+            dependencies.assert_not_called()
+            subscription.assert_not_called()
+            raw.write_bytes(original_raw)
+
+            io_ready_lines = [
+                "Hyper-V Hv#1 hypercall page enabled",
+                "Hyper-V SynIC:",
+                "Powered by",
+                "Calling main(",
+                azure.PLATFORM_READY,
+                azure.BLOCK_READY,
+                azure.NETWORK_READY,
+                azure.IO_READY,
+            ]
+            for log_name in ("raw", "vpc"):
+                for mode, legacy in azure.LOCAL_BOOT_MODES:
+                    log_path = state_dir / f"local-{log_name}-{mode}-serial.log"
+                    original_log = log_path.read_text()
+
+                    log_path.unlink()
+                    with mock.patch.object(
+                        azure, "check_upload_dependencies"
+                    ) as dependencies, mock.patch.object(
+                        azure, "check_subscription"
+                    ) as subscription:
+                        with self.assertRaisesRegex(
+                            ValueError, "readable non-symlink"
+                        ):
+                            azure.run_prepared(state_dir, "io", 300, False)
+                    dependencies.assert_not_called()
+                    subscription.assert_not_called()
+
+                    log_path.write_text(
+                        original_log.replace(azure.PLATFORM_READY, "")
+                    )
+                    with mock.patch.object(
+                        azure, "check_upload_dependencies"
+                    ) as dependencies, mock.patch.object(
+                        azure, "check_subscription"
+                    ) as subscription:
+                        with self.assertRaisesRegex(
+                            RuntimeError, "application-ready marker is missing"
+                        ):
+                            azure.run_prepared(state_dir, "io", 300, False)
+                    dependencies.assert_not_called()
+                    subscription.assert_not_called()
+
+                    log_path.write_text(self.boot_text(not legacy))
+                    with mock.patch.object(
+                        azure, "check_upload_dependencies"
+                    ) as dependencies, mock.patch.object(
+                        azure, "check_subscription"
+                    ) as subscription:
+                        with self.assertRaisesRegex(
+                            RuntimeError, "xAPIC fallback"
+                        ):
+                            azure.run_prepared(state_dir, "io", 300, False)
+                    dependencies.assert_not_called()
+                    subscription.assert_not_called()
+
+                    io_log = list(io_ready_lines)
+                    if legacy:
+                        io_log.append(azure.LEGACY_APIC_MARKER)
+                    log_path.write_text("\n".join(io_log))
+                    with mock.patch.object(
+                        azure, "check_upload_dependencies"
+                    ) as dependencies, mock.patch.object(
+                        azure, "check_subscription"
+                    ) as subscription:
+                        with self.assertRaisesRegex(
+                            ValueError, "exceeded platform-only scope"
+                        ):
+                            azure.run_prepared(state_dir, "io", 300, False)
+                    dependencies.assert_not_called()
+                    subscription.assert_not_called()
+
+                    log_path.write_text(original_log)
+
     def test_import_requires_external_digest_and_exact_provenance(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2087,8 +2245,12 @@ class HypervAzureControllerTest(unittest.TestCase):
 
     @mock.patch.object(azure, "check_subscription")
     @mock.patch.object(azure, "image_sha256", return_value="b" * 64)
+    @mock.patch.object(azure, "validate_prepared_run_provenance")
     @mock.patch.object(azure, "load_state")
-    def test_modified_image_is_rejected_before_any_cloud_call(self, load, digest, check):
+    def test_modified_image_is_rejected_before_any_cloud_call(
+        self, load, provenance, digest, check
+    ):
+        del provenance, digest
         load.return_value = ({
             "phase": "prepared", "local_platform_boot": True,
             "image_sha256": "a" * 64,
@@ -2110,8 +2272,12 @@ class HypervAzureControllerTest(unittest.TestCase):
     @mock.patch.object(azure, "check_subscription")
     @mock.patch.object(azure, "check_upload_dependencies", side_effect=RuntimeError("missing SDK"))
     @mock.patch.object(azure, "image_sha256", return_value="a" * 64)
+    @mock.patch.object(azure, "validate_prepared_run_provenance")
     @mock.patch.object(azure, "load_state")
-    def test_missing_upload_sdk_fails_before_cloud_calls(self, load, digest, dependencies, check):
+    def test_missing_upload_sdk_fails_before_cloud_calls(
+        self, load, provenance, digest, dependencies, check
+    ):
+        del provenance, digest, dependencies
         load.return_value = ({
             "phase": "prepared", "local_platform_boot": True,
             "image_sha256": "a" * 64,
@@ -2125,10 +2291,12 @@ class HypervAzureControllerTest(unittest.TestCase):
     @mock.patch.object(azure, "check_subscription", return_value="subscription")
     @mock.patch.object(azure, "check_upload_dependencies")
     @mock.patch.object(azure, "image_sha256", return_value="a" * 64)
+    @mock.patch.object(azure, "validate_prepared_run_provenance")
     @mock.patch.object(azure, "load_state")
     def test_failed_run_cleans_owned_resources_by_default(
-        self, load, digest, dependencies, check, constructor, save
+        self, load, provenance, digest, dependencies, check, constructor, save
     ):
+        del provenance, digest, dependencies, check, save
         state = {
             "phase": "prepared", "local_platform_boot": True,
             "image_sha256": "a" * 64, "location": "westus2",

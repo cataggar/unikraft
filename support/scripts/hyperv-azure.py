@@ -978,8 +978,7 @@ def validate_prepared_image_manifest(manifest, expected_source=None):
     }
 
 
-def export_prepared_image(directory, artifact_directory, source):
-    state, state_path = load_state(directory)
+def validate_local_prepared_state(state, directory, *, require_miz=False):
     expected_modes = {
         "raw": {"x2apic": True, "legacy-apic": True},
         "vhd": {"x2apic": True, "legacy-apic": True},
@@ -997,56 +996,61 @@ def export_prepared_image(directory, artifact_directory, source):
     acceptance = network.validate_acceptance(
         state.get("acceptance", {"mode": network.RAW_ACCEPTANCE_MODE})
     )
-    image = state_path.parent / PREPARED_IMAGE_VHD
-    raw = state_path.parent / "unikraft.raw"
-    efi = state_path.parent / "BOOTX64.EFI"
-    miz_value = state.get("miz_executable")
-    if not isinstance(miz_value, str):
-        raise ValueError("Prepared state has no miz executable")
-    miz = Path(miz_value).resolve(strict=True)
-    if not os.access(miz, os.X_OK):
-        raise ValueError("Prepared miz executable is not executable")
+    image = directory / PREPARED_IMAGE_VHD
+    raw = directory / "unikraft.raw"
+    efi = directory / "BOOTX64.EFI"
+    miz = None
+    if require_miz:
+        miz_value = state.get("miz_executable")
+        if not isinstance(miz_value, str):
+            raise ValueError("Prepared state has no miz executable")
+        miz = Path(miz_value).resolve(strict=True)
+        if not os.access(miz, os.X_OK):
+            raise ValueError("Prepared miz executable is not executable")
 
     fingerprints = {
         "efi": image_sha256(efi),
         "raw": image_sha256(raw),
         "vhd": image_sha256(image),
-        "miz": image_sha256(miz),
     }
-    for state_field, fingerprint in (
+    if raw.stat().st_size != VIRTUAL_SIZE or image.stat().st_size != VIRTUAL_SIZE + 512:
+        raise ValueError("Prepared raw or fixed-VHD image has an unexpected size")
+    expected_fields = [
         ("efi_sha256", fingerprints["efi"]),
         ("raw_sha256", fingerprints["raw"]),
         ("image_sha256", fingerprints["vhd"]),
-        ("miz_executable_sha256", fingerprints["miz"]),
-    ):
+    ]
+    if require_miz:
+        fingerprints["miz"] = image_sha256(miz)
+        expected_fields.append(("miz_executable_sha256", fingerprints["miz"]))
+    for state_field, fingerprint in expected_fields:
         if state.get(state_field) != fingerprint:
             raise ValueError(f"Prepared {state_field} no longer matches its local gate")
-    if raw.stat().st_size != VIRTUAL_SIZE or image.stat().st_size != VIRTUAL_SIZE + 512:
-        raise ValueError("Prepared raw or fixed-VHD image has an unexpected size")
 
     packaging, _ = load_strict_json(
-        state_path.parent / "packaging.json",
+        directory / "packaging.json",
         MAX_MANIFEST_SIZE,
         "miz packaging report",
     )
     check_packaging_report(packaging, fingerprints["efi"], image.stat().st_size)
-    check_log = (
-        state_path.parent / "tools" / "tmp"
-        / f"miz-export-{secrets.token_hex(8)}.log"
-    )
-    checked = miz_command(miz, [
-        "check-efi-application", "--output=json", "--architecture", "x86_64",
-        "--expected-efi-sha256", fingerprints["efi"],
-        "--expected-virtual-size", "66M", str(image),
-    ], check_log, json_output=True)
-    check_packaging_report(checked, fingerprints["efi"], image.stat().st_size)
-    check_log.unlink(missing_ok=True)
+    if require_miz:
+        check_log = (
+            directory / "tools" / "tmp"
+            / f"miz-export-{secrets.token_hex(8)}.log"
+        )
+        checked = miz_command(miz, [
+            "check-efi-application", "--output=json", "--architecture", "x86_64",
+            "--expected-efi-sha256", fingerprints["efi"],
+            "--expected-virtual-size", "66M", str(image),
+        ], check_log, json_output=True)
+        check_packaging_report(checked, fingerprints["efi"], image.stat().st_size)
+        check_log.unlink(missing_ok=True)
 
     boot_outcomes = {"raw": {}, "vhd": {}}
     for image_name, log_name in (("raw", "raw"), ("vhd", "vpc")):
         for mode, disable_x2apic in LOCAL_BOOT_MODES:
             evidence = validate_local_boot_log(
-                state_path.parent / f"local-{log_name}-{mode}-serial.log",
+                directory / f"local-{log_name}-{mode}-serial.log",
                 platform_marker,
                 disable_x2apic,
             )
@@ -1056,7 +1060,7 @@ def export_prepared_image(directory, artifact_directory, source):
                 )
             if acceptance["mode"] == network.NETWORK_ACCEPTANCE_MODE:
                 text = read_regular_file(
-                    state_path.parent / f"local-{log_name}-{mode}-serial.log",
+                    directory / f"local-{log_name}-{mode}-serial.log",
                     MAX_LOCAL_LOG_SIZE,
                     f"Local {image_name}/{mode} serial evidence",
                 ).decode("utf-8", errors="replace")
@@ -1073,6 +1077,25 @@ def export_prepared_image(directory, artifact_directory, source):
         prepared_boot_outcomes(acceptance)
     ):
         raise ValueError("Prepared local evidence does not contain all four exact boots")
+    return {
+        "platform_marker": platform_marker,
+        "acceptance": acceptance,
+        "image": image,
+        "fingerprints": fingerprints,
+        "boot_outcomes": boot_outcomes,
+    }
+
+
+def export_prepared_image(directory, artifact_directory, source):
+    state, state_path = load_state(directory)
+    validated = validate_local_prepared_state(
+        state, state_path.parent, require_miz=True
+    )
+    platform_marker = validated["platform_marker"]
+    acceptance = validated["acceptance"]
+    image = validated["image"]
+    fingerprints = validated["fingerprints"]
+    boot_outcomes = validated["boot_outcomes"]
 
     manifest = {
         "schema": PREPARED_IMAGE_SCHEMA,
@@ -1224,6 +1247,7 @@ def import_prepared_image(artifact_directory, directory, miz,
 
 def validate_prepared_run_provenance(state, directory):
     if state.get("local_platform_boot") is True:
+        validate_local_prepared_state(state, directory)
         return
     receipt = require_exact_fields(
         state.get("prepared_image_import"),
