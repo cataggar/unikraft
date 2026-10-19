@@ -15,6 +15,21 @@ fn ignoredSource(allocator: std.mem.Allocator) ![]u8 {
     return result.stdout;
 }
 
+fn configureGlobalCacheDir(allocator: std.mem.Allocator, environ_map: *std.process.Environ.Map, fallback: []const u8) !void {
+    if (environ_map.get("ZIG_GLOBAL_CACHE_DIR")) |existing| {
+        if (std.fs.path.isAbsolute(existing) and
+            !std.mem.eql(u8, existing, options.repository_root) and
+            !(std.mem.startsWith(u8, existing, options.repository_root) and
+                existing.len > options.repository_root.len and
+                existing[options.repository_root.len] == '/'))
+        {
+            return;
+        }
+    }
+    try environ_map.put("ZIG_GLOBAL_CACHE_DIR", fallback);
+    _ = allocator;
+}
+
 test "install-controller rejects incompatible build flags without creating output" {
     const allocator = std.testing.allocator;
     const ignored = try ignoredSource(allocator);
@@ -36,7 +51,7 @@ test "install-controller rejects incompatible build flags without creating outpu
     defer allocator.free(build_file);
     var environ_map = try std.testing.environ.createMap(allocator);
     defer environ_map.deinit();
-    try environ_map.put("ZIG_GLOBAL_CACHE_DIR", global);
+    try configureGlobalCacheDir(allocator, &environ_map, global);
     for ([_]struct { triple: []const u8, cpu: []const u8 }{
         .{ .triple = "-Dtarget=x86_64-linux-musl", .cpu = "-Dcpu=x86_64_v2" },
         .{ .triple = "-Dtarget=x86_64-linux-gnu", .cpu = "-Dcpu=native" },
@@ -91,8 +106,10 @@ test "install-controller installs v2 default and v3 opt-in with matching describ
     defer allocator.free(build_file);
     var environ_map = try std.testing.environ.createMap(allocator);
     defer environ_map.deinit();
-    try environ_map.put("ZIG_GLOBAL_CACHE_DIR", global);
-    const work_parent = try std.Io.Dir.openDirAbsolute(io, options.fixture_root, .{ .iterate = true });
+    try configureGlobalCacheDir(allocator, &environ_map, global);
+    const work_root = try std.fs.path.join(allocator, &.{ options.fixture_root, "install-target-work" });
+    defer allocator.free(work_root);
+    const work_parent = try std.Io.Dir.openDirAbsolute(io, work_root, .{ .iterate = true });
     defer work_parent.close(io);
     for ([_]struct { name: []const u8, cpu: []const u8 }{
         .{ .name = "install-target-v2", .cpu = "-Dcpu=x86_64_v2" },
@@ -101,7 +118,7 @@ test "install-controller installs v2 default and v3 opt-in with matching describ
         work_parent.deleteTree(io, entry.name) catch {};
         try work_parent.createDir(io, entry.name, .fromMode(0o700));
         defer work_parent.deleteTree(io, entry.name) catch {};
-        const runtime = try std.fs.path.join(allocator, &.{ options.fixture_root, entry.name });
+        const runtime = try std.fs.path.join(allocator, &.{ work_root, entry.name });
         defer allocator.free(runtime);
         const runtime_flag = try allocator.print("-Dcontroller-runtime={s}", .{runtime});
         defer allocator.free(runtime_flag);
@@ -111,7 +128,7 @@ test "install-controller installs v2 default and v3 opt-in with matching describ
                 build_file,                "install-controller", "-Dtarget=x86_64-linux-gnu",
                 entry.cpu,                 "-Doptimize=safe",    runtime_flag,
                 "--system",                packages,             "--cache-dir",
-                cache,
+                cache,                     "-j2",
             },
             .cwd = .{ .path = options.repository_root },
             .environ_map = &environ_map,

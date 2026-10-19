@@ -89,6 +89,17 @@ pub fn sourceClosureModule(
 }
 
 pub fn testOptions(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.Optimize, fixture_root: anytype) *std.Build.Step.Options {
+    return testOptionsWithTools(b, target, optimize, fixture_root, null, null);
+}
+
+pub fn testOptionsWithTools(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.Optimize,
+    fixture_root: anytype,
+    existing_validator: ?std.Build.LazyPath,
+    existing_package: ?std.Build.LazyPath,
+) *std.Build.Step.Options {
     const fixture = b.addExecutable(.{
         .name = "authority-process-fixture",
         .root_module = b.createModule(.{
@@ -116,32 +127,36 @@ pub fn testOptions(b: *std.Build, target: std.Build.ResolvedTarget, optimize: st
         }),
     });
     options.addOptionPath("probe_fixture", probe_fixture.getEmittedBin());
-    options.addOptionPath("validator", b.dependency("direct_validator", .{ .target = target, .optimize = .safe }).artifact("uk-wamr-direct-validate").getEmittedBin());
-    const image = b.dependency("public_image", .{ .target = target, .optimize = .safe }).module("hyperv_public_image");
-    for (b.graph.configure_dependencies.items) |*dep| switch (dep.lazy_path) {
-        .src_path => |sp| if (sp.owner != b) {
-            dep.lazy_path = b.graph.cwdRelativePath(
-                sp.owner.root.joinString(b.allocator, sp.sub_path) catch @panic("OOM"),
-            );
-        },
-        else => {},
-    };
-    const package_options = b.addOptions();
-    package_options.addOption([]const u8, "miz_revision", "66ea6701cf0e1b6d31e5f30fade00b7a546d4b44");
-    const package = b.addExecutable(.{
-        .name = "authorization-image-fixture",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("package.zig"),
-            .target = target,
-            .optimize = .safe,
-            .strip = true,
-            .imports = &.{
-                .{ .name = "public_image", .module = image },
-                .{ .name = "package_options", .module = package_options.createModule() },
+    options.addOptionPath("validator", existing_validator orelse b.dependency("direct_validator", .{ .target = target, .optimize = .safe }).artifact("uk-wamr-direct-validate").getEmittedBin());
+    if (existing_package) |pkg_bin| {
+        options.addOptionPath("authorization_package", pkg_bin);
+    } else {
+        const image = b.dependency("public_image", .{ .target = target, .optimize = .safe }).module("hyperv_public_image");
+        for (b.graph.configure_dependencies.items) |*dep| switch (dep.lazy_path) {
+            .src_path => |sp| if (sp.owner != b) {
+                dep.lazy_path = b.graph.cwdRelativePath(
+                    sp.owner.root.joinString(b.allocator, sp.sub_path) catch @panic("OOM"),
+                );
             },
-        }),
-    });
-    options.addOptionPath("authorization_package", package.getEmittedBin());
+            else => {},
+        };
+        const package_options = b.addOptions();
+        package_options.addOption([]const u8, "miz_revision", "66ea6701cf0e1b6d31e5f30fade00b7a546d4b44");
+        const package = b.addExecutable(.{
+            .name = "authorization-image-fixture",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("package.zig"),
+                .target = target,
+                .optimize = .safe,
+                .strip = true,
+                .imports = &.{
+                    .{ .name = "public_image", .module = image },
+                    .{ .name = "package_options", .module = package_options.createModule() },
+                },
+            }),
+        });
+        options.addOptionPath("authorization_package", package.getEmittedBin());
+    }
     return options;
 }
 

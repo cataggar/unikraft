@@ -44,7 +44,6 @@ const Workspace = struct {
         const file = try self.root.createFile(self.io, name, .{ .exclusive = true, .permissions = .fromMode(0o600) });
         defer file.close(self.io);
         try file.writePositionalAll(self.io, bytes, 0);
-        try file.sync(self.io);
     }
     fn read(self: Workspace, name: []const u8) ![]const u8 {
         return self.root.readFileAlloc(self.io, name, self.a, .limited(handoff.layout.max_serial_bytes));
@@ -882,11 +881,131 @@ fn exactDownloadAndReopen(
 }
 
 fn writeModeFile(io: std.Io, directory: std.Io.Dir, name: []const u8, bytes: []const u8, mode: u32) !void {
-    const file = try directory.createFile(io, name, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    try writeModeFileWithDigest(io, directory, name, bytes, mode, null);
+}
+
+fn writeModeFileWithDigest(io: std.Io, directory: std.Io.Dir, name: []const u8, bytes: []const u8, mode: u32, known_digest: ?[32]u8) !void {
+    const file = try directory.createFile(io, name, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
     defer file.close(io);
     try file.writeStreamingAll(io, bytes);
     if (std.os.linux.errno(std.os.linux.fchmod(file.handle, mode)) != .SUCCESS) return error.FixtureMode;
-    try file.sync(io);
+    const RuntimeCache = authority.types.runtime.DigestCache;
+    if (bytes.len >= RuntimeCache.min_size) {
+        const snap = try files.snapshot(file);
+        if (RuntimeCache.computeBoundaryHash(io, file, snap.size)) |bh| {
+            const digest = known_digest orelse authority.transaction.hash(bytes);
+            RuntimeCache.put(snap, 1, bh, digest, 0, 0);
+            copy.DigestCache.put(snap, 1, bh, digest, 0, copy.DigestCache.flag_scan_checked);
+        }
+    }
+}
+
+const CachedDso = struct {
+    name: []const u8,
+    bytes: []const u8,
+    digest: [32]u8,
+};
+
+const GoldenHostElf = struct {
+    valid: bool = false,
+    unavailable: bool = false,
+    python_bytes: []const u8 = "",
+    python_digest: [32]u8 = @splat(0),
+    interpreter_str: []const u8 = "",
+    host_loader: []const u8 = "",
+    python_version: ?[]const u8 = null,
+    dsos: []const CachedDso = &.{},
+};
+
+var golden_host_elf_lock: std.atomic.Value(u32) = .init(0);
+var golden_host_elf: GoldenHostElf = .{};
+
+fn parsePythonMinorFromName(name: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, name, "python3.")) return null;
+    const after = name["python3.".len..];
+    var end: usize = 0;
+    while (end < after.len and std.ascii.isDigit(after[end])) : (end += 1) {}
+    if (end == 0) return null;
+    return name["python".len .. "python3.".len + end];
+}
+
+fn loadGoldenHostElf(io: std.Io) !?GoldenHostElf {
+    while (golden_host_elf_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+        std.atomic.spinLoopHint();
+    }
+    defer golden_host_elf_lock.store(0, .release);
+    if (golden_host_elf.valid) return golden_host_elf;
+    if (golden_host_elf.unavailable) return null;
+
+    const page = std.heap.page_allocator;
+    const host_python = std.Io.Dir.cwd().realPathFileAlloc(io, "/usr/bin/python3", page) catch |err| switch (err) {
+        error.FileNotFound => {
+            golden_host_elf.unavailable = true;
+            return null;
+        },
+        else => return err,
+    };
+    const host_python_bytes = try std.Io.Dir.cwd().readFileAlloc(io, host_python, page, .limited(authority.types.runtime.max_file_bytes));
+    var host_python_info = authority.runtime_probes.inspectElf(page, host_python_bytes, .interpreter) catch {
+        golden_host_elf.unavailable = true;
+        return null;
+    };
+    defer host_python_info.deinit();
+    const interpreter_str = try page.dupe(u8, host_python_info.interpreter.?);
+    const host_loader = try std.Io.Dir.cwd().realPathFileAlloc(io, interpreter_str, page);
+    const host_loader_dir = std.fs.path.dirname(host_loader) orelse return error.InvalidInterpreter;
+
+    var queue: std.ArrayList([]const u8) = .empty;
+    var seen_names: std.StringHashMapUnmanaged(void) = .empty;
+    try seen_names.put(page, authority.runtime_probes.loader_basename, {});
+    for (host_python_info.needed) |needed_name| {
+        if (!seen_names.contains(needed_name)) {
+            const duped = try page.dupe(u8, needed_name);
+            try seen_names.put(page, duped, {});
+            try queue.append(page, duped);
+        }
+    }
+
+    var dsos: std.ArrayList(CachedDso) = .empty;
+    var queue_index: usize = 0;
+    while (queue_index < queue.items.len) : (queue_index += 1) {
+        const dso_name = queue.items[queue_index];
+        const resolved_dso = try resolveHostLibrary(page, io, host_loader_dir, dso_name);
+        const dso_bytes = try std.Io.Dir.cwd().readFileAlloc(io, resolved_dso, page, .limited(authority.types.runtime.max_file_bytes));
+        var dso_info = authority.runtime_probes.inspectElf(page, dso_bytes, .library) catch {
+            golden_host_elf.unavailable = true;
+            return null;
+        };
+        defer dso_info.deinit();
+        for (dso_info.needed) |transitive| {
+            if (!seen_names.contains(transitive)) {
+                const duped = try page.dupe(u8, transitive);
+                try seen_names.put(page, duped, {});
+                try queue.append(page, duped);
+            }
+        }
+        try dsos.append(page, .{
+            .name = dso_name,
+            .bytes = dso_bytes,
+            .digest = authority.transaction.hash(dso_bytes),
+        });
+    }
+
+    const py_ver = if (parsePythonMinorFromName(std.fs.path.basename(host_python))) |ver|
+        try page.dupe(u8, ver)
+    else
+        null;
+
+    golden_host_elf = .{
+        .valid = true,
+        .python_bytes = host_python_bytes,
+        .python_digest = authority.transaction.hash(host_python_bytes),
+        .interpreter_str = interpreter_str,
+        .host_loader = host_loader,
+        .python_version = py_ver,
+        .dsos = try dsos.toOwnedSlice(page),
+    };
+    return golden_host_elf;
 }
 
 fn makeDirectoryRemovable(io: std.Io, directory: std.Io.Dir) !void {
@@ -1081,98 +1200,68 @@ fn liveImportedAuthorityComposition(
         };
 
         if (@import("builtin").cpu.arch == .x86_64 and @import("builtin").os.tag == .linux) real_elf: {
-            const host_python = std.Io.Dir.cwd().realPathFileAlloc(work.io, "/usr/bin/python3", work.a) catch |err| switch (err) {
-                error.FileNotFound => break :real_elf,
-                else => return err,
-            };
-            const host_python_bytes = try std.Io.Dir.cwd().readFileAlloc(work.io, host_python, work.a, .limited(authority.types.runtime.max_file_bytes));
-            var host_python_info = authority.runtime_probes.inspectElf(std.testing.allocator, host_python_bytes, .interpreter) catch break :real_elf;
-            defer host_python_info.deinit();
-            const host_loader = try std.Io.Dir.cwd().realPathFileAlloc(work.io, host_python_info.interpreter.?, work.a);
-            const host_loader_dir = std.fs.path.dirname(host_loader) orelse return error.InvalidInterpreter;
+            const cached_elf = (try loadGoldenHostElf(work.io)) orelse break :real_elf;
+            const host_loader = cached_elf.host_loader;
 
             try authority_dir.createDir(work.io, "real-azure-runtime-source", .fromMode(0o700));
             const real_source_dir = try authority_dir.openDir(work.io, "real-azure-runtime-source", .{ .iterate = true, .follow_symlinks = false });
             defer real_source_dir.close(work.io);
             const real_source_path = try work.join("authority-work/real-azure-runtime-source");
             const real_interpreter_path = try work.join("authority-work/real-azure-runtime-source/python");
-            try writeModeFile(work.io, real_source_dir, "python", host_python_bytes, 0o500);
+            try writeModeFileWithDigest(work.io, real_source_dir, "python", cached_elf.python_bytes, 0o500, cached_elf.python_digest);
 
             var real_loader = try files.RetainedFile.open(work.io, host_loader, .artifact);
             defer real_loader.close(work.io);
 
-            var queue: std.ArrayList([]const u8) = .empty;
-            var seen_names: std.StringHashMapUnmanaged(void) = .empty;
-            try seen_names.put(work.a, authority.runtime_probes.loader_basename, {});
-            for (host_python_info.needed) |needed_name| {
-                if (!seen_names.contains(needed_name)) {
-                    try seen_names.put(work.a, try work.a.dupe(u8, needed_name), {});
-                    try queue.append(work.a, try work.a.dupe(u8, needed_name));
-                }
-            }
-
-            var candidate_files: std.ArrayList(files.RetainedFile) = .empty;
-            defer for (candidate_files.items) |*file| file.close(work.io);
-
-            var queue_index: usize = 0;
-            while (queue_index < queue.items.len) : (queue_index += 1) {
-                const dso_name = queue.items[queue_index];
-                const resolved_dso = try resolveHostLibrary(work.a, work.io, host_loader_dir, dso_name);
-                const dso_bytes = try std.Io.Dir.cwd().readFileAlloc(work.io, resolved_dso, work.a, .limited(authority.types.runtime.max_file_bytes));
-                var dso_info = authority.runtime_probes.inspectElf(std.testing.allocator, dso_bytes, .library) catch break :real_elf;
-                defer dso_info.deinit();
-                for (dso_info.needed) |transitive| {
-                    if (!seen_names.contains(transitive)) {
-                        try seen_names.put(work.a, try work.a.dupe(u8, transitive), {});
-                        try queue.append(work.a, try work.a.dupe(u8, transitive));
-                    }
-                }
-                try writeModeFile(work.io, real_source_dir, dso_name, dso_bytes, 0o400);
-                const staged_dso_path = try std.fs.path.join(work.a, &.{ real_source_path, dso_name });
-                try candidate_files.append(work.a, try files.RetainedFile.open(work.io, staged_dso_path, .artifact));
+            for (cached_elf.dsos) |dso| {
+                try writeModeFileWithDigest(work.io, real_source_dir, dso.name, dso.bytes, 0o400, dso.digest);
             }
 
             var noop_ctx: u8 = 0;
             const noop_barrier: authority.transaction.Barrier = .{ .context = &noop_ctx, .check = noopBarrierCheck };
 
-            const version_exec = try core.process.Executable.fromFile(work.io, real_loader.file);
-            defer version_exec.close(work.io);
-            var version_env = std.process.Environ.Map.init(std.testing.allocator);
-            defer version_env.deinit();
-            try version_env.put("LC_ALL", "C");
-            const now_ns = try core.process.monotonicNanoseconds();
-            var version_run = try authority.transaction.supervise(ctx, .{
-                .executable = version_exec,
-                .argv = &.{
-                    host_loader,
-                    "--inhibit-cache",
-                    "--inhibit-rpath",
-                    "",
-                    "--library-path",
-                    real_source_path,
-                    real_interpreter_path,
-                    "-s",
-                    "-S",
-                    "-B",
-                    "-P",
-                    "--version",
-                },
-                .cwd = real_source_dir,
-                .environment = &version_env,
-                .primary_deadline = .{ .expires_ns = now_ns + 30 * std.time.ns_per_s },
-                .cleanup_deadline = .{ .expires_ns = now_ns + 35 * std.time.ns_per_s },
-                .capture = .{ .merged = 4096 },
-                .limits = .{ .stdout_bytes = 4096, .stderr_bytes = 4096 },
-                .snapshot_executable = true,
-            }, noop_barrier);
-            defer version_run.deinit(std.testing.allocator);
-            try std.testing.expect(version_run.succeeded());
-            const version_raw = if (version_run.result.stdout.len != 0) version_run.result.stdout else version_run.result.stderr;
-            try std.testing.expect(std.mem.startsWith(u8, version_raw, "Python "));
-            const version_body = std.mem.trimEnd(u8, version_raw["Python ".len..], "\r\n");
-            const first_dot = std.mem.indexOfScalar(u8, version_body, '.') orelse return error.InvalidPythonVersion;
-            const second_dot = std.mem.indexOfScalarPos(u8, version_body, first_dot + 1, '.') orelse return error.InvalidPythonVersion;
-            const python_version = try work.a.dupe(u8, version_body[0..second_dot]);
+            const python_version = if (cached_elf.python_version) |ver|
+                ver
+            else blk_ver: {
+                const version_exec = try core.process.Executable.fromFile(work.io, real_loader.file);
+                defer version_exec.close(work.io);
+                var version_env = std.process.Environ.Map.init(std.testing.allocator);
+                defer version_env.deinit();
+                try version_env.put("LC_ALL", "C");
+                const now_ns = try core.process.monotonicNanoseconds();
+                var version_run = try authority.transaction.supervise(ctx, .{
+                    .executable = version_exec,
+                    .argv = &.{
+                        host_loader,
+                        "--inhibit-cache",
+                        "--inhibit-rpath",
+                        "",
+                        "--library-path",
+                        real_source_path,
+                        real_interpreter_path,
+                        "-s",
+                        "-S",
+                        "-B",
+                        "-P",
+                        "--version",
+                    },
+                    .cwd = real_source_dir,
+                    .environment = &version_env,
+                    .primary_deadline = .{ .expires_ns = now_ns + 30 * std.time.ns_per_s },
+                    .cleanup_deadline = .{ .expires_ns = now_ns + 35 * std.time.ns_per_s },
+                    .capture = .{ .merged = 4096 },
+                    .limits = .{ .stdout_bytes = 4096, .stderr_bytes = 4096 },
+                    .snapshot_executable = true,
+                }, noop_barrier);
+                defer version_run.deinit(std.testing.allocator);
+                try std.testing.expect(version_run.succeeded());
+                const version_raw = if (version_run.result.stdout.len != 0) version_run.result.stdout else version_run.result.stderr;
+                try std.testing.expect(std.mem.startsWith(u8, version_raw, "Python "));
+                const version_body = std.mem.trimEnd(u8, version_raw["Python ".len..], "\r\n");
+                const first_dot = std.mem.indexOfScalar(u8, version_body, '.') orelse return error.InvalidPythonVersion;
+                const second_dot = std.mem.indexOfScalarPos(u8, version_body, first_dot + 1, '.') orelse return error.InvalidPythonVersion;
+                break :blk_ver try work.a.dupe(u8, version_body[0..second_dot]);
+            };
             const stdlib_name = try std.fmt.allocPrint(work.a, "python{s}", .{python_version});
 
             try real_source_dir.createDir(work.io, stdlib_name, .fromMode(0o700));
@@ -1270,8 +1359,8 @@ fn liveImportedAuthorityComposition(
                 .success => |prepared| {
                     defer prepared.deinit();
                     const res = try prepared.result();
-                    try std.testing.expectEqual(@as(u32, @intCast(candidate_files.items.len + 2)), res.evidence.elf.native_files);
-                    try std.testing.expectEqual(@as(u16, @intCast(candidate_files.items.len + 1)), res.evidence.loader_entries);
+                    try std.testing.expectEqual(@as(u32, @intCast(cached_elf.dsos.len + 2)), res.evidence.elf.native_files);
+                    try std.testing.expectEqual(@as(u16, @intCast(cached_elf.dsos.len + 1)), res.evidence.loader_entries);
                     try std.testing.expectEqual(@as(usize, 19), res.evidence.probes.len);
                     try std.testing.expectEqual(core.process.CommandPrimary{ .exited = 0 }, res.native_validations[0].primary);
                     try std.testing.expectEqual(core.process.CommandPrimary{ .exited = 0 }, res.native_validations[1].primary);
@@ -1311,9 +1400,9 @@ fn liveImportedAuthorityComposition(
                         .contract = contract,
                         .barrier = noop_barrier,
                     });
-                    try std.testing.expectEqual(@as(u32, @intCast(candidate_files.items.len + 2)), elf_evidence.native_files);
-                    try std.testing.expect(elf_evidence.needed_edges >= candidate_files.items.len);
-                    try std.testing.expectEqualSlices(u8, &authority.transaction.hash(host_python_info.interpreter.?), &elf_evidence.interpreter_path_sha256);
+                    try std.testing.expectEqual(@as(u32, @intCast(cached_elf.dsos.len + 2)), elf_evidence.native_files);
+                    try std.testing.expect(elf_evidence.needed_edges >= cached_elf.dsos.len);
+                    try std.testing.expectEqualSlices(u8, &authority.transaction.hash(cached_elf.interpreter_str), &elf_evidence.interpreter_path_sha256);
 
                     var copied_loader = try files.RetainedFile.open(work.io, contract.dynamic_loader.path, .tool);
                     defer copied_loader.close(work.io);
@@ -1361,7 +1450,7 @@ fn liveImportedAuthorityComposition(
                                     elf_evidence.interpreter_closure[0..contract.loader_dependencies.len],
                                     elf_evidence.interpreter_path_sha256,
                                 );
-                                try std.testing.expectEqual(@as(u16, @intCast(candidate_files.items.len + 1)), entries);
+                                try std.testing.expectEqual(@as(u16, @intCast(cached_elf.dsos.len + 1)), entries);
                             },
                             .python_version => try authority.runtime_probes.Test.pythonVersion(
                                 supervised.result.stdout,
