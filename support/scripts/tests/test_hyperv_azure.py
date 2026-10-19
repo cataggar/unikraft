@@ -2779,7 +2779,7 @@ class HypervWorkflowTest(unittest.TestCase):
                     header,
                 )
                 self.assertIn("        persist-credentials: false\n", job)
-                if lane == "build-protocol":
+                if lane in ("runtime", "build-protocol"):
                     self.assertIn("        fetch-depth: 0\n", job)
                 else:
                     self.assertNotIn("        fetch-depth: 0\n", job)
