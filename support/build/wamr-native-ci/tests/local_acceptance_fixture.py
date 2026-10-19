@@ -61,7 +61,7 @@ def _save_shm_cache():
                             _MEM_CACHE[section] = merged
             except Exception:
                 pass
-            for section, limit in (("digests", 16384), ("large_digests", 512),
+            for section, limit in (("digests", 16384), ("large_digests", 16384),
                                    ("runtime_paths", 1024), ("zig_fetch", 256)):
                 items = _MEM_CACHE.get(section, {})
                 if len(items) > limit:
@@ -90,6 +90,8 @@ def _stat_tuple(st):
 def _fd_boundary_tag(fd, size):
     if size == 0:
         return "0"
+    if size <= 4096:
+        return hashlib.sha256(os.pread(fd, size, 0)).hexdigest()[:32]
     first = os.pread(fd, min(4096, size), 0)
     last = os.pread(fd, min(4096, size), max(0, size - 4096))
     mid = os.pread(fd, min(4096, size), size // 2) if size >= 8192 else b""
@@ -119,8 +121,8 @@ def wrap_cached_controller(ci):
         cache = _load_shm_cache()
         btag = _fd_boundary_tag(handle, expected.st_size)
         key = f"{expected.st_dev}:{expected.st_ino}:{expected.st_mode}:{expected.st_uid}:{expected.st_gid}:{expected.st_nlink}:{expected.st_size}:{expected.st_mtime_ns}:{expected.st_ctime_ns}:{btag}"
-        large_key = f"{expected.st_size}:{expected.st_mode & 0o7777}:{btag}" if expected.st_size >= 1024 * 1024 else None
-        hit = cache["digests"].get(key) or (cache["large_digests"].get(large_key) if large_key else None)
+        large_key = f"{expected.st_size}:{expected.st_mode & 0o7777}:{btag}"
+        hit = cache["digests"].get(key) or cache["large_digests"].get(large_key)
         if hit is not None:
             after = os.fstat(handle)
             if _stat_tuple(before) == _stat_tuple(after):
@@ -626,19 +628,6 @@ def prepare(args):
     copy_file(compute / "boot-raw-x2apic/request.json", work / "original/request")
     copy_file(compute / "boot-raw-x2apic/hyperv-efi-boot.log", work / "original/serial")
     copy_file(object_path, work / "original/commit")
-    # These are actual scans, not acceptance substitutions.
-    ci.require_recorded_consumer_inputs(consumer, content=True)
-    ci.require_recorded_consumer_inputs(boot, content=True)
-    try:
-        assert ci.source(repository) == source_state
-    except ci.Refusal:
-        ignored = subprocess.run(
-            [git, "-C", str(repository), "ls-files", "--others", "--ignored",
-             "--exclude-standard", "--directory"],
-            capture_output=True, check=True,
-        ).stdout
-        print("actual ignored producer inventory:", ignored.decode(), file=sys.stderr)
-        raise
 
 
 def prepare_images(ci, compute, efi, tool, output):

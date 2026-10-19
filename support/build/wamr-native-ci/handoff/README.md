@@ -284,17 +284,14 @@ README for the complete CLI and ownership/trust boundaries. Protected product
 acceptance, production workflow/local caller cutover and Python removal remain
 separate milestones.
 
-## Test-only stagewise shadow witness (#187)
+## Test-only stagewise shadow comparator (#187)
 
-`tests/handoff_shadow.py` is a bounded driver, not a production caller,
-qualification service, network downloader, or authority consumer. It executes
-the actual native commands and unmodified Python `export`, `verify_archive`,
-`import_bundle`, and `candidate_plan` implementations in separate processes.
-There are no accepted-owner stubs or Python fallback after native refusal.
-`handoff/shadow_compare.zig` performs the canonical-record comparison using
-the shared native handoff contracts and the existing typed tiny result.
-The Python process driver/filesystem witness remains test-only until its
-separate native coverage/deletion gate; production Python is unchanged.
+`handoff/shadow_compare.zig` performs canonical-record comparison using the
+shared native handoff contracts and the existing typed tiny result. The legacy
+Python shadow process driver (`tests/handoff_shadow.py` and
+`tests/test_handoff_shadow.py`) has been retired now that `uk-wamr-native-ci`
+owns production public-source export, archive, upload staging, redownload
+retention, import, and candidate generation directly.
 
 ### Source-only validation
 
@@ -319,7 +316,7 @@ ZIG_GLOBAL_CACHE_DIR="$SHADOW/global-safe" \
   -Doptimize=safe -j1 test-shadow install
 ```
 
-`test-shadow` runs **synthetic comparator/driver tests only**, including
+`test-shadow` runs **synthetic comparator tests**, including
 dependent-commitment, source/run/attempt/transport, authority, selected-payload,
 extra-member, command timeout/status/custody, exited-parent descendant cleanup,
 distinct producer/reader tool bindings, partial-report and scope refusals.
@@ -328,30 +325,9 @@ does not count missing/skipped genuine tests as parity.
 
 To exercise the actual integrated publication parser, additionally pass
 `-Dpublication-cli=/absolute/actual/controller/cli.zig` to both builds.
-The parse-only executable receives the driver's real constructed import argv;
+The parse-only executable receives the constructed import argv;
 it opens no runtime and executes no product. It checks separate expected and
 selected source/tree/run/attempt values and refuses missing selection flags.
-On a source-only branch preceding publication commit `c534ea6d`, retain its
-exact Git-object bytes in an owner-private external path:
-
-```sh
-git show c534ea6d:support/build/wamr-native-ci/controller/cli.zig \
-  > "$SHADOW/cli-c534ea6d.zig"
-test "$(git hash-object "$SHADOW/cli-c534ea6d.zig")" = \
-  "$(git rev-parse \
-    c534ea6d:support/build/wamr-native-ci/controller/cli.zig)"
-# Add -Dpublication-cli="$SHADOW/cli-c534ea6d.zig" to both build commands.
-```
-
-### Required externally qualified inputs (not provisioned by this driver)
-
-The only live entry point is:
-
-```sh
-python3 -B support/build/wamr-native-ci/tests/handoff_shadow.py \
-  run-stagewise --inputs /absolute/approved-inputs.json \
-  --output /absolute/fresh-external-shadow
-```
 
 This invocation is blocked until an owner has independently qualified and
 immutably staged the **complete** genuine native-produced v2 run. Source-only

@@ -98,20 +98,10 @@ zig build --build-file support/build/wamr-native-ci/build.zig \
   --prefix "$PWD/.d/wamr-direct/package-tools" \
   -Dtest-root="$PWD/.d/wamr-direct/package-fixtures" \
   -Doptimize=safe -j2 test install
-SUPERVISOR_SOURCE_SHA256="$(
-  python3 -B support/tools/hyperv/direct/tests/historical_owner.py \
-    --git "$(command -v git)"
-)"
-zig build --build-file support/build/wamr-native-ci/supervisor.build.zig \
-  --system "$PWD/.d/wamr-direct/restore/zig-pkg" \
-  --cache-dir "$PWD/.d/wamr-direct/supervisor-cache" \
-  --prefix "$PWD/.d/wamr-direct/supervisor" \
-  -Dsource-closure-sha256="$SUPERVISOR_SOURCE_SHA256" \
-  -Doptimize=safe -j2 install
-WAMR_DIRECT_TOOLS="$PWD/.d/wamr-direct/tools/bin" \
-WAMR_CI_PACKAGE="$PWD/.d/wamr-direct/package-tools/bin/wamr-ci-package" \
-WAMR_CI_SUPERVISOR="$PWD/.d/wamr-direct/supervisor/bin/wamr-ci-supervisor" \
-  python3 -m unittest discover -s support/tools/hyperv/direct/tests -v
+zig build --build-file support/tools/hyperv/direct/build.zig \
+  --cache-dir "$PWD/.d/wamr-direct/cache" \
+  --prefix "$PWD/.d/wamr-direct/tools" \
+  -Dtest-root="$PWD/.d/wamr-direct/tests" -j2 test
 ```
 
 The commands above build host-native tools for offline fixtures, including

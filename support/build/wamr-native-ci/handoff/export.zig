@@ -49,6 +49,7 @@ pub const Invocation = struct {
     runtime_path: []const u8,
     repository_path: []const u8,
     output_path: []const u8,
+    allow_public_scope: bool = false,
     signal: ?*core.process.SignalCancellation = null,
     aggregate_limit: u64 = copy.aggregate_budget,
     faults: Faults = .{},
@@ -190,9 +191,13 @@ const Attempt = struct {
         try files.absoluteFilePath(invocation.runtime_path);
         try files.absoluteFilePath(invocation.repository_path);
         try files.absoluteFilePath(invocation.output_path);
-        if (std.mem.eql(u8, invocation.runtime_path, invocation.output_path) or
+        const inside_runtime = std.mem.eql(u8, invocation.runtime_path, invocation.output_path) or
             (std.mem.startsWith(u8, invocation.output_path, invocation.runtime_path) and
-                invocation.output_path[invocation.runtime_path.len] == '/')) return error.OutputInsideRuntime;
+                invocation.output_path[invocation.runtime_path.len] == '/');
+        const public_scope = invocation.allow_public_scope and
+            std.mem.startsWith(u8, invocation.output_path, invocation.runtime_path) and
+            std.mem.eql(u8, invocation.output_path[invocation.runtime_path.len..], "/compute/public-source/handoff");
+        if (inside_runtime and !public_scope) return error.OutputInsideRuntime;
         const result = try invocation.allocator.create(Attempt);
         result.* = .{
             .allocator = invocation.allocator,

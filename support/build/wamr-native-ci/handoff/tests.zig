@@ -368,6 +368,42 @@ test "export runner refuses absent runtime" {
         .output_path = "/missing-export-review-output",
     });
     try std.testing.expect(outcome == .refused);
+    try std.testing.expectEqual(error.FileNotFound, outcome.refused.err);
+
+    const inside_private = native_export.run(.{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .environ = .empty,
+        .runtime_path = "/missing-export-review-runtime",
+        .repository_path = "/missing-export-review-repository",
+        .output_path = "/missing-export-review-runtime/compute/public-source/handoff",
+    });
+    try std.testing.expect(inside_private == .refused);
+    try std.testing.expectEqual(error.OutputInsideRuntime, inside_private.refused.err);
+
+    const inside_public_wrong = native_export.run(.{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .environ = .empty,
+        .runtime_path = "/missing-export-review-runtime",
+        .repository_path = "/missing-export-review-repository",
+        .output_path = "/missing-export-review-runtime/compute/handoff",
+        .allow_public_scope = true,
+    });
+    try std.testing.expect(inside_public_wrong == .refused);
+    try std.testing.expectEqual(error.OutputInsideRuntime, inside_public_wrong.refused.err);
+
+    const inside_public_exact = native_export.run(.{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .environ = .empty,
+        .runtime_path = "/missing-export-review-runtime",
+        .repository_path = "/missing-export-review-repository",
+        .output_path = "/missing-export-review-runtime/compute/public-source/handoff",
+        .allow_public_scope = true,
+    });
+    try std.testing.expect(inside_public_exact == .refused);
+    try std.testing.expectEqual(error.FileNotFound, inside_public_exact.refused.err);
 }
 
 fn descriptorCount() !usize {
@@ -486,7 +522,7 @@ test "sensitive scan matches streaming byte semantics for every pattern and spli
     try scanner.observe("\xffAuthorization: bearer \x00accesssas\x80?SV=&SIG=");
 }
 
-test "complete typed v2 runtime exports every byte with live Python export parity" {
+test "complete typed v2 runtime exports every byte and validates root-bound handoff" {
     var fixture = try ExportFixture.init("export-parity");
     defer fixture.deinit();
     const before = try descriptorCount();
@@ -504,17 +540,18 @@ test "complete typed v2 runtime exports every byte with live Python export parit
         try std.testing.expectEqual(@as(usize, 33), result.success.evidence);
     }
     try std.testing.expectEqual(before, try descriptorCount());
-    const parity = try std.process.run(std.testing.allocator, std.testing.io, .{
-        .argv = &.{ "python3", "-B", test_options.python_oracle, "--export-parity", fixture.root_path },
-        .stdout_limit = .limited(4096),
-        .stderr_limit = .limited(8192),
-    });
-    defer std.testing.allocator.free(parity.stdout);
-    defer std.testing.allocator.free(parity.stderr);
-    if (!std.meta.eql(parity.term, std.process.Child.Term{ .exited = 0 })) {
-        std.debug.print("Python export parity: {s}\n", .{parity.stderr});
-        return error.TestUnexpectedResult;
-    }
+    const bundle_path = try std.fs.path.join(std.testing.allocator, &.{ fixture.output_path, "bundle.json" });
+    defer std.testing.allocator.free(bundle_path);
+    const bundle_file = try core.private_files.openAbsolute(std.testing.io, bundle_path, .private);
+    defer bundle_file.close(std.testing.io);
+    var bundle_raw = try core.private_files.readSensitiveFile(std.testing.io, std.testing.allocator, bundle_file, contracts.json_limits.bytes, .private);
+    defer bundle_raw.deinit();
+    var bundle_doc = try contracts.parseCanonical(std.testing.allocator, bundle_raw.bytes());
+    defer bundle_doc.deinit();
+    try std.testing.expectEqual(
+        profile.Compatibility.tiny_qcow2_derived_vhd_v2,
+        try contracts.validateLocalImageHandoffWithRoot(bundle_doc.value(), fixture.output_path),
+    );
 }
 
 test "every export phase failure retains private evidence forbids final bundle and replay" {

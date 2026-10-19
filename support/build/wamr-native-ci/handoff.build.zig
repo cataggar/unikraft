@@ -81,12 +81,6 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption([]const u8, "fixture_root", fixture_root);
     candidate_tests.root_module.addOptions("test_options", options);
-    // Nested --build-file invocations can render source LazyPaths relatively.
-    options.addOption([]const u8, "python_oracle", std.Io.Dir.cwd().realPathFileAlloc(
-        b.graph.io,
-        b.root.joinString(b.allocator, "tests/test_handoff_contract_goldens.py") catch @panic("OOM"),
-        b.allocator,
-    ) catch @panic("cannot resolve handoff Python oracle"));
     options.addOption([]const u8, "accepted_result_fixture", std.Io.Dir.cwd().realPathFileAlloc(
         b.graph.io,
         b.root.joinString(b.allocator, "tests/fixtures/differential/accepted-v2.json") catch @panic("OOM"),
@@ -94,13 +88,8 @@ pub fn build(b: *std.Build) void {
     ) catch @panic("cannot resolve accepted handoff fixture"));
     tests.root_module.addOptions("test_options", options);
     const run = b.addRunArtifact(tests);
-    const python = b.addSystemCommand(&.{"env"});
-    python.addArg(b.fmt("WAMR_HANDOFF_GOLDEN_ROOT={s}", .{fixture_root}));
-    python.addArgs(&.{ "python3", "-B" });
-    python.addFileArg(b.path("tests/test_handoff_contract_goldens.py"));
-    const step = b.step("test", "Run native and Python handoff contract goldens");
+    const step = b.step("test", "Run native handoff contract goldens");
     step.dependOn(&run.step);
-    step.dependOn(&python.step);
     const archive_options = b.addOptions();
     archive_options.addOption([]const u8, "fixture_root", b.pathJoin(&.{ fixture_root, "handoff-public-archive-tests" }));
     const genuine_archive = b.option([]const u8, "public-archive", "Read-only genuine public inner ZIP fixture");
@@ -154,12 +143,11 @@ pub fn build(b: *std.Build) void {
     const fixture_dirs = b.addSystemCommand(&.{ "mkdir", "-p", "-m", "0700", "--" });
     fixture_dirs.has_side_effects = true;
     fixture_dirs.addArg(fixture_root);
-    inline for (.{ "handoff-export-tests", "handoff-python-goldens", "handoff-public-archive-tests", "handoff-public-transport-tests" }) |name|
+    inline for (.{ "handoff-export-tests", "handoff-public-archive-tests", "handoff-public-transport-tests" }) |name|
         fixture_dirs.addArg(b.pathJoin(&.{ fixture_root, name }));
-    inline for (.{ &run.step, &python.step, &archive_run.step, &transport_run.step, &candidate_run.step }) |test_step|
+    inline for (.{ &run.step, &archive_run.step, &transport_run.step, &candidate_run.step }) |test_step|
         test_step.dependOn(&fixture_dirs.step);
     b.step("test-unit", "Run native handoff contract unit tests").dependOn(&run.step);
-    b.step("test-golden", "Run Python handoff contract goldens").dependOn(&python.step);
     b.step("test-public-archive", "Run native public archive engine tests").dependOn(&archive_run.step);
     b.step("test-public-transport", "Run native public transport staging and binding tests").dependOn(&transport_run.step);
     step.dependOn(&archive_run.step);

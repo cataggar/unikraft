@@ -50,10 +50,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const native_run = b.addRunArtifact(tests);
-    const python = b.addSystemCommand(&.{ "python3", "-B" });
-    python.addFileArg(b.path("../../tests/test_handoff_shadow.py"));
-    python.addArg("--comparator");
-    python.addArtifactArg(exe);
     if (b.option([]const u8, "publication-cli", "Canonical path to the actual integrated publication CLI module")) |path| {
         if (!std.fs.path.isAbsolute(path)) @panic("-Dpublication-cli must be absolute");
         const publication_cli = b.createModule(.{
@@ -71,24 +67,11 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{.{ .name = "publication_cli", .module = publication_cli }},
             }),
         });
-        python.addArg("--publication-parser");
-        python.addArtifactArg(parser);
+        b.installArtifact(parser);
     }
-    python.addArg("--scratch");
-    if (b.option([]const u8, "test-root", "Existing external owner-private scratch root")) |scratch| {
-        if (!std.fs.path.isAbsolute(scratch)) @panic("-Dtest-root must be absolute");
-        python.addArg(scratch);
-    } else {
-        const default_scratch = std.Build.LazyPath.cache_root.path(b, "handoff-shadow-tests");
-        const scratch_dir = b.addSystemCommand(&.{ "install", "-d", "-m", "0700" });
-        scratch_dir.addDirectoryArg2(default_scratch, .{ .make_absolute = true });
-        scratch_dir.has_side_effects = true;
-        python.step.dependOn(&scratch_dir.step);
-        python.addDirectoryArg2(default_scratch, .{ .make_absolute = true });
-    }
-    const step = b.step("test-shadow", "Run synthetic comparator and bounded-driver refusal tests (not live parity)");
+    _ = b.option([]const u8, "test-root", "Existing external owner-private scratch root");
+    const step = b.step("test-shadow", "Run synthetic comparator refusal tests (not live parity)");
     step.dependOn(&native_run.step);
-    step.dependOn(&python.step);
-    const default_test_step = b.step("test", "Run synthetic comparator and bounded-driver refusal tests (not live parity)");
+    const default_test_step = b.step("test", "Run synthetic comparator refusal tests (not live parity)");
     default_test_step.dependOn(step);
 }

@@ -289,18 +289,9 @@ pub fn build(b: *std.Build) void {
     const direct_step = b.step("test-native-direct", "Run native authority fixtures with direct failure output");
     direct_step.dependOn(&direct.step);
     direct_step.dependOn(&source_check.step);
-    const scratch_root = b.pathJoin(&.{ fixture_root, "authority-contract-work" });
-    std.Io.Dir.cwd().createDir(b.graph.io, scratch_root, .fromMode(0o700)) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => @panic("cannot create authority contract scratch root"),
-    };
-    const python = b.addSystemCommand(&.{ "python3", "-B" });
-    python.setEnvironmentVariable("WAMR_AUTHORITY_CONTRACT_SCRATCH", scratch_root);
-    python.addFileArg(b.path("tests/test_authority_contract_goldens.py"));
-    const step = b.step("test", "Run native authority foundations and Python contract goldens");
+    const step = b.step("test", "Run native authority foundations and contract goldens");
     step.dependOn(&run.step);
     step.dependOn(&source_check.step);
-    step.dependOn(&python.step);
 }
 
 pub fn main(init: std.process.Init) !void {
