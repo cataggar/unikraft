@@ -472,6 +472,7 @@ test "nested native supervisor gets cleanup grace and all adopted groups are rea
 }
 
 comptime {
+    _ = @import("process_command_tests.zig");
     _ = @import("process_private_poison_tests.zig");
     _ = @import("process_private_completion_poison_tests.zig");
 }

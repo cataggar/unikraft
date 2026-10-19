@@ -56,7 +56,7 @@ started="$(date --utc '+%Y-%m-%d %H:%M:%S')"
 baseline=0
 zig build --build-file "${package}/build.zig" \
   --system "${packages}" \
-  --cache-dir "${root}/baseline/cache" --prefix "${root}/baseline/out" \
+  --cache-dir "${root}/debug/zig-local-cache" --prefix "${root}/baseline/out" \
   -Dtest-root="${root}/baseline/fixtures" \
   "-Dfixture-executable=${executable}" \
   -Dtest-filter='kernel guard completes' -Doptimize=debug -j2 test --summary all \

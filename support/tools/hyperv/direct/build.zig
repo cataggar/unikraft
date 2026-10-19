@@ -54,7 +54,13 @@ pub fn build(b: *std.Build) void {
     };
     const validator = b.addExecutable(.{
         .name = "uk-hyperv-direct-validate",
-        .root_module = b.createModule(.{ .root_source_file = b.path("main.zig"), .target = target, .optimize = optimize, .imports = &imports }),
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .strip = optimize != .debug,
+            .imports = &imports,
+        }),
     });
     b.installArtifact(validator);
     const fixtures = b.addExecutable(.{
@@ -90,22 +96,6 @@ pub fn build(b: *std.Build) void {
         fixture_tools.dependOn(&b.addInstallArtifact(tool, .{}).step);
     }
 
-    const test_options = b.addOptions();
-    test_options.addOption(?[]const u8, "test_root", b.option([]const u8, "test-root", "Existing private absolute native fixture directory"));
-    const foundation = b.step("test-foundation", "Run native direct observation, custody and runtime fixtures");
-    inline for (.{ "observation", "custody" }) |name| {
-        const tests = b.addTest(.{ .root_module = b.createModule(.{
-            .root_source_file = b.path(name ++ "_tests.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &imports,
-        }) });
-        tests.root_module.addOptions("test_options", test_options);
-        const run = b.addRunArtifact(tests);
-        b.step("test-" ++ name, "Run native direct " ++ name ++ " fixtures").dependOn(&run.step);
-        foundation.dependOn(&run.step);
-    }
-
     const runtime_fixture = b.addExecutable(.{
         .name = "hyperv-direct-runtime-fixture",
         .root_module = b.createModule(.{
@@ -116,14 +106,32 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "hyperv_core", .module = core }},
         }),
     });
+    const test_options = b.addOptions();
+    test_options.addOption(?[]const u8, "test_root", b.option([]const u8, "test-root", "Existing private absolute native fixture directory"));
     test_options.addOptionPath("runtime_fixture", runtime_fixture.getEmittedBin());
+    const test_options_mod = test_options.createModule();
+    const foundation = b.step("test-foundation", "Run native direct observation, custody and runtime fixtures");
+    inline for (.{ "observation", "custody" }) |name| {
+        const tests = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path(name ++ "_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &imports,
+        }) });
+        tests.root_module.addImport("test_options", test_options_mod);
+        const run = b.addRunArtifact(tests);
+        b.step("test-" ++ name, "Run native direct " ++ name ++ " fixtures").dependOn(&run.step);
+    }
+
     const test_support = b.createModule(.{
         .root_source_file = b.path("../process_private_test_support.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "hyperv_core", .module = core }},
+        .imports = &.{
+            .{ .name = "hyperv_core", .module = core },
+            .{ .name = "test_options", .module = test_options_mod },
+        },
     });
-    test_support.addOptions("test_options", test_options);
     const transfer_job = b.createModule(.{
         .root_source_file = b.path("../transfer/job.zig"),
         .target = target,
@@ -133,6 +141,7 @@ pub fn build(b: *std.Build) void {
     const runtime_imports = imports ++ [_]std.Build.Module.Import{
         .{ .name = "transfer_job", .module = transfer_job },
         .{ .name = "process_test_support", .module = test_support },
+        .{ .name = "test_options", .module = test_options_mod },
     };
     const compile = b.addObject(.{
         .name = "hyperv-direct-foundation-compile",
@@ -144,7 +153,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.step("check-foundation", "Compile production direct foundation interfaces without running them").dependOn(&compile.step);
-    foundation.dependOn(&compile.step);
     const runtime_tests = b.step("test-runtime", "Run private process and direct runtime fixtures");
     const command_tests = b.step("test-command", "Run shared trusted-command process fixtures");
     inline for (.{
@@ -158,11 +166,12 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &runtime_imports,
         }) });
-        tests.root_module.addOptions("test_options", test_options);
         const run = b.addRunArtifact(tests);
-        runtime_tests.dependOn(&run.step);
-        if (std.mem.startsWith(u8, source, "../process_command"))
+        if (std.mem.startsWith(u8, source, "../process_command")) {
             command_tests.dependOn(&run.step);
+        } else {
+            runtime_tests.dependOn(&run.step);
+        }
     }
     foundation.dependOn(runtime_tests);
 
@@ -208,7 +217,7 @@ pub fn build(b: *std.Build) void {
         .root_module = controllerModule(b, "controller_fixture_main.zig", target, optimize, &controller_imports),
     });
     controller_fixture.root_module.strip = true;
-    const lifecycle_validator = b.addExecutable(.{
+    const lifecycle_validator = if (optimize != .debug) validator else b.addExecutable(.{
         .name = "uk-hyperv-direct-validate",
         .root_module = b.createModule(.{
             .root_source_file = b.path("main.zig"),
@@ -221,7 +230,6 @@ pub fn build(b: *std.Build) void {
     const controller_tests = b.addTest(.{
         .root_module = controllerModule(b, "controller_tests.zig", target, optimize, &runtime_imports),
     });
-    controller_tests.root_module.addOptions("test_options", test_options);
     b.step("test-controller", "Run native controller policy and private IO fixtures").dependOn(&b.addRunArtifact(controller_tests).step);
 
     const lifecycle_root = b.option([]const u8, "lifecycle-root", "Fresh nonexistent absolute native lifecycle fixture root");

@@ -39,14 +39,15 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "preflight", .module = engine }},
     }) });
     b.installArtifact(cli);
-    const native = module(b, b.graph.host, optimize);
+    const is_native_target = target.query.isNative();
+    const native = if (is_native_target) engine else module(b, b.graph.host, optimize);
     const fixture = b.addExecutable(.{ .name = "preflight-child-fixture", .root_module = b.createModule(.{
         .root_source_file = b.path("fixture_main.zig"),
         .target = b.graph.host,
         .optimize = optimize,
         .imports = &.{.{ .name = "preflight", .module = native }},
     }) });
-    const native_cli = b.addExecutable(.{ .name = "preflight-cli-fixture", .root_module = b.createModule(.{
+    const native_cli = if (is_native_target) cli else b.addExecutable(.{ .name = "preflight-cli-fixture", .root_module = b.createModule(.{
         .root_source_file = b.path("main.zig"),
         .target = b.graph.host,
         .optimize = optimize,

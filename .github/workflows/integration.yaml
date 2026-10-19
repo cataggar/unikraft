@@ -856,15 +856,10 @@ jobs:
         set -euo pipefail
         umask 077
         root="${RUNNER_TEMP}/hyperv-ci/native-transfers"
-        mkdir -p "${root}/restore"
-        cp support/tools/hyperv/transfer/build.zig \
-          support/tools/hyperv/transfer/build.zig.zon "${root}/restore/"
-        ZIG_LOCAL_CACHE_DIR="${root}/restore-cache" \
-          zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
         mkdir -p "${root}/safe/fixtures"
         ZIG_LOCAL_CACHE_DIR="${root}/safe/zig-local-cache" \
           zig build --build-file support/tools/hyperv/transfer/build.zig \
-            --system "${root}/restore/zig-pkg" \
+            --system "${RUNNER_TEMP}/hyperv-ci/native-tools/restore/zig-pkg" \
             --prefix "${root}/safe/out" \
             -Dfixture-root="${root}/safe/fixtures" \
             -Doptimize=safe -j2 test install --summary all
@@ -931,8 +926,7 @@ jobs:
         mkdir -p "${root}/tmp" "${root}/fixtures" "${GITHUB_WORKSPACE}/.d"
         mkdir -m 0700 "${parent}"
         export TMPDIR="${root}/tmp"
-        ZIG_GLOBAL_CACHE_DIR="${root}/global" \
-          zig build --build-file support/tools/hyperv/direct/build.zig -j2 \
+        zig build --build-file support/tools/hyperv/direct/build.zig -j2 \
           --cache-dir "${root}/cache" \
           --prefix "${root}/tools" -Doptimize=safe \
           -Dtest-root="${root}/fixtures" \
@@ -953,7 +947,6 @@ jobs:
         umask 077
         root="${RUNNER_TEMP}/hyperv-ci/direct"
         export TMPDIR="${root}/tmp"
-        export ZIG_GLOBAL_CACHE_DIR="${root}/global"
         # Even creating/removing ignored zig-pkg changes pinned directory metadata.
         # Do not move this independent dependency restoration before collection.
         # WAMR uses the same isolated fake backend, never an authenticated CLI.
@@ -1195,15 +1188,10 @@ jobs:
         set -euo pipefail
         umask 077
         root="${RUNNER_TEMP}/hyperv-ci/native-azure"
-        mkdir -p "${root}/restore"
-        cp support/tools/hyperv/azure/build.zig \
-          support/tools/hyperv/azure/build.zig.zon "${root}/restore/"
-        ZIG_LOCAL_CACHE_DIR="${root}/restore-cache" \
-          zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
         for mode in debug safe; do
           ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
             zig build --build-file support/tools/hyperv/azure/build.zig \
-              --system "${root}/restore/zig-pkg" \
+              --system "${RUNNER_TEMP}/hyperv-ci/native-host/restore/zig-pkg" \
               --prefix "${root}/${mode}/out" \
               -Doptimize="${mode}" -j2 test install --summary all
         done

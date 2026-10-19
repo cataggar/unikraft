@@ -510,3 +510,9 @@ test "nested outer budget exhaustion never extends the deadline to finish a repo
     try testing.expect(!result.succeeded());
     try support.noChildren();
 }
+
+comptime {
+    _ = @import("observation_tests.zig");
+    _ = @import("custody_tests.zig");
+    _ = @import("foundation_compile.zig");
+}
