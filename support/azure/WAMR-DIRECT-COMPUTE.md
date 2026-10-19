@@ -183,16 +183,20 @@ directory. No earlier metadata-only Actions download can replace this step.
 
 ```sh
 # RUNTIME already contains a successful, complete native build and six boots.
-python3 support/build/wamr-native-ci/handoff.py export \
+python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff export \
   --runtime "$RUNTIME" --output "$PRIVATE_PARENT/FRESH-image-handoff"
 .d/wamr-direct/tools/bin/uk-wamr-direct-validate handoff \
   "$PRIVATE_PARENT/FRESH-image-handoff/bundle.json"
-python3 support/build/wamr-native-ci/handoff.py candidate \
+python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff candidate \
   --bundle "$PRIVATE_PARENT/FRESH-image-handoff/bundle.json" \
   --output "$PRIVATE_PARENT/FRESH-non-authorizing-candidate.json"
 ```
 
-The Python publication sequence above remains the production caller.
+The historical Python CLI oracle sequence above is retained through
+`historical_controller_fixture.py --handoff` while `uk-wamr-native-ci` provides
+the native private/public/candidate CLI commands and
+`support/build/wamr-native-ci/authority/root.zig` (`authority/handlers.zig`)
+provides the native authority composition library.
 The separately qualified local-only native private product surface is:
 
 ```sh
@@ -300,7 +304,7 @@ with zipfile.ZipFile(container) as zipped:
         target.flush()
         os.fsync(target.fileno())
 PY
-python3 support/build/wamr-native-ci/handoff.py import-public-source-bundle \
+python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff import-public-source-bundle \
   --archive "$PWD/.d/wamr-download/tiny-aot-public-source.zip" \
   --output "$PRIVATE_PARENT/FRESH-imported-image" \
   --expected-source "$SOURCE_SHA" --expected-tree "$SOURCE_TREE" \
@@ -317,7 +321,7 @@ python3 support/build/wamr-native-ci/handoff.py import-public-source-bundle \
 # REVIEWED_AZURE_IMPORT_ROOT is an import root (for example a reviewed,
 # reduced site-packages tree), not a package directory whose basename is
 # needed for import. Repeat --package-root for every distinct import root.
-python3 support/build/wamr-native-ci/handoff.py prepare-azure-runtime \
+python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff prepare-azure-runtime \
   --output "$PRIVATE_PARENT/FRESH-azure-runtime" \
   --azure "$REVIEWED_PYTHON_AZURE_BOOTSTRAP" \
   --az-python "$REVIEWED_CANONICAL_PYTHON_SOURCE" \
@@ -330,7 +334,7 @@ REVIEWED_AZURE_RUNTIME="$PRIVATE_PARENT/FRESH-azure-runtime/azure-runtime.json"
 
 mkdir -m 700 "$PRIVATE_PARENT/ORIGINAL-campaign-ledger"
 PROPOSED_LEDGER_UUID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
-python3 support/build/wamr-native-ci/handoff.py plan \
+python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff plan \
   --bundle "$PRIVATE_PARENT/FRESH-imported-image/bundle.json" \
   --candidate-output "$PRIVATE_PARENT/FRESH-candidate.json" \
   --output "$PRIVATE_PARENT/FRESH-execution-plan.json" \
@@ -519,7 +523,7 @@ that decision into the record:
 ```sh
 APPROVED_UNIX="$(date +%s)"
 EXPIRES_UNIX="$((APPROVED_UNIX + 3600))"
-python3 support/build/wamr-native-ci/handoff.py record-authorization \
+python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff record-authorization \
   --plan "$PRIVATE_PARENT/FRESH-execution-plan.json" \
   --template "$PRIVATE_PARENT/FRESH-approval-template.json" \
   --output "$PRIVATE_PARENT/FRESH-authorization.json" \
@@ -534,7 +538,7 @@ python3 support/build/wamr-native-ci/handoff.py record-authorization \
   --supervisor "$PWD/.d/wamr-direct/supervisor/bin/wamr-ci-supervisor" \
   --az-python "$REVIEWED_CANONICAL_PYTHON" \
   --azure-runtime "$REVIEWED_AZURE_RUNTIME"
-python3 support/build/wamr-native-ci/handoff.py admit \
+python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff admit \
   --plan "$PRIVATE_PARENT/FRESH-execution-plan.json" \
   --authorization "$PRIVATE_PARENT/FRESH-authorization.json" \
   --output "$PRIVATE_PARENT/FRESH-admission.json" \
