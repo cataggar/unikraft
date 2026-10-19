@@ -8246,6 +8246,20 @@ class HypervPersistenceControllerTest(unittest.TestCase):
             self.assertIn(shared, direct_config)
         self.assertEqual(defconfig_path.read_bytes(), defconfig_before)
 
+    def test_direct_persistence_bundle_and_scope_binding_surface_exposed(self):
+        production_local_zig = (
+            SUPPORT / "tools/hyperv/preparation/production_local.zig"
+        ).read_text(encoding="utf-8")
+        self.assertIn("pub const DirectPersistenceBundle = struct", production_local_zig)
+        self.assertIn("pub fn verifyDirectPersistenceRecords(", production_local_zig)
+        self.assertIn("pub fn bundleFromLoaded(", production_local_zig)
+
+        direct_main_zig = (
+            SUPPORT / "tools/hyperv/direct/main.zig"
+        ).read_text(encoding="utf-8")
+        self.assertIn("pub fn inspectConfigWithMetadata(", direct_main_zig)
+        self.assertIn("pub fn requirePreparedBundle(", direct_main_zig)
+
 
 class HypervPersistenceTemplateTest(unittest.TestCase):
     @classmethod

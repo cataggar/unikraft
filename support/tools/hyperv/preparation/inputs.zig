@@ -482,25 +482,40 @@ pub fn validateAuthoritativeConfigForPurpose(
     return validateAuthoritativeConfig(allocator, solved, metadata_bytes, guard);
 }
 
-pub fn validateDirectAuthoritativeConfig(
+pub fn validateDirectAuthoritativeConfigWithMetadata(
     allocator: std.mem.Allocator,
     solved: []const u8,
-    metadata_bytes: []const u8,
     guard: config.Guard,
+    metadata: *const config.Metadata,
 ) !void {
-    if (solved.len > config.config_cap or metadata_bytes.len > config.config_cap) return error.LimitExceeded;
-    var metadata = try config.Metadata.parse(allocator, metadata_bytes);
-    defer metadata.deinit();
+    if (solved.len > config.config_cap) return error.LimitExceeded;
     const kconfig = @import("native_kconfig");
     var diagnostic: kconfig.Diagnostic = .{};
-    var document = try kconfig.parseWithMetadata(allocator, solved, &metadata, &diagnostic);
+    var document = try kconfig.parseWithMetadata(allocator, solved, metadata, &diagnostic);
     defer document.deinit();
     for (document.entries.items) |entry|
         if (entry.symbol_type == null) return error.IncompleteMetadata;
     if (!document.enabled("ARCH_X86_64") or !document.enabled("PLAT_HYPERV")) return error.InvalidSelection;
     for ([_][]const u8{ "ARCH_ARM_64", "ARCH_ARM", "ARCH_X86_32", "PLAT_KVM", "PLAT_XEN", "PLAT_LINUXU" }) |forbidden|
         if (document.enabled(forbidden)) return error.InvalidSelection;
-    try config.validateDirectPersistenceWithMetadata(allocator, solved, guard, &metadata);
+    try config.validateDirectPersistenceWithMetadata(allocator, solved, guard, metadata);
+}
+
+pub fn validateDirectAuthoritativeConfig(
+    allocator: std.mem.Allocator,
+    solved: []const u8,
+    third: anytype,
+    fourth: anytype,
+) !void {
+    if (@TypeOf(third) == config.Guard) {
+        return validateDirectAuthoritativeConfigWithMetadata(allocator, solved, third, fourth);
+    }
+    const metadata_bytes: []const u8 = third;
+    const guard: config.Guard = fourth;
+    if (solved.len > config.config_cap or metadata_bytes.len > config.config_cap) return error.LimitExceeded;
+    var metadata = try config.Metadata.parse(allocator, metadata_bytes);
+    defer metadata.deinit();
+    return validateDirectAuthoritativeConfigWithMetadata(allocator, solved, guard, &metadata);
 }
 
 pub fn validateAuthoritativeConfig(allocator: std.mem.Allocator, solved: []const u8, metadata_bytes: []const u8, guard: config.Guard) !void {
