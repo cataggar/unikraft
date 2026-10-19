@@ -227,18 +227,13 @@ Run with Zig 0.17.0 and fresh owner-only roots (no credentials or cloud calls):
 umask 077
 mkdir -p .d
 mkdir .d/authority-contract-check
-export WAMR_AUTHORITY_CONTRACT_SCRATCH="$PWD/.d/authority-contract-check/python"
 export ZIG_LOCAL_CACHE_DIR="$PWD/.d/authority-contract-check/cache"
 export ZIG_GLOBAL_CACHE_DIR="$PWD/.d/authority-contract-check/global"
-(cd support/build/wamr-native-ci && zig build --build-file authority.build.zig test)
-python3 -B support/build/wamr-native-ci/tests/test_authority_contract_goldens.py --mutations
+(cd support/build/wamr-native-ci && zig build --build-file authority.build.zig -Dtest-root="$PWD/.d/authority-contract-check/fixtures" test)
 ```
 
 The full package build's `test-authority-contracts`, `test-controller`, and
-`test` targets include the same native/Python gate. Each oracle invocation owns
-and removes only its fresh child below the scratch parent, preserving existing
-parent contents. `--write` intentionally regenerates checked-in goldens for
-review; it is not part of verification.
+`test` targets include the native authority contract and library checks.
 The current v2 fixtures bind the Zig 0.17 SDK generation. Frozen v1 fixtures
 retain the original SDK revision and byte-identical archives; their generator
 selects the historical source context explicitly rather than relabelling it.
@@ -246,21 +241,8 @@ The controller test runner retains its selected optimization mode but is
 stripped because it serves as its own retained handoff-controller executable.
 This keeps debug information outside the unchanged 64 MiB executable bound.
 
-The scenario inventory tracks every test in its three named Python sources.
-After adding or removing tests there, regenerate and review
-`authority/goldens/python-scenarios.json` and update the native inventory count
-in `authority/tests.zig`; unrelated additions must leave
-`authority/goldens/contracts.json` unchanged. Check inventory synchronization
-without restoring tools or running the full oracle:
-
-```sh
-python3 -B support/build/wamr-native-ci/tests/test_authority_contract_goldens.py \
-  AuthorityContractGoldens.test_python_scenario_inventory_matches_current_tests
-```
-
-The native compute and integration runtime jobs run this check before tool
-acquisition and native builds. The full native/Python authority gate remains
-unchanged.
+The scenario inventory in `authority/goldens/python-scenarios.json` is verified
+against the native inventory count in `authority/tests.zig`.
 
 ### Native authority foundations (source only)
 

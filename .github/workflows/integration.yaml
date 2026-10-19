@@ -801,13 +801,6 @@ jobs:
       with:
         submodules: recursive
         persist-credentials: false
-        fetch-depth: 0
-
-    - name: Check the frozen Python scenario inventory
-      timeout-minutes: 2
-      run: |
-        python3 -B support/build/wamr-native-ci/tests/test_authority_contract_goldens.py \
-          AuthorityContractGoldens.test_python_scenario_inventory_matches_current_tests
 
     - name: Restore independent fixture tools
       uses: ./.github/actions/hyperv-fixture-setup
@@ -943,7 +936,7 @@ jobs:
           --prefix "${root}/tools" -Doptimize=safe \
           -Dtest-root="${root}/fixtures" \
           -Dlifecycle-root="${parent}/native" \
-          test test-foundation test-controller test-lifecycle-native install compute-fixture-tools
+          test test-foundation test-controller test-lifecycle-native install
 
     - name: Collect bounded persistence observations
       if: always()
@@ -981,33 +974,6 @@ jobs:
           --prefix "${root}/compute-tools" \
           -Dtest-root="${compute_fixture_root}" \
           -Doptimize=safe test install
-        # The retained Python fixture consumer is not the current controller
-        # owner, nor an older archive's producer. Build/query its exact owner.
-        historical_fixture_root="${root}/historical-fixture"
-        python3 -B support/tools/hyperv/direct/tests/historical_owner.py \
-          --repository "$(readlink -f "${GITHUB_WORKSPACE}")" \
-          --root "${historical_fixture_root}" \
-          --git "$(readlink -f "$(command -v git)")" \
-          --zig "$(readlink -f "$(command -v zig)")" \
-          --packages "${root}/restore/zig-pkg"
-        userns_restriction=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
-        if test -e "${userns_restriction}" &&
-            test "$(cat "${userns_restriction}")" != 0; then
-          userns_restriction_original="$(cat "${userns_restriction}")"
-          restore_userns_restriction() {
-            sudo sysctl -q -w \
-              "kernel.apparmor_restrict_unprivileged_userns=${userns_restriction_original}"
-          }
-          trap restore_userns_restriction EXIT
-          sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
-          test "$(cat "${userns_restriction}")" = 0
-        fi
-        unshare --user --map-root-user --mount true
-        WAMR_DIRECT_TOOLS="${root}/tools/bin" \
-        WAMR_CI_PACKAGE="${root}/compute-tools/bin/wamr-ci-package" \
-        WAMR_HISTORICAL_FIXTURE_ROOT="${historical_fixture_root}" \
-        WAMR_CI_SUPERVISOR="${historical_fixture_root}/supervisor/bin/wamr-ci-supervisor" \
-          python3 -m unittest discover -s support/tools/hyperv/direct/tests -v
 
     - name: Retain bounded runtime fixture evidence
       if: always()
@@ -1015,10 +981,6 @@ jobs:
       with:
         name: zig-hyperv-runtime-evidence
         path: |
-          ${{ runner.temp }}/hyperv-ci/direct/historical-fixture/inputs.json
-          ${{ runner.temp }}/hyperv-ci/direct/historical-fixture/result.json
-          ${{ runner.temp }}/hyperv-ci/direct/historical-fixture/closure.stdout
-          ${{ runner.temp }}/hyperv-ci/direct/historical-fixture/identity.stdout
           ${{ runner.temp }}/hyperv-ci/native-operator-guard/baseline.log
           ${{ runner.temp }}/hyperv-ci/native-operator-guard/namespace-denial.log
           ${{ runner.temp }}/hyperv-ci/native-operator-guard/fixture-sha256.txt

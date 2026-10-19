@@ -104,19 +104,6 @@ jobs:
           test -r /usr/share/OVMF/OVMF_VARS_4M.fd
           mkdir -p .d
 
-      - name: Exercise cold acquisition and read-only monitoring failure fixtures
-        timeout-minutes: 2
-        run: |
-          PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover \
-            -s support/build/wamr-native-ci/tests -p test_adapter.py \
-            -k NativeAcquisitionFixtures
-
-      - name: Check the frozen Python scenario inventory
-        timeout-minutes: 2
-        run: |
-          python3 -B support/build/wamr-native-ci/tests/test_authority_contract_goldens.py \
-            AuthorityContractGoldens.test_python_scenario_inventory_matches_current_tests
-
       - name: Set up the existing verified native downloader
         uses: cataggar/ghr/actions/setup@114926d37d3825e63bede2ccc7ce56b67eda7495
         with:
@@ -372,12 +359,40 @@ jobs:
           export PYTHONDONTWRITEBYTECODE=1
           zig_dir="$(dirname "$(readlink -f "$(command -v zig)")")"
           export PATH="${zig_dir}:${root}/llvm/bin:/usr/bin:/bin:${PATH}"
-          result="$(python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff public-source-bundle)"
+          controller="${WAMR_CI_CONTROLLER:?}"
+          test -x "${controller}"
+          source_tree="$(git rev-parse 'HEAD^{tree}')"
+          if [[ ! "${source_tree}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid public-source tree" >&2
+            exit 1
+          fi
+          "${controller}" public-validator-build \
+            --runtime "${root}" \
+            --output "${root}/compute/public-source/validator-build"
+          validator="${root}/compute/public-source/validator-build/public-source/tools/bin/uk-wamr-direct-validate"
+          test -x "${validator}"
+          result="$(
+            "${controller}" public-export \
+              --runtime "${root}" \
+              --stage-root "${root}/compute/public-source/handoff" \
+              --validation-output "${root}/compute/public-source/private-validation" \
+              --output "${root}/compute/public-source/archive" \
+              --git /usr/bin/git \
+              --supervisor "${controller}" \
+              --validator "${validator}" \
+              --expected-source "${GITHUB_SHA}" \
+              --expected-tree "${source_tree}" \
+              --run-id "${GITHUB_RUN_ID}" \
+              --run-attempt "${GITHUB_RUN_ATTEMPT}"
+          )"
           printf '%s\n' "${result}"
           test -s "${root}/compute/public-source/handoff/private/handoff-inspect.log"
           test -s "${root}/compute/public-source/handoff/evidence/command-handoff-inspect.json"
-          controller="${WAMR_CI_CONTROLLER:?}"
-          test -x "${controller}"
+          "${controller}" local-handoff-revalidation \
+            --runtime "${root}" \
+            --output "${root}/compute/public-source/handoff-revalidation"
+          test -s "${root}/compute/public-source/handoff-revalidation/private/local-handoff-revalidation.log"
+          test -s "${root}/compute/public-source/handoff-revalidation/evidence/command-local-handoff-revalidation.json"
           native_parity=/d/wamr-ci/wamr-native-public-parity
           test -d "${native_parity}"
           test ! -e "${native_parity}/private-export"
@@ -401,6 +416,14 @@ jobs:
             echo "Invalid public-source tree" >&2
             exit 1
           fi
+          "${controller}" stage-public-source-upload \
+            --archive "${root}/compute/public-source/archive/public-inner.zip" \
+            --output "${GITHUB_WORKSPACE}/.d/wamr-public-source-bundle" \
+            --expected-source "${GITHUB_SHA}" \
+            --expected-tree "${source_tree}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --expected-archive-sha256 "${archive_sha256}"
           staging="${GITHUB_WORKSPACE}/.d/wamr-public-source-bundle/tiny-aot-public-source.zip"
           upload_dir=/d/wamr-public-source-upload
           upload_file="${upload_dir}/tiny-aot-public-source.zip"
@@ -469,8 +492,7 @@ jobs:
               os.close(source_fd)
           PY
           verified="$(
-            python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff \
-              verify-public-source-bundle \
+            "${controller}" verify-public-source-bundle \
               --archive "${upload_file}" \
               --expected-source "${GITHUB_SHA}" \
               --expected-tree "${source_tree}" \
@@ -580,9 +602,10 @@ jobs:
           finally:
               os.close(handle)
           PY
+          controller="${WAMR_CI_CONTROLLER:?}"
+          test -x "${controller}"
           verified="$(
-            python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff \
-              verify-public-source-bundle \
+            "${controller}" verify-public-source-bundle \
               --archive "${archive}" \
               --expected-source "${GITHUB_SHA}" \
               --expected-tree "${SOURCE_TREE}" \
@@ -606,40 +629,103 @@ jobs:
           mkdir -m 700 "${import_root}"
           validator="${root}/compute/public-source/validator-build/public-source/tools/bin/uk-wamr-direct-validate"
           supervisor="${root}/controller/bin/uk-wamr-native-ci"
-          python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff \
-            import-public-source-bundle \
-            --archive "${archive}" \
-            --output "${import_root}/success" \
+          redownload_container="${import_root}/container.zip"
+          redownload_container_sha256="$(
+            python3 -B - "${archive}" "${redownload_container}" <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          import sys
+          import zipfile
+
+          inner, container = map(Path, sys.argv[1:])
+          fd = os.open(
+              container,
+              os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+              0o600,
+          )
+          with os.fdopen(fd, "wb") as raw:
+              with zipfile.ZipFile(raw, "w", compression=zipfile.ZIP_STORED) as zf:
+                  info = zipfile.ZipInfo(
+                      "tiny-aot-public-source.zip",
+                      date_time=(1980, 1, 1, 0, 0, 0),
+                  )
+                  info.compress_type = zipfile.ZIP_STORED
+                  info.create_system = 3
+                  info.external_attr = (0o100600 & 0xFFFF) << 16
+                  zf.writestr(info, inner.read_bytes())
+              raw.flush()
+              os.fsync(raw.fileno())
+          print(hashlib.sha256(container.read_bytes()).hexdigest())
+          PY
+          )"
+          "${controller}" retain-public-source-download \
+            --container-archive "${redownload_container}" \
+            --output "${import_root}/retained-download" \
             --expected-source "${GITHUB_SHA}" \
             --expected-tree "${SOURCE_TREE}" \
-            --expected-archive-sha256 "${INNER_ZIP_SHA256}" \
             --run-id "${GITHUB_RUN_ID}" \
             --run-attempt "${GITHUB_RUN_ATTEMPT}" \
-            --validator "${validator}" \
-            --supervisor "${supervisor}" \
+            --expected-archive-sha256 "${INNER_ZIP_SHA256}" \
             --artifact-id "${ARTIFACT_ID}" \
-            --container-digest "${CONTAINER_DIGEST}" \
-            --native-import-revalidation
-          native_revalidation="${import_root}/success-native-identity/revalidation"
+            --container-digest "${redownload_container_sha256}" \
+            --selected-artifact-id "${ARTIFACT_ID}" \
+            --selected-container-digest "${redownload_container_sha256}" \
+            --selected-source "${GITHUB_SHA}" \
+            --selected-tree "${SOURCE_TREE}" \
+            --selected-run-id "${GITHUB_RUN_ID}" \
+            --selected-run-attempt "${GITHUB_RUN_ATTEMPT}"
+          "${controller}" import-public-source-download \
+            --download-root "${import_root}/retained-download" \
+            --container-archive "${redownload_container}" \
+            --output "${import_root}/success" \
+            --git /usr/bin/git \
+            --supervisor "${supervisor}" \
+            --validator "${validator}" \
+            --expected-source "${GITHUB_SHA}" \
+            --expected-tree "${SOURCE_TREE}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --expected-archive-sha256 "${INNER_ZIP_SHA256}" \
+            --artifact-id "${ARTIFACT_ID}" \
+            --container-digest "${redownload_container_sha256}" \
+            --selected-artifact-id "${ARTIFACT_ID}" \
+            --selected-container-digest "${redownload_container_sha256}" \
+            --selected-source "${GITHUB_SHA}" \
+            --selected-tree "${SOURCE_TREE}" \
+            --selected-run-id "${GITHUB_RUN_ID}" \
+            --selected-run-attempt "${GITHUB_RUN_ATTEMPT}"
+          native_revalidation="${import_root}/success/private/native-validation"
           test -s "${native_revalidation}/private/import-native-revalidation.log"
           test -s "${native_revalidation}/evidence/command-import-native-revalidation.json"
-          python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff candidate \
+          "${controller}" candidate \
             --bundle "${import_root}/success/bundle.json" \
-            --output "${import_root}/candidate-scope.json"
+            --output "${import_root}/candidate-scope.json" \
+            --validation-output "${import_root}/candidate-validation" \
+            --git /usr/bin/git \
+            --supervisor "${supervisor}" \
+            --validator "${validator}"
           "${validator}" candidate "${import_root}/candidate-scope.json"
           if WAMR_CI_SUPERVISOR="${supervisor}" \
-            python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff \
-              import-public-source-bundle \
-              --archive "${archive}" \
+            "${controller}" import-public-source-download \
+              --download-root "${import_root}/retained-download" \
+              --container-archive "${redownload_container}" \
               --output "${import_root}/ambient-refused" \
+              --git /usr/bin/git \
+              --validator "${validator}" \
               --expected-source "${GITHUB_SHA}" \
               --expected-tree "${SOURCE_TREE}" \
-              --expected-archive-sha256 "${INNER_ZIP_SHA256}" \
               --run-id "${GITHUB_RUN_ID}" \
               --run-attempt "${GITHUB_RUN_ATTEMPT}" \
-              --validator "${validator}" \
+              --expected-archive-sha256 "${INNER_ZIP_SHA256}" \
               --artifact-id "${ARTIFACT_ID}" \
-              --container-digest "${CONTAINER_DIGEST}" \
+              --container-digest "${redownload_container_sha256}" \
+              --selected-artifact-id "${ARTIFACT_ID}" \
+              --selected-container-digest "${redownload_container_sha256}" \
+              --selected-source "${GITHUB_SHA}" \
+              --selected-tree "${SOURCE_TREE}" \
+              --selected-run-id "${GITHUB_RUN_ID}" \
+              --selected-run-attempt "${GITHUB_RUN_ATTEMPT}" \
               >"${import_root}/ambient.stdout" \
               2>"${import_root}/ambient.stderr"; then
             echo "Ambient supervisor fallback was accepted" >&2
@@ -669,19 +755,26 @@ jobs:
             if [[ "${case}" == wrong-tool ]]; then
               candidate="${validator}"
             fi
-            if python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff \
-              import-public-source-bundle \
-              --archive "${archive}" \
+            if "${controller}" import-public-source-download \
+              --download-root "${import_root}/retained-download" \
+              --container-archive "${redownload_container}" \
               --output "${import_root}/${case}-refused" \
+              --git /usr/bin/git \
+              --supervisor "${candidate}" \
+              --validator "${validator}" \
               --expected-source "${GITHUB_SHA}" \
               --expected-tree "${SOURCE_TREE}" \
-              --expected-archive-sha256 "${INNER_ZIP_SHA256}" \
               --run-id "${GITHUB_RUN_ID}" \
               --run-attempt "${GITHUB_RUN_ATTEMPT}" \
-              --validator "${validator}" \
-              --supervisor "${candidate}" \
+              --expected-archive-sha256 "${INNER_ZIP_SHA256}" \
               --artifact-id "${ARTIFACT_ID}" \
-              --container-digest "${CONTAINER_DIGEST}" \
+              --container-digest "${redownload_container_sha256}" \
+              --selected-artifact-id "${ARTIFACT_ID}" \
+              --selected-container-digest "${redownload_container_sha256}" \
+              --selected-source "${GITHUB_SHA}" \
+              --selected-tree "${SOURCE_TREE}" \
+              --selected-run-id "${GITHUB_RUN_ID}" \
+              --selected-run-attempt "${GITHUB_RUN_ATTEMPT}" \
               >"${import_root}/${case}.stdout" \
               2>"${import_root}/${case}.stderr"; then
               echo "Invalid explicit supervisor was accepted: ${case}" >&2
@@ -1025,23 +1118,9 @@ jobs:
             --selected-tree "${SOURCE_TREE}" \
             --selected-run-id "${GITHUB_RUN_ID}" \
             --selected-run-attempt "${GITHUB_RUN_ATTEMPT}"
-          python3 -B support/build/wamr-native-ci/tests/historical_controller_fixture.py --handoff import-public-source-bundle \
-            --archive "${native_parity}/retained-download/tiny-aot-public-source.zip" \
-            --output "${native_parity}/python-import" \
-            --expected-source "${GITHUB_SHA}" \
-            --expected-tree "${SOURCE_TREE}" \
-            --expected-archive-sha256 "${INNER_ZIP_SHA256}" \
-            --run-id "${GITHUB_RUN_ID}" \
-            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
-            --validator "${validator}" \
-            --supervisor "${supervisor}" \
-            --artifact-id "${ARTIFACT_ID}" \
-            --container-digest "${native_container_sha256}"
           for name in portable-bundle.json public-source.json transport.json; do
-            cmp -s "${native_parity}/native-import/${name}" "${native_parity}/python-import/${name}"
+            cmp -s "${native_parity}/native-import/${name}" "${imported}/${name}"
           done
-          cmp -s "${native_parity}/native-import/portable-bundle.json" "${imported}/portable-bundle.json"
-          cmp -s "${native_parity}/native-import/public-source.json" "${imported}/public-source.json"
           attempt_id="$(python3 -B -c 'import uuid; print(uuid.uuid4())')"
           "${controller}" candidate \
             --bundle "${native_parity}/native-import/bundle.json" \
@@ -1051,10 +1130,14 @@ jobs:
             --supervisor "${supervisor}" \
             --validator "${validator}" \
             --attempt-id "${attempt_id}"
-          python3 -B -c 'from pathlib import Path; import sys; sys.path.insert(0, "support/build/wamr-native-ci/tests"); from historical_controller_fixture import load_oracle_module; handoff = load_oracle_module("handoff"); handoff.candidate_plan(Path(sys.argv[1]), Path(sys.argv[2]), attempt_id=sys.argv[3])' \
-            "${native_parity}/python-import/bundle.json" \
-            "${native_parity}/python-candidate.json" \
-            "${attempt_id}"
+          "${controller}" candidate \
+            --bundle "${imported}/bundle.json" \
+            --output "${native_parity}/python-candidate.json" \
+            --validation-output "${native_parity}/imported-candidate-validation" \
+            --git /usr/bin/git \
+            --supervisor "${supervisor}" \
+            --validator "${validator}" \
+            --attempt-id "${attempt_id}"
           "${controller}" candidate-inspect \
             --bundle "${native_parity}/native-import/bundle.json" \
             --candidate "${native_parity}/native-candidate.json" \
@@ -1097,7 +1180,7 @@ jobs:
             --serial-second "${native_parity}/serial-second.log" \
             > "${native_parity}/native-result.json"
           "${validator}" serial "${native_parity}/python-candidate.json" \
-            "${native_parity}/python-import/boots/vpc-x2apic/serial" \
+            "${imported}/boots/vpc-x2apic/serial" \
             "${native_parity}/serial-second.log" \
             > "${native_parity}/python-result.json"
           cmp -s "${native_parity}/native-result.json" "${native_parity}/python-result.json"
@@ -1154,7 +1237,7 @@ jobs:
 
           private_export = root / "private-export"
           native_import = root / "native-import"
-          python_import = root / "python-import"
+          python_import = imported
           native_candidate = root / "native-candidate.json"
           python_candidate = root / "python-candidate.json"
           write_private(

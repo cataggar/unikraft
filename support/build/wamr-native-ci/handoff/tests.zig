@@ -486,7 +486,7 @@ test "sensitive scan matches streaming byte semantics for every pattern and spli
     try scanner.observe("\xffAuthorization: bearer \x00accesssas\x80?SV=&SIG=");
 }
 
-test "complete typed v2 runtime exports every byte with live Python export parity" {
+test "complete typed v2 runtime exports every byte and validates root-bound handoff" {
     var fixture = try ExportFixture.init("export-parity");
     defer fixture.deinit();
     const before = try descriptorCount();
@@ -504,17 +504,18 @@ test "complete typed v2 runtime exports every byte with live Python export parit
         try std.testing.expectEqual(@as(usize, 33), result.success.evidence);
     }
     try std.testing.expectEqual(before, try descriptorCount());
-    const parity = try std.process.run(std.testing.allocator, std.testing.io, .{
-        .argv = &.{ "python3", "-B", test_options.python_oracle, "--export-parity", fixture.root_path },
-        .stdout_limit = .limited(4096),
-        .stderr_limit = .limited(8192),
-    });
-    defer std.testing.allocator.free(parity.stdout);
-    defer std.testing.allocator.free(parity.stderr);
-    if (!std.meta.eql(parity.term, std.process.Child.Term{ .exited = 0 })) {
-        std.debug.print("Python export parity: {s}\n", .{parity.stderr});
-        return error.TestUnexpectedResult;
-    }
+    const bundle_path = try std.fs.path.join(std.testing.allocator, &.{ fixture.output_path, "bundle.json" });
+    defer std.testing.allocator.free(bundle_path);
+    const bundle_file = try core.private_files.openAbsolute(std.testing.io, bundle_path, .private);
+    defer bundle_file.close(std.testing.io);
+    var bundle_raw = try core.private_files.readSensitiveFile(std.testing.io, std.testing.allocator, bundle_file, contracts.json_limits.bytes, .private);
+    defer bundle_raw.deinit();
+    var bundle_doc = try contracts.parseCanonical(std.testing.allocator, bundle_raw.bytes());
+    defer bundle_doc.deinit();
+    try std.testing.expectEqual(
+        profile.Compatibility.tiny_qcow2_derived_vhd_v2,
+        try contracts.validateLocalImageHandoffWithRoot(bundle_doc.value(), fixture.output_path),
+    );
 }
 
 test "every export phase failure retains private evidence forbids final bundle and replay" {

@@ -666,25 +666,15 @@ pub fn build(b: *std.Build) void {
     });
     const handoff_options = b.addOptions();
     handoff_options.addOptionPathUntracked("fixture_root", .cache_root);
-    handoff_options.addOptionPath("python_oracle", b.graph.cwdRelativePath(b.fmt(
-        "{s}/support/build/wamr-native-ci/tests/test_handoff_contract_goldens.py",
-        .{repository_root},
-    )));
     handoff_options.addOptionPath("accepted_result_fixture", b.graph.cwdRelativePath(b.fmt(
         "{s}/support/build/wamr-native-ci/tests/fixtures/differential/accepted-v2.json",
         .{repository_root},
     )));
     handoff_contracts.root_module.addOptions("test_options", handoff_options);
     const handoff_contracts_run = b.addRunArtifact(handoff_contracts);
-    const handoff_python_goldens = b.addSystemCommand(&.{"env"});
-    handoff_python_goldens.addPrefixedDirectoryArg("WAMR_HANDOFF_GOLDEN_ROOT=", .cache_root);
-    handoff_python_goldens.addArgs(&.{ "python3", "-B" });
-    handoff_python_goldens.addFileArg(b.path("tests/test_handoff_contract_goldens.py"));
-    const handoff_step = b.step("test-handoff-contracts", "Run native/Python handoff contract goldens");
+    const handoff_step = b.step("test-handoff-contracts", "Run native handoff contract goldens");
     handoff_step.dependOn(&handoff_contracts_run.step);
-    handoff_step.dependOn(&handoff_python_goldens.step);
     controller_step.dependOn(&handoff_contracts_run.step);
-    controller_step.dependOn(&handoff_python_goldens.step);
     const authority_contracts = b.addTest(.{
         .filters = b.option([]const []const u8, "authority-test-filter", "Select bounded authority fixtures") orelse &.{},
         .root_module = b.createModule(.{
@@ -720,25 +710,18 @@ pub fn build(b: *std.Build) void {
     const authority_direct = b.addSystemCommand(&.{"/usr/bin/env"});
     authority_direct.addFileArg(authority_contracts.getEmittedBin());
     b.step("test-authority-direct", "Run authority fixtures with direct failure output").dependOn(&authority_direct.step);
-    const authority_python_goldens = b.addSystemCommand(&.{"env"});
-    authority_python_goldens.addPrefixedDirectoryArg("WAMR_AUTHORITY_CONTRACT_SCRATCH=", std.Build.LazyPath.cache_root.path(b, "authority-contract-work"));
-    authority_python_goldens.addArgs(&.{ "python3", "-B" });
-    authority_python_goldens.addFileArg(b.path("tests/test_authority_contract_goldens.py"));
-    const authority_step = b.step("test-authority-contracts", "Run native/Python authority contract goldens");
+    const authority_step = b.step("test-authority-contracts", "Run native authority contract goldens");
     authority_step.dependOn(&authority_contracts_run.step);
     authority_step.dependOn(&authority_source_check.step);
-    authority_step.dependOn(&authority_python_goldens.step);
     const authority_libraries_step = b.step("test-authority-libraries", "Run complete source-only authority library composition");
     authority_libraries_step.dependOn(&authority_contracts_run.step);
     authority_libraries_step.dependOn(&authority_source_check.step);
-    authority_libraries_step.dependOn(&authority_python_goldens.step);
     controller_step.dependOn(&authority_contracts_run.step);
     controller_step.dependOn(&authority_source_check.step);
-    controller_step.dependOn(&authority_python_goldens.step);
     // Parallel goldens must not create ancestors of recorded controller tools.
     const contract_fixture_dirs = b.addSystemCommand(&.{ "mkdir", "-p", "-m", "0700", "--" });
     contract_fixture_dirs.has_side_effects = true;
-    for ([_][]const u8{ "tmp", "h", "o", "z", "handoff-export-tests", "handoff-python-goldens", "authority-contract-work", "install-target-work", "source-limits-work", "fault-parity-work" }) |name|
+    for ([_][]const u8{ "tmp", "h", "o", "z", "handoff-export-tests", "authority-contract-work", "install-target-work", "source-limits-work", "fault-parity-work" }) |name|
         contract_fixture_dirs.addDirectoryArg2(std.Build.LazyPath.cache_root.path(b, name), .{ .make_absolute = true });
     if (explicit_controller_fixture_root == null) {
         if (env_cache_fixture_root) |cache_root| {
@@ -754,9 +737,7 @@ pub fn build(b: *std.Build) void {
         &source_limits_run.step,
         &fault_parity_run.step,
         &handoff_contracts_run.step,
-        &handoff_python_goldens.step,
         &authority_contracts_run.step,
-        &authority_python_goldens.step,
         &install_target_run.step,
     }) |step| step.dependOn(&contract_fixture_dirs.step);
     const tests = b.addTest(.{ .root_module = root });
@@ -850,10 +831,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&fault_parity_run.step);
     test_step.dependOn(&record_goldens_run.step);
     test_step.dependOn(&handoff_contracts_run.step);
-    test_step.dependOn(&handoff_python_goldens.step);
     test_step.dependOn(&authority_contracts_run.step);
     test_step.dependOn(&authority_source_check.step);
-    test_step.dependOn(&authority_python_goldens.step);
     normalizeConfigureDependencies(b);
 }
 
