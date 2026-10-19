@@ -254,10 +254,8 @@ fn validateGpaDirectDescriptor(desc: []const u8) bool {
 fn validateTransferPagesDescriptor(desc: []const u8) bool {
     if (desc.len < 8)
         return false;
-    const owns = desc[2];
-    const reserved = desc[3];
     const ranges = get32(desc, 4);
-    if (owns > 1 or reserved != 0 or ranges > (desc.len - 8) / 8)
+    if (ranges > (desc.len - 8) / 8)
         return false;
     const required = 8 + @as(usize, ranges) * 8;
     if (required > desc.len or (desc.len - required) % 4 != 0)
@@ -1118,7 +1116,34 @@ test "transfer page validation rejects corruption and footer mismatch progresses
         out.len,
     ));
 
-    transfer[3] = 1;
+    _ = vmbus_ring_initialize(ring.ptr, ring.len);
+    transfer[2] = 2;
+    transfer[3] = 0xa5;
+    try std.testing.expectEqual(@as(c_int, 0), vmbus_ring_write(
+        ring.ptr,
+        ring.len,
+        7,
+        0,
+        9,
+        &transfer,
+        transfer.len,
+        payload.ptr,
+        payload.len,
+        &signal,
+    ));
+    try std.testing.expectEqual(@as(c_int, 0), vmbus_ring_read(
+        ring.ptr,
+        ring.len,
+        &meta,
+        &desc,
+        desc.len,
+        &out,
+        out.len,
+    ));
+    try std.testing.expectEqual(@as(u8, 2), desc[2]);
+    try std.testing.expectEqual(@as(u8, 0xa5), desc[3]);
+
+    put32(&transfer, 8, 0);
     try std.testing.expectEqual(@backingInt(RingResult.malformed), vmbus_ring_write(
         ring.ptr,
         ring.len,

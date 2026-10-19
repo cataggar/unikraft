@@ -399,15 +399,10 @@ export fn netvsc_nvs_parse_init_complete(
     result.version = requested_version;
     result.max_mdl_chain = get32(input[0..length], 8);
     result.status = get32(input[0..length], 12);
-    return switch (result.status) {
-        nvs_status_ok => @backingInt(Result.ok),
-        nvs_status_failed,
-        nvs_status_protocol_too_new,
-        nvs_status_protocol_too_old,
-        nvs_status_protocol_unsupported,
-        => @backingInt(Result.version_unsupported),
-        else => @backingInt(Result.remote_failure),
-    };
+    return if (result.status == nvs_status_ok)
+        @backingInt(Result.ok)
+    else
+        @backingInt(Result.version_unsupported);
 }
 
 export fn netvsc_nvs_parse_receive_buffer_complete(
@@ -553,7 +548,7 @@ export fn netvsc_nvs_transfer_range_count(
     if (descriptor_length < 8)
         return @backingInt(Result.invalid);
     const bytes = descriptor[0..descriptor_length];
-    if (get16(bytes, 0) != rx_buffer_id or bytes[2] > 1 or bytes[3] != 0)
+    if (get16(bytes, 0) != rx_buffer_id)
         return @backingInt(Result.unexpected);
     const count = get32(bytes, 4);
     if (count == 0 or count > max_transfer_ranges)
@@ -780,8 +775,6 @@ export fn netvsc_rndis_parse_completion(
             if (message_length < 48)
                 return @backingInt(Result.invalid);
             if (get32(bytes, 16) != rndis_version_major or
-                get32(bytes, 20) != rndis_version_minor or
-                (get32(bytes, 24) & rndis_device_connectionless) == 0 or
                 get32(bytes, 28) != rndis_medium_802_3)
                 return @backingInt(Result.unexpected);
             result.max_packets = get32(bytes, 32);
@@ -800,8 +793,9 @@ export fn netvsc_rndis_parse_completion(
             result.info_length = get32(bytes, 16);
             const relative = get32(bytes, 20);
             if (result.info_length == 0) {
-                if (relative != 0)
+                if (relative > message_length - @as(u32, rndis_relative_base))
                     return @backingInt(Result.invalid);
+                result.info_offset = 0;
             } else {
                 if (relative == 0)
                     return @backingInt(Result.invalid);
@@ -1016,7 +1010,9 @@ test "NVS init completion accepts padding and classifies rejection" {
     put32(&response, 12, nvs_status_failed);
     try std.testing.expectEqual(@backingInt(Result.version_unsupported), netvsc_nvs_parse_init_complete(&response, response.len, nvs_version_6, &result));
     put32(&response, 12, 6);
-    try std.testing.expectEqual(@backingInt(Result.remote_failure), netvsc_nvs_parse_init_complete(&response, response.len, nvs_version_6, &result));
+    try std.testing.expectEqual(@backingInt(Result.version_unsupported), netvsc_nvs_parse_init_complete(&response, response.len, nvs_version_6, &result));
+    put32(&response, 12, 0xffff_ffff);
+    try std.testing.expectEqual(@backingInt(Result.version_unsupported), netvsc_nvs_parse_init_complete(&response, response.len, nvs_version_61, &result));
 }
 
 test "receive section table and transfer ranges are bounded" {
@@ -1106,14 +1102,22 @@ test "receive section table and transfer ranges are bounded" {
         descriptor.len,
         &range_count,
     ));
+    descriptor[2] = 2;
+    descriptor[3] = 0xa5;
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_nvs_transfer_range_count(
+        &descriptor,
+        descriptor.len,
+        &range_count,
+    ));
     descriptor[2] = 0;
-    descriptor[3] = 1;
+    descriptor[3] = 0;
+    put16(&descriptor, 0, rx_buffer_id + 1);
     try std.testing.expectEqual(@backingInt(Result.unexpected), netvsc_nvs_transfer_range_count(
         &descriptor,
         descriptor.len,
         &range_count,
     ));
-    descriptor[3] = 0;
+    put16(&descriptor, 0, rx_buffer_id);
     var range: TransferRange = undefined;
     try std.testing.expectEqual(@backingInt(Result.ok), netvsc_nvs_parse_transfer_range(
         &descriptor,
@@ -1331,12 +1335,48 @@ test "RNDIS lifecycle completions reject wrong late IDs and contradictions" {
         0x20002,
         &complete,
     ));
+    put32(&response, 20, 2);
+    put32(&response, 24, 0);
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_rndis_parse_completion(
+        &response,
+        response.len,
+        rndis_initialize_complete,
+        0x20001,
+        &complete,
+    ));
+    put32(&response, 20, rndis_version_minor);
+    put32(&response, 24, rndis_device_connectionless);
     put32(&response, 28, 1);
     try std.testing.expectEqual(@backingInt(Result.unexpected), netvsc_rndis_parse_completion(
         &response,
         response.len,
         rndis_initialize_complete,
         0x20001,
+        &complete,
+    ));
+
+    @memset(&response, 0);
+    put32(&response, 0, rndis_query_complete);
+    put32(&response, 4, 24);
+    put32(&response, 8, 0x20002);
+    put32(&response, 12, rndis_status_success);
+    put32(&response, 16, 0);
+    put32(&response, 20, 16);
+    try std.testing.expectEqual(@backingInt(Result.ok), netvsc_rndis_parse_completion(
+        &response,
+        24,
+        rndis_query_complete,
+        0x20002,
+        &complete,
+    ));
+    try std.testing.expectEqual(@as(u32, 0), complete.info_length);
+    try std.testing.expectEqual(@as(u32, 0), complete.info_offset);
+    put32(&response, 20, 17);
+    try std.testing.expectEqual(@backingInt(Result.invalid), netvsc_rndis_parse_completion(
+        &response,
+        24,
+        rndis_query_complete,
+        0x20002,
         &complete,
     ));
 }
