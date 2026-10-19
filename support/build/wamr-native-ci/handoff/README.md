@@ -426,10 +426,17 @@ The driver re-enumerates/re-hashes these live trees before and after; extras,
 removals, link/target changes, same-byte replacement and metadata changes refuse.
 Downloads, selected assets and witness product trees still forbid links.
 All producer `runtime_inputs`, result/cleanup, executable pins, test driver,
-`historical_controller_fixture.py`, `producer_objects`, and both checkouts'
-frozen Python oracle files (`handoff.py`, `public_bundle.py`,
-`accepted_records.py`, plus `run.py` when present in a pre-retirement checkout)
-must be covered.
+`historical_controller_fixture.py`, `producer_objects`, and any frozen Python
+oracle files (`handoff.py`, `public_bundle.py`, `accepted_records.py`, `run.py`)
+present in a pre-retirement checkout must be covered; working-tree
+`support/build/wamr-native-ci/{handoff.py,public_bundle.py,accepted_records.py}`
+are now retired (like `run.py`), with
+`support/build/wamr-native-ci/tests/historical_controller_fixture.py` serving as
+the authenticated Git-blob oracle loader (`ORACLE_SOURCES` at
+`c72bd80b024694590912259fb88a4ba06e84f0a2`) for differential shadow parity and
+historical fixture tests while `uk-wamr-native-ci` and
+`support/build/wamr-native-ci/authority/root.zig` (`authority/handlers.zig`) own
+the native implementation.
 Use immutable source/object/input subtrees, not mutable validation/cache/output
 parents. Each inventory is bounded to 65,536 entries, depth 32, 8 GiB total
 and 2 GiB per file. Input JSON records (including custody) are also bounded to

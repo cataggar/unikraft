@@ -49,13 +49,13 @@ def load_legacy_oracles():
     global ci, public_bundle, ENV_COMMAND_TOOL_PATHS
     if "ci" in globals():
         return
-    controller = _historical_controller_fixture().load_oracle_module(
+    fixture = _historical_controller_fixture()
+    controller = fixture.load_oracle_module(
         "run.py", HERE.parents[2], module_name="wamr_ci"
     )
-    bundle_spec = importlib.util.spec_from_file_location(
-        "wamr_public_bundle", HERE / "public_bundle.py")
-    bundle = importlib.util.module_from_spec(bundle_spec)
-    bundle_spec.loader.exec_module(bundle)
+    bundle = fixture.load_oracle_module(
+        "public_bundle.py", HERE.parents[2], module_name="wamr_public_bundle"
+    )
     ci, public_bundle = controller, bundle
     ENV_COMMAND_TOOL_PATHS = {
         name: os.environ["WAMR_CI_TOOL_" + name.upper().replace("-", "_")]
@@ -456,11 +456,11 @@ class NativeRecordBridge(unittest.TestCase):
         self.assertFalse(public_bundle.accepted_records._TIMING_ENABLED)
 
     def handoff_module(self):
-        spec = importlib.util.spec_from_file_location(
-            "wamr_handoff_native_records_test", HERE / "handoff.py")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
+        return _historical_controller_fixture().load_oracle_module(
+            "handoff.py",
+            HERE.parents[2],
+            module_name="wamr_handoff_native_records_test",
+        )
 
     def controller_fixture(self, body):
         parent = HERE.parents[2] / ".d"
@@ -5588,7 +5588,9 @@ source/generated/
         for relative in ("handoff.py", "public_bundle.py"):
             self.assertNotIn(
                 "allow_bootstrap",
-                (HERE / relative).read_text(),
+                _historical_controller_fixture().oracle_source(
+                    relative, HERE.parents[2]
+                ),
             )
 
     def test_supervisor_build_pins_portable_target(self):

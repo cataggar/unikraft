@@ -6,6 +6,7 @@ import errno
 import hashlib
 import importlib
 from importlib.metadata import PackageNotFoundError, version
+import importlib.util
 import io
 import itertools
 import json
@@ -35,6 +36,16 @@ preflight_tests = importlib.import_module(
 )
 historical_owner = importlib.import_module(
     "support.tools.hyperv.direct.tests.historical_owner"
+)
+_historical_controller_fixture_spec = importlib.util.spec_from_file_location(
+    "wamr_historical_controller_fixture",
+    SUPPORT / "build/wamr-native-ci/tests/historical_controller_fixture.py",
+)
+historical_controller_fixture = importlib.util.module_from_spec(
+    _historical_controller_fixture_spec
+)
+_historical_controller_fixture_spec.loader.exec_module(
+    historical_controller_fixture
 )
 
 
@@ -4014,9 +4025,9 @@ class HypervWorkflowTest(unittest.TestCase):
             '"${comparator}" --request "${native_parity}/compare-candidate.json"',
         ):
             self.assertIn(token, workflow)
-        handoff = (
-            repository / "support/build/wamr-native-ci/handoff.py"
-        ).read_text()
+        handoff = historical_controller_fixture.oracle_source(
+            "handoff.py", repository
+        )
         self.assertIn(
             'imp.add_argument("--expected-archive-sha256")',
             handoff,
@@ -4050,6 +4061,7 @@ class HypervWorkflowTest(unittest.TestCase):
             "support/build/wamr-native-ci/public_bundle.py",
             "support/build/wamr-native-ci/accepted_records.py",
         ):
+            self.assertFalse((repository / retired).exists())
             self.assertNotIn(retired, workflow)
             self.assertNotIn(retired, operator)
 
