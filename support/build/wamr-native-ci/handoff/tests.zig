@@ -368,6 +368,42 @@ test "export runner refuses absent runtime" {
         .output_path = "/missing-export-review-output",
     });
     try std.testing.expect(outcome == .refused);
+    try std.testing.expectEqual(error.FileNotFound, outcome.refused.err);
+
+    const inside_private = native_export.run(.{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .environ = .empty,
+        .runtime_path = "/missing-export-review-runtime",
+        .repository_path = "/missing-export-review-repository",
+        .output_path = "/missing-export-review-runtime/compute/public-source/handoff",
+    });
+    try std.testing.expect(inside_private == .refused);
+    try std.testing.expectEqual(error.OutputInsideRuntime, inside_private.refused.err);
+
+    const inside_public_wrong = native_export.run(.{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .environ = .empty,
+        .runtime_path = "/missing-export-review-runtime",
+        .repository_path = "/missing-export-review-repository",
+        .output_path = "/missing-export-review-runtime/compute/handoff",
+        .allow_public_scope = true,
+    });
+    try std.testing.expect(inside_public_wrong == .refused);
+    try std.testing.expectEqual(error.OutputInsideRuntime, inside_public_wrong.refused.err);
+
+    const inside_public_exact = native_export.run(.{
+        .allocator = std.testing.allocator,
+        .io = std.testing.io,
+        .environ = .empty,
+        .runtime_path = "/missing-export-review-runtime",
+        .repository_path = "/missing-export-review-repository",
+        .output_path = "/missing-export-review-runtime/compute/public-source/handoff",
+        .allow_public_scope = true,
+    });
+    try std.testing.expect(inside_public_exact == .refused);
+    try std.testing.expectEqual(error.FileNotFound, inside_public_exact.refused.err);
 }
 
 fn descriptorCount() !usize {

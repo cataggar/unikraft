@@ -60,6 +60,7 @@ fn exportRun(inv: ExportInvocation, phase: *Phase, reserved: *bool) !Outcome(arc
             .runtime_path = runtime,
             .repository_path = inv.repository,
             .output_path = inv.handoff,
+            .allow_public_scope = true,
             .signal = inv.signal,
         })) {
             .success => reserved.* = true,
