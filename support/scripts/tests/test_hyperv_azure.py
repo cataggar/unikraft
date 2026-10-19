@@ -8020,6 +8020,64 @@ class HypervPersistenceControllerTest(unittest.TestCase):
             azure.image_sha256(receipt_path),
         )
 
+    def test_seed_enrollment_v2_and_direct_persistence_config_posture_preserve_defconfig(self):
+        defconfig_path = SUPPORT / "apps" / "hyperv-acceptance" / "defconfig"
+        defconfig_before = defconfig_path.read_bytes()
+        defconfig_text = defconfig_before.decode()
+        self.assertIn("CONFIG_LIBSTORVSC_MAX_LUNS=2\n", defconfig_text)
+        self.assertIn("CONFIG_UKPLAT_CPU_MAXCOUNT=1\n", defconfig_text)
+
+        seed_producer = importlib.import_module("hyperv-storage-manifest")
+        prefix = self.root / "seed-enrollment"
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "hyperv-storage-manifest.py",
+                "--output-prefix",
+                str(prefix),
+                "--sectors",
+                str(self.APPROVED_SECTORS),
+                "--lun",
+                str(self.APPROVED_LUN),
+                "--identity-policy",
+                "seed-enrollment-v2",
+                "--run-id",
+                self.RUN_ID,
+                "--disk-id",
+                self.DISK_ID,
+            ],
+        ):
+            self.assertEqual(seed_producer.main(), 0)
+
+        seed_config = prefix.with_suffix(".config").read_text()
+        seed_manifest = json.loads(prefix.with_suffix(".json").read_text())
+        self.assertEqual(seed_manifest["identity_policy"], "seed-enrollment-v2")
+        self.assertIn("CONFIG_LIBSTORVSC_MAX_LUNS=8\n", seed_config)
+        self.assertNotIn("CONFIG_UKPLAT_CPU_MAXCOUNT=", seed_config)
+
+        direct_config = (
+            seed_config.replace(
+                "CONFIG_LIBSTORVSC_MAX_LUNS=8\n",
+                "CONFIG_LIBSTORVSC_MAX_LUNS=2\n",
+                1,
+            )
+            + "CONFIG_UKPLAT_CPU_MAXCOUNT=1\n"
+        )
+        self.assertIn("CONFIG_LIBSTORVSC_MAX_LUNS=2\n", direct_config)
+        self.assertIn("CONFIG_UKPLAT_CPU_MAXCOUNT=1\n", direct_config)
+        for shared in (
+            f'CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_RUN_ID="{self.RUN_ID}"\n',
+            f'CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID="{self.DISK_ID}"\n',
+            f"CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS={self.APPROVED_SECTORS}\n",
+            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE=512\n",
+            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY=2\n",
+            f"CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN={self.APPROVED_LUN}\n",
+        ):
+            self.assertIn(shared, seed_config)
+            self.assertIn(shared, direct_config)
+        self.assertEqual(defconfig_path.read_bytes(), defconfig_before)
+
 
 class HypervPersistenceTemplateTest(unittest.TestCase):
     @classmethod

@@ -466,7 +466,41 @@ pub fn validateSolvedConfig(allocator: std.mem.Allocator, io: std.Io, plan: Plan
     const solved = try directory.read(allocator, io, receipt.config_after.path, config.config_cap, .private);
     defer allocator.free(solved);
     if (!std.meta.eql(c.digest(solved), receipt.config_after.sha256)) return error.HashMismatch;
-    try validateAuthoritativeConfig(allocator, solved, bytes, receipt.guard);
+    try validateAuthoritativeConfigForPurpose(allocator, solved, bytes, receipt.guard, receipt.purpose);
+}
+
+pub fn validateAuthoritativeConfigForPurpose(
+    allocator: std.mem.Allocator,
+    solved: []const u8,
+    metadata_bytes: []const u8,
+    guard: config.Guard,
+    purpose: c.Purpose,
+) !void {
+    if (purpose == .persistence) {
+        return validateDirectAuthoritativeConfig(allocator, solved, metadata_bytes, guard);
+    }
+    return validateAuthoritativeConfig(allocator, solved, metadata_bytes, guard);
+}
+
+pub fn validateDirectAuthoritativeConfig(
+    allocator: std.mem.Allocator,
+    solved: []const u8,
+    metadata_bytes: []const u8,
+    guard: config.Guard,
+) !void {
+    if (solved.len > config.config_cap or metadata_bytes.len > config.config_cap) return error.LimitExceeded;
+    var metadata = try config.Metadata.parse(allocator, metadata_bytes);
+    defer metadata.deinit();
+    const kconfig = @import("native_kconfig");
+    var diagnostic: kconfig.Diagnostic = .{};
+    var document = try kconfig.parseWithMetadata(allocator, solved, &metadata, &diagnostic);
+    defer document.deinit();
+    for (document.entries.items) |entry|
+        if (entry.symbol_type == null) return error.IncompleteMetadata;
+    if (!document.enabled("ARCH_X86_64") or !document.enabled("PLAT_HYPERV")) return error.InvalidSelection;
+    for ([_][]const u8{ "ARCH_ARM_64", "ARCH_ARM", "ARCH_X86_32", "PLAT_KVM", "PLAT_XEN", "PLAT_LINUXU" }) |forbidden|
+        if (document.enabled(forbidden)) return error.InvalidSelection;
+    try config.validateDirectPersistenceWithMetadata(allocator, solved, guard, &metadata);
 }
 
 pub fn validateAuthoritativeConfig(allocator: std.mem.Allocator, solved: []const u8, metadata_bytes: []const u8, guard: config.Guard) !void {

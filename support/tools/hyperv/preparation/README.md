@@ -228,12 +228,18 @@ The legacy no-metadata API still accepts a guarded fragment without a CPU
 setting; a supplied CPU setting must be 1. Both direct APIs reject equal
 run/disk identities. Original MAX_LUNS=8, synthetic and platform config APIs
 retain their existing behavior and do not become direct-config validators.
-The metadata-aware API is exposed through the preparation module but has no
-solver/production consumer in this substage. It checks supplied types and
-guarded constraints, **not** the complete target/profile, solver execution,
-metadata/source authenticity or independent approval. Later guarded building
-still requires reviewed namespace execution and independently approved solved
-bytes/metadata; no nonisolated fallback is added.
+`inputs.validateDirectAuthoritativeConfig` (and purpose-dispatched
+`inputs.validateAuthoritativeConfigForPurpose` when `purpose == .persistence`)
+pairs `config.validateDirectPersistenceWithMetadata` with solved x86-64
+Hyper-V architecture/platform selection checks and full metadata coverage for
+every supplied symbol. `receipts.Context.prepared`, `receipts.Context.runProducer`,
+and `inputs.validateSolvedConfig` dispatch on `.persistence` to enforce the
+direct-persistence contract (`MAX_LUNS=2`, `UKPLAT_CPU_MAXCOUNT=1`, distinct
+`run_id != disk_id`, `sectors == 8388608`, `lun == 7`) while preserving
+`validateAuthoritativeConfig` (`MAX_LUNS=8`) for `.synthetic` and
+`.platform_preflight`. Later guarded building still requires reviewed namespace
+execution and independently approved solved bytes/metadata; no nonisolated
+fallback is added.
 
 ### Focused and full-size qualification
 
@@ -316,6 +322,31 @@ loader still binds actual executable identity, all physical source/runtime and
 asset directories, receipts, inspections, origins and the exact ledger. Keep its
 returned lock alive and retain the existing revalidation obligations.
 Provenance, producer-executable and engine-executable commitments stay separate.
+
+For direct `.persistence` preparation, `production_local` also exposes
+`DirectConfiguration`, `DirectFacade`, and `loadDirectPersistence` while
+keeping `Configuration`, `Facade`, and `load` unchanged for
+`platform_preflight`:
+
+- `DirectConfiguration` binds `directory`, `derivation` (`derivation.json`),
+  `initial_metadata`, `solved_config`, and `solved_metadata`.
+- `DirectFacade` requires `context.purpose == .persistence`,
+  `config.validateGuardPurpose(guard, .persistence)`, and distinct
+  `run_id != disk_id`. `DirectFacade.requireConfiguration` verifies
+  `derivation` as a canonical `direct_config.Record` matching `context.guard`,
+  requires the unsolved workspace config record to match `derived_config`
+  (`sha256`, `size`, and `mode`), refuses physical aliasing against
+  `workspace.config` or `native-config/metadata.tsv`, and validates both
+  expected and workspace configs with `inputs.validateDirectAuthoritativeConfig`.
+- `DirectFacade.prepared`, `DirectFacade.runProducer`, `DirectFacade.package`,
+  and `DirectFacade.generate` mirror the `Facade` lifecycle for `.persistence`,
+  with `DirectFacade.generate` requiring staged control bindings via
+  `inputs.requireControlFileBinding` for all four `DirectConfiguration` files
+  (`derivation`, `initial_metadata`, `solved_config`, `solved_metadata`).
+- `production_local.loadDirectPersistence` requires `.persistence` and
+  `.packaged` in `input.json`, verifies that `derivation` in `bindings.config`
+  is bound as a staged control file and matches both `guard` and
+  `chain[0].receipt.config_before`, and delegates to `admission.load`.
 
 This seam alone produces no reviewed material or Azure-ready handoff. A real
 current-source producer/package/input/load run still needs independently
