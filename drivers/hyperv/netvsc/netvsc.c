@@ -57,6 +57,8 @@
 					 1024U * 1024U)
 #define NETVSC_SECTION_LIMIT		(CONFIG_LIBNETVSC_TX_SLOTS + \
 					 CONFIG_LIBNETVSC_CONTROL_SLOTS)
+#define NETVSC_SECTION_MASK_WORDS	((NETVSC_SECTION_LIMIT + 63U) / 64U)
+#define NETVSC_TX_MASK_WORDS		((CONFIG_LIBNETVSC_TX_SLOTS + 63U) / 64U)
 
 struct uk_netdev_rx_queue {
 	struct uk_netdev *netdev;
@@ -161,6 +163,9 @@ struct netvsc_device {
 	__u8 control_info[CONFIG_LIBNETVSC_CONTROL_SLOTS]
 			 [NETVSC_CONTROL_INFO_SIZE];
 	__u8 section_used[NETVSC_SECTION_LIMIT];
+	__u64 section_used_mask[NETVSC_SECTION_MASK_WORDS];
+	__u64 tx_used_mask[NETVSC_TX_MASK_WORDS];
+	__u64 tx_reclaimable_mask[NETVSC_TX_MASK_WORDS];
 	struct uk_hwaddr current_address;
 	struct uk_hwaddr permanent_address;
 	__spinlock state_lock;
@@ -687,29 +692,78 @@ static int netvsc_known_request(const struct netvsc_device *device, __u32 id)
 	return 0;
 }
 
+static inline void netvsc_mask_set(__u64 *mask, unsigned int index)
+{
+	mask[index / 64U] |= 1ULL << (index % 64U);
+}
+
+static inline void netvsc_mask_clear(__u64 *mask, unsigned int index)
+{
+	mask[index / 64U] &= ~(1ULL << (index % 64U));
+}
+
+static inline int netvsc_mask_find_zero_from(const __u64 *used_mask,
+					     unsigned int word_count,
+					     unsigned int limit,
+					     unsigned int start,
+					     unsigned int *index_out)
+{
+	unsigned int start_word;
+	unsigned int start_bit;
+	unsigned int step;
+
+	if (!limit)
+		return -ENOENT;
+	start %= limit;
+	start_word = start / 64U;
+	start_bit = start % 64U;
+
+	for (step = 0; step <= word_count; step++) {
+		unsigned int w = (start_word + step) % word_count;
+		unsigned int base = w * 64U;
+		__u64 free_bits;
+
+		if (base >= limit)
+			continue;
+		free_bits = ~used_mask[w];
+		if (limit - base < 64U)
+			free_bits &= (1ULL << (limit - base)) - 1ULL;
+		if (step == 0)
+			free_bits &= ~((1ULL << start_bit) - 1ULL);
+		else if (step == word_count) {
+			if (!start_bit)
+				break;
+			free_bits &= (1ULL << start_bit) - 1ULL;
+		}
+		if (free_bits) {
+			*index_out = base +
+				(unsigned int)__builtin_ctzll(free_bits);
+			return 0;
+		}
+	}
+	return -ENOENT;
+}
+
 static int netvsc_send_section_allocate_locked(struct netvsc_device *device,
 					       __u32 required, __u32 *section)
 {
 	__u32 count = device->send_section_count;
-	__u32 start;
-	__u32 step;
+	unsigned int i;
 
 	*section = NETVSC_INVALID_SECTION;
 	if (!device->send_connected || !device->send_section_size ||
 	    !count || required > device->send_section_size)
 		return -ENOSPC;
-	start = device->section_next_index % count;
-	for (step = 0; step < count; step++) {
-		__u32 i = (start + step) % count;
-
-		if (device->section_used[i])
-			continue;
-		device->section_used[i] = 1;
-		device->section_next_index = (i + 1) % count;
-		*section = i;
-		return 0;
-	}
-	return -ENOSPC;
+	if (netvsc_mask_find_zero_from(device->section_used_mask,
+				       NETVSC_SECTION_MASK_WORDS,
+				       count, device->section_next_index,
+				       &i))
+		return -ENOSPC;
+	device->section_used[i] = 1;
+	netvsc_mask_set(device->section_used_mask, i);
+	device->section_next_index = (i + 1) % count;
+	*section = (__u32)i;
+	return 0;
 }
 
 static void netvsc_send_section_release_locked(struct netvsc_device *device,
@@ -718,6 +772,7 @@ static void netvsc_send_section_release_locked(struct netvsc_device *device,
 	if (section >= NETVSC_SECTION_LIMIT)
 		return;
 	device->section_used[section] = 0;
+	netvsc_mask_clear(device->section_used_mask, section);
 	if (section < device->send_section_count &&
 	    (device->section_next_index >= device->send_section_count ||
 	     device->section_used[device->section_next_index] ||
@@ -1492,6 +1547,8 @@ static int netvsc_connect_send_buffer(struct netvsc_device *device)
 	if (device->send_section_count > NETVSC_SECTION_LIMIT)
 		device->send_section_count = NETVSC_SECTION_LIMIT;
 	zero_bytes(device->section_used, sizeof(device->section_used));
+	zero_bytes(device->section_used_mask,
+		   sizeof(device->section_used_mask));
 	device->section_next_index = 0;
 	device->send_connected = 1;
 	return 0;
@@ -1777,9 +1834,12 @@ static void netvsc_tx_mark_completed_locked(
 	context->completion_pending = 0;
 	context->state = NETVSC_TX_COMPLETED;
 	if (context->upper_done) {
+		unsigned int slot = (unsigned int)(context - &device->tx[0]);
+
 		UK_ASSERT(device->tx_reclaimable_count <
 			  CONFIG_LIBNETVSC_TX_SLOTS);
 		device->tx_reclaimable_count++;
+		netvsc_mask_set(device->tx_reclaimable_mask, slot);
 	}
 	netvsc_send_section_release_locked(device, section);
 	(void)__atomic_add_fetch(&device->diagnostic_tx_completed, 1,
@@ -1792,7 +1852,7 @@ static void netvsc_tx_reclaim_completed(struct netvsc_device *device)
 	struct uk_netbuf *packets[CONFIG_LIBNETVSC_TX_SLOTS];
 	unsigned long flags;
 	unsigned int count = 0;
-	unsigned int i;
+	unsigned int w;
 
 	ukplat_spin_lock_irqsave(&device->tx_lock, flags);
 	/* The public wrappers may still be walking any submitted chain. */
@@ -1800,26 +1860,39 @@ static void netvsc_tx_reclaim_completed(struct netvsc_device *device)
 		ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
 		return;
 	}
-	for (i = 0; i < CONFIG_LIBNETVSC_TX_SLOTS &&
-		    device->tx_reclaimable_count; i++) {
-		struct netvsc_tx_context *context = &device->tx[i];
+	for (w = 0; w < NETVSC_TX_MASK_WORDS &&
+		    device->tx_reclaimable_count; w++) {
+		__u64 mask = device->tx_reclaimable_mask[w];
 
-		if (context->state != NETVSC_TX_COMPLETED ||
-		    !context->upper_done)
-			continue;
-		if (context->packet)
-			packets[count++] = context->packet;
-		netvsc_tx_reset_context_locked(context);
-		UK_ASSERT(device->tx_active_count != 0);
-		device->tx_active_count--;
-		device->tx_reclaimable_count--;
-		if (!device->tx_active_count)
-			device->tx_next_slot = 0;
-		else if (device->tx_next_slot >= CONFIG_LIBNETVSC_TX_SLOTS ||
-			 device->tx[device->tx_next_slot].state !=
-				 NETVSC_TX_FREE ||
-			 i < device->tx_next_slot)
-			device->tx_next_slot = (__u16)i;
+		while (mask && device->tx_reclaimable_count) {
+			unsigned int i = w * 64U +
+				(unsigned int)__builtin_ctzll(mask);
+			struct netvsc_tx_context *context;
+
+			mask &= mask - 1ULL;
+			if (i >= CONFIG_LIBNETVSC_TX_SLOTS)
+				break;
+			context = &device->tx[i];
+			if (context->state != NETVSC_TX_COMPLETED ||
+			    !context->upper_done)
+				continue;
+			if (context->packet)
+				packets[count++] = context->packet;
+			netvsc_tx_reset_context_locked(context);
+			netvsc_mask_clear(device->tx_reclaimable_mask, i);
+			netvsc_mask_clear(device->tx_used_mask, i);
+			UK_ASSERT(device->tx_active_count != 0);
+			device->tx_active_count--;
+			device->tx_reclaimable_count--;
+			if (!device->tx_active_count)
+				device->tx_next_slot = 0;
+			else if (device->tx_next_slot >=
+				 CONFIG_LIBNETVSC_TX_SLOTS ||
+				 device->tx[device->tx_next_slot].state !=
+					 NETVSC_TX_FREE ||
+				 i < device->tx_next_slot)
+				device->tx_next_slot = (__u16)i;
+		}
 	}
 	ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
 	while (count)
@@ -1854,6 +1927,7 @@ static void netvsc_tx_returned(struct uk_netdev *netdev,
 			UK_ASSERT(device->tx_reclaimable_count <
 				  CONFIG_LIBNETVSC_TX_SLOTS);
 			device->tx_reclaimable_count++;
+			netvsc_mask_set(device->tx_reclaimable_mask, i);
 		}
 		UK_ASSERT(device->tx_wrapper_pending != 0);
 		device->tx_wrapper_pending--;
@@ -1869,38 +1943,51 @@ static int netvsc_complete_tx(struct netvsc_device *device,
 			      const __u8 *payload, size_t payload_length)
 {
 	unsigned long flags;
-	unsigned int i;
+	unsigned int w;
 	int found = 0;
 	int malformed =
 		netvsc_nvs_parse_rndis_completion(payload, payload_length) != 0;
 
 	ukplat_spin_lock_irqsave(&device->tx_lock, flags);
-	for (i = 0; i < CONFIG_LIBNETVSC_TX_SLOTS; i++) {
-		struct netvsc_tx_context *context = &device->tx[i];
+	for (w = 0; w < NETVSC_TX_MASK_WORDS && !found; w++) {
+		__u64 mask = device->tx_used_mask[w];
 
-		if (context->state == NETVSC_TX_FREE ||
-		    context->transaction_id != packet->transaction_id)
-			continue;
-		found = 1;
-		if (context->state == NETVSC_TX_BUILDING) {
-			if (context->completion_pending)
-				netvsc_count_duplicate_completion(device);
-			else {
-				context->completion_pending = 1;
-				context->completion_malformed = malformed;
+		while (mask) {
+			unsigned int i = w * 64U +
+				(unsigned int)__builtin_ctzll(mask);
+			struct netvsc_tx_context *context;
+
+			mask &= mask - 1ULL;
+			if (i >= CONFIG_LIBNETVSC_TX_SLOTS)
+				break;
+			context = &device->tx[i];
+			if (context->state == NETVSC_TX_FREE ||
+			    context->transaction_id != packet->transaction_id)
+				continue;
+			found = 1;
+			if (context->state == NETVSC_TX_BUILDING) {
+				if (context->completion_pending)
+					netvsc_count_duplicate_completion(
+						device);
+				else {
+					context->completion_pending = 1;
+					context->completion_malformed =
+						malformed;
+				}
+				break;
 			}
+			if (context->state == NETVSC_TX_COMPLETED) {
+				netvsc_count_duplicate_completion(device);
+				break;
+			}
+			context->completion_malformed = malformed;
+			if (malformed)
+				(void)__atomic_add_fetch(
+					&device->malformed_messages, 1,
+					__ATOMIC_RELAXED);
+			netvsc_tx_mark_completed_locked(device, context);
 			break;
 		}
-		if (context->state == NETVSC_TX_COMPLETED) {
-			netvsc_count_duplicate_completion(device);
-			break;
-		}
-		context->completion_malformed = malformed;
-		if (malformed)
-			(void)__atomic_add_fetch(&device->malformed_messages, 1,
-						 __ATOMIC_RELAXED);
-		netvsc_tx_mark_completed_locked(device, context);
-		break;
 	}
 	ukplat_spin_unlock_irqrestore(&device->tx_lock, flags);
 	return found;
@@ -2502,28 +2589,27 @@ static int netvsc_frame_length(struct uk_netbuf *packet, __u32 *length)
 static struct netvsc_tx_context *
 netvsc_tx_allocate(struct netvsc_device *device, __u64 transaction_id)
 {
-	unsigned int step;
-	unsigned int start;
+	struct netvsc_tx_context *context;
+	unsigned int i;
 
 	if (device->tx_active_count >= device->txq.descriptors ||
 	    device->tx_active_count >= CONFIG_LIBNETVSC_TX_SLOTS)
 		return NULL;
-	start = device->tx_next_slot % CONFIG_LIBNETVSC_TX_SLOTS;
-	for (step = 0; step < CONFIG_LIBNETVSC_TX_SLOTS; step++) {
-		unsigned int i = (start + step) % CONFIG_LIBNETVSC_TX_SLOTS;
-		struct netvsc_tx_context *context = &device->tx[i];
-
-		if (context->state != NETVSC_TX_FREE)
-			continue;
-		netvsc_tx_reset_context_locked(context);
-		context->state = NETVSC_TX_BUILDING;
-		context->transaction_id = transaction_id;
-		device->tx_active_count++;
-		device->tx_next_slot = (__u16)((i + 1) %
-					       CONFIG_LIBNETVSC_TX_SLOTS);
-		return context;
-	}
-	return NULL;
+	if (netvsc_mask_find_zero_from(device->tx_used_mask,
+				       NETVSC_TX_MASK_WORDS,
+				       CONFIG_LIBNETVSC_TX_SLOTS,
+				       device->tx_next_slot, &i))
+		return NULL;
+	context = &device->tx[i];
+	netvsc_tx_reset_context_locked(context);
+	context->state = NETVSC_TX_BUILDING;
+	context->transaction_id = transaction_id;
+	netvsc_mask_set(device->tx_used_mask, i);
+	netvsc_mask_clear(device->tx_reclaimable_mask, i);
+	device->tx_active_count++;
+	device->tx_next_slot = (__u16)((i + 1) %
+				       CONFIG_LIBNETVSC_TX_SLOTS);
+	return context;
 }
 
 static int netvsc_tx_has_room(struct netvsc_device *device)
@@ -2548,6 +2634,8 @@ static void netvsc_tx_rollback(struct netvsc_device *device,
 						   context->section_index);
 		netvsc_remember_transaction(device, transaction_id);
 		netvsc_tx_reset_context_locked(context);
+		netvsc_mask_clear(device->tx_used_mask, slot);
+		netvsc_mask_clear(device->tx_reclaimable_mask, slot);
 		UK_ASSERT(device->tx_active_count != 0);
 		device->tx_active_count--;
 		if (!device->tx_active_count)
@@ -3182,6 +3270,9 @@ static void netvsc_cancel_tx(struct netvsc_device *device, int quarantine)
 		device->tx[i].section_index = NETVSC_INVALID_SECTION;
 	}
 	UK_ASSERT(device->tx_wrapper_pending == 0);
+	zero_bytes(device->tx_used_mask, sizeof(device->tx_used_mask));
+	zero_bytes(device->tx_reclaimable_mask,
+		   sizeof(device->tx_reclaimable_mask));
 	device->tx_active_count = 0;
 	device->tx_reclaimable_count = 0;
 	device->tx_next_slot = 0;
@@ -3735,6 +3826,10 @@ void netvsc_host_reset(void)
 	netvsc.next_request = 1;
 	netvsc.next_transaction = 1;
 	netvsc.id_reservations = 0;
+	zero_bytes(netvsc.tx_used_mask, sizeof(netvsc.tx_used_mask));
+	zero_bytes(netvsc.tx_reclaimable_mask,
+		   sizeof(netvsc.tx_reclaimable_mask));
+	zero_bytes(netvsc.section_used_mask, sizeof(netvsc.section_used_mask));
 	netvsc.tx_active_count = 0;
 	netvsc.tx_reclaimable_count = 0;
 	netvsc.tx_next_slot = 0;
