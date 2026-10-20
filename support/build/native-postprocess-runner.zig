@@ -98,11 +98,13 @@ pub fn execute(allocator: std.mem.Allocator, io: std.Io, args: []const []const u
     const binary = std.mem.eql(u8, action, "objcopy-binary");
     const reloc = std.mem.eql(u8, action, "uk-reloc");
     const boot = std.mem.eql(u8, action, "bootinfo");
+    const multiboot = std.mem.eql(u8, action, "multiboot");
     const efi = std.mem.eql(u8, action, "efi");
+    const linux = std.mem.eql(u8, action, "linux-header");
     const database = std.mem.eql(u8, action, "compile-database");
-    if (!strip and !binary and !reloc and !boot and !efi and !database)
+    if (!strip and !binary and !reloc and !boot and !multiboot and !efi and !linux and !database)
         return error.UnsupportedTransformation;
-    if (paths.len != (if (reloc or boot or efi) @as(usize, 3) else @as(usize, 2)))
+    if (paths.len != (if (reloc or boot or efi or linux) @as(usize, 3) else @as(usize, 2)))
         return error.InvalidArguments;
     if ((options.tool != null) != (strip or binary) or
         (options.objcopy != null) != (reloc or boot) or
@@ -113,7 +115,7 @@ pub fn execute(allocator: std.mem.Allocator, io: std.Io, args: []const []const u
         (options.remove.items.len != 0 and !strip)) return error.InvalidArguments;
     if (boot and !std.mem.eql(u8, options.arch.?, "x86_64") and
         !std.mem.eql(u8, options.arch.?, "arm64")) return error.InvalidArguments;
-    const input_count: usize = if (efi) 2 else 1;
+    const input_count: usize = if (efi or linux) 2 else 1;
     var files = try Files.init(allocator, io, paths[0..input_count], paths[input_count..]);
     defer files.deinit();
 
@@ -126,6 +128,24 @@ pub fn execute(allocator: std.mem.Allocator, io: std.Io, args: []const []const u
     }
     const input = try files.readInput(0);
     defer allocator.free(input);
+    if (linux) {
+        const elf_bytes = try files.readInput(1);
+        defer allocator.free(elf_bytes);
+        var elf_image = try format.Image.parse(allocator, elf_bytes);
+        defer elf_image.deinit();
+        const result = try transform.linuxHeader(allocator, input, elf_image);
+        defer allocator.free(result);
+        try files.write(0, result);
+        try files.commit();
+        return;
+    }
+    if (multiboot) {
+        const result = try transform.multiboot(allocator, input);
+        defer allocator.free(result);
+        try files.write(0, result);
+        try files.commit();
+        return;
+    }
     var image = try format.Image.parse(allocator, input);
     defer image.deinit();
 

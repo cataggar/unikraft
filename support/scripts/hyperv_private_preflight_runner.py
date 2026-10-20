@@ -78,9 +78,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "e62a19ca3809bd54fa958dd2a19c54ad2c284fba5f944c5b43e0e7b3cda40e98"
+            "5e2c82067e6e8c044656ca0b811cc560f154e4fd2af66e6244d0bd34d3242584"
         ),
-        "size": 1826333,
+        "size": 1843976,
         "files": 220,
     },
     "support/kconfig": {
@@ -226,7 +226,7 @@ GUARDED_PRODUCER_FILES = {
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
     ),
     "build.zig": (
-        "b1515e3747b41d864cfbab389c89a6b577581674706f52732b351d09609298b2"
+        "839db0460fa009db9885cf45c53ea615c7bd878d0cdb6dfa9aee4e97147fbdf3"
     ),
     "build.zig.zon": (
         "8c9bab9a0d0c3cbd68c3b21bcfc212f7148d03c5a30ed9b3c669f1f68e886fba"
@@ -340,7 +340,7 @@ GUARDED_PRODUCER_FILES = {
         "1073f0dd62d950f97e1c0d3504e1c02d4c6af596b3f73221afb93977db3f4260"
     ),
     "support/build/postprocess-image.zig": (
-        "35b9f6890159b9c3f53b3a7ad9ba4be95cd25e86116cef176c9cea36309ef0cc"
+        "63ed0767c23b29310af05e48fde325563567b6858862ac902d6576f9ee4842e8"
     ),
     "support/build/symbols/libukrandom-lcpu.localize": (
         "b00d5cfee43ae40b56bda292365bf7339d2c8f4239131d632edbebe623e940c6"
@@ -520,10 +520,10 @@ GUARDED_PRODUCER_FILES = {
         "3379115753b149a6f16675cb3d5f315c25bfb49bf702720cdc882470434ef0f1"
     ),
     "support/build/native-postprocess-runner.zig": (
-        "f7700d90475285230dd5bc1dbf9c4142b1c16c90c931bf4fcc07605e725861d1"
+        "1a775accf2ee35ff7b6e6c9a836e726cec529488cfa44c1e1aa1f23b03a4ac9e"
     ),
     "support/build/native-postprocess.zig": (
-        "294ffe3767a69e7cb60aecf4a8417924e27eb69996562afe954f7efdc6b57381"
+        "857f4b970f815f815f3a18118f918a62e8ef517cf12e0b524cebc39895151b85"
     ),
     "support/scripts/elf_tools.py": (
         "0aad63e7830a814a5c29a7330925f64e8c844cf28700aa959002a629d5019820"

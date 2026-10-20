@@ -662,8 +662,7 @@ pub fn execute(
 
 fn nativeArguments(allocator: std.mem.Allocator, operation: Operation) Error![]const Argument {
     switch (operation.kind) {
-        .uk_reloc, .strip, .bootinfo, .efi, .objcopy_binary, .compile_database => {},
-        else => return error.UnsupportedTransformation,
+        .uk_reloc, .strip, .bootinfo, .multiboot, .efi, .objcopy_binary, .linux_header, .compile_database => {},
     }
     var result = std.array_list.Managed(Argument).init(allocator);
     errdefer result.deinit();
@@ -982,13 +981,58 @@ test "EFI plan populates relocation data before strip and EFI conversion" {
     try std.testing.expectEqual(plan.operations[2].outputs[0], efi_args[3].output);
 }
 
-test "native postprocess cannot implicitly fall back to an unrelated Python mode" {
-    try std.testing.expectError(error.UnsupportedTransformation, nativeArguments(std.testing.allocator, .{
+test "native postprocess arguments strip legacy script and inspector flags for multiboot and linux-header" {
+    const multiboot_args = try nativeArguments(std.testing.allocator, .{
         .transformation = "multiboot",
         .kind = .multiboot,
         .inputs = &.{0},
         .outputs = &.{1},
-        .arguments = &.{.{ .literal = "multiboot" }},
+        .arguments = &.{
+            .{ .literal = "multiboot" },
+            .{ .literal = "--script" },
+            .{ .helper = .multiboot },
+            .{ .input = 0 },
+            .{ .output = 1 },
+        },
+    });
+    defer std.testing.allocator.free(multiboot_args);
+    try std.testing.expectEqual(@as(usize, 3), multiboot_args.len);
+    try std.testing.expectEqualStrings("multiboot", multiboot_args[0].literal);
+    try std.testing.expectEqual(@as(usize, 0), multiboot_args[1].input);
+    try std.testing.expectEqual(@as(usize, 1), multiboot_args[2].output);
+
+    const linux_args = try nativeArguments(std.testing.allocator, .{
+        .transformation = "linux-header",
+        .kind = .linux_header,
+        .inputs = &.{ 0, 1 },
+        .outputs = &.{2},
+        .arguments = &.{
+            .{ .literal = "linux-header" },
+            .{ .literal = "--script" },
+            .{ .helper = .linux_header },
+            .{ .literal = "--nm" },
+            .{ .tool = .nm },
+            .{ .input = 0 },
+            .{ .input = 1 },
+            .{ .output = 2 },
+        },
+    });
+    defer std.testing.allocator.free(linux_args);
+    try std.testing.expectEqual(@as(usize, 4), linux_args.len);
+    try std.testing.expectEqualStrings("linux-header", linux_args[0].literal);
+    try std.testing.expectEqual(@as(usize, 0), linux_args[1].input);
+    try std.testing.expectEqual(@as(usize, 1), linux_args[2].input);
+    try std.testing.expectEqual(@as(usize, 2), linux_args[3].output);
+
+    try std.testing.expectError(error.MalformedTransformation, nativeArguments(std.testing.allocator, .{
+        .transformation = "multiboot",
+        .kind = .multiboot,
+        .inputs = &.{0},
+        .outputs = &.{1},
+        .arguments = &.{
+            .{ .literal = "multiboot" },
+            .{ .helper = .multiboot },
+        },
     }));
 }
 

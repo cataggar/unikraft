@@ -1905,16 +1905,16 @@ pub fn build(b: *std.Build) void {
         "test-target-config-cache",
         "Test warm configuration/header caches and live path/executable trust refusals",
     ).dependOn(&target_config_cache_test.step);
-    const native_postprocess_integration = b.addSystemCommand(&.{
-        "python3",
-        "support/build/tests/native-postprocess-test.py",
-        "--work-dir",
+    const native_postprocess_image_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/native-postprocess-tests.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
     });
-    native_postprocess_integration.addDirectoryArg(.cache_root);
-    native_postprocess_integration.addArgs(&.{ "--base", root });
-    native_postprocess_integration.setCwd(.{ .cwd_relative = root });
-    native_postprocess_integration.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
-    test_step.dependOn(&native_postprocess_integration.step);
+    const run_native_postprocess_image_tests = b.addRunArtifact(native_postprocess_image_tests);
+    run_native_postprocess_image_tests.setCwd(.cache_root);
+    test_step.dependOn(&run_native_postprocess_image_tests.step);
     const acme_integration_output = b.graph.path(.local_cache, "native-config-acme");
     const integration_metadata = acme_integration_output.path(b, "metadata.tsv");
     const acme_config = resolvePath(
@@ -2520,17 +2520,14 @@ fn finishNativeImages(
             .readelf = forwardedCommand(options.forwarded, "READELF") orelse "llvm-readelf",
         },
         .{
-            .native_runner = if (std.mem.eql(u8, registered.graph.selectedPlatform().name, "hyperv"))
-                b.addExecutable(.{
-                    .name = "native-postprocess-runner",
-                    .root_module = b.createModule(.{
-                        .root_source_file = b.path("support/build/native-postprocess-runner.zig"),
-                        .target = b.graph.host,
-                        .optimize = .safe,
-                    }),
-                })
-            else
-                null,
+            .native_runner = b.addExecutable(.{
+                .name = "native-postprocess-runner",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("support/build/native-postprocess-runner.zig"),
+                    .target = b.graph.host,
+                    .optimize = .safe,
+                }),
+            }),
             .runner = b.path("support/build/native-postprocess-runner.py"),
             .uk_reloc = b.path("support/scripts/mkukreloc.py"),
             .bootinfo = b.path("support/scripts/mkbootinfo.py"),

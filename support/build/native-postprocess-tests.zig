@@ -108,6 +108,28 @@ fn symbol(bytes: []u8, index: usize, name: []const u8, value: u64, endian: std.b
     put(u64, bytes, pos + 8, value, endian);
 }
 
+fn arm64LinuxFixture() [0x7400]u8 {
+    var bytes = fixture(.little, .AARCH64);
+    const extra_names = "_start_ram_addr\x00_libkvmplat_entry\x00";
+    const start_ram_off = symbol_names.len;
+    const entry_off = start_ram_off + "_start_ram_addr\x00".len;
+    @memcpy(bytes[strings_offset + start_ram_off ..][0..extra_names.len], extra_names);
+    put(u64, &bytes, section_table + 2 * 64 + 32, symbol_names.len + extra_names.len, .little);
+    put(u64, &bytes, section_table + 3 * 64 + 32, 14 * 24, .little);
+    symbol(&bytes, 1, "_base_addr", 0x40200040, .little);
+    const pos12 = symbol_table + 12 * 24;
+    put(u32, &bytes, pos12, @intCast(start_ram_off), .little);
+    bytes[pos12 + 4] = 0x10;
+    put(u16, &bytes, pos12 + 6, std.elf.SHN_ABS, .little);
+    put(u64, &bytes, pos12 + 8, 0x40000000, .little);
+    const pos13 = symbol_table + 13 * 24;
+    put(u32, &bytes, pos13, @intCast(entry_off), .little);
+    bytes[pos13 + 4] = 0x10;
+    put(u16, &bytes, pos13 + 6, std.elf.SHN_ABS, .little);
+    put(u64, &bytes, pos13 + 8, 0x40200080, .little);
+    return bytes;
+}
+
 test "ELF64 parsing uses standard ELF structs and handles both byte orders and extended counts" {
     for ([_]std.builtin.Endian{ .little, .big }) |endian| {
         for ([_]std.elf.EM{ .X86_64, .AARCH64 }) |machine| {
@@ -436,6 +458,117 @@ test "EFI rejects wrong endian missing entry architecture mismatch and overflowi
     try testing.expectError(error.MissingLoadSegments, transform.efi(testing.allocator, image, image));
 }
 
+test "multiboot prepends ELF32 and multiboot headers and adjusts program and section offsets" {
+    const bytes = fixture(.little, .X86_64);
+    const actual = try transform.multiboot(testing.allocator, &bytes);
+    defer testing.allocator.free(actual);
+    const prepend_offset: usize = 64 + 3 * 32;
+    const shoff: usize = prepend_offset + bytes.len;
+    try testing.expectEqual(shoff + 11 * 40, actual.len);
+    try testing.expectEqualSlices(u8, "\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00", actual[0..16]);
+    try testing.expectEqual(@as(u16, 3), try format.integer(u16, actual, 16, .little));
+    try testing.expectEqual(@as(u16, 3), try format.integer(u16, actual, 18, .little));
+    try testing.expectEqual(@as(u32, 1), try format.integer(u32, actual, 20, .little));
+    try testing.expectEqualSlices(u8, bytes[24..28], actual[24..28]);
+    try testing.expectEqual(@as(u32, 64), try format.integer(u32, actual, 28, .little));
+    try testing.expectEqual(@as(u32, @intCast(shoff)), try format.integer(u32, actual, 32, .little));
+    try testing.expectEqual(@as(u16, 52), try format.integer(u16, actual, 40, .little));
+    try testing.expectEqual(@as(u16, 32), try format.integer(u16, actual, 42, .little));
+    try testing.expectEqual(@as(u16, 3), try format.integer(u16, actual, 44, .little));
+    try testing.expectEqual(@as(u16, 40), try format.integer(u16, actual, 46, .little));
+    try testing.expectEqual(@as(u16, 11), try format.integer(u16, actual, 48, .little));
+    try testing.expectEqual(@as(u16, 1), try format.integer(u16, actual, 50, .little));
+    try testing.expectEqual(@as(u32, 0x1BADB002), try format.integer(u32, actual, 52, .little));
+    try testing.expectEqual(@as(u32, 0x00000003), try format.integer(u32, actual, 56, .little));
+    try testing.expectEqual(@as(u32, 0xE4524FFB), try format.integer(u32, actual, 60, .little));
+    for ([_]u32{ 0x1000, 0x2000, 0x2200 }, 0..) |orig_off, idx| {
+        const phdr_pos = 64 + idx * 32;
+        try testing.expectEqual(orig_off + @as(u32, @intCast(prepend_offset)), try format.integer(u32, actual, phdr_pos + 4, .little));
+    }
+    try testing.expectEqualSlices(u8, &bytes, actual[prepend_offset..shoff]);
+    for (0..11) |idx| {
+        const orig_sh_off = try format.integer(u32, &bytes, section_table + idx * 64 + 24, .little);
+        const shdr_pos = shoff + idx * 40;
+        try testing.expectEqual(orig_sh_off + @as(u32, @intCast(prepend_offset)), try format.integer(u32, actual, shdr_pos + 16, .little));
+    }
+    const arm_bytes = fixture(.little, .AARCH64);
+    try testing.expectError(error.UnsupportedArchitecture, transform.multiboot(testing.allocator, &arm_bytes));
+}
+
+test "linuxHeader prepends arm64 boot header with branch offset and 2MiB-aligned image size" {
+    const elf_bytes = arm64LinuxFixture();
+    var elf_image = try format.Image.parse(testing.allocator, &elf_bytes);
+    defer elf_image.deinit();
+    const raw = "arm64-raw-image-payload";
+    const actual = try transform.linuxHeader(testing.allocator, raw, elf_image);
+    defer testing.allocator.free(actual);
+    try testing.expectEqual(64 + raw.len, actual.len);
+    try testing.expectEqual(@as(u32, 0x91005A4D), try format.integer(u32, actual, 0, .little));
+    try testing.expectEqual(@as(u32, 0x1400001f), try format.integer(u32, actual, 4, .little));
+    try testing.expectEqual(@as(u64, 0x200000), try format.integer(u64, actual, 8, .little));
+    try testing.expectEqual(@as(u64, 0x200000), try format.integer(u64, actual, 16, .little));
+    try testing.expectEqual(@as(u64, 0xA), try format.integer(u64, actual, 24, .little));
+    try testing.expectEqualSlices(u8, &(@as([24]u8, @splat(0))), actual[32..56]);
+    try testing.expectEqualSlices(u8, "ARM\x64", actual[56..60]);
+    try testing.expectEqual(@as(u32, 0x40), try format.integer(u32, actual, 60, .little));
+    try testing.expectEqualSlices(u8, raw, actual[64..]);
+
+    const x86_bytes = fixture(.little, .X86_64);
+    var x86_image = try format.Image.parse(testing.allocator, &x86_bytes);
+    defer x86_image.deinit();
+    try testing.expectError(error.UnsupportedArchitecture, transform.linuxHeader(testing.allocator, raw, x86_image));
+
+    for (elf_image.symbols) |*sym| {
+        if (std.mem.eql(u8, sym.name, "_libkvmplat_entry")) sym.header.st_value = 0x40200082;
+    }
+    try testing.expectError(error.InvalidEntryOffset, transform.linuxHeader(testing.allocator, raw, elf_image));
+    for (elf_image.symbols) |*sym| {
+        if (std.mem.eql(u8, sym.name, "_libkvmplat_entry")) sym.header.st_value = 0x40200080;
+        if (std.mem.eql(u8, sym.name, "_base_addr")) sym.header.st_value = 0x40000020;
+    }
+    try testing.expectError(error.InvalidSymbolAddress, transform.linuxHeader(testing.allocator, raw, elf_image));
+}
+
+test "runner execute handles multiboot and linux-header end-to-end" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try temporary.dir.realPath(testing.io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    const mb_in = try std.fs.path.join(testing.allocator, &.{ root, "mb-in.elf" });
+    defer testing.allocator.free(mb_in);
+    const mb_out = try std.fs.path.join(testing.allocator, &.{ root, "mb-out.elf" });
+    defer testing.allocator.free(mb_out);
+    const x86_bytes = fixture(.little, .X86_64);
+    try runner.write(testing.io, mb_in, &x86_bytes);
+    try runner.execute(testing.allocator, testing.io, &.{ "multiboot", mb_in, mb_out });
+    const mb_actual = try runner.read(testing.allocator, testing.io, mb_out);
+    defer testing.allocator.free(mb_actual);
+    const mb_expected = try transform.multiboot(testing.allocator, &x86_bytes);
+    defer testing.allocator.free(mb_expected);
+    try testing.expectEqualSlices(u8, mb_expected, mb_actual);
+
+    const linux_bin = try std.fs.path.join(testing.allocator, &.{ root, "linux-in.bin" });
+    defer testing.allocator.free(linux_bin);
+    const linux_elf = try std.fs.path.join(testing.allocator, &.{ root, "linux-in.elf" });
+    defer testing.allocator.free(linux_elf);
+    const linux_out = try std.fs.path.join(testing.allocator, &.{ root, "linux-out.img" });
+    defer testing.allocator.free(linux_out);
+    const raw = "raw-binary-image";
+    const arm_bytes = arm64LinuxFixture();
+    try runner.write(testing.io, linux_bin, raw);
+    try runner.write(testing.io, linux_elf, &arm_bytes);
+    try runner.execute(testing.allocator, testing.io, &.{ "linux-header", linux_bin, linux_elf, linux_out });
+    const linux_actual = try runner.read(testing.allocator, testing.io, linux_out);
+    defer testing.allocator.free(linux_actual);
+    var arm_image = try format.Image.parse(testing.allocator, &arm_bytes);
+    defer arm_image.deinit();
+    const linux_expected = try transform.linuxHeader(testing.allocator, raw, arm_image);
+    defer testing.allocator.free(linux_expected);
+    try testing.expectEqualSlices(u8, linux_expected, linux_actual);
+}
+
 test "native tool argv quoting is preserved without a shell or Python fallback" {
     const args = try runner.splitCommand(testing.allocator, " '/native tools/llvm-objcopy' --flag=\"two words\" '' plain\\ space \"a\\qb\"");
     defer runner.freeCommand(testing.allocator, args);
@@ -444,7 +577,10 @@ test "native tool argv quoting is preserved without a shell or Python fallback" 
         try testing.expectEqualStrings(expected, actual);
     for ([_][]const u8{ "", " ", "''", "'unclosed", "tool\\", "tool\\\x00" }) |input|
         try testing.expectError(error.InvalidToolCommand, runner.splitCommand(testing.allocator, input));
-    try testing.expectError(error.UnsupportedTransformation, runner.execute(testing.allocator, testing.io, &.{"multiboot"}));
+    try testing.expectError(error.UnsupportedTransformation, runner.execute(testing.allocator, testing.io, &.{"gzip"}));
+    try testing.expectError(error.InvalidArguments, runner.execute(testing.allocator, testing.io, &.{"multiboot"}));
+    try testing.expectError(error.InvalidArguments, runner.execute(testing.allocator, testing.io, &.{ "multiboot", "--script", "old.py", "in", "out" }));
+    try testing.expectError(error.InvalidArguments, runner.execute(testing.allocator, testing.io, &.{ "linux-header", "--nm", "llvm-nm", "in.bin", "in.elf", "out" }));
     try testing.expectError(error.InvalidArguments, runner.execute(testing.allocator, testing.io, &.{ "efi", "--script", "old.py", "in", "debug", "out" }));
     try testing.expectError(error.InvalidArguments, runner.execute(testing.allocator, testing.io, &.{ "bootinfo", "--arch", "mips", "--objcopy", "tool", "in", "side", "out" }));
 }
@@ -457,8 +593,15 @@ fn allocationFixture(allocator: std.mem.Allocator) !void {
     defer allocator.free(reloc);
     const boot = try transform.bootinfo(allocator, image, "guest.elf", true);
     defer allocator.free(boot);
+    const mb = try transform.multiboot(allocator, &bytes);
+    defer allocator.free(mb);
     const efi = try transform.efi(allocator, image, image);
     defer allocator.free(efi);
+    const arm_bytes = arm64LinuxFixture();
+    var arm_image = try format.Image.parse(allocator, &arm_bytes);
+    defer arm_image.deinit();
+    const linux = try transform.linuxHeader(allocator, "raw", arm_image);
+    defer allocator.free(linux);
     const command = try runner.splitCommand(allocator, "'/native tools/objcopy' --flag value");
     defer runner.freeCommand(allocator, command);
 }

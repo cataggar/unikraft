@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2022, 2023, Unikraft GmbH and The Unikraft Authors.
 
-//! Native equivalents of the reached mkukreloc, mkbootinfo and mkefi actions.
+//! Native equivalents of the reached mkukreloc, mkbootinfo, multiboot, mkefi
+//! and mklinux actions.
 //! LLVM strip/objcopy remain responsible for ELF layout-changing operations.
 const std = @import("std");
 const elf = std.elf;
@@ -410,6 +411,127 @@ pub fn efi(allocator: std.mem.Allocator, image: Image, debug: Image) ![]u8 {
     return result;
 }
 
+pub fn multiboot(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var image = try format.Image.parse(allocator, input);
+    defer image.deinit();
+    if (image.header.machine != .X86_64) return error.UnsupportedArchitecture;
+    const endian = image.header.endian;
+    const e_phoff = try format.integer(u64, input, 32, endian);
+    const e_shoff = try format.integer(u64, input, 40, endian);
+    const e_phentsize = try format.integer(u16, input, 54, endian);
+    const e_phnum = try format.integer(u16, input, 56, endian);
+    const e_shentsize = try format.integer(u16, input, 58, endian);
+    const e_shnum = try format.integer(u16, input, 60, endian);
+    if (e_phnum == elf.PN_XNUM or e_shnum == 0) return error.InvalidElfHeader;
+
+    const elf32_ehdr_len: usize = 52;
+    const elf32_phdr_len: usize = 32;
+    const elf32_shdr_len: usize = 40;
+    const multiboot_header_end_off: usize = elf32_ehdr_len + 12;
+    const prepend_offset: u64 = multiboot_header_end_off + @as(u64, elf32_phdr_len) * @as(u64, e_phnum);
+    const shoff_u64 = try add(prepend_offset, input.len);
+    const shoff32 = std.math.cast(u32, shoff_u64) orelse return error.IntegerOverflow;
+    const shdrs_bytes = std.math.mul(u64, elf32_shdr_len, e_shnum) catch return error.IntegerOverflow;
+    const total_len = try format.asUsize(try add(shoff_u64, shdrs_bytes));
+
+    const result = try allocator.alloc(u8, total_len);
+    errdefer allocator.free(result);
+    @memset(result, 0);
+
+    @memcpy(result[0..16], "\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00");
+    @memcpy(result[16..18], input[16..18]);
+    put(u16, result, 18, 3, endian);
+    @memcpy(result[20..24], input[20..24]);
+    @memcpy(result[24..28], input[24..28]);
+    put(u32, result, 28, multiboot_header_end_off, endian);
+    put(u32, result, 32, shoff32, endian);
+    @memcpy(result[36..40], input[48..52]);
+    put(u16, result, 40, elf32_ehdr_len, endian);
+    put(u16, result, 42, elf32_phdr_len, endian);
+    @memcpy(result[44..46], input[56..58]);
+    put(u16, result, 46, elf32_shdr_len, endian);
+    @memcpy(result[48..50], input[60..62]);
+    @memcpy(result[50..52], input[62..64]);
+
+    const mb_magic: u32 = 0x1BADB002;
+    const mb_flags: u32 = 0x00000003;
+    const mb_checksum: u32 = @bitCast(-@as(i32, @intCast(mb_magic + mb_flags)));
+    put(u32, result, 52, mb_magic, .little);
+    put(u32, result, 56, mb_flags, .little);
+    put(u32, result, 60, mb_checksum, .little);
+
+    for (0..e_phnum) |index| {
+        const elf64_phdr = try format.range(input, e_phoff + index * @as(u64, e_phentsize), e_phentsize);
+        const elf32_phdr = result[multiboot_header_end_off + index * elf32_phdr_len ..][0..elf32_phdr_len];
+        @memcpy(elf32_phdr[0..4], elf64_phdr[0..4]);
+        const old_off = try format.integer(u32, elf64_phdr, 8, endian);
+        const new_off = std.math.cast(u32, try add(prepend_offset, old_off)) orelse return error.IntegerOverflow;
+        put(u32, elf32_phdr, 4, new_off, endian);
+        @memcpy(elf32_phdr[8..12], elf64_phdr[16..20]);
+        @memcpy(elf32_phdr[12..16], elf64_phdr[24..28]);
+        @memcpy(elf32_phdr[16..20], elf64_phdr[32..36]);
+        @memcpy(elf32_phdr[20..24], elf64_phdr[40..44]);
+        @memcpy(elf32_phdr[24..28], elf64_phdr[4..8]);
+        @memcpy(elf32_phdr[28..32], elf64_phdr[48..52]);
+    }
+
+    const prepend_usize = try format.asUsize(prepend_offset);
+    @memcpy(result[prepend_usize..][0..input.len], input);
+
+    const shoff_usize = try format.asUsize(shoff_u64);
+    for (0..e_shnum) |index| {
+        const elf64_shdr = try format.range(input, e_shoff + index * @as(u64, e_shentsize), e_shentsize);
+        const elf32_shdr = result[shoff_usize + index * elf32_shdr_len ..][0..elf32_shdr_len];
+        @memcpy(elf32_shdr[0..4], elf64_shdr[0..4]);
+        @memcpy(elf32_shdr[4..8], elf64_shdr[4..8]);
+        @memcpy(elf32_shdr[8..12], elf64_shdr[8..12]);
+        @memcpy(elf32_shdr[12..16], elf64_shdr[16..20]);
+        const old_off = try format.integer(u32, elf64_shdr, 24, endian);
+        const new_off = std.math.cast(u32, try add(prepend_offset, old_off)) orelse return error.IntegerOverflow;
+        put(u32, elf32_shdr, 16, new_off, endian);
+        @memcpy(elf32_shdr[20..24], elf64_shdr[32..36]);
+        @memcpy(elf32_shdr[24..28], elf64_shdr[40..44]);
+        @memcpy(elf32_shdr[28..32], elf64_shdr[44..48]);
+        @memcpy(elf32_shdr[32..36], elf64_shdr[48..52]);
+        @memcpy(elf32_shdr[36..40], elf64_shdr[56..60]);
+    }
+    return result;
+}
+
+pub fn linuxHeader(allocator: std.mem.Allocator, raw_binary: []const u8, elf_image: Image) ![]u8 {
+    if (elf_image.header.machine != .AARCH64) return error.UnsupportedArchitecture;
+    const ram_base = try elf_image.symbol("_start_ram_addr");
+    const img_base = try elf_image.symbol("_base_addr");
+    const entry = try elf_image.symbol("_libkvmplat_entry");
+
+    const hdr_size: u64 = 64;
+    if (img_base < hdr_size - 4 or img_base < try add(ram_base, hdr_size))
+        return error.InvalidSymbolAddress;
+    const pc = img_base - hdr_size + 4;
+    if (entry < pc) return error.InvalidEntryOffset;
+    const offs = entry - pc;
+    if (offs > ((1 << 26) / 2 - 1) or (offs & 3) != 0)
+        return error.InvalidEntryOffset;
+    const code0: u32 = 0x91005A4D;
+    const code1: u32 = (0b101 << 26) | @as(u32, @intCast(offs / 4));
+    const load_offs: u64 = (img_base - ram_base) - hdr_size;
+    const total_size = try std.math.add(u64, raw_binary.len, hdr_size);
+    const image_size: u64 = std.mem.alignForward(u64, total_size, 1 << 21);
+    const kernel_flags: u64 = 0xA;
+
+    const out = try allocator.alloc(u8, try format.asUsize(total_size));
+    @memset(out[0..64], 0);
+    put(u32, out, 0, code0, .little);
+    put(u32, out, 4, code1, .little);
+    put(u64, out, 8, load_offs, .little);
+    put(u64, out, 16, image_size, .little);
+    put(u64, out, 24, kernel_flags, .little);
+    put(u32, out, 56, 0x644D5241, .little);
+    put(u32, out, 60, 0x00000040, .little);
+    @memcpy(out[64..], raw_binary);
+    return out;
+}
+
 fn pe32(bytes: []u8, offset: usize, value: u64) !void {
     put(u32, bytes, offset, std.math.cast(u32, value) orelse return error.PeFieldOverflow, .little);
 }
@@ -434,6 +556,8 @@ pub fn diagnostic(err: anyerror) []const u8 {
         error.UnsupportedEfiEndian => "EFI requires little-endian ELF inputs",
         error.ArchitectureMismatch => "ELF architecture does not match the selected architecture or debug image",
         error.InvalidEfiEntry => "uk_efi_entry64 is outside executable ELF LOAD segments",
+        error.InvalidSymbolAddress => "invalid Linux boot header symbol address",
+        error.InvalidEntryOffset => "Linux boot header entry branch offset is out of range or misaligned",
         error.PeFieldOverflow => "ELF metadata does not fit a PE32+ header field",
         error.ToolFailed => "native strip/objcopy tool failed",
         error.InvalidArguments => "invalid native post-processing arguments",
