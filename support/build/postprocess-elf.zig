@@ -149,13 +149,22 @@ pub const Image = struct {
     }
 
     pub fn symbol(self: Image, name: []const u8) !u64 {
-        var found: ?u64 = null;
-        for (self.symbols) |item| {
-            if (!std.mem.eql(u8, name, item.name)) continue;
-            if (found != null) return error.DuplicateSymbol;
-            found = item.header.st_value;
+        var low: usize = 0;
+        var high: usize = self.symbols.len;
+        while (low < high) {
+            const idx = low + (high - low) / 2;
+            switch (std.mem.order(u8, self.symbols[idx].name, name)) {
+                .lt => low = idx + 1,
+                .gt => high = idx,
+                .eq => {
+                    if ((idx > 0 and std.mem.eql(u8, self.symbols[idx - 1].name, name)) or
+                        (idx + 1 < self.symbols.len and std.mem.eql(u8, self.symbols[idx + 1].name, name)))
+                        return error.DuplicateSymbol;
+                    return self.symbols[idx].header.st_value;
+                },
+            }
         }
-        return found orelse error.MissingSymbol;
+        return error.MissingSymbol;
     }
 
     pub fn sectionData(self: Image, item: Section) ![]const u8 {

@@ -164,9 +164,9 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "be56b33917c95492a44af2c45be42002e7ffc9a63e532804d92768b0d5ccf7c9"
+            "e62a19ca3809bd54fa958dd2a19c54ad2c284fba5f944c5b43e0e7b3cda40e98"
         ),
-        "size": 1820420,
+        "size": 1826333,
         "files": 220,
     },
     "support/kconfig": {
@@ -513,13 +513,13 @@ GUARDED_PRODUCER_FILES = {
         "181edc4a09ff985241ea8809127c42c4aa86732552d231cd53d3dec10ced0cc8"
     ),
     "support/build/postprocess-elf.zig": (
-        "a5216c490acbf66c7b9c97cba3ebea8a5cd024416e494e61658d9f505b5b7376"
+        "27a9329835e22de71ac90226299a4c54bdc1db89fe7adb667857715b1710ab4d"
     ),
     "support/build/postprocess-files.zig": (
         "1073f0dd62d950f97e1c0d3504e1c02d4c6af596b3f73221afb93977db3f4260"
     ),
     "support/build/postprocess-image.zig": (
-        "528654fe904ddfa17268a6315c388fb644c4eb8acf3d356a9547b653a9c6b169"
+        "35b9f6890159b9c3f53b3a7ad9ba4be95cd25e86116cef176c9cea36309ef0cc"
     ),
     "support/build/symbols/libukrandom-lcpu.localize": (
         "b00d5cfee43ae40b56bda292365bf7339d2c8f4239131d632edbebe623e940c6"
