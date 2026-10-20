@@ -123,7 +123,7 @@ fn scan(allocator: std.mem.Allocator, source: []const u8) !void {
     var depth: usize = 0;
     var tokens: usize = 0;
     while (true) {
-        const token = scanner.nextAllocMax(allocator, .alloc_always, maximum_capture_bytes) catch |err| return jsonError(err);
+        const token = scanner.nextAllocMax(allocator, .alloc_if_needed, maximum_capture_bytes) catch |err| return jsonError(err);
         defer switch (token) {
             .allocated_string, .allocated_number => |bytes| allocator.free(bytes),
             else => {},
