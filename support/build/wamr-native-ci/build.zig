@@ -147,10 +147,9 @@ pub fn build(b: *std.Build) void {
         } else {
             install_step.dependOn(&b.addInstallArtifact(controller_cli, .{}).step);
         }
-    } else
-        install_step.dependOn(&b.addFail(
-            "install-controller requires -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 (or -Dcpu=x86_64_v3) -Doptimize=safe",
-        ).step);
+    } else install_step.dependOn(&b.addFail(
+        "install-controller requires -Dtarget=x86_64-linux-gnu -Dcpu=x86_64_v2 (or -Dcpu=x86_64_v3) -Doptimize=safe",
+    ).step);
     const host_direct = b.dependency("direct_validator", .{
         .target = b.graph.host,
         .optimize = .safe,
@@ -256,8 +255,7 @@ pub fn build(b: *std.Build) void {
         controller_options.addOption([]const u8, "fixture_root", custom_fixture_root);
     } else if (env_cache_fixture_root) |cache_root| {
         controller_options.addOption([]const u8, "fixture_root", cache_root);
-    } else
-        controller_options.addOptionPathUntracked("fixture_root", .cache_root);
+    } else controller_options.addOptionPathUntracked("fixture_root", .cache_root);
     const is_native_target = requested_target.isNative();
     const host_core = if (is_native_target) core else blk: {
         const mod = b.createModule(.{
@@ -602,8 +600,7 @@ pub fn build(b: *std.Build) void {
         source_limits_options.addOption([]const u8, "fixture_root", custom_fixture_root);
     } else if (env_cache_fixture_root) |cache_root| {
         source_limits_options.addOption([]const u8, "fixture_root", b.pathJoin(&.{ cache_root, "source-limits-work" }));
-    } else
-        source_limits_options.addOptionPathUntracked("fixture_root", std.Build.LazyPath.cache_root.path(b, "source-limits-work"));
+    } else source_limits_options.addOptionPathUntracked("fixture_root", std.Build.LazyPath.cache_root.path(b, "source-limits-work"));
     source_limits_tests.root_module.addOptions("test_options", source_limits_options);
     const source_limits_run = b.addRunArtifact(source_limits_tests);
     b.step("test-controller-limits", "Run native source-custody production boundary fixtures")
@@ -627,8 +624,7 @@ pub fn build(b: *std.Build) void {
         fault_parity_options.addOption([]const u8, "fixture_root", custom_fixture_root);
     } else if (env_cache_fixture_root) |cache_root| {
         fault_parity_options.addOption([]const u8, "fixture_root", b.pathJoin(&.{ cache_root, "fault-parity-work" }));
-    } else
-        fault_parity_options.addOptionPathUntracked("fixture_root", std.Build.LazyPath.cache_root.path(b, "fault-parity-work"));
+    } else fault_parity_options.addOptionPathUntracked("fixture_root", std.Build.LazyPath.cache_root.path(b, "fault-parity-work"));
     fault_parity_options.addOptionPath("git_executable", b.findProgramLazy(.{ .names = &.{"git"} }));
     fault_parity_options.addOptionPath("command_fixture", command_fixture.getEmittedBin());
     fault_parity_options.addOptionPath("descendant_fixture", descendant_fixture.getEmittedBin());
@@ -744,8 +740,15 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addRunArtifact(tests);
     const unit_step = b.step("test-unit", "Test the compute packaging adapter command boundary");
     unit_step.dependOn(&unit_tests.step);
-    const cli_tests = b.addSystemCommand(&.{ "python3", "-B" });
-    cli_tests.addFileArg(b.path("../../apps/wamr-aot/validator/cli_test.py"));
+    const cli_tests_exe = b.addExecutable(.{
+        .name = "uk-wamr-log-validate-cli-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("../../apps/wamr-aot/validator/cli_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const cli_tests = b.addRunArtifact(cli_tests_exe);
     cli_tests.addFileArg(log_cli.getEmittedBin());
     unit_step.dependOn(&cli_tests.step);
     const options = b.addOptions();

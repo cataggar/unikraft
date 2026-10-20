@@ -1879,9 +1879,16 @@ pub fn build(b: *std.Build) void {
     run_build_tools_integration.addArtifactArg(native_build_tools.legacyConfigFixture(b, b.path("."), bison_command, flex_command));
     build_tools_tests.dependOn(&run_build_tools_integration.step);
     test_step.dependOn(build_tools_tests);
-    const target_config_cache_test = b.addSystemCommand(&.{
-        "python3",
-        "support/build/tests/target-config-cache-test.py",
+    const target_config_cache_exe = b.addExecutable(.{
+        .name = "target-config-cache-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/tests/target-config-cache-test.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const target_config_cache_test = b.addRunArtifact(target_config_cache_exe);
+    target_config_cache_test.addArgs(&.{
         "--base",
         root,
         "--work-dir",
@@ -1899,7 +1906,6 @@ pub fn build(b: *std.Build) void {
         "--packages", std.fs.path.dirname(translator_root) orelse @panic("missing translator package directory"),
     });
     target_config_cache_test.setCwd(.{ .cwd_relative = root });
-    target_config_cache_test.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
     test_step.dependOn(&target_config_cache_test.step);
     b.step(
         "test-target-config-cache",
@@ -2000,9 +2006,24 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&compare_x86_header.step);
     const version_integration_output = b.graph.path(.local_cache, "native-config-version-test");
     const version_work_dir = version_integration_output.path(b, "cases");
-    const prepare_version_fragment = b.addSystemCommand(&.{
-        "python3",
-        "support/build/tests/native-config/version-metadata-test.py",
+    const version_metadata_exe = b.addExecutable(.{
+        .name = "version-metadata-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/tests/version-metadata-test.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+            .imports = &.{.{
+                .name = "native_config_metadata",
+                .module = b.createModule(.{
+                    .root_source_file = b.path("support/build/native-config-metadata.zig"),
+                    .target = b.graph.host,
+                    .optimize = .debug,
+                }),
+            }},
+        }),
+    });
+    const prepare_version_fragment = b.addRunArtifact(version_metadata_exe);
+    prepare_version_fragment.addArgs(&.{
         "--base",
         root,
         "--work-dir",
@@ -2011,7 +2032,6 @@ pub fn build(b: *std.Build) void {
     prepare_version_fragment.addArg("--prepare-output");
     prepare_version_fragment.addDirectoryArg(version_integration_output);
     prepare_version_fragment.setCwd(.{ .cwd_relative = root });
-    prepare_version_fragment.setEnvironmentVariable("PYTHONDONTWRITEBYTECODE", "1");
     const version_config = resolvePath(
         b.allocator,
         root,
@@ -2053,6 +2073,10 @@ pub fn build(b: *std.Build) void {
     compare_version_header.addFileArg(version_generated_header);
     compare_version_header.step.dependOn(&generate_version_header.step);
     test_step.dependOn(&compare_version_header.step);
+    b.step(
+        "test-version-metadata",
+        "Test native version metadata and Kconfig version path expansion",
+    ).dependOn(&prepare_version_fragment.step);
     const runner_link_targets = [_]struct {
         name: []const u8,
         query: std.Target.Query,
@@ -2509,7 +2533,6 @@ fn finishNativeImages(
         post_plan,
         &.{validated_link_output},
         .{
-            .python_executable = forwardedCommand(options.forwarded, "PYTHON") orelse "python3",
             .strip = registered.graph.toolchain.binutils.objcopy.command,
             .objcopy = registered.graph.toolchain.binutils.objcopy.command,
             .objdump = if (registered.graph.toolchain.binutils.objdump) |tool|
@@ -2528,14 +2551,6 @@ fn finishNativeImages(
                     .optimize = .safe,
                 }),
             }),
-            .runner = b.path("support/build/native-postprocess-runner.py"),
-            .uk_reloc = b.path("support/scripts/mkukreloc.py"),
-            .bootinfo = b.path("support/scripts/mkbootinfo.py"),
-            .multiboot = b.path("support/scripts/multiboot.py"),
-            .efi = b.path("support/scripts/mkefi.py"),
-            .linux_header = b.path("support/scripts/mklinux.py"),
-            .compile_database = b.path("support/scripts/mkcompiledb.py"),
-            .elf_tools = b.path("support/scripts/elf_tools.py"),
         },
     ) catch |err| {
         step.dependOn(&b.addFail(b.fmt(

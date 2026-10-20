@@ -294,18 +294,24 @@ pub fn addFixtureValidation(b: *std.Build) Error!*std.Build.Step {
     link.addArg("-o");
     const linked = link.addOutputFileArg("issue34-target-zig-linked.o");
 
-    const verify = b.addSystemCommand(&.{
-        "python3",
-        "support/build/tests/target-zig-object/verify.py",
+    const verify_tool = b.addExecutable(.{
+        .name = "verify-target-zig-object",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/tests/target-zig-object/verify.zig"),
+            .target = b.graph.host,
+            .optimize = .safe,
+        }),
+    });
+    const verify = b.addRunArtifact(verify_tool);
+    verify.addArgs(&.{
         "--readelf",
         "llvm-readelf",
         "--nm",
         "llvm-nm",
     });
     verify.addFileArg(linked);
-    const verify_stripped = b.addSystemCommand(&.{
-        "python3",
-        "support/build/tests/target-zig-object/verify.py",
+    const verify_stripped = b.addRunArtifact(verify_tool);
+    verify_stripped.addArgs(&.{
         "--readelf",
         "llvm-readelf",
         "--nm",
