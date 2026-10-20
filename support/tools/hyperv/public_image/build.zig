@@ -50,10 +50,24 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "public_image", .module = module }},
     }) });
+    const configure_cache_tests = b.addExecutable(.{
+        .name = "configure-cache-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("configure_cache_tests.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const run_configure_cache_tests = b.addRunArtifact(configure_cache_tests);
+    run_configure_cache_tests.has_side_effects = true;
+    run_configure_cache_tests.addArg(b.graph.zig_exe);
+    run_configure_cache_tests.addFileArg(b.path("build.zig"));
+    b.step("test-configure-cache", "Test public-image debug/safe warm configure cache peer commitment").dependOn(&run_configure_cache_tests.step);
+    const explicit_test_root = b.option([]const u8, "test-root", "Existing absolute private fixture directory");
     const options = b.addOptions();
     options.addOptionPath("cli", cli.getEmittedBin());
     options.addOptionPath("fixture", fixture.getEmittedBin());
-    options.addOption(?[]const u8, "test_root", b.option([]const u8, "test-root", "Existing absolute private fixture directory"));
+    options.addOption(?[]const u8, "test_root", explicit_test_root);
     const tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("tests.zig"),
         .target = target,
@@ -63,7 +77,12 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addOptions("test_options", options);
     const run_tests = b.addRunArtifact(tests);
     run_tests.has_side_effects = true;
-    b.step("test", "Test native public packaging/export without real guest boots").dependOn(&run_tests.step);
+    const test_step = b.step("test", "Test native public packaging/export without real guest boots");
+    if (explicit_test_root != null) {
+        test_step.dependOn(&run_tests.step);
+    } else {
+        test_step.dependOn(&run_configure_cache_tests.step);
+    }
     const hash_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("../sha256_tests.zig"),
         .target = target,
@@ -74,6 +93,7 @@ pub fn build(b: *std.Build) void {
     const run_hash_tests = b.addRunArtifact(hash_tests);
     b.step("test-sha256", "Check full-byte standard SHA equivalence and streaming boundaries").dependOn(&run_hash_tests.step);
     run_tests.step.dependOn(&run_hash_tests.step);
+    test_step.dependOn(&run_hash_tests.step);
     const import_options = b.addOptions();
     import_options.addOptionPath("cli", cli.getEmittedBin());
     import_options.addOption(?[]const u8, "test_root", b.option([]const u8, "import-test-root", "Existing private native import fixture directory"));

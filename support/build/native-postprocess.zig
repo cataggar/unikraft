@@ -529,14 +529,14 @@ pub const ToolCommands = struct {
 pub const ExecutorPaths = struct {
     /// Explicit selection: unsupported native operations fail, never fall back.
     native_runner: ?*std.Build.Step.Compile = null,
-    runner: std.Build.LazyPath,
-    uk_reloc: std.Build.LazyPath,
-    bootinfo: std.Build.LazyPath,
-    multiboot: std.Build.LazyPath,
-    efi: std.Build.LazyPath,
-    linux_header: std.Build.LazyPath,
-    compile_database: std.Build.LazyPath,
-    elf_tools: std.Build.LazyPath,
+    runner: ?std.Build.LazyPath = null,
+    uk_reloc: ?std.Build.LazyPath = null,
+    bootinfo: ?std.Build.LazyPath = null,
+    multiboot: ?std.Build.LazyPath = null,
+    efi: ?std.Build.LazyPath = null,
+    linux_header: ?std.Build.LazyPath = null,
+    compile_database: ?std.Build.LazyPath = null,
+    elf_tools: ?std.Build.LazyPath = null,
 };
 
 pub const TrackedOutput = struct {
@@ -595,14 +595,14 @@ pub fn execute(
                 "PYTHON",
                 tools.python_command orelse tools.python_executable,
             );
-            legacy.addFileArg(paths.runner);
+            legacy.addFileArg(paths.runner orelse return error.MissingTool);
             break :blk legacy;
         };
         if (!native and (operation.kind == .uk_reloc or operation.kind == .bootinfo or
             operation.kind == .efi or
             operation.kind == .linux_header))
         {
-            run.addFileInput(paths.elf_tools);
+            run.addFileInput(paths.elf_tools orelse return error.MissingTool);
         }
 
         const arguments = if (native)
@@ -631,14 +631,14 @@ pub fn execute(
                     resolved[artifact_index] = run.addOutputFileArg(basename);
                 },
                 .tool => |tool| run.addArg(try toolCommand(tools, tool)),
-                .helper => |helper| run.addFileArg(switch (helper) {
+                .helper => |helper| run.addFileArg((switch (helper) {
                     .uk_reloc => paths.uk_reloc,
                     .bootinfo => paths.bootinfo,
                     .multiboot => paths.multiboot,
                     .efi => paths.efi,
                     .linux_header => paths.linux_header,
                     .compile_database => paths.compile_database,
-                }),
+                }) orelse return error.MissingTool),
             }
         }
         for (operation.outputs) |artifact_index| {

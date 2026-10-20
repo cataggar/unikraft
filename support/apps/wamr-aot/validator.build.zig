@@ -60,8 +60,15 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run native WAMR validator primitive tests");
     test_step.dependOn(&native_tests.step);
     test_step.dependOn(&production.step);
-    const cli_tests = b.addSystemCommand(&.{ "python3", "-B" });
-    cli_tests.addFileArg(b.path("validator/cli_test.py"));
+    const cli_tests_exe = b.addExecutable(.{
+        .name = "uk-wamr-log-validate-cli-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("validator/cli_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const cli_tests = b.addRunArtifact(cli_tests_exe);
     cli_tests.addFileArg(cli.getEmittedBin());
     test_step.dependOn(&cli_tests.step);
 }

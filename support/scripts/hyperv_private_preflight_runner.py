@@ -78,10 +78,10 @@ GUARDED_PRODUCER_CLOSURES = {
     "support/build": {
         "name": "support/build",
         "sha256": (
-            "5e2c82067e6e8c044656ca0b811cc560f154e4fd2af66e6244d0bd34d3242584"
+            "b5d5b70a725a1abf3d4f73c6aa4a54cb7b7e9d30af8640166216689b1f10fb9c"
         ),
-        "size": 1843976,
-        "files": 220,
+        "size": 1879841,
+        "files": 223,
     },
     "support/kconfig": {
         "name": "support/kconfig",
@@ -226,7 +226,7 @@ GUARDED_PRODUCER_FILES = {
         "288bb7b13ca5484812e1fa5c6bdc34724607b61d8542cef08357c4e4988bcf09"
     ),
     "build.zig": (
-        "839db0460fa009db9885cf45c53ea615c7bd878d0cdb6dfa9aee4e97147fbdf3"
+        "c67ef734491a3f0b696c0af2a3ea9ed85a38ce9053f760b43f82c42a2e2b3a10"
     ),
     "build.zig.zon": (
         "8c9bab9a0d0c3cbd68c3b21bcfc212f7148d03c5a30ed9b3c669f1f68e886fba"
@@ -331,7 +331,7 @@ GUARDED_PRODUCER_FILES = {
         "481a8e9c2bfad546ecc94647f69b82d9d6dc8d86534d5f284d841d1f39475858"
     ),
     "support/build/native-target-object.zig": (
-        "181edc4a09ff985241ea8809127c42c4aa86732552d231cd53d3dec10ced0cc8"
+        "4d4150b0cd5e8b93ea4e15b5961fbc685a41147675be4a6d50e868d9b52b52e0"
     ),
     "support/build/postprocess-elf.zig": (
         "27a9329835e22de71ac90226299a4c54bdc1db89fe7adb667857715b1710ab4d"
@@ -523,7 +523,7 @@ GUARDED_PRODUCER_FILES = {
         "1a775accf2ee35ff7b6e6c9a836e726cec529488cfa44c1e1aa1f23b03a4ac9e"
     ),
     "support/build/native-postprocess.zig": (
-        "857f4b970f815f815f3a18118f918a62e8ef517cf12e0b524cebc39895151b85"
+        "0d580e82e54291b0bcffc84f83f54d5da63a71313c1eaba3c5dd1ff5033bb075"
     ),
     "support/scripts/elf_tools.py": (
         "0aad63e7830a814a5c29a7330925f64e8c844cf28700aa959002a629d5019820"
