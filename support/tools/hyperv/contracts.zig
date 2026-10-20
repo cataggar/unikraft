@@ -88,7 +88,7 @@ pub const SensitiveDocument = struct {
     fn destroyOwner(owner: *sensitive.Allocator) void {
         const allocator = owner.backing;
         std.crypto.secureZero(u8, std.mem.asBytes(owner));
-        allocator.rawFree(std.mem.asBytes(owner), .of(sensitive.Allocator), @returnAddress());
+        allocator.destroy(owner);
     }
 };
 
@@ -98,7 +98,7 @@ fn scanBounds(allocator: std.mem.Allocator, source: []const u8, limits: Limits) 
     var depth: usize = 0;
     var count: usize = 0;
     while (true) {
-        const token = try scanner.nextAllocMax(allocator, .alloc_always, limits.string_bytes);
+        const token = try scanner.nextAllocMax(allocator, .alloc_if_needed, limits.string_bytes);
         defer switch (token) {
             .allocated_string, .allocated_number => |bytes| allocator.free(bytes),
             else => {},
