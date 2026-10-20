@@ -206,6 +206,62 @@ test "relocation blob is byte exact including override ordering PTE flags signed
     }
 }
 
+test "binary-search symbol lookup detects duplicates and pre-indexed relocations preserve pte_attr data and imm parity" {
+    const base_bytes = fixture(.little, .X86_64);
+    var parsed = try format.Image.parse(testing.allocator, &base_bytes);
+    defer parsed.deinit();
+    const expected_symbols = [_]struct { name: []const u8, value: u64 }{
+        .{ .name = "__bss_start", .value = base + 0x5000 },
+        .{ .name = "_base_addr", .value = base },
+        .{ .name = "_start16_uk_reloc_data8_0", .value = base + 0x2020 },
+        .{ .name = "_uk_reloc_end", .value = base + 0x2500 },
+        .{ .name = "_uk_reloc_start", .value = base + 0x2400 },
+        .{ .name = "negative", .value = base - 8 },
+        .{ .name = "negative_uk_reloc_imm4_0", .value = base + 0x1020 },
+        .{ .name = "target", .value = base + 0x2100 },
+        .{ .name = "target_uk_reloc_data8_phys_0", .value = base + 0x2010 },
+        .{ .name = "target_uk_reloc_pte_attr0_0", .value = 3 },
+        .{ .name = "uk_efi_entry64", .value = base + 0x1010 },
+    };
+    for (expected_symbols) |item|
+        try testing.expectEqual(item.value, try parsed.symbol(item.name));
+    for ([_][]const u8{ "", "000_before", "middle_missing", "zzz_after" }) |missing|
+        try testing.expectError(error.MissingSymbol, parsed.symbol(missing));
+
+    for ([_][]const u8{ "__bss_start", "negative", "uk_efi_entry64" }) |dup_name| {
+        var dup_bytes = fixture(.little, .X86_64);
+        put(u32, &dup_bytes, symbol_table + 11 * 24, @intCast(std.mem.indexOf(u8, symbol_names, dup_name).?), .little);
+        var dup_image = try format.Image.parse(testing.allocator, &dup_bytes);
+        defer dup_image.deinit();
+        try testing.expectError(error.DuplicateSymbol, dup_image.symbol(dup_name));
+    }
+
+    var reloc_bytes = fixture(.little, .X86_64);
+    // Replace the third dynamic relocation (at .bss) with a second dynamic
+    // relocation at 0x2010 so only the first at 0x2010 is consumed by .data.
+    put(u64, &reloc_bytes, 0x2300 + 24 * 2, base + 0x2010, .little);
+    put(i64, &reloc_bytes, 0x2310 + 24 * 2, base + 0x2040, .little);
+    var reloc_image = try format.Image.parse(testing.allocator, &reloc_bytes);
+    defer reloc_image.deinit();
+    const actual = try transform.relocations(testing.allocator, reloc_image);
+    defer testing.allocator.free(actual);
+    var expected = @as([124]u8, @splat(0));
+    put(u32, &expected, 0, 0x0badb0b0, .little);
+    for (
+        [_]u64{ 0x2018, 0x2010, 0x2010, 0x1020 },
+        [_]i64{ 0x1110, 0x2040, 0x2103, -8 },
+        [_]u32{ 8, 8, 8, 4 },
+        [_]u32{ 0, 0, 1, 0 },
+        0..,
+    ) |offset, value, size, flags, index| {
+        put(u64, &expected, 4 + index * 24, offset, .little);
+        put(i64, &expected, 12 + index * 24, value, .little);
+        put(u32, &expected, 20 + index * 24, size, .little);
+        put(u32, &expected, 24 + index * 24, flags, .little);
+    }
+    try testing.expectEqualSlices(u8, &expected, actual);
+}
+
 test "required sections symbols relocation formats and reservation errors fail closed" {
     const mutations = [_]struct { offset: usize, value: u64, width: u8, expected: anyerror }{
         .{ .offset = section_table + 6 * 64, .value = 0, .width = 4, .expected = error.MissingSection },

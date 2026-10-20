@@ -112,55 +112,112 @@ pub fn relocations(allocator: std.mem.Allocator, image: Image) ![]u8 {
     if (expected != rela.header.sh_size / @sizeOf(elf.Elf64_Rela))
         return error.RelocationCountMismatch;
 
+    const OffsetQueue = struct {
+        head: usize,
+        tail: usize,
+    };
+    const IndexedRelocSymbol = struct {
+        symbol: format.Symbol,
+        parsed: RelocSymbol,
+    };
+    const no_next = std.math.maxInt(usize);
+
     var entries: std.ArrayList(Relocation) = .empty;
     defer entries.deinit(allocator);
+    var consumed: std.ArrayList(bool) = .empty;
+    defer consumed.deinit(allocator);
+    var next_at_offset: std.ArrayList(usize) = .empty;
+    defer next_at_offset.deinit(allocator);
+    var by_offset: std.AutoHashMapUnmanaged(u64, OffsetQueue) = .empty;
+    defer by_offset.deinit(allocator);
+
     const relative_type: u32 = if (image.header.machine == .X86_64) 8 else 1027;
     for (0..try format.asUsize(expected)) |index| {
         const entry = try format.structure(elf.Elf64_Rela, image.bytes, rela.header.sh_offset + index * @sizeOf(elf.Elf64_Rela), image.header.endian);
         if (@as(u32, @truncate(entry.r_info)) != relative_type or entry.r_info >> 32 != 0)
             return error.UnsupportedRelocation;
+        const offset = try sub(entry.r_offset, base);
+        const slot = entries.items.len;
         try entries.append(allocator, .{
-            .offset = try sub(entry.r_offset, base),
+            .offset = offset,
             .value = try relativeValue(entry.r_addend, base),
             .size = 8,
             .flags = 0,
         });
+        try consumed.append(allocator, false);
+        try next_at_offset.append(allocator, no_next);
+        const gop = try by_offset.getOrPut(allocator, offset);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{ .head = slot, .tail = slot };
+        } else {
+            next_at_offset.items[gop.value_ptr.tail] = slot;
+            gop.value_ptr.tail = slot;
+        }
+    }
+
+    var data_symbols: std.ArrayList(IndexedRelocSymbol) = .empty;
+    defer data_symbols.deinit(allocator);
+    var imm_symbols: std.ArrayList(IndexedRelocSymbol) = .empty;
+    defer imm_symbols.deinit(allocator);
+    var pte_attrs: std.StringHashMapUnmanaged(u64) = .empty;
+    defer pte_attrs.deinit(allocator);
+    for (image.symbols) |symbol| {
+        const parsed = (try relocSymbol(symbol.name)) orelse continue;
+        switch (parsed.kind) {
+            .data => try data_symbols.append(allocator, .{ .symbol = symbol, .parsed = parsed }),
+            .imm => try imm_symbols.append(allocator, .{ .symbol = symbol, .parsed = parsed }),
+            .pte_attr => {
+                const gop = try pte_attrs.getOrPut(allocator, parsed.target);
+                if (!gop.found_existing) gop.value_ptr.* = symbol.header.st_value;
+            },
+        }
     }
 
     // nm sorts by name; the legacy helper processes all data entries before
     // immediate entries, replacing the first dynamic relocation at that offset.
-    for ([_]@FieldType(RelocSymbol, "kind"){ .data, .imm }) |kind| {
-        for (image.symbols) |symbol| {
-            const parsed = (try relocSymbol(symbol.name)) orelse continue;
-            if (parsed.kind != kind) continue;
-            var value: i128 = @as(i128, try image.symbol(parsed.target)) - @as(i128, base);
-            var flags: u32 = @intFromBool(parsed.physical);
-            for (image.symbols) |attribute| {
-                const attr = (try relocSymbol(attribute.name)) orelse continue;
-                if (attr.kind == .pte_attr and std.mem.eql(u8, attr.target, parsed.target)) {
-                    value += attribute.header.st_value;
-                    flags |= 1;
-                }
+    for ([_][]const IndexedRelocSymbol{ data_symbols.items, imm_symbols.items }) |group| {
+        for (group) |item| {
+            var value: i128 = @as(i128, try image.symbol(item.parsed.target)) - @as(i128, base);
+            var flags: u32 = @intFromBool(item.parsed.physical);
+            if (pte_attrs.get(item.parsed.target)) |attr_value| {
+                value += attr_value;
+                flags |= 1;
             }
-            const offset = try sub(symbol.header.st_value, base);
-            for (entries.items, 0..) |entry, index| {
-                if (entry.offset == offset) {
-                    _ = entries.orderedRemove(index);
-                    break;
-                }
-            }
-            try entries.append(allocator, .{
+            const offset = try sub(item.symbol.header.st_value, base);
+            const reloc: Relocation = .{
                 .offset = offset,
                 .value = std.math.cast(i64, value) orelse return error.InvalidRelocationValue,
-                .size = parsed.size,
+                .size = item.parsed.size,
                 .flags = flags,
-            });
+            };
+            if (by_offset.getPtr(offset)) |queue| {
+                const victim = queue.head;
+                consumed.items[victim] = true;
+                const next = next_at_offset.items[victim];
+                if (next == no_next) {
+                    _ = by_offset.remove(offset);
+                } else {
+                    queue.head = next;
+                }
+            }
+            const slot = entries.items.len;
+            try entries.append(allocator, reloc);
+            try consumed.append(allocator, false);
+            try next_at_offset.append(allocator, no_next);
+            const gop = try by_offset.getOrPut(allocator, offset);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .{ .head = slot, .tail = slot };
+            } else {
+                next_at_offset.items[gop.value_ptr.tail] = slot;
+                gop.value_ptr.tail = slot;
+            }
         }
     }
 
     const limit = try sub(bss.header.sh_addr, base);
     var kept: usize = 0;
-    for (entries.items) |entry| {
+    for (entries.items, consumed.items) |entry, is_consumed| {
+        if (is_consumed) continue;
         // Discard dummy trace relocations at/after .bss, as mkukreloc does.
         if (entry.offset >= limit) continue;
         if (!image.containsMemory(try add(base, entry.offset), entry.size))
@@ -311,11 +368,16 @@ pub fn efi(allocator: std.mem.Allocator, image: Image, debug: Image) ![]u8 {
     data_size = try sub(data_size, uninitialized);
     const result = try allocator.alloc(u8, try format.asUsize(try add(headers, image.bytes.len)));
     errdefer allocator.free(result);
-    @memset(result, 0);
     // mkefi edits a copy in place: bytes between its section table and the
     // inserted ELF are the original ELF bytes, not newly zeroed padding.
-    @memcpy(result[0..image.bytes.len], image.bytes);
     @memset(result[0..table_end], 0);
+    const middle_end = @min(headers, image.bytes.len);
+    if (middle_end > table_end) {
+        @memcpy(result[table_end..middle_end], image.bytes[table_end..middle_end]);
+    }
+    if (headers > middle_end) {
+        @memset(result[middle_end..headers], 0);
+    }
     @memcpy(result[headers..], image.bytes);
     @memcpy(result[0..2], "MZ");
     put(u32, result, 60, 64, .little);
