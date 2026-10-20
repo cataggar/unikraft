@@ -80,6 +80,18 @@ const Fixture = struct {
         try self.put("request.json", request);
     }
 
+    fn zeroPagesRange(self: Fixture, size: usize, start: usize, end: usize) !void {
+        const bytes = try allocator.alloc(u8, size);
+        defer allocator.free(bytes);
+        @memset(bytes, 0x5a);
+        @memset(bytes[start..end], 0);
+        try self.put("source", bytes);
+        const digest = std.fmt.bytesToHex(core.transfer.job.hash(bytes), .lower);
+        const request = try allocator.print("{{\"schema\":\"unikraft.hyperv.managed-disk-page-worker\",\"schema_version\":1,\"endpoint\":\"https://fixture.blob.storage.azure.net/upload/vhd\",\"path\":\"{s}/source\",\"size\":{d},\"sha256\":\"{s}\"}}", .{ self.path, size, digest });
+        defer allocator.free(request);
+        try self.put("request.json", request);
+    }
+
     fn deinit(self: Fixture) void {
         self.directory.close(io);
         self.root.dir.deleteTree(io, &self.name) catch @panic("worker fixture cleanup failed");
@@ -377,6 +389,34 @@ test "partial page side effects retain attempted confirmed and consumed-attempt 
     defer invocations.deinit();
     try testing.expectEqualStrings("1", invocations.bytes());
     try safeReport(result);
+    try noChildren();
+}
+
+test "sparse page upload elides interior zero chunks and validates progress and footer readback" {
+    const size: usize = 2 * 4 * 1024 * 1024 + 512;
+    const fixture = try Fixture.init("pass", .pages, size, false, 5000);
+    defer fixture.deinit();
+    try fixture.zeroPagesRange(size, 4 * 1024 * 1024, 8 * 1024 * 1024);
+    const result = fixture.run(null);
+    try testing.expect(result.succeeded());
+    try testing.expectEqual(.accepted, result.side_effect);
+    try testing.expectEqual(@as(u64, 3), result.admitted_plan.?.mutations);
+    try testing.expectEqual(@as(u64, 4), result.admitted_plan.?.requests);
+    try testing.expectEqual(@as(u64, 2), result.progress.?.mutations_attempted);
+    try testing.expectEqual(@as(u64, 2), result.progress.?.mutations_confirmed);
+    try testing.expectEqual(@as(u64, 3), result.progress.?.requests_attempted);
+    try testing.expectEqual(@as(u64, 3), result.progress.?.responses_observed);
+    try testing.expectEqual(@as(u64, size), result.progress.?.bytes_attempted);
+    try testing.expectEqual(@as(u64, size), result.progress.?.bytes_confirmed);
+    try testing.expectEqual(@as(u64, size), result.outcome.?.bytes_streamed);
+    try testing.expectEqual(@as(u64, size), result.outcome.?.bytes_accepted);
+    try testing.expect(result.outcome.?.sha256 != null and result.outcome.?.footer_sha256 != null);
+    try roundtrip(result, reportContext(result));
+    try safeReport(result);
+    var invalid = result;
+    invalid.progress.?.requests_attempted = 4;
+    invalid.progress.?.responses_observed = 4;
+    try testing.expectError(error.InvalidReport, invalid.validate());
     try noChildren();
 }
 

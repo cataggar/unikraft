@@ -166,7 +166,7 @@ pub const Client = struct {
         self.headers(&request, download_api_version, null) catch return d.Outcome.fail(.download_open, .allocation);
         var outcome = d.Outcome.fail(.download_open, .transport);
         outcome.side_effect = .not_applicable;
-        const operation = self.open(&request, null, .download_open, false, &outcome) orelse return outcome;
+        const operation = self.open(&request, null, .download_open, false, 0, &outcome) orelse return outcome;
         defer operation.deinit();
         if (operation.status_code != 200) {
             self.reject(operation, &outcome);
@@ -265,14 +265,20 @@ pub const Client = struct {
             return d.Outcome.fail(.input_hash, .input_changed);
         var outcome = d.Outcome.fail(.page_put, .local_io);
         var digest = @import("hyperv_core").Sha256.init(.{});
+        var elided_bytes: u64 = 0;
         var offset: u64 = 0;
         while (offset < input.size) {
-            if (offset > 0) outcome.side_effect = .incomplete;
+            if (outcome.bytes_accepted > 0) outcome.side_effect = .incomplete;
             self.budget.check() catch |err| return failAfter(outcome, .page_put, localCategory(err));
             const length: usize = @intCast(@min(input.size - offset, chunk.len));
             const count = source.file.readPositionalAll(self.io, chunk[0..length], offset) catch return failAfter(outcome, .page_put, .local_io);
             if (count != length) return failAfter(outcome, .input_verify, .input_changed);
             digest.update(chunk[0..length]);
+            if (offset + length < input.size and std.mem.allEqual(u8, chunk[0..length], 0)) {
+                elided_bytes += length;
+                offset += length;
+                continue;
+            }
             var request = core.http.Request.init(self.allocator, .PUT, page_url);
             defer request.deinit();
             self.headers(&request, page_api_version, length) catch return failAfter(outcome, .page_put, .allocation);
@@ -286,9 +292,11 @@ pub const Client = struct {
             request.setHeader("Content-MD5", std.base64.standard.Encoder.encode(&encoded, &md5)) catch return failAfter(outcome, .page_put, .allocation);
             // A per-page fixed reader exposes exactly this page's boundary.
             // The full-file EOF probe and SHA-256 check are separate below.
+            const covered_bytes = elided_bytes + length;
             var reader: files.PageReader = .{ .bytes = chunk[0..length], .guard = self.budget.guard() };
-            var current = self.mutation(&request, .knownLength(&reader.interface, length), .page_put, length);
-            current.bytes_streamed = outcome.bytes_streamed + reader.offset;
+            var current = self.mutation(&request, .knownLength(&reader.interface, length), .page_put, covered_bytes);
+            const accepted_elided = if (current.side_effect == .accepted) elided_bytes else 0;
+            current.bytes_streamed = outcome.bytes_streamed + accepted_elided + reader.offset;
             current.bytes_accepted += outcome.bytes_accepted;
             if (current.completion != .complete) {
                 if (reader.failure) |err| current.diagnostic.category = localCategory(err);
@@ -299,6 +307,7 @@ pub const Client = struct {
                 return current;
             }
             if (reader.offset != length) return failAfter(current, .input_verify, .input_changed);
+            elided_bytes = 0;
             outcome = current;
             offset += length;
         }
@@ -332,7 +341,7 @@ pub const Client = struct {
         };
         const prior = outcome.*;
         outcome.completion = .failed;
-        const operation = self.open(&request, null, .footer_readback, false, outcome) orelse {
+        const operation = self.open(&request, null, .footer_readback, false, 0, outcome) orelse {
             outcome.side_effect = prior.side_effect;
             return;
         };
@@ -459,7 +468,7 @@ pub const Client = struct {
         }
     }
 
-    fn open(self: *Client, request: *core.http.Request, body: ?core.http.StreamingRequestBody, stage: d.Stage, mutation_request: bool, outcome: *d.Outcome) ?*core.http.HttpOperation {
+    fn open(self: *Client, request: *core.http.Request, body: ?core.http.StreamingRequestBody, stage: d.Stage, mutation_request: bool, declared_bytes: u64, outcome: *d.Outcome) ?*core.http.HttpOperation {
         outcome.diagnostic = .{ .stage = stage, .category = .transport };
         self.budget.check() catch |err| {
             outcome.diagnostic.category = localCategory(err);
@@ -482,8 +491,7 @@ pub const Client = struct {
             return null;
         }
         request.operation_timeout_ms = self.budget.deadline_ms - now;
-        const length = if (body) |stream| stream.content_length orelse 0 else if (request.body) |bytes| bytes.len else 0;
-        if (!self.notify(.{ .begin = .{ .stage = stage, .mutation = mutation_request, .bytes = length } }, outcome)) {
+        if (!self.notify(.{ .begin = .{ .stage = stage, .mutation = mutation_request, .bytes = declared_bytes } }, outcome)) {
             outcome.diagnostic.category = .none;
             return null;
         }
@@ -505,7 +513,7 @@ pub const Client = struct {
         };
         outcome.diagnostic.status = operation.status_code;
         if (mutation_request) outcome.side_effect = if (operation.isSuccess()) .accepted else .rejected;
-        if (mutation_request and operation.isSuccess()) outcome.bytes_accepted = length;
+        if (mutation_request and operation.isSuccess()) outcome.bytes_accepted = declared_bytes;
         outcome.diagnostic.category = if (operation.isSuccess()) .none else d.statusCategory(operation.status_code);
         if (!self.notify(.{ .end = .{ .transport_started = true, .status = operation.status_code } }, outcome)) {
             operation.deinit();
@@ -525,7 +533,7 @@ pub const Client = struct {
 
     fn mutation(self: *Client, request: *core.http.Request, body: ?core.http.StreamingRequestBody, stage: d.Stage, accepted_bytes: u64) d.Outcome {
         var outcome = d.Outcome.fail(stage, .transport);
-        const operation = self.open(request, body, stage, true, &outcome) orelse return outcome;
+        const operation = self.open(request, body, stage, true, accepted_bytes, &outcome) orelse return outcome;
         defer operation.deinit();
         if (operation.isSuccess()) outcome.bytes_accepted = accepted_bytes;
         if (operation.status_code != 201) {

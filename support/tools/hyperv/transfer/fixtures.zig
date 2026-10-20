@@ -541,6 +541,68 @@ test "managed disk page wire alignment chunk boundary SHA256 and footer readback
     try testing.expectEqual(@as(usize, 3), mock.calls);
 }
 
+test "managed disk sparse page upload elides interior zero chunks and preserves full digest and footer" {
+    const fixture = try Fixture.init("page-sparse");
+    defer fixture.deinit();
+    const bytes = try allocator.alloc(u8, 2 * transfer.page_chunk_size + 512);
+    defer allocator.free(bytes);
+    for (bytes[0..transfer.page_chunk_size], 0..) |*byte, i| byte.* = @truncate(i * 17 + 1);
+    @memset(bytes[transfer.page_chunk_size .. 2 * transfer.page_chunk_size], 0);
+    for (bytes[2 * transfer.page_chunk_size ..], 0..) |*byte, i| byte.* = @truncate(i * 29 + 3);
+    const input = try fixture.input(bytes);
+    defer allocator.free(input.path);
+    const footer = bytes[2 * transfer.page_chunk_size ..];
+    var md5: [16]u8 = undefined;
+    var encoded: [24]u8 = undefined;
+    std.crypto.hash.Md5.hash(footer, &md5, .{});
+    const steps = [_]Step{
+        .{ .url = disk_url ++ "&comp=page", .length = transfer.page_chunk_size, .body = bytes[0..transfer.page_chunk_size], .verify_md5 = true, .request_headers = &.{ .{ .name = "x-ms-version", .value = "2020-10-02" }, .{ .name = "x-ms-range", .value = "bytes=0-4194303" }, .{ .name = "x-ms-page-write", .value = "update" } } },
+        .{ .url = disk_url ++ "&comp=page", .length = 512, .body = footer, .verify_md5 = true, .request_headers = &.{ .{ .name = "x-ms-range", .value = "bytes=8388608-8389119" }, .{ .name = "x-ms-page-write", .value = "update" } } },
+        .{ .method = .GET, .url = disk_url, .status = 206, .response = footer, .request_headers = &.{ .{ .name = "x-ms-range", .value = "bytes=8388608-8389119" }, .{ .name = "x-ms-range-get-content-md5", .value = "true" } }, .headers = &.{ .{ .name = "Content-Length", .value = "512" }, .{ .name = "Content-Range", .value = "bytes 8388608-8389119/8389120" }, .{ .name = "Content-MD5", .value = std.base64.standard.Encoder.encode(&encoded, &md5) } } },
+    };
+    var mock: Mock = .{ .steps = &steps };
+    var client = mock.client();
+    const result = client.uploadPages(disk, input);
+    try testing.expectEqual(d.Completion.complete, result.completion);
+    try testing.expectEqual(input.size, result.bytes_streamed);
+    try testing.expectEqual(input.size, result.bytes_accepted);
+    try testing.expectEqualSlices(u8, &input.sha256, &result.sha256.?);
+    try testing.expect(result.footer_sha256 != null);
+    try testing.expectEqual(@as(usize, 3), mock.calls);
+
+    const zero_fixture = try Fixture.init("page-sparse-zero");
+    defer zero_fixture.deinit();
+    const zero_bytes = try allocator.alloc(u8, transfer.page_chunk_size + 512);
+    defer allocator.free(zero_bytes);
+    @memset(zero_bytes, 0);
+    const zero_input = try zero_fixture.input(zero_bytes);
+    defer allocator.free(zero_input.path);
+    var reject_mock: Mock = .{ .steps = &.{
+        .{ .url = disk_url ++ "&comp=page", .length = 512, .status = 412, .request_headers = &.{.{ .name = "x-ms-range", .value = "bytes=4194304-4194815" }} },
+    } };
+    var reject_client = reject_mock.client();
+    const rejected = reject_client.uploadPages(disk, zero_input);
+    try expectFailure(rejected, .condition, .rejected, 412);
+    try testing.expectEqual(@as(u64, 0), rejected.bytes_accepted);
+    try testing.expectEqual(@as(usize, 1), reject_mock.calls);
+
+    const zero_footer = zero_bytes[transfer.page_chunk_size..];
+    var zero_md5: [16]u8 = undefined;
+    var zero_encoded: [24]u8 = undefined;
+    std.crypto.hash.Md5.hash(zero_footer, &zero_md5, .{});
+    var zero_mock: Mock = .{ .steps = &.{
+        .{ .url = disk_url ++ "&comp=page", .length = 512, .body = zero_footer, .verify_md5 = true, .request_headers = &.{.{ .name = "x-ms-range", .value = "bytes=4194304-4194815" }} },
+        .{ .method = .GET, .url = disk_url, .status = 206, .response = zero_footer, .request_headers = &.{ .{ .name = "x-ms-range", .value = "bytes=4194304-4194815" }, .{ .name = "x-ms-range-get-content-md5", .value = "true" } }, .headers = &.{ .{ .name = "Content-Length", .value = "512" }, .{ .name = "Content-Range", .value = "bytes 4194304-4194815/4194816" }, .{ .name = "Content-MD5", .value = std.base64.standard.Encoder.encode(&zero_encoded, &zero_md5) } } },
+    } };
+    var zero_client = zero_mock.client();
+    const zero_result = zero_client.uploadPages(disk, zero_input);
+    try testing.expectEqual(d.Completion.complete, zero_result.completion);
+    try testing.expectEqual(zero_input.size, zero_result.bytes_streamed);
+    try testing.expectEqual(zero_input.size, zero_result.bytes_accepted);
+    try testing.expectEqualSlices(u8, &zero_input.sha256, &zero_result.sha256.?);
+    try testing.expectEqual(@as(usize, 2), zero_mock.calls);
+}
+
 test "managed disk partial known rejection and unknown later update never replay" {
     const fixture = try Fixture.init("page-incomplete");
     defer fixture.deinit();

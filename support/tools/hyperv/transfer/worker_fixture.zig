@@ -223,7 +223,12 @@ const Mock = struct {
             std.crypto.hash.Md5.hash(&operation.footer, &digest, .{});
             try headers.append("Content-MD5", std.base64.standard.Encoder.encode(&encoded, &digest));
             try headers.append("Content-Length", "512");
-            try headers.append("Content-Range", "bytes 0-511/512");
+            const requested_range = request.getHeader("x-ms-range") orelse return error.MissingRange;
+            if (!std.mem.startsWith(u8, requested_range, "bytes=")) return error.InvalidRange;
+            const dash = std.mem.indexOfScalar(u8, requested_range, '-') orelse return error.InvalidRange;
+            const end = try std.fmt.parseInt(u64, requested_range[dash + 1 ..], 10);
+            const content_range = try std.mem.print(&operation.content_range, "bytes {s}/{d}", .{ requested_range["bytes=".len..], end + 1 });
+            try headers.append("Content-Range", content_range);
         }
         if (self.mode == .metadata) try headers.append("x-ms-error-code", "AuthorizationServiceMismatch");
         if (self.mode == .cleanup_failure) try headers.append("Content-MD5", "AAAAAAAAAAAAAAAAAAAAAA==");
@@ -246,6 +251,7 @@ const Operation = struct {
     interface: sdk.http.HttpOperation,
     reader: std.Io.Reader,
     footer: [512]u8 = @as([512]u8, @splat(0x5a)),
+    content_range: [80]u8 = undefined,
 
     fn finish(_: *sdk.http.HttpOperation) !void {
         return error.UnboundedFinishForbidden;
