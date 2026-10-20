@@ -33,6 +33,7 @@ const msr_stimer0_count = 0x400000b1;
 const hypercall_enable = @as(u64, 1);
 const register_enable = @as(u64, 1);
 const register_reserved = @as(u64, 0x0ffe);
+const page_size = 4096;
 const page_mask = ~@as(u64, 0xfff);
 const sint_vector_mask = @as(u64, 0xff);
 const sint_masked = @as(u64, 1) << 16;
@@ -42,6 +43,7 @@ const sint_owned_mask = sint_vector_mask | sint_masked | sint_auto_eoi | sint_po
 const stimer_auto_enable = @as(u64, 1) << 3;
 const stimer_sint_shift = 16;
 const reference_tick_ns = 100;
+pub const hv_reference_tsc_sequence_invalid: u32 = 0xFFFF_FFFF;
 const message_pending = @as(u8, 1);
 const message_completion_order: std.builtin.AtomicOrder = .seq_cst;
 const max_message_payload = 240;
@@ -263,7 +265,7 @@ fn wrmsr(msr: u32, value: u64) void {
 fn rdtsc() u64 {
     var lo: u32 = undefined;
     var hi: u32 = undefined;
-    asm volatile ("rdtsc"
+    asm volatile ("lfence\n\trdtsc"
         : [lo] "={eax}" (lo),
           [hi] "={edx}" (hi),
         :
@@ -271,12 +273,11 @@ fn rdtsc() u64 {
     return (@as(u64, hi) << 32) | lo;
 }
 
-fn zeroSharedPage(page: *[4096]u8) void {
-    var i: usize = 0;
-    while (i < page.len) : (i += 64) {
-        @memset(page[i..][0..64], 0);
-        asm volatile ("" ::: .{ .memory = true });
-    }
+fn zeroSharedPage(bytes: *[page_size]u8) void {
+    const words: *volatile [page_size / @sizeOf(u64)]u64 = @ptrCast(@alignCast(bytes));
+    for (words) |*word|
+        word.* = 0;
+    asm volatile ("" ::: .{ .memory = true });
 }
 
 fn programPageMsr(msr: u32, gpa: u64) bool {
@@ -333,7 +334,7 @@ fn referenceTimeFromPage(page: *const volatile ReferenceTscPage) ?u64 {
     for (0..8) |_| {
         const sequence: *const u32 = @ptrCast(@volatileCast(&page.sequence));
         const start = @atomicLoad(u32, sequence, .acquire);
-        if (start == 0)
+        if (start == 0 or start == hv_reference_tsc_sequence_invalid)
             return null;
         const tsc = rdtsc();
         const scale = page.scale;
@@ -346,7 +347,7 @@ fn referenceTimeFromPage(page: *const volatile ReferenceTscPage) ?u64 {
 }
 
 fn referenceSequenceStable(start: u32, end: u32) bool {
-    return start != 0 and start == end;
+    return start != 0 and start != hv_reference_tsc_sequence_invalid and start == end;
 }
 
 export fn hyperv_hypercall_page() callconv(.c) *anyopaque {
@@ -588,17 +589,30 @@ export fn hyperv_msr_write(msr: u32, value: u64) callconv(.c) void {
     wrmsr(msr, value);
 }
 
-export fn hyperv_time_ref_count() callconv(.c) u64 {
+fn readTimeRefCountMsr() u64 {
     return rdmsr(msr_time_ref_count);
 }
 
-export fn hyperv_reference_time() callconv(.c) u64 {
+fn uk_hyperv_read_reference_time(
+    page: *const volatile ReferenceTscPage,
+    comptime fallback_msr: fn () u64,
+) u64 {
     if (@atomicLoad(bool, &reference_tsc_enabled, .acquire)) {
-        const page: *const volatile ReferenceTscPage = &hyperv_reference_tsc_page_storage;
         if (referenceTimeFromPage(page)) |value|
             return value;
     }
-    return rdmsr(msr_time_ref_count);
+    return fallback_msr();
+}
+
+export fn hyperv_time_ref_count() callconv(.c) u64 {
+    return readTimeRefCountMsr();
+}
+
+export fn hyperv_reference_time() callconv(.c) u64 {
+    return uk_hyperv_read_reference_time(
+        &hyperv_reference_tsc_page_storage,
+        readTimeRefCountMsr,
+    );
 }
 
 export fn hyperv_x86_irq_to_vector(irq: u32, vector: *u8) callconv(.c) c_int {
@@ -827,7 +841,56 @@ test "reference TSC sequence zero falls back" {
 test "reference TSC retries changed sequences" {
     try std.testing.expect(!referenceSequenceStable(4, 5));
     try std.testing.expect(!referenceSequenceStable(0, 0));
+    try std.testing.expect(!referenceSequenceStable(
+        hv_reference_tsc_sequence_invalid,
+        hv_reference_tsc_sequence_invalid,
+    ));
     try std.testing.expect(referenceSequenceStable(7, 7));
+}
+
+test "reference TSC invalid sequence sentinel falls back to MSR callback" {
+    const Fallback = struct {
+        var calls: usize = 0;
+        var value: u64 = 0xfeed_cafe_1234_5678;
+
+        fn read() u64 {
+            calls += 1;
+            return value;
+        }
+    };
+
+    var page = std.mem.zeroes(ReferenceTscPage);
+    page.sequence = hv_reference_tsc_sequence_invalid;
+    page.scale = 0;
+    page.offset = 99;
+    try std.testing.expectEqual(@as(?u64, null), referenceTimeFromPage(&page));
+    try std.testing.expect(!referenceSequenceStable(
+        hv_reference_tsc_sequence_invalid,
+        hv_reference_tsc_sequence_invalid,
+    ));
+
+    @atomicStore(bool, &reference_tsc_enabled, true, .release);
+    defer @atomicStore(bool, &reference_tsc_enabled, false, .release);
+
+    Fallback.calls = 0;
+    try std.testing.expectEqual(
+        Fallback.value,
+        uk_hyperv_read_reference_time(&page, Fallback.read),
+    );
+    try std.testing.expectEqual(@as(usize, 1), Fallback.calls);
+
+    page.sequence = 3;
+    try std.testing.expectEqual(
+        @as(u64, 99),
+        uk_hyperv_read_reference_time(&page, Fallback.read),
+    );
+    try std.testing.expectEqual(@as(usize, 1), Fallback.calls);
+}
+
+test "zeroSharedPage clears all 4096 bytes of a non-zero page" {
+    var page: [page_size]u8 align(page_size) = @as([page_size]u8, @splat(0xa5));
+    zeroSharedPage(&page);
+    try std.testing.expect(std.mem.allEqual(u8, &page, 0));
 }
 
 test "message and page layouts match TLFS" {
