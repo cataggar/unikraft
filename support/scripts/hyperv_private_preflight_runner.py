@@ -496,7 +496,7 @@ GUARDED_PRODUCER_FILES = {
         "d73b989cc28c7884e4f26156fad52dd92847ed71ff45dba17a12d2feb9120990"
     ),
     "plat/hyperv/hyperv_runtime.zig": (
-        "9df0e53263210a4a4790f547e7f1c51dca6acd7257abeb00c083ac34ed7a5dd6"
+        "7d24cb5d9ae7a07f23f216830626aab2fcf71b79feec1b55d980552114581ceb"
     ),
     "plat/hyperv/include/hyperv/clock.h": (
         "378e4b267ca5330d5a7a1fd9da306d1fd59244528e15560d1ef8842ce26eea35"
