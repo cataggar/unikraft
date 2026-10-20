@@ -92,8 +92,12 @@ pub const Progress = struct {
             return error.InvalidReport;
         const before_requests = self.requests_attempted - @as(u64, @intFromBool(counted));
         const before_mutations = self.mutations_attempted - current_mutation;
+        const expected_previous: d.Certainty = if (kind == .pages and self.stage == .footer_readback)
+            .accepted
+        else
+            prefixEffect(plan, before_mutations);
         if (before_requests >= plan.requests or
-            self.previous_effect != prefixEffect(plan, before_mutations)) return error.InvalidReport;
+            self.previous_effect != expected_previous) return error.InvalidReport;
         switch (kind) {
             .blob => if (plan.mutations == 0) {
                 if (self.stage != .download_open or self.mutations_attempted != 0) return error.InvalidReport;
@@ -107,12 +111,19 @@ pub const Progress = struct {
                     return error.InvalidReport;
             },
             .pages => {
-                if (self.bytes_attempted != @min(self.mutations_attempted * client.page_chunk_size, plan.bytes) or
-                    self.bytes_confirmed != @min(self.mutations_confirmed * client.page_chunk_size, plan.bytes))
+                if ((self.bytes_attempted != plan.bytes and self.bytes_attempted % client.page_chunk_size != 0) or
+                    (self.bytes_confirmed != plan.bytes and self.bytes_confirmed % client.page_chunk_size != 0))
+                    return error.InvalidReport;
+                const attempted_chunks = if (self.bytes_attempted == plan.bytes) plan.mutations else self.bytes_attempted / client.page_chunk_size;
+                const confirmed_chunks = if (self.bytes_confirmed == plan.bytes) plan.mutations else self.bytes_confirmed / client.page_chunk_size;
+                if (attempted_chunks < self.mutations_attempted or
+                    confirmed_chunks < self.mutations_confirmed or
+                    attempted_chunks - confirmed_chunks < self.mutations_attempted - self.mutations_confirmed)
                     return error.InvalidReport;
                 switch (self.stage) {
-                    .page_put => if (self.requests_attempted != self.mutations_attempted) return error.InvalidReport,
-                    .footer_readback => if (self.mutations_confirmed != plan.mutations or before_requests != plan.mutations)
+                    .page_put => if (self.requests_attempted != self.mutations_attempted or (!confirmed and self.bytes_confirmed == plan.bytes))
+                        return error.InvalidReport,
+                    .footer_readback => if (self.bytes_confirmed != plan.bytes or before_requests != self.mutations_confirmed)
                         return error.InvalidReport,
                     else => return error.InvalidReport,
                 }
@@ -128,7 +139,11 @@ pub const Progress = struct {
             if (self.status == null) return .unknown;
             return if (self.mutations_confirmed == 0) .rejected else .incomplete;
         }
-        return prefixEffect(plan, self.mutations_confirmed);
+        if (self.mutations_confirmed == 0) return .not_started;
+        return if (self.mutations_confirmed == plan.mutations or (plan.download_bytes != 0 and self.bytes_confirmed == plan.bytes))
+            .accepted
+        else
+            .incomplete;
     }
 
     pub fn checkpointPhase(self: Progress) Phase {
@@ -299,8 +314,12 @@ pub const Report = struct {
                 ((kind == .pages or plan.mutations > 0 or p.requests_attempted == 0) and value.bytes_downloaded != 0) or
                 (value.diagnostic.status != null and value.diagnostic.status != p.status)) return error.InvalidReport;
             if (value.completion == .complete) {
-                if (p.requests_attempted != plan.requests or p.responses_observed != plan.requests or
-                    p.mutations_confirmed != plan.mutations or p.bytes_confirmed != plan.bytes or
+                const expected_requests = switch (kind) {
+                    .blob => plan.requests,
+                    .pages => p.mutations_confirmed + 1,
+                };
+                if (p.requests_attempted != expected_requests or p.responses_observed != expected_requests or
+                    (kind == .blob and p.mutations_confirmed != plan.mutations) or p.bytes_confirmed != plan.bytes or
                     value.bytes_streamed != p.bytes_attempted)
                     return error.InvalidReport;
                 if (value.side_effect != (if (plan.mutations == 0) d.Certainty.not_applicable else .accepted))
