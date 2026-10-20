@@ -1749,39 +1749,6 @@ pub fn build(b: *std.Build) void {
     }
     const hyperv_image_proofs = hyperv_proof_build.tests(b, b.path("."));
     test_step.dependOn(hyperv_image_proofs);
-    const hyperv_controller_fixtures = b.addSystemCommand(&.{
-        "python3",
-        "-m",
-        "unittest",
-        "support.scripts.tests.test_hyperv_azure",
-        "support.scripts.tests.test_hyperv_efi_boot",
-        "support.scripts.tests.test_hyperv_network_controller",
-        "support.scripts.tests.test_hyperv_network_peer",
-        "support.scripts.tests.test_hyperv_storage_manifest",
-    });
-    hyperv_controller_fixtures.setCwd(.{ .cwd_relative = root });
-    hyperv_controller_fixtures.setEnvironmentVariable(
-        "PYTHONDONTWRITEBYTECODE",
-        "1",
-    );
-    const hyperv_private_preflight_fixtures = b.addSystemCommand(&.{
-        "python3",
-        "-m",
-        "unittest",
-        "support.scripts.tests.test_hyperv_private_preflight",
-    });
-    hyperv_private_preflight_fixtures.setCwd(.{ .cwd_relative = root });
-    hyperv_private_preflight_fixtures.setEnvironmentVariable(
-        "PYTHONDONTWRITEBYTECODE",
-        "1",
-    );
-    const hyperv_private_preflight_tests = b.step(
-        "test-hyperv-private-preflight",
-        "Run private nested-KVM Hyper-V preflight controller fixtures",
-    );
-    hyperv_private_preflight_tests.dependOn(
-        &hyperv_private_preflight_fixtures.step,
-    );
     const hyperv_regression_tests = b.step(
         "test-hyperv-regression",
         "Run focused Hyper-V protocol, driver, controller, and IRQ regressions",
@@ -1825,10 +1792,6 @@ pub fn build(b: *std.Build) void {
         &b.addRunArtifact(platform_correctness_tests).step,
     );
     hyperv_regression_tests.dependOn(&verify_vmbus_channel.step);
-    hyperv_regression_tests.dependOn(&hyperv_controller_fixtures.step);
-    hyperv_regression_tests.dependOn(
-        &hyperv_private_preflight_fixtures.step,
-    );
     const build_tools_tests = b.step(
         "test-build-tools",
         "Test native metadata, linker merge, final link and LTO policy without Make or Python",
@@ -1845,6 +1808,28 @@ pub fn build(b: *std.Build) void {
         run.setCwd(.cache_root);
         build_tools_tests.dependOn(&run.step);
     }
+    const lto_proof_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/native-lto-proof.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const run_lto_proof_tests = b.addRunArtifact(lto_proof_tests);
+    run_lto_proof_tests.setCwd(.cache_root);
+    b.step("test-lto-proof", "Run native cross-TU LTO proof unit tests").dependOn(&run_lto_proof_tests.step);
+    build_tools_tests.dependOn(&run_lto_proof_tests.step);
+    const elf_size_diff_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/native-elf-size-diff.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const run_elf_size_diff_tests = b.addRunArtifact(elf_size_diff_tests);
+    run_elf_size_diff_tests.setCwd(.cache_root);
+    b.step("test-elf-size-diff", "Run native ELF size diff unit tests").dependOn(&run_elf_size_diff_tests.step);
+    build_tools_tests.dependOn(&run_elf_size_diff_tests.step);
     build_tools_tests.dependOn(&run_native_config_tests.step);
     build_tools_tests.dependOn(&run_linker_script_tests.step);
     build_tools_tests.dependOn(&run_final_link_tests.step);

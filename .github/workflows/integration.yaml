@@ -243,7 +243,6 @@ jobs:
           git \
           libncurses-dev \
           make \
-          python3 \
           tar \
           xz-utils
         rm -rf /var/lib/apt/lists/*
@@ -644,7 +643,7 @@ jobs:
     - name: Run LTO proof
       run: |
         set -euo pipefail
-        python3 "${GITHUB_WORKSPACE}/support/scripts/lto-proof.py" \
+        zig run "${GITHUB_WORKSPACE}/support/build/native-lto-proof.zig" -- \
           --work-dir "${RUNNER_TEMP}/lto-proof" \
           --zig "$(command -v zig)" \
           --nm "llvm-nm"
@@ -655,7 +654,7 @@ jobs:
         baseline="${RUNNER_TEMP}/build-zig/helloworld_qemu-x86_64.dbg"
         lto="${RUNNER_TEMP}/build-zig-lto/helloworld_qemu-x86_64.dbg"
         diff_output="$(
-          python3 "${GITHUB_WORKSPACE}/support/scripts/elf-size-diff.py" \
+          zig run "${GITHUB_WORKSPACE}/support/build/native-elf-size-diff.zig" -- \
             --readelf "llvm-readelf" \
             --nm "llvm-nm" \
             "${baseline}" \
@@ -1031,17 +1030,6 @@ jobs:
     - name: Restore independent fixture tools
       uses: ./.github/actions/hyperv-fixture-setup
 
-    - name: Install pinned Hyper-V controller dependencies
-      run: |
-        set -euo pipefail
-        venv="${RUNNER_TEMP}/hyperv-ci/python"
-        python3 -m venv "${venv}"
-        "${venv}/bin/python" -m pip install \
-          --disable-pip-version-check -r support/azure/requirements.txt
-        PYTHONPATH=support/scripts "${venv}/bin/python" -c \
-          'import hyperv_private_preflight as p; p.sdk_dependency_contract()'
-        echo "${venv}/bin" >> "${GITHUB_PATH}"
-
     - name: Run native configuration, linker, and LTO fixtures
       run: |
         set -euo pipefail
@@ -1284,8 +1272,6 @@ jobs:
           make \
           ovmf \
           patch \
-          python3 \
-          python3-venv \
           tar \
           unzip \
           wget \
@@ -1368,18 +1354,6 @@ jobs:
           echo "ZIG_GLOBAL_CACHE_DIR=${root}/zig-global-cache"
           echo 'MAKEFLAGS=-j2'
         } >> "${GITHUB_ENV}"
-
-    - name: Install pinned Hyper-V controller dependencies
-      if: ${{ success() && !cancelled() }}
-      run: |
-        set -euo pipefail
-        venv="${RUNNER_TEMP}/hyperv-ci/python"
-        python3 -m venv "${venv}"
-        "${venv}/bin/python" -m pip install \
-          --disable-pip-version-check -r support/azure/requirements.txt
-        PYTHONPATH=support/scripts "${venv}/bin/python" -c \
-          'import hyperv_private_preflight as p; p.sdk_dependency_contract()'
-        echo "${venv}/bin" >> "${GITHUB_PATH}"
 
     - name: Build pinned miz EFI application tooling
       if: ${{ success() && !cancelled() }}
@@ -1552,10 +1526,8 @@ jobs:
           "${RUNNER_TEMP}/hyperv-ci/native-qemu" integration \
           "${RUNNER_TEMP}/hyperv-ci" "${HYPERV_NETWORK_APPLICATION}"
 
-    - name: Boot exact raw GPT and fixed VHD in both APIC modes
+    - name: Boot the fixed scheduled-SMP workload on two CPUs
       if: ${{ success() && !cancelled() }}
-      env:
-        HYPERV_NETWORK_APPLICATION: ${{ github.event_name == 'workflow_dispatch' && inputs.hyperv_network_application }}
       run: |
         set -euo pipefail
         if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
@@ -1563,44 +1535,6 @@ jobs:
         fi
         test -r /dev/kvm
         test -w /dev/kvm
-        state="${RUNNER_TEMP}/hyperv-ci/packaging"
-        solved_config=()
-        if [ "${HYPERV_NETWORK_APPLICATION}" = "true" ]; then
-          solved_config=(
-            --solved-config
-            "${RUNNER_TEMP}/hyperv-ci/hyperv-acceptance.config"
-          )
-        fi
-        python3 support/scripts/hyperv-azure.py prepare \
-          --efi "${RUNNER_TEMP}/hyperv-ci/build/helloworld_hyperv-x86_64-efi-netvsc" \
-          --miz "${RUNNER_TEMP}/hyperv-ci/miz/bin/miz" \
-          --state-dir "${state}" \
-          --ovmf-code /usr/share/OVMF/OVMF_CODE_4M.fd \
-          --ovmf-vars /usr/share/OVMF/OVMF_VARS_4M.fd \
-          --qemu "${RUNNER_TEMP}/hyperv-tools/qemu-system-x86_64" \
-          "${solved_config[@]}" \
-          --timeout 60
-        python3 - "${state}/state.json" <<'PY'
-        import json
-        from pathlib import Path
-        import sys
-
-        state = json.loads(Path(sys.argv[1]).read_text())
-        expected = {
-            "raw": {"x2apic": True, "legacy-apic": True},
-            "vhd": {"x2apic": True, "legacy-apic": True},
-        }
-        if state.get("local_platform_boot_modes") != expected:
-            raise SystemExit(
-                f"unexpected local boot matrix: "
-                f"{state.get('local_platform_boot_modes')!r}"
-            )
-        PY
-
-    - name: Boot the fixed scheduled-SMP workload on two CPUs
-      if: ${{ success() && !cancelled() }}
-      run: |
-        set -euo pipefail
         umask 077
         disk="${RUNNER_TEMP}/hyperv-ci/smp.raw"
         "${RUNNER_TEMP}/hyperv-ci/miz/bin/miz" build-efi-application \
@@ -1634,24 +1568,15 @@ jobs:
       id: hyperv_prepared_image
       run: |
         set -euo pipefail
-        state="${RUNNER_TEMP}/hyperv-ci/packaging"
-        artifact="${RUNNER_TEMP}/hyperv-ci/prepared-export"
-        digest="$(
-          python3 support/scripts/hyperv-azure.py export-prepared \
-            --state-dir "${state}" \
-            --artifact-dir "${artifact}" \
-            --source-repository "${GITHUB_REPOSITORY}" \
-            --source-repository-id "${{ github.repository_id }}" \
-            --source-workflow-ref "${GITHUB_WORKFLOW_REF}" \
-            --source-job zig-hyperv \
-            --source-run-id "${GITHUB_RUN_ID}" \
-            --source-run-attempt "${GITHUB_RUN_ATTEMPT}" \
-            --source-head-sha "${GITHUB_SHA}"
-        )"
-        if [[ ! "${digest}" =~ ^[0-9a-f]{64}$ ]]; then
-          echo "Invalid prepared-image manifest digest" >&2
-          exit 1
-        fi
+        root="${RUNNER_TEMP}/hyperv-ci/native-public-boot"
+        for required in \
+          "${root}/export-digest.txt" \
+          "${root}/export/prepared-image-manifest.json" \
+          "${root}/export/unikraft.vhd"; do
+          test -s "${required}"
+        done
+        digest="$(tr -d '\r\n' < "${root}/export-digest.txt")"
+        grep --extended-regexp --quiet '^[0-9a-f]{64}$' <<< "${digest}"
         echo "manifest_sha256=${digest}" >> "${GITHUB_OUTPUT}"
         echo "artifact_name=zig-hyperv-prepared-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
           >> "${GITHUB_OUTPUT}"
@@ -1670,8 +1595,8 @@ jobs:
       with:
         name: zig-hyperv-prepared-${{ github.run_id }}-${{ github.run_attempt }}
         path: |
-          ${{ runner.temp }}/hyperv-ci/prepared-export/prepared-image-manifest.json
-          ${{ runner.temp }}/hyperv-ci/prepared-export/unikraft.vhd
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/export/prepared-image-manifest.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/export/unikraft.vhd
         compression-level: 9
         retention-days: 7
         if-no-files-found: error
@@ -1697,9 +1622,6 @@ jobs:
           ${{ runner.temp }}/hyperv-ci/smp-disk-sha256.txt
           ${{ runner.temp }}/hyperv-ci/smp-boot/hyperv-efi-boot.log
           ${{ runner.temp }}/hyperv-ci/smp-boot/report.json
-          ${{ runner.temp }}/hyperv-ci/packaging/packaging.json
-          ${{ runner.temp }}/hyperv-ci/packaging/local-*-serial.log
-          ${{ runner.temp }}/hyperv-ci/packaging/miz-*.log
           ${{ runner.temp }}/hyperv-ci/native-public-boot/prepare-result.json
           ${{ runner.temp }}/hyperv-ci/native-public-boot/matrix.json
           ${{ runner.temp }}/hyperv-ci/native-public-boot/export-digest.txt
@@ -1784,7 +1706,6 @@ jobs:
           git \
           libncurses-dev \
           make \
-          python3 \
           tar \
           xz-utils
         rm -rf /var/lib/apt/lists/*
