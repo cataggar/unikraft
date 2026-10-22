@@ -896,7 +896,7 @@ fn executeOpen(
     try root_environment.put("ZIG_GLOBAL_CACHE_DIR", make_environment.zig_global_cache);
     try root_environment.put("ZIG_LOCAL_PKG_DIR", root_packages.path);
     try root_packages.authenticate(allocator, io, tools.zig, &root_environment, state, state_path, &runner, repository.root.dir, repository.root.path);
-    try ensureAppConfig(allocator, io, repository, build_path);
+    try ensureAppConfig(allocator, io, repository, build, build_path, command == .olddefconfig);
     const environment_path = try std.fs.path.join(
         a,
         &.{ state_path, "environment.json" },
@@ -1257,91 +1257,121 @@ fn ensureAppConfig(
     allocator: std.mem.Allocator,
     io: std.Io,
     repository: contract.files.Repository,
+    build: std.Io.Dir,
     build_path: []const u8,
+    seed_build_config: bool,
 ) !void {
-    if (repository.app.dir.statFile(
+    const app_exists = if (repository.app.dir.statFile(
+        io,
+        ".config",
+        .{ .follow_symlinks = false },
+    )) |stat| blk: {
+        if (stat.kind != .file) return error.UnsafeConfig;
+        const existing = try repository.app.openFile(io, ".config", .source);
+        existing.close(io);
+        break :blk true;
+    } else |err| switch (err) {
+        error.FileNotFound => false,
+        else => return err,
+    };
+    if (!app_exists) {
+        const defconfig = try repository.app.read(
+            allocator,
+            io,
+            "defconfig",
+            maximum_identity_bytes,
+            .source,
+        );
+        defer allocator.free(defconfig);
+        const identity_path = try std.fs.path.join(
+            allocator,
+            &.{ build_path, "artifacts", "identity.json" },
+        );
+        defer allocator.free(identity_path);
+        var identity = try contract.files.RetainedFile.open(
+            io,
+            identity_path,
+            .private,
+        );
+        defer identity.close(io);
+        const identity_bytes = try readRetained(
+            allocator,
+            io,
+            identity,
+            maximum_identity_bytes,
+        );
+        defer allocator.free(identity_bytes);
+        var document = try contract.json.parse(allocator, identity_bytes, .{
+            .bytes = maximum_identity_bytes,
+            .depth = 32,
+            .string_bytes = 64 * 1024,
+            .items = 4096,
+            .tokens = 65536,
+        });
+        defer document.deinit();
+        const fields = switch (document.value()) {
+            .object => |object| object,
+            else => return error.InvalidIdentity,
+        };
+        const variant = if (fields.get("variant")) |value|
+            try core.contracts.string(value)
+        else
+            "tiny";
+        var contents = std.Io.Writer.Allocating.init(allocator);
+        defer contents.deinit();
+        try contents.writer.writeAll(defconfig);
+        if (!std.mem.eql(u8, variant, "tiny")) {
+            const jit_value = fields.get("jit_mode") orelse return error.InvalidIdentity;
+            const mode: u8 = switch (jit_value) {
+                .null => 0,
+                .string => |value| if (std.mem.eql(u8, value, "fast"))
+                    1
+                else if (std.mem.eql(u8, value, "full"))
+                    2
+                else
+                    return error.InvalidIdentity,
+                else => return error.InvalidIdentity,
+            };
+            try contents.writer.print(
+                "\nCONFIG_STACK_SIZE_PAGE_ORDER=8\n" ++
+                    "CONFIG_APPWAMRAOT_JIT_BOOT_MODE={d}\n",
+                .{mode},
+            );
+        }
+        try contract.files.writePrivateCreate(
+            io,
+            repository.app.dir,
+            ".config",
+            contents.written(),
+        );
+        try identity.verify(io);
+    }
+    if (!seed_build_config) return;
+    if (build.statFile(
         io,
         ".config",
         .{ .follow_symlinks = false },
     )) |stat| {
         if (stat.kind != .file) return error.UnsafeConfig;
-        const existing = try repository.app.openFile(io, ".config", .source);
-        existing.close(io);
         return;
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     }
-    const defconfig = try repository.app.read(
+    const app_config = try repository.app.read(
         allocator,
         io,
-        "defconfig",
+        ".config",
         maximum_identity_bytes,
         .source,
     );
-    defer allocator.free(defconfig);
-    const identity_path = try std.fs.path.join(
-        allocator,
-        &.{ build_path, "artifacts", "identity.json" },
-    );
-    defer allocator.free(identity_path);
-    var identity = try contract.files.RetainedFile.open(
-        io,
-        identity_path,
-        .private,
-    );
-    defer identity.close(io);
-    const identity_bytes = try readRetained(
-        allocator,
-        io,
-        identity,
-        maximum_identity_bytes,
-    );
-    defer allocator.free(identity_bytes);
-    var document = try contract.json.parse(allocator, identity_bytes, .{
-        .bytes = maximum_identity_bytes,
-        .depth = 32,
-        .string_bytes = 64 * 1024,
-        .items = 4096,
-        .tokens = 65536,
-    });
-    defer document.deinit();
-    const fields = switch (document.value()) {
-        .object => |object| object,
-        else => return error.InvalidIdentity,
-    };
-    const variant = if (fields.get("variant")) |value|
-        try core.contracts.string(value)
-    else
-        "tiny";
-    var contents = std.Io.Writer.Allocating.init(allocator);
-    defer contents.deinit();
-    try contents.writer.writeAll(defconfig);
-    if (!std.mem.eql(u8, variant, "tiny")) {
-        const jit_value = fields.get("jit_mode") orelse return error.InvalidIdentity;
-        const mode: u8 = switch (jit_value) {
-            .null => 0,
-            .string => |value| if (std.mem.eql(u8, value, "fast"))
-                1
-            else if (std.mem.eql(u8, value, "full"))
-                2
-            else
-                return error.InvalidIdentity,
-            else => return error.InvalidIdentity,
-        };
-        try contents.writer.print(
-            "\nCONFIG_STACK_SIZE_PAGE_ORDER=8\n" ++
-                "CONFIG_APPWAMRAOT_JIT_BOOT_MODE={d}\n",
-            .{mode},
-        );
-    }
+    defer allocator.free(app_config);
     try contract.files.writePrivateCreate(
         io,
-        repository.app.dir,
+        build,
         ".config",
-        contents.written(),
+        app_config,
     );
-    try identity.verify(io);
 }
 
 fn rootCommand(
