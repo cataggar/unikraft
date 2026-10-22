@@ -810,7 +810,13 @@ const TestFixture = struct {
 };
 fn project(comptime T: type, value: anytype) T {
     var result: T = undefined;
-    inline for (@typeInfo(T).@"struct".field_names) |field_name| @field(result, field_name) = @field(value, field_name);
+    inline for (@typeInfo(T).@"struct".field_names) |field_name| {
+        if (@hasField(@TypeOf(value), field_name)) {
+            @field(result, field_name) = @field(value, field_name);
+        } else {
+            @field(result, field_name) = null;
+        }
+    }
     return result;
 }
 fn testMetadata(value: types.Plan) candidate.Metadata {

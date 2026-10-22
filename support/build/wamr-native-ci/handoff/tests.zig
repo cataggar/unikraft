@@ -2131,3 +2131,119 @@ fn writeFile(io: std.Io, dir: std.Io.Dir, name: []const u8, bytes: []const u8) !
     try file.sync(io);
     try (std.Io.File{ .handle = dir.handle, .flags = .{ .nonblocking = false } }).sync(io);
 }
+
+test "closed CoreMark correctness profile binds 30-artifact 89-member bundle, candidate purpose, and [0]crc* serial checks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try std.testing.expectEqual(profile.Compatibility.coremark_qcow2_derived_vhd_v2, try profile.compatibility(2, "coremark-qcow2-derived-vhd"));
+    try std.testing.expectEqual(@as(usize, 30), layout.artifactNames(.coremark_qcow2_derived_vhd_v2).len);
+    try std.testing.expectEqual(@as(usize, 89), layout.coremark_v2_zip_member_count);
+
+    const coremark_bundle = try native_export.Test.buildRootBoundBundleCoremarkV2(
+        a,
+        root_bound_stage,
+        "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+    );
+    var coremark_doc = try contracts.parseCanonical(a, coremark_bundle);
+    defer coremark_doc.deinit();
+    const validated = try contracts.validateLocalImageHandoffWithRoot(coremark_doc.value(), root_bound_stage);
+    try std.testing.expectEqual(profile.Compatibility.coremark_qcow2_derived_vhd_v2, validated);
+    try std.testing.expectEqual(@as(usize, 30), coremark_doc.value().object.get("artifacts").?.array.items.len);
+
+    const relabeled_as_tiny = try std.mem.replaceOwned(u8, a, coremark_bundle, "\"profile\":\"coremark-qcow2-derived-vhd\"", "\"profile\":\"qcow2-derived-vhd\"");
+    var relabeled_tiny_doc = try contracts.parseCanonical(a, relabeled_as_tiny);
+    defer relabeled_tiny_doc.deinit();
+    try std.testing.expectError(error.UnexpectedFields, contracts.validateLocalImageHandoffWithRoot(relabeled_tiny_doc.value(), root_bound_stage));
+
+    const tiny_bundle = try native_export.Test.buildRootBoundBundleV2(
+        a,
+        root_bound_stage,
+        "2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881",
+    );
+    const relabeled_as_coremark = try std.mem.replaceOwned(u8, a, tiny_bundle, "\"profile\":\"qcow2-derived-vhd\"", "\"profile\":\"coremark-qcow2-derived-vhd\"");
+    var relabeled_cm_doc = try contracts.parseCanonical(a, relabeled_as_coremark);
+    defer relabeled_cm_doc.deinit();
+    try std.testing.expectError(error.UnexpectedFields, contracts.validateLocalImageHandoffWithRoot(relabeled_cm_doc.value(), root_bound_stage));
+
+    const d_tiny_wasm = @as([64]u8, @splat('1'));
+    const d_tiny_cwasm = @as([64]u8, @splat('2'));
+    const d_runtime = @as([64]u8, @splat('3'));
+    const d_compiler = @as([64]u8, @splat('4'));
+    const d_config = @as([64]u8, @splat('5'));
+    const d_cm_wasm = @as([64]u8, @splat('6'));
+    const d_cm_cwasm = @as([64]u8, @splat('7'));
+    const d_nofp_wasm = @as([64]u8, @splat('8'));
+    const d_nofp_cwasm = @as([64]u8, @splat('9'));
+    const coremark_identity: handoff.candidate.Identity = .{
+        .wamr_revision = rev,
+        .wasm_sha256 = &d_tiny_wasm,
+        .cwasm_sha256 = &d_tiny_cwasm,
+        .runtime_sha256 = &d_runtime,
+        .compiler_sha256 = &d_compiler,
+        .config_sha256 = &d_config,
+        .coremark_wasm_sha256 = &d_cm_wasm,
+        .coremark_cwasm_sha256 = &d_cm_cwasm,
+        .coremark_nofp_wasm_sha256 = &d_nofp_wasm,
+        .coremark_nofp_cwasm_sha256 = &d_nofp_cwasm,
+    };
+    const scope_artifact: handoff.candidate.Artifact = .{ .path = "/private/scope.json", .size = 1, .sha256 = sha };
+    const encoded_candidate = try handoff.candidate.Test.encode(a, coremark_doc.value(), scope_artifact, .{ .attempt_id = uuid });
+    var candidate_doc = try contracts.parseCanonical(a, encoded_candidate);
+    defer candidate_doc.deinit();
+    _ = try contracts.validateDirectComputeCandidate(candidate_doc.value());
+    try std.testing.expectEqualStrings("coremark-qcow2-derived-vhd", candidate_doc.value().object.get("purpose").?.string);
+
+    const cm_stdout =
+        "2K performance run parameters for coremark.\n" ++
+        "CoreMark Size    : 666\n" ++
+        "Total ticks      : 1\n" ++
+        "Total time (secs): 0.001000\n" ++
+        "Iterations/Sec   : 100000.000000\n" ++
+        "ERROR! Must execute for at least 10 secs for a valid result!\n" ++
+        "Iterations       : 100\n" ++
+        "Compiler version : synthetic fixture, not execution evidence\n" ++
+        "Compiler flags   : synthetic\n" ++
+        "Memory location  : STACK\n" ++
+        "seedcrc          : 0xe9f5\n" ++
+        "[0]crclist       : 0xe714\n" ++
+        "[0]crcmatrix     : 0x1fd7\n" ++
+        "[0]crcstate      : 0x8e3a\n" ++
+        "[0]crcfinal      : 0x988c\n" ++
+        "Errors detected\n";
+    const cm_b64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(cm_stdout.len));
+    _ = std.base64.standard.Encoder.encode(cm_b64, cm_stdout);
+    const coremark_serial = try a.print(
+        "Hyper-V Hv#1 hypercall page enabled\n" ++
+            "Hyper-V SynIC:\n" ++
+            "Powered by Unikraft\n" ++
+            "Calling main(0, 0)\n" ++
+            "WAMR_NATIVE_WASI={{\"version\":1,\"correctness_only\":true,\"workload\":\"coremark\",\"wasm_sha256\":\"{s}\",\"cwasm_sha256\":\"{s}\",\"terminal\":2,\"detail\":0,\"crc_ok\":true,\"output_error\":0,\"pending_stdout\":0,\"pending_stderr\":0,\"unsupported_clock\":0,\"realtime_supported\":true,\"stdout_base64\":\"{s}\",\"stderr_base64\":\"\"}}\n" ++
+            "WAMR_NATIVE_WASI={{\"version\":1,\"correctness_only\":true,\"workload\":\"coremark-nofp\",\"wasm_sha256\":\"{s}\",\"cwasm_sha256\":\"{s}\",\"terminal\":2,\"detail\":0,\"crc_ok\":true,\"output_error\":0,\"pending_stdout\":0,\"pending_stderr\":0,\"unsupported_clock\":0,\"realtime_supported\":true,\"stdout_base64\":\"{s}\",\"stderr_base64\":\"\"}}\n" ++
+            "WAMR_NATIVE_COMPUTE={{\"version\":1,\"workload\":\"tiny\",\"wamr_revision\":\"{s}\",\"wasm_sha256\":\"{s}\",\"cwasm_sha256\":\"{s}\",\"runtime_sha256\":\"{s}\",\"platform_status\":0,\"checks\":2,\"answer\":42,\"terminal\":1,\"detail\":2,\"reserved_bytes\":0,\"frame_bytes\":0,\"accessible_bytes\":0,\"allocation_bytes\":0,\"system_page_table_bytes\":4096,\"error_name\":\"\"}}\n" ++
+            "WAMR_NATIVE_AOT_OK answer=42 teardown=0\n" ++
+            "[    0.050000] Info: [libukboot] main returned 0\n",
+        .{
+            &d_cm_wasm,   &d_cm_cwasm,   cm_b64,
+            &d_nofp_wasm, &d_nofp_cwasm, cm_b64,
+            rev,          &d_tiny_wasm,  &d_tiny_cwasm, &d_runtime,
+        },
+    );
+    const checked = try handoff.candidate.Test.checkSerial(a, coremark_serial, coremark_identity);
+    try std.testing.expectEqual(@as(i32, 42), checked.answer);
+
+    const bad_stdout = try std.mem.replaceOwned(u8, a, cm_stdout, "[0]crcfinal      : 0x988c", "[0]crcfinal      : 0xdead");
+    const bad_b64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(bad_stdout.len));
+    _ = std.base64.standard.Encoder.encode(bad_b64, bad_stdout);
+    const bad_crc = try std.mem.replaceOwned(u8, a, coremark_serial, cm_b64, bad_b64);
+    try std.testing.expectError(error.InvalidCoreMarkField, handoff.candidate.Test.checkSerial(a, bad_crc, coremark_identity));
+
+    var tiny_only_identity = coremark_identity;
+    tiny_only_identity.coremark_wasm_sha256 = null;
+    tiny_only_identity.coremark_cwasm_sha256 = null;
+    tiny_only_identity.coremark_nofp_wasm_sha256 = null;
+    tiny_only_identity.coremark_nofp_cwasm_sha256 = null;
+    try std.testing.expectError(error.ForbiddenMarker, handoff.candidate.Test.checkSerial(a, coremark_serial, tiny_only_identity));
+}
+

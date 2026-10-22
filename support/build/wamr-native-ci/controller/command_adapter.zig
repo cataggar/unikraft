@@ -25,6 +25,7 @@ pub const Outcome = struct {
 pub const Request = struct {
     roots: plan.Roots,
     stage: plan.Stage,
+    profile: @import("profile.zig").ProductionProfile = .tiny_exact_v2,
     private_dir: std.Io.Dir,
     evidence_dir: std.Io.Dir,
     cancel: ?*const std.atomic.Value(bool) = null,
@@ -234,7 +235,7 @@ pub fn execute(allocator: Allocator, io: std.Io, request: Request) !Outcome {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var selected = plan.spec(request.stage);
+    var selected = plan.specForProfile(request.stage, @import("profile.zig").activeCpuBaseline(), request.profile);
     if (request.test_seconds != null or request.test_output_limit != null or request.test_replacement != null) {
         if (!builtin.is_test) return error.TestOnlyOverride;
         selected.seconds = request.test_seconds orelse selected.seconds;

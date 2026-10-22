@@ -7,6 +7,7 @@ const contracts = core.contracts;
 pub const Action = enum { build, boot, diagnostics, describe, @"--identity", @"supervisor-source-closure", @"standalone-supervisor-source-closure", @"reader-source-closure", records, @"check-local-records", @"readonly-records", @"local-consumer-custody", @"handoff-inspect", @"handoff-inspect-legacy", @"public-validator-build", @"local-handoff-revalidation", @"supervisor-import-identity", @"import-validator-build", @"import-native-revalidation", @"import-handoff-revalidation", @"private-export", @"private-validate", @"public-export", @"public-archive", @"verify-public-source-bundle", @"stage-public-source-upload", @"seal-public-source-upload", @"retain-public-source-download", @"import-public-source-bundle", @"import-public-source-download", candidate, @"candidate-inspect", @"candidate-result" };
 pub const Command = struct {
     action: Action,
+    profile: @import("profile.zig").ProductionProfile = .tiny_exact_v2,
     runtime: ?[]const u8 = null,
     wamr_source: ?[]const u8 = null,
     stage_root: ?[]const u8 = null,
@@ -404,11 +405,19 @@ fn parseExisting(args: []const []const u8, action: Action) !Command {
         if (result.runtime == null or result.output == null) return error.InvalidUsage;
         return result;
     }
-    if (args.len < 4 or args.len > 6 or args.len % 2 != 0) return error.InvalidUsage;
+    if (args.len < 4 or args.len > 8) return error.InvalidUsage;
     var result = Command{ .action = action };
+    var profile_set = false;
     var i: usize = 2;
-    while (i < args.len) : (i += 2) {
+    while (i < args.len) {
         const flag = args[i];
+        if (action == .build and std.mem.eql(u8, flag, "--coremark") and !profile_set) {
+            result.profile = .coremark_exact_v2;
+            profile_set = true;
+            i += 1;
+            continue;
+        }
+        if (i + 1 >= args.len) return error.InvalidUsage;
         const value = args[i + 1];
         if (std.mem.eql(u8, flag, "--runtime") and result.runtime == null) {
             files.absoluteFilePath(value) catch return error.InvalidUsage;
@@ -418,7 +427,13 @@ fn parseExisting(args: []const []const u8, action: Action) !Command {
         {
             files.absoluteFilePath(value) catch return error.InvalidUsage;
             result.wamr_source = value;
+        } else if (std.mem.eql(u8, flag, "--profile") and
+            action == .build and !profile_set)
+        {
+            result.profile = @import("profile.zig").parseProductionProfile(value) catch return error.InvalidUsage;
+            profile_set = true;
         } else return error.InvalidUsage;
+        i += 2;
     }
     if (result.runtime == null or (action == .build) != (result.wamr_source != null))
         return error.InvalidUsage;

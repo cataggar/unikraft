@@ -24,7 +24,9 @@ fn run(allocator: std.mem.Allocator, io: std.Io, root: []const u8) !void {
     var iterator = directory.dir.iterate();
     if (try iterator.next(io) != null) return error.FixtureAlreadyUsed;
     const modes = controller.profile.production_modes;
-    if (modes.len != 6 or controller.profile.productionSet(.tiny_exact_v2) != .tiny_v2_qcow2_derived_vhd)
+    if (modes.len != 6 or
+        controller.profile.productionSet(.tiny_exact_v2) != .tiny_v2_qcow2_derived_vhd or
+        controller.profile.productionSet(.coremark_exact_v2) != .coremark_v2_qcow2_derived_vhd)
         return error.InvalidProfile;
     for (modes, 0..) |mode, index|
         if (mode.legacyApic() != (index % 2 == 1)) return error.InvalidMode;

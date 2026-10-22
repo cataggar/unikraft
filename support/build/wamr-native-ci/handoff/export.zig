@@ -382,7 +382,11 @@ const Attempt = struct {
     }
 
     fn compatibility(self: *Attempt) profile.Compatibility {
-        return if (self.accepted.?.compatibility == .tiny_v1_legacy) .frozen_tiny_v1 else .tiny_qcow2_derived_vhd_v2;
+        return switch (self.accepted.?.compatibility) {
+            .tiny_v1_legacy => .frozen_tiny_v1,
+            .tiny_v2_qcow2_derived_vhd => .tiny_qcow2_derived_vhd_v2,
+            .coremark_v2_qcow2_derived_vhd => .coremark_qcow2_derived_vhd_v2,
+        };
     }
 
     fn addSource(self: *Attempt, retained_: files.RetainedFile, phase: Phase, relative: []const u8, member: *Member, limit: u64) !void {
@@ -551,7 +555,7 @@ const Attempt = struct {
             try buildLegacyBundleBytes(self.a(), self.accepted.?.source.revision, self.accepted.?.source.tree, self.artifacts, self.boots, self.evidence)
         else blk: {
             const run_info = try runIdentity(self.invocation.environ);
-            break :blk try buildBundleBytes(self.a(), self.accepted.?.source.revision, self.accepted.?.source.tree, self.accepted.?.imported_wamr_revision, run_info.run_id, run_info.run_attempt, self.artifacts, self.boots, self.evidence);
+            break :blk try buildBundleBytes(self.a(), self.compatibility(), self.accepted.?.source.revision, self.accepted.?.source.tree, self.accepted.?.imported_wamr_revision, run_info.run_id, run_info.run_attempt, self.artifacts, self.boots, self.evidence);
         };
         if (self.bundle.len > layout.max_json_bytes) return error.ManifestTooLarge;
         try requireDurable(try self.private_lock.?.createImmutable(self.invocation.io, "handoff.json", self.bundle));
@@ -706,10 +710,47 @@ fn decimal(value: []const u8) bool {
     for (value) |byte| if (!std.ascii.isDigit(byte)) return false;
     return true;
 }
-fn buildBundleBytes(a: std.mem.Allocator, revision: []const u8, tree: []const u8, wamr_revision: []const u8, id: []const u8, attempt: []const u8, artifacts: []const Member, boots: []const Boot, evidence: []const Member) ![]const u8 {
-    if (artifacts.len != layout.artifact_names_v2.len or boots.len != profile.production_modes.len or evidence.len != layout.evidence_v2.len)
+fn buildBundleBytes(a: std.mem.Allocator, compat: profile.Compatibility, revision: []const u8, tree: []const u8, wamr_revision: []const u8, id: []const u8, attempt: []const u8, artifacts: []const Member, boots: []const Boot, evidence: []const Member) ![]const u8 {
+    if (artifacts.len != layout.artifactNames(compat).len or boots.len != profile.production_modes.len or evidence.len != layout.evidence_v2.len)
         return error.InvalidMemberCount;
     const by_name = ArtifactMap{ .items = artifacts };
+    const lineage = .{
+        .raw_sha256 = try by_name.sha("raw"),
+        .accepted_qcow2_sha256 = try by_name.sha("qcow2"),
+        .derived_vhd_sha256 = try by_name.sha("vhd"),
+        .qcow2_finalization_sha256 = try by_name.sha("qcow2_finalization"),
+        .qcow2_acceptance_sha256 = try by_name.sha("qcow2_acceptance"),
+        .fixed_vhd_derivation_sha256 = try by_name.sha("fixed_vhd_derivation"),
+        .fixed_vhd_derivation_gate_sha256 = try by_name.sha("fixed_vhd_derivation_gate"),
+        .final_inspection_sha256 = try by_name.sha("final_inspection"),
+    };
+    if (compat == .coremark_qcow2_derived_vhd_v2) {
+        return canonical(a, .{
+            .schema = "uk.wamr.local-image-handoff",
+            .version = @as(u8, 2),
+            .profile = profile.coremark_profile,
+            .authority = profile.authority,
+            .source_revision = revision,
+            .source_tree = tree,
+            .run = .{ .repository = profile.repository, .run_id = id, .run_attempt = attempt },
+            .identity = .{
+                .wamr_revision = wamr_revision,
+                .wasm_sha256 = try by_name.sha("wasm"),
+                .cwasm_sha256 = try by_name.sha("cwasm"),
+                .coremark_wasm_sha256 = try by_name.sha("coremark_wasm"),
+                .coremark_cwasm_sha256 = try by_name.sha("coremark_cwasm"),
+                .coremark_nofp_wasm_sha256 = try by_name.sha("coremark_nofp_wasm"),
+                .coremark_nofp_cwasm_sha256 = try by_name.sha("coremark_nofp_cwasm"),
+                .runtime_sha256 = try by_name.sha("runtime"),
+                .compiler_sha256 = try by_name.sha("compiler"),
+                .config_sha256 = try by_name.sha("config"),
+            },
+            .lineage = lineage,
+            .artifacts = artifacts,
+            .boots = boots,
+            .evidence = evidence,
+        });
+    }
     return canonical(a, .{
         .schema = "uk.wamr.local-image-handoff",
         .version = @as(u8, 2),
@@ -726,16 +767,7 @@ fn buildBundleBytes(a: std.mem.Allocator, revision: []const u8, tree: []const u8
             .compiler_sha256 = try by_name.sha("compiler"),
             .config_sha256 = try by_name.sha("config"),
         },
-        .lineage = .{
-            .raw_sha256 = try by_name.sha("raw"),
-            .accepted_qcow2_sha256 = try by_name.sha("qcow2"),
-            .derived_vhd_sha256 = try by_name.sha("vhd"),
-            .qcow2_finalization_sha256 = try by_name.sha("qcow2_finalization"),
-            .qcow2_acceptance_sha256 = try by_name.sha("qcow2_acceptance"),
-            .fixed_vhd_derivation_sha256 = try by_name.sha("fixed_vhd_derivation"),
-            .fixed_vhd_derivation_gate_sha256 = try by_name.sha("fixed_vhd_derivation_gate"),
-            .final_inspection_sha256 = try by_name.sha("final_inspection"),
-        },
+        .lineage = lineage,
         .artifacts = artifacts,
         .boots = boots,
         .evidence = evidence,
@@ -767,7 +799,12 @@ fn buildLegacyBundleBytes(a: std.mem.Allocator, revision: []const u8, tree: []co
 const ArtifactMap = struct {
     items: []const Member,
     fn sha(self: ArtifactMap, name: []const u8) ![]const u8 {
-        const names: []const []const u8 = if (self.items.len == layout.artifact_names_v1.len) &layout.artifact_names_v1 else &layout.artifact_names_v2;
+        const names: []const []const u8 = if (self.items.len == layout.artifact_names_v1.len)
+            &layout.artifact_names_v1
+        else if (self.items.len == layout.artifact_names_coremark_v2.len)
+            &layout.artifact_names_coremark_v2
+        else
+            &layout.artifact_names_v2;
         for (names, self.items) |candidate, member|
             if (std.mem.eql(u8, candidate, name)) return member.sha256;
         return error.MissingArtifact;
@@ -818,7 +855,22 @@ pub const Test = if (builtin.is_test) struct {
         const evidence = try a.alloc(Member, layout.evidence_v2.len);
         for (layout.evidence_v2, 0..) |name, i|
             evidence[i] = try fixtureMember(a, root, try a.print("evidence/{s}", .{name}), sha256);
-        return buildBundleBytes(a, "0123456789012345678901234567890123456789", "0123456789012345678901234567890123456789", profile.wamr_revision, "1", "1", artifacts, boots, evidence);
+        return buildBundleBytes(a, .tiny_qcow2_derived_vhd_v2, "0123456789012345678901234567890123456789", "0123456789012345678901234567890123456789", profile.wamr_revision, "1", "1", artifacts, boots, evidence);
+    }
+    pub fn buildRootBoundBundleCoremarkV2(a: std.mem.Allocator, root: []const u8, sha256: []const u8) ![]const u8 {
+        const artifacts = try a.alloc(Member, layout.artifact_names_coremark_v2.len);
+        for (layout.artifact_names_coremark_v2, 0..) |name, i|
+            artifacts[i] = try fixtureMember(a, root, try a.print("artifacts/{s}", .{name}), sha256);
+        const boots = try a.alloc(Boot, profile.production_modes.len);
+        for (profile.production_modes, 0..) |mode, i| {
+            boots[i].mode = @tagName(mode);
+            inline for (.{ "serial", "request", "report", "compute" }) |part|
+                @field(boots[i], part) = try fixtureMember(a, root, try a.print("boots/{s}/{s}", .{ @tagName(mode), part }), sha256);
+        }
+        const evidence = try a.alloc(Member, layout.evidence_v2.len);
+        for (layout.evidence_v2, 0..) |name, i|
+            evidence[i] = try fixtureMember(a, root, try a.print("evidence/{s}", .{name}), sha256);
+        return buildBundleBytes(a, .coremark_qcow2_derived_vhd_v2, "0123456789012345678901234567890123456789", "0123456789012345678901234567890123456789", profile.wamr_revision, "1", "1", artifacts, boots, evidence);
     }
     fn fixtureMember(a: std.mem.Allocator, root: []const u8, relative: []const u8, sha256: []const u8) !Member {
         return .{ .path = try std.fs.path.join(a, &.{ root, relative }), .size = 1, .sha256 = sha256 };

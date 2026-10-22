@@ -2269,9 +2269,25 @@ test "CLI accepts only closed arguments and no caller-selected profile" {
     try std.testing.expectEqual(cli.Action.@"supervisor-import-identity", imported_identity.action);
     try std.testing.expectEqualStrings("/stage", imported_identity.stage_root.?);
     try std.testing.expectEqualStrings("/trusted/supervisor", imported_identity.supervisor.?);
+    const build_coremark = try cli.parse(&.{
+        "uk-wamr-native-ci", "build", "--runtime", "/runtime", "--wamr-source", "/wamr", "--coremark",
+    });
+    try std.testing.expectEqual(controller.profile.ProductionProfile.coremark_exact_v2, build_coremark.profile);
+    const build_coremark_profile = try cli.parse(&.{
+        "uk-wamr-native-ci", "build",     "--runtime",                  "/runtime", "--wamr-source", "/wamr",
+        "--profile",         "coremark-qcow2-derived-vhd",
+    });
+    try std.testing.expectEqual(controller.profile.ProductionProfile.coremark_exact_v2, build_coremark_profile.profile);
+    const build_tiny_profile = try cli.parse(&.{
+        "uk-wamr-native-ci", "build", "--runtime", "/runtime", "--wamr-source", "/wamr", "--profile", "qcow2-derived-vhd",
+    });
+    try std.testing.expectEqual(controller.profile.ProductionProfile.tiny_exact_v2, build_tiny_profile.profile);
     const rejected = [_][]const []const u8{
         &.{"uk-wamr-native-ci"},
         &.{ "uk-wamr-native-ci", "--identity", "--runtime", "/runtime" },
+        &.{ "uk-wamr-native-ci", "build", "--runtime", "/runtime", "--wamr-source", "/wamr", "--profile", "tiny" },
+        &.{ "uk-wamr-native-ci", "build", "--runtime", "/runtime", "--wamr-source", "/wamr", "--coremark", "--profile", "qcow2-derived-vhd" },
+        &.{ "uk-wamr-native-ci", "boot", "--runtime", "/runtime", "--coremark" },
         &.{ "uk-wamr-native-ci", "local-handoff-revalidation", "--runtime", "/runtime" },
         &.{ "uk-wamr-native-ci", "local-handoff-revalidation", "--runtime", "/runtime", "--output", "/private/revalidation", "--validator", "/caller" },
         &.{ "uk-wamr-native-ci", "supervised-command-record", "--record", "/record", "--identities", "/ids", "--stage", "adapter", "--transport", "trusted-inner-zip", "--profile", "tiny-aot-two-boot" },
@@ -6026,3 +6042,52 @@ test "handoff inspect supervises original roles, captures output and refuses mis
     try handoffInspectFixtures();
     try legacyHandoffInspectLiveFixture();
 }
+
+test "closed CoreMark correctness profile binds prepare, boot forbidden list, and prepared identity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqual(controller.profile.CompatibleRecordSet.coremark_v2_qcow2_derived_vhd, controller.profile.productionSet(.coremark_exact_v2));
+    try std.testing.expectEqualStrings("coremark-qcow2-derived-vhd", controller.profile.profileName(.coremark_exact_v2));
+    try std.testing.expectEqualStrings("qcow2-derived-vhd", controller.profile.profileName(.tiny_exact_v2));
+    try std.testing.expect(controller.profile.isV2(.coremark_v2_qcow2_derived_vhd));
+    try std.testing.expect(controller.profile.isCoremark(.coremark_v2_qcow2_derived_vhd));
+    try std.testing.expect(!controller.profile.isCoremark(.tiny_v2_qcow2_derived_vhd));
+
+    const tiny_prepare = controller.command_plan.specForProfile(.prepare, .x86_64_v2, .tiny_exact_v2);
+    const coremark_prepare = controller.command_plan.specForProfile(.prepare, .x86_64_v2, .coremark_exact_v2);
+    try std.testing.expectEqual(@as(usize, 6), tiny_prepare.argv.len);
+    try std.testing.expectEqual(@as(usize, 7), coremark_prepare.argv.len);
+    try std.testing.expectEqualStrings("--coremark", coremark_prepare.argv[6].literal);
+
+    const tiny_boot = controller.command_plan.specForProfile(.@"raw-x2apic", .x86_64_v2, .tiny_exact_v2);
+    const coremark_boot = controller.command_plan.specForProfile(.@"raw-x2apic", .x86_64_v2, .coremark_exact_v2);
+    var tiny_forbids_wasi = false;
+    for (tiny_boot.argv) |item| switch (item) {
+        .literal => |val| if (std.mem.eql(u8, val, "WAMR_NATIVE_WASI=")) {
+            tiny_forbids_wasi = true;
+        },
+        else => {},
+    };
+    var coremark_forbids_wasi = false;
+    for (coremark_boot.argv) |item| switch (item) {
+        .literal => |val| if (std.mem.eql(u8, val, "WAMR_NATIVE_WASI=")) {
+            coremark_forbids_wasi = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(tiny_forbids_wasi);
+    try std.testing.expect(!coremark_forbids_wasi);
+
+    const tiny_cfg = try controller.boot_pipeline.expectedModeConfigForProfile(a, .@"raw-x2apic", .tiny_exact_v2, "/img", "/code", "/vars", "/qemu", "/work");
+    const coremark_cfg = try controller.boot_pipeline.expectedModeConfigForProfile(a, .@"raw-x2apic", .coremark_exact_v2, "/img", "/code", "/vars", "/qemu", "/work");
+    try std.testing.expectEqual(@as(usize, 7), tiny_cfg.object.get("forbidden").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 6), coremark_cfg.object.get("forbidden").?.array.items.len);
+
+    const tiny_result_raw = try fixture(a, true, true);
+    const coremark_result_raw = try std.mem.replaceOwned(u8, a, tiny_result_raw, "\"profile\":\"qcow2-derived-vhd\"", "\"profile\":\"coremark-qcow2-derived-vhd\"");
+    var parsed_coremark = try controller.records.parseCanonicalResult(a, try controller.records.canonicalAlloc(a, coremark_result_raw));
+    defer parsed_coremark.deinit();
+    try std.testing.expectEqual(controller.profile.CompatibleRecordSet.coremark_v2_qcow2_derived_vhd, parsed_coremark.value.set);
+}
+

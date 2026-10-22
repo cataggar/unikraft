@@ -158,7 +158,7 @@ pub const Download = struct {
             @field(owned.upload.context, name) = try arena.allocator().dupe(u8, @field(expected.upload.context, name));
         var standalone = try Standalone.open(allocator, io, path, owned.upload.context, owned.inner_digest, cancel);
         errdefer standalone.deinit(io);
-        if (standalone.archive.metadata.compatibility != .tiny_qcow2_derived_vhd_v2)
+        if (!standalone.archive.metadata.compatibility.isV2())
             return error.TransportRequiresV2;
         return .{ .standalone = standalone, .arena = arena, .expected = owned };
     }

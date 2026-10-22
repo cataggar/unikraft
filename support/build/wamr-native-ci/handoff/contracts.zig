@@ -18,6 +18,18 @@ pub const schema_fields = struct {
     pub const manifest_member = [_][]const u8{ "sha256", "size" };
     pub const boot = [_][]const u8{ "compute", "mode", "report", "request", "serial" };
     pub const identity = [_][]const u8{ "compiler_sha256", "config_sha256", "cwasm_sha256", "runtime_sha256", "wamr_revision", "wasm_sha256" };
+    pub const identity_coremark = [_][]const u8{
+        "compiler_sha256",
+        "config_sha256",
+        "coremark_cwasm_sha256",
+        "coremark_nofp_cwasm_sha256",
+        "coremark_nofp_wasm_sha256",
+        "coremark_wasm_sha256",
+        "cwasm_sha256",
+        "runtime_sha256",
+        "wamr_revision",
+        "wasm_sha256",
+    };
     pub const local_image_handoff_v1 = [_][]const u8{ "artifacts", "authority", "boots", "evidence", "identity", "schema", "source_revision", "source_tree", "version" };
     pub const local_image_handoff_v2 = [_][]const u8{ "artifacts", "authority", "boots", "evidence", "identity", "lineage", "profile", "run", "schema", "source_revision", "source_tree", "version" };
     pub const public_source_manifest_v1 = [_][]const u8{ "authority", "members", "schema", "source", "version" };
@@ -62,7 +74,7 @@ pub fn validatePublicSourceManifest(value: std.json.Value) !profile.Compatibilit
         try string(initial, "profile")
     else
         null);
-    _ = try c.exactFields(value, if (compatibility == .tiny_qcow2_derived_vhd_v2) &schema_fields.public_source_manifest_v2 else &schema_fields.public_source_manifest_v1);
+    _ = try c.exactFields(value, if (compatibility.isV2()) &schema_fields.public_source_manifest_v2 else &schema_fields.public_source_manifest_v1);
     try literal(initial, "schema", "uk.wamr.public-source-bundle");
     try literal(initial, "authority", profile.authority);
     try validatePublicContext(initial.get("source") orelse return error.MissingField, compatibility);
@@ -89,8 +101,15 @@ pub fn validateDirectComputeCandidate(value: std.json.Value) !profile.Compatibil
     try literal(fields, "schema", "uk.wamr.direct-compute");
     try literal(fields, "authority", profile.authority);
     const version = try integer(u8, fields, "version");
-    const compatibility = try profile.compatibility(version, if (version == 2) profile.current_profile else null);
-    try literal(fields, "purpose", if (compatibility == .frozen_tiny_v1) "tiny-aot-two-boot" else profile.current_profile);
+    const purpose = try string(fields, "purpose");
+    const compatibility = switch (version) {
+        1 => blk: {
+            if (!std.mem.eql(u8, purpose, "tiny-aot-two-boot")) return error.InvalidLiteral;
+            break :blk profile.Compatibility.frozen_tiny_v1;
+        },
+        2 => profile.compatibility(version, purpose) catch return error.InvalidLiteral,
+        else => return error.UnsupportedVersion,
+    };
     try validateApproval(fields.get("approval").?);
     try uuid(try string(fields, "attempt_id"));
     const subscription = try string(fields, "subscription");
@@ -112,17 +131,21 @@ pub fn validateDirectComputeCandidate(value: std.json.Value) !profile.Compatibil
         return error.InvalidBudget;
     try hex(try string(fields, "source_revision"), 40);
     try hex(try string(fields, "source_tree"), 40);
-    try validateIdentity(fields.get("identity").?);
+    try validateIdentityForCompatibility(fields.get("identity").?, compatibility);
     try validateArtifact(fields.get("os_vhd").?, layout.max_large_artifact_bytes);
     try validateArtifact(fields.get("bundle").?, layout.max_json_bytes);
     return compatibility;
 }
 
 pub fn validateDirectComputeAdmissionV2(value: std.json.Value) !void {
+    _ = try validateDirectComputeAdmissionV2WithCompatibility(value);
+}
+
+pub fn validateDirectComputeAdmissionV2WithCompatibility(value: std.json.Value) !profile.Compatibility {
     const fields = try c.exactFields(value, &schema_fields.direct_compute_admission_v2);
     try literal(fields, "schema", "uk.wamr.direct-compute-admission");
     if (try integer(u8, fields, "version") != 2) return error.UnsupportedVersion;
-    try literal(fields, "profile", profile.current_profile);
+    const compatibility = profile.compatibility(2, try string(fields, "profile")) catch return error.InvalidLiteral;
     try literal(fields, "authority", profile.authority);
     try hex(try string(fields, "source_revision"), 40);
     try hex(try string(fields, "source_tree"), 40);
@@ -130,6 +153,7 @@ pub fn validateDirectComputeAdmissionV2(value: std.json.Value) !void {
     try validateLineage(fields.get("lineage").?, null);
     try validateArtifact(fields.get("public_bundle").?, layout.max_json_bytes);
     try validateArtifact(fields.get("transport").?, layout.max_json_bytes);
+    return compatibility;
 }
 
 fn validateBundleV1(value: std.json.Value, root: ?[]const u8) !profile.Compatibility {
@@ -140,11 +164,11 @@ fn validateBundleV1(value: std.json.Value, root: ?[]const u8) !profile.Compatibi
 
 fn validateBundleV2(value: std.json.Value, root: ?[]const u8) !profile.Compatibility {
     const fields = try c.exactFields(value, &schema_fields.local_image_handoff_v2);
-    try commonBundle(fields, .tiny_qcow2_derived_vhd_v2, root);
-    try literal(fields, "profile", profile.current_profile);
+    const compatibility = profile.compatibility(2, try string(fields, "profile")) catch return error.InvalidLiteral;
+    try commonBundle(fields, compatibility, root);
     try validateRun(fields.get("run").?);
-    try validateLineage(fields.get("lineage").?, fields.get("artifacts").?);
-    return .tiny_qcow2_derived_vhd_v2;
+    try validateLineageForCompatibility(fields.get("lineage").?, fields.get("artifacts").?, compatibility);
+    return compatibility;
 }
 
 fn commonBundle(fields: std.json.ObjectMap, compatibility: profile.Compatibility, root: ?[]const u8) !void {
@@ -153,7 +177,7 @@ fn commonBundle(fields: std.json.ObjectMap, compatibility: profile.Compatibility
     try literal(fields, "authority", profile.authority);
     try hex(try string(fields, "source_revision"), 40);
     try hex(try string(fields, "source_tree"), 40);
-    try validateIdentity(fields.get("identity").?);
+    try validateIdentityForCompatibility(fields.get("identity").?, compatibility);
     var total: u64 = 0;
     total = try addBounded(total, try validateArtifacts(fields.get("artifacts").?, compatibility, root));
     total = try addBounded(total, try validateBoots(fields.get("boots").?, compatibility, root));
@@ -220,10 +244,18 @@ fn validateMemberMap(value: std.json.Value, compatibility: profile.Compatibility
 }
 
 fn validateIdentity(value: std.json.Value) !void {
-    const fields = try c.exactFields(value, &schema_fields.identity);
+    return validateIdentityForCompatibility(value, .tiny_qcow2_derived_vhd_v2);
+}
+
+fn validateIdentityForCompatibility(value: std.json.Value, compatibility: profile.Compatibility) !void {
+    const fields = try c.exactFields(value, if (compatibility == .coremark_qcow2_derived_vhd_v2) &schema_fields.identity_coremark else &schema_fields.identity);
     try hex(try string(fields, "wamr_revision"), 40);
     inline for (.{ "wasm_sha256", "cwasm_sha256", "runtime_sha256", "compiler_sha256", "config_sha256" }) |name|
         _ = try c.parseSha256(try string(fields, name));
+    if (compatibility == .coremark_qcow2_derived_vhd_v2) {
+        inline for (.{ "coremark_wasm_sha256", "coremark_cwasm_sha256", "coremark_nofp_wasm_sha256", "coremark_nofp_cwasm_sha256" }) |name|
+            _ = try c.parseSha256(try string(fields, name));
+    }
 }
 
 fn validateRun(value: std.json.Value) !void {
@@ -234,17 +266,21 @@ fn validateRun(value: std.json.Value) !void {
 }
 
 fn validateLineage(value: std.json.Value, artifacts: ?std.json.Value) !void {
+    return validateLineageForCompatibility(value, artifacts, .tiny_qcow2_derived_vhd_v2);
+}
+
+fn validateLineageForCompatibility(value: std.json.Value, artifacts: ?std.json.Value, compatibility: profile.Compatibility) !void {
     const fields = try c.exactFields(value, &schema_fields.lineage);
     inline for (schema_fields.lineage) |name| _ = try c.parseSha256(try string(fields, name));
     if (artifacts) |artifact_value| {
-        try equalField(fields, "raw_sha256", try artifactSha(artifact_value, "raw"));
-        try equalField(fields, "accepted_qcow2_sha256", try artifactSha(artifact_value, "qcow2"));
-        try equalField(fields, "derived_vhd_sha256", try artifactSha(artifact_value, "vhd"));
-        try equalField(fields, "qcow2_finalization_sha256", try artifactSha(artifact_value, "qcow2_finalization"));
-        try equalField(fields, "qcow2_acceptance_sha256", try artifactSha(artifact_value, "qcow2_acceptance"));
-        try equalField(fields, "fixed_vhd_derivation_gate_sha256", try artifactSha(artifact_value, "fixed_vhd_derivation_gate"));
-        try equalField(fields, "fixed_vhd_derivation_sha256", try artifactSha(artifact_value, "fixed_vhd_derivation"));
-        try equalField(fields, "final_inspection_sha256", try artifactSha(artifact_value, "final_inspection"));
+        try equalField(fields, "raw_sha256", try artifactSha(artifact_value, compatibility, "raw"));
+        try equalField(fields, "accepted_qcow2_sha256", try artifactSha(artifact_value, compatibility, "qcow2"));
+        try equalField(fields, "derived_vhd_sha256", try artifactSha(artifact_value, compatibility, "vhd"));
+        try equalField(fields, "qcow2_finalization_sha256", try artifactSha(artifact_value, compatibility, "qcow2_finalization"));
+        try equalField(fields, "qcow2_acceptance_sha256", try artifactSha(artifact_value, compatibility, "qcow2_acceptance"));
+        try equalField(fields, "fixed_vhd_derivation_gate_sha256", try artifactSha(artifact_value, compatibility, "fixed_vhd_derivation_gate"));
+        try equalField(fields, "fixed_vhd_derivation_sha256", try artifactSha(artifact_value, compatibility, "fixed_vhd_derivation"));
+        try equalField(fields, "final_inspection_sha256", try artifactSha(artifact_value, compatibility, "final_inspection"));
     }
 }
 
@@ -256,7 +292,7 @@ fn validatePublicContext(value: std.json.Value, compatibility: profile.Compatibi
     try hex(try string(fields, "source_revision"), 40);
     try hex(try string(fields, "source_tree"), 40);
     const revision = try string(fields, "wamr_revision");
-    if (std.mem.eql(u8, revision, profile.historical_wamr_revision)) return;
+    if (compatibility != .coremark_qcow2_derived_vhd_v2 and std.mem.eql(u8, revision, profile.historical_wamr_revision)) return;
     if (compatibility == .frozen_tiny_v1) return error.InvalidLiteral;
     try literal(fields, "wamr_revision", profile.wamr_revision);
 }
@@ -303,9 +339,9 @@ fn artifactFields(value: std.json.Value, maximum: u64) !struct { path: []const u
     return .{ .path = path, .size = size };
 }
 
-fn artifactSha(artifacts: std.json.Value, name: []const u8) ![]const u8 {
+fn artifactSha(artifacts: std.json.Value, compatibility: profile.Compatibility, name: []const u8) ![]const u8 {
     const items = try array(artifacts);
-    for (layout.artifact_names_v2, 0..) |candidate, i| {
+    for (layout.artifactNames(compatibility), 0..) |candidate, i| {
         if (!std.mem.eql(u8, candidate, name)) continue;
         const fields = try c.exactFields(items[i], &schema_fields.artifact);
         return try string(fields, "sha256");

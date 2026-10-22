@@ -17,7 +17,7 @@ pub fn revalidateHandoff(
 ) !@import("command_validation.zig").ValidatedCommand {
     if (accepted.context != .local_runtime or accepted.repository == null or
         accepted.local_producer != .native or
-        accepted.compatibility != .tiny_v2_qcow2_derived_vhd)
+        !@import("profile.zig").isV2(accepted.compatibility))
         return error.InvalidContext;
     try accepted.revalidateWithSignal(signal);
     return revalidateHandoffValidated(allocator, io, accepted, output, signal);
@@ -32,7 +32,7 @@ pub fn revalidateHandoffValidated(
 ) !@import("command_validation.zig").ValidatedCommand {
     if (accepted.context != .local_runtime or accepted.repository == null or
         accepted.local_producer != .native or
-        accepted.compatibility != .tiny_v2_qcow2_derived_vhd)
+        !@import("profile.zig").isV2(accepted.compatibility))
         return error.InvalidContext;
     var roots = try handoff_inspect.bind(accepted, output);
     const build_output = try std.fs.path.join(allocator, &.{ accepted.root, "compute/public-source/validator-build" });
@@ -93,7 +93,7 @@ pub fn run(
     signal: ?*core.process.SignalCancellation,
 ) !@import("command_validation.zig").ValidatedCommand {
     if (accepted.context != .local_runtime or accepted.repository == null or
-        accepted.compatibility != .tiny_v2_qcow2_derived_vhd)
+        !@import("profile.zig").isV2(accepted.compatibility))
         return error.InvalidContext;
     try accepted.revalidateWithSignal(signal);
     return runValidated(allocator, io, accepted, output, signal);
@@ -107,7 +107,7 @@ pub fn runValidated(
     signal: ?*core.process.SignalCancellation,
 ) !@import("command_validation.zig").ValidatedCommand {
     if (accepted.context != .local_runtime or accepted.repository == null or
-        accepted.compatibility != .tiny_v2_qcow2_derived_vhd)
+        !@import("profile.zig").isV2(accepted.compatibility))
         return error.InvalidContext;
     const roots = try handoff_inspect.bind(accepted, output);
     var zig = try adapter.openPinnedTool(io, roots.zig, "tool:zig");

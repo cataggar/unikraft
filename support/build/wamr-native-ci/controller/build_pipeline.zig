@@ -361,6 +361,7 @@ pub const Context = struct {
     git: []const u8,
     tools: [inputs.host_tools.len][]const u8,
     roots: plan.Roots,
+    profile: profile.ProductionProfile = .tiny_exact_v2,
     signal: *const process.SignalCancellation,
     custody_cache: ?*CustodyCache = null,
     source: ?custody.Source = null,
@@ -753,6 +754,7 @@ fn runStage(state: anytype, selected: plan.Stage, check_consumer: bool) !void {
     const result = try adapter.execute(context.allocator, context.io, .{
         .roots = context.roots,
         .stage = selected,
+        .profile = context.profile,
         .private_dir = private,
         .evidence_dir = evidence_dir,
         .cancel = context.signal.flag(),
@@ -1036,6 +1038,15 @@ pub fn prepare(state: NativeFixturesPassed) !ProducerPrepared {
     return next(state, ProducerPrepared);
 }
 
+const tiny_artifact_names = [_][]const u8{
+    "embedded.c", "identity.h", "libwamr-aot.a", "tiny.cwasm", "tiny.wasm", "wamr_aot.h", "wamrc",
+};
+const coremark_artifact_names = [_][]const u8{
+    "coremark.cwasm",      "coremark.wasm",      "coremark-nofp.cwasm", "coremark-nofp.wasm",
+    "embedded.c",          "identity.h",         "libwamr-aot.a",       "tiny.cwasm",
+    "tiny.wasm",           "wamr_aot.h",         "wamrc",
+};
+
 fn verifyRuntimeIdentity(context: *Context) !void {
     try cancelled(context);
     const a = context.allocator;
@@ -1043,9 +1054,13 @@ fn verifyRuntimeIdentity(context: *Context) !void {
     const raw = try read(context, try join(context, &.{ artifact_dir, "identity.json" }), limits.mib, false);
     const parsed = try core.contracts.Document.parse(a, raw, .{});
     defer parsed.deinit();
-    try admitPreparedIdentity(parsed.value());
+    try admitPreparedIdentityForProfile(parsed.value(), context.profile);
     const artifacts = parsed.value().object.get("files").?.object;
-    for ([_][]const u8{ "embedded.c", "identity.h", "libwamr-aot.a", "tiny.cwasm", "tiny.wasm", "wamr_aot.h", "wamrc" }) |name| {
+    const expected_names: []const []const u8 = switch (context.profile) {
+        .tiny_exact_v2 => &tiny_artifact_names,
+        .coremark_exact_v2 => &coremark_artifact_names,
+    };
+    for (expected_names) |name| {
         try cancelled(context);
         const digest = try core.contracts.parseSha256(try core.contracts.string(artifacts.get(name).?));
         const file = try physical.readFileCached(context.io, try join(context, &.{ artifact_dir, name }), limits.tracked_file, false, knownFiles(context));
@@ -1054,18 +1069,41 @@ fn verifyRuntimeIdentity(context: *Context) !void {
 }
 
 pub fn admitPreparedIdentity(value: std.json.Value) !void {
-    return admitIdentity(value, "0.17.0", limits.wamr_revision);
+    return admitPreparedIdentityForProfile(value, .tiny_exact_v2);
+}
+
+pub fn admitPreparedIdentityForProfile(value: std.json.Value, prod: profile.ProductionProfile) !void {
+    return admitIdentity(value, "0.17.0", limits.wamr_revision, prod);
 }
 
 pub fn admitImportedIdentity(value: std.json.Value) !void {
-    if (value != .object) return error.InvalidProducer;
-    const version = try core.contracts.string(value.object.get("zig_version") orelse return error.InvalidProducer);
-    if (std.mem.eql(u8, version, "0.16.0"))
-        return admitIdentity(value, "0.16.0", limits.historical_wamr_revision);
-    return admitPreparedIdentity(value);
+    return admitImportedIdentityForSet(value, .tiny_v2_qcow2_derived_vhd);
 }
 
-fn admitIdentity(value: std.json.Value, zig_version: []const u8, wamr_revision: []const u8) !void {
+pub fn admitImportedIdentityForSet(value: std.json.Value, set: profile.CompatibleRecordSet) !void {
+    if (value != .object) return error.InvalidProducer;
+    const prod: profile.ProductionProfile = switch (set) {
+        .coremark_v2_qcow2_derived_vhd => .coremark_exact_v2,
+        .tiny_v1_legacy, .tiny_v2_qcow2_derived_vhd => .tiny_exact_v2,
+    };
+    const version = try core.contracts.string(value.object.get("zig_version") orelse return error.InvalidProducer);
+    if (std.mem.eql(u8, version, "0.16.0")) {
+        if (prod != .tiny_exact_v2) return error.InvalidProducer;
+        return admitIdentity(value, "0.16.0", limits.historical_wamr_revision, prod);
+    }
+    return admitPreparedIdentityForProfile(value, prod);
+}
+
+pub fn detectPreparedProfile(value: std.json.Value) !profile.ProductionProfile {
+    if (value != .object) return error.InvalidProducer;
+    const wasi = value.object.get("minimal_wasi") orelse return error.InvalidProducer;
+    if (wasi != .bool) return error.InvalidProducer;
+    const prod: profile.ProductionProfile = if (wasi.bool) .coremark_exact_v2 else .tiny_exact_v2;
+    try admitPreparedIdentityForProfile(value, prod);
+    return prod;
+}
+
+fn admitIdentity(value: std.json.Value, zig_version: []const u8, wamr_revision: []const u8, prod: profile.ProductionProfile) !void {
     if (value != .object) return error.InvalidProducer;
     const object = value.object;
     const revision = try core.contracts.string(object.get("wamr_revision") orelse return error.InvalidProducer);
@@ -1078,11 +1116,16 @@ fn admitIdentity(value: std.json.Value, zig_version: []const u8, wamr_revision: 
         !std.mem.eql(u8, try core.contracts.string(object.get("zig_version") orelse return error.InvalidProducer), zig_version) or
         jit != .null)
         return error.InvalidProducer;
-    if (development != .bool or development.bool or wasi != .bool or wasi.bool)
+    const expect_wasi = prod == .coremark_exact_v2;
+    if (development != .bool or development.bool or wasi != .bool or wasi.bool != expect_wasi)
         return error.InvalidProducer;
+    const expected_names: []const []const u8 = switch (prod) {
+        .tiny_exact_v2 => &tiny_artifact_names,
+        .coremark_exact_v2 => &coremark_artifact_names,
+    };
     const artifacts = (object.get("files") orelse return error.InvalidProducer);
-    if (artifacts != .object or artifacts.object.count() != 7) return error.InvalidProducer;
-    for ([_][]const u8{ "embedded.c", "identity.h", "libwamr-aot.a", "tiny.cwasm", "tiny.wasm", "wamr_aot.h", "wamrc" }) |name| {
+    if (artifacts != .object or artifacts.object.count() != expected_names.len) return error.InvalidProducer;
+    for (expected_names) |name| {
         _ = try core.contracts.parseSha256(try core.contracts.string(artifacts.object.get(name) orelse return error.InvalidProducer));
     }
 }
@@ -1289,6 +1332,10 @@ pub fn loadAccepted(context: *Context) !void {
         context.command_records[@backingInt(stage)] = try physical.readFileCached(io, path, limits.tracked_file, true, knownFiles(context));
     }
     try requireBuildEvidence(context);
+    const app_identity_raw = try read(context, try join(context, &.{ context.repository, "support/apps/wamr-aot/build/artifacts/identity.json" }), limits.mib, false);
+    const app_identity_doc = try core.contracts.Document.parse(a, app_identity_raw, .{});
+    defer app_identity_doc.deinit();
+    context.profile = try detectPreparedProfile(app_identity_doc.value());
     try revalidateAcceptedWithValue(context, try buildValueFromCurrent(context));
 }
 
