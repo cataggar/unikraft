@@ -4,7 +4,7 @@ on:
   # zig16 does not require pull requests to be up to date before merging, so
   # every push re-runs the matrix on the combined result of serial merges.
   push:
-    branches: [staging, stable, zig16]
+    branches: [staging, stable, zig, zig16]
     paths-ignore: ['*.md']
 
   # No `paths-ignore` here: the job contexts of this workflow are meant to be
@@ -14,7 +14,7 @@ on:
   # the full matrix on documentation-only changes.
   pull_request:
     types: [opened, synchronize, reopened]
-    branches: [staging, zig16]
+    branches: [staging, zig, zig16]
 
   workflow_dispatch:
     inputs:

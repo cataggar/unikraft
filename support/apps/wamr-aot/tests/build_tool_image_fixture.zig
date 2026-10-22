@@ -68,12 +68,20 @@ fn run(init: std.process.Init) !void {
             return error.UnboundOfflinePackages;
         if (std.mem.eql(u8, stage, "olddefconfig")) {
             const source = try std.fs.path.join(allocator, &.{ app, ".config" });
-            const bytes = try std.Io.Dir.cwd().readFileAlloc(
+            const app_bytes = try std.Io.Dir.cwd().readFileAlloc(
                 init.io,
                 source,
                 allocator,
                 .limited(1024 * 1024),
             );
+            const bytes = try std.Io.Dir.cwd().readFileAlloc(
+                init.io,
+                config,
+                allocator,
+                .limited(1024 * 1024),
+            );
+            if (!std.mem.eql(u8, app_bytes, bytes))
+                return error.ConfigSeedMismatch;
             try writeFile(init.io, config, bytes, 0o600, true);
             return;
         }

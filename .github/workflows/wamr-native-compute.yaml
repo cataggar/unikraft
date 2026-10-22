@@ -3,7 +3,7 @@ name: wamr-native-compute
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-    branches: [zig16, fleet/wamr-native-156, fleet/wamr-realtime-clock]
+    branches: [zig, zig16, fleet/wamr-native-156, fleet/wamr-realtime-clock]
   workflow_dispatch:
     inputs:
       cpu_baseline:
