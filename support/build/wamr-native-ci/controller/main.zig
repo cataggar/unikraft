@@ -341,6 +341,7 @@ pub fn main(init: std.process.Init) void {
         .repository = repository,
         .wamr = command.wamr_source orelse "",
         .compute = compute,
+        .profile = command.profile,
         .git = undefined,
         .tools = undefined,
         .roots = undefined,

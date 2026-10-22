@@ -1118,7 +1118,7 @@ pub fn run(
     signal: ?*core.process.SignalCancellation,
 ) !void {
     if (accepted.context != .trusted_inner_zip or
-        accepted.compatibility != .tiny_v2_qcow2_derived_vhd)
+        !profile.isV2(accepted.compatibility))
         return error.InvalidContext;
     var scratch = std.heap.ArenaAllocator.init(raw_allocator);
     defer scratch.deinit();

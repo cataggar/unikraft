@@ -58,6 +58,10 @@ const forbidden = [_][]const u8{
     "HYPERV_ACCEPTANCE",        "UK_HYPERV_IO_READY", "UK_HYPERV_NETWORK_APP_READY",
     "UK_HYPERV_PLATFORM_READY", "WAMR_NATIVE_WASI=",  "WAMR_NATIVE_AOT_FAIL",
 };
+const forbidden_coremark = [_][]const u8{
+    "HYPERV_ACCEPTANCE",        "UK_HYPERV_IO_READY", "UK_HYPERV_NETWORK_APP_READY",
+    "UK_HYPERV_PLATFORM_READY", "WAMR_NATIVE_AOT_FAIL",
+};
 
 pub fn modeStage(mode: profile.Mode) Stage {
     return switch (mode) {
@@ -78,7 +82,7 @@ pub fn bootImage(mode: profile.Mode) []const u8 {
     };
 }
 
-fn bootArgv(comptime mode: profile.Mode) []const Binding {
+fn bootArgv(comptime mode: profile.Mode, comptime forbidden_items: []const []const u8) []const Binding {
     const source_flag = switch (mode) {
         .@"raw-x2apic", .@"raw-legacy-apic" => "--raw-disk",
         .@"qcow2-x2apic", .@"qcow2-legacy-apic" => "--qcow2",
@@ -97,8 +101,8 @@ fn bootArgv(comptime mode: profile.Mode) []const Binding {
         .{ .literal = "60" },
     };
     const no_hardware = comptime blk: {
-        var values: [forbidden.len * 2]Binding = undefined;
-        for (forbidden, 0..) |item, i| {
+        var values: [forbidden_items.len * 2]Binding = undefined;
+        for (forbidden_items, 0..) |item, i| {
             values[i * 2] = .{ .literal = "--forbid-marker" };
             values[i * 2 + 1] = .{ .literal = item };
         }
@@ -127,10 +131,14 @@ pub fn isValidator(stage: Stage) bool {
 }
 
 pub fn spec(stage: Stage) Spec {
-    return specForBaseline(stage, profile.activeCpuBaseline());
+    return specForProfile(stage, profile.activeCpuBaseline(), .tiny_exact_v2);
 }
 
 pub fn specForBaseline(stage: Stage, baseline: profile.CpuBaseline) Spec {
+    return specForProfile(stage, baseline, .tiny_exact_v2);
+}
+
+pub fn specForProfile(stage: Stage, baseline: profile.CpuBaseline, prod: profile.ProductionProfile) Spec {
     return switch (stage) {
         .adapter => .{ .stage = stage, .executable = "tool:zig", .seconds = 900, .output_limit = 8 * 1024 * 1024, .argv = &.{
             zig,                                                                                      .{ .literal = "build" },                               .{ .literal = "--build-file" },
@@ -147,9 +155,16 @@ pub fn specForBaseline(stage: Stage, baseline: profile.CpuBaseline) Spec {
         .fixtures => .{ .stage = stage, .executable = "native:wamr-native-ci-fixtures", .seconds = 600, .output_limit = 8 * 1024 * 1024, .argv = &.{
             fixtures, .{ .literal = "--fixture-root" }, .{ .path = .{ .role = "work", .relative = "fixtures" } },
         } },
-        .prepare => .{ .stage = stage, .executable = "native:wamr-aot-build", .seconds = 1800, .output_limit = 8 * 1024 * 1024, .argv = &.{
-            producer,                           .{ .literal = "prepare" },                                                  .{ .literal = "--repository" }, source,
-            .{ .literal = "--source-archive" }, .{ .path = .{ .role = "runtime", .relative = "custody/wamr-source.tar" } },
+        .prepare => .{ .stage = stage, .executable = "native:wamr-aot-build", .seconds = 1800, .output_limit = 8 * 1024 * 1024, .argv = switch (prod) {
+            .tiny_exact_v2 => &.{
+                producer,                           .{ .literal = "prepare" },                                                  .{ .literal = "--repository" }, source,
+                .{ .literal = "--source-archive" }, .{ .path = .{ .role = "runtime", .relative = "custody/wamr-source.tar" } },
+            },
+            .coremark_exact_v2 => &.{
+                producer,                           .{ .literal = "prepare" },                                                  .{ .literal = "--repository" }, source,
+                .{ .literal = "--source-archive" }, .{ .path = .{ .role = "runtime", .relative = "custody/wamr-source.tar" } },
+                .{ .literal = "--coremark" },
+            },
         } },
         .config => .{ .stage = stage, .executable = "native:wamr-aot-build", .seconds = 600, .output_limit = 8 * 1024 * 1024, .argv = &.{
             producer, .{ .literal = "olddefconfig" }, .{ .literal = "--repository" }, source,
@@ -211,12 +226,12 @@ pub fn specForBaseline(stage: Stage, baseline: profile.CpuBaseline) Spec {
         .@"import-historical-native-revalidation" => importHandoffSpec(.@"import-historical-native-revalidation"),
         .@"finalize-qcow2" => packageSpec(.@"finalize-qcow2"),
         .@"derive-fixed-vhd" => packageSpec(.@"derive-fixed-vhd"),
-        .@"raw-x2apic" => bootSpec(stage, .@"raw-x2apic"),
-        .@"raw-legacy-apic" => bootSpec(stage, .@"raw-legacy-apic"),
-        .@"qcow2-x2apic" => bootSpec(stage, .@"qcow2-x2apic"),
-        .@"qcow2-legacy-apic" => bootSpec(stage, .@"qcow2-legacy-apic"),
-        .@"vpc-x2apic" => bootSpec(stage, .@"vpc-x2apic"),
-        .@"vpc-legacy-apic" => bootSpec(stage, .@"vpc-legacy-apic"),
+        .@"raw-x2apic" => bootSpecForProfile(stage, .@"raw-x2apic", prod),
+        .@"raw-legacy-apic" => bootSpecForProfile(stage, .@"raw-legacy-apic", prod),
+        .@"qcow2-x2apic" => bootSpecForProfile(stage, .@"qcow2-x2apic", prod),
+        .@"qcow2-legacy-apic" => bootSpecForProfile(stage, .@"qcow2-legacy-apic", prod),
+        .@"vpc-x2apic" => bootSpecForProfile(stage, .@"vpc-x2apic", prod),
+        .@"vpc-legacy-apic" => bootSpecForProfile(stage, .@"vpc-legacy-apic", prod),
         .@"log-validator-x2apic" => validatorSpec(.@"log-validator-x2apic"),
         .@"log-validator-legacy" => validatorSpec(.@"log-validator-legacy"),
     };
@@ -275,8 +290,11 @@ fn validatorSpec(comptime stage: Stage) Spec {
     };
 }
 
-fn bootSpec(stage: Stage, comptime mode: profile.Mode) Spec {
-    return .{ .stage = stage, .executable = "input:local_boot_tool", .seconds = 90, .output_limit = 64 * 1024, .argv = bootArgv(mode) };
+fn bootSpecForProfile(stage: Stage, comptime mode: profile.Mode, prod: profile.ProductionProfile) Spec {
+    return switch (prod) {
+        .tiny_exact_v2 => .{ .stage = stage, .executable = "input:local_boot_tool", .seconds = 90, .output_limit = 64 * 1024, .argv = bootArgv(mode, &forbidden) },
+        .coremark_exact_v2 => .{ .stage = stage, .executable = "input:local_boot_tool", .seconds = 90, .output_limit = 64 * 1024, .argv = bootArgv(mode, &forbidden_coremark) },
+    };
 }
 
 pub fn limits(plan: Spec) process.CommandLimits {

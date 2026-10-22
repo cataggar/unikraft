@@ -10,6 +10,7 @@ pub const max_config_bytes: u64 = 1024 * 1024;
 pub const max_large_artifact_bytes: u64 = 256 * 1024 * 1024 + 512;
 pub const v1_zip_member_count: usize = 55;
 pub const v2_zip_member_count: usize = 85;
+pub const coremark_v2_zip_member_count: usize = 89;
 
 pub const BootKey = enum { serial, request, report, compute };
 pub const boot_keys = [_]BootKey{ .serial, .request, .report, .compute };
@@ -45,6 +46,39 @@ pub const artifact_names_v2 = [_][]const u8{
     "compiler",
     "wasm",
     "cwasm",
+    "config",
+    "runtime_identity",
+    "image_identity",
+    "local_result",
+    "package",
+    "build",
+    "build_start",
+    "boot_inputs",
+    "qcow2_finalization_intent",
+    "qcow2_finalization",
+    "qcow2_acceptance",
+    "fixed_vhd_derivation_intent",
+    "fixed_vhd_derivation_gate",
+    "fixed_vhd_derivation",
+    "final_inspection",
+    "cleanup",
+};
+
+pub const artifact_names_coremark_v2 = [_][]const u8{
+    "efi",
+    "debug_elf",
+    "bootinfo",
+    "raw",
+    "qcow2",
+    "vhd",
+    "runtime",
+    "compiler",
+    "wasm",
+    "cwasm",
+    "coremark_wasm",
+    "coremark_cwasm",
+    "coremark_nofp_wasm",
+    "coremark_nofp_cwasm",
     "config",
     "runtime_identity",
     "image_identity",
@@ -126,20 +160,22 @@ pub fn artifactNames(compatibility: profile.Compatibility) []const []const u8 {
     return switch (compatibility) {
         .frozen_tiny_v1 => &artifact_names_v1,
         .tiny_qcow2_derived_vhd_v2 => &artifact_names_v2,
+        .coremark_qcow2_derived_vhd_v2 => &artifact_names_coremark_v2,
     };
 }
 
 pub fn evidenceNames(compatibility: profile.Compatibility) []const []const u8 {
     return switch (compatibility) {
         .frozen_tiny_v1 => &evidence_v1,
-        .tiny_qcow2_derived_vhd_v2 => &evidence_v2,
+        .tiny_qcow2_derived_vhd_v2, .coremark_qcow2_derived_vhd_v2 => &evidence_v2,
     };
 }
 
 pub fn artifactLimit(name: []const u8) u64 {
     const large = [_][]const u8{
-        "efi",     "debug_elf", "bootinfo", "raw",   "qcow2", "vhd",
-        "runtime", "compiler",  "wasm",     "cwasm",
+        "efi",                 "debug_elf",           "bootinfo",      "raw",           "qcow2", "vhd",
+        "runtime",             "compiler",            "wasm",          "cwasm",         "coremark_wasm",
+        "coremark_cwasm",      "coremark_nofp_wasm",  "coremark_nofp_cwasm",
     };
     for (large) |item| if (std.mem.eql(u8, item, name)) return max_large_artifact_bytes;
     if (std.mem.eql(u8, name, "config")) return max_config_bytes;

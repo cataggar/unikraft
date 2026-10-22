@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BSD-3-Clause
 const std = @import("std");
 
-pub const ProductionProfile = enum { tiny_exact_v2 };
-pub const CompatibleRecordSet = enum { tiny_v1_legacy, tiny_v2_qcow2_derived_vhd };
+pub const ProductionProfile = enum { tiny_exact_v2, coremark_exact_v2 };
+pub const CompatibleRecordSet = enum { tiny_v1_legacy, tiny_v2_qcow2_derived_vhd, coremark_v2_qcow2_derived_vhd };
 pub const CpuBaseline = enum { x86_64_v2, x86_64_v3 };
 pub const default_cpu_baseline: CpuBaseline = .x86_64_v2;
 pub const Mode = enum {
@@ -70,29 +70,70 @@ pub fn activeExecutableTarget() [2][]const u8 {
     return executableTargetFor(activeCpuBaseline());
 }
 
+pub const tiny_profile_name = "qcow2-derived-vhd";
+pub const coremark_profile_name = "coremark-qcow2-derived-vhd";
+
+pub fn isV2(set: CompatibleRecordSet) bool {
+    return switch (set) {
+        .tiny_v1_legacy => false,
+        .tiny_v2_qcow2_derived_vhd, .coremark_v2_qcow2_derived_vhd => true,
+    };
+}
+
+pub fn isCoremark(set: CompatibleRecordSet) bool {
+    return set == .coremark_v2_qcow2_derived_vhd;
+}
+
 pub fn modes(set: CompatibleRecordSet) []const Mode {
     return switch (set) {
         .tiny_v1_legacy => &legacy_modes,
-        .tiny_v2_qcow2_derived_vhd => &production_modes,
+        .tiny_v2_qcow2_derived_vhd, .coremark_v2_qcow2_derived_vhd => &production_modes,
     };
 }
 
 pub fn productionSet(profile: ProductionProfile) CompatibleRecordSet {
     return switch (profile) {
         .tiny_exact_v2 => .tiny_v2_qcow2_derived_vhd,
+        .coremark_exact_v2 => .coremark_v2_qcow2_derived_vhd,
     };
 }
 
 pub fn recordSet(version: u32, profile: ?[]const u8) !CompatibleRecordSet {
     if (version == 1 and profile == null) return .tiny_v1_legacy;
-    if (version == 2 and profile != null and
-        std.mem.eql(u8, profile.?, "qcow2-derived-vhd"))
-        return .tiny_v2_qcow2_derived_vhd;
+    if (version == 2 and profile != null) {
+        if (std.mem.eql(u8, profile.?, tiny_profile_name))
+            return .tiny_v2_qcow2_derived_vhd;
+        if (std.mem.eql(u8, profile.?, coremark_profile_name))
+            return .coremark_v2_qcow2_derived_vhd;
+    }
     return error.UnsupportedRecordSet;
 }
 
 pub fn profileName(profile: ProductionProfile) []const u8 {
     return switch (profile) {
-        .tiny_exact_v2 => "qcow2-derived-vhd",
+        .tiny_exact_v2 => tiny_profile_name,
+        .coremark_exact_v2 => coremark_profile_name,
+    };
+}
+
+pub fn parseProductionProfile(name: []const u8) !ProductionProfile {
+    if (std.mem.eql(u8, name, tiny_profile_name)) return .tiny_exact_v2;
+    if (std.mem.eql(u8, name, coremark_profile_name)) return .coremark_exact_v2;
+    return error.UnsupportedRecordSet;
+}
+
+pub fn recordSetProfileName(set: CompatibleRecordSet) ?[]const u8 {
+    return switch (set) {
+        .tiny_v1_legacy => null,
+        .tiny_v2_qcow2_derived_vhd => tiny_profile_name,
+        .coremark_v2_qcow2_derived_vhd => coremark_profile_name,
+    };
+}
+
+pub fn productionProfileForSet(set: CompatibleRecordSet) ?ProductionProfile {
+    return switch (set) {
+        .tiny_v1_legacy => null,
+        .tiny_v2_qcow2_derived_vhd => .tiny_exact_v2,
+        .coremark_v2_qcow2_derived_vhd => .coremark_exact_v2,
     };
 }

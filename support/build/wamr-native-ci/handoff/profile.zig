@@ -3,7 +3,9 @@ const std = @import("std");
 
 pub const repository = "cataggar/unikraft";
 pub const workload = "tiny";
+pub const coremark_workload = "coremark";
 pub const current_profile = "qcow2-derived-vhd";
+pub const coremark_profile = "coremark-qcow2-derived-vhd";
 pub const wamr_revision = "bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20";
 pub const historical_wamr_revision = "a53205d77be3b880eb8f8b96679512ba58e2331a";
 pub const authority = "not_admitted";
@@ -12,16 +14,28 @@ pub const canonicalization = "utf8-byte-sorted-keys-compact-lf-v1";
 pub const Compatibility = enum {
     frozen_tiny_v1,
     tiny_qcow2_derived_vhd_v2,
+    coremark_qcow2_derived_vhd_v2,
 
     pub fn version(self: Compatibility) u8 {
         return switch (self) {
             .frozen_tiny_v1 => 1,
-            .tiny_qcow2_derived_vhd_v2 => 2,
+            .tiny_qcow2_derived_vhd_v2, .coremark_qcow2_derived_vhd_v2 => 2,
         };
+    }
+
+    pub fn isV2(self: Compatibility) bool {
+        return self.version() == 2;
+    }
+
+    pub fn isCoremark(self: Compatibility) bool {
+        return self == .coremark_qcow2_derived_vhd_v2;
     }
 };
 
-pub const ProfileSpec = enum { @"qcow2-derived-vhd" };
+pub const ProfileSpec = enum {
+    @"qcow2-derived-vhd",
+    @"coremark-qcow2-derived-vhd",
+};
 
 pub const Mode = enum {
     @"raw-x2apic",
@@ -55,7 +69,7 @@ pub const pre_supervisor_with_external_archive_digest = [_]SourceIdentity{
 pub fn modes(compat: Compatibility) []const Mode {
     return switch (compat) {
         .frozen_tiny_v1 => &legacy_modes,
-        .tiny_qcow2_derived_vhd_v2 => &production_modes,
+        .tiny_qcow2_derived_vhd_v2, .coremark_qcow2_derived_vhd_v2 => &production_modes,
     };
 }
 
@@ -63,19 +77,23 @@ pub fn profileName(compat: Compatibility) ?[]const u8 {
     return switch (compat) {
         .frozen_tiny_v1 => null,
         .tiny_qcow2_derived_vhd_v2 => current_profile,
+        .coremark_qcow2_derived_vhd_v2 => coremark_profile,
     };
 }
 
 pub fn compatibility(version: u8, profile: ?[]const u8) !Compatibility {
     if (version == 1 and profile == null) return .frozen_tiny_v1;
-    if (version == 2 and profile != null and std.mem.eql(u8, profile.?, current_profile))
-        return .tiny_qcow2_derived_vhd_v2;
+    if (version == 2 and profile != null) {
+        if (std.mem.eql(u8, profile.?, current_profile)) return .tiny_qcow2_derived_vhd_v2;
+        if (std.mem.eql(u8, profile.?, coremark_profile)) return .coremark_qcow2_derived_vhd_v2;
+    }
     return error.UnsupportedCompatibility;
 }
 
 pub fn productionProfile(spec: ProfileSpec) Compatibility {
     return switch (spec) {
         .@"qcow2-derived-vhd" => .tiny_qcow2_derived_vhd_v2,
+        .@"coremark-qcow2-derived-vhd" => .coremark_qcow2_derived_vhd_v2,
     };
 }
 

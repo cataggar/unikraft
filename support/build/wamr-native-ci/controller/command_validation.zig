@@ -95,8 +95,9 @@ fn matchPlan(
     context: EvidenceContext,
     historical_generation: bool,
     baseline: profile.CpuBaseline,
+    prod: profile.ProductionProfile,
 ) !void {
-    const selected = plan.specForBaseline(stage, if (variant == .native) baseline else .x86_64_v2);
+    const selected = plan.specForProfile(stage, if (variant == .native) baseline else .x86_64_v2, if (variant == .native) prod else .tiny_exact_v2);
     const argv = try get(request, "argv");
     const historical = variant == .historical_import;
     const wrapper = historical and (stage == .adapter or stage == .@"local-boot-tool");
@@ -304,7 +305,7 @@ pub fn validate(
     stage: plan.Stage,
     context: EvidenceContext,
 ) !ValidatedCommand {
-    return validateForBaseline(a, record, stage, context, profile.activeCpuBaseline());
+    return validateForProfile(a, record, stage, context, profile.activeCpuBaseline(), .tiny_exact_v2);
 }
 
 pub fn validateForBaseline(
@@ -314,7 +315,18 @@ pub fn validateForBaseline(
     context: EvidenceContext,
     baseline: profile.CpuBaseline,
 ) !ValidatedCommand {
-    return validateWithProfile(a, record, stage, context, false, baseline);
+    return validateForProfile(a, record, stage, context, baseline, .tiny_exact_v2);
+}
+
+pub fn validateForProfile(
+    a: std.mem.Allocator,
+    record: std.json.Value,
+    stage: plan.Stage,
+    context: EvidenceContext,
+    baseline: profile.CpuBaseline,
+    prod: profile.ProductionProfile,
+) !ValidatedCommand {
+    return validateWithProfile(a, record, stage, context, false, baseline, prod);
 }
 
 pub fn validateHistoricalGeneration(
@@ -324,7 +336,7 @@ pub fn validateHistoricalGeneration(
     context: EvidenceContext,
 ) !ValidatedCommand {
     if (context == .local_runtime) return error.InvalidCommand;
-    return validateWithProfile(a, record, stage, context, true, .x86_64_v2);
+    return validateWithProfile(a, record, stage, context, true, .x86_64_v2, .tiny_exact_v2);
 }
 
 pub fn validateLegacyV1(
@@ -335,7 +347,7 @@ pub fn validateLegacyV1(
 ) !ValidatedCommand {
     if (context != .local_runtime or stage != .@"handoff-inspect-legacy")
         return error.InvalidCommand;
-    return validateWithProfile(a, record, stage, context, false, .x86_64_v2);
+    return validateWithProfile(a, record, stage, context, false, .x86_64_v2, .tiny_exact_v2);
 }
 
 fn validateWithProfile(
@@ -345,6 +357,7 @@ fn validateWithProfile(
     context: EvidenceContext,
     historical_generation: bool,
     baseline: profile.CpuBaseline,
+    prod: profile.ProductionProfile,
 ) !ValidatedCommand {
     try exact(record, &.{
         "scope",      "stage",               "exit_code",  "bytes", "sha256", "sha256_scope",
@@ -382,12 +395,12 @@ fn validateWithProfile(
     if (try num(u8, try get(request, "version")) != 1 or
         try num(u8, try get(request, "binding_version")) != 1) return error.InvalidCommand;
     const variant: PlanVariant = blk: {
-        matchPlan(a, request, stage, .native, context, historical_generation, baseline) catch |err| {
+        matchPlan(a, request, stage, .native, context, historical_generation, baseline, prod) catch |err| {
             if (context == .local_runtime or err == error.OutOfMemory) return err;
-            if (matchPlan(a, request, stage, .historical_native, context, historical_generation, baseline)) |_| {
+            if (matchPlan(a, request, stage, .historical_native, context, historical_generation, baseline, prod)) |_| {
                 break :blk .historical_native;
             } else |legacy_err| if (legacy_err == error.OutOfMemory) return legacy_err;
-            try matchPlan(a, request, stage, .historical_import, context, historical_generation, baseline);
+            try matchPlan(a, request, stage, .historical_import, context, historical_generation, baseline, prod);
             break :blk .historical_import;
         };
         break :blk .native;

@@ -165,7 +165,7 @@ pub const Metadata = struct {
             try canonical(a, .{
                 .schema = "uk.wamr.public-source-bundle",
                 .version = @as(u8, 2),
-                .profile = profile.current_profile,
+                .profile = profile.profileName(compatibility).?,
                 .authority = profile.authority,
                 .source = bound_context,
                 .members = std.json.Value{ .object = members },
@@ -743,7 +743,11 @@ fn verifySourceDirectories(root: []const u8, directory: std.Io.Dir, snapshot: fi
 fn bindAccepted(accepted: *accepted_run.AcceptedRun, metadata: *const Metadata, context: Context) !void {
     try equal(accepted.source.revision, context.source_revision);
     try equal(accepted.source.tree, context.source_tree);
-    const compatibility: profile.Compatibility = if (accepted.compatibility == .tiny_v1_legacy) .frozen_tiny_v1 else .tiny_qcow2_derived_vhd_v2;
+    const compatibility: profile.Compatibility = switch (accepted.compatibility) {
+        .tiny_v1_legacy => .frozen_tiny_v1,
+        .tiny_v2_qcow2_derived_vhd => .tiny_qcow2_derived_vhd_v2,
+        .coremark_v2_qcow2_derived_vhd => .coremark_qcow2_derived_vhd_v2,
+    };
     if (compatibility != metadata.compatibility or accepted.records.len != layout.evidenceNames(compatibility).len)
         return error.ProfileMismatch;
     var document = try contracts.parseCanonical(accepted.arena.allocator(), metadata.bundle);
@@ -753,6 +757,12 @@ fn bindAccepted(accepted: *accepted_run.AcceptedRun, metadata: *const Metadata, 
         inline for (.{ "wasm", "cwasm", "runtime", "compiler", "config" }) |name| {
             if (std.mem.eql(u8, member.name, "artifacts/" ++ name))
                 try equal(try c.string(try field(identity, name ++ "_sha256")), &std.fmt.bytesToHex(member.sha256, .lower));
+        }
+        if (compatibility == .coremark_qcow2_derived_vhd_v2) {
+            inline for (.{ "coremark_wasm", "coremark_cwasm", "coremark_nofp_wasm", "coremark_nofp_cwasm" }) |name| {
+                if (std.mem.eql(u8, member.name, "artifacts/" ++ name))
+                    try equal(try c.string(try field(identity, name ++ "_sha256")), &std.fmt.bytesToHex(member.sha256, .lower));
+            }
         }
     }
     for (metadata.selected) |member| {
@@ -803,7 +813,7 @@ fn bindBundle(value: std.json.Value, compatibility: profile.Compatibility, conte
     try equal(try c.string(try field(value, "source_revision")), context.source_revision);
     try equal(try c.string(try field(value, "source_tree")), context.source_tree);
     try equal(try c.string(try field(try field(value, "identity"), "wamr_revision")), context.wamr_revision);
-    if (compatibility == .tiny_qcow2_derived_vhd_v2) {
+    if (compatibility.isV2()) {
         const run = try field(value, "run");
         try equal(try c.string(try field(run, "repository")), context.repository);
         try equal(try c.string(try field(run, "run_id")), context.run_id);

@@ -69,6 +69,10 @@ pub const ArtifactRole = enum {
     compiler,
     wasm,
     cwasm,
+    coremark_wasm,
+    coremark_cwasm,
+    coremark_nofp_wasm,
+    coremark_nofp_cwasm,
     config,
     runtime_identity,
     image_identity,
@@ -91,6 +95,7 @@ const ArtifactSpec = struct {
     role: ArtifactRole,
     relative: []const u8,
     source: bool = false,
+    coremark_only: bool = false,
 };
 const artifact_specs = [_]ArtifactSpec{
     .{ .role = .efi, .relative = "support/apps/wamr-aot/build/wamr_hyperv-x86_64-efi", .source = true },
@@ -103,6 +108,10 @@ const artifact_specs = [_]ArtifactSpec{
     .{ .role = .compiler, .relative = "support/apps/wamr-aot/build/artifacts/wamrc", .source = true },
     .{ .role = .wasm, .relative = "support/apps/wamr-aot/build/artifacts/tiny.wasm", .source = true },
     .{ .role = .cwasm, .relative = "support/apps/wamr-aot/build/artifacts/tiny.cwasm", .source = true },
+    .{ .role = .coremark_wasm, .relative = "support/apps/wamr-aot/build/artifacts/coremark.wasm", .source = true, .coremark_only = true },
+    .{ .role = .coremark_cwasm, .relative = "support/apps/wamr-aot/build/artifacts/coremark.cwasm", .source = true, .coremark_only = true },
+    .{ .role = .coremark_nofp_wasm, .relative = "support/apps/wamr-aot/build/artifacts/coremark-nofp.wasm", .source = true, .coremark_only = true },
+    .{ .role = .coremark_nofp_cwasm, .relative = "support/apps/wamr-aot/build/artifacts/coremark-nofp.cwasm", .source = true, .coremark_only = true },
     .{ .role = .config, .relative = "support/apps/wamr-aot/.config", .source = true },
     .{ .role = .runtime_identity, .relative = "support/apps/wamr-aot/build/artifacts/identity.json", .source = true },
     .{ .role = .image_identity, .relative = "support/apps/wamr-aot/build/image-identity.json", .source = true },
@@ -306,7 +315,7 @@ pub const AcceptedRun = struct {
     /// Wrapper cleanup is export-owned proof, not a completed-record prerequisite.
     pub fn pinExportCleanup(self: *AcceptedRun) !files.RetainedFile {
         if (self.context != .local_runtime or self.local_producer != .native or
-            self.compatibility != .tiny_v2_qcow2_derived_vhd)
+            !profile.isV2(self.compatibility))
             return error.InvalidContext;
         if (self.cleanup_snapshot != null) return self.pinArtifact(.cleanup);
         const path = try self.artifactPath(.cleanup);
@@ -467,8 +476,12 @@ pub const AcceptedRun = struct {
             .schema = "uk.wamr.native-ci-controller-records",
             .schema_version = @as(u8, 1),
             .context = if (self.context == .local_runtime) "local-runtime" else "trusted-inner-zip",
-            .compatibility = if (self.compatibility == .tiny_v1_legacy) "tiny-v1" else "tiny-v2",
-            .profile = if (self.production_profile == null) @as(?[]const u8, null) else "qcow2-derived-vhd",
+            .compatibility = switch (self.compatibility) {
+                .tiny_v1_legacy => "tiny-v1",
+                .tiny_v2_qcow2_derived_vhd => "tiny-v2",
+                .coremark_v2_qcow2_derived_vhd => "coremark-v2",
+            },
+            .profile = if (self.production_profile) |prod| profile.profileName(prod) else @as(?[]const u8, null),
             .source = self.source,
             .modes = names.items,
             .result = self.result,
@@ -703,7 +716,7 @@ fn openAndValidateWithPolicy(
         for (paths) |path|
             try appendCurrentInput(&accepted, try p.print("{s}{s}", .{ readonly_runtime_prefix, path }), try p.dupe(u8, path), false);
     }
-    if (accepted.compatibility != .tiny_v2_qcow2_derived_vhd and policy == .native_only)
+    if (!profile.isV2(accepted.compatibility) and policy == .native_only)
         return error.UnsupportedLocalLegacyRun;
     accepted.local_producer = if (accepted.compatibility == .tiny_v1_legacy) .python else try localProducer(&accepted);
     accepted.local_read_only = policy == .read_only;
@@ -872,7 +885,7 @@ fn loadResult(self: *AcceptedRun) !void {
         value.records.count() != 20)
         return error.InvalidRecords;
     self.compatibility = value.set;
-    self.production_profile = if (value.set == .tiny_v2_qcow2_derived_vhd) .tiny_exact_v2 else null;
+    self.production_profile = profile.productionProfileForSet(value.set);
     const observed = try self.readPin(&retained, records.max_record_bytes);
     try retained.verify(self.io);
     self.result = .{
@@ -999,7 +1012,7 @@ fn revalidateLocalWithSignal(self: *AcceptedRun, signal: *core.process.SignalCan
     const a = self.allocator();
     const raw = try canonicalFile(self, try resultPath(self), records.max_record_bytes);
     const result = try records.readResult(raw);
-    if (result.set != self.compatibility or result.set != .tiny_v2_qcow2_derived_vhd)
+    if (result.set != self.compatibility or !profile.isV2(result.set))
         return error.InvalidResult;
     const compute = try join(a, &.{ self.root, "compute" });
     const custody_cache = self.ensureCustodyCache();
@@ -1364,6 +1377,17 @@ pub fn validateCommandBindingForBaseline(
     context: EvidenceContext,
     baseline: profile.CpuBaseline,
 ) !ValidatedCommand {
+    return validateCommandBindingForProfile(allocator, record, stage, context, baseline, .tiny_exact_v2);
+}
+
+pub fn validateCommandBindingForProfile(
+    allocator: std.mem.Allocator,
+    record: []const u8,
+    stage: Stage,
+    context: EvidenceContext,
+    baseline: profile.CpuBaseline,
+    prod: profile.ProductionProfile,
+) !ValidatedCommand {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1375,7 +1399,7 @@ pub fn validateCommandBindingForBaseline(
     });
     defer document.deinit();
     try document.requireCanonical(a, record);
-    return command.validateForBaseline(a, document.value(), stage, context, baseline);
+    return command.validateForProfile(a, document.value(), stage, context, baseline, prod);
 }
 
 pub fn validateLocalHandoffCommand(self: *AcceptedRun, raw: []const u8) !ValidatedCommand {
@@ -1389,7 +1413,7 @@ pub fn validateLocalPostRunCommand(self: *AcceptedRun, raw: []const u8, stage: S
         return error.InvalidCommand;
     if ((stage == .@"handoff-inspect-legacy") != (self.compatibility == .tiny_v1_legacy))
         return error.InvalidContext;
-    if (stage == .@"handoff-inspect" and self.compatibility != .tiny_v2_qcow2_derived_vhd)
+    if (stage == .@"handoff-inspect" and !profile.isV2(self.compatibility))
         return error.InvalidContext;
     var scratch_arena: ?std.heap.ArenaAllocator = if (self.scratch == null)
         std.heap.ArenaAllocator.init(self.arena.child_allocator)
@@ -1412,7 +1436,7 @@ pub fn validateLocalPostRunCommand(self: *AcceptedRun, raw: []const u8, stage: S
     const checked = if (self.compatibility == .tiny_v1_legacy)
         try command.validateLegacyV1(a, record, stage, .local_runtime)
     else
-        try command.validate(a, record, stage, .local_runtime);
+        try command.validateForProfile(a, record, stage, .local_runtime, profile.activeCpuBaseline(), self.production_profile orelse .tiny_exact_v2);
     const request = try get(try get(record, "supervisor"), "request");
     const supervisor = try get(request, "supervisor");
     try checkPostRunSupervisorRole(self, supervisor, stage);
@@ -1450,19 +1474,20 @@ fn validateCommands(self: *AcceptedRun, legacy: bool, allow_historical_local: bo
             if (over != .bool or over.bool or markers != .array or markers.array.items.len != 0)
                 return error.InvalidCommand;
         } else {
+            const prod = self.production_profile orelse .tiny_exact_v2;
             const validated = if (self.compatibility == .tiny_v1_legacy)
                 command.validateLegacyV1(self.allocator(), value, stage, self.context)
             else if (historical_generation)
                 command.validateHistoricalGeneration(self.allocator(), value, stage, self.context)
             else
-                command.validate(self.allocator(), value, stage, self.context);
+                command.validateForProfile(self.allocator(), value, stage, self.context, profile.activeCpuBaseline(), prod);
             if (validated) |_| {} else |err| {
                 if (!allow_historical_local or err == error.OutOfMemory) return err;
                 _ = try command.validateHistoricalGeneration(self.allocator(), value, stage, .trusted_inner_zip);
             }
             if (self.context == .local_runtime) {
                 const log = try join(self.allocator(), &.{ self.root, "compute/private", try self.allocator().print("{s}.log", .{stage_name}) });
-                const observed = try self.readFileInPass(log, plan.spec(stage).output_limit + 1, true);
+                const observed = try self.readFileInPass(log, plan.specForProfile(stage, profile.activeCpuBaseline(), prod).output_limit + 1, true);
                 if (observed.bytes != try number(u64, try get(value, "bytes")))
                     return error.CommandOutputChanged;
                 try equal(&observed.sha256, try text(try get(value, "sha256")));
@@ -1611,6 +1636,7 @@ fn collectArtifacts(self: *AcceptedRun) !void {
     var result: std.ArrayList(PinnedArtifact) = .empty;
     for (artifact_specs) |spec| {
         if (self.context == .local_runtime and spec.role == .cleanup and !self.local_read_only) continue;
+        if (spec.coremark_only and self.compatibility != .coremark_v2_qcow2_derived_vhd) continue;
         if (self.compatibility == .tiny_v1_legacy and
             (spec.role == .qcow2 or spec.role == .cleanup or
                 @backingInt(spec.role) >= @backingInt(ArtifactRole.qcow2_finalization_intent)))
@@ -1704,7 +1730,7 @@ fn revalidateImported(self: *AcceptedRun) !void {
             if (!std.ascii.isDigit(digit)) return error.InvalidImportedBundle;
     }
     if (version == 2)
-        try equal(try text(try get(manifest, "profile")), "qcow2-derived-vhd");
+        try equal(try text(try get(manifest, "profile")), profile.recordSetProfileName(self.compatibility).?);
     if (version == 2) {
         const run = try get(portable, "run");
         _ = try contracts.exactFields(run, &.{ "repository", "run_id", "run_attempt" });
@@ -1750,7 +1776,7 @@ fn validateBundleHeader(self: *AcceptedRun, portable: std.json.Value) !void {
     try equal(try text(try get(portable, "source_revision")), self.source.revision);
     try equal(try text(try get(portable, "source_tree")), self.source.tree);
     if (version == 2)
-        try equal(try text(try get(portable, "profile")), "qcow2-derived-vhd");
+        try equal(try text(try get(portable, "profile")), profile.recordSetProfileName(self.compatibility).?);
     if (self.context == .private_bundle) {
         const wamr_revision = try text(try get(try get(portable, "identity"), "wamr_revision"));
         if (version == 1)
@@ -1773,7 +1799,11 @@ fn validateSelectedBundle(self: *AcceptedRun, portable: std.json.Value, members:
     const artifact_items = try get(portable, "artifacts");
     const boot_items = try get(portable, "boots");
     const evidence_items = try get(portable, "evidence");
-    const expected_artifacts: usize = if (version == 1) 17 else artifact_specs.len;
+    const expected_artifacts: usize = switch (self.compatibility) {
+        .tiny_v1_legacy => 17,
+        .tiny_v2_qcow2_derived_vhd => 26,
+        .coremark_v2_qcow2_derived_vhd => 30,
+    };
     if (artifact_items != .array or artifact_items.array.items.len != expected_artifacts or
         boot_items != .array or boot_items.array.items.len != profile.modes(self.compatibility).len or
         evidence_items != .array or evidence_items.array.items.len != self.records.len)
@@ -1784,6 +1814,7 @@ fn validateSelectedBundle(self: *AcceptedRun, portable: std.json.Value, members:
     }
     var cursor: usize = 0;
     for (artifact_specs) |spec| {
+        if (spec.coremark_only and self.compatibility != .coremark_v2_qcow2_derived_vhd) continue;
         if (version == 1 and (spec.role == .qcow2 or spec.role == .cleanup or
             @backingInt(spec.role) >= @backingInt(ArtifactRole.qcow2_finalization_intent)))
             continue;
@@ -1915,7 +1946,8 @@ fn verifyImportedEvidence(self: *AcceptedRun, portable: ?std.json.Value) !void {
     const built = try canonicalFile(self, try recordPath(self, "build.json"), records.max_record_bytes);
     const package = try canonicalFile(self, try recordPath(self, "package.json"), records.max_record_bytes);
     const boot_inputs = try canonicalFile(self, try recordPath(self, "boot-inputs.json"), records.max_record_bytes);
-    const v2 = self.compatibility == .tiny_v2_qcow2_derived_vhd;
+    const v2 = profile.isV2(self.compatibility);
+    const coremark = self.compatibility == .coremark_v2_qcow2_derived_vhd;
     const old = !v2 and oldLegacySource(self.source);
     if (!old) {
         _ = try contracts.exactFields(start, if (v2)
@@ -1938,7 +1970,7 @@ fn verifyImportedEvidence(self: *AcceptedRun, portable: ?std.json.Value) !void {
     try compareCopy(self, "package.json", .package);
     // Producer identity artifacts are not canonical JSON; archive member hashes pin their exact bytes.
     const identity = try documentArtifact(self, .runtime_identity, 64 * 1024);
-    if (v2) try build.admitImportedIdentity(identity);
+    if (v2) try build.admitImportedIdentityForSet(identity, self.compatibility);
     try equal(try text(try get(identity, "wamr_revision")), self.imported_wamr_revision);
     try sameJson(a, try get(built, "runtime"), identity);
     const image = try documentArtifact(self, .image_identity, 1024 * 1024);
@@ -1964,6 +1996,17 @@ fn verifyImportedEvidence(self: *AcceptedRun, portable: ?std.json.Value) !void {
         }) |entry| {
             const expected = try get(try get(identity, "files"), entry.name);
             try equal(try text(expected), &(try stagedArtifact(self, entry.role)).sha256);
+        }
+        if (coremark) {
+            for ([_]struct { name: []const u8, role: ArtifactRole }{
+                .{ .name = "coremark.wasm", .role = .coremark_wasm },
+                .{ .name = "coremark.cwasm", .role = .coremark_cwasm },
+                .{ .name = "coremark-nofp.wasm", .role = .coremark_nofp_wasm },
+                .{ .name = "coremark-nofp.cwasm", .role = .coremark_nofp_cwasm },
+            }) |entry| {
+                const expected = try get(try get(identity, "files"), entry.name);
+                try equal(try text(expected), &(try stagedArtifact(self, entry.role)).sha256);
+            }
         }
     }
     if (v2 or !old) {
@@ -2125,7 +2168,18 @@ fn verifyImportedEvidence(self: *AcceptedRun, portable: ?std.json.Value) !void {
     }
     if (portable) |manifest| {
         const hashes = try get(manifest, "identity");
-        _ = try contracts.exactFields(hashes, &.{
+        _ = try contracts.exactFields(hashes, if (coremark) &.{
+            "wamr_revision",
+            "wasm_sha256",
+            "cwasm_sha256",
+            "coremark_wasm_sha256",
+            "coremark_cwasm_sha256",
+            "coremark_nofp_wasm_sha256",
+            "coremark_nofp_cwasm_sha256",
+            "runtime_sha256",
+            "compiler_sha256",
+            "config_sha256",
+        } else &.{
             "wamr_revision",  "wasm_sha256",     "cwasm_sha256",
             "runtime_sha256", "compiler_sha256", "config_sha256",
         });
@@ -2138,6 +2192,15 @@ fn verifyImportedEvidence(self: *AcceptedRun, portable: ?std.json.Value) !void {
             .{ .name = "config_sha256", .role = .config },
         }) |entry|
             try equal(try text(try get(hashes, entry.name)), &(try stagedArtifact(self, entry.role)).sha256);
+        if (coremark) {
+            for ([_]struct { name: []const u8, role: ArtifactRole }{
+                .{ .name = "coremark_wasm_sha256", .role = .coremark_wasm },
+                .{ .name = "coremark_cwasm_sha256", .role = .coremark_cwasm },
+                .{ .name = "coremark_nofp_wasm_sha256", .role = .coremark_nofp_wasm },
+                .{ .name = "coremark_nofp_cwasm_sha256", .role = .coremark_nofp_cwasm },
+            }) |entry|
+                try equal(try text(try get(hashes, entry.name)), &(try stagedArtifact(self, entry.role)).sha256);
+        }
     }
 
     var boots = std.json.Value{ .object = .empty };
@@ -2595,9 +2658,11 @@ fn verifyImportedBoot(self: *AcceptedRun, mode: profile.Mode, boot_inputs: std.j
         !std.mem.endsWith(u8, runtime, "/.d/wamr-native-runtime"))
         return error.InvalidBootRequest;
     const compute_root = try join(a, &.{ runtime, "compute" });
-    const expected_config = try boot.expectedModeConfig(
+    const prod = self.production_profile orelse .tiny_exact_v2;
+    const expected_config = try boot.expectedModeConfigForProfile(
         a,
         mode,
+        prod,
         try join(a, &.{ compute_root, "package", if (image_role == .vhd and self.compatibility == .tiny_v1_legacy)
             "unikraft.vhd"
         else
@@ -2815,12 +2880,13 @@ fn verifyImportedChain(
     const producer = try text(try get(package, "producer_sha256"));
     try provenance(try get(finalization, "provenance"), "raw", &raw.sha256, producer);
 
+    const expected_profile = profile.recordSetProfileName(self.compatibility).?;
     const acceptance = try chainRecord(self, "qcow2-acceptance.json", "uk.wamr.compute-qcow2-acceptance");
     _ = try contracts.exactFields(acceptance, &.{
         "schema",              "schema_version", "profile", "status",       "source",             "accepted_qcow2",
         "finalization_sha256", "modes",          "boots",   "build_sha256", "boot_inputs_sha256",
     });
-    try equal(try text(try get(acceptance, "profile")), "qcow2-derived-vhd");
+    try equal(try text(try get(acceptance, "profile")), expected_profile);
     try equal(try text(try get(acceptance, "status")), "accepted");
     try sameJson(a, try get(acceptance, "source"), try valueOf(a, self.source));
     try imageOutput(try get(acceptance, "accepted_qcow2"), qcow2, raw.bytes);
@@ -2847,7 +2913,7 @@ fn verifyImportedChain(
         "schema",                  "schema_version",           "profile",               "status", "accepted_qcow2_sha256",
         "qcow2_acceptance_sha256", "derivation_intent_sha256", "derived_output_absent",
     });
-    try equal(try text(try get(gate, "profile")), "qcow2-derived-vhd");
+    try equal(try text(try get(gate, "profile")), expected_profile);
     try equal(try text(try get(gate, "status")), "accepted_qcow2_only");
     try equal(try text(try get(gate, "accepted_qcow2_sha256")), &qcow2.sha256);
     try evidenceReference(self, gate, "qcow2_acceptance_sha256", "qcow2-acceptance.json");
@@ -2898,7 +2964,7 @@ fn verifyImportedChain(
         "schema",    "schema_version", "profile", "status", "source",
         "artifacts", "records",        "modes",   "boots",
     });
-    try equal(try text(try get(inspection, "profile")), "qcow2-derived-vhd");
+    try equal(try text(try get(inspection, "profile")), expected_profile);
     try equal(try text(try get(inspection, "status")), "complete");
     try sameJson(a, try get(inspection, "source"), try get(acceptance, "source"));
     try matchModes(try get(inspection, "modes"), &profile.production_modes);

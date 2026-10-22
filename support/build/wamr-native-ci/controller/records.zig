@@ -132,11 +132,11 @@ pub fn readResult(value: std.json.Value) !Result {
         const name = try std.fmt.bufPrint(&buf, "{s}-compute.json", .{@tagName(mode)});
         if (!records.contains(name)) return error.MissingRecord;
     }
-    if (set == .tiny_v2_qcow2_derived_vhd)
+    if (profile.isV2(set))
         for (required_v2) |name| {
             if (!records.contains(name)) return error.MissingRecord;
         };
-    if (set == .tiny_v2_qcow2_derived_vhd) {
+    if (profile.isV2(set)) {
         for (required_v2_commands) |name|
             if (!records.contains(name)) return error.MissingRecord;
         for (expected_modes) |mode| {
@@ -164,7 +164,7 @@ fn literal(object: std.json.ObjectMap, key: []const u8, expected: []const u8) !v
 
 fn allowedName(set: profile.CompatibleRecordSet, name: []const u8) bool {
     for (required_common) |expected| if (std.mem.eql(u8, name, expected)) return true;
-    if (set == .tiny_v2_qcow2_derived_vhd)
+    if (profile.isV2(set))
         for (required_v2) |expected| {
             if (std.mem.eql(u8, name, expected)) return true;
         };
@@ -180,7 +180,7 @@ fn allowedName(set: profile.CompatibleRecordSet, name: []const u8) bool {
         const expected = std.fmt.bufPrint(&buf, "command-{s}.json", .{stage}) catch unreachable;
         if (std.mem.eql(u8, name, expected)) return true;
     }
-    if (set == .tiny_v2_qcow2_derived_vhd) {
+    if (profile.isV2(set)) {
         if (std.mem.eql(u8, name, "command-finalize-qcow2.json") or
             std.mem.eql(u8, name, "command-derive-fixed-vhd.json"))
             return true;

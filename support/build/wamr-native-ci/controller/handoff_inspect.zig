@@ -35,7 +35,7 @@ fn optionalInputPath(accepted: *accepted_run.AcceptedRun, role: []const u8) []co
 
 pub fn bind(accepted: *accepted_run.AcceptedRun, output: []const u8) !plan.Roots {
     if (accepted.context != .local_runtime or accepted.repository == null or
-        (accepted.compatibility != .tiny_v2_qcow2_derived_vhd and accepted.compatibility != .tiny_v1_legacy))
+        (!@import("profile.zig").isV2(accepted.compatibility) and accepted.compatibility != .tiny_v1_legacy))
         return error.InvalidContext;
     try files.absoluteFilePath(output);
     const a = accepted.arena.allocator();

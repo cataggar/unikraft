@@ -104,8 +104,12 @@ live until a separately qualified cutover.
   `Imported`. It never relabels portable archived paths as a root-bound private
   bundle. `Imported` borrows its `Archive`; deinitialize it first.
 
-The frozen v2 product is exactly 85 regular members: 83 positively selected
-outputs/evidence, then `bundle.json` and `public-source.json`. Limits remain 96
+The frozen tiny v2 product (`qcow2-derived-vhd`) is exactly 85 regular members:
+83 positively selected outputs/evidence, then `bundle.json` and
+`public-source.json`. The closed CoreMark correctness v2 profile
+(`coremark-qcow2-derived-vhd`) adds the four CoreMark Wasm/AOT artifacts (30
+artifacts, 89 regular ZIP members) and binds both `coremark` and
+`coremark-nofp` `WAMR_NATIVE_WASI=` records (`[0]crc*`). Limits remain 96
 members, 512 MiB complete ZIP/aggregate content, 64 KiB JSON and the frozen
 per-member bounds. Duplicate names, case collisions, links, traversal, extras,
 input replacement/mutation, cancellation and uncertain durability refuse.

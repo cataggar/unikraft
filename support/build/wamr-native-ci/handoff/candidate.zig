@@ -52,9 +52,46 @@ pub const Identity = struct {
     wamr_revision: []const u8,
     wasm_sha256: []const u8,
     cwasm_sha256: []const u8,
+    coremark_wasm_sha256: ?[]const u8 = null,
+    coremark_cwasm_sha256: ?[]const u8 = null,
+    coremark_nofp_wasm_sha256: ?[]const u8 = null,
+    coremark_nofp_cwasm_sha256: ?[]const u8 = null,
     runtime_sha256: []const u8,
     compiler_sha256: []const u8,
     config_sha256: []const u8,
+
+    pub fn jsonStringify(self: Identity, jws: anytype) !void {
+        try jws.beginObject();
+        try jws.objectField("wamr_revision");
+        try jws.write(self.wamr_revision);
+        try jws.objectField("wasm_sha256");
+        try jws.write(self.wasm_sha256);
+        try jws.objectField("cwasm_sha256");
+        try jws.write(self.cwasm_sha256);
+        if (self.coremark_wasm_sha256) |value| {
+            try jws.objectField("coremark_wasm_sha256");
+            try jws.write(value);
+        }
+        if (self.coremark_cwasm_sha256) |value| {
+            try jws.objectField("coremark_cwasm_sha256");
+            try jws.write(value);
+        }
+        if (self.coremark_nofp_wasm_sha256) |value| {
+            try jws.objectField("coremark_nofp_wasm_sha256");
+            try jws.write(value);
+        }
+        if (self.coremark_nofp_cwasm_sha256) |value| {
+            try jws.objectField("coremark_nofp_cwasm_sha256");
+            try jws.write(value);
+        }
+        try jws.objectField("runtime_sha256");
+        try jws.write(self.runtime_sha256);
+        try jws.objectField("compiler_sha256");
+        try jws.write(self.compiler_sha256);
+        try jws.objectField("config_sha256");
+        try jws.write(self.config_sha256);
+        try jws.endObject();
+    }
 };
 pub const Scope = struct {
     schema: []const u8 = "uk.wamr.direct-compute",
@@ -387,11 +424,11 @@ fn finish(owner: *State, existing: bool) !void {
         inline for (.{ "source_revision", "source_tree" }) |key|
             if (!std.mem.eql(u8, try core.contracts.string(receipt.get(key).?), try core.contracts.string(fields.get(key).?)))
                 return error.TransportMismatch;
-        owner.provenance = try provenance(a, value, receipt, manifest.artifact(), transport.artifact());
+        owner.provenance = try provenance(a, compatibility, value, receipt, manifest.artifact(), transport.artifact());
         admission_bytes = try canonical(a, .{
             .schema = "uk.wamr.direct-compute-admission",
             .version = @as(u8, 2),
-            .profile = contracts.profile.current_profile,
+            .profile = contracts.profile.profileName(compatibility).?,
             .authority = "not_admitted",
             .source_revision = fields.get("source_revision").?,
             .source_tree = fields.get("source_tree").?,
@@ -402,7 +439,8 @@ fn finish(owner: *State, existing: bool) !void {
         });
         var admission_document = try contracts.parseCanonical(a, admission_bytes.?);
         defer admission_document.deinit();
-        try contracts.validateDirectComputeAdmissionV2(admission_document.value());
+        if (try contracts.validateDirectComputeAdmissionV2WithCompatibility(admission_document.value()) != compatibility)
+            return error.ProfileMismatch;
         scope_bundle = .{
             .path = admission_path,
             .sha256 = try a.dupe(u8, &std.fmt.bytesToHex(controller.records.fileIdentity(admission_bytes.?), .lower)),
@@ -415,7 +453,8 @@ fn finish(owner: *State, existing: bool) !void {
         owner.candidate = try owner.retain(inv.output, contracts.layout.max_json_bytes, inv.signal);
         var candidate_document = try owner.document(&owner.candidate.?);
         defer candidate_document.deinit();
-        _ = try contracts.validateDirectComputeCandidate(candidate_document.value());
+        if (try contracts.validateDirectComputeCandidate(candidate_document.value()) != compatibility)
+            return error.ProfileMismatch;
         const fields = candidate_document.value().object;
         settings = .{
             .attempt_id = try a.dupe(u8, try core.contracts.string(fields.get("attempt_id").?)),
@@ -427,7 +466,8 @@ fn finish(owner: *State, existing: bool) !void {
     const encoded = try encode(a, value, scope_bundle, settings);
     var candidate_document = try contracts.parseCanonical(a, encoded);
     defer candidate_document.deinit();
-    _ = try contracts.validateDirectComputeCandidate(candidate_document.value());
+    if (try contracts.validateDirectComputeCandidate(candidate_document.value()) != compatibility)
+        return error.ProfileMismatch;
     const parsed = try std.json.parseFromSlice(Scope, a, encoded, .{ .allocate = .alloc_always });
     owner.scope = parsed.value;
     try copy.checkCancellation(if (inv.signal) |active| active.flag() else null);
@@ -463,9 +503,9 @@ fn finish(owner: *State, existing: bool) !void {
     if (owner.candidate) |*held| try owner.verifyHeld(held, inv.signal);
 }
 
-fn provenance(a: std.mem.Allocator, bundle: std.json.Value, receipt: std.json.ObjectMap, manifest: Artifact, transport: Artifact) !Provenance {
+fn provenance(a: std.mem.Allocator, compatibility: contracts.profile.Compatibility, bundle: std.json.Value, receipt: std.json.ObjectMap, manifest: Artifact, transport: Artifact) !Provenance {
     var qcow2: ?Artifact = null;
-    for (contracts.layout.artifactNames(.tiny_qcow2_derived_vhd_v2), bundle.object.get("artifacts").?.array.items) |name, item| {
+    for (contracts.layout.artifactNames(compatibility), bundle.object.get("artifacts").?.array.items) |name, item| {
         if (std.mem.eql(u8, name, "qcow2"))
             qcow2 = try std.json.parseFromValueLeaky(Artifact, a, item, .{ .allocate = .alloc_always });
     }
@@ -515,14 +555,26 @@ pub const Test = if (builtin.is_test) struct {
     ) !controller.tiny.Result {
         return owner.resultWithFault(first, second, signal, fault);
     }
+
+    pub fn checkSerial(a: std.mem.Allocator, raw: []const u8, identity: Identity) !controller.tiny.Result {
+        return @import("candidate.zig").checkSerial(a, raw, identity);
+    }
+
+    pub fn encode(a: std.mem.Allocator, bundle: std.json.Value, scope_bundle: Artifact, settings: Settings) ![]const u8 {
+        return @import("candidate.zig").encode(a, bundle, scope_bundle, settings);
+    }
 } else struct {};
 
 fn encode(a: std.mem.Allocator, bundle: std.json.Value, scope_bundle: Artifact, settings: Settings) ![]const u8 {
     const fields = bundle.object;
     const version = try core.contracts.integer(u8, fields.get("version").?);
+    const compatibility = try contracts.profile.compatibility(version, if (version == 2)
+        try core.contracts.string(fields.get("profile").?)
+    else
+        null);
     const identity_bytes = try std.json.Stringify.valueAlloc(a, fields.get("identity").?, .{});
     const identity = try std.json.parseFromSlice(Identity, a, identity_bytes, .{ .allocate = .alloc_always });
-    const names = contracts.layout.artifactNames(if (version == 1) .frozen_tiny_v1 else .tiny_qcow2_derived_vhd_v2);
+    const names = contracts.layout.artifactNames(compatibility);
     var vhd: ?Artifact = null;
     for (names, fields.get("artifacts").?.array.items) |name, item| if (std.mem.eql(u8, name, "vhd")) {
         const artifact_fields = item.object;
@@ -534,7 +586,11 @@ fn encode(a: std.mem.Allocator, bundle: std.json.Value, scope_bundle: Artifact, 
     };
     return canonical(a, Scope{
         .version = version,
-        .purpose = if (version == 1) "tiny-aot-two-boot" else contracts.profile.current_profile,
+        .purpose = switch (compatibility) {
+            .frozen_tiny_v1 => "tiny-aot-two-boot",
+            .tiny_qcow2_derived_vhd_v2 => contracts.profile.current_profile,
+            .coremark_qcow2_derived_vhd_v2 => contracts.profile.coremark_profile,
+        },
         .attempt_id = settings.attempt_id orelse return error.MissingAttemptId,
         .subscription = if (version == 1) "FINAL-APPROVED-SUBSCRIPTION-UUID" else settings.subscription orelse "00000000-0000-0000-0000-000000000001",
         .prefix = if (version == 1) "FINAL-APPROVED-FRESH-NAME" else settings.prefix orelse "not-admitted-candidate",
@@ -563,13 +619,18 @@ fn inside(path: []const u8, root: []const u8) bool {
     return std.mem.eql(u8, path, root) or (path.len > root.len and std.mem.startsWith(u8, path, root) and path[root.len] == '/');
 }
 fn checkSerial(a: std.mem.Allocator, raw: []const u8, identity: Identity) !controller.tiny.Result {
+    const coremark = identity.coremark_wasm_sha256 != null;
     return controller.tiny.checkSerial(a, raw, .{
         .wamr_revision = identity.wamr_revision,
-        .minimal_wasi = false,
+        .minimal_wasi = coremark,
         .tiny_wasm = identity.wasm_sha256,
         .tiny_cwasm = identity.cwasm_sha256,
+        .coremark_wasm = identity.coremark_wasm_sha256 orelse "",
+        .coremark_cwasm = identity.coremark_cwasm_sha256 orelse "",
+        .nofp_wasm = identity.coremark_nofp_wasm_sha256 orelse "",
+        .nofp_cwasm = identity.coremark_nofp_cwasm_sha256 orelse "",
         .runtime = identity.runtime_sha256,
-    }, .{ .scope = .direct });
+    }, .{ .scope = if (coremark) .app else .direct });
 }
 fn secondBytes(raw: []const u8, first: []const u8) ![]const u8 {
     const prefix = std.mem.trimEnd(u8, first, "\x00");
@@ -609,7 +670,7 @@ test "candidate typed provenance preserves the validated v2 public and transport
     try receipt.put(a, "container_digest", .{ .string = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" });
     const manifest: Artifact = .{ .path = "/private/bundle.json", .size = 1, .sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" };
     const transport: Artifact = .{ .path = "/private/transport.json", .size = 2, .sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" };
-    const view = try provenance(a, document.value(), receipt, manifest, transport);
+    const view = try provenance(a, .tiny_qcow2_derived_vhd_v2, document.value(), receipt, manifest, transport);
     try std.testing.expectEqualStrings(view.qcow2.sha256, view.lineage.accepted_qcow2_sha256);
     try std.testing.expectEqualStrings(document.value().object.get("run").?.object.get("run_id").?.string, view.run.run_id);
     try std.testing.expectEqualStrings(manifest.sha256, view.public_bundle.sha256);

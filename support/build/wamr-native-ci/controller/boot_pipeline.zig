@@ -23,6 +23,10 @@ const forbidden = [_][]const u8{
     "HYPERV_ACCEPTANCE",        "UK_HYPERV_IO_READY", "UK_HYPERV_NETWORK_APP_READY",
     "UK_HYPERV_PLATFORM_READY", "WAMR_NATIVE_WASI=",  "WAMR_NATIVE_AOT_FAIL",
 };
+const forbidden_coremark = [_][]const u8{
+    "HYPERV_ACCEPTANCE",        "UK_HYPERV_IO_READY", "UK_HYPERV_NETWORK_APP_READY",
+    "UK_HYPERV_PLATFORM_READY", "WAMR_NATIVE_AOT_FAIL",
+};
 
 pub const Context = struct {
     build_context: *build.Context,
@@ -379,6 +383,7 @@ fn runStage(ctx: *Context, stage: plan.Stage, private_record: bool) !Value {
     const outcome = try adapter.execute(ctx.allocator(), ctx.io(), .{
         .roots = ctx.build_context.roots,
         .stage = stage,
+        .profile = ctx.build_context.profile,
         .private_dir = log_dir,
         .evidence_dir = record_dir,
         .cancel = ctx.build_context.signal.flag(),
@@ -467,9 +472,10 @@ pub fn parseValidator(a: std.mem.Allocator, raw: []const u8, expected_bytes: u64
 fn modeConfig(ctx: *Context, mode: profile.Mode) !Value {
     const a = ctx.allocator();
     const roots = ctx.build_context.roots;
-    return expectedModeConfig(
+    return expectedModeConfigForProfile(
         a,
         mode,
+        ctx.build_context.profile,
         try ctx.path(try a.print("package/{s}", .{plan.bootImage(mode)})),
         roots.ovmf_code,
         roots.ovmf_vars,
@@ -487,8 +493,21 @@ pub fn expectedModeConfig(
     qemu: []const u8,
     work_dir: []const u8,
 ) !Value {
+    return expectedModeConfigForProfile(a, mode, .tiny_exact_v2, source_path, ovmf_code, ovmf_vars, qemu, work_dir);
+}
+
+pub fn expectedModeConfigForProfile(
+    a: std.mem.Allocator,
+    mode: profile.Mode,
+    prod: profile.ProductionProfile,
+    source_path: []const u8,
+    ovmf_code: []const u8,
+    ovmf_vars: []const u8,
+    qemu: []const u8,
+    work_dir: []const u8,
+) !Value {
     var prohibited: std.ArrayList([]const u8) = .empty;
-    try prohibited.appendSlice(a, &forbidden);
+    try prohibited.appendSlice(a, if (prod == .coremark_exact_v2) &forbidden_coremark else &forbidden);
     if (!mode.legacyApic()) try prohibited.append(a, legacy_marker);
     const kind: []const u8 = switch (mode) {
         .@"raw-x2apic", .@"raw-legacy-apic" => "raw_disk",
@@ -878,7 +897,7 @@ fn publishQcow2Acceptance(ctx: *Context) !void {
     try ctx.publish("qcow2-acceptance.json", .{
         .schema = "uk.wamr.compute-qcow2-acceptance",
         .schema_version = @as(u8, 1),
-        .profile = "qcow2-derived-vhd",
+        .profile = profile.profileName(ctx.build_context.profile),
         .status = "accepted",
         .source = .{ .revision = source.revision, .tree = source.tree },
         .accepted_qcow2 = accepted,
@@ -931,7 +950,7 @@ fn publishVhdGate(ctx: *Context) !void {
     try ctx.publish("fixed-vhd-derivation-gate.json", .{
         .schema = "uk.wamr.compute-fixed-vhd-derivation-gate",
         .schema_version = @as(u8, 1),
-        .profile = "qcow2-derived-vhd",
+        .profile = profile.profileName(ctx.build_context.profile),
         .status = "accepted_qcow2_only",
         .accepted_qcow2_sha256 = try text(try field(try field(ctx.acceptance.?, "accepted_qcow2"), "sha256")),
         .qcow2_acceptance_sha256 = try ctx.hash("qcow2-acceptance.json"),
@@ -1064,7 +1083,7 @@ fn inspectArtifacts(ctx: *Context) !Value {
     return typed(ctx.allocator(), .{
         .schema = "uk.wamr.compute-image-chain-inspection",
         .schema_version = @as(u8, 1),
-        .profile = "qcow2-derived-vhd",
+        .profile = profile.profileName(ctx.build_context.profile),
         .status = "complete",
         .source = .{ .revision = source.revision, .tree = source.tree },
         .artifacts = artifacts,
@@ -1094,7 +1113,7 @@ fn publishAcceptedResult(ctx: *Context) !ResultPublished {
     for (profile.production_modes, &modes) |mode, *entry| entry.* = @tagName(mode);
     const accepted = try typed(ctx.allocator(), .{
         .schema_version = @as(u8, 2),
-        .profile = "qcow2-derived-vhd",
+        .profile = profile.profileName(ctx.build_context.profile),
         .scope = "local_native_compute_only",
         .passed = true,
         .hardware_acceptance = "not_established",
@@ -1113,7 +1132,7 @@ fn publishAcceptedResult(ctx: *Context) !ResultPublished {
 /// acceptance: source, consumer and boot inputs, every boot transcript, image
 /// and intermediate image-chain record are checked again before returning.
 pub fn revalidateComplete(ctx: *Context, accepted: records.Result) !void {
-    if (accepted.set != .tiny_v2_qcow2_derived_vhd) return error.UnsupportedRecordSet;
+    if (!profile.isV2(accepted.set)) return error.UnsupportedRecordSet;
     var custody_cache: ?build.CustodyCache = if (ctx.build_context.custody_cache == null)
         build.CustodyCache.init(std.heap.page_allocator)
     else
@@ -1133,6 +1152,7 @@ pub fn revalidateComplete(ctx: *Context, accepted: records.Result) !void {
         ctx.files_cache = null;
     };
     try build.loadAccepted(ctx.build_context);
+    if (profile.productionSet(ctx.build_context.profile) != accepted.set) return error.ProfileMismatch;
     try captureBootInputs(ctx);
     if (ctx.files_cache) |cache| {
         for (ctx.boot_inputs.?.files) |item| {
@@ -1215,7 +1235,7 @@ fn revalidateChain(ctx: *Context) !void {
     const acceptance = try typed(a, .{
         .schema = "uk.wamr.compute-qcow2-acceptance",
         .schema_version = @as(u8, 1),
-        .profile = "qcow2-derived-vhd",
+        .profile = profile.profileName(ctx.build_context.profile),
         .status = "accepted",
         .source = .{ .revision = source.revision, .tree = source.tree },
         .accepted_qcow2 = accepted_image,
@@ -1241,7 +1261,7 @@ fn revalidateChain(ctx: *Context) !void {
     const gate = try typed(a, .{
         .schema = "uk.wamr.compute-fixed-vhd-derivation-gate",
         .schema_version = @as(u8, 1),
-        .profile = "qcow2-derived-vhd",
+        .profile = profile.profileName(ctx.build_context.profile),
         .status = "accepted_qcow2_only",
         .accepted_qcow2_sha256 = try text(try field(accepted_qcow2, "sha256")),
         .qcow2_acceptance_sha256 = try ctx.hash("qcow2-acceptance.json"),
