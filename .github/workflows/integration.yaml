@@ -248,11 +248,11 @@ jobs:
         rm -rf /var/lib/apt/lists/*
 
     - name: Download LLVM and QEMU tools
-      uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495 # v0.8.0
+      uses: cataggar/ghr/actions/download@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1
       env:
         GH_TOKEN: ${{ github.token }}
       with:
-        ghr-version: v0.8.0
+        ghr-version: v0.9.1
         tools: |
           cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
           cataggar/qemu/qemu-v11.0.91-z.15-linux-x64.tar.gz@v11.0.91-z.15
@@ -303,11 +303,11 @@ jobs:
         done
 
     - name: Install Zig with ghr
-      uses: cataggar/ghr/actions/install@114926d37d3825e63bede2ccc7ce56b67eda7495 # v0.8.0
+      uses: cataggar/ghr/actions/install@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1
       env:
         GH_TOKEN: ${{ github.token }}
       with:
-        ghr-version: v0.8.0
+        ghr-version: v0.9.1
         tools: |
           cataggar/zig@v${{ env.ZIG_VERSION }} RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
@@ -685,19 +685,19 @@ jobs:
         persist-credentials: false
 
     - name: Install the pinned native compiler
-      uses: cataggar/ghr/actions/install@114926d37d3825e63bede2ccc7ce56b67eda7495
+      uses: cataggar/ghr/actions/install@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9
       env:
         GH_TOKEN: ${{ github.token }}
       with:
-        ghr-version: v0.8.0
+        ghr-version: v0.9.1
         tools: cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
     - name: Acquire the pinned native LLVM tools
-      uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495
+      uses: cataggar/ghr/actions/download@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9
       env:
         GH_TOKEN: ${{ github.token }}
       with:
-        ghr-version: v0.8.0
+        ghr-version: v0.9.1
         tools: cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
         dest: ${{ runner.temp }}/hyperv-preparation-llvm
         extract: 'true'
@@ -1298,11 +1298,11 @@ jobs:
 
     - name: Download LLVM and QEMU tools
       if: ${{ success() && !cancelled() }}
-      uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495 # v0.8.0
+      uses: cataggar/ghr/actions/download@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1
       env:
         GH_TOKEN: ${{ github.token }}
       with:
-        ghr-version: v0.8.0
+        ghr-version: v0.9.1
         tools: |
           cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
           cataggar/qemu/qemu-v11.0.91-z.15-linux-x64.tar.gz@v11.0.91-z.15
@@ -1331,11 +1331,11 @@ jobs:
 
     - name: Install Zig with ghr
       if: ${{ success() && !cancelled() }}
-      uses: cataggar/ghr/actions/install@114926d37d3825e63bede2ccc7ce56b67eda7495 # v0.8.0
+      uses: cataggar/ghr/actions/install@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1
       env:
         GH_TOKEN: ${{ github.token }}
       with:
-        ghr-version: v0.8.0
+        ghr-version: v0.9.1
         tools: |
           cataggar/zig@v${{ env.ZIG_VERSION }} RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
@@ -1711,11 +1711,11 @@ jobs:
         rm -rf /var/lib/apt/lists/*
 
     - name: Download LLVM and QEMU tools
-      uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495 # v0.8.0
+      uses: cataggar/ghr/actions/download@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1
       env:
         GH_TOKEN: ${{ github.token }}
       with:
-        ghr-version: v0.8.0
+        ghr-version: v0.9.1
         tools: |
           cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
           cataggar/qemu/qemu-v11.0.91-z.15-linux-x64.tar.gz@v11.0.91-z.15
@@ -1772,11 +1772,11 @@ jobs:
         done
 
     - name: Install Zig with ghr
-      uses: cataggar/ghr/actions/install@114926d37d3825e63bede2ccc7ce56b67eda7495 # v0.8.0
+      uses: cataggar/ghr/actions/install@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1
       env:
         GH_TOKEN: ${{ github.token }}
       with:
-        ghr-version: v0.8.0
+        ghr-version: v0.9.1
         tools: |
           cataggar/zig@v${{ env.ZIG_VERSION }} RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
@@ -1970,11 +1970,11 @@ jobs:
         version: ${{ env.CLANG_VERSION }}
 
     - name: Download QEMU
-      uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495 # v0.8.0
+      uses: cataggar/ghr/actions/download@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1
       env:
         GH_TOKEN: ${{ github.token }}
       with:
-        ghr-version: v0.8.0
+        ghr-version: v0.9.1
         tools: cataggar/qemu/qemu-v11.0.91-z.15-linux-x64.tar.gz@v11.0.91-z.15
         dest: ${{ runner.temp }}/qemu-tools
         extract: 'true'
