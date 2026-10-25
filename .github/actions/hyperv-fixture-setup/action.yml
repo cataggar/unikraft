@@ -44,11 +44,11 @@ runs:
     uses: ./.github/actions/ci-versions
 
   - name: Download LLVM and QEMU tools
-    uses: cataggar/ghr/actions/download@114926d37d3825e63bede2ccc7ce56b67eda7495
+    uses: cataggar/ghr/actions/download@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9
     env:
       GH_TOKEN: ${{ github.token }}
     with:
-      ghr-version: v0.8.0
+      ghr-version: v0.9.1
       tools: |
         cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
         cataggar/qemu/qemu-v11.0.91-z.15-linux-x64.tar.gz@v11.0.91-z.15
@@ -76,11 +76,11 @@ runs:
       } >> "${GITHUB_PATH}"
 
   - name: Install Zig with ghr
-    uses: cataggar/ghr/actions/install@114926d37d3825e63bede2ccc7ce56b67eda7495
+    uses: cataggar/ghr/actions/install@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9
     env:
       GH_TOKEN: ${{ github.token }}
     with:
-      ghr-version: v0.8.0
+      ghr-version: v0.9.1
       tools: |
         cataggar/zig@v${{ env.ZIG_VERSION }} RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
