@@ -4,11 +4,37 @@ const linux = std.os.linux;
 const testing = std.testing;
 const core = @import("hyperv_core");
 const build_tool = @import("wamr_aot_build");
+const native_services = build_tool.native_services;
 
 const allocator = testing.allocator;
 const io = testing.io;
 
 extern fn check_mode(c_uint, c_uint, c_int, [*c][*c]u8, *c_uint) c_int;
+
+test "CPU brand string normalizer matches Linux producer token rules" {
+    var buf: [48]u8 = undefined;
+    try testing.expectEqualStrings(
+        "AMD_EPYC_7763_64-Core_Processor",
+        native_services.normalizeCpuModelToken("  AMD EPYC 7763 64-Core Processor  \x00trailing", &buf),
+    );
+    try testing.expectEqualStrings(
+        "Intel_R__Xeon_R__Platinum_8370C_CPU___2.80GHz",
+        native_services.normalizeCpuModelToken("Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz\x00", &buf),
+    );
+    try testing.expectEqualStrings(
+        "unknown",
+        native_services.normalizeCpuModelToken("   \t\r\n\x00", &buf),
+    );
+    try testing.expectEqualStrings(
+        "unknown",
+        native_services.normalizeCpuModelToken("AMD EPYC", buf[0..0]),
+    );
+    const host_token = native_services.cpuidBrandToken(&buf);
+    try testing.expect(host_token.len > 0 and host_token.len <= 48);
+    for (host_token) |ch| {
+        try testing.expect(std.ascii.isAlphanumeric(ch) or std.mem.indexOfScalar(u8, "_.:+-", ch) != null);
+    }
+}
 
 test "native workload mode keeps fixed JIT presets and compiler-free refusals" {
     inline for (.{ .{ 1, "correctness-fast" }, .{ 2, "correctness-full" } }) |case| {

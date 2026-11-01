@@ -144,8 +144,12 @@ are serialized before reuse, reset or release.
 This is deliberately a `Session` correctness exercise, **not a call to v2
 `benchmark.run` with invented deployment metadata**. The full v2 producer's
 independent image/placement/RAM/qualification inputs do not exist in this app.
-Wiring that measurement entry and guarded physical transport remains separate;
-the current entry fails rather than forging a receipt to satisfy admission.
+`native-services.zig` (`normalizeCpuModelToken`, `cpuidBrandToken`,
+`Services.benchmarkPages`, `Services.benchmarkClock`) and `snapshot.runBenchmark`
+provide the freestanding `wamr-aot.benchmark` service bindings (`clock`, `pages`,
+`native`, `allocator`) for separately admitted measurement harnesses, while the
+correctness entry point (`wamr_workload_run` with `mode == 0`) refuses other
+modes rather than forging a receipt to satisfy admission.
 These fixed finite AOT workloads do not acquire a JIT fuel guarantee.
 
 ### Matched sampler
