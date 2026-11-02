@@ -36,6 +36,14 @@ test "CPU brand string normalizer matches Linux producer token rules" {
     }
 }
 
+test "benchmarkClock enables all four WASI clocks with monotonic resolution" {
+    try testing.expectEqualSlices(
+        u64,
+        &.{ 100, 100, 100, 100 },
+        &native_services.wasi_clock_resolutions,
+    );
+}
+
 test "native workload mode keeps fixed JIT presets and compiler-free refusals" {
     inline for (.{ .{ 1, "correctness-fast" }, .{ 2, "correctness-full" } }) |case| {
         try checkMode(2, case[0], &.{"wamr"}, case[0]);

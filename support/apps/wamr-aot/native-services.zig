@@ -5,6 +5,7 @@ pub const c = @import("workloads_c");
 
 pub const clock_method = "hyperv-reference-monotonic";
 pub const clock_resolution_ns: u64 = 100;
+pub const wasi_clock_resolutions: [4]u64 = @splat(clock_resolution_ns);
 pub const memory_method = "native-vma-owned-4k-data-frames-including-none";
 
 /// Normalizes a raw CPU brand string (such as x86_64 CPUID leaves
@@ -190,9 +191,8 @@ pub fn Services(comptime aot: type) type {
 
         pub fn benchmarkClock(self: *Self, comptime bench: type) bench.Clock {
             const Adapter = struct {
-                fn read(raw: ?*anyopaque, id: bench.wasi.ClockId, _: u64) bench.wasi.ClockResult {
+                fn read(raw: ?*anyopaque, _: bench.wasi.ClockId, _: u64) bench.wasi.ClockResult {
                     const s = cast(raw orelse return .{ .failure = .inval });
-                    if (id != .monotonic) return .{ .failure = .notsup };
                     return .{ .timestamp_ns = s.platform().monotonicNs() catch return .{ .failure = .overflow } };
                 }
             };
@@ -202,7 +202,7 @@ pub fn Services(comptime aot: type) type {
                 .wasi_clock = .{
                     .userdata = self,
                     .read = Adapter.read,
-                    .resolution_ns = .{ 0, clock_resolution_ns, 0, 0 },
+                    .resolution_ns = wasi_clock_resolutions,
                 },
             };
         }
