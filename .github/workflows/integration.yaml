@@ -58,6 +58,21 @@ jobs:
         fetch-depth: 1
         path: _helloworld
 
+    - name: Pin upstream libc-test commit compatible with uktest patches
+      run: |
+        python3 - <<'PY'
+        from pathlib import Path
+        p = Path("support/build/Makefile.rules")
+        old = "\t$(GIT) clone --recurse-submodules -q --progress --depth 1 --branch $(3) --no-tags $(2) $(BUILD_DIR)/$(1)/origin/ && \\\n"
+        new = (
+            "\t$(GIT) clone --recurse-submodules -q --progress --branch $(3) --no-tags $(2) $(BUILD_DIR)/$(1)/origin/ && \\\n"
+            "\t(if [ \"$(1)\" = \"liblibctest\" ]; then $(GIT) -C $(BUILD_DIR)/$(1)/origin checkout -q c8b9db5111e48bf6e05e516a2b9e62d602c99a9c; fi) && \\\n"
+        )
+        text = p.read_text()
+        assert old in text, "clone rule not found in Makefile.rules"
+        p.write_text(text.replace(old, new, 1))
+        PY
+
     - name: Build and run libc-test via uktest
       uses: unikraft/kraftkit@staging
       with:
