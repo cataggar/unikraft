@@ -89,6 +89,25 @@ runs:
     run: |
       set -euo pipefail
       umask 077
+      if [ "$(id -u)" -eq 0 ]; then
+        git config --global --add safe.directory '*'
+        chown root:root /
+        chmod go-w /
+        for target in "${RUNNER_TEMP}" "${GITHUB_WORKSPACE}" "${HOME}"; do
+          if [ -n "${target}" ] && [ -e "${target}" ]; then
+            chown -R root:root "${target}"
+            chmod -R go-w "${target}"
+          fi
+          current="${target}"
+          while [ -n "${current}" ] && [ "${current}" != "/" ]; do
+            if [ -e "${current}" ]; then
+              chown root:root "${current}"
+              chmod go-w "${current}"
+            fi
+            current="$(dirname "${current}")"
+          done
+        done
+      fi
       root="${RUNNER_TEMP}/hyperv-ci"
       mkdir -p \
         "${root}/cache" \
