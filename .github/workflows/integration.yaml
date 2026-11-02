@@ -58,6 +58,21 @@ jobs:
         fetch-depth: 1
         path: _helloworld
 
+    - name: Pin upstream libc-test commit compatible with uktest patches
+      run: |
+        python3 - <<'PY'
+        from pathlib import Path
+        p = Path("support/build/Makefile.rules")
+        old = "\t$(GIT) clone --recurse-submodules -q --progress --depth 1 --branch $(3) --no-tags $(2) $(BUILD_DIR)/$(1)/origin/ && \\\n"
+        new = (
+            "\t$(GIT) clone --recurse-submodules -q --progress --branch $(3) --no-tags $(2) $(BUILD_DIR)/$(1)/origin/ && \\\n"
+            "\t(if [ \"$(1)\" = \"liblibctest\" ]; then $(GIT) -C $(BUILD_DIR)/$(1)/origin checkout -q c8b9db5111e48bf6e05e516a2b9e62d602c99a9c; fi) && \\\n"
+        )
+        text = p.read_text()
+        assert old in text, "clone rule not found in Makefile.rules"
+        p.write_text(text.replace(old, new, 1))
+        PY
+
     - name: Build and run libc-test via uktest
       uses: unikraft/kraftkit@staging
       with:
@@ -218,7 +233,7 @@ jobs:
 
   zig-helloworld:
     name: zig-helloworld
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
     container:
       image: ubuntu:24.04
     permissions:
@@ -754,9 +769,7 @@ jobs:
 
   zig-hyperv-public-debug:
     name: zig-hyperv-public-debug
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
-    container:
-      image: ubuntu:24.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
       attestations: read
@@ -765,14 +778,6 @@ jobs:
       run:
         shell: bash
     steps:
-    - name: Install checkout dependencies
-      run: |
-        set -euxo pipefail
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update
-        apt-get install -y --no-install-recommends ca-certificates git
-        rm -rf /var/lib/apt/lists/*
-
     - uses: actions/checkout@v4
       with:
         submodules: recursive
@@ -1002,9 +1007,7 @@ jobs:
 
   zig-hyperv-build-protocol:
     name: zig-hyperv-build-protocol
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
-    container:
-      image: ubuntu:24.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
       attestations: read
@@ -1013,14 +1016,6 @@ jobs:
       run:
         shell: bash
     steps:
-    - name: Install checkout dependencies
-      run: |
-        set -euxo pipefail
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update
-        apt-get install -y --no-install-recommends ca-certificates git
-        rm -rf /var/lib/apt/lists/*
-
     - uses: actions/checkout@v4
       with:
         submodules: recursive
@@ -1660,7 +1655,7 @@ jobs:
     - zig-hyperv-runtime
     - zig-hyperv-build-protocol
     - zig-hyperv
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
     timeout-minutes: 5
     permissions: {}
     steps:
@@ -1681,7 +1676,7 @@ jobs:
 
   zig-helloworld-arm64:
     name: zig-helloworld-arm64
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
     container:
       image: ubuntu:24.04
     permissions:
@@ -1916,7 +1911,7 @@ jobs:
 
   clang-helloworld-arm64:
     name: clang-helloworld-arm64
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
     container:
       image: ubuntu:24.04
     permissions:
