@@ -754,9 +754,7 @@ jobs:
 
   zig-hyperv-public-debug:
     name: zig-hyperv-public-debug
-    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
-    container:
-      image: ubuntu:24.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
       attestations: read
@@ -765,14 +763,6 @@ jobs:
       run:
         shell: bash
     steps:
-    - name: Install checkout dependencies
-      run: |
-        set -euxo pipefail
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update
-        apt-get install -y --no-install-recommends ca-certificates git
-        rm -rf /var/lib/apt/lists/*
-
     - uses: actions/checkout@v4
       with:
         submodules: recursive
@@ -1002,9 +992,7 @@ jobs:
 
   zig-hyperv-build-protocol:
     name: zig-hyperv-build-protocol
-    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
-    container:
-      image: ubuntu:24.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
       attestations: read
@@ -1013,14 +1001,6 @@ jobs:
       run:
         shell: bash
     steps:
-    - name: Install checkout dependencies
-      run: |
-        set -euxo pipefail
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update
-        apt-get install -y --no-install-recommends ca-certificates git
-        rm -rf /var/lib/apt/lists/*
-
     - uses: actions/checkout@v4
       with:
         submodules: recursive
