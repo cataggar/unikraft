@@ -15,6 +15,16 @@ export fn wamr_workload_run(config: *const c.wamr_aot_config, facts: *const c.st
     return 0;
 }
 
+export fn wamr_workload_bench(
+    config: *const c.wamr_aot_config,
+    facts: *const c.struct_wamr_workload_facts,
+    envelope_ptr: [*]const u8,
+    envelope_len: usize,
+) c_int {
+    runBenchEnvelope(config, facts, envelope_ptr[0..envelope_len]) catch return 1;
+    return 0;
+}
+
 /// Binds a Unikraft `wamr_aot_config` (`Services`) to `@import("wamr-aot").benchmark.Options`
 /// and runs the v2 freestanding guest benchmark producer when supplied with an
 /// independently admitted request and deployment envelope.
@@ -26,6 +36,170 @@ pub fn runBenchmark(config: *const c.wamr_aot_config, options: bench.Options) !v
     bound.clock = platform.benchmarkClock(bench);
     bound.pages = platform.benchmarkPages(bench);
     try bench.run(bound);
+}
+
+const Cursor = struct {
+    bytes: []const u8,
+    pos: usize = 0,
+
+    fn take(self: *Cursor, n: usize) ![]const u8 {
+        if (n > self.bytes.len -| self.pos) return error.InvalidEnvelope;
+        const out = self.bytes[self.pos .. self.pos + n];
+        self.pos += n;
+        return out;
+    }
+
+    fn takeU32(self: *Cursor) !u32 {
+        const b = try self.take(4);
+        return std.mem.readInt(u32, b[0..4], .little);
+    }
+
+    fn takeU64(self: *Cursor) !u64 {
+        const b = try self.take(8);
+        return std.mem.readInt(u64, b[0..8], .little);
+    }
+
+    fn takeFramed(self: *Cursor) ![]const u8 {
+        const len = try self.takeU32();
+        return self.take(len);
+    }
+};
+
+fn writeStream(bytes: []const u8) !void {
+    if (bytes.len == 0) return;
+    if (c.wamr_workload_write_stream(bytes.ptr, bytes.len) != 0) return error.SerialWriteFailed;
+}
+
+fn writeMarkerLine(prefix: []const u8, token: []const u8) !void {
+    try writeStream(prefix);
+    try writeStream(token);
+    try writeStream("\n");
+}
+
+fn runBenchEnvelope(
+    config: *const c.wamr_aot_config,
+    facts: *const c.struct_wamr_workload_facts,
+    envelope: []const u8,
+) !void {
+    var cur: Cursor = .{ .bytes = envelope };
+    const magic = try cur.take(12);
+    if (!std.mem.eql(u8, magic, "WAMRBENCHV2\n")) return error.InvalidEnvelope;
+
+    const configured_vm_ram_bytes = try cur.takeU64();
+    const runtime_bytes = try cur.takeU64();
+    const compiler_bytes = try cur.takeU64();
+    const image_bytes = try cur.takeU64();
+    const image_sha256 = try cur.take(64);
+    const tracked_diff_sha256 = try cur.take(64);
+    const compiler_version = try cur.takeFramed();
+    const target_abi = try cur.takeFramed();
+    const azure_sku = try cur.takeFramed();
+    const azure_region = try cur.takeFramed();
+    const receipt_json = try cur.takeFramed();
+
+    const workload_count = try cur.takeU32();
+    if (workload_count == 0 or workload_count > 8) return error.InvalidEnvelope;
+    var workloads: [8]bench.Workload = undefined;
+    for (0..workload_count) |idx| {
+        workloads[idx] = .{
+            .name = try cur.takeFramed(),
+            .wasm = try cur.takeFramed(),
+            .aot_bytes = try cur.takeFramed(),
+        };
+    }
+
+    const request_count = try cur.takeU32();
+    if (request_count == 0 or request_count > 256) return error.InvalidEnvelope;
+
+    const source: bench.Source = .{
+        .commit = std.mem.span(facts.revision),
+        .tree_sha256 = std.mem.span(facts.source_tree_sha256),
+        .tracked_diff_sha256 = tracked_diff_sha256,
+    };
+    const build: bench.Build = .{
+        .source = source,
+        .runtime = .{
+            .sha256 = std.mem.span(facts.runtime_sha256),
+            .bytes = runtime_bytes,
+        },
+        .compiler = .{
+            .binary = .{
+                .sha256 = std.mem.span(facts.compiler_sha256),
+                .bytes = compiler_bytes,
+            },
+            .source = source,
+            .version = compiler_version,
+        },
+        .target_abi = target_abi,
+        .memory_policy = .{
+            .allocator_by_phase = .{
+                .load = "unikraft-uk_alloc-page-backed",
+                .instantiate = "unikraft-uk_alloc-page-backed",
+                .first = "wasm-linear-memory-in-place",
+                .steady = "snapshot-restore-in-place",
+            },
+            .page_policy = .{
+                .reservation = "uk_paging_page_map-4k",
+                .commitment = "eager-physical-frame-alloc",
+                .release = "uk_paging_page_unmap-and-frame-free",
+            },
+        },
+    };
+    const deployment: bench.Deployment = .{
+        .receipt_json = receipt_json,
+        .image = .{
+            .sha256 = image_sha256,
+            .bytes = image_bytes,
+        },
+        .azure_sku = azure_sku,
+        .azure_region = azure_region,
+        .configured_vm_ram_bytes = configured_vm_ram_bytes,
+        .qualification = .independently_qualified_hardware,
+    };
+
+    var brand_buf: [48]u8 = undefined;
+    const cpu_model = services.cpuidBrandToken(&brand_buf);
+    var outer_platform: Platform = .{ .config = config };
+
+    for (0..request_count) |_| {
+        const run_id = try cur.takeFramed();
+        const config_sha256 = try cur.take(64);
+        const request_json = try cur.takeFramed();
+
+        {
+            const scratch = try outer_platform.allocator().alloc(u8, 768 * 1024);
+            defer outer_platform.allocator().free(scratch);
+            const workspace = scratch[0 .. 512 * 1024];
+            const result_buf = scratch[512 * 1024 .. 640 * 1024];
+            const evidence_buf = scratch[640 * 1024 .. 768 * 1024];
+            var result_writer = std.Io.Writer.fixed(result_buf);
+            var evidence_writer = std.Io.Writer.fixed(evidence_buf);
+
+            try writeMarkerLine("WAMR_BENCH_RUN_BEGIN=", run_id);
+            try runBenchmark(config, .{
+                .request_json = request_json,
+                .config_sha256 = config_sha256,
+                .build = build,
+                .deployment = deployment,
+                .workloads = workloads[0..workload_count],
+                .cpu = .{ .model = cpu_model, .active_count = 1 },
+                .native = undefined,
+                .clock = undefined,
+                .pages = undefined,
+                .allocator = undefined,
+                .workspace = workspace,
+                .result = &result_writer,
+                .evidence = &evidence_writer,
+            });
+            try writeStream(evidence_writer.buffered());
+            try writeStream(result_writer.buffered());
+            try writeMarkerLine("WAMR_BENCH_RUN_END=", run_id);
+        }
+        const observed = outer_platform.pages();
+        if (observed.reserved_bytes != 0 or observed.frame_bytes != 0 or
+            observed.accessible_bytes != 0 or observed.allocation_bytes != 0)
+            return error.ResourceLeak;
+    }
 }
 
 fn clock(raw: ?*anyopaque, id: bench.wasi.ClockId, _: u64) bench.wasi.ClockResult {

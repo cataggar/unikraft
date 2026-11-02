@@ -20,8 +20,12 @@ struct wamr_workload_pages {
 
 void wamr_workload_observe(void *, struct wamr_workload_pages *);
 int wamr_workload_write(const uint8_t *, size_t);
+int wamr_workload_write_stream(const uint8_t *, size_t);
 int wamr_workload_run(const wamr_aot_config *,
 		     const struct wamr_workload_facts *, unsigned int);
+int wamr_workload_bench(const wamr_aot_config *,
+			const struct wamr_workload_facts *,
+			const uint8_t *, size_t);
 int wamr_workload_main(int, char **);
 
 #endif

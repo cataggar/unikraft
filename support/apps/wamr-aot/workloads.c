@@ -7,6 +7,7 @@
 #include <uk/alloc.h>
 #include <uk/console.h>
 #include <uk/console/driver.h>
+#include <uk/plat/memory.h>
 
 #if WAMR_APP_VARIANT
 #if CONFIG_STACK_SIZE_PAGE_ORDER < 8
@@ -39,6 +40,40 @@ int wamr_workload_write(const uint8_t *bytes, size_t length)
 	if (!selected || uk_console_out_direct(selected, (const char *)bytes,
 					     length) != (ssize_t)length)
 		return -1;
+	return 0;
+}
+
+int wamr_workload_write_stream(const uint8_t *bytes, size_t length)
+{
+	struct uk_console *selected = NULL, *console;
+	unsigned int index, count = uk_console_count();
+	size_t offset = 0;
+
+	if (!length)
+		return 0;
+	if (!bytes || count > 16)
+		return -1;
+	for (index = 0; index < count; index++) {
+		console = uk_console_get(index);
+		if (!console || console->dclass != UK_CONSOLE_CLASS_UART ||
+		    !(console->flags & UK_CONSOLE_FLAG_STDOUT))
+			continue;
+		if (selected || (console->flags & UK_CONSOLE_FLAG_ASYNC_TX))
+			return -1;
+		selected = console;
+	}
+	if (!selected)
+		return -1;
+	while (offset < length) {
+		size_t chunk = length - offset;
+
+		if (chunk > 16384)
+			chunk = 16384;
+		if (uk_console_out_direct(selected, (const char *)(bytes + offset),
+					  chunk) != (ssize_t)chunk)
+			return -1;
+		offset += chunk;
+	}
 	return 0;
 }
 
@@ -81,6 +116,33 @@ int wamr_workload_main(int argc, char **argv)
 	status = wamr_platform_config(&platform, uk_alloc_get_default(), &config);
 	if (!status)
 		status = wamr_platform_selftest(&platform, &config);
+#if WAMR_APP_VARIANT == 1
+	{
+		struct ukplat_memregion_desc *initrd = NULL;
+
+		if (!status &&
+		    ukplat_memregion_find_initrd0(&initrd) >= 0 &&
+		    initrd && initrd->vbase && initrd->len >= 12 &&
+		    !memcmp((const void *)initrd->vbase, "WAMRBENCHV2\n", 12)) {
+			status = wamr_workload_bench(&config, &facts,
+						     (const uint8_t *)initrd->vbase,
+						     initrd->len);
+			if (platform.reserved_bytes || platform.frame_bytes ||
+			    platform.accessible_bytes || platform.allocation_bytes)
+				status = 1;
+			if (status) {
+				printf("WAMR_NATIVE_WORKLOAD_FAILED status=%d\n", status);
+				return 1;
+			}
+			length = snprintf(completed, sizeof(completed),
+					  "WAMR_NATIVE_BENCH_COMPLETE variant=%d teardown=0\n",
+					  WAMR_APP_VARIANT);
+			if (length <= 0 || (size_t)length >= sizeof(completed))
+				return 1;
+			return wamr_workload_write((const uint8_t *)completed, length) ? 1 : 0;
+		}
+	}
+#endif
 	if (!status)
 		status = wamr_workload_run(&config, &facts, mode);
 	if (platform.reserved_bytes || platform.frame_bytes ||
