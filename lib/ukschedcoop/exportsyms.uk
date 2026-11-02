@@ -1,1 +1,6 @@
 uk_schedcoop_create
+uk_schedcoop_create_on
+uk_schedcoop_fixed_submit
+uk_schedcoop_fixed_wait
+uk_schedcoop_fixed_idle_armed
+uk_schedcoop_fixed_destroy

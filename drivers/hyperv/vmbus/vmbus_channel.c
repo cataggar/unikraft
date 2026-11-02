@@ -1,0 +1,2499 @@
+/* SPDX-License-Identifier: BSD-3-Clause */
+#include <errno.h>
+#include <hyperv/hyperv.h>
+#include <uk/arch/spinlock.h>
+#include <uk/config.h>
+#include <uk/paging.h>
+#include <uk/plat/time.h>
+#include <uk/print.h>
+#include <uk/sched.h>
+#include <uk/vmbus.h>
+
+#include "vmbus_channel_core.h"
+#include "vmbus_channel_args.h"
+#include "vmbus_channel_owner.h"
+#include "vmbus_channel_state.h"
+#include "vmbus_internal.h"
+#include "vmbus_page_pool.h"
+#include "vmbus_protocol.h"
+#include "vmbus_signal_policy.h"
+
+#define VMBUS_PAGE_SIZE			4096U
+#define VMBUS_CHANNEL_RELID_LIMIT	2048U
+#define VMBUS_CONTROL_TICKS_PER_MS	10000ULL
+#define VMBUS_CONTROL_WAIT_NS		1000000ULL
+enum vmbus_gpadl_record_state {
+	VMBUS_GPADL_RECORD_FREE,
+	VMBUS_GPADL_RECORD_OWNED,
+	VMBUS_GPADL_RECORD_ASYNC,
+	VMBUS_GPADL_RECORD_RESET,
+	VMBUS_GPADL_RECORD_TEARING_DOWN,
+	VMBUS_GPADL_RECORD_RECLAIMING,
+};
+
+struct vmbus_gpadl_record {
+	struct vmbus_channel_transaction *transaction;
+	__u64 channel_generation;
+	__vaddr_t address;
+	__u32 gpadl_id;
+	__u32 relid;
+	__u32 byte_count;
+	__u32 target_vp;
+	__u32 target_generation;
+	__u16 page_start;
+	__u16 page_count;
+	__u8 state;
+	__u8 host_done;
+	__u8 local_drained;
+	__u8 owns_ring_pages;
+	__u8 owns_target_vp;
+	__u8 external;
+};
+
+struct vmbus_channel {
+	struct vmbus_device *device;
+	__u8 *tx_ring;
+	__u8 *rx_ring;
+	__u16 tx_pages;
+	__u16 rx_pages;
+	__u16 page_start;
+	__u16 page_count;
+	__u32 gpadl_id;
+	__u32 open_id;
+	__u32 relid;
+	__u32 connection_id;
+	__u32 target_vp;
+	__u32 target_generation;
+	__u64 relid_sequence;
+	__u8 state;
+	__u8 rescinded;
+	__u8 event_pending;
+	__u8 gpadl_live;
+	__u8 close_posted;
+	__u8 teardown_posted;
+	__u8 gpadl_posted;
+	__u8 target_held;
+	__u16 gpadl_record;
+	struct vmbus_channel_owner owner;
+	__spinlock lifetime_lock;
+	__spinlock tx_lock;
+	__spinlock rx_lock;
+	__spinlock signal_lock;
+	struct vmbus_signal_input_abi signal_input __align(8);
+	__u64 signal_input_gpa;
+	vmbus_channel_callback_t callback;
+	void *callback_arg;
+};
+
+static struct vmbus_channel channels[CONFIG_LIBVMBUS_MAX_DEVICES];
+static struct vmbus_channel *channel_by_relid[VMBUS_CHANNEL_RELID_LIMIT];
+static struct vmbus_channel_transaction
+	transactions[CONFIG_LIBVMBUS_MAX_TRANSACTIONS];
+static struct vmbus_gpadl_record
+	gpadl_records[CONFIG_LIBVMBUS_MAX_GPADLS];
+static __u8 ring_pages[CONFIG_LIBVMBUS_RING_PAGES][VMBUS_PAGE_SIZE]
+	__align(VMBUS_PAGE_SIZE);
+static __u8 ring_page_used[CONFIG_LIBVMBUS_RING_PAGES];
+static __u32 next_gpadl_id = 0x10000U;
+static __u32 next_open_id = 1U;
+static unsigned int live_gpadls;
+static __u32 ignored_responses;
+static __u64 next_channel_generation = 1;
+static int channel_locks_initialized;
+static __spinlock transaction_lock;
+static const __u8 empty_input;
+static __u8 empty_output;
+
+/*
+ * Lifetime state is sampled only under lifetime_lock. Data operations take a
+ * reference there, drop it, then take tx_lock, rx_lock, or signal_lock and
+ * revalidate. Revocation never holds lifetime_lock while waiting for an I/O
+ * lock or issuing a hypercall, so callbacks may safely re-enter close paths.
+ */
+static void free_ring_pages(unsigned int start, unsigned int count);
+static void
+transaction_release(struct vmbus_channel_transaction *transaction);
+static void gpadl_record_release(struct vmbus_gpadl_record *record,
+				 int free_pages);
+static void gpadl_record_try_reclaim(struct vmbus_gpadl_record *record);
+static int teardown_external_gpadls(struct vmbus_channel *channel,
+				    const struct vmbus_channel_token *token,
+				    int wait);
+
+static inline void vmbus_channel_cpu_relax(void)
+{
+#ifdef VMBUS_CHANNEL_HOST_TEST
+	__atomic_signal_fence(__ATOMIC_ACQ_REL);
+#else
+	__asm__ __volatile__("pause");
+#endif
+}
+
+static void initialize_channel_locks(void)
+{
+	unsigned int i;
+
+	if (channel_locks_initialized)
+		return;
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++) {
+		ukarch_spin_init(&channels[i].lifetime_lock);
+		ukarch_spin_init(&channels[i].tx_lock);
+		ukarch_spin_init(&channels[i].rx_lock);
+		ukarch_spin_init(&channels[i].signal_lock);
+	}
+	ukarch_spin_init(&transaction_lock);
+	channel_locks_initialized = 1;
+}
+
+static int channel_operation_begin(struct vmbus_channel *channel,
+				   struct vmbus_channel_token *token,
+				   int require_open)
+{
+	unsigned long flags;
+	int rc;
+
+	if (!channel)
+		return -ENODEV;
+	ukplat_spin_lock_irqsave(&channel->lifetime_lock, flags);
+	if (!channel->owner.generation || channel->state == CHANNEL_FREE)
+		rc = -ENODEV;
+	else if (channel->owner.revoked)
+		rc = -ECANCELED;
+	else if (require_open && channel->state != CHANNEL_OPEN)
+		rc = -ENODEV;
+	else
+		rc = vmbus_channel_owner_begin(&channel->owner, token);
+	ukplat_spin_unlock_irqrestore(&channel->lifetime_lock, flags);
+	return rc;
+}
+
+static int channel_operation_pin(struct vmbus_channel *channel,
+				 struct vmbus_channel_token *token)
+{
+	unsigned long flags;
+	int rc = 0;
+
+	ukplat_spin_lock_irqsave(&channel->lifetime_lock, flags);
+	if (!channel->owner.generation || channel->state == CHANNEL_FREE ||
+	    channel->owner.operations == UINT16_MAX ||
+	    channel->owner.cleanup_pending)
+		rc = -ENODEV;
+	else {
+		channel->owner.operations++;
+		token->owner = &channel->owner;
+		token->generation = channel->owner.generation;
+	}
+	ukplat_spin_unlock_irqrestore(&channel->lifetime_lock, flags);
+	return rc;
+}
+
+static int channel_operation_valid(const struct vmbus_channel_token *token,
+				   int require_open)
+{
+	struct vmbus_channel *channel;
+	unsigned long flags;
+	int valid;
+
+	if (!token || !token->owner)
+		return 0;
+	channel = (struct vmbus_channel *)((char *)token->owner -
+			offsetof(struct vmbus_channel, owner));
+	ukplat_spin_lock_irqsave(&channel->lifetime_lock, flags);
+	valid = vmbus_channel_owner_valid(token) &&
+		(!require_open || channel->state == CHANNEL_OPEN);
+	ukplat_spin_unlock_irqrestore(&channel->lifetime_lock, flags);
+	return valid;
+}
+
+static int channel_revoke(struct vmbus_channel *channel, int rescinded)
+{
+	unsigned long flags;
+	int cleanup_now;
+
+	ukplat_spin_lock_irqsave(&channel->lifetime_lock, flags);
+	if (rescinded)
+		channel->rescinded = 1;
+	cleanup_now = vmbus_channel_owner_revoke(&channel->owner);
+	ukplat_spin_unlock_irqrestore(&channel->lifetime_lock, flags);
+	return cleanup_now;
+}
+
+static void channel_synchronize_io(struct vmbus_channel *channel)
+{
+	unsigned long flags;
+
+	ukplat_spin_lock_irqsave(&channel->tx_lock, flags);
+	ukplat_spin_unlock_irqrestore(&channel->tx_lock, flags);
+	ukplat_spin_lock_irqsave(&channel->rx_lock, flags);
+	ukplat_spin_unlock_irqrestore(&channel->rx_lock, flags);
+	ukarch_spin_lock(&channel->signal_lock);
+	ukarch_spin_unlock(&channel->signal_lock);
+}
+
+static __u32 read_le32(const __u8 *p)
+{
+	return (__u32)p[0] | ((__u32)p[1] << 8) |
+		((__u32)p[2] << 16) | ((__u32)p[3] << 24);
+}
+
+static __u64 channel_hypercall(void *arg __unused, __u64 input_gpa)
+{
+	return hyperv_hypercall(0x005d, input_gpa, 0);
+}
+
+static struct vmbus_channel *find_channel(__u32 channel_id)
+{
+	unsigned int i;
+
+	if (channel_id < VMBUS_CHANNEL_RELID_LIMIT) {
+		struct vmbus_channel *channel = __atomic_load_n(
+			&channel_by_relid[channel_id], __ATOMIC_ACQUIRE);
+
+		if (channel &&
+		    __atomic_load_n(&channel->state, __ATOMIC_ACQUIRE) !=
+			    CHANNEL_FREE &&
+		    channel->relid == channel_id)
+			return channel;
+	}
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++)
+		if (__atomic_load_n(&channels[i].state, __ATOMIC_ACQUIRE) !=
+			    CHANNEL_FREE &&
+		    channels[i].relid == channel_id)
+			return &channels[i];
+	return NULL;
+}
+
+static struct vmbus_channel *allocate_channel(struct vmbus_device *device)
+{
+	unsigned int i;
+	unsigned long flags;
+
+	if (device->channel)
+		return device->channel;
+	initialize_channel_locks();
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++) {
+		ukplat_spin_lock_irqsave(&channels[i].lifetime_lock, flags);
+		if (channels[i].state != CHANNEL_FREE ||
+		    channels[i].owner.operations ||
+		    channels[i].owner.cleanup_pending) {
+			ukplat_spin_unlock_irqrestore(
+				&channels[i].lifetime_lock, flags);
+			continue;
+		}
+		if (!next_channel_generation) {
+			ukplat_spin_unlock_irqrestore(
+				&channels[i].lifetime_lock, flags);
+			return NULL;
+		}
+		channels[i].device = device;
+		channels[i].relid = device->channel_id;
+		channels[i].connection_id = device->connection_id;
+		channels[i].relid_sequence =
+			vmbus_control_relid_sequence(device->channel_id);
+		channels[i].owner.generation = next_channel_generation;
+		next_channel_generation =
+			next_channel_generation == UINT64_MAX ?
+			0 : next_channel_generation + 1;
+		channels[i].owner.operations = 0;
+		channels[i].owner.revoked = 0;
+		channels[i].owner.cleanup_pending = 0;
+		channels[i].owner.cleanup_claimed = 0;
+		channels[i].rescinded = 0;
+		__atomic_store_n(&channels[i].state, CHANNEL_ALLOCATED,
+				 __ATOMIC_RELEASE);
+		if (device->channel_id < VMBUS_CHANNEL_RELID_LIMIT)
+			__atomic_store_n(&channel_by_relid[device->channel_id],
+					 &channels[i], __ATOMIC_RELEASE);
+		device->channel = &channels[i];
+		ukplat_spin_unlock_irqrestore(&channels[i].lifetime_lock,
+					     flags);
+		return &channels[i];
+	}
+	return NULL;
+}
+
+static void release_channel_object_locked(struct vmbus_channel *channel)
+{
+	if (channel->device && channel->device->channel == channel)
+		channel->device->channel = NULL;
+	if (channel->relid < VMBUS_CHANNEL_RELID_LIMIT) {
+		struct vmbus_channel *expected = channel;
+
+		(void)__atomic_compare_exchange_n(
+			&channel_by_relid[channel->relid],
+			&expected, NULL, 0,
+			__ATOMIC_RELEASE, __ATOMIC_RELAXED);
+	}
+	channel->device = NULL;
+	channel->tx_ring = NULL;
+	channel->rx_ring = NULL;
+	channel->tx_pages = 0;
+	channel->rx_pages = 0;
+	channel->page_start = 0;
+	channel->page_count = 0;
+	channel->gpadl_id = 0;
+	channel->open_id = 0;
+	channel->relid = 0;
+	channel->connection_id = 0;
+	if (channel->target_held)
+		hyperv_vmbus_target_release(channel->target_vp,
+					   channel->target_generation);
+	channel->target_vp = 0;
+	channel->target_generation = 0;
+	channel->target_held = 0;
+	channel->relid_sequence = 0;
+	channel->rescinded = 0;
+	channel->event_pending = 0;
+	channel->gpadl_live = 0;
+	channel->close_posted = 0;
+	channel->teardown_posted = 0;
+	channel->gpadl_posted = 0;
+	channel->gpadl_record = 0;
+	channel->owner.generation = 0;
+	channel->owner.operations = 0;
+	channel->owner.revoked = 0;
+	channel->owner.cleanup_pending = 0;
+	channel->owner.cleanup_claimed = 0;
+	channel->callback = NULL;
+	channel->callback_arg = NULL;
+	channel->signal_input_gpa = 0;
+	__atomic_store_n(&channel->state, CHANNEL_FREE, __ATOMIC_RELEASE);
+}
+
+static void finalize_channel_locked(struct vmbus_channel *channel)
+{
+	struct vmbus_gpadl_record *record = NULL;
+
+	if (channel->gpadl_record &&
+	    channel->gpadl_record <= CONFIG_LIBVMBUS_MAX_GPADLS)
+		record = &gpadl_records[channel->gpadl_record - 1];
+	if (record &&
+	    (__atomic_load_n(&record->state, __ATOMIC_ACQUIRE) ==
+		     VMBUS_GPADL_RECORD_ASYNC ||
+	     __atomic_load_n(&record->state, __ATOMIC_ACQUIRE) ==
+		     VMBUS_GPADL_RECORD_RESET)) {
+		if (record->owns_ring_pages && channel->page_count &&
+		    channel->page_start == record->page_start &&
+		    channel->page_count == record->page_count) {
+			channel->page_start = 0;
+			channel->page_count = 0;
+			channel->tx_ring = NULL;
+			channel->rx_ring = NULL;
+			channel->tx_pages = 0;
+			channel->rx_pages = 0;
+		}
+		if (channel->target_held) {
+			record->target_vp = channel->target_vp;
+			record->target_generation = channel->target_generation;
+			record->owns_target_vp = 1;
+			channel->target_vp = 0;
+			channel->target_generation = 0;
+			channel->target_held = 0;
+		}
+		__atomic_store_n(&record->local_drained, 1, __ATOMIC_RELEASE);
+		channel->gpadl_record = 0;
+		gpadl_record_try_reclaim(record);
+	}
+	if (channel->page_count)
+		free_ring_pages(channel->page_start, channel->page_count);
+	release_channel_object_locked(channel);
+}
+
+#ifdef VMBUS_CHANNEL_HOST_TEST
+static void release_channel_object(struct vmbus_channel *channel)
+{
+	unsigned long flags;
+
+	ukplat_spin_lock_irqsave(&channel->lifetime_lock, flags);
+	release_channel_object_locked(channel);
+	ukplat_spin_unlock_irqrestore(&channel->lifetime_lock, flags);
+	vmbus_control_channel_resource_released();
+}
+#endif
+
+static void end_channel_operation(struct vmbus_channel *channel,
+				  struct vmbus_channel_token *token)
+{
+	unsigned long flags;
+	__u32 relid;
+	__u64 relid_sequence;
+	int release_relid;
+	int cleanup;
+
+	ukplat_spin_lock_irqsave(&channel->lifetime_lock, flags);
+	cleanup = vmbus_channel_owner_end(token);
+	if (cleanup) {
+		relid = channel->relid;
+		relid_sequence = channel->relid_sequence;
+		release_relid = channel->rescinded;
+		finalize_channel_locked(channel);
+	} else {
+		relid = 0;
+		relid_sequence = 0;
+		release_relid = 0;
+	}
+	ukplat_spin_unlock_irqrestore(&channel->lifetime_lock, flags);
+	if (cleanup) {
+		vmbus_control_channel_resource_released();
+		if (release_relid &&
+		    vmbus_control_release_relid(relid, relid_sequence))
+			vmbus_control_fail();
+	}
+}
+
+static int allocate_ring_pages(unsigned int count, unsigned int *start)
+{
+	return vmbus_page_pool_allocate(ring_page_used,
+			CONFIG_LIBVMBUS_RING_PAGES, count, start);
+}
+
+static void free_ring_pages(unsigned int start, unsigned int count)
+{
+	if (!count)
+		return;
+	vmbus_page_pool_free(ring_page_used, CONFIG_LIBVMBUS_RING_PAGES,
+			     start, count);
+	vmbus_control_channel_resource_released();
+}
+
+static struct vmbus_gpadl_record *gpadl_record_allocate(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_GPADLS; i++) {
+		__u8 expected = VMBUS_GPADL_RECORD_FREE;
+
+		if (!__atomic_compare_exchange_n(&gpadl_records[i].state,
+				&expected, VMBUS_GPADL_RECORD_RECLAIMING, 0,
+				__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+			continue;
+		gpadl_records[i].transaction = NULL;
+		gpadl_records[i].address = 0;
+		gpadl_records[i].byte_count = 0;
+		gpadl_records[i].target_vp = 0;
+		gpadl_records[i].target_generation = 0;
+		gpadl_records[i].host_done = 0;
+		gpadl_records[i].local_drained = 0;
+		gpadl_records[i].owns_ring_pages = 0;
+		gpadl_records[i].owns_target_vp = 0;
+		gpadl_records[i].external = 0;
+		__atomic_add_fetch(&live_gpadls, 1, __ATOMIC_RELAXED);
+		__atomic_store_n(&gpadl_records[i].state,
+				 VMBUS_GPADL_RECORD_OWNED, __ATOMIC_RELEASE);
+		return &gpadl_records[i];
+	}
+	return NULL;
+}
+
+static struct vmbus_gpadl_record *gpadl_record_find(__u32 gpadl_id)
+{
+	unsigned int i;
+
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_GPADLS; i++) {
+		if (__atomic_load_n(&gpadl_records[i].state,
+				    __ATOMIC_ACQUIRE) !=
+		    VMBUS_GPADL_RECORD_ASYNC)
+			continue;
+		if (gpadl_records[i].gpadl_id == gpadl_id)
+			return &gpadl_records[i];
+	}
+	return NULL;
+}
+
+static void gpadl_record_release(struct vmbus_gpadl_record *record,
+				 int free_pages)
+{
+	if (!record)
+		return;
+	if (record->transaction)
+		transaction_release(record->transaction);
+	if (free_pages && record->owns_ring_pages && record->page_count)
+		free_ring_pages(record->page_start, record->page_count);
+	if (free_pages && record->owns_target_vp)
+		hyperv_vmbus_target_release(record->target_vp,
+					    record->target_generation);
+	record->transaction = NULL;
+	record->channel_generation = 0;
+	record->address = 0;
+	record->gpadl_id = 0;
+	record->relid = 0;
+	record->byte_count = 0;
+	record->target_vp = 0;
+	record->target_generation = 0;
+	record->page_start = 0;
+	record->page_count = 0;
+	record->host_done = 0;
+	record->local_drained = 0;
+	record->owns_ring_pages = 0;
+	record->owns_target_vp = 0;
+	record->external = 0;
+	if (__atomic_load_n(&live_gpadls, __ATOMIC_RELAXED))
+		__atomic_sub_fetch(&live_gpadls, 1, __ATOMIC_RELAXED);
+	__atomic_store_n(&record->state, VMBUS_GPADL_RECORD_FREE,
+			 __ATOMIC_RELEASE);
+}
+
+static void gpadl_record_try_reclaim(struct vmbus_gpadl_record *record)
+{
+	__u8 state;
+
+	if (!__atomic_load_n(&record->host_done, __ATOMIC_ACQUIRE) ||
+	    !__atomic_load_n(&record->local_drained, __ATOMIC_ACQUIRE))
+		return;
+	state = __atomic_load_n(&record->state, __ATOMIC_ACQUIRE);
+	if (state != VMBUS_GPADL_RECORD_ASYNC &&
+	    state != VMBUS_GPADL_RECORD_RESET)
+		return;
+	if (!__atomic_compare_exchange_n(&record->state, &state,
+			VMBUS_GPADL_RECORD_RECLAIMING, 0,
+			__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+		return;
+	gpadl_record_release(record, 1);
+}
+
+static struct vmbus_gpadl_record *
+channel_gpadl_record(struct vmbus_channel *channel)
+{
+	unsigned int index;
+
+	if (!channel->gpadl_record)
+		return NULL;
+	index = channel->gpadl_record - 1;
+	if (index >= CONFIG_LIBVMBUS_MAX_GPADLS ||
+	    __atomic_load_n(&gpadl_records[index].state, __ATOMIC_ACQUIRE) ==
+		    VMBUS_GPADL_RECORD_FREE ||
+	    gpadl_records[index].gpadl_id != channel->gpadl_id ||
+	    gpadl_records[index].channel_generation !=
+		    channel->owner.generation)
+		return NULL;
+	return &gpadl_records[index];
+}
+
+static void quarantine_channel_pages(
+	struct vmbus_channel *channel, struct vmbus_gpadl_record *record,
+	struct vmbus_channel_transaction *transaction, int posted)
+{
+	/*
+	 * TLFS completes a GPADL teardown with GPADL_TORNDOWN. FreeBSD's
+	 * vmbus_chan_gpadl_disconnect likewise waits for that response and
+	 * abandons the ring allocation when disconnect cannot be confirmed.
+	 * Keep these pages unavailable until confirmation or connection reset.
+	 */
+	record->page_start = channel->page_start;
+	record->page_count = channel->page_count;
+	record->byte_count = (__u32)channel->page_count * VMBUS_PAGE_SIZE;
+	record->owns_ring_pages = 1;
+	if (channel->target_held) {
+		record->target_vp = channel->target_vp;
+		record->target_generation = channel->target_generation;
+		record->owns_target_vp = 1;
+		channel->target_vp = 0;
+		channel->target_generation = 0;
+		channel->target_held = 0;
+	}
+	record->transaction = transaction;
+	__atomic_store_n(&record->state,
+			 posted ? VMBUS_GPADL_RECORD_ASYNC :
+				  VMBUS_GPADL_RECORD_RESET,
+			 __ATOMIC_RELEASE);
+	channel->page_start = 0;
+	channel->page_count = 0;
+	channel->tx_ring = NULL;
+	channel->rx_ring = NULL;
+	channel->tx_pages = 0;
+	channel->rx_pages = 0;
+	channel->gpadl_id = 0;
+	channel->gpadl_live = 0;
+}
+
+static void complete_async_gpadl(__u32 gpadl_id)
+{
+	struct vmbus_gpadl_record *record = gpadl_record_find(gpadl_id);
+
+	if (!record ||
+	    __atomic_load_n(&record->state, __ATOMIC_ACQUIRE) !=
+		    VMBUS_GPADL_RECORD_ASYNC)
+		return;
+	__atomic_store_n(&record->host_done, 1, __ATOMIC_RELEASE);
+	gpadl_record_try_reclaim(record);
+}
+
+static struct vmbus_channel_transaction *
+transaction_allocate(enum vmbus_transaction_type type, __u32 channel_id,
+		     __u32 id)
+{
+	struct vmbus_channel_transaction *transaction;
+	unsigned long flags;
+
+	ukplat_spin_lock_irqsave(&transaction_lock, flags);
+	transaction = vmbus_transaction_allocate(transactions,
+			CONFIG_LIBVMBUS_MAX_TRANSACTIONS, type, channel_id, id);
+	ukplat_spin_unlock_irqrestore(&transaction_lock, flags);
+	return transaction;
+}
+
+static struct vmbus_channel_transaction *
+transaction_find(enum vmbus_transaction_type type, __u32 channel_id,
+		 __u32 id)
+{
+	struct vmbus_channel_transaction *transaction = NULL;
+	unsigned long flags;
+	unsigned int i;
+
+	ukplat_spin_lock_irqsave(&transaction_lock, flags);
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_TRANSACTIONS; i++)
+		if (transactions[i].used && transactions[i].type == type &&
+		    transactions[i].channel_id == channel_id &&
+		    transactions[i].id == id) {
+			transaction = &transactions[i];
+			break;
+		}
+	ukplat_spin_unlock_irqrestore(&transaction_lock, flags);
+	return transaction;
+}
+
+static void
+transaction_release(struct vmbus_channel_transaction *transaction)
+{
+	unsigned long flags;
+	int used;
+
+	ukplat_spin_lock_irqsave(&transaction_lock, flags);
+	used = transaction->used;
+	vmbus_transaction_release(transaction);
+	ukplat_spin_unlock_irqrestore(&transaction_lock, flags);
+	if (used)
+		vmbus_control_channel_resource_released();
+}
+
+static unsigned int transaction_cancel_channel(__u32 channel_id,
+					       __u32 status)
+{
+	unsigned long flags;
+	unsigned int cancelled;
+
+	ukplat_spin_lock_irqsave(&transaction_lock, flags);
+	cancelled = vmbus_transaction_cancel_channel_except(transactions,
+			CONFIG_LIBVMBUS_MAX_TRANSACTIONS, channel_id,
+			VMBUS_TRANSACTION_GPADL_TEARDOWN, status);
+	ukplat_spin_unlock_irqrestore(&transaction_lock, flags);
+	return cancelled;
+}
+
+static __u64 channel_control_deadline(void)
+{
+	return hyperv_reference_time() +
+		(__u64)CONFIG_LIBVMBUS_CHANNEL_TIMEOUT_MS *
+		VMBUS_CONTROL_TICKS_PER_MS;
+}
+
+static int
+transaction_wait_status(struct vmbus_channel_transaction *transaction,
+			const struct vmbus_channel_token *token,
+			__u64 deadline, __u32 *host_status)
+{
+	int rc;
+
+	while (!__atomic_load_n(&transaction->done, __ATOMIC_ACQUIRE)) {
+		rc = vmbus_control_pump();
+		if (rc)
+			return rc;
+		if (token && !channel_operation_valid(token, 0))
+			return -ECANCELED;
+		if (vmbus_transaction_timed_out(hyperv_reference_time(),
+					       deadline))
+			return -ETIMEDOUT;
+		if (uk_sched_current())
+			uk_sched_thread_sleep(VMBUS_CONTROL_WAIT_NS);
+		else
+			vmbus_channel_cpu_relax();
+	}
+	if (transaction->status == (__u32)-ECANCELED)
+		return -ECANCELED;
+	*host_status = transaction->status;
+	return 0;
+}
+
+static int
+transaction_wait(struct vmbus_channel_transaction *transaction,
+		 const struct vmbus_channel_token *token, __u64 deadline)
+{
+	__u32 host_status = 0;
+	int rc = transaction_wait_status(transaction, token, deadline,
+					 &host_status);
+
+	if (rc)
+		return rc;
+	return host_status ? -EIO : 0;
+}
+
+static int transmit_message(const __u8 *message, int length,
+			    const struct vmbus_channel_token *token,
+			    __u64 deadline)
+{
+	int rc;
+
+	if (length <= 0)
+		return length ? length : -EINVAL;
+	for (;;) {
+		rc = vmbus_control_transmit(message, (size_t)length);
+		if (rc != -EAGAIN)
+			return rc;
+		if (token && !channel_operation_valid(token, 0))
+			return -ECANCELED;
+		if (vmbus_transaction_timed_out(hyperv_reference_time(),
+					       deadline))
+			return -ETIMEDOUT;
+		if (uk_sched_current())
+			uk_sched_thread_sleep(VMBUS_CONTROL_WAIT_NS);
+		else
+			vmbus_channel_cpu_relax();
+	}
+}
+
+static int create_gpadl(struct vmbus_channel *channel,
+			const struct vmbus_channel_token *token)
+{
+	struct vmbus_gpadl_record *record;
+	struct vmbus_channel_transaction *transaction;
+	__u64 pfns[CONFIG_LIBVMBUS_RING_PAGES];
+	__u8 message[240];
+	size_t consumed;
+	size_t offset;
+	unsigned int i;
+	__u64 capacity_epoch;
+	__u32 message_number = 1;
+	__u32 creation_status = 0;
+	int length;
+	int rc;
+	__u64 deadline = channel_control_deadline();
+
+	if (channel->page_count > CONFIG_LIBVMBUS_RING_PAGES)
+		return -EINVAL;
+	if (channel->gpadl_id || channel->gpadl_record)
+		return -EBUSY;
+	capacity_epoch =
+		vmbus_control_channel_capacity_epoch(channel->device);
+	record = gpadl_record_allocate();
+	if (!record) {
+		vmbus_control_note_channel_capacity(channel->device,
+						    capacity_epoch);
+		return -ENOSPC;
+	}
+	rc = vmbus_monotonic_id_allocate(&next_gpadl_id,
+					 &channel->gpadl_id);
+	if (rc) {
+		gpadl_record_release(record, 0);
+		return rc;
+	}
+	record->gpadl_id = channel->gpadl_id;
+	record->relid = channel->relid;
+	record->channel_generation = channel->owner.generation;
+	record->page_start = channel->page_start;
+	record->page_count = channel->page_count;
+	record->byte_count = (__u32)channel->page_count * VMBUS_PAGE_SIZE;
+	record->owns_ring_pages = 1;
+	channel->gpadl_record =
+		(__u16)(record - &gpadl_records[0] + 1);
+	capacity_epoch =
+		vmbus_control_channel_capacity_epoch(channel->device);
+	transaction = transaction_allocate(VMBUS_TRANSACTION_GPADL_CREATE,
+			channel->relid, channel->gpadl_id);
+	if (!transaction) {
+		channel->gpadl_id = 0;
+		channel->gpadl_record = 0;
+		gpadl_record_release(record, 0);
+		vmbus_control_note_channel_capacity(channel->device,
+						    capacity_epoch);
+		return -ENOSPC;
+	}
+	for (i = 0; i < channel->page_count; i++) {
+		__paddr_t gpa = uk_paging_virt_to_phys(
+			(__vaddr_t)&ring_pages[channel->page_start + i][0]);
+
+		if (gpa == UK_PAGING_PADDR_INV || (gpa & (VMBUS_PAGE_SIZE - 1))) {
+			rc = -EINVAL;
+			goto out;
+		}
+		pfns[i] = gpa >> 12;
+	}
+	length = vmbus_gpadl_header(message, sizeof(message),
+			channel->relid, channel->gpadl_id,
+			channel->page_count * VMBUS_PAGE_SIZE, pfns,
+			channel->page_count, &consumed);
+	rc = transmit_message(message, length, token, deadline);
+	if (rc)
+		goto out;
+	channel->gpadl_posted = 1;
+	offset = consumed;
+	while (offset < channel->page_count) {
+		length = vmbus_gpadl_body(message, sizeof(message),
+				message_number++, channel->gpadl_id,
+				&pfns[offset], channel->page_count - offset,
+				&consumed);
+		rc = transmit_message(message, length, token, deadline);
+		if (rc)
+			goto out;
+		offset += consumed;
+	}
+	rc = transaction_wait_status(transaction, token, deadline,
+				     &creation_status);
+	if (!rc && creation_status) {
+		transaction_release(transaction);
+		channel->gpadl_id = 0;
+		channel->gpadl_record = 0;
+		channel->gpadl_posted = 0;
+		gpadl_record_release(record, 0);
+		return -EIO;
+	}
+	if (!rc) {
+		rc = vmbus_channel_state_gpadl_created(&channel->state);
+		if (rc)
+			goto out;
+		channel->gpadl_live = 1;
+	}
+out:
+	transaction_release(transaction);
+	if (rc && !channel->gpadl_posted) {
+		channel->gpadl_id = 0;
+		channel->gpadl_record = 0;
+		gpadl_record_release(record, 0);
+	}
+	return rc;
+}
+
+static int teardown_gpadl(struct vmbus_channel *channel,
+			  const struct vmbus_channel_token *token)
+{
+	struct vmbus_gpadl_record *record;
+	struct vmbus_channel_transaction *transaction;
+	__u8 message[16];
+	__u64 capacity_epoch;
+	__u64 deadline = channel_control_deadline();
+	int length;
+	int rc;
+
+	if (!channel->gpadl_id)
+		return 0;
+	record = channel_gpadl_record(channel);
+	if (!record)
+		return -EPROTO;
+	capacity_epoch =
+		vmbus_control_channel_capacity_epoch(channel->device);
+	transaction = transaction_allocate(VMBUS_TRANSACTION_GPADL_TEARDOWN,
+			channel->relid, channel->gpadl_id);
+	if (!transaction) {
+		vmbus_control_note_channel_capacity(channel->device,
+						    capacity_epoch);
+		quarantine_channel_pages(channel, record, NULL, 0);
+		return -ENOSPC;
+	}
+	length = vmbus_gpadl_teardown_message(message, sizeof(message),
+			channel->relid, channel->gpadl_id);
+	rc = transmit_message(message, length, token, deadline);
+	if (!rc) {
+		channel->teardown_posted = 1;
+		rc = transaction_wait(transaction, token, deadline);
+	}
+	if (!rc &&
+	    __atomic_load_n(&record->state, __ATOMIC_ACQUIRE) ==
+		    VMBUS_GPADL_RECORD_OWNED) {
+		transaction_release(transaction);
+		channel->gpadl_id = 0;
+		channel->gpadl_record = 0;
+		channel->gpadl_live = 0;
+		channel->gpadl_posted = 0;
+		gpadl_record_release(record, 0);
+	} else if (__atomic_load_n(&record->state, __ATOMIC_ACQUIRE) ==
+		   VMBUS_GPADL_RECORD_FREE) {
+		/* A nested pump completed asynchronous teardown and reclamation. */
+		return rc;
+	} else if (__atomic_load_n(&record->state, __ATOMIC_ACQUIRE) ==
+			   VMBUS_GPADL_RECORD_ASYNC ||
+		   __atomic_load_n(&record->state, __ATOMIC_ACQUIRE) ==
+			   VMBUS_GPADL_RECORD_RESET) {
+		if (!rc &&
+		    __atomic_load_n(&record->state, __ATOMIC_ACQUIRE) ==
+			    VMBUS_GPADL_RECORD_ASYNC) {
+			__atomic_store_n(&record->host_done, 1,
+					 __ATOMIC_RELEASE);
+			gpadl_record_try_reclaim(record);
+		}
+		if (record->transaction != transaction)
+			transaction_release(transaction);
+	} else {
+		if (channel->teardown_posted) {
+			record->transaction = transaction;
+			record->host_done = __atomic_load_n(
+				&transaction->done, __ATOMIC_ACQUIRE);
+		} else {
+			transaction_release(transaction);
+		}
+		quarantine_channel_pages(channel, record,
+					 record->transaction,
+					 channel->teardown_posted);
+	}
+	return rc;
+}
+
+static int teardown_gpadl_nowait(struct vmbus_channel *channel)
+{
+	struct vmbus_gpadl_record *record;
+	struct vmbus_channel_transaction *transaction;
+	__u8 message[16];
+	__u64 deadline = channel_control_deadline();
+	int length;
+	int rc;
+
+	if (!channel->gpadl_id)
+		return 0;
+	record = channel_gpadl_record(channel);
+	if (!record)
+		return -EPROTO;
+	if (!channel->gpadl_posted) {
+		channel->gpadl_id = 0;
+		channel->gpadl_record = 0;
+		gpadl_record_release(record, 0);
+		return 0;
+	}
+	transaction = transaction_find(VMBUS_TRANSACTION_GPADL_TEARDOWN,
+			channel->relid, channel->gpadl_id);
+	rc = 0;
+	if (!channel->teardown_posted) {
+		transaction = transaction_allocate(
+			VMBUS_TRANSACTION_GPADL_TEARDOWN,
+			channel->relid, channel->gpadl_id);
+		if (!transaction) {
+			quarantine_channel_pages(channel, record, NULL, 0);
+			return -ENOSPC;
+		}
+		length = vmbus_gpadl_teardown_message(message, sizeof(message),
+				channel->relid, channel->gpadl_id);
+		rc = transmit_message(message, length, NULL, deadline);
+		channel->teardown_posted = !rc;
+	}
+	if (channel->teardown_posted && transaction) {
+		record->transaction = transaction;
+		record->host_done = __atomic_load_n(&transaction->done,
+						    __ATOMIC_ACQUIRE);
+	} else {
+		if (transaction)
+			transaction_release(transaction);
+		record->transaction = NULL;
+	}
+	quarantine_channel_pages(channel, record, record->transaction,
+				 channel->teardown_posted && transaction);
+	return rc;
+}
+
+static struct vmbus_gpadl_record *
+external_gpadl_find(struct vmbus_channel *channel,
+		    const struct vmbus_gpadl *gpadl)
+{
+	unsigned int i;
+
+	if (!channel || !gpadl || !gpadl->id || !gpadl->generation)
+		return NULL;
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_GPADLS; i++) {
+		struct vmbus_gpadl_record *record = &gpadl_records[i];
+
+		if (__atomic_load_n(&record->state, __ATOMIC_ACQUIRE) ==
+			    VMBUS_GPADL_RECORD_FREE ||
+		    !record->external || record->gpadl_id != gpadl->id ||
+		    record->channel_generation != gpadl->generation ||
+		    record->channel_generation != channel->owner.generation ||
+		    record->relid != channel->relid ||
+		    record->page_count != gpadl->page_count)
+			continue;
+		return record;
+	}
+	return NULL;
+}
+
+static int external_gpadl_pfns(__vaddr_t address, __u16 page_start,
+			       __u16 page_count, __u64 *pfns)
+{
+	unsigned int i;
+
+	for (i = 0; i < page_count; i++) {
+		__vaddr_t page = address +
+			(__vaddr_t)(page_start + i) * VMBUS_PAGE_SIZE;
+		__paddr_t gpa;
+
+		if (page < address)
+			return -EOVERFLOW;
+		gpa = uk_paging_virt_to_phys(page);
+		if (gpa == UK_PAGING_PADDR_INV ||
+		    (gpa & (VMBUS_PAGE_SIZE - 1)))
+			return -EINVAL;
+		pfns[i] = gpa >> 12;
+	}
+	return 0;
+}
+
+static int post_external_gpadl(struct vmbus_channel *channel,
+			       struct vmbus_gpadl_record *record,
+			       const struct vmbus_channel_token *token,
+			       __u64 deadline,
+			       int *posted)
+{
+	__u64 pfns[28];
+	__u8 message[240];
+	size_t consumed;
+	unsigned int page = 0;
+	__u32 message_number = 1;
+	int length;
+	int rc;
+
+	rc = external_gpadl_pfns(record->address, 0,
+				 record->page_count > 26 ? 26 :
+				 record->page_count, pfns);
+	if (rc)
+		return rc;
+	length = vmbus_gpadl_header(message, sizeof(message),
+			channel->relid, record->gpadl_id, record->byte_count,
+			pfns, record->page_count, &consumed);
+	rc = transmit_message(message, length, token, deadline);
+	if (rc)
+		return rc;
+	*posted = 1;
+	page += consumed;
+	while (page < record->page_count) {
+		__u16 count = (__u16)(record->page_count - page);
+
+		if (count > 28)
+			count = 28;
+		rc = external_gpadl_pfns(record->address, (__u16)page,
+					 count, pfns);
+		if (rc)
+			return rc;
+		length = vmbus_gpadl_body(message, sizeof(message),
+				message_number++, record->gpadl_id, pfns,
+				count, &consumed);
+		rc = transmit_message(message, length, token, deadline);
+		if (rc)
+			return rc;
+		page += consumed;
+	}
+	return 0;
+}
+
+static int teardown_external_gpadl(struct vmbus_channel *channel,
+				   struct vmbus_gpadl_record *record,
+				   const struct vmbus_channel_token *token,
+				   int wait)
+{
+	struct vmbus_channel_transaction *transaction;
+	__u8 message[16];
+	__u8 expected = VMBUS_GPADL_RECORD_OWNED;
+	__u64 deadline = channel_control_deadline();
+	int posted = 0;
+	int length;
+	int rc;
+
+	if (!__atomic_compare_exchange_n(&record->state, &expected,
+			VMBUS_GPADL_RECORD_TEARING_DOWN, 0,
+			__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+		return expected == VMBUS_GPADL_RECORD_FREE ? 0 :
+			-EINPROGRESS;
+	transaction = transaction_allocate(VMBUS_TRANSACTION_GPADL_TEARDOWN,
+			channel->relid, record->gpadl_id);
+	if (!transaction) {
+		__atomic_store_n(&record->local_drained, 1, __ATOMIC_RELEASE);
+		__atomic_store_n(&record->state, VMBUS_GPADL_RECORD_RESET,
+				 __ATOMIC_RELEASE);
+		return -ENOSPC;
+	}
+	record->transaction = transaction;
+	length = vmbus_gpadl_teardown_message(message, sizeof(message),
+			channel->relid, record->gpadl_id);
+	rc = transmit_message(message, length, token, deadline);
+	posted = !rc;
+	if (!rc && wait)
+		rc = transaction_wait(transaction, token, deadline);
+	if (!rc && wait) {
+		record->transaction = NULL;
+		transaction_release(transaction);
+		gpadl_record_release(record, 0);
+		return 0;
+	}
+	if (posted) {
+		record->host_done = __atomic_load_n(&transaction->done,
+						    __ATOMIC_ACQUIRE);
+		__atomic_store_n(&record->state, VMBUS_GPADL_RECORD_ASYNC,
+				 __ATOMIC_RELEASE);
+	} else {
+		record->transaction = NULL;
+		transaction_release(transaction);
+		__atomic_store_n(&record->state, VMBUS_GPADL_RECORD_RESET,
+				 __ATOMIC_RELEASE);
+	}
+	__atomic_store_n(&record->local_drained, 1, __ATOMIC_RELEASE);
+	gpadl_record_try_reclaim(record);
+	return rc;
+}
+
+static int teardown_external_gpadls(
+	struct vmbus_channel *channel,
+	const struct vmbus_channel_token *token, int wait)
+{
+	unsigned int i;
+	int result = 0;
+
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_GPADLS; i++) {
+		struct vmbus_gpadl_record *record = &gpadl_records[i];
+		int rc;
+
+		if (__atomic_load_n(&record->state, __ATOMIC_ACQUIRE) !=
+			    VMBUS_GPADL_RECORD_OWNED ||
+		    !record->external ||
+		    record->channel_generation != channel->owner.generation ||
+		    record->relid != channel->relid)
+			continue;
+		rc = teardown_external_gpadl(channel, record, token, wait);
+		if (!result)
+			result = rc;
+	}
+	return result;
+}
+
+static int open_channel_control(struct vmbus_channel *channel,
+				const void *user_data, size_t user_data_size,
+				const struct vmbus_channel_token *token)
+{
+	struct vmbus_channel_transaction *transaction;
+	__u8 message[148];
+	__u64 deadline = channel_control_deadline();
+	int length;
+	int rc;
+
+	if (!channel->target_held) {
+		rc = hyperv_vmbus_target_acquire_channel(
+			channel->relid, &channel->target_vp,
+			&channel->target_generation);
+		if (rc)
+			return rc;
+		channel->target_held = 1;
+	}
+	rc = vmbus_monotonic_id_allocate(&next_open_id, &channel->open_id);
+	if (rc)
+		return rc;
+	transaction = transaction_allocate(VMBUS_TRANSACTION_OPEN,
+			channel->relid, channel->open_id);
+	if (!transaction)
+		return -ENOSPC;
+	length = vmbus_open_message(message, sizeof(message),
+			channel->relid, channel->open_id,
+			channel->gpadl_id, channel->target_vp, channel->tx_pages,
+			user_data, user_data_size);
+	rc = vmbus_channel_state_open_begin(&channel->state);
+	if (rc)
+		goto done;
+	rc = transmit_message(message, length, token, deadline);
+	if (!rc)
+		rc = transaction_wait(transaction, token, deadline);
+	if (__atomic_load_n(&transaction->done, __ATOMIC_ACQUIRE)) {
+		int transition_rc =
+			vmbus_channel_state_open_complete(&channel->state, rc);
+
+		if (!rc)
+			rc = transition_rc;
+	}
+done:
+	transaction_release(transaction);
+	return rc;
+}
+
+static int close_channel_control(struct vmbus_channel *channel)
+{
+	__u8 message[12];
+	__u8 previous_state = channel->state;
+	__u64 deadline = channel_control_deadline();
+	int length;
+	int rc;
+
+	if (channel->state == CHANNEL_GPADL)
+		return 0;
+	if (vmbus_channel_state_close_begin(&channel->state))
+		return -EPROTO;
+	length = vmbus_close_message(message, sizeof(message),
+				     channel->relid);
+	rc = transmit_message(message, length, NULL, deadline);
+	if (rc) {
+		channel->state = previous_state;
+	} else {
+		channel->close_posted = 1;
+	}
+	return rc;
+}
+
+static int signal_channel(struct vmbus_channel *channel,
+			  const struct vmbus_channel_token *token)
+{
+	int rc;
+
+	if (!hyperv_has_signal_events())
+		return -EACCES;
+	ukarch_spin_lock(&channel->signal_lock);
+	if (!channel_operation_valid(token, 1)) {
+		rc = -ECANCELED;
+		goto out;
+	}
+	if (!channel->signal_input_gpa) {
+		channel->signal_input_gpa = uk_paging_virt_to_phys(
+			(__vaddr_t)&channel->signal_input);
+		if (channel->signal_input_gpa == UK_PAGING_PADDR_INV ||
+		    (channel->signal_input_gpa & 7)) {
+			rc = -EINVAL;
+			goto out;
+		}
+	}
+	/*
+	 * The offer's dedicated flag controls host-to-guest interrupt routing.
+	 * Guest-to-host notification still publishes the shared send bit before
+	 * SignalEvent, matching the TLFS connection/event contract and FreeBSD.
+	 */
+	rc = vmbus_control_set_event(channel->relid);
+	if (rc && rc != -ERANGE)
+		goto out;
+	rc = vmbus_signal_event(&channel->signal_input,
+			vmbus_signal_connection_id(vmbus_protocol_version(),
+				channel->connection_id), 0,
+			channel->signal_input_gpa, channel_hypercall, NULL);
+out:
+	ukarch_spin_unlock(&channel->signal_lock);
+	return rc;
+}
+
+int vmbus_channel_open(struct vmbus_device *device, __u16 tx_pages,
+		       __u16 rx_pages, const void *user_data,
+		       size_t user_data_size)
+{
+	struct vmbus_channel *channel;
+	struct vmbus_channel_token token = { 0 };
+	unsigned int start;
+	__u64 capacity_epoch;
+	int acquired;
+	int rc;
+
+	if (!device || !device->present || device->subchannel_index ||
+	    tx_pages < 2 || rx_pages < 2 ||
+	    (__u32)tx_pages + rx_pages > CONFIG_LIBVMBUS_RING_PAGES ||
+	    vmbus_channel_validate_open_data(user_data, user_data_size,
+					      VMBUS_USER_DATA_SIZE))
+		return -EINVAL;
+	rc = vmbus_control_enter(&acquired);
+	if (rc)
+		return rc;
+	capacity_epoch = vmbus_control_channel_capacity_epoch(device);
+	channel = allocate_channel(device);
+	if (!channel) {
+		vmbus_control_note_channel_capacity(device, capacity_epoch);
+		rc = -ENOSPC;
+		goto out_control;
+	}
+	if (channel->state == CHANNEL_OPEN) {
+		rc = -EALREADY;
+		goto out_control;
+	}
+	if (channel->state != CHANNEL_ALLOCATED) {
+		rc = -EBUSY;
+		goto out_control;
+	}
+	rc = channel_operation_begin(channel, &token, 0);
+	if (rc)
+		goto out_control;
+	capacity_epoch = vmbus_control_channel_capacity_epoch(device);
+	rc = allocate_ring_pages(tx_pages + rx_pages, &start);
+	if (rc) {
+		vmbus_control_note_channel_capacity(device, capacity_epoch);
+		goto out_failed;
+	}
+	channel->page_start = start;
+	channel->page_count = tx_pages + rx_pages;
+	channel->tx_pages = tx_pages;
+	channel->rx_pages = rx_pages;
+	channel->tx_ring = &ring_pages[start][0];
+	channel->rx_ring = &ring_pages[start + tx_pages][0];
+	rc = vmbus_ring_initialize(channel->tx_ring,
+				   (size_t)tx_pages * VMBUS_PAGE_SIZE);
+	if (rc)
+		goto out_pages;
+	rc = vmbus_ring_initialize(channel->rx_ring,
+				   (size_t)rx_pages * VMBUS_PAGE_SIZE);
+	if (rc)
+		goto out_pages;
+	rc = hyperv_vmbus_target_acquire_channel(channel->relid,
+						 &channel->target_vp,
+						 &channel->target_generation);
+	if (rc)
+		goto out_pages;
+	channel->target_held = 1;
+	rc = create_gpadl(channel, &token);
+	if (rc)
+		goto out_partial_gpadl;
+	rc = open_channel_control(channel,
+			user_data ? user_data : &empty_input, user_data_size,
+			&token);
+	if (!rc)
+		goto out_operation;
+	if (!channel_operation_valid(&token, 0))
+		goto out_operation;
+	if (close_channel_control(channel)) {
+		struct vmbus_gpadl_record *record =
+			channel_gpadl_record(channel);
+
+		vmbus_control_fail();
+		if (record)
+			quarantine_channel_pages(channel, record, NULL, 0);
+		goto out_failed;
+	}
+out_partial_gpadl:
+	if (!channel_operation_valid(&token, 0))
+		goto out_operation;
+	if (channel->gpadl_id) {
+		int cleanup_rc = teardown_gpadl(channel, &token);
+
+		if (cleanup_rc) {
+			if (cleanup_rc == -ECANCELED)
+				goto out_operation;
+			vmbus_control_fail();
+			rc = cleanup_rc;
+			goto out_failed;
+		}
+	}
+out_pages:
+	free_ring_pages(channel->page_start, channel->page_count);
+	channel->page_count = 0;
+out_failed:
+	(void)channel_revoke(channel, 0);
+out_operation:
+	end_channel_operation(channel, &token);
+out_control:
+	vmbus_control_exit(acquired);
+	return rc;
+}
+
+int vmbus_channel_close(struct vmbus_channel *channel)
+{
+	struct vmbus_channel_token token = { 0 };
+	int acquired;
+	int rc;
+	int rc2;
+	int unmap_rc;
+
+	if (!channel)
+		return -ENODEV;
+	rc = vmbus_control_enter(&acquired);
+	if (rc)
+		return rc;
+	rc = channel_operation_begin(channel, &token, 0);
+	if (rc)
+		goto out;
+	(void)channel_revoke(channel, 0);
+	if (channel->device && channel->device->channel == channel)
+		channel->device->channel = NULL;
+	channel_synchronize_io(channel);
+	rc = close_channel_control(channel);
+	unmap_rc = teardown_external_gpadls(channel, NULL, 1);
+	if (unmap_rc)
+		vmbus_control_fail();
+	if (rc && channel->gpadl_id) {
+		struct vmbus_gpadl_record *record =
+			channel_gpadl_record(channel);
+
+		if (record)
+			quarantine_channel_pages(channel, record, NULL, 0);
+		rc2 = rc;
+	} else {
+		rc2 = teardown_gpadl(channel, NULL);
+	}
+	if (!rc)
+		rc = rc2;
+	if (!rc)
+		rc = unmap_rc;
+	if (rc)
+		vmbus_control_fail();
+	end_channel_operation(channel, &token);
+out:
+	vmbus_control_exit(acquired);
+	return rc;
+}
+
+static int channel_send(struct vmbus_channel *channel, __u16 packet_type,
+			__u16 flags, __u64 transaction_id,
+			const void *descriptor, size_t descriptor_size,
+			const void *payload, size_t payload_size,
+			int *published)
+{
+	struct vmbus_channel_token token = { 0 };
+	__u8 need_signal;
+	unsigned long irq_flags;
+	int rc;
+
+	if (published)
+		*published = 0;
+	if ((!descriptor && descriptor_size) || (!payload && payload_size))
+		return -EINVAL;
+	rc = channel_operation_begin(channel, &token, 1);
+	if (rc)
+		return rc;
+	ukplat_spin_lock_irqsave(&channel->tx_lock, irq_flags);
+	if (!channel_operation_valid(&token, 1))
+		rc = -ECANCELED;
+	else
+		rc = vmbus_ring_write(channel->tx_ring,
+			(size_t)channel->tx_pages * VMBUS_PAGE_SIZE,
+			packet_type, flags, transaction_id,
+			descriptor ? descriptor : &empty_input,
+			descriptor_size, payload ? payload : &empty_input,
+			payload_size, &need_signal);
+	ukplat_spin_unlock_irqrestore(&channel->tx_lock, irq_flags);
+	if (!rc && published)
+		*published = 1;
+	if (!rc && need_signal) {
+		int signal_rc = signal_channel(channel, &token);
+
+		if (signal_rc) {
+			/*
+			 * The ring write is already committed. Report an
+			 * uncertain transport failure, never a pre-commit
+			 * cancellation that could return buffer ownership.
+			 */
+			vmbus_control_fail();
+			rc = -EIO;
+		}
+	}
+	end_channel_operation(channel, &token);
+	if (rc == -ECANCELED)
+		return rc;
+	if (rc == -EIO)
+		return rc;
+	if (rc)
+		return rc == -1 ? -EAGAIN : -EPROTO;
+	return 0;
+}
+
+int vmbus_channel_gpadl_map(struct vmbus_channel *channel, void *address,
+			    size_t length, struct vmbus_gpadl *gpadl)
+{
+	struct vmbus_channel_transaction *transaction;
+	struct vmbus_gpadl_record *record;
+	struct vmbus_channel_token token = { 0 };
+	__u64 capacity_epoch;
+	__u64 deadline;
+	unsigned int pages;
+	__u32 creation_status = 0;
+	int acquired;
+	int posted = 0;
+	int rc;
+
+	if (!address || !gpadl || ((uintptr_t)address &
+		    (VMBUS_PAGE_SIZE - 1)) || !length ||
+	    (length & (VMBUS_PAGE_SIZE - 1)) || length > UINT32_MAX)
+		return -EINVAL;
+	pages = length / VMBUS_PAGE_SIZE;
+	if (!pages || pages > VMBUS_GPADL_MAX_PAGES)
+		return -E2BIG;
+	if (gpadl->id || gpadl->page_count || gpadl->generation)
+		return -EBUSY;
+	rc = vmbus_control_enter(&acquired);
+	if (rc)
+		return rc;
+	rc = channel_operation_begin(channel, &token, 1);
+	if (rc)
+		goto out_control;
+	capacity_epoch =
+		vmbus_control_channel_capacity_epoch(channel->device);
+	record = gpadl_record_allocate();
+	if (!record) {
+		vmbus_control_note_channel_capacity(channel->device,
+						    capacity_epoch);
+		rc = -ENOSPC;
+		goto out_operation;
+	}
+	rc = vmbus_monotonic_id_allocate(&next_gpadl_id,
+					 &record->gpadl_id);
+	if (rc)
+		goto out_record;
+	record->channel_generation = channel->owner.generation;
+	record->relid = channel->relid;
+	record->address = (__vaddr_t)address;
+	record->byte_count = (__u32)length;
+	record->page_count = (__u16)pages;
+	record->external = 1;
+	gpadl->id = record->gpadl_id;
+	gpadl->page_count = record->page_count;
+	gpadl->generation = record->channel_generation;
+	capacity_epoch =
+		vmbus_control_channel_capacity_epoch(channel->device);
+	transaction = transaction_allocate(VMBUS_TRANSACTION_GPADL_CREATE,
+			channel->relid, record->gpadl_id);
+	if (!transaction) {
+		vmbus_control_note_channel_capacity(channel->device,
+						    capacity_epoch);
+		rc = -ENOSPC;
+		goto out_record;
+	}
+	deadline = channel_control_deadline();
+	rc = post_external_gpadl(channel, record, &token, deadline, &posted);
+	if (!rc)
+		rc = transaction_wait_status(transaction, &token, deadline,
+					     &creation_status);
+	transaction_release(transaction);
+	if (!rc && creation_status) {
+		gpadl_record_release(record, 0);
+		gpadl->id = 0;
+		gpadl->page_count = 0;
+		gpadl->generation = 0;
+		rc = -EIO;
+		goto out_operation;
+	}
+	if (rc)
+		goto out_posted;
+	goto out_operation;
+out_posted:
+	if (posted) {
+		int cleanup_rc =
+			teardown_external_gpadl(channel, record, &token, 1);
+
+		if (cleanup_rc) {
+			vmbus_control_fail();
+			rc = -EINPROGRESS;
+		} else {
+			gpadl->id = 0;
+			gpadl->page_count = 0;
+			gpadl->generation = 0;
+		}
+	} else {
+		gpadl_record_release(record, 0);
+		gpadl->id = 0;
+		gpadl->page_count = 0;
+		gpadl->generation = 0;
+	}
+	goto out_operation;
+out_record:
+	gpadl_record_release(record, 0);
+	gpadl->id = 0;
+	gpadl->page_count = 0;
+	gpadl->generation = 0;
+out_operation:
+	end_channel_operation(channel, &token);
+out_control:
+	vmbus_control_exit(acquired);
+	return rc;
+}
+
+int vmbus_channel_gpadl_unmap(struct vmbus_channel *channel,
+			      struct vmbus_gpadl *gpadl)
+{
+	struct vmbus_channel_token token = { 0 };
+	struct vmbus_gpadl_record *record;
+	int acquired;
+	int rc;
+
+	if (!gpadl)
+		return -EINVAL;
+	if (!gpadl->id && !gpadl->page_count && !gpadl->generation)
+		return 0;
+	rc = vmbus_control_enter(&acquired);
+	if (rc)
+		return rc;
+	rc = channel_operation_begin(channel, &token, 1);
+	if (rc)
+		goto out_control;
+	record = external_gpadl_find(channel, gpadl);
+	if (!record) {
+		rc = -ESTALE;
+		goto out_operation;
+	}
+	if (__atomic_load_n(&record->state, __ATOMIC_ACQUIRE) !=
+	    VMBUS_GPADL_RECORD_OWNED) {
+		rc = -EINPROGRESS;
+		goto out_operation;
+	}
+	rc = teardown_external_gpadl(channel, record, &token, 1);
+	if (!rc) {
+		gpadl->id = 0;
+		gpadl->page_count = 0;
+		gpadl->generation = 0;
+	}
+out_operation:
+	end_channel_operation(channel, &token);
+out_control:
+	vmbus_control_exit(acquired);
+	return rc;
+}
+
+int vmbus_channel_send(struct vmbus_channel *channel, __u16 packet_type,
+		       __u16 flags, __u64 transaction_id,
+		       const void *descriptor, size_t descriptor_size,
+		       const void *payload, size_t payload_size)
+{
+	return channel_send(channel, packet_type, flags, transaction_id,
+			    descriptor, descriptor_size, payload, payload_size,
+			    NULL);
+}
+
+int vmbus_channel_send_ex(struct vmbus_channel *channel, __u16 packet_type,
+			  __u16 flags, __u64 transaction_id,
+			  const void *descriptor, size_t descriptor_size,
+			  const void *payload, size_t payload_size,
+			  int *published)
+{
+	if (!published)
+		return -EINVAL;
+	return channel_send(channel, packet_type, flags, transaction_id,
+			    descriptor, descriptor_size, payload, payload_size,
+			    published);
+}
+
+static int channel_send_gpa_direct(
+			struct vmbus_channel *channel,
+			__u16 flags, __u64 transaction_id,
+			const struct vmbus_gpa_range *ranges,
+			__u32 range_count,
+			const void *payload, size_t payload_size,
+			int *published)
+{
+	__u64 descriptor_words[1 + VMBUS_GPA_DIRECT_MAX_RANGES +
+			       VMBUS_GPA_DIRECT_MAX_PFNS];
+	size_t word_offset = 1;
+	unsigned int range_index;
+	unsigned int pfn_index;
+	unsigned int total_pfns = 0;
+
+	if (published)
+		*published = 0;
+	if (!ranges || !range_count ||
+	    range_count > VMBUS_GPA_DIRECT_MAX_RANGES)
+		return -EINVAL;
+	for (range_index = 0; range_index < range_count; range_index++) {
+		__u64 covered;
+		__u64 required_pfns;
+
+		if (!ranges[range_index].pfns ||
+		    !ranges[range_index].pfn_count ||
+		    ranges[range_index].byte_offset >= VMBUS_PAGE_SIZE ||
+		    ranges[range_index].pfn_count >
+			    VMBUS_GPA_DIRECT_MAX_PFNS ||
+		    total_pfns > VMBUS_GPA_DIRECT_MAX_PFNS -
+			    ranges[range_index].pfn_count)
+			return -EINVAL;
+		covered = (__u64)ranges[range_index].byte_offset +
+			ranges[range_index].byte_count;
+		required_pfns = (covered + VMBUS_PAGE_SIZE - 1) >> 12;
+		if (!ranges[range_index].byte_count ||
+		    required_pfns != ranges[range_index].pfn_count)
+			return -EINVAL;
+		descriptor_words[word_offset++] =
+			(__u64)ranges[range_index].byte_count |
+			((__u64)ranges[range_index].byte_offset << 32);
+		for (pfn_index = 0;
+		     pfn_index < ranges[range_index].pfn_count; pfn_index++)
+			descriptor_words[word_offset++] =
+				ranges[range_index].pfns[pfn_index];
+		total_pfns += ranges[range_index].pfn_count;
+	}
+	descriptor_words[0] = (__u64)range_count << 32;
+	return channel_send(channel, VMBUS_PACKET_DATA_USING_GPA_DIRECT,
+			    flags, transaction_id,
+			    (const __u8 *)descriptor_words,
+			    word_offset * sizeof(__u64),
+			    payload, payload_size, published);
+}
+
+int vmbus_channel_send_gpa_direct(struct vmbus_channel *channel,
+				  __u16 flags, __u64 transaction_id,
+				  const struct vmbus_gpa_range *ranges,
+				  __u32 range_count,
+				  const void *payload, size_t payload_size)
+{
+	return channel_send_gpa_direct(channel, flags, transaction_id, ranges,
+				       range_count, payload, payload_size, NULL);
+}
+
+int vmbus_channel_send_gpa_direct_ex(struct vmbus_channel *channel,
+				     __u16 flags, __u64 transaction_id,
+				     const struct vmbus_gpa_range *ranges,
+				     __u32 range_count,
+				     const void *payload, size_t payload_size,
+				     int *published)
+{
+	if (!published)
+		return -EINVAL;
+	return channel_send_gpa_direct(channel, flags, transaction_id, ranges,
+				       range_count, payload, payload_size,
+				       published);
+}
+
+int vmbus_channel_receive(struct vmbus_channel *channel,
+			  struct vmbus_packet *packet,
+			  void *descriptor, size_t descriptor_capacity,
+			  void *payload, size_t payload_capacity)
+{
+	struct vmbus_channel_token token = { 0 };
+	struct vmbus_packet_meta_abi meta;
+	unsigned long irq_flags;
+	int rc;
+
+	if (!packet || (!descriptor && descriptor_capacity) ||
+	    (!payload && payload_capacity))
+		return -EINVAL;
+	rc = channel_operation_begin(channel, &token, 1);
+	if (rc)
+		return rc;
+	ukplat_spin_lock_irqsave(&channel->rx_lock, irq_flags);
+	if (!channel_operation_valid(&token, 1))
+		rc = -ECANCELED;
+	else
+		rc = vmbus_ring_read(channel->rx_ring,
+			(size_t)channel->rx_pages * VMBUS_PAGE_SIZE, &meta,
+			descriptor ? descriptor : &empty_output,
+			descriptor_capacity, payload ? payload : &empty_output,
+			payload_capacity);
+	ukplat_spin_unlock_irqrestore(&channel->rx_lock, irq_flags);
+	if (!rc) {
+		packet->type = meta.packet_type;
+		packet->flags = meta.flags;
+		packet->transaction_id = meta.transaction_id;
+		packet->descriptor_size = meta.descriptor_size;
+		packet->payload_size = meta.payload_size;
+		packet->total_size = meta.total_size;
+		packet->trailer_mismatch = meta.trailer_mismatch;
+		if (meta.need_signal) {
+			int signal_rc = signal_channel(channel, &token);
+
+			if (signal_rc)
+				vmbus_control_fail();
+		}
+	}
+	end_channel_operation(channel, &token);
+	if (rc == 1)
+		return -EAGAIN;
+	if (rc == -ECANCELED)
+		return rc;
+	if (rc == -EIO)
+		return rc;
+	if (rc)
+		return rc == -3 ? -ENOBUFS : -EPROTO;
+	return 0;
+}
+
+int vmbus_channel_poll(struct vmbus_channel *channel)
+{
+	struct vmbus_channel_token token = { 0 };
+	unsigned long flags;
+	int rc;
+
+	rc = channel_operation_begin(channel, &token, 1);
+	if (rc)
+		return rc;
+	ukplat_spin_lock_irqsave(&channel->rx_lock, flags);
+	if (!channel_operation_valid(&token, 1))
+		rc = -ECANCELED;
+	else
+		rc = vmbus_ring_readable(channel->rx_ring,
+			(size_t)channel->rx_pages * VMBUS_PAGE_SIZE) != 0;
+	ukplat_spin_unlock_irqrestore(&channel->rx_lock, flags);
+	end_channel_operation(channel, &token);
+	return rc;
+}
+
+void vmbus_channel_set_callback(struct vmbus_channel *channel,
+				vmbus_channel_callback_t callback, void *arg)
+{
+	struct vmbus_channel_token token = { 0 };
+	unsigned long flags;
+
+	if (channel_operation_begin(channel, &token, 1))
+		return;
+	ukplat_spin_lock_irqsave(&channel->lifetime_lock, flags);
+	if (vmbus_channel_owner_valid(&token)) {
+		channel->callback = callback;
+		channel->callback_arg = arg;
+	}
+	ukplat_spin_unlock_irqrestore(&channel->lifetime_lock, flags);
+	end_channel_operation(channel, &token);
+}
+
+int vmbus_channel_mask_interrupts(struct vmbus_channel *channel)
+{
+	struct vmbus_channel_token token = { 0 };
+	unsigned long flags;
+	int rc;
+
+	rc = channel_operation_begin(channel, &token, 1);
+	if (rc)
+		return rc;
+	ukplat_spin_lock_irqsave(&channel->rx_lock, flags);
+	if (!channel_operation_valid(&token, 1))
+		rc = -ECANCELED;
+	else
+		rc = vmbus_ring_set_interrupt_mask(channel->rx_ring,
+			(size_t)channel->rx_pages * VMBUS_PAGE_SIZE, 1);
+	ukplat_spin_unlock_irqrestore(&channel->rx_lock, flags);
+	end_channel_operation(channel, &token);
+	return rc;
+}
+
+int vmbus_channel_unmask_interrupts(struct vmbus_channel *channel)
+{
+	struct vmbus_channel_token token = { 0 };
+	unsigned long flags;
+	__u32 readable;
+	int rc;
+
+	rc = channel_operation_begin(channel, &token, 1);
+	if (rc)
+		return rc;
+	ukplat_spin_lock_irqsave(&channel->rx_lock, flags);
+	if (!channel_operation_valid(&token, 1))
+		rc = -ECANCELED;
+	else {
+		readable = vmbus_ring_unmask_and_readable(channel->rx_ring,
+				(size_t)channel->rx_pages * VMBUS_PAGE_SIZE);
+		rc = readable != 0;
+	}
+	ukplat_spin_unlock_irqrestore(&channel->rx_lock, flags);
+	end_channel_operation(channel, &token);
+	return rc;
+}
+
+int vmbus_channel_control_receive(const __u8 *message, size_t length)
+{
+	unsigned long flags;
+	__u32 type;
+	__u32 channel_id;
+	__u32 id;
+	__u32 status = 0;
+	int rc;
+	enum vmbus_transaction_type expected;
+
+	if (!message || length < 12)
+		return -EPROTO;
+	type = read_le32(message);
+	switch (type) {
+	case 6:
+		if (length < 20)
+			return -EPROTO;
+		channel_id = read_le32(message + 8);
+		id = read_le32(message + 12);
+		status = read_le32(message + 16);
+		expected = VMBUS_TRANSACTION_OPEN;
+		break;
+	case 10:
+		if (length < 20)
+			return -EPROTO;
+		channel_id = read_le32(message + 8);
+		id = read_le32(message + 12);
+		status = read_le32(message + 16);
+		expected = VMBUS_TRANSACTION_GPADL_CREATE;
+		break;
+	case 12:
+		if (length < 12)
+			return -EPROTO;
+		channel_id = 0;
+		id = read_le32(message + 8);
+		expected = VMBUS_TRANSACTION_GPADL_TEARDOWN;
+		break;
+	default:
+		return -EPROTO;
+	}
+	ukplat_spin_lock_irqsave(&transaction_lock, flags);
+	rc = vmbus_transaction_complete(transactions,
+			CONFIG_LIBVMBUS_MAX_TRANSACTIONS, expected,
+			channel_id, id, status);
+	ukplat_spin_unlock_irqrestore(&transaction_lock, flags);
+	if (!rc && expected == VMBUS_TRANSACTION_GPADL_TEARDOWN)
+		complete_async_gpadl(id);
+	rc = vmbus_transaction_completion_policy(rc, &ignored_responses);
+	return rc ? -EPROTO : 0;
+}
+
+__u32 vmbus_channel_take_ignored_responses(void)
+{
+	return __atomic_exchange_n(&ignored_responses, 0, __ATOMIC_ACQ_REL);
+}
+
+void vmbus_channel_event(__u32 event)
+{
+	struct vmbus_channel *channel = find_channel(event);
+	struct vmbus_channel_token token = { 0 };
+	vmbus_channel_callback_t callback;
+	unsigned long flags;
+	void *callback_arg;
+
+	if (channel_operation_begin(channel, &token, 1))
+		return;
+	ukplat_spin_lock_irqsave(&channel->lifetime_lock, flags);
+	if (!vmbus_channel_owner_valid(&token)) {
+		callback = NULL;
+		callback_arg = NULL;
+	} else {
+		channel->event_pending = 1;
+		callback = channel->callback;
+		callback_arg = channel->callback_arg;
+	}
+	ukplat_spin_unlock_irqrestore(&channel->lifetime_lock, flags);
+	if (callback)
+		callback(channel, callback_arg);
+	end_channel_operation(channel, &token);
+}
+
+int vmbus_channel_rescind(__u32 channel_id)
+{
+	struct vmbus_channel *channel = find_channel(channel_id);
+	struct vmbus_channel_token token = { 0 };
+	struct vmbus_rescind_plan plan;
+	int rc;
+
+	if (!channel)
+		return 0;
+	rc = channel_operation_begin(channel, &token, 0);
+	if (rc == -ECANCELED) {
+		unsigned long flags;
+
+		ukplat_spin_lock_irqsave(&channel->lifetime_lock, flags);
+		channel->rescinded = 1;
+		ukplat_spin_unlock_irqrestore(&channel->lifetime_lock, flags);
+		return -EINPROGRESS;
+	}
+	if (rc)
+		return 0;
+	(void)channel_revoke(channel, 1);
+	channel_synchronize_io(channel);
+	(void)transaction_cancel_channel(channel_id, (__u32)-ECANCELED);
+	plan = vmbus_channel_rescind_plan(channel->state,
+					 channel->gpadl_id != 0);
+	if (plan.send_close && !channel->close_posted) {
+		__u8 message[12];
+		int length = vmbus_close_message(message, sizeof(message),
+						 channel_id);
+		int close_rc = transmit_message(
+			message, length, NULL, channel_control_deadline());
+
+		if (!close_rc)
+			channel->close_posted = 1;
+		else
+			vmbus_control_fail();
+	}
+	if (plan.send_gpadl_teardown &&
+	    teardown_gpadl_nowait(channel))
+		vmbus_control_fail();
+	if (teardown_external_gpadls(channel, NULL, 0))
+		vmbus_control_fail();
+	if (channel->device && channel->device->channel == channel)
+		channel->device->channel = NULL;
+	channel->device = NULL;
+	__atomic_store_n(&channel->state, CHANNEL_RESCINDED, __ATOMIC_RELEASE);
+	end_channel_operation(channel, &token);
+	return -EINPROGRESS;
+}
+
+void vmbus_channel_close_all(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++) {
+		struct vmbus_channel_token token = { 0 };
+		int rc;
+
+		if (__atomic_load_n(&channels[i].state, __ATOMIC_ACQUIRE) ==
+		    CHANNEL_FREE)
+			continue;
+		if (channel_operation_begin(&channels[i], &token, 0))
+			continue;
+		(void)channel_revoke(&channels[i], 0);
+		channel_synchronize_io(&channels[i]);
+		(void)transaction_cancel_channel(channels[i].relid,
+					 (__u32)-ECANCELED);
+		rc = close_channel_control(&channels[i]);
+		(void)rc;
+		(void)teardown_external_gpadls(&channels[i], NULL, 1);
+		(void)teardown_gpadl(&channels[i], NULL);
+		if (channels[i].device &&
+		    channels[i].device->channel == &channels[i])
+			channels[i].device->channel = NULL;
+		channels[i].device = NULL;
+		end_channel_operation(&channels[i], &token);
+	}
+}
+
+static void reset_channels(int host_quiesced)
+{
+	unsigned int i;
+
+	initialize_channel_locks();
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_GPADLS; i++) {
+		__u8 state = __atomic_load_n(&gpadl_records[i].state,
+					     __ATOMIC_ACQUIRE);
+
+		gpadl_records[i].transaction = NULL;
+		if (state == VMBUS_GPADL_RECORD_OWNED ||
+		    state == VMBUS_GPADL_RECORD_ASYNC ||
+		    state == VMBUS_GPADL_RECORD_RESET ||
+		    state == VMBUS_GPADL_RECORD_TEARING_DOWN) {
+			__atomic_store_n(&gpadl_records[i].state,
+					 VMBUS_GPADL_RECORD_RESET,
+					 __ATOMIC_RELEASE);
+			if (host_quiesced)
+				__atomic_store_n(
+					&gpadl_records[i].host_done, 1,
+					__ATOMIC_RELEASE);
+		}
+	}
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_TRANSACTIONS; i++)
+		transaction_release(&transactions[i]);
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_DEVICES; i++) {
+		struct vmbus_channel_token token = { 0 };
+
+		if (__atomic_load_n(&channels[i].state, __ATOMIC_ACQUIRE) ==
+		    CHANNEL_FREE)
+			continue;
+		if (channel_operation_pin(&channels[i], &token))
+			continue;
+		channels[i].gpadl_id = 0;
+		channels[i].gpadl_live = 0;
+		if (channels[i].device &&
+		    channels[i].device->channel == &channels[i])
+			channels[i].device->channel = NULL;
+		channels[i].device = NULL;
+		(void)channel_revoke(&channels[i], 0);
+		__atomic_store_n(&channels[i].state, CHANNEL_RESCINDED,
+				 __ATOMIC_RELEASE);
+		end_channel_operation(&channels[i], &token);
+	}
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_GPADLS; i++)
+		if (__atomic_load_n(&gpadl_records[i].state,
+				    __ATOMIC_ACQUIRE) ==
+			    VMBUS_GPADL_RECORD_ASYNC ||
+		    __atomic_load_n(&gpadl_records[i].state,
+				    __ATOMIC_ACQUIRE) ==
+			    VMBUS_GPADL_RECORD_RESET) {
+			unsigned int channel_index;
+			int locally_owned = 0;
+
+			for (channel_index = 0;
+			     channel_index < CONFIG_LIBVMBUS_MAX_DEVICES;
+			     channel_index++) {
+				if (__atomic_load_n(&channels[channel_index].state,
+						    __ATOMIC_ACQUIRE) ==
+					    CHANNEL_FREE)
+					continue;
+				if (channels[channel_index].owner.generation ==
+					    gpadl_records[i].channel_generation &&
+				    channels[channel_index].gpadl_record ==
+					    i + 1) {
+					locally_owned = 1;
+					break;
+				}
+			}
+			if (!locally_owned)
+				__atomic_store_n(
+					&gpadl_records[i].local_drained, 1,
+					__ATOMIC_RELEASE);
+			gpadl_record_try_reclaim(&gpadl_records[i]);
+		}
+	__atomic_store_n(&ignored_responses, 0, __ATOMIC_RELEASE);
+}
+
+void vmbus_channel_quarantine_all(void)
+{
+	reset_channels(0);
+}
+
+void vmbus_channel_reset_all(void)
+{
+	reset_channels(1);
+}
+
+#ifdef VMBUS_CHANNEL_HOST_TEST
+#define VMBUS_HOST_MAX_TARGETS 4U
+
+struct vmbus_host_target_slot {
+	__u32 vp_index;
+	__u32 generation;
+	__u32 refs;
+	__u8 online;
+};
+
+static struct vmbus_host_target_slot host_targets[VMBUS_HOST_MAX_TARGETS] = {
+	[0] = { .vp_index = 0, .generation = 1, .refs = 0, .online = 1 },
+};
+static __spinlock host_target_lock;
+static int host_target_lock_initialized;
+static unsigned int host_release_page;
+static __u32 host_release_relid;
+static int host_release_pending;
+static struct vmbus_channel_token host_pinned_token;
+
+static void initialize_host_target_lock(void)
+{
+	if (__atomic_load_n(&host_target_lock_initialized, __ATOMIC_ACQUIRE))
+		return;
+	ukarch_spin_init(&host_target_lock);
+	__atomic_store_n(&host_target_lock_initialized, 1, __ATOMIC_RELEASE);
+}
+
+int hyperv_vmbus_target_acquire(__u32 *vp, __u32 *generation)
+{
+	unsigned long flags;
+
+	if (!vp || !generation)
+		return -EINVAL;
+	initialize_host_target_lock();
+	ukplat_spin_lock_irqsave(&host_target_lock, flags);
+	if (!host_targets[0].online) {
+		ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+		return -ENODEV;
+	}
+	host_targets[0].refs++;
+	*vp = host_targets[0].vp_index;
+	*generation = host_targets[0].generation;
+	ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+	return 0;
+}
+
+int hyperv_vmbus_target_acquire_channel(__u32 channel_relid, __u32 *vp,
+					__u32 *generation)
+{
+	unsigned int online[VMBUS_HOST_MAX_TARGETS];
+	unsigned int online_count = 0;
+	unsigned int index;
+	unsigned int i;
+	unsigned long flags;
+
+	if (!vp || !generation)
+		return -EINVAL;
+	initialize_host_target_lock();
+	ukplat_spin_lock_irqsave(&host_target_lock, flags);
+	for (i = 0; i < VMBUS_HOST_MAX_TARGETS; i++) {
+		if (host_targets[i].online)
+			online[online_count++] = i;
+	}
+	if (!online_count) {
+		ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+		return -ENODEV;
+	}
+	index = online[channel_relid % online_count];
+	host_targets[index].refs++;
+	*vp = host_targets[index].vp_index;
+	*generation = host_targets[index].generation;
+	ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+	return 0;
+}
+
+void hyperv_vmbus_target_release(__u32 vp, __u32 generation)
+{
+	unsigned int i;
+	unsigned long flags;
+
+	initialize_host_target_lock();
+	ukplat_spin_lock_irqsave(&host_target_lock, flags);
+	for (i = 0; i < VMBUS_HOST_MAX_TARGETS; i++) {
+		if (host_targets[i].vp_index != vp ||
+		    host_targets[i].generation != generation)
+			continue;
+		if (host_targets[i].refs)
+			host_targets[i].refs--;
+		break;
+	}
+	ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+}
+
+void vmbus_channel_host_reset_targets(void)
+{
+	unsigned int i;
+	unsigned long flags;
+
+	initialize_host_target_lock();
+	ukplat_spin_lock_irqsave(&host_target_lock, flags);
+	for (i = 0; i < VMBUS_HOST_MAX_TARGETS; i++) {
+		host_targets[i].vp_index = i;
+		host_targets[i].generation = i == 0 ? 1U : 0U;
+		host_targets[i].refs = 0;
+		host_targets[i].online = i == 0 ? 1U : 0U;
+	}
+	ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+}
+
+int vmbus_channel_host_configure_targets(__u32 online_mask,
+					 const __u32 *vp_indices,
+					 const __u32 *generations,
+					 unsigned int count)
+{
+	unsigned int i;
+	unsigned long flags;
+
+	if (!vp_indices || !generations || !count ||
+	    count > VMBUS_HOST_MAX_TARGETS)
+		return -EINVAL;
+	initialize_host_target_lock();
+	ukplat_spin_lock_irqsave(&host_target_lock, flags);
+	for (i = 0; i < VMBUS_HOST_MAX_TARGETS; i++) {
+		if (i < count) {
+			host_targets[i].vp_index = vp_indices[i];
+			host_targets[i].generation = generations[i];
+			host_targets[i].refs = 0;
+			host_targets[i].online =
+				(__u8)((online_mask >> i) & 1U);
+		} else {
+			host_targets[i].vp_index = i;
+			host_targets[i].generation = 0;
+			host_targets[i].refs = 0;
+			host_targets[i].online = 0;
+		}
+	}
+	ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+	return 0;
+}
+
+__u32 vmbus_channel_host_target_refs(unsigned int cpu_index)
+{
+	unsigned long flags;
+	__u32 refs = 0;
+
+	if (cpu_index >= VMBUS_HOST_MAX_TARGETS)
+		return 0;
+	initialize_host_target_lock();
+	ukplat_spin_lock_irqsave(&host_target_lock, flags);
+	refs = host_targets[cpu_index].refs;
+	ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+	return refs;
+}
+
+__u32 vmbus_channel_host_total_target_refs(void)
+{
+	unsigned int i;
+	unsigned long flags;
+	__u32 total = 0;
+
+	initialize_host_target_lock();
+	ukplat_spin_lock_irqsave(&host_target_lock, flags);
+	for (i = 0; i < VMBUS_HOST_MAX_TARGETS; i++)
+		total += host_targets[i].refs;
+	ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+	return total;
+}
+
+int vmbus_channel_host_bump_target_generation(unsigned int cpu_index)
+{
+	unsigned long flags;
+
+	if (cpu_index >= VMBUS_HOST_MAX_TARGETS)
+		return -EINVAL;
+	initialize_host_target_lock();
+	ukplat_spin_lock_irqsave(&host_target_lock, flags);
+	if (host_targets[cpu_index].refs) {
+		ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+		return -EBUSY;
+	}
+	host_targets[cpu_index].generation++;
+	ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+	return 0;
+}
+
+void vmbus_channel_host_force_target_generation(unsigned int cpu_index,
+						__u32 generation)
+{
+	unsigned long flags;
+
+	if (cpu_index >= VMBUS_HOST_MAX_TARGETS)
+		return;
+	initialize_host_target_lock();
+	ukplat_spin_lock_irqsave(&host_target_lock, flags);
+	host_targets[cpu_index].generation = generation;
+	ukplat_spin_unlock_irqrestore(&host_target_lock, flags);
+}
+
+__u32 vmbus_channel_host_channel_target_vp(struct vmbus_channel *channel)
+{
+	return channel ? channel->target_vp : UINT32_MAX;
+}
+
+__u32
+vmbus_channel_host_channel_target_generation(struct vmbus_channel *channel)
+{
+	return channel ? channel->target_generation : 0;
+}
+
+int vmbus_channel_host_release_ready(__u32 relid)
+{
+	return host_release_pending && relid == host_release_relid &&
+		!ring_page_used[host_release_page] && !find_channel(relid);
+}
+
+struct vmbus_channel *
+vmbus_channel_host_allocate_open(struct vmbus_device *device)
+{
+	struct vmbus_channel *channel;
+	unsigned int page;
+
+	channel = allocate_channel(device);
+	if (!channel || allocate_ring_pages(4, &page))
+		return NULL;
+	if (hyperv_vmbus_target_acquire_channel(channel->relid,
+						&channel->target_vp,
+						&channel->target_generation)) {
+		free_ring_pages(page, 4);
+		release_channel_object(channel);
+		return NULL;
+	}
+	channel->target_held = 1;
+	channel->page_start = page;
+	channel->page_count = 4;
+	channel->tx_pages = 2;
+	channel->rx_pages = 2;
+	channel->tx_ring = &ring_pages[page][0];
+	channel->rx_ring = &ring_pages[page + 2][0];
+	__atomic_store_n(&channel->state, CHANNEL_OPEN, __ATOMIC_RELEASE);
+	return channel;
+}
+
+struct vmbus_channel *
+vmbus_channel_host_allocate_slot(struct vmbus_device *device)
+{
+	return allocate_channel(device);
+}
+
+struct vmbus_channel *
+vmbus_channel_host_prepare_open(struct vmbus_device *device)
+{
+	vmbus_channel_reset_all();
+	return vmbus_channel_host_allocate_open(device);
+}
+
+int vmbus_channel_host_pages_used(void)
+{
+	unsigned int i;
+	int used = 0;
+
+	for (i = 0; i < CONFIG_LIBVMBUS_RING_PAGES; i++)
+		used += !!ring_page_used[i];
+	return used;
+}
+
+int vmbus_channel_host_record_count(void)
+{
+	unsigned int i;
+	int used = 0;
+
+	for (i = 0; i < CONFIG_LIBVMBUS_MAX_GPADLS; i++)
+		used += __atomic_load_n(&gpadl_records[i].state,
+					__ATOMIC_ACQUIRE) !=
+			VMBUS_GPADL_RECORD_FREE;
+	return used;
+}
+
+int vmbus_channel_host_live_gpadls(void)
+{
+	return (int)__atomic_load_n(&live_gpadls, __ATOMIC_ACQUIRE);
+}
+
+int vmbus_channel_host_is_free(struct vmbus_channel *channel)
+{
+	return __atomic_load_n(&channel->state, __ATOMIC_ACQUIRE) ==
+		CHANNEL_FREE;
+}
+
+int vmbus_channel_host_is_revoked(struct vmbus_channel *channel)
+{
+	unsigned long flags;
+	int revoked;
+
+	ukplat_spin_lock_irqsave(&channel->lifetime_lock, flags);
+	revoked = channel->owner.revoked;
+	ukplat_spin_unlock_irqrestore(&channel->lifetime_lock, flags);
+	return revoked;
+}
+
+int vmbus_channel_host_attach_gpadl(struct vmbus_channel *channel,
+				    __u32 gpadl_id)
+{
+	struct vmbus_gpadl_record *record = gpadl_record_allocate();
+
+	if (!record || !channel || channel->state != CHANNEL_OPEN)
+		return -EINVAL;
+	record->gpadl_id = gpadl_id;
+	record->relid = channel->relid;
+	record->channel_generation = channel->owner.generation;
+	record->page_start = channel->page_start;
+	record->page_count = channel->page_count;
+	record->byte_count = (__u32)channel->page_count * VMBUS_PAGE_SIZE;
+	record->owns_ring_pages = 1;
+	channel->gpadl_id = gpadl_id;
+	channel->gpadl_record =
+		(__u16)(record - &gpadl_records[0] + 1);
+	channel->gpadl_live = 1;
+	channel->gpadl_posted = 1;
+	return 0;
+}
+
+int vmbus_channel_host_pin(struct vmbus_channel *channel)
+{
+	host_pinned_token.owner = NULL;
+	host_pinned_token.generation = 0;
+	return channel_operation_begin(channel, &host_pinned_token, 0);
+}
+
+void vmbus_channel_host_unpin(struct vmbus_channel *channel)
+{
+	end_channel_operation(channel, &host_pinned_token);
+}
+
+int vmbus_channel_host_nested_ownership_test(void)
+{
+	struct vmbus_device first_device = {
+		.channel_id = 1,
+		.connection_id = 10,
+		.present = 1,
+	};
+	struct vmbus_device second_device = {
+		.channel_id = 2,
+		.connection_id = 20,
+		.present = 1,
+	};
+	struct vmbus_device third_device = {
+		.channel_id = 3,
+		.connection_id = 30,
+		.present = 1,
+	};
+	struct vmbus_channel_token token = { 0 };
+	struct vmbus_channel *first;
+	struct vmbus_channel *second;
+	struct vmbus_channel *third;
+	unsigned int page;
+
+	vmbus_channel_reset_all();
+	first = allocate_channel(&first_device);
+	if (!first || channel_operation_begin(first, &token, 0))
+		return 1;
+	if (allocate_ring_pages(2, &page))
+		return 2;
+	first->page_start = page;
+	first->page_count = 2;
+	if (vmbus_channel_rescind(first->relid) != -EINPROGRESS ||
+	    first->state != CHANNEL_RESCINDED)
+		return 3;
+	if (first_device.channel || first->state == CHANNEL_FREE ||
+	    !ring_page_used[page])
+		return 4;
+	second = allocate_channel(&second_device);
+	if (!second || second == first)
+		return 5;
+	host_release_page = page;
+	host_release_relid = first->relid;
+	host_release_pending = 1;
+	end_channel_operation(first, &token);
+	host_release_pending = 0;
+	if (first->state != CHANNEL_FREE || ring_page_used[page])
+		return 6;
+	third = allocate_channel(&third_device);
+	if (third != first || second_device.channel != second)
+		return 7;
+	release_channel_object(second);
+	release_channel_object(third);
+	return 0;
+}
+#endif

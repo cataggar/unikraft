@@ -68,11 +68,18 @@ struct uk_pagetable *uk_paging_pt_get_active(void)
 	return pg_active_pt;
 }
 
+int uk_paging_pt_activate_lcpu(struct uk_pagetable *pt)
+{
+	if (unlikely(!pt))
+		return -EINVAL;
+	return uk_pal_pt_write_base(pt->pt_pbase);
+}
+
 int uk_paging_pt_set_active(struct uk_pagetable *pt)
 {
 	int rc;
 
-	rc = uk_pal_pt_write_base(pt->pt_pbase);
+	rc = uk_paging_pt_activate_lcpu(pt);
 	if (rc)
 		return rc;
 

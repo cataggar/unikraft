@@ -1,0 +1,233 @@
+// SPDX-License-Identifier: BSD-3-Clause
+const std = @import("std");
+const builtin = @import("builtin");
+const paths = @import("zig-facade-paths.zig");
+const wire = @import("native-make-environment-contract.zig");
+
+pub const maximum_bytes = wire.maximum_bytes;
+pub const Contract = wire.Contract;
+pub const encode = wire.encode;
+pub const parse = wire.parse;
+const commandPath = wire.commandPath;
+
+fn retainedDescriptorPath(path: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, "/proc/")) return false;
+    var components = std.mem.splitScalar(u8, path["/proc/".len..], '/');
+    const process = components.next() orelse return false;
+    const fd = components.next() orelse return false;
+    const descriptor = components.next() orelse return false;
+    if (components.next() != null or !std.mem.eql(u8, fd, "fd") or
+        descriptor.len == 0)
+        return false;
+    if (!std.mem.eql(u8, process, "self")) {
+        for (process) |byte| if (!std.ascii.isDigit(byte)) return false;
+    }
+    for (descriptor) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return true;
+}
+
+pub fn read(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !std.json.Parsed(Contract) {
+    if (comptime builtin.os.tag == .linux) return readLinux(allocator, io, path);
+    return error.UnsupportedNativeMakeHost;
+}
+
+fn readLinux(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !std.json.Parsed(Contract) {
+    const private = @import("../tools/hyperv/private_files.zig");
+    try commandPath(path);
+    var contents = try private.readSensitiveAbsolute(io, allocator, path, maximum_bytes, null);
+    defer contents.deinit();
+    var parsed = try parse(allocator, contents.bytes());
+    errdefer parsed.deinit();
+    inline for (@typeInfo(Contract).@"struct".field_names) |name| {
+        if (comptime !std.mem.eql(u8, name, "schema")) {
+            const value = @field(parsed.value, name);
+            const tool_field = comptime std.mem.eql(u8, name, "shell") or
+                std.mem.eql(u8, name, "m4");
+            const retained = tool_field and retainedDescriptorPath(value);
+            if (!retained) {
+                const canonical = try paths.canonicalizeNearestExisting(allocator, io, value);
+                defer allocator.free(canonical.path);
+                if (!canonical.exists or !std.mem.eql(u8, value, canonical.path))
+                    return error.InvalidNativeMakePath;
+            }
+            if (tool_field) {
+                const file = if (retained)
+                    try std.Io.Dir.openFileAbsolute(io, value, .{ .mode = .read_only })
+                else
+                    try private.openAbsolute(io, value, .artifact);
+                defer file.close(io);
+                const metadata = try private.snapshot(file);
+                if (metadata.mode & 0o7022 != 0 or metadata.mode & 0o111 == 0 or
+                    (metadata.uid != 0 and metadata.uid != std.os.linux.geteuid()))
+                    return error.UnsafeNativeMakeTool;
+            } else if (comptime std.mem.eql(u8, name, "bison_data")) {
+                const directory = try private.openDirectory(io, value, .artifact);
+                defer directory.close(io);
+            } else {
+                const directory = try private.Directory.open(io, value);
+                defer directory.close(io);
+            }
+        }
+    }
+    return parsed;
+}
+
+const fixture: Contract = .{
+    .bison_data = "/native/share/bison",
+    .m4 = "/native/bin/m4",
+    .schema = .unikraft_native_make_environment_v1,
+    .shell = "/native/bin/bash",
+    .tmp = "/private/scratch/tmp",
+    .xdg_cache = "/private/scratch/cache",
+    .xdg_config = "/private/scratch/config",
+    .zig_global_cache = "/private/scratch/zig-global",
+    .zig_local_cache = "/private/scratch/zig-local",
+};
+
+test "native Make environment emits only fixed private assignments" {
+    const allocator = std.testing.allocator;
+    try fixture.validate();
+    const arguments = try fixture.assignments(allocator);
+    defer for (arguments) |argument| allocator.free(argument);
+    const expected = [_][]const u8{
+        "UMASK=0077",
+        "SHELL=/native/bin/bash",
+        "CONFIG_SHELL=/native/bin/bash",
+        "M4=/native/bin/m4",
+        "BISON_PKGDATADIR=/native/share/bison",
+        "TMPDIR=/private/scratch/tmp",
+        "XDG_CACHE_HOME=/private/scratch/cache",
+        "XDG_CONFIG_HOME=/private/scratch/config",
+        "ZIG_GLOBAL_CACHE_DIR=/private/scratch/zig-global",
+        "ZIG_LOCAL_CACHE_DIR=/private/scratch/zig-local",
+    };
+    for (expected, arguments) |want, actual| try std.testing.expectEqualStrings(want, actual);
+}
+
+test "native Make environment encoder owns the canonical wire format" {
+    const allocator = std.testing.allocator;
+    const encoded = try encode(allocator, fixture);
+    defer allocator.free(encoded);
+    try std.testing.expectEqualStrings(
+        "{\"bison_data\":\"/native/share/bison\",\"m4\":\"/native/bin/m4\",\"schema\":\"unikraft_native_make_environment_v1\",\"shell\":\"/native/bin/bash\",\"tmp\":\"/private/scratch/tmp\",\"xdg_cache\":\"/private/scratch/cache\",\"xdg_config\":\"/private/scratch/config\",\"zig_global_cache\":\"/private/scratch/zig-global\",\"zig_local_cache\":\"/private/scratch/zig-local\"}\n",
+        encoded,
+    );
+    var parsed = try parse(allocator, encoded);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(fixture.zig_local_cache, parsed.value.zig_local_cache);
+}
+
+test "native Make environment requires strict canonical complete versioned JSON" {
+    const allocator = std.testing.allocator;
+    const json = try std.json.Stringify.valueAlloc(allocator, fixture, .{});
+    defer allocator.free(json);
+    const canonical = try allocator.print("{s}\n", .{json});
+    defer allocator.free(canonical);
+    var parsed = try parse(allocator, canonical);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(fixture.shell, parsed.value.shell);
+    try std.testing.expectError(error.NoncanonicalNativeMakeEnvironment, parse(allocator, json));
+    try std.testing.expectError(error.MissingField, parse(allocator, "{\"schema\":\"unikraft_native_make_environment_v1\"}\n"));
+    for ([_][]const u8{
+        "\"HOME\":\"/elsewhere\",",
+        "\"LD_PRELOAD\":\"/elsewhere\",",
+        "\"umask\":\"0022\",",
+        "\"shell\":\"/duplicate\",",
+    }) |extra| {
+        const invalid = try allocator.print("{{{s}{s}\n", .{ extra, json[1..] });
+        defer allocator.free(invalid);
+        if (std.mem.startsWith(u8, extra, "\"shell\""))
+            try std.testing.expectError(error.DuplicateField, parse(allocator, invalid))
+        else
+            try std.testing.expectError(error.UnknownField, parse(allocator, invalid));
+    }
+}
+
+test "native Make environment rejects relative ambiguous and command-bearing paths" {
+    for ([_][]const u8{
+        "",     "relative", "/",     "/a/",   "/a//b", "/a/../b", "/a/./b",
+        "/a b", "/a\nb",    "/a\tb", "/a:b",  "/a=b",  "/a$b",    "/a;b",
+        "/a`b", "/a'b",     "/a\"b", "/a\\b", "/a%b",  "/a#b",    "/a*b",
+    }) |path| {
+        var invalid = fixture;
+        invalid.shell = path;
+        try std.testing.expectError(error.InvalidNativeMakePath, invalid.validate());
+    }
+}
+
+test "native Make environment reads only private state and validated explicit paths" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const cwd = std.Io.Dir.cwd();
+    var nonce: [16]u8 = undefined;
+    io.random(&nonce);
+    const dirname = try allocator.print(
+        ".native-make-environment-{s}",
+        .{std.fmt.bytesToHex(nonce, .lower)},
+    );
+    try cwd.createDir(io, dirname, .fromMode(0o700));
+    defer cwd.deleteTree(io, dirname) catch {};
+    const temporary = .{ .dir = try cwd.openDir(io, dirname, .{ .iterate = true }) };
+    defer temporary.dir.close(io);
+    const base = try temporary.dir.realPathFileAlloc(io, ".", allocator);
+    var contract = fixture;
+    inline for (@typeInfo(Contract).@"struct".field_names) |name| {
+        if (comptime !std.mem.eql(u8, name, "schema")) {
+            @field(contract, name) = try std.fs.path.join(allocator, &.{ base, name });
+            if (comptime std.mem.eql(u8, name, "shell") or std.mem.eql(u8, name, "m4")) {
+                const file = try temporary.dir.createFile(io, name, .{ .permissions = .fromMode(0o700), .exclusive = true });
+                defer file.close(io);
+                try file.writePositionalAll(io, "metadata-only fixture, never executed\n", 0);
+            } else try temporary.dir.createDir(io, name, .fromMode(0o700));
+        }
+    }
+    const json = try std.json.Stringify.valueAlloc(allocator, contract, .{});
+    const bytes = try allocator.print("{s}\n", .{json});
+    const path = try std.fs.path.join(allocator, &.{ base, "environment.json" });
+    const file = try temporary.dir.createFile(io, "environment.json", .{ .permissions = .fromMode(0o600), .exclusive = true });
+    defer file.close(io);
+    try file.writePositionalAll(io, bytes, 0);
+    var loaded = try read(std.testing.allocator, io, path);
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings(contract.shell, loaded.value.shell);
+    const retained_shell = try temporary.dir.openFile(io, "shell", .{ .mode = .read_only });
+    defer retained_shell.close(io);
+    var retained_contract = contract;
+    retained_contract.shell = try allocator.print(
+        "/proc/{d}/fd/{d}",
+        .{ std.os.linux.getpid(), retained_shell.handle },
+    );
+    const retained_json = try std.json.Stringify.valueAlloc(allocator, retained_contract, .{});
+    const retained_bytes = try allocator.print("{s}\n", .{retained_json});
+    const retained_environment = try temporary.dir.createFile(io, "retained-environment.json", .{
+        .permissions = .fromMode(0o600),
+        .exclusive = true,
+    });
+    defer retained_environment.close(io);
+    try retained_environment.writePositionalAll(io, retained_bytes, 0);
+    const retained_path = try std.fs.path.join(allocator, &.{ base, "retained-environment.json" });
+    var retained_loaded = try read(std.testing.allocator, io, retained_path);
+    defer retained_loaded.deinit();
+    try std.testing.expectEqualStrings(retained_contract.shell, retained_loaded.value.shell);
+    try file.setPermissions(io, .fromMode(0o644));
+    try std.testing.expectError(error.UnsafeFile, read(allocator, io, path));
+    try file.setPermissions(io, .fromMode(0o600));
+    try temporary.dir.symLink(io, "environment.json", "alias.json", .{});
+    try std.testing.expectError(error.UnsafeFile, read(allocator, io, try std.fs.path.join(allocator, &.{ base, "alias.json" })));
+    const cache = try temporary.dir.openDir(io, "zig_local_cache", .{ .iterate = true });
+    defer cache.close(io);
+    try cache.setPermissions(io, .fromMode(0o755));
+    try std.testing.expectError(error.UnsafeFile, read(allocator, io, path));
+    try cache.setPermissions(io, .fromMode(0o700));
+    const bison_data = try temporary.dir.openDir(io, "bison_data", .{ .iterate = true });
+    defer bison_data.close(io);
+    try bison_data.setPermissions(io, .fromMode(0o777));
+    try std.testing.expectError(error.UnsafeFile, read(allocator, io, path));
+    try bison_data.setPermissions(io, .fromMode(0o700));
+    try temporary.dir.rename("shell", temporary.dir, "original-shell", io);
+    try temporary.dir.symLink(io, "original-shell", "shell", .{});
+    try std.testing.expectError(error.InvalidNativeMakePath, read(allocator, io, path));
+}

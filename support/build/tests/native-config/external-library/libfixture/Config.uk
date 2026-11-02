@@ -1,0 +1,2 @@
+config EXTERNAL_COUNT
+	int "External fixture count"

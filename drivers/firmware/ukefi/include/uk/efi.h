@@ -11,6 +11,7 @@
 #include <uk/arch/types.h>
 #include <uk/bitops/bitcount.h>
 #include <uk/essentials.h>
+#include <uk/efi/time.h>
 
 /* On x86_64, UEFI uses Microsoft ABI calling convention */
 #if CONFIG_ARCH_X86_64
@@ -367,28 +368,6 @@ struct uk_efi_boot_services {
 					const void *notify_ctx,
 					const struct uk_efi_guid *event_group,
 					uk_efi_event_t *event);
-};
-
-/* Time capabilities */
-struct uk_efi_time_caps {
-	__u32 resolution;
-	__u32 accuracy;
-	__bool sets_to_zero;
-};
-
-/* Time structure */
-struct uk_efi_time {
-	__u16 year;
-	__u8 month;
-	__u8 day;
-	__u8 hour;
-	__u8 minute;
-	__u8 second;
-	__u8 pad1;
-	__u32 nanosecond;
-	__s16 time_zone;
-	__u8 daylight;
-	__u8 pad2;
 };
 
 /* Capsule header */

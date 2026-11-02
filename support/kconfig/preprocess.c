@@ -140,7 +140,15 @@ static char *do_lineno(int argc, char *argv[])
 static char *do_shell(int argc, char *argv[])
 {
 	FILE *p;
+#ifdef UK_KCONFIG_METADATA
+	const size_t output_limit = 1024 * 1024;
+	size_t capacity = 256;
+	char *buf;
+	int c;
+	bool overflow = false, embedded_nul = false, read_failed;
+#else
 	char buf[256];
+#endif
 	char *cmd;
 	size_t nread;
 	int i;
@@ -153,9 +161,49 @@ static char *do_shell(int argc, char *argv[])
 		exit(1);
 	}
 
+#ifdef UK_KCONFIG_METADATA
+	/* Metadata source filenames must not inherit the solver's 255-byte
+	 * truncation. Bound raw stdout before newline normalization.
+	 */
+	buf = xmalloc(capacity);
+	nread = 0;
+	while ((c = fgetc(p)) != EOF) {
+		if (nread == output_limit) {
+			overflow = true;
+			break;
+		}
+		if (c == '\0') {
+			embedded_nul = true;
+			break;
+		}
+		if (nread + 1 == capacity) {
+			capacity *= 2;
+			if (capacity > output_limit + 1)
+				capacity = output_limit + 1;
+			buf = xrealloc(buf, capacity);
+		}
+		buf[nread++] = c;
+	}
+	read_failed = ferror(p);
+	if (overflow || embedded_nul || read_failed) {
+		/* Close the read end and reap the shell on capture failure. */
+		int status = pclose(p);
+
+		free(buf);
+		if (overflow)
+			pperror("metadata shell output exceeds %zu-byte limit",
+				output_limit);
+		if (embedded_nul)
+			pperror("metadata shell output contains a NUL byte");
+		if (status == -1)
+			pperror("metadata shell output close failed");
+		pperror("metadata shell output read failed");
+	}
+#else
 	nread = fread(buf, 1, sizeof(buf), p);
 	if (nread == sizeof(buf))
 		nread--;
+#endif
 
 	/* remove trailing new lines */
 	while (nread > 0 && buf[nread - 1] == '\n')
@@ -174,7 +222,11 @@ static char *do_shell(int argc, char *argv[])
 		exit(1);
 	}
 
+#ifdef UK_KCONFIG_METADATA
+	return buf;
+#else
 	return xstrdup(buf);
+#endif
 }
 
 static char *do_warning_if(int argc, char *argv[])

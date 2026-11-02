@@ -529,6 +529,8 @@ static inline int uk_netdev_rx_one(struct uk_netdev *dev, uint16_t queue_id,
  * @param pkt
  *   Reference to netbuf to sent. Packet is free'd by the driver after sending
  *   was successfully finished by the device.
+ *   A driver that supplies `tx_returned` must not free `pkt` before that
+ *   callback, which runs after this wrapper has finished reading the packet.
  *   Please note that some drivers may require available headroom on the netbuf
  *   for doing a transmission - inspect `nb_encap` with uk_netdev_info_get().
  *   `pkt` has never to be `NULL`.
@@ -567,22 +569,20 @@ static inline int uk_netdev_tx_one(struct uk_netdev *dev, uint16_t queue_id,
 			dev->_stats.tx_m.bytes += nb->len;
 		dev->_stats.tx_m.packets++;
 		ukarch_spin_unlock(&dev->_stats_lock);
-		return ret;
-	}
-	if (ret >= 0 && (ret & UK_NETDEV_STATUS_UNDERRUN)) {
+	} else if (ret >= 0 && (ret & UK_NETDEV_STATUS_UNDERRUN)) {
 		ukarch_spin_lock(&dev->_stats_lock);
 		dev->_stats.tx_m.fifo++;
 		ukarch_spin_unlock(&dev->_stats_lock);
-		return ret;
-	}
-	if (ret < 0) {
+	} else if (ret < 0) {
 		ukarch_spin_lock(&dev->_stats_lock);
 		dev->_stats.tx_m.errors++;
 		ukarch_spin_unlock(&dev->_stats_lock);
-		return ret;
 	}
 #endif /* CONFIG_LIBUKNETDEV_STATS */
 
+	if (ret >= 0 && (ret & UK_NETDEV_STATUS_SUCCESS) &&
+	    dev->ops->tx_returned)
+		dev->ops->tx_returned(dev, dev->_tx_queue[queue_id], pkt);
 	return ret;
 }
 

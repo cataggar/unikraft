@@ -1,0 +1,244 @@
+menuconfig APPHYPERVACCEPTANCE
+	bool "Hyper-V hardware acceptance probe"
+	default y
+	depends on PLAT_HYPERV
+	select LIBNOLIBC
+	select LIBUKALLOC
+	select LIBUKSCHED
+	select LIBUKSCHEDCOOP
+	select LIBVMBUS
+	select LIBUKBLKDEV
+	select LIBSTORVSC
+	select LIBUKNETDEV
+	select LIBNETVSC
+	help
+	  Probe real Hyper-V StorVSC and NetVSC I/O without modifying storage.
+
+if APPHYPERVACCEPTANCE
+
+choice APPHYPERVACCEPTANCE_WORKLOAD
+	prompt "Optional acceptance workload"
+	optional
+
+config APPHYPERVACCEPTANCE_NETWORK_APPLICATION
+	bool "Run stack-backed private-peer networking acceptance"
+	depends on LIBLWIP && LWIP_NOTHREADS && LWIP_DHCP && LWIP_TCP && LWIP_UDP
+	depends on LWIP_RELEASE212 && LWIP_UKNETDEV && !LWIP_AUTOIFACE
+	help
+	  Replace the default raw DHCP Offer smoke with bounded DHCP lease,
+	  ARP, TCP, and UDP acceptance through the official lib-lwip stack.
+
+config APPHYPERVACCEPTANCE_PERSISTENCE
+	bool "Run destructive disposable-disk persistence acceptance"
+	select LIBSTORVSC_LUN_DISCOVERY
+	select LIBSTORVSC_GUARDED_IO
+	help
+	  Replace the ordinary read-only storage/network probe with the
+	  manifest-gated two-boot persistence workload. This may write only
+	  the uniquely matched disposable disk described below.
+
+config APPHYPERVACCEPTANCE_STORAGE_TOPOLOGY
+	bool "Read-only OS and two seeded data-disk topology acceptance"
+	select LIBSTORVSC_LUN_DISCOVERY
+	select LIBSTORVSC_GUARDED_IO
+	help
+	  Inventory coherent StorVSC mappings, read the OS boot signatures,
+	  and verify two independent policy-2 seed manifests. No block writes,
+	  flushes, or network operations are performed by this workload.
+
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK
+	bool "Read-only guarded StorVSC block-I/O benchmark acceptance"
+	select LIBSTORVSC_LUN_DISCOVERY
+	select LIBSTORVSC_GUARDED_IO
+	select LIBUKALLOC_IFSTATS
+	help
+	  Run bounded read-only multi-slot block-I/O benchmark sweeps against
+	  the uniquely matched policy-2 seeded 4-GiB data disk at LUN 7. No
+	  block writes, flushes, or network operations are performed by this
+	  workload.
+
+config APPHYPERVACCEPTANCE_HTTP_SERVICE
+	bool "Run persistent HTTP/1.1 service workload"
+	depends on LIBLWIP && LWIP_NOTHREADS && LWIP_DHCP && LWIP_TCP && LWIP_UDP
+	depends on LWIP_RELEASE212 && LWIP_UKNETDEV && !LWIP_AUTOIFACE
+	help
+	  Run a bounded raw-lwIP HTTP/1.1 keep-alive server returning a
+	  deterministic 1 KiB payload with X-Unikraft-Boot-Id and emitting
+	  boot timing and runtime telemetry over serial.
+
+endchoice
+
+config APPHYPERVACCEPTANCE_HTTP_PORT
+	int "HTTP service TCP port"
+	range 1 65535
+	default 8080
+	depends on APPHYPERVACCEPTANCE_HTTP_SERVICE
+
+config APPHYPERVACCEPTANCE_HTTP_DURATION_MS
+	int "HTTP service active duration (ms)"
+	range 1000 86400000
+	default 360000
+	depends on APPHYPERVACCEPTANCE_HTTP_SERVICE
+
+config APPHYPERVACCEPTANCE_HTTP_MAX_CONNS
+	int "HTTP service maximum concurrent connections"
+	range 1 256
+	default 64
+	depends on APPHYPERVACCEPTANCE_HTTP_SERVICE
+
+config APPHYPERVACCEPTANCE_PEER_IPV4
+	string "Private peer IPv4 address"
+	default "10.87.0.4"
+	depends on APPHYPERVACCEPTANCE_NETWORK_APPLICATION
+
+config APPHYPERVACCEPTANCE_PEER_TCP_PORT
+	int "Private peer TCP port"
+	range 1 65535
+	default 18887
+	depends on APPHYPERVACCEPTANCE_NETWORK_APPLICATION
+
+config APPHYPERVACCEPTANCE_PEER_UDP_PORT
+	int "Private peer UDP port"
+	range 1 65535
+	default 18888
+	depends on APPHYPERVACCEPTANCE_NETWORK_APPLICATION
+
+config APPHYPERVACCEPTANCE_NONCE
+	string "Acceptance nonce (16 hexadecimal digits)"
+	default "87c0ffee5aa8dfd6"
+	depends on APPHYPERVACCEPTANCE_NETWORK_APPLICATION
+	help
+	  Run-manifest nonce encoded as exactly 16 hexadecimal digits without
+	  a 0x prefix. Invalid values fail before any network traffic.
+
+if APPHYPERVACCEPTANCE_PERSISTENCE
+
+config APPHYPERVACCEPTANCE_PERSISTENCE_RUN_ID
+	string "Private 128-bit run ID (32 lowercase hex digits)"
+	default ""
+
+config APPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID
+	string "Private 128-bit disk ID (32 lowercase hex digits)"
+	default ""
+
+config APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS
+	int "Exact disposable disk sector count"
+	default 0
+
+config APPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE
+	int "Exact disposable disk sector size"
+	default 512
+
+config APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY
+	int "Persistence identity policy version"
+	range 1 2
+	default 1
+	help
+	  Policy 1 binds path, target, and LUN in the seed before boot.
+	  Policy 2 binds LUN and geometry in the seed, then enrolls path,
+	  target, controller instance, and VPD only after a unique seed match.
+	  Intent and receipt records remain bound to the selected policy.
+
+config APPHYPERVACCEPTANCE_PERSISTENCE_PATH
+	int "Expected StorVSC path"
+	range 0 255
+	default 0
+	depends on APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY = 1
+
+config APPHYPERVACCEPTANCE_PERSISTENCE_TARGET
+	int "Expected StorVSC target"
+	range 0 255
+	default 0
+	depends on APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY = 1
+
+config APPHYPERVACCEPTANCE_PERSISTENCE_LUN
+	int "Expected StorVSC LUN"
+	range 0 255
+	default 0
+endif
+
+if APPHYPERVACCEPTANCE_STORAGE_TOPOLOGY
+
+config APPHYPERVACCEPTANCE_TOPOLOGY_RUN_ID
+	string "Private 128-bit topology run ID (32 lowercase hex digits)"
+	default ""
+
+config APPHYPERVACCEPTANCE_TOPOLOGY_DISK0_ID
+	string "Private 128-bit LUN 0 data disk ID (32 lowercase hex digits)"
+	default ""
+
+config APPHYPERVACCEPTANCE_TOPOLOGY_DISK_NONZERO_ID
+	string "Private 128-bit nonzero-LUN data disk ID (32 lowercase hex digits)"
+	default ""
+
+config APPHYPERVACCEPTANCE_TOPOLOGY_DISK0_SECTORS
+	int "Exact LUN 0 data disk sector count"
+	default 0
+
+config APPHYPERVACCEPTANCE_TOPOLOGY_DISK_NONZERO_SECTORS
+	int "Exact nonzero-LUN data disk sector count"
+	default 0
+
+config APPHYPERVACCEPTANCE_TOPOLOGY_NONZERO_LUN
+	int "Expected nonzero data disk LUN"
+	range 1 255
+	default 7
+
+endif
+
+if APPHYPERVACCEPTANCE_STORAGE_BENCHMARK
+
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_RUN_ID
+	string "Private 128-bit benchmark run ID (32 lowercase hex digits)"
+	default ""
+
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_DISK_ID
+	string "Private 128-bit benchmark data disk ID (32 lowercase hex digits)"
+	default ""
+
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_SECTORS
+	int "Exact benchmark data disk sector count"
+	default 8388608
+
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_SECTOR_SIZE
+	int "Exact benchmark data disk sector size"
+	default 512
+
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_IDENTITY_POLICY
+	int "Benchmark identity policy version"
+	range 2 2
+	default 2
+
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_LUN
+	int "Expected benchmark data disk LUN"
+	range 1 255
+	default 7
+
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_MAX_SLOTS
+	int "Maximum concurrent benchmark request slots"
+	range 1 32
+	default 32
+
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_MAX_TRANSFER_BYTES
+	int "Maximum benchmark request transfer size (bytes)"
+	range 4096 131072
+	default 131072
+
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_WARMUP_OPS
+	int "Uncounted warmup operations per benchmark cell"
+	range 1 1024
+	default 64
+
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_STEADY_OPS
+	int "Measured steady-state operations per trial"
+	range 1 4096
+	default 256
+
+config APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_TRIALS
+	int "Steady-state trials per benchmark cell"
+	range 1 10
+	default 3
+
+endif
+
+endif

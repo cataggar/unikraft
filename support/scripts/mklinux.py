@@ -3,7 +3,10 @@
 import argparse
 import os
 import re
-import subprocess
+
+from elf_tools import configured_tool, tool_output
+
+NM = configured_tool("NM", "nm")
 
 # Linux arm64 boot header
 # https://www.kernel.org/doc/Documentation/arm64/booting.txt
@@ -34,7 +37,7 @@ def autoint(x):
 # Get the absolute value of symbol, as seen through `nm`
 def get_sym_val(elf, sym):
     exp = r"^\s*" + r"([a-f0-9]+)" + r"\s+[A-Za-z]\s+" + sym + r"$"
-    out = subprocess.check_output(["nm", elf])  # nosec
+    out = tool_output(NM, elf)
 
     re_out = re.findall(exp, out.decode("ASCII"), re.MULTILINE)
     if len(re_out) != 1:

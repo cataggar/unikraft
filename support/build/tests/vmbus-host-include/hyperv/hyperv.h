@@ -1,0 +1,44 @@
+#include <uk/arch/types.h>
+#define HYPERV_PAGE_SIZE 4096U
+#define HYPERV_MESSAGE_PAYLOAD_SIZE 240U
+struct hyperv_message {
+	__u32 message_type;
+	__u8 payload_size;
+	__u8 reserved[3];
+	__u8 payload[HYPERV_MESSAGE_PAYLOAD_SIZE];
+};
+static inline __u64 hyperv_hypercall(__u64 c, __u64 i, __u64 o)
+{ (void)c; (void)i; (void)o; return 0; }
+static inline __u64 hyperv_reference_time(void)
+{
+	static __u64 t;
+
+	return t += 10000;
+}
+static inline int hyperv_has_signal_events(void) { return 1; }
+static inline int hyperv_has_post_messages(void) { return 1; }
+#if defined(VMBUS_CHANNEL_HOST_TEST) && !defined(VMBUS_EPOCH_ONLY_HOST_TEST)
+int hyperv_vmbus_target_acquire(__u32 *vp, __u32 *generation);
+int hyperv_vmbus_target_acquire_channel(__u32 channel_relid, __u32 *vp,
+					__u32 *generation);
+void hyperv_vmbus_target_release(__u32 vp, __u32 generation);
+#else
+static inline int hyperv_vmbus_target_acquire(__u32 *vp, __u32 *generation)
+{
+	*vp = 0;
+	*generation = 1;
+	return 0;
+}
+static inline int hyperv_vmbus_target_acquire_channel(__u32 channel_relid,
+						      __u32 *vp,
+						      __u32 *generation)
+{
+	(void)channel_relid;
+	*vp = 0;
+	*generation = 1;
+	return 0;
+}
+static inline void hyperv_vmbus_target_release(
+	__u32 vp __attribute__((unused)),
+	__u32 generation __attribute__((unused))) {}
+#endif

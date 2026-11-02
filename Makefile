@@ -464,7 +464,18 @@ HOSTRANLIB	:= $(shell which $(HOSTRANLIB) || type -p $(HOSTRANLIB) || echo ranli
 HOSTCC_VERSION	:= $(shell $(HOSTCC_NOCCACHE) --version | \
 		   $(SED) -n -r 's/^.* ([0-9]*)\.([0-9]*)\.([0-9]*)[ ]*.*/\1 \2/p')
 # UTC time in ISO 8601 format:
+ifeq ($(WAMR_CI_PORTABLE_CONFIG),1)
+HOSTEPOCH	:= $(shell git -C "$(CONFIG_UK_BASE)" show -s --format=%ct HEAD)
+ifeq ($(HOSTEPOCH),)
+$(error Portable CI requires a source commit timestamp)
+endif
+HOSTUTC		:= $(shell date -Iseconds -u -d "@$(HOSTEPOCH)")
+ifeq ($(HOSTUTC),)
+$(error Portable CI could not format the source commit timestamp)
+endif
+else
 HOSTUTC		:= $(shell date -Iseconds -u)
+endif
 HOSTNAME	:= $(shell hostname -s)
 HOSTUSER	:= $(shell whoami)
 
@@ -591,6 +602,10 @@ ifeq ($(UK_HAVE_DOT_CONFIG),y)
 unexport CONFIG_CROSS_COMPILE
 unexport CONFIG_LLVM_TARGET_ARCH
 unexport CONFIG_COMPILER
+unexport CONFIG_LINKER
+unexport CONFIG_PARTIAL_LINKER
+unexport CONFIG_PARTIAL_LINKER_TYPE
+unexport CONFIG_COMPILER_TARGETED
 #unexport CC
 #unexport LD
 #unexport AR
@@ -633,12 +648,64 @@ else
 	CONFIG_COMPILER := gcc
 endif
 
+ifneq ("$(origin LINKER)","undefined")
+	CONFIG_LINKER := $(LINKER:"%"=%)
+else
+	CONFIG_LINKER := $(CONFIG_COMPILER)
+endif
+
+ifneq ("$(origin PARTIAL_LINKER)","undefined")
+	CONFIG_PARTIAL_LINKER := $(PARTIAL_LINKER:"%"=%)
+else
+	CONFIG_PARTIAL_LINKER := $(CONFIG_LINKER)
+endif
+
+ifneq ("$(origin PARTIAL_LINKER_TYPE)","undefined")
+	CONFIG_PARTIAL_LINKER_TYPE := $(PARTIAL_LINKER_TYPE:"%"=%)
+else
+	CONFIG_PARTIAL_LINKER_TYPE := driver
+endif
+
+ifneq ($(filter $(CONFIG_PARTIAL_LINKER_TYPE),driver raw),$(CONFIG_PARTIAL_LINKER_TYPE))
+$(error Unsupported PARTIAL_LINKER_TYPE '$(CONFIG_PARTIAL_LINKER_TYPE)' (expected 'driver' or 'raw'))
+endif
+
+# COMPILER_TARGETED=y declares that the compiler command selects its target
+# itself instead of being an architecture-prefixed executable, for example
+# `zig cc -target aarch64-freestanding-none`. Such a command must not be
+# prefixed with CONFIG_CROSS_COMPILE and architectures must not inject their
+# own default target flag. The linker driver and the binutils keep using
+# CONFIG_CROSS_COMPILE.
+ifneq ("$(origin COMPILER_TARGETED)","undefined")
+	CONFIG_COMPILER_TARGETED := $(COMPILER_TARGETED:"%"=%)
+else
+	CONFIG_COMPILER_TARGETED := n
+endif
 
 $(eval $(call verbose_include,$(CONFIG_UK_BASE)/arch/$(UK_FAMILY)/Compiler.uk))
 
-# Make variables (CC, etc...)
-LD		:= $(CONFIG_CROSS_COMPILE)$(CONFIG_COMPILER)
-CC		:= $(CONFIG_CROSS_COMPILE)$(CONFIG_COMPILER)
+# Cross prefix of the compiler command. It is dropped for target-aware
+# compiler commands, all other tools keep CONFIG_CROSS_COMPILE.
+ifeq ($(CONFIG_COMPILER_TARGETED),y)
+CONFIG_COMPILER_CROSS_COMPILE :=
+else
+CONFIG_COMPILER_CROSS_COMPILE := $(CONFIG_CROSS_COMPILE)
+endif
+
+# Make variables (CC, etc...). A multiword tool command already identifies the
+# executable to run and must not have a cross prefix inserted into its first
+# word (for example, `zig ld.lld`).
+ifneq ($(word 2,$(CONFIG_LINKER)),)
+LD		:= $(CONFIG_LINKER)
+else
+LD		:= $(CONFIG_CROSS_COMPILE)$(CONFIG_LINKER)
+endif
+ifneq ($(word 2,$(CONFIG_PARTIAL_LINKER)),)
+PARTIAL_LD	:= $(CONFIG_PARTIAL_LINKER)
+else
+PARTIAL_LD	:= $(CONFIG_CROSS_COMPILE)$(CONFIG_PARTIAL_LINKER)
+endif
+CC		:= $(CONFIG_COMPILER_CROSS_COMPILE)$(CONFIG_COMPILER)
 CPP		:= $(CC)
 CXX		:= $(CPP)
 GOC		:= $(CONFIG_CROSS_COMPILE)gccgo
@@ -651,6 +718,7 @@ RUSTC		:= rustc
 endif
 AS		:= $(CC)
 AR		:= $(CONFIG_CROSS_COMPILE)gcc-ar
+RANLIB		:= $(CONFIG_CROSS_COMPILE)gcc-ranlib
 NM		:= $(CONFIG_CROSS_COMPILE)gcc-nm
 READELF		:= $(CONFIG_CROSS_COMPILE)readelf
 STRIP		:= $(CONFIG_CROSS_COMPILE)strip
@@ -681,7 +749,8 @@ GZIP		:= gzip
 TAR		:= tar
 UNZIP		:= unzip -qq -u
 GIT		:= git
-ifneq (,$(findstring Wget2,$(shell wget --version)))
+WGET_VERSION ?= $(shell wget --version)
+ifneq (,$(findstring Wget2,$(WGET_VERSION)))
 WGET := wget -q --force-progress --progress=bar
 else
 WGET := wget -q --show-progress --progress=bar
@@ -710,6 +779,10 @@ ASFLAGS		+= -DCC_VERSION=$(CC_VERSION)
 CFLAGS		+= -DCC_VERSION=$(CC_VERSION)
 CXXFLAGS	+= -DCC_VERSION=$(CC_VERSION)
 GOCFLAGS	+= -DCC_VERSION=$(CC_VERSION)
+
+ifeq ($(WAMR_CI_PORTABLE_CONFIG),1)
+DBGFLAGS	+= -fdebug-prefix-map=$(CONFIG_UK_BASE)=/wamr-ci/source
+endif
 
 # Add user supplied flags as the last assignments
 ASFLAGS  += $(UK_ASFLAGS)
@@ -768,6 +841,9 @@ $(error You did not select a library that handles bootstrapping! (e.g., ukboot))
 endif
 
 ifeq ($(CONFIG_OPTIMIZE_LTO), y)
+ifeq ($(CONFIG_PARTIAL_LINKER_TYPE),raw)
+$(error PARTIAL_LINKER_TYPE=raw does not support link-time optimization; disable CONFIG_OPTIMIZE_LTO or use a driver partial linker)
+endif
 ifeq ($(call have_gcc),y)
 ifneq ($(call gcc_version_ge,6,1),y)
 $(error Your gcc version does not support incremental link time optimisation)
@@ -793,7 +869,11 @@ endif
 # include Makefile for platform linking (`Linker.uk`)
 $(foreach plat,$(UK_PLATS),$(eval $(call import_linker,$(plat))))
 
-.PHONY: prepare preprocess image libs objs clean
+# Install the normalized build graph export only after all registration files
+# and platform linker definitions have been evaluated.
+$(eval $(call verbose_include,$(CONFIG_UK_BASE)/support/build/Makefile.graph))
+
+.PHONY: prepare preprocess image libs objs native-link-inputs clean
 
 fetch: $(UK_FETCH) $(UK_FETCH-y)
 
@@ -810,6 +890,8 @@ preprocess: $(UK_PREPROCESS) $(UK_PREPROCESS-y) | prepare
 objs: $(UK_OBJS) $(UK_OBJS-y)
 
 libs: $(UK_ALIBS) $(UK_ALIBS-y) $(UK_OLIBS) $(UK_OLIBS-y)
+
+native-link-inputs: $(UK_ALIBS) $(UK_ALIBS-y) $(UK_OBJS) $(UK_OBJS-y) $(UK_LDS) $(UK_LDS-y)
 
 images: $(UK_DEBUG_IMAGES) $(UK_DEBUG_IMAGES-y) $(UK_IMAGES) $(UK_IMAGES-y)
 
@@ -855,7 +937,7 @@ ukconfig: $(BUILD_DIR)/Makefile menuconfig
 
 all: ukconfig
 
-.PHONY: prepare image libs objs clean-libs clean ukconfig
+.PHONY: prepare image libs objs native-link-inputs clean-libs clean ukconfig build-graph
 
 fetch: ukconfig
 
@@ -867,7 +949,12 @@ objs: ukconfig
 
 libs: ukconfig
 
+native-link-inputs: ukconfig
+
 images: ukconfig
+
+build-graph:
+	$(error Do not have a configuration. Please run one of the configuration targets first)
 
 clean-libs clean:
 	$(error Do not know which files to clean without having a configuration. Did you mean 'properclean' or 'distclean'?)
@@ -914,6 +1001,8 @@ COMMON_CONFIG_ENV = \
 	BUILD_DIR="$(BUILD_DIR)" \
 	UK_BASE="$(CONFIG_UK_BASE)" \
 	UK_APP="$(CONFIG_UK_APP)" \
+	UK_CONFIG_BASE="$(if $(filter 1,$(WAMR_CI_PORTABLE_CONFIG)),/wamr-ci/source,$(CONFIG_UK_BASE))" \
+	UK_CONFIG_APP="$(if $(filter 1,$(WAMR_CI_PORTABLE_CONFIG)),/wamr-ci/app,$(CONFIG_UK_APP))" \
 	UK_CONFIG="$(UK_CONFIG)" \
 	UK_FULLVERSION="$(UK_FULLVERSION)" \
 	UK_CODENAME="$(UK_CODENAME)" \
@@ -1233,6 +1322,15 @@ endif
 	@echo '                            is applied to every internal and external import of libraries, platforms,'
 	@echo '                            and applications. For example, an external library (via `L=`) will also be'
 	@echo '                            skipped if its path was specified with `E=` at the same time.)'
+	@echo '  COMPILER=[COMMAND]      - C compiler command (default: gcc)'
+	@echo '  LINKER=[COMMAND]        - linker driver command (default: COMPILER)'
+	@echo '  PARTIAL_LINKER=[COMMAND] - relocatable library linker command (default: LINKER)'
+	@echo '  PARTIAL_LINKER_TYPE=TYPE - interface used by PARTIAL_LINKER: driver or raw'
+	@echo '                            (default: driver)'
+	@echo '  COMPILER_TARGETED=[y|n] - the COMPILER command already selects its target (e.g.'
+	@echo '                            `zig cc -target aarch64-freestanding-none`). CROSS_COMPILE is then'
+	@echo '                            not prepended to it and no architecture default target flag is added.'
+	@echo '                            LINKER and the binutils keep using CROSS_COMPILE. (default: n)'
 	@echo ''
 	@echo 'Environment variables:'
 	@echo '  UK_ASFLAGS             - explicit Unikraft-specific additions to the assembler flags (the ASFLAGS variable is ignored)'
@@ -1248,6 +1346,8 @@ endif
 	@echo '  print-lds              - print linker script enabled for the build'
 	@echo '  print-objs             - print object file names enabled for build'
 	@echo '  print-srcs             - print source file names enabled for build'
+	@echo '  build-graph            - export normalized build graph to O/build-graph.json'
+	@echo '                           (schema: support/build/build-graph.md)'
 	@echo '  print-vars             - prints all the variables currently defined in Makefile'
 	@echo '  print-loc              - print Lines-of-Code statistics for built unikernel image(s)'
 	@echo ''

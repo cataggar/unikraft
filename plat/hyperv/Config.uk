@@ -1,0 +1,67 @@
+menuconfig PLAT_HYPERV
+	bool "Hyper-V Generation 2 guest"
+	default n
+	depends on ARCH_X86_64
+	select OPTIMIZE_PIE
+	select LIBUKDEBUG
+	select LIBUKBOOT
+	select LIBUKBITOPS
+	select LIBUKALLOC
+	select LIBUKTIMECONV
+	select LIBNOLIBC if !HAVE_LIBC
+	select LIBUKATOMIC
+	select LIBUKACPI
+	select LIBUKACPI_MADT_FILL_CPU_IDMAP if HAVE_SMP
+	select LIBUKEFI
+	select LIBUKPAGING
+	select HAVE_PAGING
+	select LIBUKPLAT_NATIVE_PAL
+	select LIBUKPLAT_NATIVE_PAGING
+	select LIBUKPLAT_NATIVE_LCPU_PM if LIBUKLCPU
+	select HAVE_INTCTLR
+	select HAVE_APIC
+	select HAVE_IBMPC_NS16550
+	select LIBUKINTCTLR_XPIC
+	select LIBUKINTCTLR_APIC
+	select LIBVMBUS
+	imply LIBNS16550 if LIBUKCONSOLE
+	imply LIBNS16550_EARLY_CONSOLE if LIBUKCONSOLE
+	imply LIBNS16550_COM1 if LIBUKCONSOLE
+	imply LIBUKRANDOM_LCPU if LIBUKRANDOM
+	help
+		Create an x86_64 UEFI image for Hyper-V Generation 2 guests.
+		SynIC and STimer state is initialized on each online vCPU.
+		Static per-vCPU pages are sized by UKPLAT_CPU_MAXCOUNT.
+
+if PLAT_HYPERV
+
+config HYPERV_EFI_STUB_CMDLINE_FNAME
+	string "Name of the command line arguments file"
+	default ""
+
+config HYPERV_EFI_STUB_INITRD_FNAME
+	string "Name of the initial RAM disk file"
+	default ""
+
+config HYPERV_EFI_STUB_DTB_FNAME
+	string "Name of the Devicetree Blob file"
+	default ""
+
+config HYPERV_EFI_STUB_RST_ATK_MITIGATION
+	bool "TCG Reset Attack Mitigation"
+	default n
+	help
+		Request firmware memory overwrite on the next reset.
+
+config HYPERV_FIXED_SMP_WORKLOAD
+	bool "Fixed scheduled secondary-CPU workloads"
+	default n
+	depends on HAVE_SMP && LIBUKBOOT_INITSCHEDCOOP
+	select LIBUKBOOT_FIXED_SMP
+	help
+		Start one BSP-prepared cooperative scheduler and persistent worker
+		on each x2APIC secondary CPU. This remains opt-in; the default
+		Hyper-V image is single CPU and all device/control workers stay on
+		the BSP.
+
+endif

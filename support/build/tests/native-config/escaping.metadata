@@ -1,0 +1,7 @@
+unikraft-native-config-metadata-v1
+symbol	BACKSLASH	string
+symbol	DISABLED	bool
+symbol	HEX_UPPER	hex
+symbol	KCONFIG_GENERIC_ESCAPE	string
+symbol	QUOTE	string
+symbol	ZERO	int

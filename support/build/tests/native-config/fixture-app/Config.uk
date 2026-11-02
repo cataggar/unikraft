@@ -1,0 +1,30 @@
+menu "Native configuration fixture application"
+
+config FIXTURE_STRING
+	string "Fixture string"
+
+config FIXTURE_INT
+	int "Fixture integer"
+
+config FIXTURE_HEX
+	hex "Fixture hex"
+
+config QUOTE
+	string "Quote"
+
+config BACKSLASH
+	string "Backslash"
+
+config KCONFIG_GENERIC_ESCAPE
+	string "Generic escape"
+
+config ZERO
+	int "Zero"
+
+config HEX_UPPER
+	hex "Upper-case hex"
+
+config DISABLED
+	bool "Disabled"
+
+endmenu

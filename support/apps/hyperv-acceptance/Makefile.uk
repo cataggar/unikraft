@@ -1,0 +1,34 @@
+$(eval $(call addlib,apphelloworld))
+
+APPHELLOWORLD_SRCS-y += $(APPHELLOWORLD_BASE)/main.c
+APPHELLOWORLD_SRCS-y += $(APPHELLOWORLD_BASE)/acceptance_protocol.c
+APPHELLOWORLD_SRCS-y += $(APPHELLOWORLD_BASE)/application_protocol.c
+APPHELLOWORLD_SRCS-y += $(APPHELLOWORLD_BASE)/application_network.c
+APPHELLOWORLD_SRCS-y += $(APPHELLOWORLD_BASE)/http_protocol.c
+APPHELLOWORLD_SRCS-y += $(APPHELLOWORLD_BASE)/http_service.c
+APPHELLOWORLD_SRCS-y += $(APPHELLOWORLD_BASE)/storage_target.c
+APPHELLOWORLD_SRCS-$(CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE) += \
+	$(APPHELLOWORLD_BASE)/persistence.c
+APPHELLOWORLD_SRCS-$(CONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK) += \
+	$(APPHELLOWORLD_BASE)/storage_benchmark.c
+APPHELLOWORLD_CINCLUDES-y += -I$(CONFIG_UK_BASE)/drivers/hyperv/vmbus/include
+APPHELLOWORLD_CINCLUDES-y += -I$(CONFIG_UK_BASE)/plat/hyperv/include
+
+ifneq ($(filter y,$(CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION) $(CONFIG_APPHYPERVACCEPTANCE_HTTP_SERVICE)),)
+include $(APPHELLOWORLD_BASE)/network-stack.mk
+APPHELLOWORLD_CINCLUDES-y += -I$(LIBLWIP_BASE)
+APPHELLOWORLD_CINCLUDES-y += -I$(CONFIG_UK_BASE)/drivers/hyperv/netvsc/include
+
+.PHONY: hyperv_acceptance_network_stack_verify
+UK_PREPARE-y += hyperv_acceptance_network_stack_verify
+hyperv_acceptance_network_stack_verify:
+	@test "$(LIBLWIP_TAG)" = "$(HYPERV_ACCEPTANCE_LWIP_UPSTREAM_TAG)"
+	@test "$(LIBLWIP_ORIGIN_SHA256)" = \
+		"$(HYPERV_ACCEPTANCE_LWIP_UPSTREAM_SHA256)"
+	@test "$$(git -C "$(LIBLWIP_BASE)" rev-parse HEAD)" = \
+		"$(HYPERV_ACCEPTANCE_LWIP_COMMIT)"
+	@test "$$(git -C "$(LIBLWIP_BASE)" remote get-url origin)" = \
+		"$(HYPERV_ACCEPTANCE_LWIP_REPOSITORY)"
+	@test -z "$$(git -C "$(LIBLWIP_BASE)" status \
+		--porcelain --untracked-files=all)"
+endif

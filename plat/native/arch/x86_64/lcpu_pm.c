@@ -179,8 +179,15 @@ UK_BOOT_EARLYTAB_ENTRY(boot_memregion_alloc_sipi_vect, UK_PRIO_EARLIEST);
 
 static int plat_native_lcpu_start(__u64 idx)
 {
+#if CONFIG_LIBUKBOOT_FIXED_SMP
+	uk_pr_info("Fixed SMP: send INIT to LCPU %lu/APIC %lu\n",
+		   idx, uk_pcpuvar_lval(idx, uk_pcpuvar_cpu_id));
+#endif
 	/* Send INIT IPI */
 	apic_send_iipi(uk_pcpuvar_lval(idx, uk_pcpuvar_cpu_id));
+#if CONFIG_LIBUKBOOT_FIXED_SMP
+	uk_pr_info("Fixed SMP: INIT sent to LCPU %lu\n", idx);
+#endif
 
 	/* Deassert */
 	apic_send_iipi_deassert();
@@ -203,8 +210,17 @@ static int plat_native_lcpu_post_start(const __u64 lcpuidx[], unsigned int *num)
 			continue;
 
 		for (j = 0; j < 2; j++) {
+#if CONFIG_LIBUKBOOT_FIXED_SMP
+			uk_pr_info("Fixed SMP: send SIPI %u to LCPU %lu/"
+				   "APIC %lu\n",
+				   j + 1, lcpuidx[i], id);
+#endif
 			/* Send STARTUP IPI */
 			apic_send_sipi(uk_plat_native_x86_64_start16_addr, id);
+#if CONFIG_LIBUKBOOT_FIXED_SMP
+			uk_pr_info("Fixed SMP: SIPI %u sent to LCPU %lu\n",
+				   j + 1, lcpuidx[i]);
+#endif
 
 			/* wait 200 usec (according to Intel manual 8.4.4.1) */
 			udelay(200);

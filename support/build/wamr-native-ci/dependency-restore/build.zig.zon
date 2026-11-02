@@ -1,0 +1,17 @@
+.{
+    .name = .wamr_dependency_restore,
+    .version = "0.0.1",
+    .fingerprint = 0x8a598b1ca322056d,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .miz_source = .{
+            .url = "git+https://github.com/cataggar/miz.git#66ea6701cf0e1b6d31e5f30fade00b7a546d4b44",
+            .hash = "miz-0.2.0-Z3lHlLgL2wDiGxutMJMDy9Qy4CLNCwOptwgQLp1ZDSiv",
+        },
+        .wamr_sdk_source = .{
+            .url = "git+https://github.com/cataggar/wamr#bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20",
+            .hash = "wamr-0.1.0-_KKF6RgUqwCKfMFTu8Jh5YiEDdwxBEkIpHavOCNMh1uV",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon" },
+}

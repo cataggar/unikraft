@@ -1,0 +1,110 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "namePrefix": { "type": "string", "minLength": 6, "maxLength": 32 },
+    "location": { "type": "string" },
+    "ownerRun": { "type": "string", "minLength": 36, "maxLength": 36 },
+    "imageSha256": { "type": "string", "minLength": 64, "maxLength": 64 },
+    "osDiskId": { "type": "string" },
+    "dataDiskId": { "type": "string" },
+    "vmSize": { "type": "string", "allowedValues": ["Standard_D2s_v5", "Standard_D2as_v5", "Standard_B2s"] }
+  },
+  "variables": {
+    "tags": {
+      "managed-by": "unikraft-hyperv",
+      "uk-direct-run": "[parameters('ownerRun')]",
+      "unikraft-run": "[parameters('namePrefix')]",
+      "image-sha256": "[parameters('imageSha256')]"
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2024-05-01",
+      "name": "[concat(parameters('namePrefix'), '-nsg')]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('tags')]",
+      "properties": { "securityRules": [] }
+    },
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2024-05-01",
+      "name": "[concat(parameters('namePrefix'), '-vnet')]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('tags')]",
+      "dependsOn": ["[resourceId('Microsoft.Network/networkSecurityGroups', concat(parameters('namePrefix'), '-nsg'))]"],
+      "properties": {
+        "addressSpace": { "addressPrefixes": ["10.73.0.0/24"] },
+        "subnets": [{
+          "name": "default",
+          "properties": {
+            "addressPrefix": "10.73.0.0/24",
+            "defaultOutboundAccess": false,
+            "networkSecurityGroup": { "id": "[resourceId('Microsoft.Network/networkSecurityGroups', concat(parameters('namePrefix'), '-nsg'))]" }
+          }
+        }]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2024-05-01",
+      "name": "[concat(parameters('namePrefix'), '-nic')]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('tags')]",
+      "dependsOn": ["[resourceId('Microsoft.Network/virtualNetworks', concat(parameters('namePrefix'), '-vnet'))]"],
+      "properties": {
+        "enableAcceleratedNetworking": false,
+        "enableIPForwarding": false,
+        "ipConfigurations": [{
+          "name": "primary",
+          "properties": {
+            "privateIPAllocationMethod": "Dynamic",
+            "subnet": { "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', concat(parameters('namePrefix'), '-vnet'), 'default')]" }
+          }
+        }]
+      }
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines",
+      "apiVersion": "2025-11-01",
+      "name": "[concat(parameters('namePrefix'), '-vm')]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('tags')]",
+      "dependsOn": ["[resourceId('Microsoft.Network/networkInterfaces', concat(parameters('namePrefix'), '-nic'))]"],
+      "properties": {
+        "hardwareProfile": { "vmSize": "[parameters('vmSize')]" },
+        "storageProfile": {
+          "diskControllerType": "SCSI",
+          "osDisk": {
+            "name": "[last(split(parameters('osDiskId'), '/'))]",
+            "osType": "Linux",
+            "createOption": "Attach",
+            "caching": "ReadOnly",
+            "deleteOption": "Detach",
+            "managedDisk": { "id": "[parameters('osDiskId')]" }
+          },
+          "dataDisks": [{
+            "lun": 7,
+            "name": "[last(split(parameters('dataDiskId'), '/'))]",
+            "createOption": "Attach",
+            "caching": "None",
+            "deleteOption": "Detach",
+            "managedDisk": { "id": "[parameters('dataDiskId')]" }
+          }]
+        },
+        "securityProfile": { "securityType": "Standard" },
+        "networkProfile": {
+          "networkInterfaces": [{
+            "id": "[resourceId('Microsoft.Network/networkInterfaces', concat(parameters('namePrefix'), '-nic'))]",
+            "properties": { "primary": true, "deleteOption": "Delete" }
+          }]
+        },
+        "diagnosticsProfile": { "bootDiagnostics": { "enabled": true } }
+      }
+    }
+  ],
+  "outputs": {
+    "vmId": { "type": "string", "value": "[resourceId('Microsoft.Compute/virtualMachines', concat(parameters('namePrefix'), '-vm'))]" }
+  }
+}

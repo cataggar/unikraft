@@ -1,0 +1,14 @@
+mainmenu "Native configuration escaping fixture"
+
+config QUOTE
+	string "Quote"
+config BACKSLASH
+	string "Backslash"
+config KCONFIG_GENERIC_ESCAPE
+	string "Generic escape"
+config ZERO
+	int "Zero"
+config HEX_UPPER
+	hex "Upper-case hex"
+config DISABLED
+	bool "Disabled"

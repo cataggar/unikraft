@@ -8,6 +8,7 @@
 #include <uk/plat/common/common.lds.h> /* for UK_SEGMENT_DATA */
 
 #define UKRELOC_SIGNATURE_SIZE		4
+#define UKRELOC_ENTRY_SIZE		24
 
 PHDRS
 {
@@ -23,6 +24,11 @@ SECTIONS
 		/* Start gathering static uk_reloc from the signature onwards */
 		. += UKRELOC_SIGNATURE_SIZE;
 		KEEP(*(.uk_reloc))
+		/* The post-link table also contains dynamic relocations and a
+		 * sentinel. LLVM objcopy cannot grow a section inside a segment.
+		 */
+		. += SIZEOF(.rela.dyn) + UKRELOC_ENTRY_SIZE;
+		_uk_reloc_end = .;
 	} UK_SEGMENT_DATA
 
 	/* For whatever reason, .dynsym wants to stay before .rela.dyn.
@@ -39,7 +45,6 @@ SECTIONS
 		*(.rela)
 		*(.rela.*)
 	} UK_SEGMENT_DATA
-	_uk_reloc_end = .;
 }
 INSERT BEFORE .bss
 

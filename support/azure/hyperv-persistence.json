@@ -1,0 +1,204 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "namePrefix": {
+      "type": "string",
+      "minLength": 6,
+      "maxLength": 32
+    },
+    "location": {
+      "type": "string"
+    },
+    "vmSize": {
+      "type": "string"
+    },
+    "osDiskId": {
+      "type": "string"
+    },
+    "dataDiskId": {
+      "type": "string"
+    },
+    "dataLun": {
+      "type": "int",
+      "minValue": 0,
+      "maxValue": 63
+    },
+    "imageSha256": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "seedSha256": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64
+    },
+    "operationId": {
+      "type": "string",
+      "minLength": 36,
+      "maxLength": 36
+    }
+  },
+  "variables": {
+    "vmName": "[concat(parameters('namePrefix'), '-vm')]",
+    "vnetName": "[concat(parameters('namePrefix'), '-vnet')]",
+    "nicName": "[concat(parameters('namePrefix'), '-nic')]",
+    "nsgName": "[concat(parameters('namePrefix'), '-nsg')]",
+    "tags": {
+      "managed-by": "unikraft-hyperv",
+      "purpose": "guarded-v2-two-boot-persistence",
+      "unikraft-run": "[parameters('namePrefix')]",
+      "image-sha256": "[parameters('imageSha256')]",
+      "seed-sha256": "[parameters('seedSha256')]",
+      "persistence-operation": "[parameters('operationId')]"
+    }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2024-05-01",
+      "name": "[variables('nsgName')]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('tags')]",
+      "properties": {
+        "securityRules": []
+      }
+    },
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2024-05-01",
+      "name": "[variables('vnetName')]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('tags')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
+      ],
+      "properties": {
+        "addressSpace": {
+          "addressPrefixes": [
+            "10.79.0.0/29"
+          ]
+        },
+        "subnets": [
+          {
+            "name": "default",
+            "properties": {
+              "addressPrefix": "10.79.0.0/29",
+              "defaultOutboundAccess": false,
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('nsgName'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2024-05-01",
+      "name": "[variables('nicName')]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('tags')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]"
+      ],
+      "properties": {
+        "enableAcceleratedNetworking": false,
+        "enableIPForwarding": false,
+        "ipConfigurations": [
+          {
+            "name": "primary",
+            "properties": {
+              "privateIPAllocationMethod": "Dynamic",
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), 'default')]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines",
+      "apiVersion": "2025-11-01",
+      "name": "[variables('vmName')]",
+      "location": "[parameters('location')]",
+      "tags": "[variables('tags')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
+      ],
+      "properties": {
+        "hardwareProfile": {
+          "vmSize": "[parameters('vmSize')]"
+        },
+        "storageProfile": {
+          "osDisk": {
+            "name": "[last(split(parameters('osDiskId'), '/'))]",
+            "osType": "Linux",
+            "createOption": "Attach",
+            "caching": "ReadOnly",
+            "deleteOption": "Detach",
+            "managedDisk": {
+              "id": "[parameters('osDiskId')]"
+            }
+          },
+          "dataDisks": [
+            {
+              "lun": "[parameters('dataLun')]",
+              "name": "[last(split(parameters('dataDiskId'), '/'))]",
+              "createOption": "Attach",
+              "caching": "None",
+              "writeAcceleratorEnabled": false,
+              "deleteOption": "Detach",
+              "managedDisk": {
+                "id": "[parameters('dataDiskId')]"
+              }
+            }
+          ]
+        },
+        "securityProfile": {
+          "securityType": "Standard"
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]",
+              "properties": {
+                "primary": true,
+                "deleteOption": "Delete"
+              }
+            }
+          ]
+        },
+        "diagnosticsProfile": {
+          "bootDiagnostics": {
+            "enabled": true
+          }
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "vmId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Compute/virtualMachines', variables('vmName'))]"
+    },
+    "vmUuid": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Compute/virtualMachines', variables('vmName')), '2025-11-01', 'Full').properties.vmId]"
+    },
+    "osDiskId": {
+      "type": "string",
+      "value": "[parameters('osDiskId')]"
+    },
+    "dataDiskId": {
+      "type": "string",
+      "value": "[parameters('dataDiskId')]"
+    },
+    "nicId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
+    }
+  }
+}

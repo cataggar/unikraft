@@ -1,0 +1,664 @@
+# Native Hyper-V host tool and supervised transfers
+
+This standalone Zig 0.17.0 package does not import the repository's root build,
+run any legacy controller, use Azure CLI, or acquire ambient credentials.
+The dependency-free `hyperv_core` foundation is combined with the pinned SDK
+transfer module in the `hyperv` facade. Its only installed executable is
+`uk-hyperv`; its explicit transfer command is a real network implementation,
+not a success-shaped stub. Azure execution remains paused. Local fixture
+results do not authorize execution or establish preflight/persistence acceptance.
+
+### Historical direct/public fixture retirement
+
+The legacy Python direct/public fixture harness (`direct/tests/*.py`,
+including `historical_owner.py`, `test_compute.py`, and `test_v2_lineage.py`)
+has been retired. Direct compute and v2 lineage/authority/handoff contracts are
+validated natively by `support/tools/hyperv/direct/build.zig` (`test` and
+`test-compute-runtime`) and the native WAMR CI build (`test-handoff-contracts`,
+`test-handoff-composition`, and `test-authority-contracts`).
+
+## Build and test
+
+From the repository root, using the already installed Zig 0.17.0 compiler:
+
+```sh
+CORE_WORK="$PWD/.d/zig-migration-transfer-core"
+umask 077
+mkdir -p "$CORE_WORK"/{tmp,home,cache,zig-global,zig-local,fixtures,out,restore}
+chmod 700 "$CORE_WORK" "$CORE_WORK"/{tmp,home,cache,zig-global,zig-local,fixtures,out,restore}
+export TMPDIR="$CORE_WORK/tmp" HOME="$CORE_WORK/home"
+export XDG_CACHE_HOME="$CORE_WORK/cache"
+export ZIG_GLOBAL_CACHE_DIR="$CORE_WORK/zig-global"
+export ZIG_LOCAL_CACHE_DIR="$CORE_WORK/zig-local"
+# Bind this restore's package directory explicitly, independently of ambient
+# ZIG_LOCAL_PKG_DIR, then disable fetching for every source-tree build.
+cp support/tools/hyperv/build.zig support/tools/hyperv/build.zig.zon "$CORE_WORK/restore/"
+zig build --build-file "$CORE_WORK/restore/build.zig" \
+  --fetch=all --pkg-dir "$CORE_WORK/restore/zig-pkg" \
+  --cache-dir "$CORE_WORK/restore/cache" -j2
+env -u ZIG_LOCAL_PKG_DIR zig build --build-file support/tools/hyperv/build.zig \
+  --system "$CORE_WORK/restore/zig-pkg" \
+  --cache-dir "$ZIG_LOCAL_CACHE_DIR" \
+  --prefix "$CORE_WORK/out" -Dtest-root="$CORE_WORK/fixtures" \
+  -j2 test-core test-transfer test-worker install --summary all
+```
+
+`test` requires an existing, current-user-owned, mode-0700 absolute test root.
+Every filesystem fixture gets a new private child of that root and removes only
+its own child afterward. Tests do not use `std.testing.tmpDir`, an interpreter,
+a shell subprocess, a network endpoint, or external images. The native process
+and injected-transfer fixtures are built only for tests and are not installed.
+Tests run on the build host even when the operator executable is cross-compiled.
+
+The current operating-system implementation requires Linux 5.11 or newer
+(`statx`, `close_range(CLOEXEC)`, and subreaper support); both AArch64 and x86-64
+are supported targets. Other operating systems fail compilation rather than
+silently weakening the file or supervision policy.
+
+### Shared full-file SHA256
+
+`core.Sha256` wraps Zig's standard SHA256; it does not replace compression.
+On Zig's self-hosted x86-64 backend with both SHA and AVX2, its existing
+C-ABI-safe `VZEROUPPER` leaf clears upper-vector state before updates and
+finalization. Other backends and CPU profiles keep the standard path.
+Compile-time hashing retains standard evaluation without native register work.
+The runtime fence avoids the legacy-SHA/dirty-AVX transition penalty observed on affected
+native Intel runners without changing optimization modes or file bytes.
+
+Every standalone core constructor, including direct process consumers in the
+root native build, links the same `sha256_clear_upper.S`. Literal-null sensitive
+reads are type-specialized: those existing no-hash reads, including the Zig
+build runner's native Make contract reader, need no hash-link dependency.
+Runtime optional and nonnull expected digests retain the fenced full hash.
+Shared private-file, preparation, transfer, persistence, host, custody, Azure and preflight
+hashing retains each independent complete pass, SHA256/MD5 comparison,
+snapshot, EOF/identity check and deadline. `test-sha256`, also included in
+`test-core` and persistence `test`, retains runtime and compile-time known-vector, streaming, `peek`
+and continuation equivalence. The producer and runner source guards
+independently pin the shared implementation, assembly and test dependency.
+
+Zig 0.17 reads CPU features from `builtin.target.cpu`; the SHA/AVX2 gate and
+C ABI fence are unchanged. Allocator sentinel methods retain the terminating
+zero byte for native argv and proc paths. Linux wait status storage retains its
+unsigned raw bits, with the signed `waitpid` pointer adapted only at the syscall
+boundary; termination, cancellation and cleanup diagnostics keep their existing
+schemas. Use `-Doptimize=debug` or `-Doptimize=safe` for checked qualification.
+The synthetic v1 sampling records keep their existing `Debug`/`ReleaseSafe`
+wire enum spellings; lowercase compiler mode names do not alter that contract.
+The explicit direct WAMR `historical-handoff` command revalidates only version-one
+imports bound to the existing immutable historical source revision/tree allowlist
+and frozen Zig 0.16 runtime/SDK/profile. Its SDK remains
+`a53205d77be3b880eb8f8b96679512ba58e2331a`. Ordinary `handoff` validation always
+requires Zig 0.17 and current SDK
+`bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20`, even if input strings quote historical
+pins. The historical command is not a fallback for failed current validation and does not
+relax artifact, boot, private-file or authority validation. The standalone direct
+`test-compute-runtime` selector checks rejection across those generation boundaries.
+`zig build` reads the private global cache from `ZIG_GLOBAL_CACHE_DIR` rather
+than accepting the old `--global-cache-dir` build option.
+Zig 0.17 defaults its package directory to `zig-pkg` beside the build file.
+Every source-tree build/fetch caller must instead bind an authenticated
+external depot with `--system`, or an explicit external `ZIG_LOCAL_PKG_DIR`.
+Untracked fetched source under `zig-pkg` is not a custody exclusion and must
+not be ignored to make source admission pass. Standalone restores bind their
+own `--pkg-dir`; a shared environment setting must not redirect them into
+another restore's depot.
+For system-only builds, remove inherited `ZIG_LOCAL_PKG_DIR` from that child
+environment: Zig 0.17 otherwise lets it override the supplied `--system`
+directory. Explicit restore `--pkg-dir` still takes precedence over the
+environment and remains scoped to that restore.
+The direct native process and lifecycle child fixtures strip debug metadata in both checked modes;
+its safety checks and synthetic runtime modes remain enabled. This keeps exact executable
+snapshotting within the existing 120–200 ms fixture deadlines despite the
+larger compiler-generated debug sections. Test drivers retain their selected
+optimization mode, and production executable selection and deadlines are not
+changed. Native lifecycle validation uses a separate uninstalled validator
+fixture; the installed production validator retains its existing build policy.
+
+## Local inspection CLI
+
+```text
+uk-hyperv inspect-json PRIVATE_DIRECTORY BASENAME
+uk-hyperv validate-binding PRIVATE_DIRECTORY BASENAME
+uk-hyperv inspect-diagnostic PRIVATE_DIRECTORY BASENAME
+```
+
+The directory must be mode 0700 and every ancestor must be owned by root or the
+current user, without group/other write permission. All path components are
+opened without following symlinks. Inputs must be current-user-owned mode-0600
+regular files with one hard link, at most 256 KiB.
+
+`inspect-json` reports only `canonical` and `valid` booleans, not input values.
+The other commands require canonical JSON. `validate-binding` checks a local
+immutable-input binding, **not** a build receipt, cloud admission, historical
+state conversion, or completed handoff. Its exact fields are:
+
+- `schema_version`: integer `1`;
+- `contract`: string `"uk.hyperv.input-binding"`;
+- `run_id`: canonical lowercase UUID;
+- `sha256`: 64 lowercase hexadecimal digits;
+- `byte_length`: unsigned 64-bit integer.
+
+`inspect-diagnostic` validates and emits a single allowlisted diagnostic.
+Inspection failures emit the versioned `Failures` object on stderr and exit 1.
+Unknown commands fail; arguments, input bytes, exception names,
+paths, resource identifiers, and raw process/HTTP output are never echoed.
+
+## Restricted transfer CLI
+
+```text
+uk-hyperv transfer PRIVATE_DIRECTORY JOB_BASENAME
+```
+
+This command validates private inputs, durably admits one attempt, starts the
+same native executable's restricted worker, and supervises it through `process`.
+It supplies an empty environment and descriptor-validated cwd; argv contains
+only the executable, internal command and simple job basename. SAS is loaded
+from a separate private file, never argv or environment. See the
+[transfer contracts](transfer/README.md#restricted-worker-and-parent-protocol)
+for the exact job, state and output interfaces.
+
+The public command emits a bounded `uk.hyperv.transfer-report` on stdout and
+exits 1 unless transfer, protocol delivery, state recording and process cleanup
+all succeed. A valid child report with exit 0 means protocol delivery only,
+not transfer success. The production binary cannot select an injected runtime.
+It replaces SDK log formatting with a fixed literal; raw SDK errors are never
+unwrapped or formatted.
+
+`test-core`, `test-transfer` and `test-worker` are focused selectors; `test`
+depends on all three. Dependencies, including versions and package hashes, are
+pinned in both manifests; the SDK commits are documented in the transfer README.
+The Hyper-V runtime fixture lane restores dependencies in scratch and runs
+all three selectors in Debug and ReleaseSafe. It also exercises the standalone
+transfer build in ReleaseSafe, without implicit source-tree fetching.
+
+## Credential-free integration lanes
+
+Three explicit fixture jobs in `.github/workflows/integration.yaml` feed the
+unchanged required **real image producer**, whose job ID and display name remain
+`zig-hyperv`:
+
+| Job | Complete coverage |
+| --- | --- |
+| `zig-hyperv-public-debug` | Debug public-image packaging/export and import: 14 + 14 tests, including complete physical image bytes and unchanged real-clock bounds. |
+| `zig-hyperv-runtime` | Operator custody; core/transfer/worker in both modes; standalone ReleaseSafe transfer; persistence in both modes including `test-arm`, `test-strip-equivalence`, `test-strip-proof` and parked CLI refusal; direct `test test-foundation test-controller test-lifecycle-native install`, unfiltered (85 foundation + 18 controller tests, 94 lifecycle cases / 890 controls). |
+| `zig-hyperv-build-protocol` | Build tools; explicit private Make positive/refusal; object/ABI proofs with both outer Debug/ReleaseSafe passes; consolidated image/compiler/regression graph; host in both modes and synthetic-key cross-compile size bound; postprocess on both fixture arches; ARM/credential and preflight in both modes including parked CLI refusal. |
+| `zig-hyperv` | Local-boot fixtures in both modes; all 28 ReleaseSafe public-image tests/install; standalone pinned miz; fresh acceptance/SMP solve/build and proofs; separately pinned native QEMU acquisition; native and legacy exact-image four-boot APIC paths; two-CPU SMP boot; native export/import/reload and bounded evidence; unchanged opt-in legacy #87 prepared-image outputs. |
+| `zig-hyperv-complete` | Result-only guard requiring all three fixtures and the real producer to report `success`; no checkout, tools, image work, outputs or artifacts. |
+
+```text
+zig-hyperv-public-debug ---+
+zig-hyperv-runtime --------+--> zig-hyperv: dependency guard -> real producer
+zig-hyperv-build-protocol -+
+
+all three fixture results + zig-hyperv result
+  -> zig-hyperv-complete: require all four successes
+
+zig-hyperv-preparation remains independently scheduled and required.
+All eleven existing required contexts are retained; completion is additive.
+```
+
+The producer explicitly needs all three fixture jobs and uses job-level
+`!cancelled()`, not `always()`, so a running producer can actually be cancelled.
+Its first, checkout-free guard requires all three named results to equal
+`success`, including when a failed or skipped dependency permits scheduling.
+Image/setup steps additionally require `success() && !cancelled()`. A skipped
+producer is never interpreted as successful.
+
+The separate `zig-hyperv-complete` job explicitly needs all four results and
+uses job-level `always()` only for its single result-checking step. Its guard
+rejects missing, failed, cancelled, timed-out (normally reported as failure),
+or skipped fixture/producer results, including a producer cancelled before
+starting. It has `permissions: {}` and a five-minute timeout. It is not the
+image producer and does not emit source-job fields or image artifacts.
+Cancellation truth comes from the cancelable producer and the actual job
+results, not an assumed independent workflow-cancellation signal in an
+always-running job. If all four jobs actually completed successfully before
+a later workflow cancellation, the result-only completion guard can succeed;
+it does not claim retroactive cancellation of completed work.
+
+The existing Python unittest workflow tests execute the actual producer guard
+over all 216 three-result combinations and the actual completion guard over
+all 1,296 four-result combinations, plus individually unset bindings. They
+enforce the job scheduling policies structurally. This is deterministic
+result-checking coverage, not an Actions scheduler emulator or proof of
+cancellation-message propagation. A successful evidence upload is never
+authority to hide a non-success job result.
+
+Each fixture job grants only `contents: read` and `attestations: read`, disables
+checkout credential persistence, and runs on its own ordinary-user Ubuntu
+runner. Attestation read access is required by the pinned ghr bootstrap and
+downstream public verification; verification is not skipped. The shared local
+setup action independently restores pinned compiler/LLVM/shared-QEMU inputs and
+private cache directories; it is not a central prerequisite for other jobs.
+There are no cross-job tool/image artifacts or shared mutable caches, ledgers,
+fixture roots or suite directories. Runtime custody/persistence diagnostics move
+to `zig-hyperv-runtime-evidence`, retaining the existing bounded file inventory.
+Native direct uses a fresh private checkout-local `.d/` parent; the suite child
+must not already exist. Existing namespace/host-isolation fixtures retain their
+supported Actions context and must not be run by spoofing that context on a
+shared development host. No Azure credentials, OIDC grants, runner enrollment,
+seed production, resource creation, cloud admission or recovery are added.
+
+### User-approved additive required context
+
+The user explicitly approved adding `zig-hyperv-complete`, not replacing or
+renaming any existing required context. The intended twelve-context protection
+set retains GitHub Actions app **15368**, strict/up-to-date checks and admin
+enforcement:
+
+- `libc-test (qemu, x86_64)`
+- `self-test (qemu, x86_64)`
+- `helloworld (qemu, x86_64)`
+- `helloworld (qemu, arm64)`
+- `helloworld (xen, x86_64)`
+- `helloworld (fc, x86_64)`
+- `zig-helloworld`
+- `zig-helloworld-arm64`
+- `static-analysis`
+- `zig-hyperv`
+- `zig-hyperv-preparation`
+- `zig-hyperv-complete` (additive)
+
+Publication and protection activation remain parent/integrator-owned. After
+the protected predecessor merge, independent review and affected qualification,
+publish the lane PR **without auto-merge**. Once the new Actions check has
+emitted, add its approved required context and verify all eleven old contexts,
+app bindings, strictness and admin enforcement remain intact. Only then enable
+exact-head protected auto-merge. This workflow change does not itself modify
+branch protection or authorize any cloud activation.
+
+### Existing helper contracts and measurements
+
+`.github/scripts/hyperv-native-public-fixtures.sh` accepts one optional mode,
+`Debug` or `ReleaseSafe`; no argument still runs both. Each invocation restores
+beside copied manifests outside the checkout and uses pinned `--system` inputs.
+The helper creates the global-cache `tmp` child before SQLite ZIP restoration,
+so the independent Debug lane does not rely on an earlier compiler build.
+Mode-specific cache, fixture, import-fixture and installation paths are unchanged.
+The build/protocol lane invokes `.github/scripts/hyperv-native-proofs-ci.sh` for
+linked-image proofs, compiler probes and focused regressions in one build
+graph/cache namespace. Regression
+already depends on the proof and compiler selectors; the combined invocation
+retains the full target union and proof-tool installation without running those
+dependencies twice. Proof unit coverage still selects both optimization modes
+internally, and the workflow retains separate Debug/ReleaseSafe object-verifier
+passes. The broad regression target retains its legacy Python dependencies.
+These credential-free CI helpers run from the repository
+root with the workflow's pinned tools and `RUNNER_TEMP` setup. Public-image
+dependencies are restored beside copied manifests outside the checkout;
+optimization modes retain separate caches, fixture roots and installed tools.
+The helpers print elapsed, user and system seconds alongside the existing Zig
+build summaries, including timings on failure. Public-image timings separate
+restore, each mode and the total; they are observations, not image admission or
+a claim of reduced critical-path latency. Per-phase timing remains in nested
+subshells so the aggregate reports `total` on success and failure.
+
+This partition has **no measured latency claim**. The model target is at most
+35 minutes median across at least five comparable cold all-required-context
+runs; retain the real producer's 60-minute timeout. The result-only completion
+guard has its own five-minute timeout. Future naturally occurring
+Actions runs must report queue delay separately, cold setup/restoration overhead,
+critical-path elapsed time and total runner-minutes, plus median and maximum.
+Do not dispatch a benchmark fleet implicitly. Native QEMU `v11.0.50-z.7` and
+shared/legacy QEMU `v11.0.91-z.15` remain distinct. Legacy regression and prepared
+image assertions still need Python; the whole workflow is not Python-free.
+
+## Preflight engine integration
+
+The separate [native preflight package](preflight/README.md) implements the
+single-use execution, signed six-boot evidence, cleanup and completed-state
+loader. Its standalone `test` selector exercises native adapters and supervised
+children in Debug and ReleaseSafe in `zig-hyperv-build-protocol`, a mandatory
+fixture dependency of the required `zig-hyperv` producer.
+
+This is not yet an operator preflight command. The installed
+`uk-hyperv-preflight-worker` refuses execution with exit 2 until the trusted
+preparation and independent authority/image/provider/route bindings are wired.
+Neither ordinary input structs nor absent VM-agent metadata establishes that
+admission. The `uk-hyperv` commands above remain unchanged.
+
+## Public local boot driver
+
+The separate [native local-boot package](local_boot/README.md) installs
+`uk-hyperv-local-boot` for public QEMU/KVM EFI and exact read-only raw-disk
+assertions. Dedicated native fixtures and the CI fixed two-CPU SMP boot use it.
+It retains bounded raw serial evidence and independent process/recording
+failures, but establishes no host, storage, network or Azure admission.
+Other legacy controller/CI paths remain until their separate native cutover.
+
+## Module interfaces
+
+Import build module `hyperv` for the facade, `hyperv_transfer` for transfers,
+or dependency-free `hyperv_core` (`core.zig`) for these foundation interfaces.
+The facade's `root.zig` needs those two named module imports wired by the build.
+
+The separate [persistence engine](persistence/README.md) exports
+`hyperv_persistence` for the exact two-boot state machine, serial evidence,
+typed workers and independent cleanup. Its standalone `test test-arm` selectors
+run both the engine and affected shared ARM fixtures in CI. The installed
+`uk-hyperv-persistence-engine` supports local inspection only; execution remains
+closed until the real preparation/completed-preflight loaders, independent
+authority and outer crash-recovery supervision are integrated. These APIs do
+not add persistence commands to the public `uk-hyperv` facade.
+
+### `contracts`
+
+- `Document.parse(allocator, bytes, Limits)` owns its parsed data until `deinit`.
+  A bounded scanner runs before the standard JSON parser. Duplicate decoded
+  keys, including escape-equivalent keys, are rejected at every depth.
+- Defaults: 256 KiB input, depth 16, 4096 decoded bytes per string, 256 members
+  per object/array, 8192 tokens. Caller-selected bounds have hard upper caps.
+- Numbers preserve their lexical form. Only canonical decimal integers in
+  `[-2^63, 2^64-1]` are admitted: no floats, exponents, leading zeroes, `-0`,
+  non-finite constants, bool-as-integer, or numeric strings.
+- `exactFields`, `integer(T, value)`, `enumeration(T, value)`, and `string`
+  implement schema-specific checking without permissive struct coercion.
+- `canonicalAlloc` / `requireCanonical`: compact UTF-8 JSON, byte-sorted object
+  keys at all levels, minimal standard JSON string escaping, exactly one final
+  LF. This is the native contract, not a claim of RFC 8785 compatibility.
+- `parseSha256` and `parseUuid` return fixed byte arrays. UUID spelling does
+  **not** establish version, variant, non-nil identity, or workflow authority;
+  each owning schema must impose those policies.
+- `SensitiveDocument.parse` uses the same strict parser but owns a stable
+  wiping allocator. Scanner copies, decoded keys/strings, parser arenas,
+  canonicalization copies and failed partial parses are cleared on release.
+  `requireCanonical(source)` uses that allocator internally; `deinit` is
+  mandatory. The caller owns and must clear the original source buffer.
+- `Geometry.byteSize` requires positive 512-byte-sector geometry and checks
+  multiplication overflow. Owning schemas must additionally bind exact sector
+  counts, LUNs, and original identities.
+
+### `sensitive`
+
+`Allocator { backing }` is a wiping allocator adapter. Keep the adapter's
+address stable until every allocation is released. In-place resize/remap is
+refused so relocation cannot bypass a wiping free. `Buffer.bytes()` exposes
+only the read length; `Buffer.deinit()` clears the entire allocation, including
+the overflow-probe byte. Do not release it with an ordinary allocator free.
+These APIs do not clear independently copied caller data or caller-owned files.
+Forced process death cannot promise userspace destructors; the supervisor must
+reap the worker's address space and retain explicit unresolved-cleanup state.
+
+### `diagnostics`
+
+`Diagnostic` contains only `Stage`, `Category`, `http_status: ?u16`, and
+`ServiceCode`. HTTP status is an actually observed value in 100–599 or `null`.
+A null status requires `service_code = unavailable`. A present status does not
+establish side-effect certainty or imply a request is safe to replay.
+
+Service codes are enumerated. `classifyServiceCode` and
+`reconcileServiceCodes` inspect raw codes transiently without retaining them:
+
+- `unavailable`: no code was provided;
+- `unknown`: a syntactically plausible but unallowlisted code;
+- `malformed`: empty, oversized, or invalid code syntax;
+- `conflicting`: header and body codes disagree.
+
+Transport adapters remain responsible for bounded header/XML/JSON extraction,
+observed status, and distinct side-effect certainty. A 403 is not absence.
+`RoleAssignmentNotFound` is recognized for role-specific absence handling;
+its classification does not make it a generic resource/group absence proof.
+The shared allowlist includes `LeaseIdMismatchWithBlobOperation`,
+`AuthorizationServiceMismatch`, `KeyBasedAuthenticationNotPermitted`,
+`InvalidBlobType` and `PendingCopyOperation`. The old undocumented
+`LeaseIdMismatchWithBlob` spelling stays unknown. Transfer `MetadataState`
+retains each header/body source independently; its aggregate maps `absent` to
+core `unavailable` and the other sentinel states by name. Do not flatten those
+sources or infer effects from this summary.
+
+`Failures` has schema version 1 and independent nullable `primary`, `cleanup`,
+and `recording` diagnostics. `record` retains the first error in each lane;
+`parse` checks exact fields and typed diagnostics; `write` emits canonical JSON.
+None of these objects has a message, body, stderr, resource-ID, path, or SAS
+field. Never serialize private `process.Result` as a public diagnostic.
+
+### `private_files`
+
+- `Directory.open` retains a descriptor for an already prepared private root.
+  `openFile` checks metadata on a nonblocking, no-follow descriptor, refusing
+  FIFO/device/directory/symlink/hard-link inputs without blocking on a FIFO.
+- `read` has an explicit byte bound, checks size/timestamps before and after
+  descriptor reads, and can verify an expected SHA-256. A hash supplied by the
+  owning immutable contract is necessary for adversarial content substitution.
+- `readSensitive` and `readSensitiveAbsolute` return `sensitive.Buffer`, with
+  no unzeroized intermediate copy, including read/hash rejection paths. Use
+  these for private requests, SAS and sensitive JSON. Ordinary `read` clears
+  its intermediate but returns an ordinary caller-owned copy, not a secret API.
+- `openAbsolute(io, path, policy)`, `FileParent`, `snapshot` and `sameSnapshot`
+  centralize descriptor-safe file access. `.private` requires owner-only
+  directories and current-user 0600 single-link files. `.artifact` is distinct:
+  a no-follow regular file in a trusted path, without forcing private mode,
+  ownership or single-link policy. Transfers additionally enforce its exact
+  size, immutable SHA-256, metadata and final pathname binding.
+- `Directory.openWorkerCwd` adopts and checks the inherited descriptor-relative
+  working directory; it does not discover a credential or authority path.
+- `Directory.lock` obtains a nonblocking exclusive lock on `.writer.lock`.
+  The stable lock inode is never replaced or removed by this API.
+- `Locked.commit` replaces state atomically; `Locked.createImmutable` uses
+  atomic nonreplacement for immutable input. Both require a live lock guard,
+  simple non-hidden basenames, and at most 4 MiB. Callers must validate and
+  canonicalize their owning schema first.
+- The standard library's `std.Io.File.Atomic` supplies atomic staging/link/rename.
+  The wrapper verifies private metadata and adds file fsync before publication,
+  directory fsync after publication, and separate cleanup/recording failures.
+- `CommitResult.status` is `not_committed`, `publication_unknown`,
+  `visible_not_durable`, or `durable`. A failed publication syscall has an
+  explicitly unknown outcome; a directory-sync failure after successful
+  publication must not be treated as rollback. Retain failed state and reconcile
+  it instead of blindly retrying a mutation.
+- `Locked.close` releases the lock, but borrows rather than closes `Directory`.
+  No transfer of writer ownership is allowed while a prior process has
+  unresolved cleanup.
+
+The facade's existing filesystem policy was reviewed; its helper functions
+are private and remain unchanged. This package reuses standard file/atomic
+operations and implements only the additional private-data policy. It adds
+no ELF, configuration, guest-build, or packaging implementation.
+
+### `process`
+
+Call `initialize` explicitly in a dedicated native supervisor: it enables the
+Linux child-subreaper policy. `run(allocator, io, Options)` requires an absolute
+executable, explicit environment map and directory, a monotonic `Deadline`,
+and an independent cleanup budget (100 ms to 30 minutes).
+
+The module owns fork/exec and a nonblocking, bounded exec-status handshake.
+This narrow implementation is necessary because Zig 0.16's
+`Threaded.processSpawnPosix` discards PID/pipe ownership on an exec error.
+All allocations precede fork; the child uses only Linux syscalls before exec.
+Exec preserves only stdio, and parent-death signaling binds the direct child.
+No executable/PATH discovery, automatic mutation retry, or shell command
+construction is supplied. Owning workflows must allowlist fingerprinted native
+executables and must not place credentials in argv.
+
+Stdout is captured under a hard cap; stderr is discarded under an independent
+cap. Deadlines and the optional atomic cancellation flag are checked while
+draining both streams. Output is returned only for a successful child with
+complete cleanup; failed stdout storage is zeroized, and `deinit` zeroizes all
+capture storage.
+
+Cleanup always runs, including after a successful leader exits. It signals
+the owned process group with TERM then KILL and reaps adopted descendants.
+The leader is not reaped until the final signal, preventing PID/PGID-reuse
+signals. Cleanup receives a fresh budget, not the expired primary deadline.
+An incomplete cleanup records a separate diagnostic and poisons the supervisor:
+later `run` calls fail, and the caller must retain state/lock ownership and
+escalate to independent cleanup. There is intentionally no reset/rearm API.
+
+This is process-group supervision of trusted native tools, not a sandbox:
+descendants must not call `setsid`/escape their group, change credentials,
+or install another child reaper. The dedicated supervisor must have no
+unrelated child reapers. Kernel-uninterruptible processes cannot be guaranteed
+to disappear by a userspace deadline; unresolved cleanup is explicit failure,
+never success. Parent-death signaling alone does not replace independent
+whole-tree cleanup after a supervisor crash. Native controller/parent/host
+state machines must implement that higher-level recovery protocol.
+
+`runCommand(allocator, io, CommandRequest)` is a separate opt-in internal
+contract for controllers that need ordinary Linux detached-child cleanup.
+It does not change `run` or `runPrivate`, and there is no user-facing command
+wrapper. `CommandRequest` borrows an `Executable` opened with
+`Executable.open`; the retained descriptor, physical identity and full-content
+SHA-256 select the source object without reopening its pathname.
+`Executable.open` accepts only regular, non-set-ID, executable native 64-bit
+little-endian ELF `ET_EXEC`/`ET_DYN` images no larger than 256 MiB, with bounded
+program headers, valid segment alignment and an executable entry point. It
+rejects shebang scripts, executable text, truncated/malformed ELF, and foreign
+architectures with `error.UnsupportedExecutableFormat` before spawn.
+
+Before every command launch, the supervisor revalidates the retained source,
+copies it only through descriptor reads into a newly created anonymous
+executable memfd, compares the complete source hash and physical identity
+before and after the copy, validates the copied ELF, and applies the Linux
+write/grow/shrink/seal seals. `execveat(AT_EMPTY_PATH)` receives only that
+sealed snapshot descriptor. Source pathname replacement or removal therefore
+does not redirect execution, and post-seal writes fail. A validated ELF
+`PT_INTERP` remains supported, including dynamically linked WAMR tools; no
+script pathname is reopened and no ambient shell/interpreter is selected.
+The caller owns the retained source descriptor until `Executable.close`; the
+supervisor closes every per-run snapshot on every return path. The request also
+supplies explicit argv, environment and cwd, one absolute primary `Deadline`,
+one independent absolute cleanup `Deadline`, optional cancellation, and fixed
+limits. Source identity is checked again after cleanup to preserve the explicit
+persistent/accidental input-custody signal even though execution is isolated
+from later source-file writes.
+
+The command mode requires an authority-free Linux 5.11-or-newer host with
+procfs, child-subreaper support, pidfds, `pidfd_send_signal`, executable memfds
+and file seals. On kernels that define `MFD_EXEC` it is requested explicitly;
+Linux 5.11-era kernels use the original executable-memfd behavior. A host
+policy or LSM that denies executable memfds produces the explicit
+`ExecutableSnapshotUnsupported`/`snapshot_unsupported` outcome; there is no
+fallback to mutable pathname execution. It requires a dedicated process with
+no pre-existing children. During cleanup it scans bounded procfs records,
+traces parentage from the unreaped leader or the subreaper, validates
+`/proc/PID/stat` start ticks around `pidfd_open`, and keeps the leader and
+discovered ancestors unreaped until all live descendants have been signalled.
+This includes ordinary children that call `setsid()` and ordinary double-fork
+descendants adopted by the subreaper. Every exact live pidfd receives TERM and,
+if it remains live after the one fixed grace interval, KILL. Matching unreaped
+zombies remain owned and count against descendant/reap limits, but are never
+signalled. A candidate whose numeric parent matches a tracked entry is not
+opened or signalled until that parent's retained pidfd is still live and
+`/proc` still reports the recorded PID/start identity; the proof is repeated
+after the candidate itself is pinned and verified. An exited/reaped parent
+therefore causes a rescan for subreaper adoption instead of admitting a
+recycled PID, while contradictory live identity evidence poisons cleanup. Only
+after a final stable discovery pass reports no live owned process does the
+supervisor reap each tracked child and consume one final bounded `ECHILD`
+observation. Escaped writers cannot extend the primary deadline: pipes are
+nonblocking, bounded, finally drained after proven cleanup, and always closed.
+
+An `ENOENT` or `ESRCH` while opening or reading a stat entry means that the
+process disappeared, not that procfs is unavailable. Unpinned scan candidates
+are skipped; missing metadata for a pinned identity still requires its retained
+pidfd to corroborate exit. Other stat I/O errors and malformed records remain
+cleanup failures.
+
+Primary and cleanup time do not accumulate or restart per output event,
+descendant, signal or reap. Defaults are 64 KiB per output stream, 64
+descendants plus one bounded first-excess observation, one million primary and
+cleanup events, 262,144 proc entries per scan, 512 reap events, and one 100 ms
+TERM grace. Hard maxima are 4 MiB per stream, 256 requested descendants, ten
+million events, one million proc entries per scan, 1,024 reap events, 128 argv
+items/256 KiB argv, 256 environment entries/256 KiB environment, and a 4,095
+byte executable path. `reap_events` must be at least `descendants + 3`: one
+event each for the leader, every requested descendant, the retained first
+excess sentinel, and the terminal `ECHILD` observation.
+
+Capture remains separate by default, including the existing per-stream limits
+and retained stdout-file sink. Trusted callers may explicitly set
+`CommandRequest.capture = .{ .merged = aggregate_bytes }` to connect child
+stdout and stderr to the **same pipe before exec**. Kernel pipe order is
+retained, including binary bytes; this is not concatenation or polling-order
+reconstruction of independent streams. The merged cap accepts exactly that
+many bytes and stops primary execution on the first excess byte, entering the
+same bounded TERM/KILL, descendant-discovery and reap protocol immediately
+rather than waiting for the primary deadline. Its cap must be nonzero and at
+most 8 MiB; existing `CommandLimits` validation remains unchanged. In this
+opt-in mode only, the merged cap replaces the two separate capture budgets:
+`CommandResult.stdout` and `stdout_status` hold the merged bytes/status, while
+`stderr` is empty and `stderr_status` is complete. No result fields or persisted
+command records are added. A merged request with `stdout_file` is refused with
+`error.InvalidOptions` before spawn; the supervisor never redirects a merged
+stream into a caller's sink implicitly.
+
+Merged timeout/cancellation and failures retain their bounded partial byte
+prefix, executable identity and independent cleanup evidence just like command
+mode's separate capture. An inherited merged pipe is drained after proven
+descendant cleanup; incomplete cleanup still poisons the entire supervisor.
+Neither `run` nor `runPrivate` offers this opt-in or changes its behavior.
+The shared fixtures (ordered descriptor writes, aggregate boundaries, live and
+stopped leaders, inherited pipes, KILL/reap and irreversible cleanup poison)
+can be run with `zig build --build-file support/tools/hyperv/direct/build.zig
+test-command -Dtest-root=/absolute/private/fixtures`, using the normal external
+SDK/cache options for this repository. `test-runtime` includes those cases
+alongside the unchanged private-process and direct-runtime regressions.
+Guarded producer/runner hashes are deliberately not updated by this API change;
+outer guarded gates require separate approval of the exact new source bytes.
+
+`CommandResult` owns zeroized bounded stdout/stderr storage and reports the
+leader's primary outcome, termination, deadline/cancellation observations,
+per-stream completion/overflow/I/O status, executable stability, descendant
+count/adoption/identity validation and first-excess state, fixed event/reap
+counts, plus an independent `CommandCleanup`. A first excess is reported and
+cleaned when it is the only excess, but makes `succeeded()` false. Untracked
+additional descendants, identity ambiguity, signal/reap/proc failures, or
+cleanup-deadline exhaustion make cleanup incomplete and irreversibly poison
+the supervisor. No later call can turn that uncertainty into success.
+
+This mode cleans cooperative or accidentally detached descendants owned by the
+subreaper. The sealed executable snapshot narrows only executable-object
+selection. It does not protect arbitrary input/data trees and does not make
+this a security boundary against a malicious concurrent same-UID process or a
+compromised child. It does not add PID, user or mount namespaces, capabilities,
+privileged admission, Azure credentials/authority, or crash recovery.
+Credential changes, a descendant installing a nearer subreaper,
+kernel-uninterruptible tasks, procfs/pidfd denial, and other unsupported kernel
+escape mechanisms can make proof impossible; the result is explicit cleanup
+failure and poison, not a custody claim. Use the separate operator guard only
+where its namespace custody contract is explicitly required.
+
+## Native operator process custody
+
+The separate [operator guard](operator_guard/README.md) provides kernel-backed
+PID-namespace custody, latched cancellation and signed stopped-process
+witnesses. Its persisted witness permits only separately authorized cleanup
+and retains publication uncertainty; it cannot admit a completed attempt.
+The production entry remains closed until actual preparation, engine,
+authority and aggregate-budget bindings are integrated. Dedicated CI uses
+ReleaseSafe children without weakening runtime checks to reduce their size.
+
+## Assertion-to-native-test mapping
+
+`tests.zig` covers these migration-foundation assertions:
+
+| Assertion | Native cases |
+| --- | --- |
+| Strict contracts | decoded duplicate keys, nested duplicates, non-UTF-8, exact fields/schema, bool/string-as-integer, signed/unsigned limits, overflow |
+| Bounded/canonical JSON | input/depth/string/member/token caps, nested key order, escaped spelling, final LF |
+| Identity/geometry | lowercase fixed-width SHA/UUID, malformed variants, sector-size/zero/overflow checks |
+| Secret-safe diagnostics | missing/unknown/malformed/conflicting codes, invalid status/enums/extra message fields, independent first failures and canonical round-trip |
+| Private filesystem | private modes/ancestors, symlink traversal, hard links/FIFO/directories, bounded/hash-bound reads, exclusive immutable creation |
+| Durable ownership | lock contention/stable inode, closed-guard rejection, atomic file-sync/rename/directory-sync failure boundaries, old/new visibility and scratch cleanup |
+| Native subprocesses | exact stdout cap, stderr cap/disposal, nonzero/missing executable, deadline/active cancellation, TERM-resistant child, grandchild/orphan reaping |
+| Inheritance isolation | private lock descriptor absent after exec, empty explicit environment, no failed output exposed |
+| Sensitive allocation lifecycle | zero-before-free observer for reads/hash failures, scanner/decoded strings, canonicalization, malformed/duplicate JSON, resize and allocation failures |
+
+`transfer/worker_tests.zig` runs real native child processes through the same
+restricted entry and supervisor, using a separately built injected HTTP
+runtime. Cases cover normal Blob/page transfers, shared artifact policy,
+partial and blocked mutations, cancellation/deadline, malformed/stale/flooded
+output, independent metadata and failure lanes, request substitution, consumed
+attempts, strict job/report schemas, and pre-transport recording failure.
+The public production CLI is also invoked with a deliberately missing synthetic
+source, proving native worker dispatch and durable failure reporting with zero
+HTTP attempts. Terminal-status contradictions and post-child lock failures have
+dedicated regressions.
+
+Durability error tests inject failure at the filesystem-operation boundaries;
+they do not claim to simulate a power loss or certify storage hardware.
+Live transport acceptance, credentials, source receipts, controller state machines, boot evidence,
+original acceptance artifacts, and production CI migration remain separate
+work. No cloud acceptance is authorized by passing these tests.

@@ -75,9 +75,7 @@ void _uk_waitq_remove(struct uk_thread *thread)
 static inline
 void _uk_waitq_block_until(struct uk_thread *thread, __snsec deadline)
 {
-	uk_thread_set_wakeup(thread, deadline);
-	uk_thread_set_blocked(thread);
-	uk_sched_thread_blocked(thread);
+	uk_thread_block_until(thread, deadline);
 }
 
 /**
@@ -286,6 +284,31 @@ void uk_waitq_wake_up_one(struct uk_waitq *wq)
 		_uk_waitq_wake(wq, t);
 	_uk_waitq_unlock(wq, flags);
 }
+
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+/*
+ * Wake at most one waiter and report whether its runnable transition was
+ * committed before a remote kick failed.
+ */
+static inline
+int uk_waitq_wake_up_one_published(struct uk_waitq *wq, int *published)
+{
+	struct uk_waitq_ticket *t;
+	unsigned long flags;
+	int rc = 0;
+
+	UK_ASSERT(published);
+	*published = 0;
+	_uk_waitq_lock(wq, flags);
+	t = uk_list_first_entry_or_null(&wq->waiters,
+					struct uk_waitq_ticket, link);
+	if (t)
+		rc = uk_thread_wake_published(
+			uk_thread_of_wait_ticket(t), published);
+	_uk_waitq_unlock(wq, flags);
+	return rc;
+}
+#endif
 
 #define _uk_waitq_wake_up_if_then(wq, ticket, condition, aftermath)	\
 do {									\

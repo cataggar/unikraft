@@ -1,0 +1,705 @@
+// SPDX-License-Identifier: BSD-3-Clause
+const std = @import("std");
+const builtin = @import("builtin");
+const core = @import("hyperv_core");
+const controller = @import("wamr_controller");
+const files = core.private_files;
+const contracts = controller.handoff_contracts;
+const copy = @import("retained_copy.zig");
+const products = @import("public_products.zig");
+const validation = controller.import_validator_build;
+
+pub const Settings = struct {
+    attempt_id: ?[]const u8 = null,
+    subscription: ?[]const u8 = null,
+    prefix: ?[]const u8 = null,
+};
+pub const Source = union(enum) {
+    private_bundle: *controller.accepted_run.PrivateBundle,
+    imported_product: *products.ImportedProduct,
+
+    fn bundle(self: Source) !*controller.accepted_run.PrivateBundle {
+        return switch (self) {
+            .private_bundle => |owner| owner,
+            .imported_product => |owner| if (owner.publication == .durable and owner.bundle != null)
+                &owner.bundle.?
+            else
+                error.ImportNotPublished,
+        };
+    }
+    fn revalidate(self: Source, signal: ?*core.process.SignalCancellation) !void {
+        switch (self) {
+            .private_bundle => |owner| try owner.revalidate(signal),
+            .imported_product => |owner| try owner.revalidate(signal),
+        }
+    }
+};
+pub const Invocation = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source: Source,
+    output: []const u8,
+    validation_output: []const u8,
+    settings: Settings = .{},
+    signal: ?*core.process.SignalCancellation = null,
+};
+pub const Phase = enum { inputs, native_validation, bindings, admission, publication, final_revalidation };
+pub const Diagnostic = struct { phase: Phase, err: anyerror, publication: files.CommitStatus = .not_committed };
+pub const Outcome = union(enum) { success: *Finalized, refused: Diagnostic, poisoned: Diagnostic };
+
+pub const Artifact = struct { path: []const u8, sha256: []const u8, size: u64 };
+pub const Identity = struct {
+    wamr_revision: []const u8,
+    wasm_sha256: []const u8,
+    cwasm_sha256: []const u8,
+    coremark_wasm_sha256: ?[]const u8 = null,
+    coremark_cwasm_sha256: ?[]const u8 = null,
+    coremark_nofp_wasm_sha256: ?[]const u8 = null,
+    coremark_nofp_cwasm_sha256: ?[]const u8 = null,
+    runtime_sha256: []const u8,
+    compiler_sha256: []const u8,
+    config_sha256: []const u8,
+
+    pub fn jsonStringify(self: Identity, jws: anytype) !void {
+        try jws.beginObject();
+        try jws.objectField("wamr_revision");
+        try jws.write(self.wamr_revision);
+        try jws.objectField("wasm_sha256");
+        try jws.write(self.wasm_sha256);
+        try jws.objectField("cwasm_sha256");
+        try jws.write(self.cwasm_sha256);
+        if (self.coremark_wasm_sha256) |value| {
+            try jws.objectField("coremark_wasm_sha256");
+            try jws.write(value);
+        }
+        if (self.coremark_cwasm_sha256) |value| {
+            try jws.objectField("coremark_cwasm_sha256");
+            try jws.write(value);
+        }
+        if (self.coremark_nofp_wasm_sha256) |value| {
+            try jws.objectField("coremark_nofp_wasm_sha256");
+            try jws.write(value);
+        }
+        if (self.coremark_nofp_cwasm_sha256) |value| {
+            try jws.objectField("coremark_nofp_cwasm_sha256");
+            try jws.write(value);
+        }
+        try jws.objectField("runtime_sha256");
+        try jws.write(self.runtime_sha256);
+        try jws.objectField("compiler_sha256");
+        try jws.write(self.compiler_sha256);
+        try jws.objectField("config_sha256");
+        try jws.write(self.config_sha256);
+        try jws.endObject();
+    }
+};
+pub const Scope = struct {
+    schema: []const u8 = "uk.wamr.direct-compute",
+    version: u8,
+    purpose: []const u8,
+    authority: enum { not_admitted } = .not_admitted,
+    approval: struct {
+        direct_specialized_gen2: bool = false,
+        os_only_private: bool = false,
+        two_boots_only: bool = false,
+        cleanup_owned_group: bool = false,
+        exact_image_and_local_bundle_reviewed: bool = false,
+        fresh_final_approval: bool = false,
+        approved_unix: u64 = 0,
+        expires_unix: u64 = 0,
+    } = .{},
+    attempt_id: []const u8,
+    subscription: []const u8,
+    location: []const u8 = "northeurope",
+    prefix: []const u8,
+    vm_size: []const u8 = "Standard_D2s_v5",
+    serial_mode: enum { azure_cumulative } = .azure_cumulative,
+    runtime_seconds: u32 = 3600,
+    cleanup_seconds: u32 = 1800,
+    operation_seconds: u32 = 600,
+    poll_seconds: u32 = 10,
+    source_revision: []const u8,
+    source_tree: []const u8,
+    identity: Identity,
+    os_vhd: Artifact,
+    bundle: Artifact,
+};
+
+pub const Provenance = struct {
+    public_bundle: Artifact,
+    transport: Artifact,
+    qcow2: Artifact,
+    run: struct { repository: []const u8, run_id: []const u8, run_attempt: []const u8 },
+    lineage: struct {
+        raw_sha256: []const u8,
+        accepted_qcow2_sha256: []const u8,
+        derived_vhd_sha256: []const u8,
+        qcow2_finalization_sha256: []const u8,
+        qcow2_acceptance_sha256: []const u8,
+        fixed_vhd_derivation_gate_sha256: []const u8,
+        fixed_vhd_derivation_sha256: []const u8,
+        final_inspection_sha256: []const u8,
+    },
+    artifact_id: []const u8,
+    inner_zip_sha256: []const u8,
+    container_digest: []const u8,
+};
+pub const Metadata = struct {
+    source: enum { private_bundle, imported_product },
+    reader: ReaderContext,
+    scope: Scope,
+    candidate: Artifact,
+    provenance: Provenance,
+};
+pub const ReaderContext = struct {
+    io: std.Io,
+    repository: []const u8,
+    git: *const files.RetainedFile,
+    controller: *const files.RetainedFile,
+    supervisor: *const files.RetainedFile,
+    validator: *const files.RetainedFile,
+    reader_revision: []const u8,
+    reader_tree: []const u8,
+    validation_output: []const u8,
+    validation_record: Artifact,
+    validation_log: Artifact,
+};
+
+// Only successful construction yields this boundary. The borrowed source must
+// outlive it; authority consumers revalidate it instead of re-parsing metadata.
+pub const Finalized = opaque {
+    fn state(self: *Finalized) *State {
+        return @ptrCast(@alignCast(self));
+    }
+    pub fn revalidate(self: *Finalized, signal: ?*core.process.SignalCancellation) !void {
+        try self.state().revalidate(signal);
+    }
+    pub fn inspect(self: *Finalized, signal: ?*core.process.SignalCancellation) !Scope {
+        try self.revalidate(signal);
+        return self.state().scope;
+    }
+    pub fn artifact(self: *Finalized, signal: ?*core.process.SignalCancellation) !Artifact {
+        try self.revalidate(signal);
+        return self.state().candidate.?.artifact();
+    }
+    /// Borrowed typed metadata from the retained, validated v2 source. This
+    /// view does not reconstruct archive/download custody from a JSON receipt.
+    pub fn metadata(self: *Finalized, signal: ?*core.process.SignalCancellation) !Metadata {
+        try self.revalidate(signal);
+        const owner = self.state();
+        const bundle = try owner.inv.source.bundle();
+        return .{
+            .source = switch (owner.inv.source) {
+                .private_bundle => .private_bundle,
+                .imported_product => .imported_product,
+            },
+            .reader = .{
+                .io = owner.inv.io,
+                .repository = bundle.evidence.repository orelse return error.InvalidContext,
+                .git = &bundle.tools.git,
+                .controller = &bundle.tools.controller,
+                .supervisor = &bundle.tools.supervisor.supervisor,
+                .validator = &bundle.tools.validator,
+                .reader_revision = bundle.tools.before.revision,
+                .reader_tree = bundle.tools.before.tree,
+                .validation_output = owner.inv.validation_output,
+                .validation_record = owner.held.items[0].artifact(),
+                .validation_log = owner.held.items[1].artifact(),
+            },
+            .scope = owner.scope,
+            .candidate = owner.candidate.?.artifact(),
+            .provenance = owner.provenance orelse return error.Version2Required,
+        };
+    }
+    pub fn result(
+        self: *Finalized,
+        first_path: []const u8,
+        second_path: ?[]const u8,
+        signal: ?*core.process.SignalCancellation,
+    ) !controller.tiny.Result {
+        return self.resultWithFault(first_path, second_path, signal, .none);
+    }
+    fn resultWithFault(
+        self: *Finalized,
+        first_path: []const u8,
+        second_path: ?[]const u8,
+        signal: ?*core.process.SignalCancellation,
+        fault: ResultFault,
+    ) !controller.tiny.Result {
+        const owner = self.state();
+        const a = owner.arena.allocator();
+        try copy.checkCancellation(if (signal) |active| active.flag() else null);
+        var scratch = std.heap.ArenaAllocator.init(owner.inv.allocator);
+        defer scratch.deinit();
+        const s = scratch.allocator();
+        var first = try retainFile(s, owner.inv.io, first_path, contracts.layout.max_serial_bytes, signal, error.EvidenceIncomplete);
+        defer first.file.close(owner.inv.io);
+        var first_bytes = try files.readSensitiveFile(owner.inv.io, s, first.file.file, contracts.layout.max_serial_bytes, .private);
+        defer first_bytes.deinit();
+        const identity = owner.scope.identity;
+        var observed = try checkSerial(a, first_bytes.bytes(), identity);
+        if (second_path) |path| {
+            var second = try retainFile(s, owner.inv.io, path, contracts.layout.max_serial_bytes, signal, error.WrongSerialPrefix);
+            defer second.file.close(owner.inv.io);
+            var second_bytes = try files.readSensitiveFile(owner.inv.io, s, second.file.file, contracts.layout.max_serial_bytes, .private);
+            defer second_bytes.deinit();
+            observed = try checkSerial(a, try secondBytes(second_bytes.bytes(), first_bytes.bytes()), identity);
+            if (builtin.is_test) switch (fault) {
+                .change_second => try changeFile(owner.inv.io, path),
+                .replace_second => try replaceCapture(owner.inv.io, s, path, second_bytes.bytes()),
+                else => {},
+            };
+            try owner.verifyHeld(&second, signal);
+        }
+        if (builtin.is_test) switch (fault) {
+            .change_first => try changeFile(owner.inv.io, first_path),
+            .replace_first => try replaceCapture(owner.inv.io, s, first_path, first_bytes.bytes()),
+            else => {},
+        };
+        try owner.verifyHeld(&first, signal);
+        try owner.revalidate(signal);
+        return observed;
+    }
+    pub fn deinit(self: *Finalized) void {
+        self.state().deinit();
+    }
+};
+
+const Held = struct {
+    file: files.RetainedFile,
+    digest: [64]u8,
+    limit: u64,
+
+    fn artifact(self: *const Held) Artifact {
+        return .{ .path = self.file.path, .sha256 = &self.digest, .size = self.file.file_snapshot.size };
+    }
+};
+const Faults = struct {
+    admission: ?files.TestFault = null,
+    publication: ?files.TestFault = null,
+    cancel_after_admission: bool = false,
+    change_before_final_revalidation: bool = false,
+};
+const ResultFault = enum { none, change_first, replace_first, change_second, replace_second };
+const State = struct {
+    inv: Invocation,
+    arena: std.heap.ArenaAllocator,
+    held: std.ArrayList(Held) = .empty,
+    candidate: ?Held = null,
+    admission: ?Held = null,
+    scope: Scope = undefined,
+    provenance: ?Provenance = null,
+    phase: Phase = .inputs,
+    publication: files.CommitStatus = .not_committed,
+    reserved: bool = false,
+    faults: Faults = .{},
+
+    fn retain(self: *State, path: []const u8, limit: u64, signal: ?*core.process.SignalCancellation) !Held {
+        return retainFile(self.arena.allocator(), self.inv.io, path, limit, signal, null);
+    }
+    fn retainSerial(self: *State, path: []const u8, empty_error: anyerror, signal: ?*core.process.SignalCancellation) !Held {
+        return retainFile(self.arena.allocator(), self.inv.io, path, contracts.layout.max_serial_bytes, signal, empty_error);
+    }
+    fn verifyHeld(self: *State, held: *Held, signal: ?*core.process.SignalCancellation) !void {
+        const digest = try copy.hashRetained(self.inv.io, &held.file, held.limit, if (signal) |active| active.flag() else null);
+        if (!std.mem.eql(u8, &digest, &held.digest)) return error.CandidateInputChanged;
+    }
+    fn revalidate(self: *State, signal: ?*core.process.SignalCancellation) !void {
+        try copy.checkCancellation(if (signal) |active| active.flag() else null);
+        try self.inv.source.revalidate(signal);
+        for (self.held.items) |*held| try self.verifyHeld(held, signal);
+        if (self.admission) |*held| try self.verifyHeld(held, signal);
+        if (self.candidate) |*held| try self.verifyHeld(held, signal);
+    }
+    fn deinit(self: *State) void {
+        if (self.candidate) |*held| held.file.close(self.inv.io);
+        if (self.admission) |*held| held.file.close(self.inv.io);
+        for (self.held.items) |*held| held.file.close(self.inv.io);
+        self.held.deinit(self.inv.allocator);
+        const allocator = self.inv.allocator;
+        self.arena.deinit();
+        allocator.destroy(self);
+    }
+    fn document(self: *State, held: *Held) !core.contracts.Document {
+        var bytes = try files.readSensitiveFile(self.inv.io, self.arena.allocator(), held.file.file, contracts.layout.max_json_bytes, .private);
+        defer bytes.deinit();
+        return contracts.parseCanonical(self.arena.allocator(), bytes.bytes());
+    }
+    fn publish(self: *State, path: []const u8, bytes: []const u8) !files.CommitStatus {
+        const parent = try files.FileParent.open(self.inv.io, path, .private);
+        defer parent.close(self.inv.io);
+        var lock = try (files.Directory{ .dir = parent.directory }).lock(self.inv.io);
+        defer lock.close(self.inv.io);
+        const fault = if (self.phase == .admission) self.faults.admission else self.faults.publication;
+        const committed = if (builtin.is_test and fault != null)
+            try lock.createImmutableFault(self.inv.io, parent.name, bytes, fault.?)
+        else
+            try lock.createImmutable(self.inv.io, parent.name, bytes);
+        if (self.phase == .publication) self.publication = committed.status;
+        if (committed.status != .durable or committed.failures.primary != null or committed.failures.cleanup != null or committed.failures.recording != null)
+            return error.PublicationUncertain;
+        return committed.status;
+    }
+};
+
+fn retainFile(a: std.mem.Allocator, io: std.Io, path: []const u8, limit: u64, signal: ?*core.process.SignalCancellation, empty_error: ?anyerror) !Held {
+    const owned_path = try a.dupe(u8, path);
+    var file = try files.RetainedFile.open(io, owned_path, .private);
+    errdefer file.close(io);
+    if (file.file_snapshot.size == 0) {
+        if (empty_error) |err| {
+            try copy.checkCancellation(if (signal) |active| active.flag() else null);
+            try copy.verifyRetained(io, &file);
+            return err;
+        }
+    }
+    return .{ .file = file, .digest = try copy.hashRetained(io, &file, limit, if (signal) |active| active.flag() else null), .limit = limit };
+}
+
+pub fn create(inv: Invocation) Outcome {
+    return construct(inv, false, .{});
+}
+
+pub fn open(inv: Invocation) Outcome {
+    return construct(inv, true, .{});
+}
+
+fn construct(inv: Invocation, existing: bool, faults: Faults) Outcome {
+    const owner = inv.allocator.create(State) catch |err| return .{ .refused = .{ .phase = .inputs, .err = err } };
+    owner.* = .{ .inv = inv, .arena = std.heap.ArenaAllocator.init(inv.allocator), .faults = faults };
+    finish(owner, existing) catch |err| {
+        const diagnostic: Diagnostic = .{ .phase = owner.phase, .err = err, .publication = owner.publication };
+        const reserved = owner.reserved;
+        owner.deinit();
+        return if (reserved) .{ .poisoned = diagnostic } else .{ .refused = diagnostic };
+    };
+    return .{ .success = @ptrCast(owner) };
+}
+
+fn finish(owner: *State, existing: bool) !void {
+    const inv = owner.inv;
+    const a = owner.arena.allocator();
+    try files.absoluteFilePath(inv.output);
+    try files.absoluteFilePath(inv.validation_output);
+    const bundle = try inv.source.bundle();
+    if (inside(inv.output, bundle.evidence.root) or inside(bundle.evidence.root, inv.output) or
+        inside(inv.output, bundle.evidence.repository.?) or inside(bundle.evidence.repository.?, inv.output))
+        return error.AliasedOutput;
+    try inv.source.revalidate(inv.signal);
+    owner.phase = .native_validation;
+    owner.reserved = true;
+    try validation.runPrivateValidated(inv.allocator, inv.io, bundle, inv.validation_output, inv.signal);
+    const revalidation_files: [2][]const u8 = if (bundle.evidence.compatibility == .tiny_v1_legacy)
+        .{ "evidence/command-import-historical-native-revalidation.json", "private/import-historical-native-revalidation.log" }
+    else
+        .{ "evidence/command-import-native-revalidation.json", "private/import-native-revalidation.log" };
+    for (revalidation_files) |relative| {
+        var retained = try owner.retain(try std.fs.path.join(a, &.{ inv.validation_output, relative }), contracts.layout.max_json_bytes, inv.signal);
+        errdefer retained.file.close(inv.io);
+        try owner.held.append(inv.allocator, retained);
+    }
+    owner.phase = .bindings;
+    var manifest = try owner.retain(bundle.manifest.path, contracts.layout.max_json_bytes, inv.signal);
+    defer manifest.file.close(inv.io);
+    var document = try owner.document(&manifest);
+    defer document.deinit();
+    const value = document.value();
+    const compatibility = try contracts.validateLocalImageHandoffWithRoot(value, bundle.evidence.root);
+    const version = compatibility.version();
+    var scope_bundle = manifest.artifact();
+    var admission_bytes: ?[]const u8 = null;
+    const admission_path = try a.print("{s}.admission.json", .{inv.output});
+    if (version == 2) {
+        var transport = try owner.retain(try std.fs.path.join(a, &.{ bundle.evidence.root, "transport.json" }), contracts.layout.max_json_bytes, inv.signal);
+        errdefer transport.file.close(inv.io);
+        var transport_document = try owner.document(&transport);
+        defer transport_document.deinit();
+        try contracts.validatePublicSourceTransportV2(transport_document.value());
+        const receipt = transport_document.value().object;
+        const fields = value.object;
+        const run = fields.get("run").?.object;
+        inline for (.{ "repository", "run_id", "run_attempt" }) |key|
+            if (!std.mem.eql(u8, try core.contracts.string(receipt.get(key).?), try core.contracts.string(run.get(key).?)))
+                return error.TransportMismatch;
+        inline for (.{ "source_revision", "source_tree" }) |key|
+            if (!std.mem.eql(u8, try core.contracts.string(receipt.get(key).?), try core.contracts.string(fields.get(key).?)))
+                return error.TransportMismatch;
+        owner.provenance = try provenance(a, compatibility, value, receipt, manifest.artifact(), transport.artifact());
+        admission_bytes = try canonical(a, .{
+            .schema = "uk.wamr.direct-compute-admission",
+            .version = @as(u8, 2),
+            .profile = contracts.profile.profileName(compatibility).?,
+            .authority = "not_admitted",
+            .source_revision = fields.get("source_revision").?,
+            .source_tree = fields.get("source_tree").?,
+            .run = fields.get("run").?,
+            .lineage = fields.get("lineage").?,
+            .public_bundle = manifest.artifact(),
+            .transport = transport.artifact(),
+        });
+        var admission_document = try contracts.parseCanonical(a, admission_bytes.?);
+        defer admission_document.deinit();
+        if (try contracts.validateDirectComputeAdmissionV2WithCompatibility(admission_document.value()) != compatibility)
+            return error.ProfileMismatch;
+        scope_bundle = .{
+            .path = admission_path,
+            .sha256 = try a.dupe(u8, &std.fmt.bytesToHex(controller.records.fileIdentity(admission_bytes.?), .lower)),
+            .size = admission_bytes.?.len,
+        };
+        try owner.held.append(inv.allocator, transport);
+    }
+    var settings = inv.settings;
+    if (existing) {
+        owner.candidate = try owner.retain(inv.output, contracts.layout.max_json_bytes, inv.signal);
+        var candidate_document = try owner.document(&owner.candidate.?);
+        defer candidate_document.deinit();
+        if (try contracts.validateDirectComputeCandidate(candidate_document.value()) != compatibility)
+            return error.ProfileMismatch;
+        const fields = candidate_document.value().object;
+        settings = .{
+            .attempt_id = try a.dupe(u8, try core.contracts.string(fields.get("attempt_id").?)),
+            .subscription = try a.dupe(u8, try core.contracts.string(fields.get("subscription").?)),
+            .prefix = try a.dupe(u8, try core.contracts.string(fields.get("prefix").?)),
+        };
+    }
+    if (settings.attempt_id == null) settings.attempt_id = try freshUuid(a, inv.io);
+    const encoded = try encode(a, value, scope_bundle, settings);
+    var candidate_document = try contracts.parseCanonical(a, encoded);
+    defer candidate_document.deinit();
+    if (try contracts.validateDirectComputeCandidate(candidate_document.value()) != compatibility)
+        return error.ProfileMismatch;
+    const parsed = try std.json.parseFromSlice(Scope, a, encoded, .{ .allocate = .alloc_always });
+    owner.scope = parsed.value;
+    try copy.checkCancellation(if (inv.signal) |active| active.flag() else null);
+    for (owner.held.items) |*held| try owner.verifyHeld(held, inv.signal);
+    if (owner.candidate) |*held| try owner.verifyHeld(held, inv.signal);
+    owner.phase = .admission;
+    if (admission_bytes) |bytes| {
+        if (!existing) _ = try owner.publish(admission_path, bytes);
+        owner.admission = try owner.retain(admission_path, contracts.layout.max_json_bytes, inv.signal);
+        if (!std.mem.eql(u8, &owner.admission.?.digest, scope_bundle.sha256) or owner.admission.?.file.file_snapshot.size != bytes.len)
+            return error.CandidateBindingChanged;
+    }
+    if (builtin.is_test and owner.faults.cancel_after_admission)
+        @constCast((inv.signal orelse return error.InvalidFault).flag()).store(true, .release);
+    try copy.checkCancellation(if (inv.signal) |active| active.flag() else null);
+    if (owner.admission) |*held| try owner.verifyHeld(held, inv.signal);
+    owner.phase = .publication;
+    if (!existing) {
+        owner.publication = try owner.publish(inv.output, encoded);
+        owner.candidate = try owner.retain(inv.output, contracts.layout.max_json_bytes, inv.signal);
+    }
+    const digest = std.fmt.bytesToHex(controller.records.fileIdentity(encoded), .lower);
+    if (!std.mem.eql(u8, &owner.candidate.?.digest, &digest) or owner.candidate.?.file.file_snapshot.size != encoded.len)
+        return error.CandidateBindingChanged;
+    owner.phase = .final_revalidation;
+    if (builtin.is_test and owner.faults.change_before_final_revalidation)
+        try changeFile(inv.io, inv.output);
+    try copy.checkCancellation(if (inv.signal) |active| active.flag() else null);
+    try bundle.tools.verifyExecutables(inv.io);
+    try bundle.manifest.verify(inv.io);
+    for (owner.held.items) |*held| try owner.verifyHeld(held, inv.signal);
+    if (owner.admission) |*held| try owner.verifyHeld(held, inv.signal);
+    if (owner.candidate) |*held| try owner.verifyHeld(held, inv.signal);
+}
+
+fn provenance(a: std.mem.Allocator, compatibility: contracts.profile.Compatibility, bundle: std.json.Value, receipt: std.json.ObjectMap, manifest: Artifact, transport: Artifact) !Provenance {
+    var qcow2: ?Artifact = null;
+    for (contracts.layout.artifactNames(compatibility), bundle.object.get("artifacts").?.array.items) |name, item| {
+        if (std.mem.eql(u8, name, "qcow2"))
+            qcow2 = try std.json.parseFromValueLeaky(Artifact, a, item, .{ .allocate = .alloc_always });
+    }
+    return .{
+        .public_bundle = try ownedArtifact(a, manifest),
+        .transport = try ownedArtifact(a, transport),
+        .qcow2 = qcow2 orelse return error.MissingQcow2,
+        .run = try std.json.parseFromValueLeaky(@TypeOf(@as(Provenance, undefined).run), a, bundle.object.get("run").?, .{ .allocate = .alloc_always }),
+        .lineage = try std.json.parseFromValueLeaky(@TypeOf(@as(Provenance, undefined).lineage), a, bundle.object.get("lineage").?, .{ .allocate = .alloc_always }),
+        .artifact_id = try a.dupe(u8, try core.contracts.string(receipt.get("artifact_id").?)),
+        .inner_zip_sha256 = try a.dupe(u8, try core.contracts.string(receipt.get("inner_zip_sha256").?)),
+        .container_digest = try a.dupe(u8, try core.contracts.string(receipt.get("container_digest").?)),
+    };
+}
+fn ownedArtifact(a: std.mem.Allocator, value: Artifact) !Artifact {
+    return .{ .path = try a.dupe(u8, value.path), .sha256 = try a.dupe(u8, value.sha256), .size = value.size };
+}
+
+fn changeFile(io: std.Io, path: []const u8) !void {
+    if (!builtin.is_test) @compileError("Fault injection is only available to native tests");
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write, .follow_symlinks = false });
+    defer file.close(io);
+    try file.writePositionalAll(io, "!", 0);
+    try file.sync(io);
+}
+
+fn replaceCapture(io: std.Io, a: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
+    if (!builtin.is_test) @compileError("Fault injection is only available to native tests");
+    const saved = try a.print("{s}.retained-original", .{path});
+    try std.Io.Dir.cwd().renamePreserve(path, .cwd(), saved, io);
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    defer file.close(io);
+    try file.writePositionalAll(io, bytes, 0);
+    try file.sync(io);
+}
+
+pub const Test = if (builtin.is_test) struct {
+    pub fn create(inv: Invocation, faults: Faults) Outcome {
+        return construct(inv, false, faults);
+    }
+    pub fn result(
+        owner: *Finalized,
+        first: []const u8,
+        second: ?[]const u8,
+        signal: ?*core.process.SignalCancellation,
+        fault: ResultFault,
+    ) !controller.tiny.Result {
+        return owner.resultWithFault(first, second, signal, fault);
+    }
+
+    pub fn checkSerial(a: std.mem.Allocator, raw: []const u8, identity: Identity) !controller.tiny.Result {
+        return @import("candidate.zig").checkSerial(a, raw, identity);
+    }
+
+    pub fn encode(a: std.mem.Allocator, bundle: std.json.Value, scope_bundle: Artifact, settings: Settings) ![]const u8 {
+        return @import("candidate.zig").encode(a, bundle, scope_bundle, settings);
+    }
+} else struct {};
+
+fn encode(a: std.mem.Allocator, bundle: std.json.Value, scope_bundle: Artifact, settings: Settings) ![]const u8 {
+    const fields = bundle.object;
+    const version = try core.contracts.integer(u8, fields.get("version").?);
+    const compatibility = try contracts.profile.compatibility(version, if (version == 2)
+        try core.contracts.string(fields.get("profile").?)
+    else
+        null);
+    const identity_bytes = try std.json.Stringify.valueAlloc(a, fields.get("identity").?, .{});
+    const identity = try std.json.parseFromSlice(Identity, a, identity_bytes, .{ .allocate = .alloc_always });
+    const names = contracts.layout.artifactNames(compatibility);
+    var vhd: ?Artifact = null;
+    for (names, fields.get("artifacts").?.array.items) |name, item| if (std.mem.eql(u8, name, "vhd")) {
+        const artifact_fields = item.object;
+        vhd = .{
+            .path = try core.contracts.string(artifact_fields.get("path").?),
+            .sha256 = try core.contracts.string(artifact_fields.get("sha256").?),
+            .size = try core.contracts.integer(u64, artifact_fields.get("size").?),
+        };
+    };
+    return canonical(a, Scope{
+        .version = version,
+        .purpose = switch (compatibility) {
+            .frozen_tiny_v1 => "tiny-aot-two-boot",
+            .tiny_qcow2_derived_vhd_v2 => contracts.profile.current_profile,
+            .coremark_qcow2_derived_vhd_v2 => contracts.profile.coremark_profile,
+        },
+        .attempt_id = settings.attempt_id orelse return error.MissingAttemptId,
+        .subscription = if (version == 1) "FINAL-APPROVED-SUBSCRIPTION-UUID" else settings.subscription orelse "00000000-0000-0000-0000-000000000001",
+        .prefix = if (version == 1) "FINAL-APPROVED-FRESH-NAME" else settings.prefix orelse "not-admitted-candidate",
+        .source_revision = try core.contracts.string(fields.get("source_revision").?),
+        .source_tree = try core.contracts.string(fields.get("source_tree").?),
+        .identity = identity.value,
+        .os_vhd = vhd orelse return error.MissingVhd,
+        .bundle = scope_bundle,
+    });
+}
+
+fn canonical(a: std.mem.Allocator, value: anytype) ![]const u8 {
+    const raw = try std.json.Stringify.valueAlloc(a, value, .{});
+    defer a.free(raw);
+    return controller.records.canonicalAlloc(a, raw);
+}
+fn freshUuid(a: std.mem.Allocator, io: std.Io) ![]const u8 {
+    var bytes: [16]u8 = undefined;
+    io.random(&bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = std.fmt.bytesToHex(bytes, .lower);
+    return a.print("{s}-{s}-{s}-{s}-{s}", .{ hex[0..8], hex[8..12], hex[12..16], hex[16..20], hex[20..32] });
+}
+fn inside(path: []const u8, root: []const u8) bool {
+    return std.mem.eql(u8, path, root) or (path.len > root.len and std.mem.startsWith(u8, path, root) and path[root.len] == '/');
+}
+fn checkSerial(a: std.mem.Allocator, raw: []const u8, identity: Identity) !controller.tiny.Result {
+    const coremark = identity.coremark_wasm_sha256 != null;
+    return controller.tiny.checkSerial(a, raw, .{
+        .wamr_revision = identity.wamr_revision,
+        .minimal_wasi = coremark,
+        .tiny_wasm = identity.wasm_sha256,
+        .tiny_cwasm = identity.cwasm_sha256,
+        .coremark_wasm = identity.coremark_wasm_sha256 orelse "",
+        .coremark_cwasm = identity.coremark_cwasm_sha256 orelse "",
+        .nofp_wasm = identity.coremark_nofp_wasm_sha256 orelse "",
+        .nofp_cwasm = identity.coremark_nofp_cwasm_sha256 orelse "",
+        .runtime = identity.runtime_sha256,
+    }, .{ .scope = if (coremark) .app else .direct });
+}
+fn secondBytes(raw: []const u8, first: []const u8) ![]const u8 {
+    const prefix = std.mem.trimEnd(u8, first, "\x00");
+    if (prefix.len == 0 or !std.mem.startsWith(u8, raw, prefix)) return error.WrongSerialPrefix;
+    return raw[prefix.len..];
+}
+
+test "candidate encoding preserves frozen selectors and refuses authorizing edits" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    inline for (.{ "goldens/root-bound-v1.json", "goldens/root-bound-v2.json" }) |name| {
+        var document = try contracts.parseCanonical(a, @embedFile(name));
+        defer document.deinit();
+        const artifact: Artifact = .{ .path = "/private/scope.json", .size = 1, .sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" };
+        const encoded = try encode(a, document.value(), artifact, .{ .attempt_id = "00000000-0000-4000-8000-000000000001" });
+        var candidate_document = try contracts.parseCanonical(a, encoded);
+        defer candidate_document.deinit();
+        _ = try contracts.validateDirectComputeCandidate(candidate_document.value());
+        const changed = try std.mem.replaceOwned(u8, a, encoded, "\"fresh_final_approval\":false", "\"fresh_final_approval\":true");
+        var changed_document = try contracts.parseCanonical(a, changed);
+        defer changed_document.deinit();
+        try std.testing.expectError(error.AuthorityNotAllowed, contracts.validateDirectComputeCandidate(changed_document.value()));
+    }
+}
+
+test "candidate typed provenance preserves the validated v2 public and transport bindings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var document = try contracts.parseCanonical(a, @embedFile("goldens/root-bound-v2.json"));
+    defer document.deinit();
+    _ = try contracts.validateLocalImageHandoffWithRoot(document.value(), "/opt/wamr-handoff-golden-stage");
+    var receipt: std.json.ObjectMap = .empty;
+    try receipt.put(a, "artifact_id", .{ .string = "123" });
+    try receipt.put(a, "inner_zip_sha256", .{ .string = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" });
+    try receipt.put(a, "container_digest", .{ .string = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" });
+    const manifest: Artifact = .{ .path = "/private/bundle.json", .size = 1, .sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" };
+    const transport: Artifact = .{ .path = "/private/transport.json", .size = 2, .sha256 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" };
+    const view = try provenance(a, .tiny_qcow2_derived_vhd_v2, document.value(), receipt, manifest, transport);
+    try std.testing.expectEqualStrings(view.qcow2.sha256, view.lineage.accepted_qcow2_sha256);
+    try std.testing.expectEqualStrings(document.value().object.get("run").?.object.get("run_id").?.string, view.run.run_id);
+    try std.testing.expectEqualStrings(manifest.sha256, view.public_bundle.sha256);
+    try std.testing.expectEqualStrings(transport.sha256, view.transport.sha256);
+    try std.testing.expectEqualStrings("123", view.artifact_id);
+}
+
+test "candidate cumulative result requires the exact original prefix with Azure NUL padding" {
+    try std.testing.expectEqualStrings("second", try secondBytes("firstsecond", "first\x00\x00"));
+    try std.testing.expectError(error.WrongSerialPrefix, secondBytes("changedsecond", "first"));
+    try std.testing.expectError(error.WrongSerialPrefix, secondBytes("second", "\x00\x00"));
+}
+
+test "candidate empty captures retain the frozen incomplete and cumulative prefix refusals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var fixture_root = try std.Io.Dir.openDirAbsolute(io, @import("test_options").fixture_root, .{});
+    defer fixture_root.close(io);
+    try fixture_root.createDirPath(io, "handoff-export-tests");
+    const directory = try fixture_root.openDir(io, "handoff-export-tests", .{});
+    defer directory.close(io);
+    const name = try a.print("candidate-empty-serial-{d}", .{std.os.linux.getpid()});
+    const file = try directory.createFile(io, name, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    file.close(io);
+    defer directory.deleteFile(io, name) catch @panic("empty candidate capture cleanup failed");
+    const path = try std.fs.path.join(a, &.{ @import("test_options").fixture_root, "handoff-export-tests", name });
+    try std.testing.expectError(error.EvidenceIncomplete, retainFile(a, io, path, contracts.layout.max_serial_bytes, null, error.EvidenceIncomplete));
+    try std.testing.expectError(error.WrongSerialPrefix, retainFile(a, io, path, contracts.layout.max_serial_bytes, null, error.WrongSerialPrefix));
+    try std.testing.expectError(error.UnsafeSource, retainFile(a, io, path, contracts.layout.max_json_bytes, null, null));
+}

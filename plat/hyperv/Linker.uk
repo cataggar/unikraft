@@ -1,0 +1,94 @@
+ifeq (x86_64,$(CONFIG_UK_ARCH))
+HYPERV_LDFLAGS-y += -Wl,--entry=uk_efi_entry64
+ifneq ($(CONFIG_PARTIAL_LINKER_TYPE),raw)
+HYPERV_LDFLAGS-y += -Wl,-m,elf_x86_64
+endif
+endif
+
+ifneq ($(UK_IMAGE_NAME_OVERWRITE),)
+HYPERV_IMAGE := $(BUILD_DIR)/$(UK_IMAGE_NAME_OVERWRITE)
+else
+HYPERV_IMAGE := $(BUILD_DIR)/$(CONFIG_UK_NAME)_hyperv-$(CONFIG_UK_ARCH)
+endif
+HYPERV_DEBUG_IMAGE := $(HYPERV_IMAGE).dbg
+HYPERV_COMPILE_DB_IMAGE := $(BUILD_DIR)/compile_commands.json
+HYPERV_STRIPFLAGS += -R .gnu.hash -R .hash
+
+HYPERV_LD_SCRIPT_INPUTS := $(UK_PLAT_HYPERV_DEF_LDS) \
+			   $(HYPERV_LD_SCRIPT-y) $(EXTRA_LD_SCRIPT-y)
+
+ifeq ($(CONFIG_PARTIAL_LINKER_TYPE),raw)
+HYPERV_COMBINED_LD_SCRIPT := $(BUILD_DIR)/hyperv-combined.lds
+HYPERV_LD_SCRIPT_MERGER := $(CONFIG_UK_BASE)/support/build/merge-linker-scripts.py
+
+$(HYPERV_COMBINED_LD_SCRIPT): $(HYPERV_LD_SCRIPT_INPUTS) $(HYPERV_LD_SCRIPT_MERGER)
+	$(call build_cmd,GEN,,$@,\
+		$(PYTHON) $(HYPERV_LD_SCRIPT_MERGER) \
+			$(HYPERV_COMBINED_LD_SCRIPT) $(HYPERV_LD_SCRIPT_INPUTS))
+
+HYPERV_LD_SCRIPT_FLAGS := -Wl$(comma)-T$(comma)$(HYPERV_COMBINED_LD_SCRIPT)
+HYPERV_LD_SCRIPT_DEPS := $(HYPERV_COMBINED_LD_SCRIPT)
+else
+HYPERV_LD_SCRIPT_FLAGS := -Wl$(comma)-dT$(comma)$(UK_PLAT_HYPERV_DEF_LDS)
+HYPERV_LD_SCRIPT_FLAGS += $(addprefix -Wl$(comma)-T$(comma),\
+			   $(HYPERV_LD_SCRIPT-y) $(EXTRA_LD_SCRIPT-y))
+HYPERV_LD_SCRIPT_DEPS := $(HYPERV_LD_SCRIPT_INPUTS)
+endif
+
+$(eval $(call add_build_graph_link_stage,hyperv,final-link,link,$(HYPERV_DEBUG_IMAGE)))
+$(eval $(call add_build_graph_link_inputs,hyperv,final-link,object,\
+	$(HYPERV_OLIBS) $(HYPERV_OLIBS-y) $(UK_OLIBS) $(UK_OLIBS-y)))
+$(eval $(call add_build_graph_link_inputs,hyperv,final-link,archive,\
+	$(HYPERV_ALIBS) $(HYPERV_ALIBS-y) $(UK_ALIBS) $(UK_ALIBS-y)))
+$(eval $(call add_build_graph_link_inputs,hyperv,final-link,linker-script,\
+	$(HYPERV_LD_SCRIPT_DEPS)))
+
+$(HYPERV_DEBUG_IMAGE): $(HYPERV_ALIBS) $(HYPERV_ALIBS-y) \
+		       $(HYPERV_OLIBS) $(HYPERV_OLIBS-y) \
+		       $(UK_ALIBS) $(UK_ALIBS-y) $(UK_OLIBS) $(UK_OLIBS-y) \
+		       $(HYPERV_LD_SCRIPT_DEPS) $(UK_LDEPS)
+	$(call build_cmd,LD,,$@,\
+	       $(LD) $(HYPERV_LDFLAGS) $(HYPERV_LDFLAGS-y) \
+			$(HYPERV_OLIBS) $(HYPERV_OLIBS-y) \
+			$(UK_OLIBS) $(UK_OLIBS-y) \
+			-Wl$(comma)--start-group \
+			$(HYPERV_ALIBS) $(HYPERV_ALIBS-y) \
+			$(UK_ALIBS) $(UK_ALIBS-y) \
+			-Wl$(comma)--end-group \
+			$(HYPERV_LDLIBS) $(HYPERV_LDLIBS-y) \
+			$(LDFLAGS) $(LDFLAGS-y) \
+			$(HYPERV_LD_SCRIPT_FLAGS) -o $@)
+	$(call build_uk_reloc,$@)
+ifeq ($(CONFIG_LIBUKPCPUVAR),y)
+	$(call build_uk_pcpuvar,$@)
+endif
+
+$(HYPERV_IMAGE): $(HYPERV_DEBUG_IMAGE)
+	$(call build_cmd,SCSTRIP,,$@,\
+		$(STRIP) -s $(SECT_STRIP_FLAGS) $(SECT_STRIP_FLAGS-y) \
+			$(HYPERV_STRIPFLAGS) $< -o $@ 2>&1 | \
+			{ $(GREP) -Ev \
+				"Empty loadable segment detected|section.*lma.*adjusted to.*" || \
+				true; })
+	$(call build_bootinfo,$@)
+	$(call build_efi,$@)
+
+$(HYPERV_IMAGE).sym: $(HYPERV_DEBUG_IMAGE)
+	$(call build_cmd,NM,,$@, $(NM) -n $< > $@)
+
+$(HYPERV_IMAGE).gz: $(HYPERV_IMAGE)
+	$(call build_cmd,GZ,,$@, $(GZIP) -f -9 -c $< >$@)
+
+$(HYPERV_COMPILE_DB_IMAGE): $(HYPERV_IMAGE)
+	$(call build_compile_db,$(BUILD_DIR),$@)
+
+ifeq ($(CONFIG_PLAT_HYPERV),y)
+UK_DEBUG_IMAGES-y += $(HYPERV_DEBUG_IMAGE)
+UK_IMAGES-y += $(HYPERV_IMAGE)
+UK_IMAGES-$(CONFIG_OPTIMIZE_SYMFILE) += $(HYPERV_IMAGE).sym
+UK_IMAGES-$(CONFIG_OPTIMIZE_COMPRESS) += $(HYPERV_IMAGE).gz
+UK_IMAGES-y += $(HYPERV_COMPILE_DB_IMAGE)
+endif
+
+LIBHYPERVPLAT_CLEAN += $(call build_clean,$(HYPERV_DEBUG_IMAGE).bootinfo)
+LIBHYPERVPLAT_CLEAN += $(call build_clean,$(HYPERV_COMBINED_LD_SCRIPT))

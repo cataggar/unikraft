@@ -7,6 +7,10 @@
 #define __UK_SCHEDCOOP_SCHEDCOOP_H__
 
 #include <uk/schedcoop.h>
+#if CONFIG_LIBUKSCHEDCOOP_FIXED_SMP
+#include <uk/wait.h>
+#include <uk/schedcoop/fixed.h>
+#endif
 
 struct schedcoop {
 	struct uk_sched sched;
@@ -16,6 +20,19 @@ struct schedcoop {
 	struct uk_thread idle;
 	__nsec idle_return_time;
 	__nsec ts_prev_switch;
+#if CONFIG_LIBUKSCHEDCOOP_FIXED_SMP
+	struct uk_schedcoop_fixed_guard fixed_guard;
+	struct uk_waitq work_wait;
+	struct uk_waitq done_wait;
+	struct uk_thread *worker;
+	uk_schedcoop_work_fn_t work_fn;
+	void *work_arg;
+	int work_result;
+	int completion_kick_error;
+	struct uk_sched *completion_sched;
+	unsigned int completion_finalized;
+	unsigned int work_state;
+#endif
 };
 
 static inline struct schedcoop *uksched2schedcoop(struct uk_sched *s)

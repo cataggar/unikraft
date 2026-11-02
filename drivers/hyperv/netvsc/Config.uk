@@ -1,0 +1,58 @@
+config LIBNETVSC
+	bool "Hyper-V synthetic network device"
+	depends on PLAT_HYPERV
+	depends on LIBUKNETDEV
+	depends on LIBVMBUS
+	depends on LIBVMBUS_MAX_GPADLS >= 3
+	depends on LIBVMBUS_RING_PAGES >= 128
+	select LIBUKALLOC
+	help
+		Bounded single-queue Hyper-V NetVSC driver using NVS and RNDIS.
+		RSS, subchannels, checksum offload, LSO, and VF paths are disabled.
+
+if LIBNETVSC
+
+config LIBNETVSC_CHANNEL_TX_PAGES
+	int "VMBus transmit ring pages"
+	range 4 64
+	default 16
+
+config LIBNETVSC_CHANNEL_RX_PAGES
+	int "VMBus receive ring pages"
+	range 4 64
+	default 16
+
+config LIBNETVSC_RX_BUFFER_MB
+	int "Host receive buffer size (MiB)"
+	range 31 31
+	default 31
+	help
+		The modern Hyper-V receive buffer is 31 MiB. NVS v1/v2 expose
+		the first 15 MiB of this statically allocated buffer.
+
+config LIBNETVSC_SEND_BUFFER_MB
+	int "Host send buffer size (MiB)"
+	range 15 15
+	default 15
+
+config LIBNETVSC_TX_SLOTS
+	int "Maximum outstanding transmissions"
+	range 4 256
+	default 64
+
+config LIBNETVSC_RX_SLOTS
+	int "Maximum queued receive frames and pending acknowledgements"
+	range 4 256
+	default 64
+
+config LIBNETVSC_CONTROL_SLOTS
+	int "RNDIS control request slots"
+	range 2 32
+	default 8
+
+config LIBNETVSC_CONTROL_TIMEOUT_MS
+	int "NVS/RNDIS control timeout (milliseconds)"
+	range 10 10000
+	default 1000
+
+endif

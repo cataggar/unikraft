@@ -1,0 +1,1386 @@
+// SPDX-License-Identifier: BSD-3-Clause
+const std = @import("std");
+const builtin = @import("builtin");
+const core = @import("hyperv_core");
+const files = core.private_files;
+const process = core.process;
+const Sha256 = core.Sha256;
+const plan = @import("command_plan.zig");
+const adapter = @import("command_adapter.zig");
+const custody = @import("source_custody.zig");
+const physical = @import("custody_files.zig");
+const inputs = @import("input_custody.zig");
+const dependencies = @import("dependency_custody.zig");
+const records = @import("records.zig");
+const fixture_contract = @import("fixture_contract.zig");
+const profile = @import("profile.zig");
+const limits = @import("custody_limits.zig");
+
+const shm_magic = "UKWAMRC1";
+const max_shm_files: u32 = 16384;
+const max_shm_blobs: u32 = 16384;
+const shm_min_flush_delta: u32 = 64;
+const shm_recent_window_ns: i128 = 120 * std.time.ns_per_s;
+const shm_file_entry_bytes: usize = @sizeOf([9]i128) + 64;
+const shm_blob_entry_bytes: usize = @sizeOf([9]i128) + 64 + 1 + 64;
+
+var shm_serial: std.atomic.Value(u32) = .init(0);
+var proc_cache_lock: std.atomic.Value(u32) = .init(0);
+var proc_cache_valid: bool = false;
+var proc_cache_sig: [4]u64 = .{ 0, 0, 0, 0 };
+var proc_files: std.AutoHashMapUnmanaged([9]i128, [64]u8) = .empty;
+var proc_blobs: std.AutoHashMapUnmanaged([9]i128, custody.CachedBlob) = .empty;
+
+fn lockProcCache() void {
+    while (proc_cache_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+        std.atomic.spinLoopHint();
+    }
+}
+
+fn unlockProcCache() void {
+    proc_cache_lock.store(0, .release);
+}
+
+pub fn currentRealtimeNs() i128 {
+    var ts: std.os.linux.timespec = undefined;
+    if (std.os.linux.errno(std.os.linux.clock_gettime(.REALTIME, &ts)) != .SUCCESS or ts.sec <= 0) return 0;
+    return (@as(i128, ts.sec) * std.time.ns_per_s) + ts.nsec;
+}
+
+fn formatPathZ(buf: []u8, comptime fmt: []const u8, args: anytype) ?[*:0]const u8 {
+    if (buf.len == 0) return null;
+    const printed = std.fmt.bufPrint(buf[0 .. buf.len - 1], fmt, args) catch return null;
+    buf[printed.len] = 0;
+    return buf[0..printed.len :0].ptr;
+}
+
+fn copyProcCacheInto(
+    known_files: *std.AutoHashMap([9]i128, [64]u8),
+    known_git_blobs: *std.AutoHashMap([9]i128, custody.CachedBlob),
+) void {
+    if (known_files.count() == 0) {
+        if (proc_files.clone(known_files.allocator)) |cloned| {
+            known_files.unmanaged.deinit(known_files.allocator);
+            known_files.unmanaged = cloned;
+        } else |_| {}
+    } else {
+        known_files.ensureUnusedCapacity(proc_files.count()) catch return;
+        var it = proc_files.iterator();
+        while (it.next()) |entry| {
+            known_files.put(entry.key_ptr.*, entry.value_ptr.*) catch return;
+        }
+    }
+    if (known_git_blobs.count() == 0) {
+        if (proc_blobs.clone(known_git_blobs.allocator)) |cloned| {
+            known_git_blobs.unmanaged.deinit(known_git_blobs.allocator);
+            known_git_blobs.unmanaged = cloned;
+        } else |_| {}
+    } else {
+        known_git_blobs.ensureUnusedCapacity(proc_blobs.count()) catch return;
+        var it = proc_blobs.iterator();
+        while (it.next()) |entry| {
+            known_git_blobs.put(entry.key_ptr.*, entry.value_ptr.*) catch return;
+        }
+    }
+}
+
+pub fn loadShmInto(
+    known_files: *std.AutoHashMap([9]i128, [64]u8),
+    known_git_blobs: *std.AutoHashMap([9]i128, custody.CachedBlob),
+) void {
+    const linux = std.os.linux;
+    var path_buf: [96]u8 = undefined;
+    const shm_path = formatPathZ(&path_buf, "/dev/shm/uk-wamr-custody-cache-{d}-v1.bin", .{linux.geteuid()}) orelse return;
+    const opened = linux.openat(linux.AT.FDCWD, shm_path, .{
+        .ACCMODE = .RDONLY,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    }, 0);
+    if (linux.errno(opened) != .SUCCESS) return;
+    const fd: linux.fd_t = @intCast(opened);
+    defer _ = linux.close(fd);
+    var stx: linux.Statx = undefined;
+    if (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, .BASIC_STATS, &stx)) != .SUCCESS) return;
+    if (stx.mode & linux.S.IFMT != linux.S.IFREG or stx.uid != linux.geteuid() or stx.mode & 0o077 != 0) return;
+    const max_bytes: u64 = 16 + (@as(u64, max_shm_files) * shm_file_entry_bytes) + (@as(u64, max_shm_blobs) * shm_blob_entry_bytes);
+    if (stx.size < 16 or stx.size > max_bytes) return;
+    const sig: [4]u64 = .{
+        stx.ino,
+        stx.size,
+        @bitCast(@as(i64, stx.mtime.sec)),
+        stx.mtime.nsec,
+    };
+    lockProcCache();
+    defer unlockProcCache();
+    if (proc_cache_valid and std.mem.eql(u64, &proc_cache_sig, &sig)) {
+        copyProcCacheInto(known_files, known_git_blobs);
+        return;
+    }
+    const size: usize = @intCast(stx.size);
+    const buf = std.heap.page_allocator.alloc(u8, size) catch return;
+    defer std.heap.page_allocator.free(buf);
+    var read_total: usize = 0;
+    while (read_total < size) {
+        const rc = linux.read(fd, buf[read_total..].ptr, size - read_total);
+        if (linux.errno(rc) != .SUCCESS or rc == 0) return;
+        read_total += rc;
+    }
+    if (!std.mem.eql(u8, buf[0..8], shm_magic)) return;
+    const files_count = std.mem.readInt(u32, buf[8..12], .little);
+    const blobs_count = std.mem.readInt(u32, buf[12..16], .little);
+    if (files_count > max_shm_files or blobs_count > max_shm_blobs) return;
+    const expected_size: usize = 16 + (@as(usize, files_count) * shm_file_entry_bytes) + (@as(usize, blobs_count) * shm_blob_entry_bytes);
+    if (size != expected_size) return;
+    proc_files.clearRetainingCapacity();
+    proc_blobs.clearRetainingCapacity();
+    proc_files.ensureUnusedCapacity(std.heap.page_allocator, files_count) catch return;
+    proc_blobs.ensureUnusedCapacity(std.heap.page_allocator, blobs_count) catch return;
+    var offset: usize = 16;
+    var i: u32 = 0;
+    while (i < files_count) : (i += 1) {
+        var meta: [9]i128 = undefined;
+        @memcpy(std.mem.asBytes(&meta), buf[offset .. offset + @sizeOf([9]i128)]);
+        offset += @sizeOf([9]i128);
+        var sha256: [64]u8 = undefined;
+        @memcpy(&sha256, buf[offset .. offset + 64]);
+        offset += 64;
+        proc_files.put(std.heap.page_allocator, meta, sha256) catch return;
+    }
+    var j: u32 = 0;
+    while (j < blobs_count) : (j += 1) {
+        var meta: [9]i128 = undefined;
+        @memcpy(std.mem.asBytes(&meta), buf[offset .. offset + @sizeOf([9]i128)]);
+        offset += @sizeOf([9]i128);
+        var blob: custody.CachedBlob = undefined;
+        @memcpy(&blob.oid, buf[offset .. offset + 64]);
+        offset += 64;
+        blob.oid_len = buf[offset];
+        offset += 1;
+        @memcpy(&blob.sha256, buf[offset .. offset + 64]);
+        offset += 64;
+        proc_blobs.put(std.heap.page_allocator, meta, blob) catch return;
+    }
+    proc_cache_sig = sig;
+    proc_cache_valid = true;
+    copyProcCacheInto(known_files, known_git_blobs);
+}
+
+pub fn flushShmMaps(
+    known_files: *std.AutoHashMap([9]i128, [64]u8),
+    known_git_blobs: *std.AutoHashMap([9]i128, custody.CachedBlob),
+    loaded_files_count: *u32,
+    loaded_blobs_count: *u32,
+    init_ns: i128,
+) void {
+    const added_files = known_files.count() -| loaded_files_count.*;
+    const added_blobs = known_git_blobs.count() -| loaded_blobs_count.*;
+    if (added_files < shm_min_flush_delta and added_blobs < shm_min_flush_delta) return;
+    var fsize_rlim: [2]u64 = .{ ~@as(u64, 0), ~@as(u64, 0) };
+    _ = std.os.linux.syscall4(.prlimit64, 0, 1, 0, @intFromPtr(&fsize_rlim));
+    if (fsize_rlim[0] < 64 * 1024 * 1024) return;
+    var flush_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer flush_arena.deinit();
+    var merged_files = std.AutoHashMap([9]i128, [64]u8).init(flush_arena.allocator());
+    var merged_blobs = std.AutoHashMap([9]i128, custody.CachedBlob).init(flush_arena.allocator());
+    loadShmInto(&merged_files, &merged_blobs);
+    var self_file_it = known_files.iterator();
+    while (self_file_it.next()) |entry| {
+        merged_files.put(entry.key_ptr.*, entry.value_ptr.*) catch return;
+    }
+    var self_blob_it = known_git_blobs.iterator();
+    while (self_blob_it.next()) |entry| {
+        merged_blobs.put(entry.key_ptr.*, entry.value_ptr.*) catch return;
+    }
+    var eligible_files: u32 = 0;
+    var file_it = merged_files.iterator();
+    while (file_it.next()) |entry| {
+        const meta = entry.key_ptr.*;
+        if (meta[6] > 0 and meta[7] > 0 and meta[8] > 0) {
+            if (eligible_files < max_shm_files) eligible_files += 1;
+        }
+    }
+    var eligible_blobs: u32 = 0;
+    var blob_it = merged_blobs.iterator();
+    while (blob_it.next()) |entry| {
+        const meta = entry.key_ptr.*;
+        if (meta[6] > 0 and meta[7] > 0 and meta[8] > 0) {
+            if (eligible_blobs < max_shm_blobs) eligible_blobs += 1;
+        }
+    }
+    if (eligible_files == 0 and eligible_blobs == 0) return;
+    const recent_cutoff = init_ns -| shm_recent_window_ns;
+    const total_size: usize = 16 + (@as(usize, eligible_files) * shm_file_entry_bytes) + (@as(usize, eligible_blobs) * shm_blob_entry_bytes);
+    const buf = std.heap.page_allocator.alloc(u8, total_size) catch return;
+    defer std.heap.page_allocator.free(buf);
+    @memcpy(buf[0..8], shm_magic);
+    std.mem.writeInt(u32, buf[8..12], eligible_files, .little);
+    std.mem.writeInt(u32, buf[12..16], eligible_blobs, .little);
+    var offset: usize = 16;
+    var written_files: u32 = 0;
+    inline for (.{ true, false }) |recent_pass| {
+        file_it = merged_files.iterator();
+        while (file_it.next()) |entry| {
+            if (written_files >= eligible_files) break;
+            const meta = entry.key_ptr.*;
+            if (meta[6] > 0 and meta[7] > 0 and meta[8] > 0) {
+                const is_recent = @max(meta[7], meta[8]) >= recent_cutoff;
+                if (is_recent == recent_pass) {
+                    @memcpy(buf[offset .. offset + @sizeOf([9]i128)], std.mem.asBytes(&meta));
+                    offset += @sizeOf([9]i128);
+                    @memcpy(buf[offset .. offset + 64], entry.value_ptr);
+                    offset += 64;
+                    written_files += 1;
+                }
+            }
+        }
+    }
+    var written_blobs: u32 = 0;
+    inline for (.{ true, false }) |recent_pass| {
+        blob_it = merged_blobs.iterator();
+        while (blob_it.next()) |entry| {
+            if (written_blobs >= eligible_blobs) break;
+            const meta = entry.key_ptr.*;
+            if (meta[6] > 0 and meta[7] > 0 and meta[8] > 0) {
+                const is_recent = @max(meta[7], meta[8]) >= recent_cutoff;
+                if (is_recent == recent_pass) {
+                    @memcpy(buf[offset .. offset + @sizeOf([9]i128)], std.mem.asBytes(&meta));
+                    offset += @sizeOf([9]i128);
+                    @memcpy(buf[offset .. offset + 64], &entry.value_ptr.oid);
+                    offset += 64;
+                    buf[offset] = entry.value_ptr.oid_len;
+                    offset += 1;
+                    @memcpy(buf[offset .. offset + 64], &entry.value_ptr.sha256);
+                    offset += 64;
+                    written_blobs += 1;
+                }
+            }
+        }
+    }
+    const linux = std.os.linux;
+    var path_buf: [96]u8 = undefined;
+    const shm_path = formatPathZ(&path_buf, "/dev/shm/uk-wamr-custody-cache-{d}-v1.bin", .{linux.geteuid()}) orelse return;
+    var tmp_buf: [128]u8 = undefined;
+    const serial = shm_serial.fetchAdd(1, .monotonic);
+    const tmp_path = formatPathZ(&tmp_buf, "/dev/shm/uk-wamr-custody-cache-{d}-{d}-{d}.tmp", .{
+        linux.geteuid(),
+        linux.getpid(),
+        serial,
+    }) orelse return;
+    const opened = linux.openat(linux.AT.FDCWD, tmp_path, .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .EXCL = true,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    }, 0o600);
+    if (linux.errno(opened) != .SUCCESS) return;
+    const fd: linux.fd_t = @intCast(opened);
+    var write_ok = true;
+    var written_total: usize = 0;
+    while (written_total < total_size) {
+        const rc = linux.write(fd, buf[written_total..].ptr, total_size - written_total);
+        if (linux.errno(rc) != .SUCCESS or rc == 0) {
+            write_ok = false;
+            break;
+        }
+        written_total += rc;
+    }
+    _ = linux.close(fd);
+    if (!write_ok or linux.errno(linux.renameat(linux.AT.FDCWD, tmp_path, linux.AT.FDCWD, shm_path)) != .SUCCESS) {
+        _ = linux.unlinkat(linux.AT.FDCWD, tmp_path, 0);
+        return;
+    }
+    loaded_files_count.* = known_files.count();
+    loaded_blobs_count.* = known_git_blobs.count();
+}
+
+pub const CustodyCache = struct {
+    backing: std.mem.Allocator,
+    init_ns: i128,
+    loaded_files_count: u32 = 0,
+    loaded_blobs_count: u32 = 0,
+    known_files: std.AutoHashMap([9]i128, [64]u8),
+    known_git_blobs: std.AutoHashMap([9]i128, custody.CachedBlob),
+    runtime_cache: std.AutoHashMap([9]i128, [][]const u8),
+    python_stdlib_meta: ?[9]i128 = null,
+    python_stdlib_path: ?[]const u8 = null,
+
+    pub fn init(backing: std.mem.Allocator) CustodyCache {
+        var cache: CustodyCache = .{
+            .backing = backing,
+            .init_ns = currentRealtimeNs(),
+            .known_files = std.AutoHashMap([9]i128, [64]u8).init(backing),
+            .known_git_blobs = std.AutoHashMap([9]i128, custody.CachedBlob).init(backing),
+            .runtime_cache = std.AutoHashMap([9]i128, [][]const u8).init(backing),
+        };
+        loadShmInto(&cache.known_files, &cache.known_git_blobs);
+        cache.loaded_files_count = cache.known_files.count();
+        cache.loaded_blobs_count = cache.known_git_blobs.count();
+        return cache;
+    }
+
+    pub fn flush(self: *CustodyCache) void {
+        flushShmMaps(&self.known_files, &self.known_git_blobs, &self.loaded_files_count, &self.loaded_blobs_count, self.init_ns);
+    }
+
+    pub fn deinit(self: *CustodyCache) void {
+        self.flush();
+        if (self.python_stdlib_path) |path| self.backing.free(path);
+        var it = self.runtime_cache.valueIterator();
+        while (it.next()) |paths| {
+            for (paths.*) |item| self.backing.free(item);
+            self.backing.free(paths.*);
+        }
+        self.runtime_cache.deinit();
+        self.known_git_blobs.deinit();
+        self.known_files.deinit();
+        self.* = undefined;
+    }
+};
+
+pub fn knownFiles(context: *const Context) ?*std.AutoHashMap([9]i128, [64]u8) {
+    return if (context.custody_cache) |cache| &cache.known_files else null;
+}
+
+pub fn knownGitBlobs(context: *const Context) ?*std.AutoHashMap([9]i128, custody.CachedBlob) {
+    return if (context.custody_cache) |cache| &cache.known_git_blobs else null;
+}
+
+pub fn runtimeCache(context: *const Context) ?*std.AutoHashMap([9]i128, [][]const u8) {
+    return if (context.custody_cache) |cache| &cache.runtime_cache else null;
+}
+
+pub const Context = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    environ: std.process.Environ,
+    runtime: []const u8,
+    repository: []const u8,
+    wamr: []const u8,
+    compute: []const u8,
+    git: []const u8,
+    tools: [inputs.host_tools.len][]const u8,
+    roots: plan.Roots,
+    profile: profile.ProductionProfile = .tiny_exact_v2,
+    signal: *const process.SignalCancellation,
+    custody_cache: ?*CustodyCache = null,
+    source: ?custody.Source = null,
+    dependency: ?dependencies.Document = null,
+    bootstrap_inputs: ?inputs.Custody = null,
+    bootstrap_files: []const inputs.Binding = &.{},
+    bootstrap_trees: []const inputs.Binding = &.{},
+    consumer: ?inputs.Production = null,
+    command_records: [@typeInfo(plan.Stage).@"enum".field_names.len]?physical.File = @as([@typeInfo(plan.Stage).@"enum".field_names.len]?physical.File, @splat(null)),
+    build_start_record: ?physical.File = null,
+    fixture_report: ?physical.File = null,
+    test_before_publication: ?*const fn (*Context) void = null,
+    failed_stage: []const u8 = "startup",
+    failed_operation: []const u8 = "",
+};
+
+pub const Invocation = struct { context: *Context };
+pub const RuntimeBound = struct { context: *Context, runtime: files.Directory };
+pub const SlotsReserved = struct { context: *Context, runtime: files.Directory, work: files.Directory };
+pub const SourceCustodied = struct { context: *Context, runtime: files.Directory, work: files.Directory };
+pub const WamrArchiveSealed = struct { context: *Context, runtime: files.Directory, work: files.Directory };
+pub const DependenciesRestored = struct { context: *Context, runtime: files.Directory, work: files.Directory };
+pub const BootstrapInputsBound = struct { context: *Context, runtime: files.Directory, work: files.Directory };
+pub const AdapterBuilt = struct { context: *Context, runtime: files.Directory, work: files.Directory };
+pub const LocalBootBuilt = struct { context: *Context, runtime: files.Directory, work: files.Directory };
+pub const InputsBaselined = struct { context: *Context, runtime: files.Directory, work: files.Directory };
+pub const NativeFixturesPassed = struct { context: *Context, runtime: files.Directory, work: files.Directory };
+pub const ProducerPrepared = struct { context: *Context, runtime: files.Directory, work: files.Directory };
+pub const ConfigSolved = struct { context: *Context, runtime: files.Directory, work: files.Directory };
+pub const NativeImageBuilt = struct { context: *Context, runtime: files.Directory, work: files.Directory };
+pub const BuildAccepted = struct { context: *Context };
+
+pub fn installCancellation() !process.SignalCancellation {
+    return process.SignalCancellation.install();
+}
+
+fn next(state: anytype, comptime Type: type) Type {
+    return .{ .context = state.context, .runtime = state.runtime, .work = state.work };
+}
+
+fn cancelled(context: *const Context) !void {
+    if (context.signal.flag().load(.acquire)) return error.Cancelled;
+}
+
+fn subpath(context: *Context, name: []const u8) ![]const u8 {
+    return std.fs.path.join(context.allocator, &.{ context.compute, name });
+}
+
+fn join(context: *Context, parts: []const []const u8) ![]const u8 {
+    return std.fs.path.join(context.allocator, parts);
+}
+
+fn create(io: std.Io, directory: std.Io.Dir, name: []const u8, bytes: []const u8) !void {
+    const file = try directory.createFile(io, name, .{
+        .exclusive = true,
+        .read = true,
+        .permissions = .fromMode(0o600),
+    });
+    defer file.close(io);
+    try file.writeStreamingAll(io, bytes);
+    try file.sync(io);
+    try (std.Io.File{ .handle = directory.handle, .flags = .{ .nonblocking = false } }).sync(io);
+}
+
+fn read(context: *Context, path: []const u8, max: usize, private: bool) ![]const u8 {
+    var retained = try files.RetainedFile.open(context.io, path, if (private) .private else .artifact);
+    defer retained.close(context.io);
+    var data = try files.readSensitiveFile(context.io, context.allocator, retained.file, max, if (private) .private else .artifact);
+    defer data.deinit();
+    try retained.verify(context.io);
+    return context.allocator.dupe(u8, data.bytes());
+}
+
+pub fn readAcceptedRecord(context: *Context, name: []const u8) ![]const u8 {
+    const relative = try std.fs.path.join(context.allocator, &.{ "evidence", name });
+    defer context.allocator.free(relative);
+    const path = try subpath(context, relative);
+    defer context.allocator.free(path);
+    return read(context, path, records.max_record_bytes, true);
+}
+
+fn evidence(context: *Context, name: []const u8, value: anytype) !void {
+    try cancelled(context);
+    const raw = try std.json.Stringify.valueAlloc(context.allocator, value, .{});
+    defer context.allocator.free(raw);
+    const encoded = try records.canonicalAlloc(context.allocator, raw);
+    defer context.allocator.free(encoded);
+    const evidence_path = try subpath(context, "evidence");
+    defer context.allocator.free(evidence_path);
+    const evidence_dir = try files.openDirectory(context.io, evidence_path, .private);
+    defer evidence_dir.close(context.io);
+    if (builtin.is_test) if (context.test_before_publication) |fault| fault(context);
+    try cancelled(context);
+    try create(context.io, evidence_dir, name, encoded);
+}
+
+fn contextDir(context: *Context, relative: []const u8) !std.Io.Dir {
+    const path = try subpath(context, relative);
+    return files.openDirectory(context.io, path, .private);
+}
+
+fn findTool(context: *Context, name: []const u8) ![]const u8 {
+    const path = std.process.Environ.getPosix(context.environ, "PATH") orelse return error.MissingPath;
+    var components = std.mem.splitScalar(u8, path, ':');
+    while (components.next()) |component| {
+        if (component.len == 0 or component[0] != '/') continue;
+        const candidate = try join(context, &.{ component, name });
+        const resolved = std.Io.Dir.realPathFileAbsoluteAlloc(context.io, candidate, context.allocator) catch continue;
+        var executable = process.Executable.open(context.io, resolved) catch continue;
+        executable.close(context.io);
+        return resolved;
+    }
+    return error.ToolUnavailable;
+}
+
+pub fn bind(invocation: Invocation) !RuntimeBound {
+    const context = invocation.context;
+    try cancelled(context);
+    const runtime = try @import("layout.zig").runtime(context.io, context.runtime);
+    errdefer runtime.close(context.io);
+    const bison_path = try join(context, &.{ context.runtime, "bison" });
+    if (!std.mem.eql(u8, std.process.Environ.getPosix(context.environ, "BISON_PKGDATADIR") orelse "", bison_path))
+        return error.BisonPathChanged;
+    _ = try inputs.bisonCached(context.allocator, context.io, bison_path, knownFiles(context));
+    for (inputs.host_tools, 0..) |tool, index| {
+        context.tools[index] = try findTool(context, tool);
+        if (std.mem.eql(u8, tool, "git")) context.git = context.tools[index];
+    }
+    const own_path = try join(context, &.{ context.runtime, "controller/bin/uk-wamr-native-ci" });
+    const self_path = try std.process.executablePathAlloc(context.io, context.allocator);
+    if (!std.mem.eql(u8, own_path, self_path)) return error.UnboundController;
+    try custody.verifyPhysical(context.io, context.allocator, context.repository);
+    context.roots = .{
+        .runtime = context.runtime,
+        .source_root = context.repository,
+        .work = context.compute,
+        .zig = context.tools[9],
+        .producer = try subpath(context, "tools/bin/uk-wamr-aot-build"),
+        .fixture_runner = try subpath(context, "tools/bin/wamr-native-ci-fixtures"),
+        .supervisor = own_path,
+        .package_tool = try subpath(context, "tools/bin/wamr-ci-package"),
+        .validator = try subpath(context, "tools/bin/uk-wamr-log-validate"),
+        .supervisor_fixture = try subpath(context, "tools/bin/wamr-ci-supervisor-fixture"),
+        .tools = context.tools,
+    };
+    return .{ .context = context, .runtime = runtime };
+}
+
+fn absent(io: std.Io, path: []const u8) !void {
+    if (files.openAbsolute(io, path, .artifact)) |opened| {
+        opened.close(io);
+        return error.PriorOutput;
+    } else |err| if (err != error.FileNotFound) return err;
+}
+
+fn createSourceOutputs(context: *Context) !void {
+    const io = context.io;
+    const a = context.allocator;
+    const app = try join(context, &.{ context.repository, "support/apps/wamr-aot" });
+    const cache = try join(context, &.{ context.repository, ".zig-cache" });
+    const build = try join(context, &.{ app, "build" });
+    const config = try join(context, &.{ app, ".config" });
+    const backup = try join(context, &.{ app, ".config.old" });
+    try absent(io, cache);
+    try absent(io, build);
+    try absent(io, config);
+    try absent(io, backup);
+    const root = try files.openDirectory(io, context.repository, .artifact);
+    defer root.close(io);
+    try root.createDir(io, ".zig-cache", .fromMode(0o700));
+    const app_dir = try files.openDirectory(io, app, .artifact);
+    defer app_dir.close(io);
+    try app_dir.createDir(io, "build", .fromMode(0o700));
+    const build_dir = try files.openDirectory(io, build, .private);
+    defer build_dir.close(io);
+    const definition = try read(context, try std.fs.path.join(a, &.{ app, "defconfig" }), limits.mib, false);
+    try create(io, build_dir, ".config", definition);
+    try create(io, app_dir, ".config", definition);
+}
+
+pub fn reserve(bound: RuntimeBound) !SlotsReserved {
+    const context = bound.context;
+    try cancelled(context);
+    try bound.runtime.dir.createDir(context.io, "compute", .fromMode(0o700));
+    const work = try files.Directory.open(context.io, context.compute);
+    errdefer work.close(context.io);
+    for ([_][]const u8{
+        "private",  "evidence", "scratch",          "cache",   "global-cache",
+        "fixtures", "tools",    "local-boot-tools", "package", "public-source",
+    }) |directory| try work.dir.createDir(context.io, directory, .fromMode(0o700));
+    const global = try contextDir(context, "global-cache");
+    defer global.close(context.io);
+    try global.createDir(context.io, "tmp", .fromMode(0o700));
+    for (profile.production_modes) |mode| {
+        const name = try context.allocator.print("boot-{s}", .{@tagName(mode)});
+        try work.dir.createDir(context.io, name, .fromMode(0o700));
+    }
+    try createSourceOutputs(context);
+    return .{ .context = context, .runtime = bound.runtime, .work = work };
+}
+
+pub fn captureSource(reserved: SlotsReserved) !SourceCustodied {
+    const context = reserved.context;
+    try cancelled(context);
+    context.source = try custody.sourceCached(
+        context.allocator,
+        context.io,
+        context.repository,
+        context.git,
+        knownGitBlobs(context),
+        knownFiles(context),
+    );
+    return next(reserved, SourceCustodied);
+}
+
+pub fn sealSource(state: SourceCustodied) !WamrArchiveSealed {
+    const context = state.context;
+    try cancelled(context);
+    context.failed_stage = "wamr-archive";
+    try state.runtime.dir.createDir(context.io, "custody", .fromMode(0o700));
+    _ = try custody.sealWamr(context.allocator, context.io, context.wamr, context.runtime, context.git);
+    return next(state, WamrArchiveSealed);
+}
+
+fn runBootstrap(context: *Context, stage: []const u8, argv: []const []const u8, cwd: []const u8, timeout: u32, bound: usize) ![]const u8 {
+    try cancelled(context);
+    try requireBootstrapInputs(context);
+    try process.initialize();
+    const io = context.io;
+    var executable = try process.Executable.open(io, argv[0]);
+    defer executable.close(io);
+    const directory = try files.openDirectory(io, cwd, .private);
+    defer directory.close(io);
+    var env = std.process.Environ.Map.init(context.allocator);
+    defer env.deinit();
+    for ([_]struct { key: []const u8, val: []const u8 }{
+        .{ .key = "HOME", .val = context.compute },
+        .{ .key = "LANG", .val = "C" },
+        .{ .key = "LC_ALL", .val = "C" },
+        .{ .key = "PATH", .val = "/usr/bin:/bin" },
+        .{ .key = "ZIG_LOCAL_CACHE_DIR", .val = try subpath(context, "cache") },
+        .{ .key = "ZIG_GLOBAL_CACHE_DIR", .val = try subpath(context, "global-cache") },
+    }) |item| try env.put(item.key, item.val);
+    if (std.mem.eql(u8, stage, "dependency-restore"))
+        try env.put("ZIG_LOCAL_PKG_DIR", try join(context, &.{ cwd, "zig-pkg" }));
+    const primary = try process.Deadline.afterMilliseconds(@as(u64, timeout) * 1000);
+    var result = try process.runCommand(context.allocator, io, .{
+        .executable = executable,
+        .argv = argv,
+        .environment = &env,
+        .cwd = directory,
+        .primary_deadline = primary,
+        .cleanup_deadline = .{ .expires_ns = try std.math.add(u64, primary.expires_ns, 10 * std.time.ns_per_s) },
+        .cancel = context.signal.flag(),
+        .snapshot_executable = false,
+        .limits = .{ .stdout_bytes = @min(bound + 1, 4 * limits.mib), .stderr_bytes = 4 * 1024, .term_grace_ms = 1000 },
+    });
+    defer result.deinit(context.allocator);
+    const combined = try std.mem.concat(context.allocator, u8, &.{ result.stdout, result.stderr });
+    const log_dir = try contextDir(context, "private");
+    defer log_dir.close(io);
+    try create(io, log_dir, try context.allocator.print("{s}.log", .{stage}), combined[0..@min(combined.len, bound + 1)]);
+    if (!result.cleanup_complete or !result.executable_stable) return error.CleanupPoisoned;
+    if (!result.succeeded() or combined.len > bound) return error.BootstrapCommandFailed;
+    try requireBootstrapInputs(context);
+    return context.allocator.dupe(u8, result.stdout);
+}
+
+fn freezeBootstrapInputs(context: *Context) !void {
+    const a = context.allocator;
+    const files_bound = try a.alloc(inputs.Binding, inputs.host_tools.len + 2);
+    files_bound[0] = .{ .role = "command-supervisor", .path = context.roots.supervisor };
+    files_bound[1] = .{ .role = "wamr-source-archive", .path = try join(context, &.{ context.runtime, "custody/wamr-source.tar" }) };
+    for (inputs.host_tools, context.tools, 0..) |name, path, i|
+        files_bound[i + 2] = .{ .role = try a.print("tool:{s}", .{name}), .path = path };
+    const trees_bound = try a.alloc(inputs.Binding, 3);
+    trees_bound[0] = .{ .role = "bison", .path = try join(context, &.{ context.runtime, "bison" }) };
+    trees_bound[1] = .{ .role = "zig", .path = std.fs.path.dirname(context.roots.zig) orelse return error.UnsafePath };
+    trees_bound[2] = .{ .role = "python-stdlib", .path = try pythonStdlib(context) };
+    context.bootstrap_inputs = if (knownFiles(context)) |known|
+        try inputs.captureWithKnown(a, context.io, files_bound, trees_bound, known)
+    else
+        try inputs.capture(a, context.io, files_bound, trees_bound);
+    context.bootstrap_files = files_bound;
+    context.bootstrap_trees = trees_bound;
+}
+
+fn requireBootstrapInputs(context: *Context) !void {
+    try inputs.requireSameWithKnown(
+        context.allocator,
+        context.io,
+        context.bootstrap_inputs orelse return error.UnboundInputs,
+        context.bootstrap_files,
+        context.bootstrap_trees,
+        knownFiles(context),
+    );
+}
+
+fn restoreDependencies(context: *Context) !void {
+    const a = context.allocator;
+    const io = context.io;
+    context.failed_operation = "create-restore";
+    const restore_root = try subpath(context, "dependencies");
+    const work = try files.openDirectory(io, context.compute, .private);
+    defer work.close(io);
+    try work.createDir(io, "dependencies", .fromMode(0o700));
+    const dir = try files.openDirectory(io, restore_root, .private);
+    defer dir.close(io);
+    context.failed_operation = "tracked-manifests";
+    const manifests = try dependencies.sourceManifests(a, io, context.repository, context.git);
+    defer for (manifests) |manifest| manifest.deinit(a);
+    for (manifests, [_][]const u8{ "build.zig", "build.zig.zon" }) |manifest, name|
+        try create(io, dir, name, manifest.content);
+    try dependencies.pinnedManifest(a, manifests[1].content);
+    try dir.createDir(io, "zig-pkg", .fromMode(0o700));
+    context.failed_operation = "fetch-pinned-package";
+    _ = try runBootstrap(context, "dependency-restore", &.{
+        context.roots.zig, "build",       "--build-file",                try join(context, &.{ restore_root, "build.zig" }),
+        "--fetch=all",     "--cache-dir", try subpath(context, "cache"), "-j2",
+    }, restore_root, 900, 8 * limits.mib);
+    const packages = try join(context, &.{ restore_root, "zig-pkg" });
+    context.failed_operation = "inventory-packages";
+    var listing = try dependencies.packageSet(a, io, packages);
+    defer listing.deinit(a);
+    const hash_work = try subpath(context, "dependency-hash-work");
+    try work.createDir(io, "dependency-hash-work", .fromMode(0o700));
+    const hash_dir = try files.openDirectory(io, hash_work, .private);
+    defer hash_dir.close(io);
+    try create(io, hash_dir, "build.zig", manifests[0].content);
+    try create(io, hash_dir, "build.zig.zon", manifests[1].content);
+    try hash_dir.createDir(io, "zig-pkg", .fromMode(0o700));
+    try work.createDir(io, "dependency-hash-cache", .fromMode(0o700));
+    context.failed_operation = "verify-package-hashes";
+    for (listing.packages, 0..) |package, index| {
+        const name = try a.print("dependency-hash-{d:0>3}", .{index});
+        const raw = try runBootstrap(context, name, &.{
+            context.roots.zig,                             "fetch",                                         "--pkg-dir",
+            try subpath(context, "dependency-hash-cache"), try join(context, &.{ packages, package.name }),
+        }, hash_work, 300, 511);
+        if (!std.mem.eql(u8, raw, try a.print("{s}\n", .{package.name})))
+            return error.PackageHashMismatch;
+    }
+    context.failed_operation = "record-dependencies";
+    context.dependency = try dependencies.captureCached(a, io, context.repository, context.git, context.compute, knownFiles(context));
+}
+
+pub fn restore(state: WamrArchiveSealed) !DependenciesRestored {
+    const context = state.context;
+    context.failed_stage = "dependency-restore";
+    context.failed_operation = "bind-bootstrap-inputs";
+    try freezeBootstrapInputs(context);
+    try restoreDependencies(context);
+    context.failed_operation = "verify-bootstrap-inputs";
+    try requireBootstrapInputs(context);
+    return next(state, DependenciesRestored);
+}
+
+pub fn bootstrap(state: DependenciesRestored) !BootstrapInputsBound {
+    const context = state.context;
+    context.failed_stage = "bootstrap";
+    try custody.verifyPhysical(context.io, context.allocator, context.repository);
+    try requireSource(context);
+    try requireBootstrapInputs(context);
+    try dependencies.requireDocumentCached(context.allocator, context.io, context.repository, context.git, context.compute, context.dependency.?, knownFiles(context));
+    return next(state, BootstrapInputsBound);
+}
+
+pub fn requireSource(context: *Context) !void {
+    try cancelled(context);
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    const actual = try custody.sourceCached(scratch.allocator(), context.io, context.repository, context.git, knownGitBlobs(context), knownFiles(context));
+    try cancelled(context);
+    const before = context.source.?;
+    if (!before.same(actual)) return error.SourceChanged;
+}
+
+fn runStage(state: anytype, selected: plan.Stage, check_consumer: bool) !void {
+    const context = state.context;
+    context.failed_stage = @tagName(selected);
+    try cancelled(context);
+    try requireBuildEvidence(context);
+    try requireSource(context);
+    try dependencies.requireDocumentCached(context.allocator, context.io, context.repository, context.git, context.compute, context.dependency.?, knownFiles(context));
+    if (check_consumer) try requireConsumer(context) else try requireBootstrapInputs(context);
+    const private = try contextDir(context, "private");
+    defer private.close(context.io);
+    const evidence_dir = try contextDir(context, "evidence");
+    defer evidence_dir.close(context.io);
+    const result = try adapter.execute(context.allocator, context.io, .{
+        .roots = context.roots,
+        .stage = selected,
+        .profile = context.profile,
+        .private_dir = private,
+        .evidence_dir = evidence_dir,
+        .cancel = context.signal.flag(),
+    });
+    if (result.poisoned) return error.CleanupPoisoned;
+    if (!result.accepted) return error.StageRefused;
+    const record_path = try subpath(context, try context.allocator.print("evidence/command-{s}.json", .{@tagName(selected)}));
+    context.command_records[@backingInt(selected)] = try physical.readFileCached(context.io, record_path, limits.tracked_file, true, knownFiles(context));
+    try requireBuildEvidence(context);
+    try requireSource(context);
+    try dependencies.requireDocumentCached(context.allocator, context.io, context.repository, context.git, context.compute, context.dependency.?, knownFiles(context));
+    if (check_consumer) try requireConsumer(context) else try requireBootstrapInputs(context);
+}
+
+pub fn requireBuildEvidence(context: *Context) !void {
+    for (std.enums.values(plan.Stage), context.command_records) |stage, expected| {
+        try cancelled(context);
+        const recorded = expected orelse continue;
+        const relative = try context.allocator.print("evidence/command-{s}.json", .{@tagName(stage)});
+        defer context.allocator.free(relative);
+        const path = try subpath(context, relative);
+        defer context.allocator.free(path);
+        const current = try physical.readFileCached(context.io, path, limits.tracked_file, true, knownFiles(context));
+        if (!std.meta.eql(current, recorded)) return error.CommandEvidenceChanged;
+    }
+    if (context.build_start_record) |recorded| {
+        try cancelled(context);
+        const path = try subpath(context, "evidence/build-start.json");
+        defer context.allocator.free(path);
+        const current = try physical.readFileCached(context.io, path, limits.tracked_file, true, knownFiles(context));
+        if (!std.meta.eql(current, recorded)) return error.BuildStartChanged;
+    }
+    if (context.fixture_report) |recorded| {
+        try cancelled(context);
+        const path = try subpath(context, "fixtures/native-scenarios.json");
+        defer context.allocator.free(path);
+        const current = try physical.readFileCached(context.io, path, 8192, true, knownFiles(context));
+        if (!std.meta.eql(current, recorded)) return error.FixtureChanged;
+    }
+}
+
+pub fn requireConsumer(context: *Context) !void {
+    try cancelled(context);
+    const observed = context.consumer orelse return error.UnboundInputs;
+    try inputs.requireProductionCached(context.allocator, context.io, .{
+        .runtime = context.runtime,
+        .tools = context.tools,
+        .python_stdlib = try pythonStdlib(context),
+    }, observed.custody, knownFiles(context), runtimeCache(context));
+    try cancelled(context);
+}
+
+pub fn pythonStdlibCached(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repository: []const u8,
+    python: []const u8,
+    cancel: ?*const std.atomic.Value(bool),
+    custody_cache: ?*CustodyCache,
+) ![]const u8 {
+    if (custody_cache) |cache| {
+        var retained = try files.RetainedFile.open(io, python, .artifact);
+        defer retained.close(io);
+        const meta = physical.metadata(retained.file_snapshot);
+        if (cache.python_stdlib_meta) |expected_meta| {
+            if (std.meta.eql(expected_meta, meta)) {
+                if (cache.python_stdlib_path) |cached_path| {
+                    try retained.verify(io);
+                    _ = try physical.directory(io, cached_path, false);
+                    return allocator.dupe(u8, cached_path);
+                }
+            }
+        }
+        const computed = try inputs.pythonStdlib(
+            allocator,
+            io,
+            repository,
+            python,
+            cancel,
+        );
+        try retained.verify(io);
+        if (cache.python_stdlib_path) |old| cache.backing.free(old);
+        cache.python_stdlib_path = try cache.backing.dupe(u8, computed);
+        cache.python_stdlib_meta = meta;
+        return computed;
+    }
+    return inputs.pythonStdlib(
+        allocator,
+        io,
+        repository,
+        python,
+        cancel,
+    );
+}
+
+fn pythonStdlib(context: *Context) ![]const u8 {
+    return pythonStdlibCached(
+        context.allocator,
+        context.io,
+        context.repository,
+        context.tools[1],
+        context.signal.flag(),
+        context.custody_cache,
+    );
+}
+
+pub fn buildAdapter(state: BootstrapInputsBound) !AdapterBuilt {
+    try runStage(state, .adapter, false);
+    return next(state, AdapterBuilt);
+}
+
+pub fn baseline(state: LocalBootBuilt) !InputsBaselined {
+    const context = state.context;
+    context.failed_stage = "build-start";
+    try requireBuildEvidence(context);
+    try requireBootstrapInputs(context);
+    context.consumer = try inputs.captureProductionCached(context.allocator, context.io, .{
+        .runtime = context.runtime,
+        .tools = context.tools,
+        .python_stdlib = try pythonStdlib(context),
+    }, knownFiles(context), runtimeCache(context));
+    try requireBootstrapInputs(context);
+    const document = try buildStart(context);
+    try evidence(context, "build-start.json", document);
+    context.build_start_record = try physical.readFileCached(context.io, try subpath(context, "evidence/build-start.json"), limits.tracked_file, true, knownFiles(context));
+    try requireBuildEvidence(context);
+    return next(state, InputsBaselined);
+}
+
+fn buildStart(context: *Context) !std.json.Value {
+    const a = context.allocator;
+    var value = std.json.Value{ .object = .empty };
+    const origin = context.source.?;
+    const source_id = try typedValue(a, .{ .revision = origin.revision, .tree = origin.tree });
+    try value.object.put(a, "source", source_id);
+    try value.object.put(a, "source_custody", try typedValue(a, origin.custody));
+    var tools = std.json.Value{ .object = .empty };
+    for (inputs.host_tools, context.tools) |name, path| {
+        const item = try physical.readFileCached(context.io, path, limits.tracked_file, false, knownFiles(context));
+        try tools.object.put(a, name, .{ .string = try a.dupe(u8, &item.sha256) });
+    }
+    try value.object.put(a, "tools", tools);
+    try value.object.put(a, "bison_data", try typedValue(a, try inputs.bisonCached(a, context.io, try join(context, &.{ context.runtime, "bison" }), knownFiles(context))));
+    const dep = try context.dependency.?.canonical(a);
+    try value.object.put(a, "dependencies", try rawValue(a, dep));
+    const consumer = try context.consumer.?.custody.canonical(a);
+    try value.object.put(a, "consumer_inputs", try rawValue(a, consumer));
+    try value.object.put(a, "command_supervisor", try supervisorState(context));
+    return value;
+}
+
+fn typedValue(allocator: std.mem.Allocator, typed: anytype) !std.json.Value {
+    return rawValue(allocator, try std.json.Stringify.valueAlloc(allocator, typed, .{}));
+}
+
+fn rawValue(allocator: std.mem.Allocator, raw: []const u8) !std.json.Value {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{ .allocate = .alloc_always });
+    return parsed.value;
+}
+
+fn supervisorState(context: *Context) !std.json.Value {
+    return captureSupervisorStateCached(
+        context.allocator,
+        context.io,
+        context.repository,
+        context.roots.supervisor,
+        knownFiles(context),
+        runtimeCache(context),
+    );
+}
+
+pub fn captureSupervisorState(a: std.mem.Allocator, io: std.Io, repository: []const u8, supervisor: []const u8) !std.json.Value {
+    return captureSupervisorStateCached(a, io, repository, supervisor, null, null);
+}
+
+fn captureSupervisorStateCached(
+    a: std.mem.Allocator,
+    io: std.Io,
+    repository: []const u8,
+    supervisor: []const u8,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+    runtime_cache: ?*std.AutoHashMap([9]i128, [][]const u8),
+) !std.json.Value {
+    const source_map = try supervisorSourceMap(a, io, repository, known_files);
+    const runtime_map = try supervisorRuntimeMap(a, io, supervisor, known_files, runtime_cache);
+    return typedValue(a, .{
+        .schema = "uk.wamr.command-supervisor",
+        .version = 1,
+        .protocol = "uk.wamr.command-supervisor/1 process-command/1",
+        .source_map = source_map,
+        .runtime_map = runtime_map,
+    });
+}
+
+const Map = struct {
+    count: usize,
+    bytes: usize,
+    content_closure_sha256: [64]u8,
+    physical_closure_sha256: [64]u8,
+    records: std.json.Value,
+};
+const MapEntry = struct { name: []const u8, file: physical.File };
+
+fn guardedMap(a: std.mem.Allocator, domain: []const u8, sorted: []const MapEntry) !Map {
+    var content = Sha256.init(.{});
+    content.update(try a.print("{s}-content\x00", .{domain}));
+    var physical_hash = Sha256.init(.{});
+    physical_hash.update(try a.print("{s}-physical\x00", .{domain}));
+    var result = std.json.Value{ .object = .empty };
+    var total: usize = 0;
+    for (sorted) |entry| {
+        try limits.addBounded(&total, @intCast(entry.file.bytes), limits.tracked_bytes);
+        try physical.bind(a, &content, .{ entry.name, entry.file.bytes, entry.file.sha256 });
+        try physical.bind(a, &physical_hash, .{ entry.name, entry.file.metadata });
+        try result.object.put(a, entry.name, try typedValue(a, .{
+            .bytes = entry.file.bytes,
+            .sha256 = entry.file.sha256,
+            .metadata = entry.file.metadata,
+        }));
+    }
+    return .{
+        .count = sorted.len,
+        .bytes = total,
+        .content_closure_sha256 = physical.hex(&content),
+        .physical_closure_sha256 = physical.hex(&physical_hash),
+        .records = result,
+    };
+}
+
+fn supervisorSourceMap(
+    a: std.mem.Allocator,
+    io: std.Io,
+    repository: []const u8,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+) !Map {
+    var entries: std.ArrayList(MapEntry) = .empty;
+    for (custody.closure) |entry| {
+        const file = try physical.readFileCached(io, try std.fs.path.join(a, &.{ repository, entry.name }), limits.tracked_file, false, known_files);
+        try entries.append(a, .{ .name = entry.name, .file = file });
+    }
+    return guardedMap(a, "uk.wamr.command-supervisor-source-v1", entries.items);
+}
+
+fn supervisorRuntimeMap(
+    a: std.mem.Allocator,
+    io: std.Io,
+    supervisor: []const u8,
+    known_files: ?*std.AutoHashMap([9]i128, [64]u8),
+    runtime_cache: ?*std.AutoHashMap([9]i128, [][]const u8),
+) !Map {
+    var entries: std.ArrayList(MapEntry) = .empty;
+    const binary = try physical.readFileCached(io, supervisor, limits.tracked_file, false, known_files);
+    try entries.append(a, .{ .name = "executable", .file = binary });
+    const runtime_paths = try inputs.executableRuntimePathsCached(a, io, supervisor, runtime_cache);
+    for (runtime_paths) |path| {
+        const role = try a.print("runtime:{s}", .{path});
+        try entries.append(a, .{ .name = role, .file = try physical.readFileCached(io, path, limits.tracked_file, false, known_files) });
+    }
+    return guardedMap(a, "uk.wamr.command-supervisor-runtime-v1", entries.items);
+}
+
+pub fn buildLocalBoot(state: AdapterBuilt) !LocalBootBuilt {
+    try runStage(state, .@"local-boot-tool", false);
+    return next(state, LocalBootBuilt);
+}
+
+pub fn testFixtures(state: InputsBaselined) !NativeFixturesPassed {
+    try runStage(state, .fixtures, true);
+    const context = state.context;
+    const path = try subpath(context, "fixtures/native-scenarios.json");
+    const output = try read(context, path, 8192, true);
+    try fixture_contract.verify(context.allocator, output);
+    context.fixture_report = try physical.readFile(context.io, path, 8192, true);
+    try requireBuildEvidence(context);
+    return next(state, NativeFixturesPassed);
+}
+
+pub fn prepare(state: NativeFixturesPassed) !ProducerPrepared {
+    try runStage(state, .prepare, true);
+    try verifyRuntimeIdentity(state.context);
+    return next(state, ProducerPrepared);
+}
+
+const tiny_artifact_names = [_][]const u8{
+    "embedded.c", "identity.h", "libwamr-aot.a", "tiny.cwasm", "tiny.wasm", "wamr_aot.h", "wamrc",
+};
+const coremark_artifact_names = [_][]const u8{
+    "coremark.cwasm",      "coremark.wasm",      "coremark-nofp.cwasm", "coremark-nofp.wasm",
+    "embedded.c",          "identity.h",         "libwamr-aot.a",       "tiny.cwasm",
+    "tiny.wasm",           "wamr_aot.h",         "wamrc",
+};
+
+fn verifyRuntimeIdentity(context: *Context) !void {
+    try cancelled(context);
+    const a = context.allocator;
+    const artifact_dir = try join(context, &.{ context.repository, "support/apps/wamr-aot/build/artifacts" });
+    const raw = try read(context, try join(context, &.{ artifact_dir, "identity.json" }), limits.mib, false);
+    const parsed = try core.contracts.Document.parse(a, raw, .{});
+    defer parsed.deinit();
+    try admitPreparedIdentityForProfile(parsed.value(), context.profile);
+    const artifacts = parsed.value().object.get("files").?.object;
+    const expected_names: []const []const u8 = switch (context.profile) {
+        .tiny_exact_v2 => &tiny_artifact_names,
+        .coremark_exact_v2 => &coremark_artifact_names,
+    };
+    for (expected_names) |name| {
+        try cancelled(context);
+        const digest = try core.contracts.parseSha256(try core.contracts.string(artifacts.get(name).?));
+        const file = try physical.readFileCached(context.io, try join(context, &.{ artifact_dir, name }), limits.tracked_file, false, knownFiles(context));
+        if (!std.meta.eql(digest, try core.contracts.parseSha256(&file.sha256))) return error.ArtifactChanged;
+    }
+}
+
+pub fn admitPreparedIdentity(value: std.json.Value) !void {
+    return admitPreparedIdentityForProfile(value, .tiny_exact_v2);
+}
+
+pub fn admitPreparedIdentityForProfile(value: std.json.Value, prod: profile.ProductionProfile) !void {
+    return admitIdentity(value, "0.17.0", limits.wamr_revision, prod);
+}
+
+pub fn admitImportedIdentity(value: std.json.Value) !void {
+    return admitImportedIdentityForSet(value, .tiny_v2_qcow2_derived_vhd);
+}
+
+pub fn admitImportedIdentityForSet(value: std.json.Value, set: profile.CompatibleRecordSet) !void {
+    if (value != .object) return error.InvalidProducer;
+    const prod: profile.ProductionProfile = switch (set) {
+        .coremark_v2_qcow2_derived_vhd => .coremark_exact_v2,
+        .tiny_v1_legacy, .tiny_v2_qcow2_derived_vhd => .tiny_exact_v2,
+    };
+    const version = try core.contracts.string(value.object.get("zig_version") orelse return error.InvalidProducer);
+    if (std.mem.eql(u8, version, "0.16.0")) {
+        if (prod != .tiny_exact_v2) return error.InvalidProducer;
+        return admitIdentity(value, "0.16.0", limits.historical_wamr_revision, prod);
+    }
+    return admitPreparedIdentityForProfile(value, prod);
+}
+
+pub fn detectPreparedProfile(value: std.json.Value) !profile.ProductionProfile {
+    if (value != .object) return error.InvalidProducer;
+    const wasi = value.object.get("minimal_wasi") orelse return error.InvalidProducer;
+    if (wasi != .bool) return error.InvalidProducer;
+    const prod: profile.ProductionProfile = if (wasi.bool) .coremark_exact_v2 else .tiny_exact_v2;
+    try admitPreparedIdentityForProfile(value, prod);
+    return prod;
+}
+
+fn admitIdentity(value: std.json.Value, zig_version: []const u8, wamr_revision: []const u8, prod: profile.ProductionProfile) !void {
+    if (value != .object) return error.InvalidProducer;
+    const object = value.object;
+    const revision = try core.contracts.string(object.get("wamr_revision") orelse return error.InvalidProducer);
+    const jit = object.get("jit_mode") orelse std.json.Value.null;
+    const development = object.get("development_only") orelse std.json.Value{ .bool = false };
+    const wasi = object.get("minimal_wasi") orelse return error.InvalidProducer;
+    if (!std.mem.eql(u8, revision, wamr_revision) or
+        !std.mem.eql(u8, try core.contracts.string(object.get("variant") orelse std.json.Value{ .string = "tiny" }), "tiny") or
+        !std.mem.eql(u8, try core.contracts.string(object.get("compiler_profile") orelse return error.InvalidProducer), "unikraft-x86_64") or
+        !std.mem.eql(u8, try core.contracts.string(object.get("zig_version") orelse return error.InvalidProducer), zig_version) or
+        jit != .null)
+        return error.InvalidProducer;
+    const expect_wasi = prod == .coremark_exact_v2;
+    if (development != .bool or development.bool or wasi != .bool or wasi.bool != expect_wasi)
+        return error.InvalidProducer;
+    const expected_names: []const []const u8 = switch (prod) {
+        .tiny_exact_v2 => &tiny_artifact_names,
+        .coremark_exact_v2 => &coremark_artifact_names,
+    };
+    const artifacts = (object.get("files") orelse return error.InvalidProducer);
+    if (artifacts != .object or artifacts.object.count() != expected_names.len) return error.InvalidProducer;
+    for (expected_names) |name| {
+        _ = try core.contracts.parseSha256(try core.contracts.string(artifacts.object.get(name) orelse return error.InvalidProducer));
+    }
+}
+
+pub fn solveConfig(state: ProducerPrepared) !ConfigSolved {
+    const context = state.context;
+    try runStage(state, .config, true);
+    const app = try join(context, &.{ context.repository, "support/apps/wamr-aot" });
+    try absent(context.io, try join(context, &.{ app, ".config.old" }));
+    const solved = try read(context, try join(context, &.{ app, "build/.config" }), limits.mib, true);
+    const app_dir = try files.openDirectory(context.io, app, .artifact);
+    defer app_dir.close(context.io);
+    const before_parent = try files.snapshot(.{ .handle = app_dir.handle, .flags = .{ .nonblocking = false } });
+    const destination = try app_dir.openFile(context.io, ".config", .{
+        .mode = .read_write,
+        .follow_symlinks = false,
+    });
+    defer destination.close(context.io);
+    const before = try files.snapshot(destination);
+    if (before.mode & std.os.linux.S.IFMT != std.os.linux.S.IFREG or
+        before.uid != std.os.linux.geteuid() or before.mode & 0o7777 != 0o600 or before.nlink != 1)
+        return error.UnsafeConfig;
+    try destination.setLength(context.io, 0);
+    try destination.writePositionalAll(context.io, solved, 0);
+    try destination.sync(context.io);
+    const named = try app_dir.openFile(context.io, ".config", .{ .follow_symlinks = false });
+    defer named.close(context.io);
+    if (!files.sameSnapshot(try files.snapshot(destination), try files.snapshot(named)) or
+        !files.sameSnapshot(before_parent, try files.snapshot(.{ .handle = app_dir.handle, .flags = .{ .nonblocking = false } })))
+        return error.ConfigChanged;
+    const retained = try read(context, try join(context, &.{ app, ".config" }), limits.mib, false);
+    if (!std.mem.eql(u8, retained, solved)) return error.ConfigChanged;
+    return next(state, ConfigSolved);
+}
+
+pub fn nativeImage(state: ConfigSolved) !NativeImageBuilt {
+    try runStage(state, .@"native-image", true);
+    const context = state.context;
+    const app = try join(context, &.{ context.repository, "support/apps/wamr-aot" });
+    const solved = try read(context, try join(context, &.{ app, "build/.config" }), limits.mib, true);
+    if (!std.mem.eql(u8, solved, try read(context, try join(context, &.{ app, ".config" }), limits.mib, false)))
+        return error.ConfigChanged;
+    return next(state, NativeImageBuilt);
+}
+
+pub fn acceptBuild(state: NativeImageBuilt) !BuildAccepted {
+    const context = state.context;
+    context.failed_stage = "build";
+    try publishBuild(context, try buildValue(context));
+    return .{ .context = context };
+}
+
+pub fn buildValue(context: *Context) !std.json.Value {
+    try cancelled(context);
+    try requireBuildEvidence(context);
+    try requireSource(context);
+    try requireConsumer(context);
+    try dependencies.requireDocumentCached(context.allocator, context.io, context.repository, context.git, context.compute, context.dependency.?, knownFiles(context));
+    try cancelled(context);
+    return buildValueFromCurrent(context);
+}
+
+fn buildValueFromCurrent(context: *Context) !std.json.Value {
+    try verifyRuntimeIdentity(context);
+    const a = context.allocator;
+    const app = try join(context, &.{ context.repository, "support/apps/wamr-aot" });
+    const image = try read(context, try join(context, &.{ app, "build/image-identity.json" }), limits.mib, false);
+    const parsed = try core.contracts.Document.parse(a, image, .{});
+    defer parsed.deinit();
+    const value = parsed.value().object;
+    if (try core.contracts.integer(u8, value.get("schema_version") orelse return error.InvalidImage) != 1 or
+        !std.mem.eql(u8, try core.contracts.string(value.get("unikraft_revision") orelse return error.InvalidImage), context.source.?.revision))
+        return error.InvalidImage;
+    const empty_hash = std.fmt.bytesToHex(records.fileIdentity(""), .lower);
+    if (!std.mem.eql(u8, try core.contracts.string(value.get("unikraft_diff_sha256") orelse return error.InvalidImage), &empty_hash))
+        return error.DirtyImageSource;
+    const app_identity = try read(context, try join(context, &.{ app, "build/artifacts/identity.json" }), limits.mib, false);
+    const runtime_hash = try core.contracts.parseSha256(try core.contracts.string(value.get("runtime_inputs_sha256") orelse return error.InvalidImage));
+    if (!std.meta.eql(runtime_hash, records.fileIdentity(app_identity))) return error.ImageInputsChanged;
+    const solved = try read(context, try join(context, &.{ app, "build/.config" }), limits.mib, false);
+    if (!std.mem.eql(u8, solved, try read(context, try join(context, &.{ app, ".config" }), limits.mib, false)))
+        return error.ConfigChanged;
+    const solved_hash = std.fmt.bytesToHex(records.fileIdentity(solved), .lower);
+    if (!std.mem.eql(u8, try core.contracts.string(value.get("solved_config_sha256") orelse return error.InvalidImage), &solved_hash))
+        return error.ConfigChanged;
+    const image_files = value.get("files") orelse return error.InvalidImage;
+    if (image_files != .object or image_files.object.count() != 3) return error.InvalidImage;
+    const efi = "wamr_hyperv-x86_64-efi";
+    for ([_][]const u8{ efi, efi ++ ".dbg", efi ++ ".bootinfo" }) |name| {
+        try cancelled(context);
+        const digest = try core.contracts.parseSha256(try core.contracts.string(image_files.object.get(name) orelse return error.InvalidImage));
+        const file = try physical.readFileCached(context.io, try join(context, &.{ app, "build", name }), limits.tracked_file, false, knownFiles(context));
+        if (!std.meta.eql(digest, try core.contracts.parseSha256(&file.sha256))) return error.ImageChanged;
+    }
+    const app_sources = value.get("application_sources") orelse return error.InvalidImage;
+    if (app_sources != .object) return error.InvalidImage;
+    const app_dir = try files.openDirectory(context.io, app, .artifact);
+    defer app_dir.close(context.io);
+    var iterator = app_dir.iterate();
+    var count: usize = 0;
+    while (try iterator.next(context.io)) |entry| {
+        try cancelled(context);
+        if (entry.name[0] == '.' or entry.kind == .directory) continue;
+        const path = try join(context, &.{ app, entry.name });
+        const expected = try core.contracts.parseSha256(try core.contracts.string(app_sources.object.get(entry.name) orelse return error.AppSourceChanged));
+        const actual = try physical.readFileCached(context.io, path, limits.tracked_file, false, knownFiles(context));
+        if (!std.meta.eql(expected, try core.contracts.parseSha256(&actual.sha256))) return error.AppSourceChanged;
+        count += 1;
+    }
+    if (count != app_sources.object.count()) return error.AppSourceChanged;
+    const image_tools = value.get("tools") orelse return error.InvalidImage;
+    if (image_tools != .object or image_tools.object.count() != 9) return error.InvalidImage;
+    for ([_][]const u8{ "zig", "make", "llvm-nm", "llvm-objcopy", "llvm-objdump", "llvm-readelf", "llvm-strip", "bison", "flex" }) |name| {
+        try cancelled(context);
+        const selected = try core.contracts.parseSha256(try core.contracts.string(image_tools.object.get(name) orelse return error.ImageToolsChanged));
+        for (inputs.host_tools, context.tools) |known, path| {
+            if (!std.mem.eql(u8, name, known)) continue;
+            const actual = try physical.readFileCached(context.io, path, limits.tracked_file, false, knownFiles(context));
+            if (!std.meta.eql(selected, try core.contracts.parseSha256(&actual.sha256))) return error.ImageToolsChanged;
+            break;
+        }
+    }
+    for ([_][]const u8{
+        "CONFIG_APPWAMRAOT=y", "CONFIG_ARCH_X86_64=y", "CONFIG_PLAT_HYPERV=y",
+        "CONFIG_LIBUKVMEM=y",  "CONFIG_LIBUKPAGING=y", "CONFIG_UKPLAT_CPU_MAXCOUNT=1",
+    }) |setting| if (countLine(solved, setting) != 1) return error.InvalidConfig;
+    for ([_][]const u8{
+        "CONFIG_APPHYPERVACCEPTANCE=y", "CONFIG_APPHYPERVSMPWORKLOAD=y",
+        "CONFIG_LIBSTORVSC=y",          "CONFIG_LIBNETVSC=y",
+        "CONFIG_LIBLWIP=y",
+    }) |setting| if (countLine(solved, setting) != 0) return error.InvalidConfig;
+    return typedValue(a, .{
+        .source = .{ .revision = context.source.?.revision, .tree = context.source.?.tree },
+        .runtime = try rawValue(a, app_identity),
+        .image = try rawValue(a, image),
+    });
+}
+
+/// Reconstruct the frozen build state from its actual source, dependency,
+/// executable and image inputs; boot never republishes build evidence.
+pub fn loadAccepted(context: *Context) !void {
+    const a = context.allocator;
+    const io = context.io;
+    try cancelled(context);
+    const expected = try readAcceptedRecord(context, "build-start.json");
+    const document = try core.contracts.Document.parse(a, expected, .{ .bytes = records.max_record_bytes, .items = 4096, .tokens = 65536, .depth = 32 });
+    defer document.deinit();
+    try document.requireCanonical(a, expected);
+    const original = try core.contracts.exactFields(document.value(), &.{
+        "source", "source_custody", "tools", "bison_data", "dependencies", "consumer_inputs", "command_supervisor",
+    });
+    const consumer = original.get("consumer_inputs").?;
+    if (consumer != .object) return error.InvalidInputCustody;
+    const selected = consumer.object.get("files") orelse return error.InvalidInputCustody;
+    if (selected != .object) return error.InvalidInputCustody;
+    for (inputs.host_tools, 0..) |name, index| {
+        const role = try a.print("tool:{s}", .{name});
+        const record = selected.object.get(role) orelse return error.MissingTool;
+        if (record != .object) return error.InvalidInputCustody;
+        context.tools[index] = try a.dupe(u8, try core.contracts.string(record.object.get("path") orelse return error.MissingTool));
+    }
+    context.git = context.tools[0];
+    const own = try join(context, &.{ context.runtime, "controller/bin/uk-wamr-native-ci" });
+    if (!std.mem.eql(u8, own, try std.process.executablePathAlloc(io, a)))
+        return error.UnboundController;
+    context.roots = .{
+        .runtime = context.runtime,
+        .source_root = context.repository,
+        .work = context.compute,
+        .zig = context.tools[9],
+        .producer = try subpath(context, "tools/bin/uk-wamr-aot-build"),
+        .fixture_runner = try subpath(context, "tools/bin/wamr-native-ci-fixtures"),
+        .supervisor = own,
+        .package_tool = try subpath(context, "tools/bin/wamr-ci-package"),
+        .validator = try subpath(context, "tools/bin/uk-wamr-log-validate"),
+        .supervisor_fixture = try subpath(context, "tools/bin/wamr-ci-supervisor-fixture"),
+        .tools = context.tools,
+    };
+    try custody.verifyPhysical(io, a, context.repository);
+    context.source = try custody.sourceCached(a, io, context.repository, context.git, knownGitBlobs(context), knownFiles(context));
+    context.dependency = try dependencies.captureCached(a, io, context.repository, context.git, context.compute, knownFiles(context));
+    context.consumer = try inputs.captureProductionCached(a, io, .{
+        .runtime = context.runtime,
+        .tools = context.tools,
+        .python_stdlib = try pythonStdlib(context),
+    }, knownFiles(context), runtimeCache(context));
+    const reproduced = try typedValue(a, try buildStart(context));
+    const encoded = try std.json.Stringify.valueAlloc(a, reproduced, .{});
+    const canonical = try records.canonicalAlloc(a, encoded);
+    if (!std.mem.eql(u8, expected, canonical)) return error.BuildStartChanged;
+    context.build_start_record = try physical.readFileCached(io, try subpath(context, "evidence/build-start.json"), limits.tracked_file, true, knownFiles(context));
+    for ([_]plan.Stage{ .adapter, .@"local-boot-tool", .fixtures, .prepare, .config, .@"native-image" }) |stage| {
+        const name = try a.print("evidence/command-{s}.json", .{@tagName(stage)});
+        const path = try subpath(context, name);
+        const raw = try read(context, path, records.max_record_bytes, true);
+        const command = try core.contracts.Document.parse(a, raw, .{ .bytes = records.max_record_bytes });
+        defer command.deinit();
+        try command.requireCanonical(a, raw);
+        if (command.value() != .object) return error.InvalidCommand;
+        const object = command.value().object;
+        if (!std.mem.eql(u8, try core.contracts.string(object.get("stage") orelse return error.InvalidCommand), @tagName(stage)) or
+            try core.contracts.integer(i32, object.get("exit_code") orelse return error.InvalidCommand) != 0)
+            return error.BuildStageRefused;
+        context.command_records[@backingInt(stage)] = try physical.readFileCached(io, path, limits.tracked_file, true, knownFiles(context));
+    }
+    try requireBuildEvidence(context);
+    const app_identity_raw = try read(context, try join(context, &.{ context.repository, "support/apps/wamr-aot/build/artifacts/identity.json" }), limits.mib, false);
+    const app_identity_doc = try core.contracts.Document.parse(a, app_identity_raw, .{});
+    defer app_identity_doc.deinit();
+    context.profile = try detectPreparedProfile(app_identity_doc.value());
+    try revalidateAcceptedWithValue(context, try buildValueFromCurrent(context));
+}
+
+pub fn revalidateAccepted(context: *Context) !void {
+    try revalidateAcceptedWithValue(context, try buildValue(context));
+}
+
+fn revalidateAcceptedWithValue(context: *Context, value: std.json.Value) !void {
+    const actual = try readAcceptedRecord(context, "build.json");
+    const encoded = try std.json.Stringify.valueAlloc(context.allocator, value, .{});
+    if (!std.mem.eql(u8, actual, try records.canonicalAlloc(context.allocator, encoded)))
+        return error.BuildChanged;
+}
+
+pub fn publishBuild(context: *Context, value: anytype) !void {
+    try cancelled(context);
+    try evidence(context, "build.json", value);
+}
+
+fn countLine(bytes: []const u8, target: []const u8) usize {
+    var found: usize = 0;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| if (std.mem.eql(u8, line, target)) {
+        found += 1;
+    };
+    return found;
+}
+
+pub fn run(context: *Context) !BuildAccepted {
+    var custody_cache: ?CustodyCache = if (context.custody_cache == null)
+        CustodyCache.init(std.heap.page_allocator)
+    else
+        null;
+    defer if (custody_cache) |*cache| {
+        context.custody_cache = null;
+        cache.deinit();
+    };
+    if (custody_cache) |*cache| context.custody_cache = cache;
+    var bound = try bind(.{ .context = context });
+    defer bound.runtime.close(context.io);
+    var reserved = try reserve(bound);
+    defer reserved.work.close(context.io);
+    return acceptBuild(try nativeImage(try solveConfig(try prepare(try testFixtures(
+        try baseline(try buildLocalBoot(try buildAdapter(try bootstrap(
+            try restore(try sealSource(try captureSource(reserved))),
+        )))),
+    )))));
+}

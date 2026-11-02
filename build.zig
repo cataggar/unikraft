@@ -1,0 +1,3959 @@
+const builtin = @import("builtin");
+const std = @import("std");
+const build_context = @import("support/build/build-context.zig");
+const component_api = @import("support/build/component-api.zig");
+const facade_paths = @import("support/build/zig-facade-paths.zig");
+const final_link = @import("support/build/final-link.zig");
+const native_library_link = @import("support/build/native-library-link.zig");
+const native_lto = @import("support/build/native-lto.zig");
+const native_postprocess = @import("support/build/native-postprocess.zig");
+const native_image_graph = @import("support/build/native-image-graph.zig");
+const native_target_object = @import("support/build/native-target-object.zig");
+const native_build_tools = @import("support/build/native-build-tools.zig");
+const native_make_environment = @import("support/build/native-make-environment.zig");
+const native_config_input = @import("support/build/native-config-input.zig");
+const object_proofs = @import("support/build/hyperv-object-proofs.build.zig");
+const hyperv_proof_build = @import("support/build/hyperv-proof-build.zig");
+
+const supported_zig = std.SemanticVersion{ .major = 0, .minor = 17, .patch = 0 };
+
+comptime {
+    if (builtin.zig_version.order(supported_zig) != .eq) {
+        @compileError("the Unikraft build facade requires Zig 0.17.0");
+    }
+}
+
+fn validateWamrAotTool(b: *std.Build, value: []const u8) ?[]const u8 {
+    b.graph.poisonCache();
+    if (!std.fs.path.isAbsolute(value)) {
+        return "-Dwamr-aot-tool must be an absolute canonical executable path";
+    }
+    const canonical = facade_paths.canonicalizeNearestExisting(
+        b.allocator,
+        b.graph.io,
+        value,
+    ) catch |err| {
+        return b.fmt(
+            "unable to validate -Dwamr-aot-tool '{s}': {s}",
+            .{ value, @errorName(err) },
+        );
+    };
+    defer b.allocator.free(canonical.path);
+    if (!canonical.exists or !std.mem.eql(u8, canonical.path, value)) {
+        return b.fmt(
+            "-Dwamr-aot-tool must name an existing canonical executable: '{s}'",
+            .{value},
+        );
+    }
+    const stat = std.Io.Dir.cwd().statFile(
+        b.graph.io,
+        value,
+        .{ .follow_symlinks = false },
+    ) catch |err| {
+        return b.fmt(
+            "unable to inspect -Dwamr-aot-tool '{s}': {s}",
+            .{ value, @errorName(err) },
+        );
+    };
+    if (stat.kind != .file or stat.permissions.toMode() & 0o111 == 0) {
+        return b.fmt(
+            "-Dwamr-aot-tool must name an executable regular file: '{s}'",
+            .{value},
+        );
+    }
+    b.dependOnFileMetadata(b.graph.cwdRelativePath(value));
+    return null;
+}
+
+const Verbosity = enum {
+    @"0",
+    @"1",
+    @"2",
+};
+
+const PartialLinkerType = enum {
+    driver,
+    raw,
+};
+
+const MakeOptions = struct {
+    command: []const u8,
+    app: []const u8,
+    output: []const u8,
+    config: ?[]const u8,
+    image_name: ?[]const u8,
+    wamr_aot_tool: ?[]const u8,
+    external_libraries: ?[]const u8,
+    external_platforms: ?[]const u8,
+    exclusions: ?[]const u8,
+    verbosity: ?Verbosity,
+    cross_compile: ?[]const u8,
+    compiler: ?[]const u8,
+    linker: ?[]const u8,
+    partial_linker: ?[]const u8,
+    partial_linker_type: ?PartialLinkerType,
+    compiler_targeted: ?bool,
+    host_cc: ?[]const u8,
+    host_cxx: ?[]const u8,
+    host_cflags: ?[]const u8,
+    forwarded: []const []const u8,
+    ci_portable_config: bool = false,
+    native_environment: ?native_make_environment.Contract = null,
+};
+
+const Target = struct {
+    name: []const u8,
+    make_target: []const u8,
+    description: []const u8,
+};
+
+const targets = [_]Target{
+    .{ .name = "all", .make_target = "all", .description = "Build everything (GNU Make backend)" },
+    .{ .name = "images", .make_target = "images", .description = "Build kernel images" },
+    .{ .name = "libs", .make_target = "libs", .description = "Build libraries and their objects" },
+    .{ .name = "objs", .make_target = "objs", .description = "Build objects only" },
+    .{ .name = "preprocess", .make_target = "preprocess", .description = "Run preprocessing steps" },
+    .{ .name = "prepare", .make_target = "prepare", .description = "Run preparation steps" },
+    .{ .name = "fetch", .make_target = "fetch", .description = "Fetch, extract, and patch remote code" },
+    .{ .name = "menuconfig", .make_target = "menuconfig", .description = "Open the interactive configuration menu" },
+    .{ .name = "defconfig", .make_target = "defconfig", .description = "Create a configuration using defaults" },
+    .{ .name = "oldconfig", .make_target = "oldconfig", .description = "Resolve new configuration symbols interactively" },
+    .{ .name = "olddefconfig", .make_target = "olddefconfig", .description = "Resolve new configuration symbols using defaults" },
+    .{ .name = "syncconfig", .make_target = "syncconfig", .description = "Synchronize configuration and dependencies" },
+    .{ .name = "savedefconfig", .make_target = "savedefconfig", .description = "Save a minimal default configuration" },
+    .{ .name = "clean-libs", .make_target = "clean-libs", .description = "Remove configured library build products" },
+    .{ .name = "clean", .make_target = "clean", .description = "Remove configured build products" },
+    .{ .name = "properclean", .make_target = "properclean", .description = "Remove the build output directory" },
+    .{ .name = "distclean", .make_target = "distclean", .description = "Remove build output and configuration" },
+};
+
+pub fn build(b: *std.Build) void {
+    // realpath, file kind, executable permissions, and marker trust must be
+    // checked live: configuration dependencies do not track all of these.
+    b.graph.poisonCache();
+    const optimize = b.standardOptimizeOption(.{});
+    const cwd = std.Io.Dir.cwd().realPathFileAlloc(b.graph.io, ".", b.allocator) catch |err| {
+        addFailedTargets(b, b.fmt("unable to canonicalize the build working directory: {s}", .{@errorName(err)}));
+        return;
+    };
+    const root_lexical = std.fs.path.resolve(b.allocator, &.{
+        cwd,
+        b.root.toString(b.allocator) catch @panic("OOM"),
+    }) catch @panic("OOM");
+    const root_result = facade_paths.canonicalizeNearestExisting(
+        b.allocator,
+        b.graph.io,
+        root_lexical,
+    ) catch |err| {
+        addFailedTargets(b, b.fmt("unable to canonicalize the Unikraft repository '{s}': {s}", .{
+            root_lexical,
+            @errorName(err),
+        }));
+        return;
+    };
+    const root = root_result.path;
+    const app_option = b.option([]const u8, "app", "Application directory (Make A=)");
+    const bison_command = b.option(
+        []const u8,
+        "bison-command",
+        "Bison executable (default: bison)",
+    ) orelse "bison";
+    const flex_command = b.option(
+        []const u8,
+        "flex-command",
+        "Flex executable (default: flex)",
+    ) orelse "flex";
+    if (app_option) |value| {
+        if (firstUnsafePathByte(value, false)) |byte| {
+            addFailedTargets(b, b.fmt(
+                "invalid A value: byte 0x{x:0>2} is outside the facade's conservative Make-safe character allowlist",
+                .{byte},
+            ));
+            return;
+        }
+    }
+    const output_option = b.option([]const u8, "output", "Build output directory (Make O=)");
+    var validation_message: ?[]const u8 = null;
+    if (output_option) |value| {
+        if (firstUnsafePathByte(value, false)) |byte| {
+            validation_message = b.fmt(
+                "invalid O value: byte 0x{x:0>2} is outside the facade's conservative Make-safe character allowlist",
+                .{byte},
+            );
+        }
+        validateOutputValue(value) catch {
+            validation_message = "invalid -Doutput: the value is empty; omit it to use <app>/build or provide a dedicated build directory";
+        };
+    }
+    const config_option = b.option([]const u8, "config", "Configuration file (Make C=)");
+    const image_name_option = b.option([]const u8, "image-name", "Image/application name override (Make N=)");
+    const wamr_aot_tool_option = b.option(
+        []const u8,
+        "wamr-aot-tool",
+        "Canonical native WAMR build executable (Make APPWAMRAOT_TOOL=)",
+    );
+    const external_library_options = b.option(
+        []const []const u8,
+        "external-lib",
+        "External library path; may be repeated (Make L=)",
+    ) orelse &.{};
+    const external_platform_options = b.option(
+        []const []const u8,
+        "external-platform",
+        "External platform path; may be repeated (Make P=)",
+    ) orelse &.{};
+    const exclusion_options = b.option(
+        []const []const u8,
+        "exclude",
+        "Excluded component path; may be repeated (Make E=)",
+    ) orelse &.{};
+    const context = build_context.Context.init(b.allocator, b.graph.io, .{
+        .base = root,
+        .application = app_option,
+        .output = output_option,
+        .prefix = b.option([]const u8, "prefix", "Native build installation/header prefix (defaults to output)"),
+        .config = config_option,
+        .external_libraries = external_library_options,
+        .external_platforms = external_platform_options,
+        .exclusions = exclusion_options,
+        .image_name = image_name_option,
+    }, null) catch |err| {
+        const message = b.fmt("unable to create canonical Unikraft build context: {s}", .{
+            @errorName(err),
+        });
+        std.debug.print("error: {s}\n", .{message});
+        addFailedTargets(b, message);
+        return;
+    };
+    const app = context.application;
+    const output = context.output;
+    b.dependOnDirectoryMetadata(b.graph.cwdRelativePath(root));
+    b.dependOnDirectoryMetadata(b.graph.cwdRelativePath(app));
+    const output_result = facade_paths.CanonicalPath{
+        .path = context.output,
+        .exists = context.output_exists,
+    };
+
+    var selected_environment: ?std.json.Parsed(native_make_environment.Contract) = null;
+    defer if (selected_environment) |*selected| selected.deinit();
+    if (b.option([]const u8, "native-make-environment", "Private canonical native Make environment contract (Linux only)")) |path| {
+        selected_environment = native_make_environment.read(b.allocator, b.graph.io, path) catch |err| {
+            const message = b.fmt("unable to load explicit native Make environment: {s}", .{@errorName(err)});
+            // Later unregistered options must not hide the actual input failure.
+            std.debug.print("error: {s}\n", .{message});
+            addFailedTargets(b, message);
+            return;
+        };
+        b.dependOnFileContents(b.graph.cwdRelativePath(path));
+    }
+    const options = MakeOptions{
+        .command = b.option([]const u8, "make-command", "GNU Make executable (default: make)") orelse "make",
+        .app = app,
+        .output = output,
+        .config = if (config_option != null) context.config else null,
+        .image_name = image_name_option,
+        .wamr_aot_tool = wamr_aot_tool_option,
+        .external_libraries = joinPathList(b.allocator, context.external_libraries),
+        .external_platforms = joinPathList(b.allocator, context.external_platforms),
+        .exclusions = joinPathList(b.allocator, context.exclusions),
+        .verbosity = b.option(Verbosity, "verbose", "Make verbosity: 0, 1, or 2 (Make V=)"),
+        .cross_compile = b.option([]const u8, "cross-compile", "Cross-toolchain prefix (Make CROSS_COMPILE=)"),
+        .compiler = b.option([]const u8, "compiler", "C compiler command (Make COMPILER=)"),
+        .linker = b.option([]const u8, "linker", "Final linker driver command (Make LINKER=)"),
+        .partial_linker = b.option([]const u8, "partial-linker", "Relocatable linker command (Make PARTIAL_LINKER=)"),
+        .partial_linker_type = b.option(PartialLinkerType, "partial-linker-type", "Relocatable linker interface: driver or raw"),
+        .compiler_targeted = b.option(bool, "compiler-targeted", "Compiler command already selects its target"),
+        .host_cc = b.option([]const u8, "host-cc", "Host C compiler command (Make HOSTCC=)"),
+        .host_cxx = b.option([]const u8, "host-cxx", "Host C++ compiler command (Make HOSTCXX=)"),
+        .host_cflags = b.option([]const u8, "host-cflags", "Host compiler flags (Make HOSTCFLAGS=)"),
+        .forwarded = b.option([]const []const u8, "make-arg", "Allowlisted NAME=VALUE tool/flag assignment; may be repeated") orelse &.{},
+        .ci_portable_config = b.option(bool, "ci-portable-config", "Use checkout-independent Kconfig and target Zig objects (paired CI only)") orelse false,
+        .native_environment = if (selected_environment) |selected| selected.value else null,
+    };
+
+    if (validation_message == null) {
+        validation_message = validatePaths(b, root, options, output_result);
+    }
+    if (validation_message == null and wamr_aot_tool_option != null) {
+        validation_message = validateWamrAotTool(b, wamr_aot_tool_option.?);
+    }
+
+    var invalid_assignment: ?[]const u8 = null;
+    for (options.forwarded) |assignment| {
+        validateForwardedAssignment(assignment) catch {
+            invalid_assignment = assignment;
+            break;
+        };
+    }
+
+    if (validation_message) |message| {
+        addFailedTargets(b, message);
+        return;
+    }
+
+    if (invalid_assignment != null) {
+        addFailedTargets(b, b.fmt(
+            "invalid -Dmake-arg: NAME must be an allowlisted toolchain, flag, or backend assignment and VALUE may contain only conservative Make-safe command characters; use dedicated facade options for paths and configuration",
+            .{},
+        ));
+        return;
+    }
+
+    const native_graph = registerNativeGraph(b, context, options);
+    if (native_graph) |registered| {
+        std.debug.assert(registered.graph.selectedPlatform().name.len != 0);
+    }
+
+    const make_runner = b.addExecutable(.{
+        .name = "unikraft-zig-make",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/zig-facade-runner.zig"),
+            .target = b.graph.host,
+            .optimize = .safe,
+            .link_libc = true,
+        }),
+    });
+    const native_config_tool = b.addExecutable(.{
+        .name = "unikraft-native-config",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/native-config-tool.zig"),
+            .target = b.graph.host,
+            .optimize = .safe,
+        }),
+    });
+    const config_input = std.Build.LazyPath{ .cwd_relative = context.config };
+    const metadata_tool = native_build_tools.metadataTool(b, b.path("."), bison_command, flex_command);
+    const metadata_path = std.fs.path.join(
+        b.allocator,
+        &.{ context.output, "native-config", "metadata.tsv" },
+    ) catch @panic("out of memory");
+    const metadata_input = std.Build.LazyPath{ .cwd_relative = metadata_path };
+    const export_config_metadata = b.addRunArtifact(metadata_tool);
+    if (options.ci_portable_config)
+        export_config_metadata.setEnvironmentVariable("WAMR_CI_PORTABLE_CONFIG", "1");
+    export_config_metadata.addArgs(&.{
+        "--base",
+        context.base,
+        "--app",
+        context.application,
+        "--output",
+        context.output,
+        "--config",
+    });
+    export_config_metadata.addFileArg(config_input);
+    export_config_metadata.addArgs(&.{ "--metadata", metadata_path });
+    export_config_metadata.setCwd(.{ .cwd_relative = root });
+    if (image_name_option) |image_name| {
+        export_config_metadata.addArgs(&.{ "--image-name", image_name });
+    }
+    for (context.external_libraries) |path| {
+        export_config_metadata.addArgs(&.{ "--external-library", path });
+    }
+    for (context.external_platforms) |path| {
+        export_config_metadata.addArgs(&.{ "--external-platform", path });
+    }
+    for (context.exclusions) |path| {
+        export_config_metadata.addArgs(&.{ "--exclude", path });
+    }
+    const inspect_config = b.addRunArtifact(native_config_tool);
+    inspect_config.addArg("inspect");
+    inspect_config.addFileArg(config_input);
+    inspect_config.addFileArg(metadata_input);
+    inspect_config.setCwd(.{ .cwd_relative = root });
+    inspect_config.step.dependOn(&export_config_metadata.step);
+    const inspect_config_step = b.step(
+        "config-inspect",
+        "Parse configuration and print the native architecture/platform selection",
+    );
+    inspect_config_step.dependOn(&inspect_config.step);
+
+    const validate_config = b.addRunArtifact(native_config_tool);
+    validate_config.addArg("validate");
+    validate_config.addFileArg(config_input);
+    validate_config.addFileArg(metadata_input);
+    validate_config.setCwd(.{ .cwd_relative = root });
+    validate_config.step.dependOn(&export_config_metadata.step);
+    const validate_config_step = b.step(
+        "config-validate",
+        "Validate typed configuration values and target selection without solving Kconfig",
+    );
+    validate_config_step.dependOn(&validate_config.step);
+
+    const header_path = context.headerPath() catch @panic("out of memory");
+    const generate_config_header = b.addRunArtifact(native_config_tool);
+    generate_config_header.addArg("header");
+    generate_config_header.addFileArg(config_input);
+    generate_config_header.addFileArg(metadata_input);
+    generate_config_header.addArg(header_path);
+    generate_config_header.setCwd(.{ .cwd_relative = root });
+    generate_config_header.step.dependOn(&export_config_metadata.step);
+    const generate_config_header_step = b.step(
+        "config-header",
+        "Generate include/uk/bits/config.h directly from an existing solved .config",
+    );
+    generate_config_header_step.dependOn(&generate_config_header.step);
+
+    const generate_target_config_header = b.addRunArtifact(native_config_tool);
+    generate_target_config_header.addArg("header");
+    generate_target_config_header.addFileArg(config_input);
+    generate_target_config_header.addFileArg(metadata_input);
+    const target_config_header = generate_target_config_header.addOutputFileArg(
+        "include/uk/bits/config.h",
+    );
+    generate_target_config_header.setCwd(.{ .cwd_relative = root });
+    generate_target_config_header.step.dependOn(&validate_config.step);
+    const install_target_config_header = b.addInstallFile(
+        target_config_header,
+        "target-config-header.h",
+    );
+    const target_config_header_step = b.step(
+        "target-config-header",
+        "Generate and install the content-tracked header used by target Zig objects",
+    );
+    target_config_header_step.dependOn(&install_target_config_header.step);
+
+    const native_images_step = registerNativePipeline(
+        b,
+        root,
+        context,
+        options,
+        optimize,
+        make_runner,
+        validate_config,
+        target_config_header,
+        native_graph,
+    );
+
+    for (targets) |target| {
+        const step = b.step(target.name, target.description);
+        if (isDestructiveTarget(target.name)) {
+            const fail = b.addFail(b.fmt(
+                "Zig facade step '{s}' is intentionally refused: GNU Make re-resolves mutable A/O/C paths before deletion, and this compatibility facade cannot provide descriptor-relative cleanup portably; verify paths and use GNU Make or manual cleanup explicitly",
+                .{target.name},
+            ));
+            step.dependOn(&fail.step);
+        } else {
+            if (native_graph != null and
+                (std.mem.eql(u8, target.name, "all") or
+                    std.mem.eql(u8, target.name, "images")))
+            {
+                step.dependOn(native_images_step);
+            } else {
+                const run = addMakeCommand(
+                    b,
+                    make_runner,
+                    output,
+                    root,
+                    target.make_target,
+                    options,
+                );
+                step.dependOn(&run.step);
+            }
+        }
+        if (std.mem.eql(u8, target.name, "all")) {
+            b.default_step = step;
+        }
+    }
+
+    const facade_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("build.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const run_facade_tests = b.addRunArtifact(facade_tests);
+    // Private-file fixtures require trusted ancestors, unlike compiler caches
+    // which may be writable by other users.
+    run_facade_tests.setCwd(b.path("."));
+    const native_environment_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("build.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+        .filters = &.{ "native Make environment", "Make assignments remain single arguments" },
+    });
+    const run_native_environment_tests = b.addRunArtifact(native_environment_tests);
+    run_native_environment_tests.setCwd(b.path("."));
+    b.step("test-native-make-environment", "Test explicit private Make environment and unchanged default forwarding").dependOn(&run_native_environment_tests.step);
+    const runner_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/zig-facade-runner.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+            .link_libc = true,
+        }),
+    });
+    const run_runner_tests = b.addRunArtifact(runner_tests);
+    run_runner_tests.setCwd(.cache_root);
+    const native_config_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/native-config-tests.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const run_native_config_tests = b.addRunArtifact(native_config_tests);
+    run_native_config_tests.setCwd(.cache_root);
+    const context_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/build-context.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const run_context_tests = b.addRunArtifact(context_tests);
+    run_context_tests.setCwd(.cache_root);
+    const native_library_link_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/native-library-link.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const run_native_library_link_tests = b.addRunArtifact(native_library_link_tests);
+    run_native_library_link_tests.setCwd(.cache_root);
+    const elf_common_validator_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/elf-common-validator.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const run_elf_common_validator_tests = b.addRunArtifact(elf_common_validator_tests);
+    run_elf_common_validator_tests.setCwd(.cache_root);
+    const linker_script_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/linker-script.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const run_linker_script_tests = b.addRunArtifact(linker_script_tests);
+    run_linker_script_tests.setCwd(.cache_root);
+    const final_link_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/final-link.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const run_final_link_tests = b.addRunArtifact(final_link_tests);
+    run_final_link_tests.setCwd(.cache_root);
+    const native_image_graph_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/native-image-graph.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const run_native_image_graph_tests = b.addRunArtifact(native_image_graph_tests);
+    run_native_image_graph_tests.setCwd(.cache_root);
+    const native_postprocess_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/native-postprocess.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const run_native_postprocess_tests = b.addRunArtifact(native_postprocess_tests);
+    run_native_postprocess_tests.setCwd(.cache_root);
+    const native_target_object_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/native-target-object.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const run_native_target_object_tests = b.addRunArtifact(native_target_object_tests);
+    run_native_target_object_tests.setCwd(.cache_root);
+    const native_lto_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/native-lto.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const run_native_lto_tests = b.addRunArtifact(native_lto_tests);
+    run_native_lto_tests.setCwd(.cache_root);
+    const test_step = b.step(
+        "test",
+        "Test facade, native configuration, native linking, QEMU graphs, and post-processing",
+    );
+    const compiler_option_tests = b.step(
+        "test-native-compiler-options",
+        "Test Make compiler-option probes with the native Zig driver",
+    );
+    const compiler_option_run = b.addSystemCommand(&.{ options.command, "-j2", "--no-print-directory", "-f" });
+    compiler_option_run.addFileArg(b.path("support/build/tests/cc-option-test.mk"));
+    compiler_option_run.addArgs(&.{
+        b.fmt("UK_ROOT={s}", .{root}),
+        b.fmt("ZIG={s}", .{b.graph.zig_exe}),
+        "test",
+    });
+    compiler_option_run.addFileInput(b.path("support/build/Makefile.rules"));
+    compiler_option_run.setCwd(.cache_root);
+    compiler_option_run.has_side_effects = true;
+    compiler_option_tests.dependOn(&compiler_option_run.step);
+    test_step.dependOn(compiler_option_tests);
+    test_step.dependOn(&run_facade_tests.step);
+    test_step.dependOn(&run_runner_tests.step);
+    test_step.dependOn(&run_native_config_tests.step);
+    test_step.dependOn(&run_context_tests.step);
+    test_step.dependOn(&run_native_library_link_tests.step);
+    test_step.dependOn(&run_elf_common_validator_tests.step);
+    test_step.dependOn(&run_native_image_graph_tests.step);
+    test_step.dependOn(&run_linker_script_tests.step);
+    test_step.dependOn(&run_final_link_tests.step);
+    test_step.dependOn(&run_native_postprocess_tests.step);
+    test_step.dependOn(&run_native_target_object_tests.step);
+    const target_object_validation = native_target_object.addFixtureValidation(b) catch |err| {
+        @panic(@errorName(err));
+    };
+    test_step.dependOn(target_object_validation);
+    const target_object_tests = b.step(
+        "test-native-target-object",
+        "Test ordered C translation, target Zig objects, stripped output and the C/Zig ABI",
+    );
+    target_object_tests.dependOn(&run_native_target_object_tests.step);
+    target_object_tests.dependOn(target_object_validation);
+    test_step.dependOn(&run_native_lto_tests.step);
+    const hyperv_runtime_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("plat/hyperv/hyperv_runtime.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+        // Match the production backend for the Microsoft-ABI hypercall thunk.
+        .use_llvm = true,
+    });
+    test_step.dependOn(&b.addRunArtifact(hyperv_runtime_tests).step);
+    const vmbus_protocol_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "drivers/hyperv/vmbus/vmbus_protocol.zig",
+            ),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(vmbus_protocol_tests).step);
+    const vmbus_channel_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "drivers/hyperv/vmbus/vmbus_channel.zig",
+            ),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(vmbus_channel_tests).step);
+    const storvsc_core_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "drivers/hyperv/storvsc/storvsc_core.zig",
+            ),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const run_storvsc_core_tests = b.addRunArtifact(storvsc_core_tests);
+    test_step.dependOn(&run_storvsc_core_tests.step);
+    const netvsc_protocol_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "drivers/hyperv/netvsc/netvsc_protocol.zig",
+            ),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const run_netvsc_protocol_tests = b.addRunArtifact(netvsc_protocol_tests);
+    test_step.dependOn(&run_netvsc_protocol_tests.step);
+    const hyperv_target = b.resolveTargetQuery(.{
+        .cpu_arch = .x86_64,
+        .os_tag = .freestanding,
+        .abi = .none,
+    });
+    const object_verifier = object_proofs.Setup.create(b, optimize);
+    const hyperv_isr_target = b.resolveTargetQuery(native_target_object.targetQuery(true));
+    const hyperv_runtime_object = b.addObject(.{
+        .name = "hyperv-runtime-freestanding",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("plat/hyperv/hyperv_runtime.zig"),
+            .target = hyperv_isr_target,
+            .optimize = .fast,
+            .link_libc = false,
+            .single_threaded = true,
+            .unwind_tables = .none,
+            .stack_protector = false,
+            .stack_check = false,
+            .red_zone = false,
+            .pic = true,
+            .error_tracing = false,
+        }),
+        .use_llvm = true,
+    });
+    const hyperv_runtime_link = b.addSystemCommand(&.{
+        "zig",
+        "cc",
+        "-target",
+        "x86_64-freestanding-none",
+        "-nostdlib",
+        "-r",
+    });
+    hyperv_runtime_link.addFileArg(hyperv_runtime_object.getEmittedBin());
+    hyperv_runtime_link.addArg("-o");
+    const hyperv_runtime_linked =
+        hyperv_runtime_link.addOutputFileArg("hyperv-runtime-linked.o");
+    const verify_hyperv_runtime = b.addRunArtifact(object_verifier.tool);
+    verify_hyperv_runtime.addArgs(&.{ "hyperv-runtime", "--object" });
+    verify_hyperv_runtime.addFileArg(hyperv_runtime_linked);
+    verify_hyperv_runtime.addArgs(&.{
+        "--nm",
+        object_verifier.nm,
+        "--readelf",
+        object_verifier.readelf,
+    });
+    verify_hyperv_runtime.setCwd(.{ .cwd_relative = root });
+    test_step.dependOn(&verify_hyperv_runtime.step);
+    const vmbus_protocol_object = b.addObject(.{
+        .name = "vmbus-protocol-freestanding",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "drivers/hyperv/vmbus/vmbus_protocol.zig",
+            ),
+            .target = hyperv_isr_target,
+            .optimize = .fast,
+            .link_libc = false,
+            .single_threaded = true,
+            .unwind_tables = .none,
+            .stack_protector = false,
+            .stack_check = false,
+            .red_zone = false,
+            .pic = true,
+            .error_tracing = false,
+        }),
+        .use_llvm = true,
+    });
+    const vmbus_protocol_link = b.addSystemCommand(&.{
+        "zig",
+        "cc",
+        "-target",
+        "x86_64-freestanding-none",
+        "-nostdlib",
+        "-r",
+    });
+    vmbus_protocol_link.addFileArg(vmbus_protocol_object.getEmittedBin());
+    vmbus_protocol_link.addArg("-o");
+    const vmbus_protocol_linked =
+        vmbus_protocol_link.addOutputFileArg("vmbus-protocol-linked.o");
+    const verify_vmbus_protocol = b.addRunArtifact(object_verifier.tool);
+    verify_vmbus_protocol.addArgs(&.{ "vmbus-protocol", "--object" });
+    verify_vmbus_protocol.addFileArg(vmbus_protocol_linked);
+    verify_vmbus_protocol.addArgs(&.{ "--nm", object_verifier.nm });
+    verify_vmbus_protocol.setCwd(.{ .cwd_relative = root });
+    test_step.dependOn(&verify_vmbus_protocol.step);
+    const vmbus_channel_object = b.addObject(.{
+        .name = "vmbus-channel-freestanding",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "drivers/hyperv/vmbus/vmbus_channel.zig",
+            ),
+            .target = hyperv_target,
+            .optimize = .fast,
+            .link_libc = false,
+            .single_threaded = true,
+            .unwind_tables = .none,
+            .stack_protector = false,
+            .stack_check = false,
+            .red_zone = false,
+            .pic = true,
+            .error_tracing = false,
+        }),
+        .use_llvm = true,
+    });
+    const vmbus_channel_link = b.addSystemCommand(&.{
+        "zig",
+        "cc",
+        "-target",
+        "x86_64-freestanding-none",
+        "-nostdlib",
+        "-r",
+    });
+    vmbus_channel_link.addFileArg(vmbus_channel_object.getEmittedBin());
+    vmbus_channel_link.addArg("-o");
+    const vmbus_channel_linked =
+        vmbus_channel_link.addOutputFileArg("vmbus-channel-linked.o");
+    const verify_vmbus_channel = b.addRunArtifact(object_verifier.tool);
+    verify_vmbus_channel.addArgs(&.{ "vmbus-channel", "--object" });
+    verify_vmbus_channel.addFileArg(vmbus_channel_linked);
+    verify_vmbus_channel.addArgs(&.{ "--nm", object_verifier.nm });
+    verify_vmbus_channel.setCwd(.{ .cwd_relative = root });
+    test_step.dependOn(&verify_vmbus_channel.step);
+    const storvsc_core_object = b.addObject(.{
+        .name = "storvsc-core-freestanding",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "drivers/hyperv/storvsc/storvsc_core.zig",
+            ),
+            .target = hyperv_target,
+            .optimize = .fast,
+            .link_libc = false,
+            .single_threaded = true,
+            .unwind_tables = .none,
+            .stack_protector = false,
+            .stack_check = false,
+            .red_zone = false,
+            .pic = true,
+            .error_tracing = false,
+        }),
+        .use_llvm = true,
+    });
+    const storvsc_core_link = b.addSystemCommand(&.{
+        "zig",
+        "cc",
+        "-target",
+        "x86_64-freestanding-none",
+        "-nostdlib",
+        "-r",
+    });
+    storvsc_core_link.addFileArg(storvsc_core_object.getEmittedBin());
+    storvsc_core_link.addArg("-o");
+    const storvsc_core_linked =
+        storvsc_core_link.addOutputFileArg("storvsc-core-linked.o");
+    const verify_storvsc_core = b.addRunArtifact(object_verifier.tool);
+    verify_storvsc_core.addArgs(&.{ "storvsc-core", "--object" });
+    verify_storvsc_core.addFileArg(storvsc_core_linked);
+    verify_storvsc_core.addArgs(&.{ "--nm", object_verifier.nm });
+    var mapping_abi_paths: [2]std.Build.LazyPath = undefined;
+    for ([_]bool{ false, true }) |cxx| {
+        const mapping_abi = b.addObject(.{
+            .name = if (cxx) "storvsc-mapping-cxx-abi" else "storvsc-mapping-c-abi",
+            .root_module = b.createModule(.{
+                .target = hyperv_target,
+                .optimize = .fast,
+                .link_libc = false,
+                .stack_protector = false,
+                .stack_check = false,
+                .red_zone = false,
+                .pic = true,
+            }),
+        });
+        mapping_abi.root_module.addIncludePath(
+            b.path("support/build/tests/storvsc-host-include"),
+        );
+        mapping_abi.root_module.addIncludePath(
+            b.path("drivers/hyperv/storvsc/include"),
+        );
+        mapping_abi.root_module.addCSourceFile(.{
+            .file = b.path(if (cxx)
+                "support/build/tests/storvsc-mapping-abi-test.cpp"
+            else
+                "support/build/tests/storvsc-mapping-abi-test.c"),
+            .flags = &.{
+                if (cxx) "-std=c++11" else "-std=c11", "-Wall",
+                "-Wextra",                             "-Werror",
+                "-pedantic-errors",
+            },
+        });
+        verify_storvsc_core.addArg("--mapping-api-object");
+        verify_storvsc_core.addFileArg(mapping_abi.getEmittedBin());
+        mapping_abi_paths[@intFromBool(cxx)] = mapping_abi.getEmittedBin();
+    }
+    verify_storvsc_core.setCwd(.{ .cwd_relative = root });
+    test_step.dependOn(&verify_storvsc_core.step);
+    const netvsc_protocol_object = b.addObject(.{
+        .name = "netvsc-protocol-freestanding",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "drivers/hyperv/netvsc/netvsc_protocol.zig",
+            ),
+            .target = hyperv_target,
+            .optimize = .fast,
+            .link_libc = false,
+            .single_threaded = true,
+            .unwind_tables = .none,
+            .stack_protector = false,
+            .stack_check = false,
+            .red_zone = false,
+            .pic = true,
+            .error_tracing = false,
+        }),
+        .use_llvm = true,
+    });
+    const netvsc_protocol_link = b.addSystemCommand(&.{
+        "zig",
+        "cc",
+        "-target",
+        "x86_64-freestanding-none",
+        "-nostdlib",
+        "-r",
+    });
+    netvsc_protocol_link.addFileArg(netvsc_protocol_object.getEmittedBin());
+    netvsc_protocol_link.addArg("-o");
+    const netvsc_protocol_linked =
+        netvsc_protocol_link.addOutputFileArg("netvsc-protocol-linked.o");
+    const verify_netvsc_protocol = b.addRunArtifact(object_verifier.tool);
+    verify_netvsc_protocol.addArgs(&.{ "netvsc-protocol", "--object" });
+    verify_netvsc_protocol.addFileArg(netvsc_protocol_linked);
+    verify_netvsc_protocol.addArgs(&.{ "--nm", object_verifier.nm });
+    verify_netvsc_protocol.setCwd(.{ .cwd_relative = root });
+    test_step.dependOn(&verify_netvsc_protocol.step);
+    const netvsc_protocol_abi_tests = b.addExecutable(.{
+        .name = "netvsc-protocol-abi-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .debug,
+            .link_libc = true,
+        }),
+    });
+    netvsc_protocol_abi_tests.root_module.addIncludePath(b.path("include"));
+    netvsc_protocol_abi_tests.root_module.addIncludePath(
+        b.path("arch/x86/x86_64/include"),
+    );
+    netvsc_protocol_abi_tests.root_module.addIncludePath(
+        b.path("drivers/hyperv/netvsc"),
+    );
+    netvsc_protocol_abi_tests.root_module.addCSourceFile(.{
+        .file = b.path(
+            "support/build/tests/netvsc-protocol-abi-test.c",
+        ),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    test_step.dependOn(&b.addRunArtifact(netvsc_protocol_abi_tests).step);
+    const vmbus_abi_tests = b.addExecutable(.{
+        .name = "vmbus-abi-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .debug,
+            .link_libc = true,
+        }),
+    });
+    vmbus_abi_tests.root_module.addIncludePath(
+        b.path("support/build/tests/vmbus-include"),
+    );
+    vmbus_abi_tests.root_module.addIncludePath(b.path("include"));
+    vmbus_abi_tests.root_module.addIncludePath(
+        b.path("arch/x86/x86_64/include"),
+    );
+    vmbus_abi_tests.root_module.addIncludePath(
+        b.path("drivers/hyperv/vmbus/include"),
+    );
+    vmbus_abi_tests.root_module.addIncludePath(
+        b.path("drivers/hyperv/vmbus"),
+    );
+    vmbus_abi_tests.root_module.addCSourceFile(.{
+        .file = b.path("support/build/tests/vmbus-abi-test.c"),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    test_step.dependOn(&b.addRunArtifact(vmbus_abi_tests).step);
+    const object_proof_tests = b.step(
+        "test-hyperv-object-proofs",
+        "Verify real Hyper-V relocatable objects, ABI contracts, and native negative fixtures (not boot proof)",
+    );
+    for ([_]*std.Build.Step.Run{
+        verify_hyperv_runtime, verify_vmbus_protocol, verify_vmbus_channel, verify_storvsc_core, verify_netvsc_protocol,
+    }) |verify| object_proof_tests.dependOn(&verify.step);
+    for ([_]*std.Build.Step.Compile{
+        vmbus_protocol_tests,      vmbus_channel_tests, storvsc_core_tests, netvsc_protocol_tests,
+        netvsc_protocol_abi_tests, vmbus_abi_tests,
+    }) |fixture| object_proof_tests.dependOn(&b.addRunArtifact(fixture).step);
+    object_verifier.fixtures(b, object_proof_tests, .{
+        hyperv_runtime_linked, vmbus_protocol_linked, vmbus_channel_linked, storvsc_core_linked, netvsc_protocol_linked,
+    }, mapping_abi_paths);
+    const vmbus_control_tests = b.addExecutable(.{
+        .name = "vmbus-control-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .debug,
+            .link_libc = true,
+        }),
+    });
+    vmbus_control_tests.root_module.addIncludePath(
+        b.path("support/build/tests/vmbus-include"),
+    );
+    vmbus_control_tests.root_module.addIncludePath(b.path("include"));
+    vmbus_control_tests.root_module.addIncludePath(
+        b.path("arch/x86/x86_64/include"),
+    );
+    vmbus_control_tests.root_module.addIncludePath(
+        b.path("drivers/hyperv/vmbus"),
+    );
+    vmbus_control_tests.root_module.addCSourceFile(.{
+        .file = b.path("support/build/tests/vmbus-control-test.c"),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    const run_vmbus_control_tests = b.addRunArtifact(vmbus_control_tests);
+    test_step.dependOn(&run_vmbus_control_tests.step);
+    const vmbus_protocol_host_object = b.addObject(.{
+        .name = "vmbus-protocol-host",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "drivers/hyperv/vmbus/vmbus_protocol.zig",
+            ),
+            .target = b.graph.host,
+            .optimize = .safe,
+        }),
+    });
+    const vmbus_production_tests = b.addExecutable(.{
+        .name = "vmbus-channel-production-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .debug,
+            .link_libc = true,
+        }),
+    });
+    inline for (.{
+        "support/build/tests/vmbus-host-include",
+        "support/build/tests/vmbus-include",
+        "drivers/hyperv/vmbus",
+    }) |path| vmbus_production_tests.root_module.addIncludePath(b.path(path));
+    vmbus_production_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "drivers/hyperv/vmbus/vmbus_bus.c",
+            "drivers/hyperv/vmbus/vmbus_channel.c",
+            "support/build/tests/vmbus-channel-production-test.c",
+        },
+        .flags = &.{
+            "-std=gnu11",
+            "-DVMBUS_CHANNEL_HOST_TEST",
+            "-DVMBUS_BUS_HOST_TEST",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-ignored-attributes",
+            "-Wno-documentation",
+            "-pthread",
+        },
+    });
+    vmbus_production_tests.root_module.linkSystemLibrary("pthread", .{});
+    vmbus_production_tests.link_gc_sections = true;
+    const run_vmbus_production_tests = b.addRunArtifact(vmbus_production_tests);
+    test_step.dependOn(&run_vmbus_production_tests.step);
+    const vmbus_disconnect_tests = b.addExecutable(.{
+        .name = "vmbus-disconnect-production-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .debug,
+            .link_libc = true,
+        }),
+    });
+    inline for (.{
+        "support/build/tests/vmbus-host-include",
+        "support/build/tests/vmbus-include",
+        "drivers/hyperv/vmbus",
+    }) |path| vmbus_disconnect_tests.root_module.addIncludePath(
+        b.path(path),
+    );
+    vmbus_disconnect_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "drivers/hyperv/vmbus/vmbus_bus.c",
+            "drivers/hyperv/vmbus/vmbus_channel.c",
+            "support/build/tests/vmbus-channel-production-test.c",
+        },
+        .flags = &.{
+            "-std=gnu11",
+            "-DVMBUS_CHANNEL_HOST_TEST",
+            "-DVMBUS_BUS_HOST_TEST",
+            "-DVMBUS_REAL_PROTOCOL_TEST",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unused-function",
+            "-Wno-unused-variable",
+            "-Wno-ignored-attributes",
+            "-Wno-documentation",
+            "-pthread",
+        },
+    });
+    vmbus_disconnect_tests.root_module.addObject(
+        vmbus_protocol_host_object,
+    );
+    vmbus_disconnect_tests.root_module.linkSystemLibrary("pthread", .{});
+    vmbus_disconnect_tests.link_gc_sections = true;
+    const run_vmbus_disconnect_tests = b.addRunArtifact(vmbus_disconnect_tests);
+    test_step.dependOn(&run_vmbus_disconnect_tests.step);
+    const storvsc_core_host_object = b.addObject(.{
+        .name = "storvsc-core-host",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "drivers/hyperv/storvsc/storvsc_core.zig",
+            ),
+            .target = b.graph.host,
+            .optimize = .safe,
+        }),
+    });
+    const storvsc_vmbus_epoch_object = b.addObject(.{
+        .name = "storvsc-vmbus-epoch-host",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .debug,
+            .link_libc = true,
+        }),
+    });
+    inline for (.{
+        "support/build/tests/vmbus-host-include",
+        "support/build/tests/vmbus-include",
+        "drivers/hyperv/vmbus",
+    }) |path| storvsc_vmbus_epoch_object.root_module.addIncludePath(
+        b.path(path),
+    );
+    storvsc_vmbus_epoch_object.root_module.addCSourceFile(.{
+        .file = b.path("drivers/hyperv/vmbus/vmbus_bus.c"),
+        .flags = &.{
+            "-std=gnu11",
+            "-DVMBUS_BUS_HOST_TEST",
+            "-DVMBUS_EPOCH_ONLY_HOST_TEST",
+            "-Dvmbus_device_bind_epoch=vmbus_epoch_object_bind_epoch",
+            "-Dvmbus_device_bind_retry=vmbus_epoch_object_bind_retry",
+            "-Dvmbus_device_bind_ready=vmbus_epoch_object_bind_ready",
+            "-ffunction-sections",
+            "-fdata-sections",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unused-variable",
+            "-Wno-ignored-attributes",
+            "-Wno-documentation",
+            "-pthread",
+        },
+    });
+    const storvsc_host_include_paths = [_][]const u8{
+        "support/build/tests/storvsc-host-include",
+        "drivers/hyperv/storvsc",
+        "drivers/hyperv/storvsc/include",
+        "support/apps/hyperv-acceptance",
+    };
+    const storvsc_host_sources = [_][]const u8{
+        "drivers/hyperv/storvsc/storvsc.c",
+        "support/apps/hyperv-acceptance/acceptance_protocol.c",
+        "support/apps/hyperv-acceptance/persistence.c",
+        "support/apps/hyperv-acceptance/storage_target.c",
+    };
+    const storvsc_host_flags = [_][]const u8{
+        "-std=gnu11",
+        "-DSTORVSC_HOST_TEST",
+        "-DHYPERV_PERSISTENCE_HOST_TEST",
+        "-DPERSISTENCE_TIMEOUT_NS=5000000ULL",
+        "-DPERSISTENCE_BIND_TIMEOUT_NS=50000000ULL",
+        "-DPERSISTENCE_POLL_NS=1000000ULL",
+        "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_RUN_ID=\"00112233445566778899aabbccddeeff\"",
+        "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID=\"102132435465768798a9bacbdcedfe0f\"",
+        "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS=1000",
+        "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE=512",
+        "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY=2",
+        "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_PATH=0",
+        "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_TARGET=0",
+        "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN=0",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-Wno-unused-function",
+        "-pthread",
+    };
+    const storvsc_production_tests = b.addExecutable(.{
+        .name = "storvsc-production-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .debug,
+            .link_libc = true,
+        }),
+    });
+    for (storvsc_host_include_paths) |path|
+        storvsc_production_tests.root_module.addIncludePath(b.path(path));
+    storvsc_production_tests.root_module.addCSourceFiles(.{
+        .files = &(storvsc_host_sources ++ [_][]const u8{
+            "support/build/tests/storvsc-production-test.c",
+        }),
+        .flags = &storvsc_host_flags,
+    });
+    storvsc_production_tests.root_module.addObject(
+        storvsc_core_host_object,
+    );
+    storvsc_production_tests.root_module.addObject(
+        storvsc_vmbus_epoch_object,
+    );
+    storvsc_production_tests.root_module.addObject(
+        vmbus_protocol_host_object,
+    );
+    storvsc_production_tests.root_module.linkSystemLibrary("pthread", .{});
+    storvsc_production_tests.link_gc_sections = true;
+    const run_storvsc_production_tests = b.addRunArtifact(storvsc_production_tests);
+    test_step.dependOn(&run_storvsc_production_tests.step);
+    const persistence_workflow_tests = b.step(
+        "test-hyperv-persistence-workflow",
+        "Run production-backed guarded persistence workflow fixtures",
+    );
+    persistence_workflow_tests.dependOn(&run_storvsc_production_tests.step);
+    const persistence_workload_tests = b.addExecutable(.{
+        .name = "hyperv-persistence-workload-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .debug,
+            .link_libc = true,
+        }),
+    });
+    for (storvsc_host_include_paths) |path|
+        persistence_workload_tests.root_module.addIncludePath(b.path(path));
+    persistence_workload_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "support/apps/hyperv-acceptance/acceptance_protocol.c",
+            "support/apps/hyperv-acceptance/persistence.c",
+            "support/apps/hyperv-acceptance/storage_target.c",
+            "support/apps/hyperv-acceptance/tests/persistence-workload-test.c",
+        },
+        .flags = &.{
+            "-std=gnu11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-DHYPERV_PERSISTENCE_HOST_TEST",
+            "-DPERSISTENCE_TIMEOUT_NS=5000000ULL",
+            "-DPERSISTENCE_BIND_TIMEOUT_NS=50000000ULL",
+            "-DPERSISTENCE_POLL_NS=1000000ULL",
+            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_RUN_ID=\"00112233445566778899aabbccddeeff\"",
+            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID=\"102132435465768798a9bacbdcedfe0f\"",
+            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS=8388608",
+            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE=512",
+            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY=2",
+            "-DCONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN=7",
+        },
+    });
+    persistence_workflow_tests.dependOn(&b.addRunArtifact(persistence_workload_tests).step);
+    const persistence_evidence_core = b.createModule(.{
+        .root_source_file = b.path("support/tools/hyperv/core.zig"),
+        .target = b.graph.host,
+        .optimize = .debug,
+    });
+    if (b.graph.host.result.cpu.arch == .x86_64)
+        persistence_evidence_core.addAssemblyFile(b.path("support/tools/hyperv/sha256_clear_upper.S"));
+    const persistence_evidence = b.createModule(.{
+        .root_source_file = b.path("support/tools/hyperv/persistence/evidence.zig"),
+        .target = b.graph.host,
+        .optimize = .debug,
+        .imports = &.{.{ .name = "hyperv_core", .module = persistence_evidence_core }},
+    });
+    const persistence_evidence_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/apps/hyperv-acceptance/tests/persistence-evidence-test.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+            .imports = &.{.{ .name = "evidence", .module = persistence_evidence }},
+        }),
+    });
+    persistence_workflow_tests.dependOn(&b.addRunArtifact(persistence_evidence_tests).step);
+    const storage_binding_tests = b.step(
+        "test-hyperv-storage-binding",
+        "Run native bounded storage discovery and acceptance readiness fixtures",
+    );
+    storage_binding_tests.dependOn(persistence_workflow_tests);
+    storage_binding_tests.dependOn(&run_storvsc_core_tests.step);
+    storage_binding_tests.dependOn(&b.addRunArtifact(vmbus_protocol_tests).step);
+    for ([_]usize{ 1, 2 }) |controllers| {
+        const binding_tests = b.addExecutable(.{
+            .name = b.fmt("storvsc-storage-binding-{d}-test", .{controllers}),
+            .root_module = b.createModule(.{
+                .target = b.graph.host,
+                .optimize = .debug,
+                .link_libc = true,
+            }),
+        });
+        for (storvsc_host_include_paths) |path|
+            binding_tests.root_module.addIncludePath(b.path(path));
+        binding_tests.root_module.addCSourceFiles(.{
+            .files = &(storvsc_host_sources ++ [_][]const u8{
+                "drivers/hyperv/storvsc/tests/storage-binding-test.c",
+            }),
+            .flags = &(storvsc_host_flags ++ [_][]const u8{
+                "-include",
+                b.root.joinString(b.allocator, "drivers/hyperv/storvsc/tests/storage-binding-config.h") catch @panic("OOM"),
+                b.fmt("-DSTORAGE_BINDING_CONTROLLERS={d}", .{controllers}),
+                "-ffunction-sections",
+                "-fdata-sections",
+            }),
+        });
+        inline for (.{
+            storvsc_core_host_object,
+            storvsc_vmbus_epoch_object,
+            vmbus_protocol_host_object,
+        }) |object| binding_tests.root_module.addObject(object);
+        binding_tests.root_module.linkSystemLibrary("pthread", .{});
+        binding_tests.link_gc_sections = true;
+        const case_count: usize = if (controllers == 1) 4 else 33;
+        for (0..case_count) |case| {
+            const run = b.addRunArtifact(binding_tests);
+            run.addArg(b.fmt("{d}", .{case}));
+            storage_binding_tests.dependOn(&run.step);
+        }
+    }
+    const storage_binding_main_tests = b.addExecutable(.{
+        .name = "hyperv-storage-binding-main-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .debug,
+            .link_libc = true,
+        }),
+    });
+    storage_binding_main_tests.root_module.addIncludePath(
+        b.path("support/apps/hyperv-acceptance"),
+    );
+    storage_binding_main_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "support/apps/hyperv-acceptance/acceptance_protocol.c",
+            "support/apps/hyperv-acceptance/tests/storage-binding-main-test.c",
+        },
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    storage_binding_tests.dependOn(&b.addRunArtifact(storage_binding_main_tests).step);
+    const storage_benchmark_tests = b.addExecutable(.{
+        .name = "hyperv-storage-benchmark-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .debug,
+            .link_libc = true,
+        }),
+    });
+    for (storvsc_host_include_paths) |path|
+        storage_benchmark_tests.root_module.addIncludePath(b.path(path));
+    storage_benchmark_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "support/apps/hyperv-acceptance/acceptance_protocol.c",
+            "support/apps/hyperv-acceptance/storage_benchmark.c",
+            "support/apps/hyperv-acceptance/tests/storage-benchmark-test.c",
+        },
+        .flags = &.{
+            "-std=gnu11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-DSTORVSC_HOST_TEST",
+            "-DSTORAGE_BENCHMARK_HOST_TEST",
+            "-DSTORAGE_BENCHMARK_READ_TIMEOUT_NS=50000ULL",
+            "-DSTORAGE_BENCHMARK_POLL_NS=10000ULL",
+            "-DCONFIG_LIBSTORVSC_QUEUE_DEPTH=32",
+            "-DCONFIG_LIBSTORVSC_MAX_TRANSFER_PAGES=33",
+            "-DCONFIG_LIBUKALLOC_IFSTATS=1",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK=1",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_RUN_ID=\"00112233445566778899aabbccddeeff\"",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_DISK_ID=\"102132435465768798a9bacbdcedfe0f\"",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_SECTORS=8388608",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_SECTOR_SIZE=512",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_IDENTITY_POLICY=2",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_LUN=7",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_MAX_SLOTS=32",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_MAX_TRANSFER_BYTES=131072",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_WARMUP_OPS=4",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_STEADY_OPS=8",
+            "-DCONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK_TRIALS=2",
+        },
+    });
+    const run_storage_benchmark_tests = b.addRunArtifact(storage_benchmark_tests);
+    const storage_benchmark_evidence = b.createModule(.{
+        .root_source_file = b.path("support/tools/hyperv/storage_benchmark_evidence.zig"),
+        .target = b.graph.host,
+        .optimize = .debug,
+    });
+    const storage_benchmark_evidence_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/apps/hyperv-acceptance/tests/storage-benchmark-evidence-test.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+            .imports = &.{.{ .name = "storage_benchmark_evidence", .module = storage_benchmark_evidence }},
+        }),
+    });
+    const run_storage_benchmark_evidence_tests = b.addRunArtifact(storage_benchmark_evidence_tests);
+    const storage_benchmark_step = b.step(
+        "test-hyperv-storage-benchmark",
+        "Run bounded StorVSC block-I/O benchmark harness and transcript validator fixtures",
+    );
+    storage_benchmark_step.dependOn(&run_storage_benchmark_tests.step);
+    storage_benchmark_step.dependOn(&run_storage_benchmark_evidence_tests.step);
+    storage_binding_tests.dependOn(storage_benchmark_step);
+    test_step.dependOn(storage_binding_tests);
+    const storvsc_regression_tests = b.step(
+        "test-storvsc-regression",
+        "Run StorVSC protocol, topology, guarded-I/O, and ABI fixtures",
+    );
+    storvsc_regression_tests.dependOn(&run_storvsc_core_tests.step);
+    storvsc_regression_tests.dependOn(&verify_storvsc_core.step);
+    storvsc_regression_tests.dependOn(&run_storvsc_production_tests.step);
+    storvsc_regression_tests.dependOn(&run_native_image_graph_tests.step);
+    storvsc_regression_tests.dependOn(storage_binding_tests);
+    const netvsc_binding_protocol = b.addObject(.{
+        .name = "netvsc-protocol-host-binding",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(
+                "drivers/hyperv/netvsc/netvsc_protocol.zig",
+            ),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const netvsc_production_tests = b.addExecutable(.{
+        .name = "netvsc-driver-production-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .debug,
+            .link_libc = true,
+        }),
+    });
+    inline for (.{
+        "support/build/tests/netvsc-host-include",
+        "support/build/tests",
+        "drivers/hyperv/netvsc",
+        "drivers/hyperv/netvsc/include",
+        "drivers/hyperv/vmbus",
+    }) |path| netvsc_production_tests.root_module.addIncludePath(b.path(path));
+    netvsc_production_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "drivers/hyperv/netvsc/netvsc.c",
+            "support/build/tests/netvsc-driver-production-test.c",
+        },
+        .flags = &.{
+            "-std=gnu11",
+            "-DNETVSC_HOST_TEST",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-ignored-attributes",
+            "-pthread",
+        },
+    });
+    netvsc_production_tests.root_module.addObject(netvsc_binding_protocol);
+    netvsc_production_tests.root_module.linkSystemLibrary("pthread", .{});
+    const run_netvsc_production_tests = b.addRunArtifact(netvsc_production_tests);
+    test_step.dependOn(&run_netvsc_production_tests.step);
+    const hyperv_acceptance_protocol_tests = b.addExecutable(.{
+        .name = "hyperv-acceptance-protocol-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .debug,
+            .link_libc = true,
+        }),
+    });
+    hyperv_acceptance_protocol_tests.root_module.addIncludePath(
+        b.path("support/apps/hyperv-acceptance"),
+    );
+    hyperv_acceptance_protocol_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "support/apps/hyperv-acceptance/acceptance_protocol.c",
+            "support/build/tests/hyperv-acceptance-protocol-test.c",
+        },
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    const run_hyperv_acceptance_protocol_tests =
+        b.addRunArtifact(hyperv_acceptance_protocol_tests);
+    test_step.dependOn(&run_hyperv_acceptance_protocol_tests.step);
+    storvsc_regression_tests.dependOn(
+        &run_hyperv_acceptance_protocol_tests.step,
+    );
+    const application_protocol_tests = b.addExecutable(.{
+        .name = "hyperv-application-protocol-test",
+        .use_llvm = true,
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .debug,
+            .link_libc = true,
+        }),
+    });
+    application_protocol_tests.root_module.addIncludePath(
+        b.path("support/apps/hyperv-acceptance"),
+    );
+    application_protocol_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "support/apps/hyperv-acceptance/application_protocol.c",
+            "support/apps/hyperv-acceptance/tests/application-protocol-test.c",
+        },
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    const run_application_protocol_tests =
+        b.addRunArtifact(application_protocol_tests);
+    test_step.dependOn(&run_application_protocol_tests.step);
+    const http_protocol_tests = b.addExecutable(.{
+        .name = "hyperv-http-protocol-test",
+        .use_llvm = true,
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .debug,
+            .link_libc = true,
+        }),
+    });
+    http_protocol_tests.root_module.addIncludePath(
+        b.path("support/apps/hyperv-acceptance"),
+    );
+    http_protocol_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "support/apps/hyperv-acceptance/http_protocol.c",
+            "support/apps/hyperv-acceptance/tests/http-protocol-test.c",
+        },
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    const run_http_protocol_tests = b.addRunArtifact(http_protocol_tests);
+    test_step.dependOn(&run_http_protocol_tests.step);
+    const network_regression_tests = b.step(
+        "test-network-regression",
+        "Run Hyper-V network protocols, production driver, and native profile fixtures",
+    );
+    network_regression_tests.dependOn(&run_netvsc_protocol_tests.step);
+    network_regression_tests.dependOn(&verify_netvsc_protocol.step);
+    network_regression_tests.dependOn(&run_netvsc_production_tests.step);
+    network_regression_tests.dependOn(&run_vmbus_disconnect_tests.step);
+    network_regression_tests.dependOn(&run_hyperv_acceptance_protocol_tests.step);
+    network_regression_tests.dependOn(&run_application_protocol_tests.step);
+    network_regression_tests.dependOn(&run_http_protocol_tests.step);
+    network_regression_tests.dependOn(&run_native_image_graph_tests.step);
+    const platform_correctness_tests = b.addExecutable(.{
+        .name = "platform-runtime-correctness-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .debug,
+            .link_libc = true,
+        }),
+    });
+    platform_correctness_tests.root_module.addIncludePath(
+        b.path("plat/common/include"),
+    );
+    platform_correctness_tests.root_module.addIncludePath(
+        b.path("plat/hyperv/include"),
+    );
+    for ([_][]const u8{
+        "support/build/tests/hyperv-smp-host-include",
+        "drivers/firmware/ukefi/include",
+        "lib/uktimeconv/include",
+    }) |path| platform_correctness_tests.root_module.addIncludePath(b.path(path));
+    platform_correctness_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "support/build/tests/platform-runtime-correctness-test.c",
+            "lib/uktimeconv/timeconv.c",
+        },
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    const run_platform_correctness = b.addRunArtifact(platform_correctness_tests);
+    test_step.dependOn(&run_platform_correctness.step);
+    const clock_tests = b.step("test-hyperv-clock", "Test qualified EFI realtime and native clock handoff");
+    clock_tests.dependOn(&run_platform_correctness.step);
+    const hyperv_smp_tests = b.addExecutable(.{
+        .name = "hyperv-smp-production-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .debug,
+            .link_libc = true,
+        }),
+    });
+    hyperv_smp_tests.root_module.addIncludePath(
+        b.path("support/build/tests/hyperv-smp-host-include"),
+    );
+    hyperv_smp_tests.root_module.addIncludePath(
+        b.path("plat/hyperv/include"),
+    );
+    hyperv_smp_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "plat/hyperv/time.c",
+            "support/build/tests/hyperv-smp-production-test.c",
+        },
+        .flags = &.{
+            "-std=gnu11",
+            "-DHYPERV_TIME_HOST_TEST",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pthread",
+        },
+    });
+    hyperv_smp_tests.root_module.linkSystemLibrary("pthread", .{});
+    const run_hyperv_smp_tests = b.addRunArtifact(hyperv_smp_tests);
+    test_step.dependOn(&run_hyperv_smp_tests.step);
+    clock_tests.dependOn(&run_hyperv_smp_tests.step);
+    const hyperv_fixed_smp_tests = b.addExecutable(.{
+        .name = "hyperv-fixed-smp-production-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .debug,
+            .link_libc = true,
+        }),
+    });
+    hyperv_fixed_smp_tests.root_module.addIncludePath(
+        b.path("support/build/tests/hyperv-smp-host-include"),
+    );
+    hyperv_fixed_smp_tests.root_module.addIncludePath(
+        b.path("plat/hyperv/include"),
+    );
+    hyperv_fixed_smp_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "plat/hyperv/time.c",
+            "support/build/tests/hyperv-smp-production-test.c",
+        },
+        .flags = &.{
+            "-std=gnu11",
+            "-DHYPERV_TIME_HOST_TEST",
+            "-DHYPERV_SMP_HOST_FIXED",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pthread",
+        },
+    });
+    hyperv_fixed_smp_tests.root_module.linkSystemLibrary("pthread", .{});
+    const run_hyperv_fixed_smp_tests =
+        b.addRunArtifact(hyperv_fixed_smp_tests);
+    test_step.dependOn(&run_hyperv_fixed_smp_tests.step);
+    clock_tests.dependOn(&run_hyperv_fixed_smp_tests.step);
+    const schedcoop_smp_tests = b.addExecutable(.{
+        .name = "ukschedcoop-smp-production-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .debug,
+            .link_libc = true,
+        }),
+    });
+    schedcoop_smp_tests.root_module.addIncludePath(
+        b.path("support/build/tests/ukschedcoop-host-include"),
+    );
+    schedcoop_smp_tests.root_module.addIncludePath(
+        b.path("lib/ukschedcoop/include"),
+    );
+    schedcoop_smp_tests.root_module.addIncludePath(
+        b.path("lib/uksched/include"),
+    );
+    schedcoop_smp_tests.root_module.addCSourceFile(.{
+        .file = b.path(
+            "support/build/tests/ukschedcoop-smp-production-test.c",
+        ),
+        .flags = &.{
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pthread",
+        },
+    });
+    schedcoop_smp_tests.root_module.linkSystemLibrary("pthread", .{});
+    const run_schedcoop_smp_tests = b.addRunArtifact(schedcoop_smp_tests);
+    const uksched_wake_tests = b.addExecutable(.{
+        .name = "uksched-wake-production-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .debug,
+            .link_libc = true,
+        }),
+    });
+    uksched_wake_tests.root_module.addIncludePath(
+        b.path("support/build/tests/uksched-wake-host-include"),
+    );
+    uksched_wake_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "lib/uksched/wake.c",
+            "support/build/tests/uksched-wake-production-test.c",
+        },
+        .flags = &.{
+            "-std=c11",
+            "-D_GNU_SOURCE",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+        },
+    });
+    const run_uksched_wake_tests = b.addRunArtifact(uksched_wake_tests);
+    const ukboot_smp_tests = b.addExecutable(.{
+        .name = "ukboot-smp-production-test",
+        .root_module = b.createModule(.{
+            .target = b.graph.host,
+            .optimize = .debug,
+            .link_libc = true,
+        }),
+    });
+    ukboot_smp_tests.root_module.addIncludePath(
+        b.path("support/build/tests/ukboot-smp-host-include"),
+    );
+    ukboot_smp_tests.root_module.addCSourceFiles(.{
+        .files = &.{
+            "lib/ukboot/smp.c",
+            "support/build/tests/ukboot-smp-production-test.c",
+        },
+        .flags = &.{
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+        },
+    });
+    const run_ukboot_smp_tests = b.addRunArtifact(ukboot_smp_tests);
+    const run_ukboot_smp_init_failure = b.addRunArtifact(ukboot_smp_tests);
+    run_ukboot_smp_init_failure.addArg("--init-failure");
+    const run_ukboot_smp_paging_failure = b.addRunArtifact(ukboot_smp_tests);
+    run_ukboot_smp_paging_failure.addArg("--paging-failure");
+    const run_ukboot_smp_paging_activation_failure =
+        b.addRunArtifact(ukboot_smp_tests);
+    run_ukboot_smp_paging_activation_failure.addArg("--paging-activation-failure");
+    const schedcoop_smp_test_step = b.step(
+        "test-schedcoop-smp",
+        "Run fixed cooperative-SMP queue and wake lifecycle fixtures",
+    );
+    schedcoop_smp_test_step.dependOn(&run_schedcoop_smp_tests.step);
+    schedcoop_smp_test_step.dependOn(&run_uksched_wake_tests.step);
+    schedcoop_smp_test_step.dependOn(&run_ukboot_smp_tests.step);
+    schedcoop_smp_test_step.dependOn(&run_ukboot_smp_init_failure.step);
+    schedcoop_smp_test_step.dependOn(&run_ukboot_smp_paging_failure.step);
+    schedcoop_smp_test_step.dependOn(&run_ukboot_smp_paging_activation_failure.step);
+    schedcoop_smp_test_step.dependOn(&run_hyperv_fixed_smp_tests.step);
+    test_step.dependOn(&run_schedcoop_smp_tests.step);
+    test_step.dependOn(&run_uksched_wake_tests.step);
+    const vmbus_lifecycle_tests = b.step(
+        "test-vmbus-lifecycle",
+        "Run hosted VMBus control, channel, and disconnect lifecycle fixtures",
+    );
+    vmbus_lifecycle_tests.dependOn(&run_vmbus_control_tests.step);
+    vmbus_lifecycle_tests.dependOn(&run_vmbus_production_tests.step);
+    vmbus_lifecycle_tests.dependOn(&run_vmbus_disconnect_tests.step);
+    storage_binding_tests.dependOn(vmbus_lifecycle_tests);
+    const hyperv_irq_tests = b.step("test-hyperv-irq", "Run Hyper-V IRQ-path hosted correctness tests");
+    hyperv_irq_tests.dependOn(&b.addRunArtifact(hyperv_runtime_tests).step);
+    hyperv_irq_tests.dependOn(&b.addRunArtifact(vmbus_protocol_tests).step);
+    hyperv_irq_tests.dependOn(vmbus_lifecycle_tests);
+    hyperv_irq_tests.dependOn(&b.addRunArtifact(hyperv_smp_tests).step);
+    hyperv_irq_tests.dependOn(&verify_hyperv_runtime.step);
+    hyperv_irq_tests.dependOn(&verify_vmbus_protocol.step);
+    var xpic_correctness_steps: [2]*std.Build.Step = undefined;
+    for ([_]bool{ false, true }, 0..) |legacy_apic, index| {
+        const xpic_correctness_tests = b.addExecutable(.{
+            .name = if (legacy_apic) "xpic-runtime-correctness-test" else "xpic-x2apic-only-test",
+            .root_module = b.createModule(.{
+                .target = b.graph.host,
+                .optimize = .debug,
+                .link_libc = true,
+            }),
+        });
+        xpic_correctness_tests.root_module.addIncludePath(
+            b.path("support/build/tests/xpic-fixture/include"),
+        );
+        xpic_correctness_tests.root_module.addCSourceFiles(.{
+            .files = &.{
+                "drivers/ukintctlr/xpic/ukintctlr.c",
+                "support/build/tests/xpic-runtime-correctness-test.c",
+            },
+            .flags = &.{
+                "-std=c11",                                                                            "-Wall", "-Wextra", "-Werror",
+                if (legacy_apic) "-DCONFIG_LIBUKINTCTLR_XAPIC=1" else "-DCONFIG_LIBUKINTCTLR_XAPIC=0",
+            },
+        });
+        const run_xpic_correctness_tests = b.addRunArtifact(xpic_correctness_tests);
+        xpic_correctness_steps[index] = &run_xpic_correctness_tests.step;
+        test_step.dependOn(&run_xpic_correctness_tests.step);
+        hyperv_irq_tests.dependOn(&run_xpic_correctness_tests.step);
+    }
+    const hyperv_image_proofs = hyperv_proof_build.tests(b, b.path("."));
+    test_step.dependOn(hyperv_image_proofs);
+    const hyperv_regression_tests = b.step(
+        "test-hyperv-regression",
+        "Run focused Hyper-V protocol, driver, controller, and IRQ regressions",
+    );
+    hyperv_regression_tests.dependOn(vmbus_lifecycle_tests);
+    hyperv_regression_tests.dependOn(hyperv_image_proofs);
+    hyperv_regression_tests.dependOn(compiler_option_tests);
+    hyperv_regression_tests.dependOn(storvsc_regression_tests);
+    hyperv_regression_tests.dependOn(network_regression_tests);
+    hyperv_regression_tests.dependOn(&run_schedcoop_smp_tests.step);
+    hyperv_regression_tests.dependOn(&run_uksched_wake_tests.step);
+    hyperv_regression_tests.dependOn(&run_ukboot_smp_tests.step);
+    hyperv_regression_tests.dependOn(&run_ukboot_smp_init_failure.step);
+    hyperv_regression_tests.dependOn(&run_ukboot_smp_paging_failure.step);
+    hyperv_regression_tests.dependOn(&run_ukboot_smp_paging_activation_failure.step);
+    hyperv_regression_tests.dependOn(&run_hyperv_fixed_smp_tests.step);
+    if (builtin.cpu.arch == .x86_64) {
+        hyperv_regression_tests.dependOn(hyperv_irq_tests);
+    } else {
+        hyperv_regression_tests.dependOn(
+            &b.addRunArtifact(vmbus_protocol_tests).step,
+        );
+        hyperv_regression_tests.dependOn(&verify_hyperv_runtime.step);
+        hyperv_regression_tests.dependOn(&verify_vmbus_protocol.step);
+        for (xpic_correctness_steps) |xpic_step|
+            hyperv_regression_tests.dependOn(xpic_step);
+        const x86_host_notice = b.addRunArtifact(object_verifier.tool);
+        x86_host_notice.addArg("architecture-notice");
+        hyperv_regression_tests.dependOn(&x86_host_notice.step);
+    }
+    hyperv_regression_tests.dependOn(
+        &b.addRunArtifact(vmbus_channel_tests).step,
+    );
+    hyperv_regression_tests.dependOn(
+        &b.addRunArtifact(netvsc_protocol_abi_tests).step,
+    );
+    hyperv_regression_tests.dependOn(
+        &b.addRunArtifact(vmbus_abi_tests).step,
+    );
+    hyperv_regression_tests.dependOn(
+        &b.addRunArtifact(platform_correctness_tests).step,
+    );
+    hyperv_regression_tests.dependOn(&verify_vmbus_channel.step);
+    const build_tools_tests = b.step(
+        "test-build-tools",
+        "Test native metadata, linker merge, final link and LTO policy without Make or Python",
+    );
+    for ([_][]const u8{ "native-config-metadata.zig", "lto-symbol-policy.zig" }) |source| {
+        const tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.fmt("support/build/{s}", .{source})),
+                .target = b.graph.host,
+                .optimize = .debug,
+            }),
+        });
+        const run = b.addRunArtifact(tests);
+        run.setCwd(.cache_root);
+        build_tools_tests.dependOn(&run.step);
+    }
+    const lto_proof_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/native-lto-proof.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const run_lto_proof_tests = b.addRunArtifact(lto_proof_tests);
+    run_lto_proof_tests.setCwd(.cache_root);
+    b.step("test-lto-proof", "Run native cross-TU LTO proof unit tests").dependOn(&run_lto_proof_tests.step);
+    build_tools_tests.dependOn(&run_lto_proof_tests.step);
+    const elf_size_diff_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/native-elf-size-diff.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const run_elf_size_diff_tests = b.addRunArtifact(elf_size_diff_tests);
+    run_elf_size_diff_tests.setCwd(.cache_root);
+    b.step("test-elf-size-diff", "Run native ELF size diff unit tests").dependOn(&run_elf_size_diff_tests.step);
+    build_tools_tests.dependOn(&run_elf_size_diff_tests.step);
+    build_tools_tests.dependOn(&run_native_config_tests.step);
+    build_tools_tests.dependOn(&run_linker_script_tests.step);
+    build_tools_tests.dependOn(&run_final_link_tests.step);
+    build_tools_tests.dependOn(&run_native_lto_tests.step);
+    const policy_tool = b.addExecutable(.{
+        .name = "unikraft-lto-policy-fixture-tool",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/lto-symbol-policy.zig"),
+            .target = b.graph.host,
+            .optimize = .safe,
+        }),
+    });
+    const build_tools_integration = b.addExecutable(.{
+        .name = "unikraft-build-tools-integration",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/build-tools-integration.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const run_build_tools_integration = b.addRunArtifact(build_tools_integration);
+    // Config.uk discovers source fragments at runtime; do not cache a model
+    // proof using only the top-level configuration file as its input.
+    run_build_tools_integration.has_side_effects = true;
+    run_build_tools_integration.addArtifactArg(metadata_tool);
+    run_build_tools_integration.addArtifactArg(native_config_tool);
+    run_build_tools_integration.addArtifactArg(policy_tool);
+    _ = run_build_tools_integration.addOutputDirectoryArg("native-build-tools-fixtures");
+    run_build_tools_integration.addArg(root);
+    run_build_tools_integration.addFileInput(b.path("Config.uk"));
+    run_build_tools_integration.addFileInput(b.path("support/build/config-submenu.sh"));
+    run_build_tools_integration.addArtifactArg(native_build_tools.legacyConfigFixture(b, b.path("."), bison_command, flex_command));
+    build_tools_tests.dependOn(&run_build_tools_integration.step);
+    test_step.dependOn(build_tools_tests);
+    const target_config_cache_exe = b.addExecutable(.{
+        .name = "target-config-cache-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/tests/target-config-cache-test.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const target_config_cache_test = b.addRunArtifact(target_config_cache_exe);
+    target_config_cache_test.addArgs(&.{
+        "--base",
+        root,
+        "--work-dir",
+    });
+    target_config_cache_test.addDirectoryArg(
+        b.graph.path(.local_cache, "target-config-cache"),
+    );
+    const translator_dependency = b.dependency("translate_c", .{});
+    const translator_root = std.fs.path.resolve(b.allocator, &.{
+        cwd,
+        translator_dependency.builder.root.toString(b.allocator) catch @panic("OOM"),
+    }) catch @panic("OOM");
+    target_config_cache_test.addArgs(&.{
+        "--zig",      b.graph.zig_exe,
+        "--packages", std.fs.path.dirname(translator_root) orelse @panic("missing translator package directory"),
+    });
+    target_config_cache_test.setCwd(.{ .cwd_relative = root });
+    test_step.dependOn(&target_config_cache_test.step);
+    b.step(
+        "test-target-config-cache",
+        "Test warm configuration/header caches and live path/executable trust refusals",
+    ).dependOn(&target_config_cache_test.step);
+    const native_postprocess_image_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/native-postprocess-tests.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+        }),
+    });
+    const run_native_postprocess_image_tests = b.addRunArtifact(native_postprocess_image_tests);
+    run_native_postprocess_image_tests.setCwd(.cache_root);
+    test_step.dependOn(&run_native_postprocess_image_tests.step);
+    const acme_integration_output = b.graph.path(.local_cache, "native-config-acme");
+    const integration_metadata = acme_integration_output.path(b, "metadata.tsv");
+    const acme_config = resolvePath(
+        b.allocator,
+        root,
+        "support/build/tests/native-config/x86_64-acme.config",
+    );
+    const acme_platform = resolvePath(
+        b.allocator,
+        root,
+        "support/build/tests/native-config/external-platform/provider",
+    );
+    const export_integration_metadata = b.addRunArtifact(metadata_tool);
+    export_integration_metadata.addArgs(&.{
+        "--base",
+        root,
+        "--app",
+        root,
+        "--output",
+    });
+    export_integration_metadata.addDirectoryArg(acme_integration_output);
+    export_integration_metadata.addArgs(&.{ "--config", acme_config, "--metadata" });
+    export_integration_metadata.addDirectoryArg(integration_metadata);
+    export_integration_metadata.addArgs(&.{ "--external-platform", acme_platform });
+    export_integration_metadata.setCwd(.{ .cwd_relative = root });
+    const inspect_acme_config = b.addRunArtifact(native_config_tool);
+    inspect_acme_config.addArgs(&.{ "inspect", acme_config });
+    inspect_acme_config.addFileArg(integration_metadata);
+    inspect_acme_config.setCwd(.{ .cwd_relative = root });
+    inspect_acme_config.step.dependOn(&export_integration_metadata.step);
+    test_step.dependOn(&inspect_acme_config.step);
+    const validate_acme_config = b.addRunArtifact(native_config_tool);
+    validate_acme_config.addArgs(&.{ "validate", acme_config });
+    validate_acme_config.addFileArg(integration_metadata);
+    validate_acme_config.setCwd(.{ .cwd_relative = root });
+    validate_acme_config.step.dependOn(&export_integration_metadata.step);
+    test_step.dependOn(&validate_acme_config.step);
+    const fixture_app = resolvePath(
+        b.allocator,
+        root,
+        "support/build/tests/native-config/fixture-app",
+    );
+    const fixture_library = resolvePath(
+        b.allocator,
+        root,
+        "support/build/tests/native-config/external-library/libfixture",
+    );
+    const x86_config = resolvePath(
+        b.allocator,
+        root,
+        "support/build/tests/native-config/x86_64-kvm.config",
+    );
+    const x86_expected_header = resolvePath(
+        b.allocator,
+        root,
+        "support/build/tests/native-config/x86_64-kvm.h",
+    );
+    const x86_integration_output = b.graph.path(.local_cache, "native-config-x86");
+    const x86_metadata = x86_integration_output.path(b, "metadata.tsv");
+    const x86_generated_header = x86_integration_output.path(b, "config.h");
+    const export_x86_metadata = b.addRunArtifact(metadata_tool);
+    export_x86_metadata.addArgs(&.{
+        "--base",
+        root,
+        "--app",
+        fixture_app,
+        "--output",
+    });
+    export_x86_metadata.addDirectoryArg(x86_integration_output);
+    export_x86_metadata.addArgs(&.{ "--config", x86_config, "--metadata" });
+    export_x86_metadata.addDirectoryArg(x86_metadata);
+    export_x86_metadata.addArgs(&.{ "--external-library", fixture_library });
+    export_x86_metadata.setCwd(.{ .cwd_relative = root });
+    const generate_x86_header = b.addRunArtifact(native_config_tool);
+    generate_x86_header.addArgs(&.{ "header", x86_config });
+    generate_x86_header.addFileArg(x86_metadata);
+    generate_x86_header.addDirectoryArg(x86_generated_header);
+    generate_x86_header.setCwd(.{ .cwd_relative = root });
+    generate_x86_header.step.dependOn(&export_x86_metadata.step);
+    const compare_x86_header = b.addSystemCommand(&.{ "cmp", x86_expected_header });
+    compare_x86_header.addFileArg(x86_generated_header);
+    compare_x86_header.step.dependOn(&generate_x86_header.step);
+    test_step.dependOn(&compare_x86_header.step);
+    const version_integration_output = b.graph.path(.local_cache, "native-config-version-test");
+    const version_work_dir = version_integration_output.path(b, "cases");
+    const version_metadata_exe = b.addExecutable(.{
+        .name = "version-metadata-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("support/build/tests/version-metadata-test.zig"),
+            .target = b.graph.host,
+            .optimize = .debug,
+            .imports = &.{.{
+                .name = "native_config_metadata",
+                .module = b.createModule(.{
+                    .root_source_file = b.path("support/build/native-config-metadata.zig"),
+                    .target = b.graph.host,
+                    .optimize = .debug,
+                }),
+            }},
+        }),
+    });
+    const prepare_version_fragment = b.addRunArtifact(version_metadata_exe);
+    prepare_version_fragment.addArgs(&.{
+        "--base",
+        root,
+        "--work-dir",
+    });
+    prepare_version_fragment.addDirectoryArg(version_work_dir);
+    prepare_version_fragment.addArg("--prepare-output");
+    prepare_version_fragment.addDirectoryArg(version_integration_output);
+    prepare_version_fragment.setCwd(.{ .cwd_relative = root });
+    const version_config = resolvePath(
+        b.allocator,
+        root,
+        "support/build/tests/native-config/version-metadata.config",
+    );
+    const version_library = resolvePath(
+        b.allocator,
+        root,
+        "support/build/tests/native-config/versioned-library",
+    );
+    const version_expected_header = resolvePath(
+        b.allocator,
+        root,
+        "support/build/tests/native-config/version-metadata.h",
+    );
+    const version_metadata = version_integration_output.path(b, "metadata.tsv");
+    const version_generated_header = version_integration_output.path(b, "config.h");
+    const export_version_metadata = b.addRunArtifact(metadata_tool);
+    export_version_metadata.addArgs(&.{
+        "--base",
+        root,
+        "--app",
+        root,
+        "--output",
+    });
+    export_version_metadata.addDirectoryArg(version_integration_output);
+    export_version_metadata.addArgs(&.{ "--config", version_config, "--metadata" });
+    export_version_metadata.addDirectoryArg(version_metadata);
+    export_version_metadata.addArgs(&.{ "--external-library", version_library });
+    export_version_metadata.setCwd(.{ .cwd_relative = root });
+    export_version_metadata.step.dependOn(&prepare_version_fragment.step);
+    const generate_version_header = b.addRunArtifact(native_config_tool);
+    generate_version_header.addArgs(&.{ "header", version_config });
+    generate_version_header.addFileArg(version_metadata);
+    generate_version_header.addDirectoryArg(version_generated_header);
+    generate_version_header.setCwd(.{ .cwd_relative = root });
+    generate_version_header.step.dependOn(&export_version_metadata.step);
+    const compare_version_header = b.addSystemCommand(&.{ "cmp", version_expected_header });
+    compare_version_header.addFileArg(version_generated_header);
+    compare_version_header.step.dependOn(&generate_version_header.step);
+    test_step.dependOn(&compare_version_header.step);
+    b.step(
+        "test-version-metadata",
+        "Test native version metadata and Kconfig version path expansion",
+    ).dependOn(&prepare_version_fragment.step);
+    const runner_link_targets = [_]struct {
+        name: []const u8,
+        query: std.Target.Query,
+    }{
+        .{
+            .name = "x86_64-macos",
+            .query = .{ .cpu_arch = .x86_64, .os_tag = .macos },
+        },
+        .{
+            .name = "aarch64-macos",
+            .query = .{ .cpu_arch = .aarch64, .os_tag = .macos },
+        },
+        .{
+            .name = "x86_64-openbsd",
+            .query = .{ .cpu_arch = .x86_64, .os_tag = .openbsd },
+        },
+    };
+    for (runner_link_targets) |link_target| {
+        const runner_link_test = b.addExecutable(.{
+            .name = b.fmt("unikraft-zig-make-{s}", .{link_target.name}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("support/build/zig-facade-runner.zig"),
+                .target = b.resolveTargetQuery(link_target.query),
+                .optimize = .safe,
+                .link_libc = true,
+            }),
+        });
+        test_step.dependOn(&runner_link_test.step);
+    }
+}
+
+fn registerNativeGraph(
+    b: *std.Build,
+    context: build_context.Context,
+    options: MakeOptions,
+) ?*native_image_graph.RegisteredGraph {
+    const step = b.step(
+        "native-link-graph",
+        "Register a native hello-world image graph without executing it",
+    );
+    const profile_name = b.option(
+        []const u8,
+        "native-profile",
+        "Registered native graph: qemu-x86_64, qemu-arm64, hyperv-x86_64-efi, hyperv-x86_64-efi-netvsc, or hyperv-x86_64-efi-wamr",
+    ) orelse b.option(
+        []const u8,
+        "native-qemu-graph",
+        "Legacy alias for -Dnative-profile",
+    ) orelse {
+        const fail = b.addFail(
+            "native-link-graph requires -Dnative-profile=qemu-x86_64, qemu-arm64, hyperv-x86_64-efi, or hyperv-x86_64-efi-netvsc",
+        );
+        step.dependOn(&fail.step);
+        return null;
+    };
+    const profile = native_image_graph.parseProfile(profile_name) catch {
+        step.dependOn(&b.addFail(b.fmt(
+            "unsupported native graph '{s}'; registered graphs are qemu-x86_64, qemu-arm64, hyperv-x86_64-efi, and hyperv-x86_64-efi-netvsc",
+            .{profile_name},
+        )).step);
+        return null;
+    };
+
+    const config = loadNativeConfig(b, context.config) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => {
+            step.dependOn(&b.addFail(b.fmt(
+                "unable to load native graph configuration '{s}': {s}",
+                .{ context.config, @errorName(err) },
+            )).step);
+            return null;
+        },
+    };
+    const enable_storvsc = if (config) |loaded|
+        nativeConfigEnabled(loaded, "CONFIG_LIBSTORVSC")
+    else
+        false;
+    const enable_ukblkdev = enable_storvsc or if (config) |loaded|
+        nativeConfigEnabled(loaded, "CONFIG_LIBUKBLKDEV")
+    else
+        false;
+    const enable_uklibparam = if (config) |loaded|
+        nativeConfigEnabled(loaded, "CONFIG_LIBUKLIBPARAM")
+    else
+        false;
+    const enable_lwip = if (config) |loaded|
+        nativeConfigEnabled(loaded, "CONFIG_LIBLWIP")
+    else
+        false;
+    const enable_hyperv_acceptance = if (config) |loaded|
+        nativeConfigEnabled(loaded, "CONFIG_APPHYPERVACCEPTANCE")
+    else
+        false;
+    const enable_hyperv_persistence = if (config) |loaded|
+        nativeConfigEnabled(
+            loaded,
+            "CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE",
+        )
+    else
+        false;
+    const enable_hyperv_storage_benchmark = if (config) |loaded|
+        nativeConfigEnabled(
+            loaded,
+            "CONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK",
+        )
+    else
+        false;
+    const enable_ukalloc_ifstats = if (config) |loaded|
+        nativeConfigEnabled(loaded, "CONFIG_LIBUKALLOC_IFSTATS")
+    else
+        false;
+    const enable_ukrandom_lcpu = if (config) |loaded|
+        nativeConfigEnabled(loaded, "CONFIG_LIBUKRANDOM_LCPU")
+    else
+        false;
+    const lwip_root = if (enable_lwip and
+        context.external_libraries.len == 1)
+        context.external_libraries[0]
+    else
+        null;
+    const registration = b.allocator.create(native_image_graph.RegisteredGraph) catch {
+        step.dependOn(&b.addFail("unable to allocate the native QEMU graph").step);
+        return null;
+    };
+    registration.* = native_image_graph.RegisteredGraph.init(b.allocator, .{
+        .roots = .{
+            .base = context.base,
+            .app = context.application,
+            .output = context.output,
+            .config = context.config,
+        },
+        .profile = profile,
+        .tools = .{
+            .compiler = forwardedCommand(options.forwarded, "ZIG"),
+            .nm = forwardedCommand(options.forwarded, "NM"),
+            .objcopy = forwardedCommand(options.forwarded, "OBJCOPY"),
+            .objdump = forwardedCommand(options.forwarded, "OBJDUMP"),
+            .strip = forwardedCommand(options.forwarded, "STRIP"),
+        },
+        .enable_ukblkdev = enable_ukblkdev,
+        .enable_storvsc = enable_storvsc,
+        .enable_uklibparam = enable_uklibparam,
+        .enable_lwip = enable_lwip,
+        .enable_hyperv_acceptance = enable_hyperv_acceptance,
+        .enable_hyperv_persistence = enable_hyperv_persistence,
+        .enable_hyperv_storage_benchmark = enable_hyperv_storage_benchmark,
+        .enable_ukalloc_ifstats = enable_ukalloc_ifstats,
+        .enable_ukrandom_lcpu = enable_ukrandom_lcpu,
+        .lwip_root = lwip_root,
+    }) catch |err| {
+        step.dependOn(&b.addFail(b.fmt(
+            "unable to register native QEMU graph '{s}': {s}",
+            .{ @tagName(profile), @errorName(err) },
+        )).step);
+        return null;
+    };
+
+    return registration;
+}
+
+const NativeResolverContext = struct {
+    libraries: native_library_link.Execution,
+
+    fn resolve(
+        context_ptr: ?*const anyopaque,
+        reference: component_api.ArtifactReference,
+        fallback_path: []const u8,
+    ) std.Build.LazyPath {
+        const self: *const NativeResolverContext = @ptrCast(@alignCast(context_ptr.?));
+        return switch (reference) {
+            .library_final_object => |name| self.libraries.finalObject(name) orelse
+                @panic("native final link references an unexecuted library"),
+            .library_partial_output => |name| blk: {
+                for (self.libraries.libraries) |library| {
+                    if (std.mem.eql(u8, library.component_name, name)) {
+                        break :blk library.partial_output;
+                    }
+                }
+                @panic("native final link references an unexecuted partial library");
+            },
+            else => .{ .cwd_relative = fallback_path },
+        };
+    }
+};
+
+fn registerNativePipeline(
+    b: *std.Build,
+    root: []const u8,
+    context: build_context.Context,
+    options: MakeOptions,
+    optimize: std.lang.Optimize,
+    make_runner: *std.Build.Step.Compile,
+    validate_config: *std.Build.Step.Run,
+    target_config_header: std.Build.LazyPath,
+    registration: ?*native_image_graph.RegisteredGraph,
+) *std.Build.Step {
+    const step = b.step(
+        "native-images",
+        "Build images with Zig-owned native link and post-processing stages",
+    );
+    const registered = registration orelse {
+        step.dependOn(&b.addFail(
+            "native-images requires -Dnative-profile=qemu-x86_64, qemu-arm64, hyperv-x86_64-efi, or hyperv-x86_64-efi-netvsc",
+        ).step);
+        return step;
+    };
+    const copy_command = forwardedCommand(options.forwarded, "CP") orelse "cp";
+
+    const config = loadNativeConfig(b, context.config) catch |err| {
+        step.dependOn(&b.addFail(b.fmt(
+            "unable to load native build configuration '{s}': {s}",
+            .{ context.config, @errorName(err) },
+        )).step);
+        return step;
+    };
+    if (!nativeProfileMatchesConfig(registered.profile, config)) {
+        step.dependOn(&b.addFail(b.fmt(
+            "native profile '{s}' does not match configuration '{s}'",
+            .{ @tagName(registered.profile), context.config },
+        )).step);
+        return step;
+    }
+    var input_options = options;
+    input_options.linker = null;
+    input_options.partial_linker = null;
+    input_options.partial_linker_type = null;
+    const make_inputs = addMakeCommand(
+        b,
+        make_runner,
+        context.output,
+        root,
+        "native-link-inputs",
+        input_options,
+    );
+    make_inputs.step.dependOn(&validate_config.step);
+
+    const target_objects = native_target_object.execute(b, registered.graph, .{
+        .optimize = optimize,
+        .strip = options.ci_portable_config,
+        .path_bindings = &.{.{
+            .logical_path = std.fs.path.join(
+                b.allocator,
+                &.{ context.output, "include", "uk", "bits", "config.h" },
+            ) catch @panic("out of memory"),
+            .lazy_path = target_config_header,
+        }},
+    }) catch |err| {
+        step.dependOn(&b.addFail(b.fmt(
+            "unable to compile native target Zig objects: {s}",
+            .{@errorName(err)},
+        )).step);
+        return step;
+    };
+
+    const cq = configQuery(config);
+    const link_mode = native_lto.LinkMode.detect(cq);
+
+    // LTO path: flat zig cc -flto final link, no per-library partial/objcopy.
+    if (link_mode == .lto) {
+        native_lto.requireLtoProfile(registered.profile) catch {
+            step.dependOn(&b.addFail(b.fmt(
+                "LTO is not supported for the '{s}' profile; only qemu-x86_64 is implemented",
+                .{@tagName(registered.profile)},
+            )).step);
+            return step;
+        };
+        const opt_level = native_lto.OptLevel.detect(cq);
+        const lto_resolver = final_link.ArtifactResolver.cwdRelative();
+        const lto_result = native_lto.executeLtoFinalLink(
+            b,
+            registered.graph,
+            lto_resolver,
+            &make_inputs.step,
+            opt_level,
+        ) catch |err| {
+            step.dependOn(&b.addFail(b.fmt(
+                "unable to execute LTO final link: {s}",
+                .{@errorName(err)},
+            )).step);
+            return step;
+        };
+        return finishNativeImages(
+            b,
+            step,
+            registered,
+            options,
+            copy_command,
+            config,
+            lto_result.stage_name,
+            lto_result.output,
+        );
+    }
+
+    // Standard path: per-library partial-link + objcopy, then final link.
+    const bindings = nativePathBindings(b, registered.graph, target_objects);
+    const libraries = native_library_link.execute(b, registered.graph, .{
+        .path_bindings = bindings,
+    }) catch |err| {
+        step.dependOn(&b.addFail(b.fmt(
+            "unable to execute native library pipelines: {s}",
+            .{@errorName(err)},
+        )).step);
+        return step;
+    };
+    for (libraries.libraries) |library| {
+        library.partial_link_step.step.dependOn(&make_inputs.step);
+    }
+
+    const resolver_context = b.allocator.create(NativeResolverContext) catch
+        @panic("out of memory");
+    resolver_context.* = .{ .libraries = libraries };
+    const linker = final_link.Executor.initWithPrerequisite(
+        b,
+        .{
+            .context = resolver_context,
+            .resolve_fn = NativeResolverContext.resolve,
+        },
+        &make_inputs.step,
+    );
+    const linked = linker.addSelected(registered.graph) catch |err| {
+        step.dependOn(&b.addFail(b.fmt(
+            "unable to execute native final link: {s}",
+            .{@errorName(err)},
+        )).step);
+        return step;
+    };
+    if (linked.len != 1) {
+        step.dependOn(&b.addFail("native QEMU graph must contain exactly one final link").step);
+        return step;
+    }
+
+    return finishNativeImages(
+        b,
+        step,
+        registered,
+        options,
+        copy_command,
+        config,
+        linked[0].stage_name,
+        linked[0].output,
+    );
+}
+
+/// Shared tail for both LTO and standard link paths: post-process and publish.
+fn finishNativeImages(
+    b: *std.Build,
+    step: *std.Build.Step,
+    registered: *native_image_graph.RegisteredGraph,
+    options: MakeOptions,
+    copy_command: []const u8,
+    config: *const NativeConfig,
+    stage_name: []const u8,
+    link_output: std.Build.LazyPath,
+) *std.Build.Step {
+    var validated_link_output = link_output;
+    if (registered.profile == .@"hyperv-x86_64-efi" or
+        registered.profile == .@"hyperv-x86_64-efi-netvsc" or
+        registered.profile == .@"hyperv-x86_64-efi-wamr")
+    {
+        const max_cpu_prefix = "CONFIG_UKPLAT_CPU_MAXCOUNT=";
+        var max_cpus: []const u8 = "1";
+        var lines = std.mem.splitScalar(u8, config.source, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, max_cpu_prefix)) {
+                max_cpus = line[max_cpu_prefix.len..];
+                break;
+            }
+        }
+        const proof_tool = hyperv_proof_build.tool(b, b.path("."));
+        const check = b.addRunArtifact(proof_tool);
+        check.addArgs(&.{ "smp", "--image" });
+        check.addFileArg(link_output);
+        check.addArgs(&.{
+            "--max-cpus",
+            max_cpus,
+            "--nm",
+            registered.graph.toolchain.binutils.nm.command,
+            "--objdump",
+            if (registered.graph.toolchain.binutils.objdump) |tool|
+                tool.command
+            else
+                "llvm-objdump",
+        });
+        check.setCwd(.{ .cwd_relative = (b.root.toString(b.allocator) catch @panic("OOM")) });
+        const irq_check = b.addRunArtifact(proof_tool);
+        irq_check.addArgs(&.{ "irq", "--image" });
+        irq_check.addFileArg(link_output);
+        irq_check.addArgs(&.{
+            "--nm",
+            registered.graph.toolchain.binutils.nm.command,
+            "--objdump",
+            if (registered.graph.toolchain.binutils.objdump) |tool|
+                tool.command
+            else
+                "llvm-objdump",
+        });
+        irq_check.setCwd(.{ .cwd_relative = (b.root.toString(b.allocator) catch @panic("OOM")) });
+        const gate = b.addSystemCommand(&.{copy_command});
+        gate.step.dependOn(&check.step);
+        gate.step.dependOn(&irq_check.step);
+        if (nativeConfigEnabled(config, "CONFIG_LIBSTORVSC") or
+            nativeConfigEnabled(config, "CONFIG_LIBNETVSC"))
+        {
+            const driver_check = b.addRunArtifact(proof_tool);
+            driver_check.addArgs(&.{ "drivers", "--image" });
+            driver_check.addFileArg(link_output);
+            driver_check.addArgs(&.{
+                "--nm",
+                registered.graph.toolchain.binutils.nm.command,
+                "--objdump",
+                if (registered.graph.toolchain.binutils.objdump) |tool|
+                    tool.command
+                else
+                    "llvm-objdump",
+            });
+            if (nativeConfigEnabled(config, "CONFIG_LIBSTORVSC"))
+                driver_check.addArgs(&.{ "--require-driver", "storvsc" });
+            if (nativeConfigEnabled(config, "CONFIG_LIBNETVSC"))
+                driver_check.addArgs(&.{ "--require-driver", "netvsc" });
+            driver_check.setCwd(.{ .cwd_relative = (b.root.toString(b.allocator) catch @panic("OOM")) });
+            gate.step.dependOn(&driver_check.step);
+        }
+        gate.addFileArg(link_output);
+        validated_link_output =
+            gate.addOutputFileArg("hyperv-validated-final.dbg");
+    }
+    const final_reference = component_api.ArtifactReference{ .stage_output = .{
+        .platform = registered.graph.selectedPlatform().name,
+        .stage = stage_name,
+    } };
+    const post_plan = native_postprocess.planSelectedPlatform(
+        b.allocator,
+        registered.graph,
+        configQuery(config),
+        &.{.{
+            .reference = final_reference,
+            .logical_path = finalStageOutput(registered.graph, stage_name) orelse {
+                step.dependOn(&b.addFail(
+                    "native QEMU graph final-link output is not registered",
+                ).step);
+                return step;
+            },
+            .role = .debug,
+        }},
+    ) catch |err| {
+        step.dependOn(&b.addFail(b.fmt(
+            "unable to plan native post-processing: {s}",
+            .{@errorName(err)},
+        )).step);
+        return step;
+    };
+    const post = native_postprocess.execute(
+        b,
+        post_plan,
+        &.{validated_link_output},
+        .{
+            .strip = registered.graph.toolchain.binutils.objcopy.command,
+            .objcopy = registered.graph.toolchain.binutils.objcopy.command,
+            .objdump = if (registered.graph.toolchain.binutils.objdump) |tool|
+                tool.command
+            else
+                null,
+            .nm = registered.graph.toolchain.binutils.nm.command,
+            .readelf = forwardedCommand(options.forwarded, "READELF") orelse "llvm-readelf",
+        },
+        .{
+            .native_runner = b.addExecutable(.{
+                .name = "native-postprocess-runner",
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("support/build/native-postprocess-runner.zig"),
+                    .target = b.graph.host,
+                    .optimize = .safe,
+                }),
+            }),
+        },
+    ) catch |err| {
+        step.dependOn(&b.addFail(b.fmt(
+            "unable to execute native post-processing: {s}",
+            .{@errorName(err)},
+        )).step);
+        return step;
+    };
+
+    const linked_logical_path = finalStageOutput(
+        registered.graph,
+        stage_name,
+    ).?;
+    addPublishedOutput(
+        b,
+        step,
+        copy_command,
+        post.publicationPath(linked_logical_path, validated_link_output),
+        linked_logical_path,
+    );
+    for (post.outputs, 0..) |output, index| {
+        if (std.mem.eql(u8, output.logical_path, linked_logical_path)) continue;
+        var superseded = false;
+        for (post.outputs[index + 1 ..]) |later| {
+            if (std.mem.eql(u8, output.logical_path, later.logical_path)) {
+                superseded = true;
+                break;
+            }
+        }
+        if (!superseded) {
+            addPublishedOutput(b, step, copy_command, output.path, output.logical_path);
+        }
+    }
+    return step;
+}
+
+const NativeConfig = struct {
+    source: []const u8,
+};
+
+fn loadNativeConfig(b: *std.Build, path: []const u8) !*NativeConfig {
+    const source = try native_config_input.read(b, path);
+    const config = try b.allocator.create(NativeConfig);
+    config.* = .{ .source = source };
+    return config;
+}
+
+fn configQuery(config: *const NativeConfig) component_api.ConfigQuery {
+    return .{
+        .context = config,
+        .is_enabled_fn = nativeConfigEnabled,
+        .value_fn = nativeConfigValue,
+    };
+}
+
+fn nativeConfigEnabled(context_ptr: ?*const anyopaque, name: []const u8) bool {
+    const config: *const NativeConfig = @ptrCast(@alignCast(context_ptr.?));
+    const value = nativeConfigRawValue(config.source, name) orelse return false;
+    return std.mem.eql(u8, value, "y");
+}
+
+fn nativeConfigValue(context_ptr: ?*const anyopaque, name: []const u8) ?[]const u8 {
+    const config: *const NativeConfig = @ptrCast(@alignCast(context_ptr.?));
+    return nativeConfigRawValue(config.source, name);
+}
+
+fn nativeConfigRawValue(source: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        if (line.len <= name.len or !std.mem.startsWith(u8, line, name)) continue;
+        if (line[name.len] != '=') continue;
+        const value = line[name.len + 1 ..];
+        if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
+            return value[1 .. value.len - 1];
+        }
+        return value;
+    }
+    return null;
+}
+
+fn nativeProfileMatchesConfig(
+    profile: native_image_graph.Profile,
+    config: *const NativeConfig,
+) bool {
+    const architecture = nativeConfigValue(config, "CONFIG_UK_ARCH") orelse return false;
+    return switch (profile) {
+        .@"hyperv-x86_64-efi-wamr" => nativeProfileMatchesConfig(.@"hyperv-x86_64-efi", config) and
+            nativeConfigEnabled(config, "CONFIG_APPWAMRAOT") and
+            nativeConfigEnabled(config, "CONFIG_LIBUKVMEM") and
+            nativeConfigEnabled(config, "CONFIG_LIBUKPAGING_STATS") and
+            !nativeConfigEnabled(config, "CONFIG_LIBUKPAGING_5LEVEL") and
+            nativeConfigEnabled(config, "CONFIG_LIBUKFALLOCBUDDY") and
+            std.mem.eql(u8, nativeConfigValue(config, "CONFIG_UKPLAT_CPU_MAXCOUNT") orelse "", "1") and
+            !nativeConfigEnabled(config, "CONFIG_LIBNETVSC") and
+            !nativeConfigEnabled(config, "CONFIG_LIBSTORVSC") and
+            !nativeConfigEnabled(config, "CONFIG_APPHYPERVACCEPTANCE"),
+        .@"qemu-x86_64" => nativeConfigEnabled(config, "CONFIG_PLAT_KVM") and
+            std.mem.eql(u8, architecture, "x86_64") and
+            nativeConfigEnabled(config, "CONFIG_KVM_BOOT_PROTO_MULTIBOOT"),
+        .@"qemu-arm64" => nativeConfigEnabled(config, "CONFIG_PLAT_KVM") and
+            std.mem.eql(u8, architecture, "arm64") and
+            nativeConfigEnabled(config, "CONFIG_KVM_BOOT_PROTO_LXBOOT"),
+        .@"hyperv-x86_64-efi" => nativeConfigEnabled(config, "CONFIG_PLAT_HYPERV") and
+            std.mem.eql(u8, architecture, "x86_64") and
+            nativeConfigEnabled(config, "CONFIG_OPTIMIZE_PIE") and
+            nativeConfigEnabled(config, "CONFIG_LIBUKPAGING"),
+        .@"hyperv-x86_64-efi-netvsc" => nativeConfigEnabled(config, "CONFIG_PLAT_HYPERV") and
+            std.mem.eql(u8, architecture, "x86_64") and
+            nativeConfigEnabled(config, "CONFIG_OPTIMIZE_PIE") and
+            nativeConfigEnabled(config, "CONFIG_LIBUKPAGING") and
+            nativeConfigEnabled(config, "CONFIG_LIBUKNETDEV") and
+            nativeConfigEnabled(config, "CONFIG_LIBNETVSC"),
+    };
+}
+
+fn nativePathBindings(
+    b: *std.Build,
+    graph: component_api.FinalizedGraph,
+    target_objects: native_target_object.Execution,
+) []const native_library_link.PathBinding {
+    var bindings = std.array_list.Managed(native_library_link.PathBinding).init(b.allocator);
+    for (graph.libraries, 0..) |library, library_index| {
+        if (!graph.libraryIsActive(library_index)) continue;
+        const pipeline = library.object_pipeline orelse continue;
+        for (pipeline.partial_link_sequence) |item| {
+            const artifact = switch (item) {
+                .artifact => |artifact| artifact.artifact,
+                else => continue,
+            };
+            const path = switch (artifact) {
+                .component_output => |output| output.path,
+                .generated_output => |output| output,
+                else => continue,
+            };
+            var duplicate = false;
+            for (bindings.items) |binding| {
+                if (std.mem.eql(u8, binding.logical_path, path)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                var lazy_path = std.Build.LazyPath{ .cwd_relative = path };
+                for (target_objects.outputs) |target_object| {
+                    if (std.mem.eql(u8, target_object.logical_path, path)) {
+                        lazy_path = target_object.lazy_path;
+                        break;
+                    }
+                }
+                bindings.append(.{
+                    .logical_path = path,
+                    .lazy_path = lazy_path,
+                }) catch @panic("out of memory");
+            }
+        }
+    }
+    return bindings.toOwnedSlice() catch @panic("out of memory");
+}
+
+fn finalStageOutput(
+    graph: component_api.FinalizedGraph,
+    stage_name: []const u8,
+) ?[]const u8 {
+    for (graph.selectedPlatform().link_stages) |stage| {
+        if (std.mem.eql(u8, stage.name, stage_name)) return stage.output;
+    }
+    return null;
+}
+
+fn addPublishedOutput(
+    b: *std.Build,
+    parent: *std.Build.Step,
+    copy_command: []const u8,
+    source: std.Build.LazyPath,
+    destination: []const u8,
+) void {
+    const copy = b.addSystemCommand(&.{copy_command});
+    copy.setName(b.fmt("publish native output {s}", .{std.fs.path.basename(destination)}));
+    copy.addFileArg(source);
+    copy.addArg(destination);
+    parent.dependOn(&copy.step);
+}
+
+test "native profiles require matching architecture and boot protocol" {
+    const x86 = NativeConfig{ .source =
+        \\CONFIG_UK_ARCH="x86_64"
+        \\CONFIG_PLAT_KVM=y
+        \\CONFIG_KVM_BOOT_PROTO_MULTIBOOT=y
+        \\
+    };
+    const arm64 = NativeConfig{ .source =
+        \\CONFIG_UK_ARCH="arm64"
+        \\CONFIG_PLAT_KVM=y
+        \\CONFIG_KVM_BOOT_PROTO_LXBOOT=y
+        \\
+    };
+    const hyperv = NativeConfig{ .source =
+        \\CONFIG_UK_ARCH="x86_64"
+        \\CONFIG_PLAT_HYPERV=y
+        \\CONFIG_OPTIMIZE_PIE=y
+        \\CONFIG_LIBUKPAGING=y
+        \\
+    };
+    const hyperv_netvsc = NativeConfig{ .source =
+        \\CONFIG_UK_ARCH="x86_64"
+        \\CONFIG_PLAT_HYPERV=y
+        \\CONFIG_OPTIMIZE_PIE=y
+        \\CONFIG_LIBUKPAGING=y
+        \\CONFIG_LIBUKNETDEV=y
+        \\CONFIG_LIBNETVSC=y
+        \\
+    };
+    try std.testing.expect(nativeProfileMatchesConfig(.@"qemu-x86_64", &x86));
+    try std.testing.expect(!nativeProfileMatchesConfig(.@"qemu-arm64", &x86));
+    try std.testing.expect(nativeProfileMatchesConfig(.@"qemu-arm64", &arm64));
+    try std.testing.expect(!nativeProfileMatchesConfig(.@"qemu-x86_64", &arm64));
+    try std.testing.expect(nativeProfileMatchesConfig(.@"hyperv-x86_64-efi", &hyperv));
+    try std.testing.expect(!nativeProfileMatchesConfig(.@"hyperv-x86_64-efi-netvsc", &hyperv));
+    try std.testing.expect(nativeProfileMatchesConfig(.@"hyperv-x86_64-efi-netvsc", &hyperv_netvsc));
+    try std.testing.expect(!nativeProfileMatchesConfig(.@"hyperv-x86_64-efi", &x86));
+}
+
+test "LTO mode detection from solved config" {
+    const lto_config = NativeConfig{ .source =
+        \\CONFIG_UK_ARCH="x86_64"
+        \\CONFIG_PLAT_KVM=y
+        \\CONFIG_KVM_BOOT_PROTO_MULTIBOOT=y
+        \\CONFIG_OPTIMIZE_LTO=y
+        \\CONFIG_OPTIMIZE_PERF=y
+        \\
+    };
+    const cq = configQuery(&lto_config);
+    try std.testing.expectEqual(native_lto.LinkMode.lto, native_lto.LinkMode.detect(cq));
+    try std.testing.expectEqual(native_lto.OptLevel.perf, native_lto.OptLevel.detect(cq));
+
+    const standard_config = NativeConfig{ .source =
+        \\CONFIG_UK_ARCH="x86_64"
+        \\CONFIG_PLAT_KVM=y
+        \\CONFIG_KVM_BOOT_PROTO_MULTIBOOT=y
+        \\CONFIG_OPTIMIZE_PERF=y
+        \\
+    };
+    const sq = configQuery(&standard_config);
+    try std.testing.expectEqual(native_lto.LinkMode.standard, native_lto.LinkMode.detect(sq));
+}
+
+test "native WAMR profile requires initialized-capable VM and a single CPU" {
+    const wamr_config = NativeConfig{ .source =
+        \\CONFIG_UK_ARCH="x86_64"
+        \\CONFIG_PLAT_HYPERV=y
+        \\CONFIG_OPTIMIZE_PIE=y
+        \\CONFIG_LIBUKPAGING=y
+        \\CONFIG_APPWAMRAOT=y
+        \\CONFIG_LIBUKVMEM=y
+        \\CONFIG_LIBUKPAGING_STATS=y
+        \\CONFIG_LIBUKFALLOCBUDDY=y
+        \\CONFIG_UKPLAT_CPU_MAXCOUNT=1
+        \\
+    };
+    try std.testing.expect(nativeProfileMatchesConfig(.@"hyperv-x86_64-efi-wamr", &wamr_config));
+    for ([_][]const u8{
+        "CONFIG_LIBUKVMEM=y",        "CONFIG_LIBUKPAGING_STATS=y",
+        "CONFIG_LIBUKFALLOCBUDDY=y", "CONFIG_UKPLAT_CPU_MAXCOUNT=1",
+        "CONFIG_APPWAMRAOT=y",
+    }) |setting| {
+        const changed = try std.mem.replaceOwned(u8, std.testing.allocator, wamr_config.source, setting, "");
+        defer std.testing.allocator.free(changed);
+        const missing = NativeConfig{ .source = changed };
+        try std.testing.expect(!nativeProfileMatchesConfig(.@"hyperv-x86_64-efi-wamr", &missing));
+    }
+}
+
+test "LTO rejects ARM64 profile" {
+    try native_lto.requireLtoProfile(.@"qemu-x86_64");
+    try std.testing.expectError(
+        error.UnsupportedLtoProfile,
+        native_lto.requireLtoProfile(.@"qemu-arm64"),
+    );
+}
+
+fn addFailedTargets(b: *std.Build, message: []const u8) void {
+    const fail = b.addFail(message);
+    for (targets) |target| {
+        const step = b.step(target.name, target.description);
+        step.dependOn(&fail.step);
+        if (std.mem.eql(u8, target.name, "all")) {
+            b.default_step = step;
+        }
+    }
+    const native_targets = [_]struct {
+        name: []const u8,
+        description: []const u8,
+    }{
+        .{
+            .name = "config-inspect",
+            .description = "Parse configuration and print the native architecture/platform selection",
+        },
+        .{
+            .name = "config-validate",
+            .description = "Validate typed configuration values and target selection without solving Kconfig",
+        },
+        .{
+            .name = "config-header",
+            .description = "Generate include/uk/bits/config.h directly from an existing solved .config",
+        },
+        .{
+            .name = "native-link-graph",
+            .description = "Register the native hello-world QEMU link graph without executing it",
+        },
+        .{
+            .name = "native-images",
+            .description = "Build QEMU images with Zig-owned native link and post-processing stages",
+        },
+    };
+    for (native_targets) |target| {
+        b.step(target.name, target.description).dependOn(&fail.step);
+    }
+}
+
+fn resolveOptionalPath(
+    b: *std.Build,
+    root: []const u8,
+    name: []const u8,
+    description: []const u8,
+) ?[]const u8 {
+    const value = b.option([]const u8, name, description) orelse return null;
+    return resolvePath(b.allocator, root, value);
+}
+
+fn resolvePath(allocator: std.mem.Allocator, root: []const u8, path: []const u8) []const u8 {
+    return std.fs.path.resolve(allocator, &.{ root, path }) catch @panic("out of memory");
+}
+
+fn resolvePathList(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    paths: ?[]const []const u8,
+) ?[]const u8 {
+    const values = paths orelse return null;
+    if (values.len == 0) return null;
+
+    var resolved = std.array_list.Managed([]const u8).init(allocator);
+    defer resolved.deinit();
+    defer for (resolved.items) |path| allocator.free(path);
+    for (values) |path| {
+        resolved.append(resolvePath(allocator, root, path)) catch @panic("out of memory");
+    }
+
+    return std.mem.join(allocator, ":", resolved.items) catch @panic("out of memory");
+}
+
+fn joinPathList(
+    allocator: std.mem.Allocator,
+    paths: []const []const u8,
+) ?[]const u8 {
+    if (paths.len == 0) return null;
+    return std.mem.join(allocator, ":", paths) catch @panic("out of memory");
+}
+
+fn canonicalizeMakePaths(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: *MakeOptions,
+) !void {
+    options.app = (try facade_paths.canonicalizeNearestExisting(
+        allocator,
+        io,
+        options.app,
+    )).path;
+    if (options.config) |config| {
+        options.config = (try facade_paths.canonicalizeNearestExisting(
+            allocator,
+            io,
+            config,
+        )).path;
+    }
+    options.external_libraries = try canonicalizePathList(
+        allocator,
+        io,
+        options.external_libraries,
+    );
+    options.external_platforms = try canonicalizePathList(
+        allocator,
+        io,
+        options.external_platforms,
+    );
+    options.exclusions = try canonicalizePathList(
+        allocator,
+        io,
+        options.exclusions,
+    );
+}
+
+fn canonicalizePathList(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    value: ?[]const u8,
+) !?[]const u8 {
+    const paths = value orelse return null;
+    var canonical = std.array_list.Managed([]const u8).init(allocator);
+    defer canonical.deinit();
+    var iterator = std.mem.splitScalar(u8, paths, ':');
+    while (iterator.next()) |path| {
+        try canonical.append((try facade_paths.canonicalizeNearestExisting(
+            allocator,
+            io,
+            path,
+        )).path);
+    }
+    return try std.mem.join(allocator, ":", canonical.items);
+}
+
+fn isDestructiveTarget(name: []const u8) bool {
+    return std.mem.eql(u8, name, "clean-libs") or
+        std.mem.eql(u8, name, "clean") or
+        std.mem.eql(u8, name, "properclean") or
+        std.mem.eql(u8, name, "distclean");
+}
+
+fn validatePaths(
+    b: *std.Build,
+    repository: []const u8,
+    options: MakeOptions,
+    output: facade_paths.CanonicalPath,
+) ?[]const u8 {
+    if (findUnsafeValue(options)) |value| {
+        return b.fmt(
+            "invalid {s} value: byte 0x{x:0>2} is outside the facade's conservative Make-safe character allowlist",
+            .{ value.name, value.byte },
+        );
+    }
+
+    validateOutputTarget(
+        b.allocator,
+        b.graph.io,
+        repository,
+        options.app,
+        output,
+    ) catch |err| {
+        const protected_name = switch (err) {
+            error.ProtectsRepository => "Unikraft repository",
+            error.ProtectsApplication => "application",
+            error.ExistingSourceDirectory => "existing source directory",
+            error.ExistingUndedicatedDirectory => "existing directory without a Unikraft build marker",
+            error.NotDirectory => "non-directory path",
+            else => return b.fmt(
+                "unable to validate canonical output '{s}': {s}",
+                .{ output.path, @errorName(err) },
+            ),
+        };
+        return b.fmt(
+            "unsafe -Doutput '{s}': canonical target is an {s} and properclean deletes it recursively; use a new dedicated path such as '{s}{s}build'",
+            .{ options.output, protected_name, options.app, std.fs.path.sep_str },
+        );
+    };
+    return null;
+}
+
+const UnsafeValue = struct {
+    name: []const u8,
+    byte: u8,
+};
+
+fn findUnsafeValue(options: MakeOptions) ?UnsafeValue {
+    const paths = [_]struct {
+        name: []const u8,
+        value: ?[]const u8,
+        allow_colon: bool,
+    }{
+        .{ .name = "A", .value = options.app, .allow_colon = false },
+        .{ .name = "O", .value = options.output, .allow_colon = false },
+        .{ .name = "C", .value = options.config, .allow_colon = false },
+        .{ .name = "L", .value = options.external_libraries, .allow_colon = true },
+        .{ .name = "P", .value = options.external_platforms, .allow_colon = true },
+        .{ .name = "E", .value = options.exclusions, .allow_colon = true },
+        .{ .name = "APPWAMRAOT_TOOL", .value = options.wamr_aot_tool, .allow_colon = false },
+    };
+    for (paths) |path| {
+        const value = path.value orelse continue;
+        if (firstUnsafePathByte(value, path.allow_colon)) |byte| {
+            return .{ .name = path.name, .byte = byte };
+        }
+    }
+
+    if (options.image_name) |value| {
+        if (firstUnsafeNameByte(value)) |byte| {
+            return .{ .name = "N", .byte = byte };
+        }
+    }
+    if (firstUnsafePathByte(options.command, false)) |byte| {
+        return .{ .name = "make-command", .byte = byte };
+    }
+
+    const commands = [_]struct {
+        name: []const u8,
+        value: ?[]const u8,
+    }{
+        .{ .name = "CROSS_COMPILE", .value = options.cross_compile },
+        .{ .name = "COMPILER", .value = options.compiler },
+        .{ .name = "LINKER", .value = options.linker },
+        .{ .name = "PARTIAL_LINKER", .value = options.partial_linker },
+        .{ .name = "HOSTCC", .value = options.host_cc },
+        .{ .name = "HOSTCXX", .value = options.host_cxx },
+        .{ .name = "HOSTCFLAGS", .value = options.host_cflags },
+    };
+    for (commands) |command| {
+        const value = command.value orelse continue;
+        if (firstUnsafeCommandByte(value)) |byte| {
+            return .{ .name = command.name, .byte = byte };
+        }
+    }
+    return null;
+}
+
+fn firstUnsafePathByte(value: []const u8, allow_colon: bool) ?u8 {
+    for (value) |byte| {
+        if (std.ascii.isAlphanumeric(byte)) continue;
+        if (std.mem.indexOfScalar(u8, "/._-+@", byte) != null) continue;
+        if (allow_colon and byte == ':') continue;
+        return byte;
+    }
+    return null;
+}
+
+fn firstUnsafeNameByte(value: []const u8) ?u8 {
+    for (value) |byte| {
+        if (std.ascii.isAlphanumeric(byte)) continue;
+        if (std.mem.indexOfScalar(u8, "._-+@", byte) != null) continue;
+        return byte;
+    }
+    return null;
+}
+
+fn firstUnsafeCommandByte(value: []const u8) ?u8 {
+    for (value) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or byte == ' ') continue;
+        if (std.mem.indexOfScalar(u8, "/._-+@:,=", byte) != null) continue;
+        return byte;
+    }
+    return null;
+}
+
+fn validateOutputValue(value: []const u8) error{EmptyOutput}!void {
+    if (value.len == 0) return error.EmptyOutput;
+}
+
+fn validateOutputTarget(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repository: []const u8,
+    app: []const u8,
+    output: facade_paths.CanonicalPath,
+) !void {
+    if (facade_paths.isSameOrAncestor(output.path, repository)) return error.ProtectsRepository;
+    if (facade_paths.isSameOrAncestor(output.path, app)) return error.ProtectsApplication;
+    if (!output.exists) return;
+
+    const stat = try std.Io.Dir.cwd().statFile(io, output.path, .{});
+    if (stat.kind != .directory) return error.NotDirectory;
+
+    const app_build_lexical = try std.fs.path.join(allocator, &.{ app, "build" });
+    defer allocator.free(app_build_lexical);
+    const app_build = try facade_paths.canonicalizeNearestExisting(
+        allocator,
+        io,
+        app_build_lexical,
+    );
+    defer allocator.free(app_build.path);
+    const repository_build_lexical = try std.fs.path.join(allocator, &.{ repository, "build" });
+    defer allocator.free(repository_build_lexical);
+    const repository_build = try facade_paths.canonicalizeNearestExisting(
+        allocator,
+        io,
+        repository_build_lexical,
+    );
+    defer allocator.free(repository_build.path);
+
+    const is_dedicated =
+        (std.mem.eql(u8, app_build.path, app_build_lexical) and
+            facade_paths.isSameOrAncestor(app_build.path, output.path)) or
+        (std.mem.eql(u8, repository_build.path, repository_build_lexical) and
+            facade_paths.isSameOrAncestor(repository_build.path, output.path)) or
+        facade_paths.hasBuildMarker(allocator, io, output.path);
+    if (is_dedicated) return;
+
+    if (facade_paths.isDescendant(repository, output.path) or
+        facade_paths.isDescendant(app, output.path))
+    {
+        return error.ExistingSourceDirectory;
+    }
+    return error.ExistingUndedicatedDirectory;
+}
+
+fn validateDistcleanConfig(
+    b: *std.Build,
+    app: []const u8,
+    config: []const u8,
+) ?[]const u8 {
+    const safe = distcleanConfigIsSafe(
+        b.allocator,
+        b.graph.io,
+        app,
+        config,
+    ) catch |err| {
+        return b.fmt(
+            "distclean refused: unable to canonicalize configuration deletion targets for '{s}': {s}",
+            .{ config, @errorName(err) },
+        );
+    };
+    if (!safe) {
+        return b.fmt(
+            "distclean refused: configuration '{s}' or its metadata resolves outside application '{s}'; use an in-application -Dconfig path or remove it manually",
+            .{ config, app },
+        );
+    }
+    return null;
+}
+
+fn distcleanConfigIsSafe(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    app: []const u8,
+    config: []const u8,
+) !bool {
+    const config_dir = std.fs.path.dirname(config) orelse {
+        return false;
+    };
+    const config_basename = std.fs.path.basename(config);
+    const deletion_targets = [_][]const u8{
+        config,
+        try allocator.print("{s}.old", .{config}),
+        try allocator.print("{s}{s}.{s}.tmp", .{ config_dir, std.fs.path.sep_str, config_basename }),
+        try allocator.print("{s}{s}.auto.deps", .{ config_dir, std.fs.path.sep_str }),
+    };
+    defer {
+        for (deletion_targets[1..]) |target| allocator.free(target);
+    }
+    for (deletion_targets) |target| {
+        const canonical = facade_paths.canonicalizeNearestExisting(
+            allocator,
+            io,
+            target,
+        ) catch |err| return err;
+        defer allocator.free(canonical.path);
+        if (!facade_paths.isDescendant(app, canonical.path)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn addMakeCommand(
+    b: *std.Build,
+    make_runner: *std.Build.Step.Compile,
+    output: []const u8,
+    root: []const u8,
+    target: []const u8,
+    options: MakeOptions,
+) *std.Build.Step.Run {
+    const argv = makeArguments(b.allocator, target, options);
+    const run = b.addRunArtifact(make_runner);
+    run.addArg(output);
+    run.addArgs(argv);
+    run.setCwd(.{ .cwd_relative = root });
+    return run;
+}
+
+fn makeArguments(
+    allocator: std.mem.Allocator,
+    target: []const u8,
+    options: MakeOptions,
+) []const []const u8 {
+    var argv = std.array_list.Managed([]const u8).init(allocator);
+    argv.append(options.command) catch @panic("out of memory");
+    argv.append("--no-print-directory") catch @panic("out of memory");
+    argv.append(target) catch @panic("out of memory");
+
+    appendAssignment(allocator, &argv, "A", options.app);
+    appendAssignment(allocator, &argv, "O", options.output);
+    appendOptionalAssignment(allocator, &argv, "C", options.config);
+    appendOptionalAssignment(allocator, &argv, "N", options.image_name);
+    appendOptionalAssignment(
+        allocator,
+        &argv,
+        "APPWAMRAOT_TOOL",
+        options.wamr_aot_tool,
+    );
+    appendOptionalAssignment(allocator, &argv, "L", options.external_libraries);
+    appendOptionalAssignment(allocator, &argv, "P", options.external_platforms);
+    appendOptionalAssignment(allocator, &argv, "E", options.exclusions);
+
+    if (options.verbosity) |value| {
+        appendAssignment(allocator, &argv, "V", @tagName(value));
+    }
+    appendOptionalAssignment(allocator, &argv, "CROSS_COMPILE", options.cross_compile);
+    appendOptionalAssignment(allocator, &argv, "COMPILER", options.compiler);
+    appendOptionalAssignment(allocator, &argv, "LINKER", options.linker);
+    appendOptionalAssignment(allocator, &argv, "PARTIAL_LINKER", options.partial_linker);
+    if (options.partial_linker_type) |value| {
+        appendAssignment(allocator, &argv, "PARTIAL_LINKER_TYPE", @tagName(value));
+    }
+    if (options.compiler_targeted) |value| {
+        appendAssignment(allocator, &argv, "COMPILER_TARGETED", if (value) "y" else "n");
+    }
+    appendOptionalAssignment(allocator, &argv, "HOSTCC", options.host_cc);
+    appendOptionalAssignment(allocator, &argv, "HOSTCXX", options.host_cxx);
+    appendOptionalAssignment(allocator, &argv, "HOSTCFLAGS", options.host_cflags);
+    if (options.ci_portable_config)
+        appendAssignment(allocator, &argv, "WAMR_CI_PORTABLE_CONFIG", "1");
+
+    for (options.forwarded) |assignment| {
+        argv.append(assignment) catch @panic("out of memory");
+    }
+    if (options.native_environment) |environment| {
+        const assignments = environment.assignments(allocator) catch @panic("out of memory");
+        argv.appendSlice(&assignments) catch @panic("out of memory");
+    }
+    return argv.toOwnedSlice() catch @panic("out of memory");
+}
+
+fn appendOptionalAssignment(
+    allocator: std.mem.Allocator,
+    argv: *std.array_list.Managed([]const u8),
+    name: []const u8,
+    value: ?[]const u8,
+) void {
+    appendAssignment(allocator, argv, name, value orelse return);
+}
+
+fn appendAssignment(
+    allocator: std.mem.Allocator,
+    argv: *std.array_list.Managed([]const u8),
+    name: []const u8,
+    value: []const u8,
+) void {
+    argv.append(allocator.print("{s}={s}", .{ name, value }) catch @panic("out of memory")) catch
+        @panic("out of memory");
+}
+
+fn validateForwardedAssignment(assignment: []const u8) error{InvalidAssignment}!void {
+    const separator = std.mem.indexOfScalar(u8, assignment, '=') orelse return error.InvalidAssignment;
+    const name = assignment[0..separator];
+    if (name.len == 0 or !isMakeNameStart(name[0])) return error.InvalidAssignment;
+    for (name[1..]) |character| {
+        if (!isMakeNameContinue(character)) return error.InvalidAssignment;
+    }
+    if (!isAllowedAssignment(name)) return error.InvalidAssignment;
+    if (firstUnsafeCommandByte(assignment[separator + 1 ..]) != null) return error.InvalidAssignment;
+}
+
+fn forwardedCommand(
+    assignments: []const []const u8,
+    name: []const u8,
+) ?[]const u8 {
+    var result: ?[]const u8 = null;
+    for (assignments) |assignment| {
+        const separator = std.mem.indexOfScalar(u8, assignment, '=') orelse
+            continue;
+        if (!std.mem.eql(u8, assignment[0..separator], name)) continue;
+        const value = assignment[separator + 1 ..];
+        const end = std.mem.indexOfScalar(u8, value, ' ') orelse value.len;
+        if (end != 0) result = value[0..end];
+    }
+    return result;
+}
+
+fn isMakeNameStart(character: u8) bool {
+    return std.ascii.isAlphabetic(character) or character == '_';
+}
+
+fn isMakeNameContinue(character: u8) bool {
+    return isMakeNameStart(character) or std.ascii.isDigit(character);
+}
+
+fn isAllowedAssignment(name: []const u8) bool {
+    const allowed = [_][]const u8{
+        "ARCH",
+        "LLVM_TARGET_ARCH",
+        "AR",
+        "CP",
+        "MKDIR",
+        "PYTHON",
+        "READLINK",
+        "ZIG",
+        "YACC",
+        "LEX",
+        "RANLIB",
+        "NM",
+        "READELF",
+        "STRIP",
+        "OBJCOPY",
+        "OBJDUMP",
+        "DTC",
+        "HOSTAR",
+        "HOSTAS",
+        "HOSTCPP",
+        "HOSTLD",
+        "HOSTLN",
+        "HOSTNM",
+        "HOSTOBJCOPY",
+        "HOSTRANLIB",
+        "HOSTOSENV",
+        "KCONFIG_OVERWRITECONFIG",
+        "WGET",
+        "WGET_VERSION",
+        "UK_ASFLAGS",
+        "UK_CFLAGS",
+        "UK_CXXFLAGS",
+        "UK_GOCFLAGS",
+        "UK_LDFLAGS",
+    };
+    for (allowed) |candidate| {
+        if (std.mem.eql(u8, name, candidate)) return true;
+    }
+    return false;
+}
+
+test "native Make environment keeps ordinary forwarding restrictions" {
+    _ = native_make_environment;
+    for ([_][]const u8{
+        "UMASK=0077",         "SHELL=/native/bash",  "CONFIG_SHELL=/native/bash",
+        "HOME=/private/home", "TMPDIR=/private/tmp", "LD_PRELOAD=/native/library",
+    }) |assignment| {
+        try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment(assignment));
+    }
+}
+
+test "Make assignments remain single arguments" {
+    var options = MakeOptions{
+        .command = "gmake",
+        .app = "/workspace/app",
+        .output = "/workspace/output",
+        .config = "/workspace/configs/test",
+        .image_name = "hello",
+        .wamr_aot_tool = "/workspace/bin/uk-wamr-aot-build",
+        .external_libraries = "/workspace/lib-one:/workspace/lib-two",
+        .external_platforms = null,
+        .exclusions = null,
+        .verbosity = .@"2",
+        .cross_compile = null,
+        .compiler = "zig cc -target x86_64-freestanding-none",
+        .linker = null,
+        .partial_linker = "zig ld.lld",
+        .partial_linker_type = .raw,
+        .compiler_targeted = true,
+        .host_cc = "zig cc",
+        .host_cxx = "zig c++",
+        .host_cflags = "-fno-sanitize=null",
+        .forwarded = &.{"AR=zig ar"},
+    };
+    const actual = makeArguments(std.testing.allocator, "images", options);
+    defer {
+        for (actual[3 .. actual.len - 1]) |argument| std.testing.allocator.free(argument);
+        std.testing.allocator.free(actual);
+    }
+
+    const expected = [_][]const u8{
+        "gmake",
+        "--no-print-directory",
+        "images",
+        "A=/workspace/app",
+        "O=/workspace/output",
+        "C=/workspace/configs/test",
+        "N=hello",
+        "APPWAMRAOT_TOOL=/workspace/bin/uk-wamr-aot-build",
+        "L=/workspace/lib-one:/workspace/lib-two",
+        "V=2",
+        "COMPILER=zig cc -target x86_64-freestanding-none",
+        "PARTIAL_LINKER=zig ld.lld",
+        "PARTIAL_LINKER_TYPE=raw",
+        "COMPILER_TARGETED=y",
+        "HOSTCC=zig cc",
+        "HOSTCXX=zig c++",
+        "HOSTCFLAGS=-fno-sanitize=null",
+        "AR=zig ar",
+    };
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |expected_argument, actual_argument| {
+        try std.testing.expectEqualStrings(expected_argument, actual_argument);
+    }
+    options.ci_portable_config = true;
+    var portable_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer portable_arena.deinit();
+    const portable = makeArguments(portable_arena.allocator(), "images", options);
+    try std.testing.expectEqual(actual.len + 1, portable.len);
+    try std.testing.expectEqualStrings("WAMR_CI_PORTABLE_CONFIG=1", portable[portable.len - 2]);
+    options.ci_portable_config = false;
+    options.native_environment = .{
+        .bison_data = "/native/share/bison",
+        .m4 = "/native/bin/m4",
+        .schema = .unikraft_native_make_environment_v1,
+        .shell = "/native/bin/bash",
+        .tmp = "/private/tmp",
+        .xdg_cache = "/private/cache",
+        .xdg_config = "/private/config",
+        .zig_global_cache = "/private/zig-global",
+        .zig_local_cache = "/private/zig-local",
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const native_arguments = makeArguments(arena.allocator(), "images", options);
+    try std.testing.expectEqual(actual.len + 10, native_arguments.len);
+    for (actual, native_arguments[0..actual.len]) |want, argument|
+        try std.testing.expectEqualStrings(want, argument);
+    try std.testing.expectEqualStrings("UMASK=0077", native_arguments[actual.len]);
+    try std.testing.expectEqualStrings("SHELL=/native/bin/bash", native_arguments[actual.len + 1]);
+    try std.testing.expectEqualStrings("ZIG_LOCAL_CACHE_DIR=/private/zig-local", native_arguments[native_arguments.len - 1]);
+}
+
+test "output path rejects repository and application deletion hazards" {
+    const repository = "/workspace/unikraft";
+    const app = "/workspace/apps/hello";
+
+    try std.testing.expectError(
+        error.ProtectsRepository,
+        validateOutputTarget(
+            std.testing.allocator,
+            std.testing.io,
+            repository,
+            app,
+            .{ .path = repository, .exists = true },
+        ),
+    );
+    try std.testing.expectError(
+        error.ProtectsRepository,
+        validateOutputTarget(
+            std.testing.allocator,
+            std.testing.io,
+            repository,
+            app,
+            .{ .path = "/workspace", .exists = true },
+        ),
+    );
+    try std.testing.expectError(
+        error.ProtectsApplication,
+        validateOutputTarget(
+            std.testing.allocator,
+            std.testing.io,
+            repository,
+            app,
+            .{ .path = app, .exists = true },
+        ),
+    );
+    try std.testing.expectError(
+        error.ProtectsApplication,
+        validateOutputTarget(
+            std.testing.allocator,
+            std.testing.io,
+            repository,
+            app,
+            .{ .path = "/workspace/apps", .exists = true },
+        ),
+    );
+
+    try validateOutputTarget(
+        std.testing.allocator,
+        std.testing.io,
+        repository,
+        app,
+        .{ .path = "/workspace/build", .exists = false },
+    );
+    try validateOutputTarget(
+        std.testing.allocator,
+        std.testing.io,
+        repository,
+        app,
+        .{ .path = "/workspace/unikraft/build", .exists = false },
+    );
+    try validateOutputTarget(
+        std.testing.allocator,
+        std.testing.io,
+        repository,
+        app,
+        .{ .path = "/workspace/apps/hello/build", .exists = false },
+    );
+}
+
+test "missing output defaults to a safe app build directory" {
+    const app = "/workspace/apps/hello";
+    const output = resolvePath(std.testing.allocator, app, "build");
+    defer std.testing.allocator.free(output);
+
+    try std.testing.expectEqualStrings("/workspace/apps/hello/build", output);
+    try validateOutputTarget(
+        std.testing.allocator,
+        std.testing.io,
+        "/workspace/unikraft",
+        app,
+        .{ .path = output, .exists = false },
+    );
+}
+
+test "dot and parent output values resolve to protected paths" {
+    const repository = "/workspace/unikraft";
+    const app = "/workspace/apps/hello";
+    const dot = resolvePath(std.testing.allocator, repository, ".");
+    defer std.testing.allocator.free(dot);
+    const parent = resolvePath(std.testing.allocator, repository, "..");
+    defer std.testing.allocator.free(parent);
+
+    try std.testing.expectError(
+        error.ProtectsRepository,
+        validateOutputTarget(
+            std.testing.allocator,
+            std.testing.io,
+            repository,
+            app,
+            .{ .path = dot, .exists = true },
+        ),
+    );
+    try std.testing.expectError(
+        error.ProtectsRepository,
+        validateOutputTarget(
+            std.testing.allocator,
+            std.testing.io,
+            repository,
+            app,
+            .{ .path = parent, .exists = true },
+        ),
+    );
+}
+
+test "canonical output rejects source directories and symlink aliases" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, "repo/lib");
+    try temporary.dir.createDirPath(std.testing.io, "repo/build");
+    try temporary.dir.createDirPath(std.testing.io, "app");
+    try temporary.dir.createDirPath(std.testing.io, "external");
+    try temporary.dir.symLink(std.testing.io, "repo/lib", "source-alias", .{ .is_directory = true });
+    try temporary.dir.symLink(std.testing.io, "../repo/lib", "app/build", .{ .is_directory = true });
+
+    const root = try testDirPath(std.testing.allocator, temporary.dir);
+    defer std.testing.allocator.free(root);
+    const repository = try std.fs.path.join(std.testing.allocator, &.{ root, "repo" });
+    defer std.testing.allocator.free(repository);
+    const app = try std.fs.path.join(std.testing.allocator, &.{ root, "app" });
+    defer std.testing.allocator.free(app);
+
+    const source_lexical = try std.fs.path.join(std.testing.allocator, &.{ repository, "lib" });
+    defer std.testing.allocator.free(source_lexical);
+    const source = try facade_paths.canonicalizeNearestExisting(
+        std.testing.allocator,
+        std.testing.io,
+        source_lexical,
+    );
+    defer std.testing.allocator.free(source.path);
+    try std.testing.expectError(
+        error.ExistingSourceDirectory,
+        validateOutputTarget(std.testing.allocator, std.testing.io, repository, app, source),
+    );
+
+    const alias_lexical = try std.fs.path.join(std.testing.allocator, &.{ root, "source-alias" });
+    defer std.testing.allocator.free(alias_lexical);
+    const alias = try facade_paths.canonicalizeNearestExisting(
+        std.testing.allocator,
+        std.testing.io,
+        alias_lexical,
+    );
+    defer std.testing.allocator.free(alias.path);
+    try std.testing.expectEqualStrings(source.path, alias.path);
+    try std.testing.expectError(
+        error.ExistingSourceDirectory,
+        validateOutputTarget(std.testing.allocator, std.testing.io, repository, app, alias),
+    );
+
+    const app_build_alias_lexical = try std.fs.path.join(std.testing.allocator, &.{ app, "build" });
+    defer std.testing.allocator.free(app_build_alias_lexical);
+    const app_build_alias = try facade_paths.canonicalizeNearestExisting(
+        std.testing.allocator,
+        std.testing.io,
+        app_build_alias_lexical,
+    );
+    defer std.testing.allocator.free(app_build_alias.path);
+    try std.testing.expectError(
+        error.ExistingSourceDirectory,
+        validateOutputTarget(std.testing.allocator, std.testing.io, repository, app, app_build_alias),
+    );
+
+    const build_lexical = try std.fs.path.join(std.testing.allocator, &.{ repository, "build" });
+    defer std.testing.allocator.free(build_lexical);
+    const build_output = try facade_paths.canonicalizeNearestExisting(
+        std.testing.allocator,
+        std.testing.io,
+        build_lexical,
+    );
+    defer std.testing.allocator.free(build_output.path);
+    try validateOutputTarget(
+        std.testing.allocator,
+        std.testing.io,
+        repository,
+        app,
+        build_output,
+    );
+
+    const external_lexical = try std.fs.path.join(std.testing.allocator, &.{ root, "external" });
+    defer std.testing.allocator.free(external_lexical);
+    const external = try facade_paths.canonicalizeNearestExisting(
+        std.testing.allocator,
+        std.testing.io,
+        external_lexical,
+    );
+    defer std.testing.allocator.free(external.path);
+    try std.testing.expectError(
+        error.ExistingUndedicatedDirectory,
+        validateOutputTarget(std.testing.allocator, std.testing.io, repository, app, external),
+    );
+}
+
+test "canonicalization follows symlinks through nearest existing ancestor" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, "real");
+    try temporary.dir.symLink(std.testing.io, "real", "alias", .{ .is_directory = true });
+
+    const root = try testDirPath(std.testing.allocator, temporary.dir);
+    defer std.testing.allocator.free(root);
+    const requested = try std.fs.path.join(std.testing.allocator, &.{ root, "alias/missing/build" });
+    defer std.testing.allocator.free(requested);
+    const expected = try std.fs.path.join(std.testing.allocator, &.{ root, "real/missing/build" });
+    defer std.testing.allocator.free(expected);
+    const canonical = try facade_paths.canonicalizeNearestExisting(
+        std.testing.allocator,
+        std.testing.io,
+        requested,
+    );
+    defer std.testing.allocator.free(canonical.path);
+
+    try std.testing.expect(!canonical.exists);
+    try std.testing.expectEqualStrings(expected, canonical.path);
+}
+
+test "Make path normalization preserves the single canonical output result" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, "app");
+
+    const root = try testDirPath(std.testing.allocator, temporary.dir);
+    defer std.testing.allocator.free(root);
+    const requested = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "app/build" },
+    );
+    defer std.testing.allocator.free(requested);
+    const canonical = try facade_paths.canonicalizeNearestExisting(
+        std.testing.allocator,
+        std.testing.io,
+        requested,
+    );
+    defer std.testing.allocator.free(canonical.path);
+    try std.testing.expect(!canonical.exists);
+
+    var options = testingMakeOptions();
+    const app_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root, "app" },
+    );
+    defer std.testing.allocator.free(app_path);
+    options.app = app_path;
+    options.output = canonical.path;
+    options.config = null;
+    options.external_libraries = null;
+    options.external_platforms = null;
+    options.exclusions = null;
+    const output_pointer = options.output.ptr;
+
+    try canonicalizeMakePaths(std.testing.allocator, std.testing.io, &options);
+    defer std.testing.allocator.free(options.app);
+    try std.testing.expectEqual(output_pointer, options.output.ptr);
+    try std.testing.expectEqualStrings(canonical.path, options.output);
+}
+
+test "distclean configuration targets stay inside the canonical app tree" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, "app");
+    try temporary.dir.createDirPath(std.testing.io, "external");
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "external/config",
+        .data = "CONFIG_TEST=y\n",
+    });
+
+    const root = try testDirPath(std.testing.allocator, temporary.dir);
+    defer std.testing.allocator.free(root);
+    const app = try std.fs.path.join(std.testing.allocator, &.{ root, "app" });
+    defer std.testing.allocator.free(app);
+    const normal_config = try std.fs.path.join(std.testing.allocator, &.{ app, ".config" });
+    defer std.testing.allocator.free(normal_config);
+    try std.testing.expect(try distcleanConfigIsSafe(
+        std.testing.allocator,
+        std.testing.io,
+        app,
+        normal_config,
+    ));
+
+    const external_config = try std.fs.path.join(std.testing.allocator, &.{ root, "external/config" });
+    defer std.testing.allocator.free(external_config);
+    try std.testing.expect(!try distcleanConfigIsSafe(
+        std.testing.allocator,
+        std.testing.io,
+        app,
+        external_config,
+    ));
+    try std.testing.expect(!try distcleanConfigIsSafe(
+        std.testing.allocator,
+        std.testing.io,
+        app,
+        "/etc/passwd",
+    ));
+
+    try temporary.dir.symLink(std.testing.io, "/etc/passwd", "app/.config", .{});
+    try std.testing.expect(!try distcleanConfigIsSafe(
+        std.testing.allocator,
+        std.testing.io,
+        app,
+        normal_config,
+    ));
+
+    try temporary.dir.deleteFile(std.testing.io, "app/.config");
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "app/.config",
+        .data = "CONFIG_TEST=y\n",
+    });
+    try temporary.dir.symLink(std.testing.io, "/etc/passwd", "app/.config.old", .{});
+    try std.testing.expect(!try distcleanConfigIsSafe(
+        std.testing.allocator,
+        std.testing.io,
+        app,
+        normal_config,
+    ));
+}
+
+test "empty output and unsafe facade values are rejected" {
+    try std.testing.expectError(error.EmptyOutput, validateOutputValue(""));
+    try validateOutputValue("/workspace/apps/hello/build");
+
+    const Field = enum { app, output, config, libraries, platforms, exclusions };
+    const cases = [_]struct {
+        field: Field,
+        make_name: []const u8,
+    }{
+        .{ .field = .app, .make_name = "A" },
+        .{ .field = .output, .make_name = "O" },
+        .{ .field = .config, .make_name = "C" },
+        .{ .field = .libraries, .make_name = "L" },
+        .{ .field = .platforms, .make_name = "P" },
+        .{ .field = .exclusions, .make_name = "E" },
+    };
+    for (cases) |case| {
+        var options = testingMakeOptions();
+        switch (case.field) {
+            .app => options.app = "/workspace/app path",
+            .output => options.output = "/workspace/output path",
+            .config => options.config = "/workspace/config path",
+            .libraries => options.external_libraries = "/workspace/library path",
+            .platforms => options.external_platforms = "/workspace/platform path",
+            .exclusions => options.exclusions = "/workspace/excluded path",
+        }
+        const invalid = findUnsafeValue(options).?;
+        try std.testing.expectEqualStrings(case.make_name, invalid.name);
+    }
+    try std.testing.expect(findUnsafeValue(testingMakeOptions()) == null);
+
+    var image_options = testingMakeOptions();
+    image_options.image_name = "image#comment";
+    try std.testing.expectEqualStrings("N", findUnsafeValue(image_options).?.name);
+
+    var command_options = testingMakeOptions();
+    command_options.command = "make;true";
+    try std.testing.expectEqualStrings("make-command", findUnsafeValue(command_options).?.name);
+
+    const CommandField = enum {
+        cross_compile,
+        compiler,
+        linker,
+        partial_linker,
+        host_cc,
+        host_cxx,
+        host_cflags,
+    };
+    const command_cases = [_]struct {
+        field: CommandField,
+        make_name: []const u8,
+    }{
+        .{ .field = .cross_compile, .make_name = "CROSS_COMPILE" },
+        .{ .field = .compiler, .make_name = "COMPILER" },
+        .{ .field = .linker, .make_name = "LINKER" },
+        .{ .field = .partial_linker, .make_name = "PARTIAL_LINKER" },
+        .{ .field = .host_cc, .make_name = "HOSTCC" },
+        .{ .field = .host_cxx, .make_name = "HOSTCXX" },
+        .{ .field = .host_cflags, .make_name = "HOSTCFLAGS" },
+    };
+    for (command_cases) |case| {
+        var options = testingMakeOptions();
+        switch (case.field) {
+            .cross_compile => options.cross_compile = "tool;true",
+            .compiler => options.compiler = "tool;true",
+            .linker => options.linker = "tool;true",
+            .partial_linker => options.partial_linker = "tool;true",
+            .host_cc => options.host_cc = "tool;true",
+            .host_cxx => options.host_cxx = "tool;true",
+            .host_cflags => options.host_cflags = "flag;true",
+        }
+        try std.testing.expectEqualStrings(case.make_name, findUnsafeValue(options).?.name);
+    }
+}
+
+test "Make and shell metacharacters are rejected conservatively" {
+    const unsafe_values = [_][]const u8{
+        "/d/victim;true",
+        "/d/victim$(true)",
+        "/d/victim`true`",
+        "/d/victim*",
+        "/d/victim#comment",
+        "/d/victim%pattern",
+        "/d/victim\"quoted",
+        "/d/victim'quoted",
+        "/d/victim\\escaped",
+        "/d/victim\nnext",
+        "/d/victim&next",
+        "/d/victim|next",
+        "/d/victim<next",
+        "/d/victim>next",
+    };
+    for (unsafe_values) |value| {
+        try std.testing.expect(firstUnsafePathByte(value, false) != null);
+        try std.testing.expect(firstUnsafeCommandByte(value) != null);
+    }
+
+    try std.testing.expect(firstUnsafePathByte("/d/safe-_.+@/name", false) == null);
+    try std.testing.expect(firstUnsafePathByte("/d/lib-one:/d/lib_two", true) == null);
+    try std.testing.expect(firstUnsafeNameByte("safe-_.+@name") == null);
+    try std.testing.expect(firstUnsafeCommandByte("zig cc -target x86_64-freestanding-none") == null);
+}
+
+test "path lists resolve from the repository root" {
+    const actual = resolvePathList(
+        std.testing.allocator,
+        "/workspace/unikraft",
+        &.{ "libs/lib-one", "/opt/platform" },
+    ).?;
+    defer std.testing.allocator.free(actual);
+
+    try std.testing.expectEqualStrings(
+        "/workspace/unikraft/libs/lib-one:/opt/platform",
+        actual,
+    );
+}
+
+test "forwarded Make assignments require allowlisted names" {
+    try validateForwardedAssignment("AR=zig ar");
+    try validateForwardedAssignment("CP=/native/bin/cp -f");
+    try validateForwardedAssignment("MKDIR=/native/bin/mkdir");
+    try validateForwardedAssignment("PYTHON=/native/bin/python3");
+    try validateForwardedAssignment("READLINK=/native/bin/readlink");
+    try validateForwardedAssignment("HOSTOSENV=Linux");
+    try validateForwardedAssignment("WGET_VERSION=unavailable");
+    try validateForwardedAssignment("WGET=false");
+    try validateForwardedAssignment("ZIG=/native/bin/zig");
+    try validateForwardedAssignment("YACC=/native/bin/bison");
+    try validateForwardedAssignment("LEX=/native/bin/flex");
+    try validateForwardedAssignment("KCONFIG_OVERWRITECONFIG=1");
+    try validateForwardedAssignment("UK_CFLAGS=-std=gnu17");
+    try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("not-an-assignment"));
+    try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("-j=8"));
+    try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("A=../app"));
+    try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("BUILD_DIR=/etc"));
+    try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("_O=/"));
+    try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("UK_CONFIG=/etc/passwd"));
+    try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("CONFIG_DIR=/etc"));
+    try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("C=/etc/passwd"));
+    try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("UK_CLEAN=/"));
+    try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("UK_LDEPS=/etc/passwd"));
+    try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("AR=zig ar;true"));
+    try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("UK_CFLAGS=$(shell true)"));
+    try std.testing.expectError(error.InvalidAssignment, validateForwardedAssignment("UK_LDFLAGS=-Wl,*"));
+}
+
+test "forwarded native commands select exact executables" {
+    const assignments = [_][]const u8{
+        "CP=/proc/100/fd/3 -f",
+        "ZIG=/proc/100/fd/4",
+        "NM=/proc/100/fd/5",
+    };
+    try std.testing.expectEqualStrings("/proc/100/fd/3", forwardedCommand(&assignments, "CP").?);
+    try std.testing.expectEqualStrings("/proc/100/fd/4", forwardedCommand(&assignments, "ZIG").?);
+    try std.testing.expectEqualStrings("/proc/100/fd/5", forwardedCommand(&assignments, "NM").?);
+    try std.testing.expect(forwardedCommand(&assignments, "STRIP") == null);
+}
+
+fn testingMakeOptions() MakeOptions {
+    return .{
+        .command = "make",
+        .app = "/workspace/apps/hello",
+        .output = "/workspace/apps/hello/build",
+        .config = "/workspace/apps/hello/.config",
+        .image_name = null,
+        .wamr_aot_tool = null,
+        .external_libraries = "/workspace/libs",
+        .external_platforms = "/workspace/platforms",
+        .exclusions = "/workspace/excluded",
+        .verbosity = null,
+        .cross_compile = null,
+        .compiler = null,
+        .linker = null,
+        .partial_linker = null,
+        .partial_linker_type = null,
+        .compiler_targeted = null,
+        .host_cc = null,
+        .host_cxx = null,
+        .host_cflags = null,
+        .forwarded = &.{},
+    };
+}
+
+fn testDirPath(allocator: std.mem.Allocator, directory: std.Io.Dir) ![]u8 {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const length = try directory.realPath(std.testing.io, &buffer);
+    return allocator.dupe(u8, buffer[0..length]);
+}

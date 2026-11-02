@@ -44,10 +44,106 @@
 #include <uk/syscall.h>
 #include <uk/wait.h>
 #include <uk/pcpuvar.h>
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+#include <uk/plat/spinlock.h>
+#include <uk/sched/fixed.h>
+#endif
 
 struct uk_sched *uk_sched_head;
 
 __uk_pcpuvar struct uk_thread *__uk_sched_thread_current;
+
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+static struct uk_sched *uk_sched_lcpu_map[CONFIG_UKPLAT_CPU_MAXCOUNT];
+
+int uk_sched_bind_lcpu(struct uk_sched *s, unsigned int lcpu_idx)
+{
+	struct uk_sched *existing;
+
+	if (lcpu_idx >= CONFIG_UKPLAT_CPU_MAXCOUNT)
+		return -ERANGE;
+	existing = __atomic_load_n(&uk_sched_lcpu_map[lcpu_idx],
+				   __ATOMIC_ACQUIRE);
+	if (existing && existing != s)
+		return -EEXIST;
+
+	s->lcpu_idx = lcpu_idx;
+	__atomic_store_n(&uk_sched_lcpu_map[lcpu_idx], s, __ATOMIC_RELEASE);
+	return 0;
+}
+
+void uk_sched_unbind_lcpu(struct uk_sched *s)
+{
+	struct uk_sched **link;
+
+	if (s->lcpu_idx < CONFIG_UKPLAT_CPU_MAXCOUNT &&
+	    __atomic_load_n(&uk_sched_lcpu_map[s->lcpu_idx],
+			    __ATOMIC_ACQUIRE) == s)
+		__atomic_store_n(&uk_sched_lcpu_map[s->lcpu_idx], NULL,
+				 __ATOMIC_RELEASE);
+
+	for (link = &uk_sched_head; *link; link = &(*link)->next) {
+		if (*link == s) {
+			*link = s->next;
+			s->next = NULL;
+			break;
+		}
+	}
+}
+
+struct uk_sched *uk_sched_get_lcpu(unsigned int lcpu_idx)
+{
+	if (lcpu_idx >= CONFIG_UKPLAT_CPU_MAXCOUNT)
+		return NULL;
+	return __atomic_load_n(&uk_sched_lcpu_map[lcpu_idx],
+			       __ATOMIC_ACQUIRE);
+}
+
+unsigned int uk_sched_lcpu(const struct uk_sched *s)
+{
+	return s->lcpu_idx;
+}
+
+__isr unsigned int uk_sched_state(const struct uk_sched *s)
+{
+	return __atomic_load_n(&s->state, __ATOMIC_ACQUIRE);
+}
+
+void uk_sched_set_state(struct uk_sched *s, unsigned int state)
+{
+	__atomic_store_n(&s->state, state, __ATOMIC_RELEASE);
+}
+
+__isr int uk_sched_kick(struct uk_sched *s)
+{
+	int rc;
+
+	if (s->lcpu_idx ==
+	    uk_pcpuvar_current_get(uk_pcpuvar_cpu_idx))
+		return 0;
+	if (uk_sched_state(s) != UK_SCHED_ONLINE)
+		return -EHOSTDOWN;
+
+	rc = uk_lcpu_wakeup_one(s->lcpu_idx);
+	__atomic_store_n(&s->kick_error, rc, __ATOMIC_RELEASE);
+	return rc;
+}
+
+static int uk_sched_kick_once(void *arg)
+{
+	return uk_sched_kick(arg);
+}
+
+int uk_sched_kick_retry(struct uk_sched *s, unsigned int attempts)
+{
+	return uk_sched_kick_bounded(uk_sched_kick_once, s, attempts);
+}
+
+int uk_sched_last_kick_error(const struct uk_sched *s)
+{
+	return __atomic_load_n(&s->kick_error, __ATOMIC_ACQUIRE);
+}
+#endif
 
 int uk_sched_register(struct uk_sched *s)
 {
@@ -200,32 +296,20 @@ err_out:
 	return NULL;
 }
 
-int uk_sched_start(struct uk_sched *s)
+static int _uk_sched_start(struct uk_sched *s,
+			   struct uk_thread *main_thread)
 {
-	struct uk_thread *main_thread;
-	uintptr_t tlsp;
-	uintptr_t auxsp;
 	int ret;
 
 	UK_ASSERT(s);
 	UK_ASSERT(s->sched_start);
 	UK_ASSERT(!s->is_started);
 	UK_ASSERT(!uk_thread_current()); /* No other thread runs */
-
-	/* Allocate an `uk_thread` instance for current context
-	 * NOTE: We assume that if we have a TLS pointer, it points to
-	 *       an TLS that is derived from the Unikraft TLS template.
-	 */
-	tlsp = uk_lcpu_tlsp_get();
-	auxsp = uk_pcpuvar_current_get(UK_LCPU_AUXSP_SYM);
-	main_thread = uk_thread_create_bare(s->a,
-					    0x0, 0x0, auxsp,
-					    tlsp, !(!tlsp), false,
-					    "init", NULL, NULL);
-	if (!main_thread) {
-		ret = -ENOMEM;
-		goto err_out;
-	}
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	UK_ASSERT(s->lcpu_idx ==
+		  uk_pcpuvar_current_get(uk_pcpuvar_cpu_idx));
+	uk_sched_set_state(s, UK_SCHED_STARTING);
+#endif
 	main_thread->sched = s;
 
 	/* Because `main_thread` acts as container for storing the current
@@ -247,6 +331,9 @@ int uk_sched_start(struct uk_sched *s)
 	if (ret < 0)
 		goto err_unset_thread_current;
 	s->is_started = true;
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	uk_sched_set_state(s, UK_SCHED_ONLINE);
+#endif
 
 #if CONFIG_LIBUKSCHED_STATS
 	s->start_time = (__u64)ukplat_monotonic_clock();
@@ -256,19 +343,90 @@ int uk_sched_start(struct uk_sched *s)
 
 err_unset_thread_current:
 	uk_pcpuvar_current_set(__uk_sched_thread_current, NULL);
-	uk_thread_release(main_thread);
-err_out:
+	UK_TAILQ_REMOVE(&s->thread_list, main_thread, thread_list);
+	main_thread->sched = NULL;
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	uk_sched_set_state(s, UK_SCHED_ROLLED_BACK);
+#endif
+	return ret;
+}
+
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+int uk_sched_start_thread(struct uk_sched *s,
+			  struct uk_thread *main_thread)
+{
+	UK_ASSERT(main_thread);
+	return _uk_sched_start(s, main_thread);
+}
+#endif
+
+int uk_sched_start(struct uk_sched *s)
+{
+	struct uk_thread *main_thread;
+	uintptr_t tlsp;
+	uintptr_t auxsp;
+	int ret;
+
+	UK_ASSERT(s);
+
+	/* Allocate an `uk_thread` instance for current context
+	 * NOTE: We assume that if we have a TLS pointer, it points to
+	 *       an TLS that is derived from the Unikraft TLS template.
+	 */
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	uk_pr_info("Fixed SMP: capture BSP scheduler context\n");
+#endif
+	tlsp = uk_lcpu_tlsp_get();
+	auxsp = uk_pcpuvar_current_get(UK_LCPU_AUXSP_SYM);
+	main_thread = uk_thread_create_bare(s->a,
+					    0x0, 0x0, auxsp,
+					    tlsp, !(!tlsp), false,
+					    "init", NULL, NULL);
+	if (!main_thread)
+		return -ENOMEM;
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	uk_pr_info("Fixed SMP: BSP scheduler context ready\n");
+#endif
+
+	ret = _uk_sched_start(s, main_thread);
+	if (ret < 0)
+		uk_thread_release(main_thread);
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	else
+		uk_pr_info("Fixed SMP: BSP scheduler online\n");
+#endif
 	return ret;
 }
 
 unsigned int uk_sched_thread_gc(struct uk_sched *sched)
 {
-	struct uk_thread *thread, *tmp;
+	struct uk_thread *thread;
+#if !CONFIG_LIBUKSCHED_FIXED_SMP
+	struct uk_thread *tmp;
+#endif
 	unsigned int num = 0;
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	unsigned long flags;
+
+	UK_ASSERT(sched->lcpu_idx ==
+		  uk_pcpuvar_current_get(uk_pcpuvar_cpu_idx));
+#endif
 
 	/* Cleanup finished threads */
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	for (;;) {
+		ukplat_spin_lock_irqsave(&sched->lock, flags);
+		thread = UK_TAILQ_FIRST(&sched->exited_threads);
+		if (thread)
+			UK_TAILQ_REMOVE(&sched->exited_threads, thread,
+					thread_list);
+		ukplat_spin_unlock_irqrestore(&sched->lock, flags);
+		if (!thread)
+			break;
+#else
 	UK_TAILQ_FOREACH_SAFE(thread, &sched->exited_threads,
 			      thread_list, tmp) {
+#endif
 		UK_ASSERT(thread != uk_thread_current());
 		UK_ASSERT(uk_thread_is_exited(thread));
 
@@ -276,7 +434,9 @@ unsigned int uk_sched_thread_gc(struct uk_sched *sched)
 			    sched, thread,
 			    thread->name ? thread->name : "<unnamed>");
 
+#if !CONFIG_LIBUKSCHED_FIXED_SMP
 		UK_TAILQ_REMOVE(&sched->exited_threads, thread, thread_list);
+#endif
 		if (thread->_gc_fn)
 			thread->_gc_fn(thread,  thread->_gc_argp);
 		uk_thread_release(thread);
@@ -300,6 +460,10 @@ void uk_sched_thread_terminate(struct uk_thread *thread)
 	UK_ASSERT(thread->sched);
 
 	sched = thread->sched;
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	UK_ASSERT(sched->lcpu_idx ==
+		  uk_pcpuvar_current_get(uk_pcpuvar_cpu_idx));
+#endif
 
 	uk_pr_debug("%p: thread %p (%s) terminated\n",
 		    sched, thread, thread->name ? thread->name : "<unnamed>");
@@ -307,7 +471,19 @@ void uk_sched_thread_terminate(struct uk_thread *thread)
 	if (uk_thread_in_waitq(thread))
 		uk_waitq_cancel(thread);
 	/* remove from scheduling queue */
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	{
+		unsigned long flags;
+
+		ukplat_spin_lock_irqsave(&sched->lock, flags);
+		thread->flags |= UK_THREADF_EXITING;
+		sched->thread_remove(sched, thread);
+		UK_TAILQ_REMOVE(&sched->thread_list, thread, thread_list);
+		ukplat_spin_unlock_irqrestore(&sched->lock, flags);
+	}
+#else
 	uk_sched_thread_remove(thread);
+#endif
 	/* causes calling termination table */
 	uk_thread_set_exited(thread);
 
@@ -316,14 +492,31 @@ void uk_sched_thread_terminate(struct uk_thread *thread)
 		uk_pr_debug("%p: thread %p (%s) on gc list\n",
 			    sched, thread, thread->name ?
 					   thread->name : "<unnamed>");
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+		unsigned long flags;
+
+		ukplat_spin_lock_irqsave(&sched->lock, flags);
+		thread->sched = NULL;
 		UK_TAILQ_INSERT_TAIL(&sched->exited_threads, thread,
 				     thread_list);
+		ukplat_spin_unlock_irqrestore(&sched->lock, flags);
+#else
+		UK_TAILQ_INSERT_TAIL(&sched->exited_threads, thread,
+				     thread_list);
+#endif
 
 		/* leave this thread */
 		sched->yield(sched); /* we won't return */
 		UK_CRASH("Unexpectedly returned to exited thread %p\n", thread);
 	} else {
 		/* free thread resources immediately */
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+		unsigned long flags;
+
+		ukplat_spin_lock_irqsave(&sched->lock, flags);
+		thread->sched = NULL;
+		ukplat_spin_unlock_irqrestore(&sched->lock, flags);
+#endif
 		uk_thread_release(thread);
 	}
 }
@@ -363,7 +556,11 @@ int uk_sched_thread_add(struct uk_sched *s, struct uk_thread *t)
 	UK_ASSERT(t);
 	UK_ASSERT(!t->sched);
 
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	ukplat_spin_lock_irqsave(&s->lock, flags);
+#else
 	flags = uk_lcpu_save_irqf();
+#endif
 
 	rc = s->thread_add(s, t);
 	if (rc < 0)
@@ -372,7 +569,20 @@ int uk_sched_thread_add(struct uk_sched *s, struct uk_thread *t)
 	t->sched = s;
 	UK_TAILQ_INSERT_TAIL(&s->thread_list, t, thread_list);
 out:
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	ukplat_spin_unlock_irqrestore(&s->lock, flags);
+	if (!rc && s->is_started &&
+	    s->lcpu_idx != uk_pcpuvar_current_get(uk_pcpuvar_cpu_idx)) {
+		int kick_rc = uk_sched_kick_retry(
+			s, UK_SCHED_KICK_RETRIES_DEFAULT);
+
+		if (kick_rc)
+			uk_pr_err("sched %p: runnable thread published, LCPU %u kick failed: %d\n",
+				  s, s->lcpu_idx, kick_rc);
+	}
+#else
 	uk_lcpu_restore_irqf(flags);
+#endif
 	return rc;
 }
 
@@ -384,12 +594,22 @@ int uk_sched_thread_remove(struct uk_thread *t)
 	UK_ASSERT(t);
 	UK_ASSERT(t->sched);
 
-	flags = uk_lcpu_save_irqf();
 	s = t->sched;
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	UK_ASSERT(s->lcpu_idx ==
+		  uk_pcpuvar_current_get(uk_pcpuvar_cpu_idx));
+	ukplat_spin_lock_irqsave(&s->lock, flags);
+#else
+	flags = uk_lcpu_save_irqf();
+#endif
 	s->thread_remove(s, t);
 	t->sched = NULL;
 	UK_TAILQ_REMOVE(&s->thread_list, t, thread_list);
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+	ukplat_spin_unlock_irqrestore(&s->lock, flags);
+#else
 	uk_lcpu_restore_irqf(flags);
+#endif
 	return 0;
 }
 

@@ -1,0 +1,3 @@
+#define CONFIG_ARCH_X86_64 1
+#define CONFIG_PLAT_KVM 1
+#define CONFIG_VERSION_PATH_SYMBOL "loaded"

@@ -1,0 +1,7 @@
+.{
+    .name = .unikraft_hyperv_scorecard,
+    .version = "0.1.0",
+    .fingerprint = 0xa15d4fb1c963553d,
+    .minimum_zig_version = "0.17.0",
+    .paths = .{""},
+}

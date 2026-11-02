@@ -1,6 +1,16 @@
 uk_sched_register
 uk_sched_create
 uk_sched_start
+uk_sched_start_thread
+uk_sched_bind_lcpu
+uk_sched_unbind_lcpu
+uk_sched_get_lcpu
+uk_sched_lcpu
+uk_sched_state
+uk_sched_set_state
+uk_sched_kick
+uk_sched_kick_retry
+uk_sched_last_kick_error
 uk_sched_thread_create_fn0
 uk_sched_thread_create_fn1
 uk_sched_thread_create_fn2
@@ -35,6 +45,7 @@ uk_thread_block_until
 uk_thread_block_timeout
 uk_thread_block
 uk_thread_wake
+uk_thread_wake_published
 uk_thread_wake_isr
 __uk_sched_thread_current
 sched_yield

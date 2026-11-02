@@ -129,6 +129,611 @@ There are two ways to get started with Unikraft:
 
 2. Using the GNU Make-based system.  For this, see our [advanced usage guide][unikraft-guides-advanced].
 
+### Zig build facade and experimental Zig C compiler support
+
+Exactly Zig 0.17.0 provides a compatibility facade for the existing GNU Make build.
+GNU Make remains the backend; this facade only maps Zig build steps and options
+to Make targets and assignments. It does not yet model Unikraft's components
+as a native Zig build graph.
+
+Root builds use the pinned `translate_c` tool and its GitHub-hosted Aro fork for
+target-aware generated C bindings. Set `ZIG_LOCAL_PKG_DIR` to a scoped directory
+outside the source worktree before building; Zig 0.17 otherwise creates an
+untracked `zig-pkg` directory, which source-provenance checks correctly refuse.
+Strict producers restore exact copied `build.zig` and `build.zig.zon` files into
+private scratch with `zig build --fetch=all`, then pass the restored depot with
+`--system` and the same `ZIG_LOCAL_PKG_DIR` binding. The environment variable
+takes precedence over the `--system` directory in Zig 0.17. Keep that restoration
+before source/admission custody; do not hide
+untracked dependency sources or allow an ambient depot to substitute for the
+authenticated binding. Set the global cache with `ZIG_GLOBAL_CACHE_DIR`;
+Zig 0.17 `build` and `fetch` no longer accept `--global-cache-dir`.
+
+Zig 0.17's hosted standard-library OS floors are Linux 5.10+, macOS 15+, and
+OpenBSD 7.8+; its Windows floor is Windows 10+. These floors apply to tools
+running on the build/control host, including the facade and hosted verifiers,
+not to freestanding Unikraft guests. Meeting a floor does not establish facade
+support: hosts without the required filesystem/process safety capabilities are
+still rejected. The Windows floor does not add Windows facade support, and none
+of these hosted floors changes guest-platform support or requires a Linux guest.
+
+The root build now requires the immutable `translate_c` package and its Aro
+dependency even for selectors that do not translate C themselves. Restore the
+manifest-pinned closure explicitly before invoking the root build:
+
+```shell
+umask 077
+work="$HOME/unikraft-zig17-build"
+export ZIG_LOCAL_PKG_DIR="$work/packages"
+export ZIG_GLOBAL_CACHE_DIR="$work/global-cache"
+export ZIG_LOCAL_CACHE_DIR="$work/local-cache"
+mkdir -p "$ZIG_LOCAL_PKG_DIR" "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_CACHE_DIR"
+zig build --fetch=all --cache-dir "$ZIG_LOCAL_CACHE_DIR" --prefix "$work/outputs"
+```
+
+Subsequent root invocations use `--system "$ZIG_LOCAL_PKG_DIR"` to prohibit
+implicit fetching. Zig 0.17 gives `ZIG_LOCAL_PKG_DIR` precedence over the
+directory argument to `--system`: fixed child environments must bind both to
+the same qualified depot, or remove the ambient variable before using the
+explicit directory. Never forward an unrelated or untrusted package selector.
+Guarded factories and CI must restore, authenticate, and
+bind the compiler and complete package closure **before** establishing
+source/admission custody. `--system` disables fetching; a directory path or
+hash-shaped package name alone is not authentication. Do not replace the
+qualified depot with an empty tree or remove `--system` to make a gate pass.
+Keep package depots outside every source snapshot: Zig 0.17's default
+`zig-pkg` acquisition writes new package sources into the build root, which
+must fail strict source custody rather than be ignored. Scope this root depot
+to root invocations; independent restorers retain their own per-restore
+`--pkg-dir`. Do not override all restorers through a shared `GITHUB_ENV` entry.
+
+The facade also exposes an isolated native configuration parser and header
+generator. It consumes an already solved Kconfig `.config`; it does not
+evaluate `Config.uk`, resolve dependencies/defaults, or replace the Kconfig
+solver. The non-destructive native steps are:
+
+```shell
+zig build --system "$ZIG_LOCAL_PKG_DIR" config-inspect -Dapp=/absolute/path/to/app
+zig build --system "$ZIG_LOCAL_PKG_DIR" config-validate -Dapp=/absolute/path/to/app
+zig build --system "$ZIG_LOCAL_PKG_DIR" config-header -Dapp=/absolute/path/to/app
+```
+
+`config-inspect` prints the selected architecture and platform, and
+`config-validate` checks typed values plus the single-architecture and
+single-platform invariants. Boot-entry validation is intentionally deferred
+until native component registration can prove that the configured provider is
+present. `config-header` generates `<output>/include/uk/bits/config.h` without
+invoking Make. The steps use the existing Kconfiglib model only to export
+authoritative symbol types (including application and external component
+`Config.uk` files), and pair them with existing platform `addplat_s`
+registrations. Zig parses `.config` and writes the header deterministically.
+Use `-Dconfig` for a non-default `.config`, or `-Dprefix` to place the
+generated header below a prefix other than the build output.
+
+From the Unikraft repository, build an application with:
+
+```shell
+zig build --system "$ZIG_LOCAL_PKG_DIR" \
+  -Dapp=/absolute/path/to/app \
+  -Dconfig=/absolute/path/to/app/.config
+```
+
+When `-Doutput` is omitted, it safely defaults to `<app>/build`. The facade
+creates one fresh canonical output identity by resolving existing symlinks and
+the nearest existing ancestor of a new output. That same identity is used for
+validation, the runner argument, and Make's `O=` assignment; the runner
+requires those two arguments to match exactly before marker handling and again
+immediately before execution. The facade rejects repository/application
+ancestors, existing source directories, filesystem roots, and unmarked existing
+directories. New output directories receive a small marker so subsequent
+builds can distinguish them from source trees.
+
+Zig 0.17 separates configuration from build execution. Configuration-time
+`.config` reads declare content dependencies, while canonical-path, file-kind,
+permission and marker trust checks deliberately poison the configuration cache:
+these checks must run on every invocation, including warm caches. Individual
+compilation and generated-header steps remain content-cached. Do not override
+configuration cache poisoning for trusted build execution.
+
+The default step delegates to Make's `all` target. Named steps include
+`images`, `libs`, `objs`, `preprocess`, `prepare`, `fetch`, configuration
+targets such as `menuconfig` and `defconfig`. The compatibility names `clean`,
+`clean-libs`, `properclean`, and `distclean` are registered but intentionally
+refuse to run; see the cleanup safety limitation below. For example:
+
+```shell
+zig build --system "$ZIG_LOCAL_PKG_DIR" menuconfig -Dapp=/absolute/path/to/app
+zig build --system "$ZIG_LOCAL_PKG_DIR" images -Dapp=/absolute/path/to/app -Dverbose=1
+```
+
+`-Dapp`, `-Doutput`, `-Dconfig`, and `-Dimage-name` map to Make's `A`, `O`,
+`C`, and `N` variables. Repeat `-Dexternal-lib`, `-Dexternal-platform`, or
+`-Dexclude` to construct the `L`, `P`, or `E` path lists. Relative paths are
+resolved from the Unikraft repository root and canonicalized before they are
+forwarded. The runner revalidates `A`, `O`, `C`, `L`, `P`, and `E` immediately
+before executing a non-destructive Make target and refuses changed path
+identities. Because the existing Make backend does not quote these values end
+to end, the facade also applies a conservative ASCII allowlist. Paths accept
+letters, digits, `/`, `-_.+@`; joined `L`, `P`, and `E` lists additionally use
+`:` as their intentional separator. Image names accept letters, digits, and
+`-_.+@`. Tool/flag values additionally accept spaces, `:`, `,`, and `=`.
+Whitespace in paths and Make/shell syntax such as quotes, backslashes, `$()`,
+backticks, `;&|<>`, globs, `#`, `%`, and control characters are rejected.
+Additional Make assignments can be forwarded as individual, safely separated
+arguments with repeated `-Dmake-arg=NAME=VALUE`. This option uses a strict
+allowlist for compiler flags and non-path tools such as `AR`, `NM`, `OBJCOPY`,
+`OBJDUMP`, `READELF`, `STRIP`, `UK_CFLAGS`, and `UK_LDFLAGS`.
+Facade-managed, path, cleanup, configuration, and internal graph variables are
+rejected and must use dedicated facade options where available.
+
+On Linux, `-Dnative-make-environment=/absolute/private/environment.json`
+provides an opt-in machine-generated environment for private native producers.
+The file must be current-user-owned, single-link `0600` in a private `0700`
+directory. Its schema is `unikraft_native_make_environment_v1`, with required
+`bison_data`, `m4`, `shell`, `tmp`, `xdg_cache`, `xdg_config`,
+`zig_global_cache`, and `zig_local_cache` absolute canonical paths. JSON is
+compact, has sorted keys and exactly one final LF, and rejects unknown,
+duplicate, or missing fields. Tools and Bison data must already exist under
+trusted directory chains; cache/temp directories must already be private.
+This emits only fixed-name Make assignments, including `UMASK=0077`,
+`SHELL`/`CONFIG_SHELL`, `M4`, `BISON_PKGDATADIR`, and the explicit temp/cache
+paths. GNU Make propagates these command-line assignments to its children.
+It neither forwards arbitrary environment variables nor changes canonical
+passwd `HOME` or the stable facade lock. Without the option, behavior is
+unchanged. This is configuration plumbing, not tool/runtime admission or a
+Python-free isolation guarantee: callers must separately bind the exact
+contract, executable/runtime closure, source, and resulting artifacts.
+
+Make runs with a newly constructed environment rather than inheriting the
+caller's environment. Only the Make-safe canonical passwd `HOME`, a validated
+absolute-entry `PATH` (or `/usr/bin:/bin` fallback), and validated
+`LANG`/`LC_ALL` locale values are supplied. GNU Make control channels including
+`MAKEFLAGS`, `GNUMAKEFLAGS`, `MAKEFILES`, `MFLAGS`, `MAKEOVERRIDES`,
+`MAKELEVEL`, jobserver/restart/terminal state, compiler variables, and internal
+build variables therefore cannot rewrite goals or bypass the facade's
+assignment allowlist. Toolchain and flag overrides must use the dedicated Zig
+options or an allowlisted `-Dmake-arg`. Before process replacement, the runner
+resolves a bare Make command itself using only that validated child `PATH`;
+commands containing `/` are canonicalized directly. The selected backend must
+resolve to an absolute regular executable owned by root or the current user,
+without group/other write access. A final symlink is accepted only when its
+non-symlink parent and fully resolved target chains are both trusted. Canonical
+directory chains are walked with descriptor-relative, no-follow opens;
+ancestors must be root- or current-user-owned and not group/other-writable. A
+root-owned `01777` sticky boundary is accepted only when its protected child
+entry is trusted and not group/other-writable. Linux retains the opened
+executable descriptor and uses `fexecve`, so replacing the final directory
+entry cannot change the executed backend. Zig 0.17's macOS and OpenBSD libc
+targets do not export `fexecve`, so descriptor execution is conservatively
+gated to Linux. Other supported hosts retain the original descriptor, re-open
+the fully trusted chain at the last possible point, require matching
+device/inode identity, and then replace the process using the canonical absolute
+path. The runner's original inherited `PATH` is never consulted for execution.
+
+Invoke only one Make-backed named step per `zig build` command. A portable,
+non-blocking file lock rejects overlapping Make processes rather than allowing
+selected steps such as `clean all` to race. For each effective UID, facade
+invocations use one lock in a private `unikraft-zig-facade-<uid>` directory
+beneath a stable, trusted per-user namespace. Linux prefers
+`/run/user/<effective-uid>` and falls back to the canonical home directory from
+the passwd database. macOS uses its OS-provided per-user temporary directory;
+other supported POSIX hosts use the canonical passwd home. `HOME`,
+`XDG_RUNTIME_DIR`, `TMPDIR`, `TEMP`, and `TMP` do not select the lock root.
+Every production root and ancestor is opened without following its final
+component and must be owned by root or the current user without group/other
+write access; the per-user root must be current-user-owned. The private
+directory must have mode `0700`, and the regular, single-link lock mode `0600`;
+symlinks and unsafe ownership or permissions are refused. This preserves
+same-user serialization across parent/nested outputs, caches, applications,
+and checkouts without allowing shared-temporary-directory pre-creation or
+environment changes to lock out a user or split the lock.
+
+The private runtime directory must be outside every output tree; its persistent
+lock file is never unlinked while held. Before invoking Make, the runner makes
+the locked descriptor inheritable and replaces its own process image with the
+backend. Make and its descendants therefore retain the same lock even if the
+original runner PID is killed; the lock is released normally after the complete
+backend tree exits. Hosts without process-image replacement are refused rather
+than running without this lifetime guarantee. Run separate commands when
+multiple phases are needed.
+
+The facade creates `.unikraft-zig-build` relative to a validated canonical
+output-directory handle. New markers use exclusive creation; existing markers
+must be current-user-owned, single-link regular files with safe permissions and
+the exact expected contents. No-follow, descriptor-relative operations prevent
+marker symlinks or replacement races from redirecting writes.
+
+Non-destructive builds may use an external `-Dconfig`. Destructive Make targets
+cannot safely consume mutable pathnames after Zig's validation: `properclean`
+recursively removes `O`, `distclean` also removes `C` and companion metadata,
+and configured `clean`/`clean-libs` rules contain further generated paths.
+Until cleanup is implemented using portable descriptor-relative deletion, the
+facade refuses all four steps instead of exposing a check-then-delete race. Use
+manual cleanup, or invoke GNU Make directly only after independently ensuring
+the application, output, and configuration path components cannot be replaced.
+The offline `test` selector runs the facade's path, argument, and lock unit checks.
+It also links the production runner for x86_64/aarch64 macOS and x86_64
+OpenBSD, catching target-libc symbol availability rather than stopping after
+code generation.
+`python3 -m unittest -v support.scripts.tests.test_zig_facade` adds
+end-to-end metacharacter, cross-checkout parent/nested output, destructive path
+replacement refusal, and orphaned backend-tree lock-lifetime coverage,
+including hostile inherited Make environments, output-identity replacement,
+runtime/build-marker entries, and differing temporary-directory environments.
+
+The experimental QEMU/x86_64 native Zig image pipeline becomes:
+
+```shell
+zig build --system "$ZIG_LOCAL_PKG_DIR" native-images \
+  -Dnative-profile=qemu-x86_64 \
+  -Dapp=/absolute/path/to/app \
+  -Dconfig=/absolute/path/to/solved-qemu-x86_64.config \
+  '-Dcompiler=zig cc -target x86_64-freestanding-none' \
+  -Dcompiler-targeted=true \
+  '-Dhost-cc=zig cc' \
+  '-Dhost-cxx=zig c++' \
+  -Dhost-cflags=-fno-sanitize=null \
+  '-Dmake-arg=AR=zig ar' \
+  -Dmake-arg=NM=llvm-nm \
+  -Dmake-arg=OBJCOPY=llvm-objcopy \
+  -Dmake-arg=OBJDUMP=llvm-objdump \
+  -Dmake-arg=READELF=llvm-readelf \
+  -Dmake-arg=STRIP=llvm-strip \
+  -Dmake-arg=UK_CFLAGS=-std=gnu17 \
+  -Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt
+```
+
+This step asks GNU Make only for compiled objects, generated linker scripts,
+and archives. `build.zig` executes the ordered `zig cc -r` library links,
+merges linker scripts, runs the final `zig cc` link, performs image
+post-processing, and publishes the image, debug image, bootinfo, and compile
+database under the build output directory. The x86_64 build requires Python 3
+and the listed LLVM binary tools, but not GCC. The `host-cflags` exception
+accommodates Kconfig's kernel-style, null-derived list sentinel.
+
+For QEMU/ARM64, use the same GCC-free tool contract with an explicit
+freestanding AArch64 target:
+
+```shell
+zig build --system "$ZIG_LOCAL_PKG_DIR" native-images \
+  -Dnative-profile=qemu-arm64 \
+  -Dapp=/absolute/path/to/app \
+  -Dconfig=/absolute/path/to/solved-qemu-arm64.config \
+  '-Dcompiler=zig cc -target aarch64-freestanding-none' \
+  -Dcompiler-targeted=true \
+  '-Dhost-cc=zig cc' \
+  '-Dhost-cxx=zig c++' \
+  -Dhost-cflags=-fno-sanitize=null \
+  '-Dmake-arg=AR=zig ar' \
+  -Dmake-arg=NM=llvm-nm \
+  -Dmake-arg=OBJCOPY=llvm-objcopy \
+  -Dmake-arg=OBJDUMP=llvm-objdump \
+  -Dmake-arg=READELF=llvm-readelf \
+  -Dmake-arg=STRIP=llvm-strip \
+  -Dmake-arg=UK_CFLAGS=-std=gnu17 \
+  -Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt
+```
+
+Neither target requires GCC or GNU cross-binutils. Both require Python 3 and
+the listed LLVM binary tools. Passing `-Dnative-profile` also routes the
+`images` and default `all` steps through this native link pipeline. Other
+profiles and invocations without that option retain the GNU Make backend.
+The legacy `-Dnative-qemu-graph` option remains supported.
+
+The `hyperv-x86_64-efi` profile extends the same compatibility pipeline with
+first-class target-side Zig objects and EFI post-processing. Its solved
+configuration must select the standalone x86_64 `PLAT_HYPERV`, PIE, and
+`LIBUKPAGING`; GNU Make continues to provide the shared x86 UEFI C/assembly
+objects. When the solved configuration enables `LIBSTORVSC`, the graph also
+adds `LIBUKBLKDEV`, the StorVSC C binding, and its freestanding Zig core:
+
+The platform captures wall-clock time from UEFI before `ExitBootServices`,
+uses the Hyper-V reference-TSC page when available (falling back to the
+partition reference counter), and uses SynIC STimer0 for one-shot scheduler
+wakeups. SMP images allocate Kconfig-bounded, page-aligned SIMP/SIEFP storage
+for every logical CPU and program SynIC/STimer MSRs on the CPU that owns them.
+Hyper-V VP indices are discovered from `HV_X64_MSR_VP_INDEX`; logical CPU
+indices are never used as host VP identifiers. Secondary CPUs currently run
+the framework's idle/IPI entry rather than independent schedcoop workloads.
+VMBus control and primary StorVSC/NetVSC channels remain pinned to the BSP
+because schedcoop has no SMP-safe cross-CPU worker wake primitive. Subchannels,
+RSS, and multiqueue remain deferred until that scheduler support and live-host
+measurements justify their topology and queue policy.
+
+SynIC IRQ entry saves only general-purpose registers. The VMBus bus C object
+uses Unikraft's `|isr` variant; the Hyper-V runtime and VMBus protocol Zig
+objects disable x87/MMX/SSE/AVX code generation in both build backends.
+Freestanding targeting alone is not sufficient. Queue publication, legacy
+event routing, and the ISR scheduler wake callback stay on this restricted
+path; protocol processing and channel/driver callbacks run in the worker.
+
+The offline `test-hyperv-irq` selector runs the targeted hosted correctness tests, including
+8-, 196-, and 240-byte receive payloads. Native Hyper-V image publication also
+checks the final linked IRQ call graph for unsaved FP/SIMD use and strong VMBus
+hook resolution using compiled Zig proof tools. For GNU Make images, build
+the native checker and run the same check explicitly:
+
+```shell
+zig build --system "$ZIG_LOCAL_PKG_DIR" build-hyperv-image-proofs -j2
+./zig-out/bin/hyperv-image-proof irq --image /path/to/image.dbg
+```
+
+The checker follows direct calls/tail branches, the native/controller SynIC
+dispatch, and schedcoop's registered ISR wake callback, rejecting unreviewed
+indirect edges. Only terminal assertion
+logging immediately leading to a fatal trap is excluded: it cannot return to
+the interrupted context. This compiler/register check is not live Hyper-V I/O
+or AP workload acceptance.
+
+The offline `test-hyperv-image-proofs -j2` selector runs the Python-free proof aggregate:
+native parser/register tests, real C/Zig objects and linked x86-64 ELF fixtures,
+and refusal mutations. It does not execute a guest or invoke Make. Set
+`-Dproof-nm=/path/to/llvm-nm` and `-Dproof-objdump=/path/to/llvm-objdump` when
+these native tools are not on `PATH`. The production image gates retain the
+configured NM/objdump commands, maximum CPU count, and StorVSC/NetVSC selection.
+See [native image proof coverage](support/build/hyperv-image-proofs.md) for the
+SMP/IRQ/driver CLI, assertion mapping, and evidence limits.
+
+```shell
+zig build --system "$ZIG_LOCAL_PKG_DIR" native-images \
+  -Dnative-profile=hyperv-x86_64-efi \
+  -Dapp=/absolute/path/to/app \
+  -Dconfig=/absolute/path/to/solved-x86_64-efi.config \
+  '-Dcompiler=zig cc -target x86_64-freestanding-none' \
+  -Dcompiler-targeted=true \
+  '-Dhost-cc=zig cc' \
+  '-Dhost-cxx=zig c++' \
+  -Dhost-cflags=-fno-sanitize=null \
+  '-Dmake-arg=AR=zig ar' \
+  -Dmake-arg=NM=llvm-nm \
+  -Dmake-arg=OBJCOPY=llvm-objcopy \
+  -Dmake-arg=OBJDUMP=llvm-objdump \
+  -Dmake-arg=READELF=llvm-readelf \
+  -Dmake-arg=STRIP=llvm-strip \
+  -Dmake-arg=UK_CFLAGS=-std=gnu17 \
+  -Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt
+```
+
+The separate `hyperv-x86_64-efi-wamr` profile registers the
+[source-pinned native WAMR AOT application](support/apps/wamr-aot/README.md),
+its explicitly initialized VM capabilities, trusted embedded fixture and
+optional minimal WASI/CoreMarks. It retains the existing image safety gates
+and packaging/local-boot machinery. Build/link evidence is not native boot,
+hardware, networking or benchmark acceptance.
+
+The `hyperv-x86_64-efi-netvsc` profile extends that graph with `libuknetdev`,
+the NetVSC C binding, and the freestanding NVS/RNDIS Zig protocol object. Its
+solved configuration must additionally select `CONFIG_LIBUKNETDEV=y` and
+`CONFIG_LIBNETVSC=y`; use the same command above with
+`-Dnative-profile=hyperv-x86_64-efi-netvsc`. If the solved configuration
+accepts uknetdev's `CONFIG_LIBUKLIBPARAM` implication, the native graph includes
+that library and its generated linker script as well.
+
+For the first local boot, use a single-CPU hello-world configuration with
+`CONFIG_LIBUKPRINT_KLVL_INFO=y`. EFI configurations now default to 512 bootinfo
+memory descriptors: the firmware memory map and Memory Attributes Table must
+both fit before coalescing. Existing solved configurations retain their old
+value; update `CONFIG_UKPLAT_MEMREGION_MAX_COUNT` to at least 512 if it is still
+128, then regenerate the configuration and rebuild.
+
+With KVM access, OVMF, and QEMU's `vmbus-bridge` device available:
+
+```shell
+python3 support/build/tests/hyperv-efi-boot-test.py \
+  --image /absolute/path/to/helloworld_hyperv-x86_64 \
+  --ovmf-code /usr/share/OVMF/OVMF_CODE.fd \
+  --ovmf-vars /usr/share/OVMF/OVMF_VARS.fd \
+  --work-dir /absolute/path/to/build/hyperv-efi-smoke \
+  --expect 'Hello world!'
+```
+
+This bounded smoke run requires hypercall/SynIC initialization, the application
+marker, a zero return from `main`, and normal QEMU exit. It keeps the serial log
+in the work directory and removes its temporary firmware and FAT staging files.
+The FAT directory is only an EFI launch fixture, not a GPT/ESP or Azure image.
+Passing does not establish VMBus channel or storage/network operation: bus errors
+remain visible in the serial log. Real Hyper-V I/O, fixed-VHD packaging through
+`miz`, and Azure Boot Diagnostics remain separate acceptance gates.
+
+The [Azure acceptance controller](support/azure/README.md) uses native `miz`
+packaging, locally boots both GPT/raw and fixed-VHD images, and manages a
+private, ownership-tagged Gen2 deployment with separate platform and real-I/O
+acceptance markers.
+Its separate exact two-boot StorVSC controller is destructive and default-off:
+credential-free fixtures do not replace an approved exact-image private x86
+preflight or an explicitly authorized one-VM/two-disk Azure run.
+
+NetVSC never guesses past a structurally malformed VMBus ring record. It
+disables channel callbacks and requests bounded VMBus reconnect, then closes
+and tears down the channel after the active callback/data-path operation has
+unwound. Queued TX ownership is released only after confirmed close/reset,
+while an ambiguous close quarantines GPA-direct buffers until the next
+connection generation. This preserves memory safety at the cost of a temporary
+interface outage when the host corrupts the shared ring.
+
+Receive-section bounds are computed from the validated start, slot size, and
+slot count; the host's unused `EndOffset` is treated as informational. Inbound
+transfer ranges may be unaligned or span multiple slots, but every range must
+remain wholly inside one validated receive section and its registered GPADL.
+Transfer-page descriptors may contain 4-byte-aligned trailing padding between
+the range array and payload; parsers ignore only that bounded padding.
+
+NetVSC completion callbacks mark TX contexts complete without freeing their
+`uk_netbuf`. The optional `uknetdev` post-return hook records that the public
+wrapper has finished statistics accounting. Reclaim waits until every
+concurrent successful wrapper has crossed that handoff, then runs from a
+later TX operation or quiesced teardown and frees each packet exactly once.
+Transaction sequences
+rotate to a fresh nonzero generation only with no live TX, control, NVS, or
+pending-ACK state; generation exhaustion takes the device offline.
+
+Target Zig modules receive generated Kconfig headers through tracked build
+dependencies and can opt into narrow Unikraft include roots for `@cImport`.
+The resulting objects feed the normal library partial-link and final-link
+pipelines as `LazyPath` inputs. The EFI pipeline runs the repository's
+`mkukreloc.py` helper against the unstripped PIE image, updates `.uk_reloc`,
+and only then strips and converts the image to PE/COFF. Configuration and
+metadata inputs for target headers are content-tracked, so changing a solved
+configuration in place invalidates the generated header.
+
+Self-relocation requires a loadable `.uk_reloc` section with space for the
+signature, static and dynamic records, and sentinel before post-processing.
+The linker keeps GOT entries in initialized data, before `.bss`, so their
+relocations are retained. On x86, the early relocator uses explicit RIP-relative
+addresses rather than consulting a GOT that has not yet been relocated.
+
+#### Experimental LTO (QEMU/x86_64 native pipeline only)
+
+The Zig 0.17 `native-images` pipeline supports a whole-program flat LTO path
+for the `qemu-x86_64` profile. Selecting `CONFIG_OPTIMIZE_LTO=y` with the
+`qemu-arm64`, `hyperv-x86_64-efi`, or `hyperv-x86_64-efi-netvsc` native
+profiles is detected at build time and rejected with an explicit error.
+Non-LTO QEMU/ARM64 builds remain fully supported. The GNU Make backend is not
+affected: it retains its existing compiler-specific per-library LTO behavior
+(e.g. `-flto` forwarded to GCC or Clang) unchanged.
+
+To enable LTO for the QEMU/x86_64 native pipeline, copy the application
+x86_64 defconfig, append `CONFIG_OPTIMIZE_LTO=y`, run the offline `olddefconfig`
+selector to fill in remaining defaults, then run `native-images` with the same
+tool arguments. Using a shell array avoids repeating the argument list:
+
+```shell
+config=/absolute/path/to/qemu-x86_64-lto.config
+output=/absolute/path/to/build-zig-lto
+cp /absolute/path/to/app/defconfigs/qemu-x86_64 "${config}"
+printf 'CONFIG_OPTIMIZE_LTO=y\n' >> "${config}"
+
+zig_args=(
+  "-Dapp=/absolute/path/to/app"
+  "-Doutput=${output}"
+  "-Dconfig=${config}"
+  "-Dcompiler=zig cc -target x86_64-freestanding-none"
+  "-Dcompiler-targeted=true"
+  "-Dhost-cc=zig cc"
+  "-Dhost-cxx=zig c++"
+  "-Dhost-cflags=-fno-sanitize=null"
+  "-Dmake-arg=AR=zig ar"
+  "-Dmake-arg=NM=llvm-nm"
+  "-Dmake-arg=OBJCOPY=llvm-objcopy"
+  "-Dmake-arg=OBJDUMP=llvm-objdump"
+  "-Dmake-arg=READELF=llvm-readelf"
+  "-Dmake-arg=STRIP=llvm-strip"
+  "-Dmake-arg=UK_CFLAGS=-std=gnu17"
+  "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt"
+)
+
+zig build --system "$ZIG_LOCAL_PKG_DIR" olddefconfig "${zig_args[@]}"
+zig build --system "$ZIG_LOCAL_PKG_DIR" native-images -Dnative-profile=qemu-x86_64 "${zig_args[@]}"
+```
+
+When `CONFIG_OPTIMIZE_LTO=y` is active the per-library `zig cc -r` partial-link
+and `objcopy --keep-global-symbols` stages are bypassed. All library object and
+archive inputs are collected in registration order and passed directly to a
+single `zig cc -flto` final link, allowing LLVM LTO cross-translation-unit
+optimization. The build applies only to the registered native graph scope;
+arbitrary application layouts outside the documented profiles are not
+guaranteed to work.
+
+**Symbol policy and linker arguments.** After GNU Make materializes the native
+link inputs, `lto-symbol-policy.py` invokes the configured `llvm-nm` tool on
+each library's objects and archives, reads per-library export-symbol files, and
+validates cross-library symbol references. Private-symbol collisions (the same
+private name defined in multiple libraries) and illegal cross-library
+references to private symbols cause an explicit build failure. On success it
+generates a deterministic LLD version script with the global-symbol union and
+`local: *;`, plus a response file containing `-Wl,-u` force-keep arguments for
+the active export lists. The version script keeps private definitions local,
+while the response arguments preserve required exports through LTO
+internalization. Generating both at execution time also supports a clean build
+output when an export list is itself produced by GNU Make.
+
+**Measurement tools.** Two scripts under `support/scripts/` assist in
+evaluating the effect of LTO. They must be run against images built from
+identical configurations and identical source commits, differing only in the
+`CONFIG_OPTIMIZE_LTO` setting; results from differing commits or configs are
+not comparable.
+
+Verify that Zig performs cross-translation-unit LTO at all (compiles two
+separate C translation units and confirms the callee is inlined and eliminated):
+
+```shell
+python3 support/scripts/lto-proof.py \
+  --work-dir lto-proof-work \
+  --zig /path/to/zig \
+  --nm llvm-nm
+```
+
+Compare section sizes and defined-symbol counts between a baseline (non-LTO)
+and an LTO image:
+
+```shell
+python3 support/scripts/elf-size-diff.py \
+  --readelf llvm-readelf \
+  --nm llvm-nm \
+  /path/to/baseline.dbg \
+  /path/to/lto.dbg
+```
+
+Pass `--json` to get machine-readable output. The tool reports `file_size`,
+`.text`, `.rodata`, `.data`, `.bss`, and `symbol_count` deltas.
+
+**Representative observations.** The following measurements were recorded for
+a hello-world application on QEMU/x86_64 with identical configs differing only
+in `CONFIG_OPTIMIZE_LTO`. They are informational observations on a specific
+workload and commit; they are **not** guaranteed thresholds and do not imply
+runtime speedup. Real applications may see different, smaller, or larger
+changes depending on their code and configuration:
+
+| Metric              | Delta    |
+|---------------------|----------|
+| Debug ELF file size | +0.57%   |
+| `.text`             | -0.22%   |
+| `.rodata`           | -6.83%   |
+| `.data`             | -45.57%  |
+| `.bss`              | +0.00%   |
+| Defined symbols     | -10.89%  |
+
+The standalone Clang/LLVM 21.1.8 QEMU/ARM64 build uses the GNU Make backend
+directly:
+
+```shell
+llvm=/absolute/path/to/llvm/bin
+app=/absolute/path/to/app
+build=/absolute/path/to/build
+make_args=(
+  "A=${app}"
+  "O=${build}"
+  "HOSTCC=${llvm}/clang -fuse-ld=lld -rtlib=compiler-rt -unwindlib=none"
+  "HOSTCXX=${llvm}/clang++ -fuse-ld=lld -rtlib=compiler-rt -unwindlib=none"
+  "COMPILER=${llvm}/clang --target=aarch64-none-elf"
+  "COMPILER_TARGETED=y"
+  "LINKER=${llvm}/clang --target=aarch64-none-elf -fuse-ld=lld"
+  "PARTIAL_LINKER=${llvm}/ld.lld -m aarch64elf"
+  "PARTIAL_LINKER_TYPE=raw"
+  "AR=${llvm}/llvm-ar"
+  "NM=${llvm}/llvm-nm"
+  "OBJCOPY=${llvm}/llvm-objcopy"
+  "OBJDUMP=${llvm}/llvm-objdump"
+  "READELF=${llvm}/llvm-readelf"
+  "STRIP=${llvm}/llvm-strip"
+  "UK_CFLAGS=-std=gnu17"
+  "UK_LDFLAGS=-rtlib=compiler-rt"
+)
+make "${make_args[@]}" \
+  "UK_DEFCONFIG=${app}/defconfigs/qemu-arm64" \
+  defconfig
+make "${make_args[@]}" -j"$(nproc)"
+```
+
+Raw `ld.lld` partial links activate Unikraft's merged linker-script path; the
+final link still runs through the Clang driver. The build requires GNU Make,
+Bison, Flex, Python 3, ncurses headers, and LLVM's Clang, LLD, archive, and ELF
+tools. It does not require GCC, libgcc, or GNU cross-binutils. The x86_64 LLVM
+release does not ship an AArch64 compiler-rt archive, so applications that emit
+compiler builtin calls must also supply AArch64 compiler-rt objects. CI builds
+and links a forced 128-bit division builtin from the matching pinned
+compiler-rt source release.
+
 ### Toolchain Installation
 
 You can install the companion command-line client [`kraft`][kraft] by using the interactive installer:

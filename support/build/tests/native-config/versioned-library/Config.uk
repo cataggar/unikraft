@@ -1,0 +1,1 @@
+source "$(BUILD_DIR)/native-config-version/$(UK_FULLVERSION)/Config.uk"

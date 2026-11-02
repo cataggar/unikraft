@@ -1,0 +1,641 @@
+# Hyper-V hardware acceptance probe
+
+This application is a bounded, non-destructive acceptance probe for a real
+Hyper-V guest. Its default configuration preserves the lightweight hardware
+smoke:
+
+- inventory VMBus offers and bound StorVSC/NetVSC devices;
+- select the unique LUN 0 OS candidate independently of registration order,
+  read only LBAs 0 and 1, and require MBR plus primary GPT signatures;
+- send a checksummed raw DHCP Discover and accept one bounded, validated Offer;
+- emit `HYPERV_ACCEPTANCE ... PASS|FAIL|UNAVAILABLE` serial markers.
+
+The separately selected `app-network.defconfig` replaces only the raw DHCP
+network stage with an official lib-lwip path. It manually attaches the first
+NetVSC device with one RX and one TX queue, completes DHCP through the BOUND
+state, verifies the applied lease, resolves an explicit same-subnet private peer
+with ARP, and performs exact TCP and UDP exchanges. Storage remains read-only.
+This profile admits two StorVSC controllers for Azure's normal OS/resource-disk
+offer topology. It uses REPORT LUNS discovery, and an additional controller is
+accepted as empty only after two successful zero-entry reports on the same
+binding. Failed or disrupted addressed discovery remains unresolved. The probe
+waits for current bound offers and a coherent StorVSC generation instead of
+treating previously registered device counts as ready.
+The application replaces only that netif instance's unbounded lib-lwIP
+poll/transmit callbacks with a scoped boundary that processes at most 64 RX
+packets per pump and attempts each TX exactly once. Persistent TX backpressure
+fails acceptance instead of spinning; a continuous RX flood returns to lwIP
+timers and the outer deadlines after every bounded batch. NetVSC also limits
+each deferred channel drain to 64 VMBus packets and requeues remaining work on
+the VMBus worker, including on legacy VMBus versions, so the bound applies
+below the stack adapter. The pinned
+external wrapper checkout remains unmodified.
+On a DHCP start, adapter, or lease deadline failure, the application emits an
+additive `NETWORK_DHCP_DIAGNOSTIC INFO` record containing bounded lwIP state and
+NetVSC TX, completion, RX, queue, and transport counters before the existing
+stable failure marker.
+
+`UK_HYPERV_IO_READY` is emitted only when storage and the selected network mode
+both pass. A missing offer is `UNAVAILABLE`; a present but unbound device or any
+DHCP, ARP, peer, content, sequence, count, or timeout error is `FAIL`.
+
+## Application-network peer contract
+
+The default probe never writes to a block device. An environment without
+StorVSC or NetVSC returns 2 (`UNAVAILABLE`); a present device that cannot bind,
+configure, complete I/O, or meet the timeout returns 1.
+
+## Read-only storage topology profile
+
+Select `CONFIG_APPHYPERVACCEPTANCE_STORAGE_TOPOLOGY=y` for a separate,
+default-off storage-only workload. It selects guarded StorVSC read sessions
+and requires a nonempty LU-associated VPD identity for every target; unlike
+the default smoke workload, it cannot fall back to unpinned reads. Configure
+the 32-lowercase-hex-digit
+`CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_RUN_ID`, distinct
+`CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_DISK0_ID` and
+`CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_DISK_NONZERO_ID`, exact positive
+`CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_DISK0_SECTORS` and
+`CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_DISK_NONZERO_SECTORS`, and
+`CONFIG_APPHYPERVACCEPTANCE_TOPOLOGY_NONZERO_LUN=7`. The approved
+two-4-GiB-disk configuration uses 8,388,608 sectors of 512 bytes for
+**each** data disk, `CONFIG_LIBSTORVSC_MAX_DEVICES>=3`, and
+`CONFIG_LIBSTORVSC_MAX_LUNS=4`. Invalid or unset IDs and geometry fail
+before storage I/O.
+
+The workload waits for complete discovery, inventories a coherent generation,
+and reads LBAs 0-1 from each target. Exactly one LUN-0 target must have both
+MBR and primary GPT signatures. Independently on the two selected data disks,
+it reads LBAs 8-9 and compares **both complete 512-byte sectors** against the
+expected policy-2 seed manifest (run ID, distinct disk ID, LUN, exact
+capacity, CRC, and layout). It validates each read session and the final
+inventory; unexpected unseeded LUNs are reported but cannot substitute for
+either required data disk. Only `UK_HYPERV_TOPOLOGY_READ_OK` with
+`HYPERV_TOPOLOGY FINAL PASS` means all three reads and mappings passed.
+An empty inventory is `UNAVAILABLE` only after two coherent, driver-proven
+pristine-empty snapshots with no StorVSC offers. An unbound/rejected offer,
+previously observed storage lifetime, or mappings without an offer fail
+instead. Raw and fixed-VHD local QEMU boots without offered StorVSC can
+demonstrate only this `UNAVAILABLE` path, never a real-device `PASS`.
+On a read timeout, the probe fails closed: its request buffer and read session
+stay pinned while the I/O is outstanding, and subsequent probes cannot reuse
+either. If a delayed completion arrives, a later probe can release the session
+but still fails; only a fresh boot can retry acceptance.
+Serial evidence contains controller/channel/SCSI mappings and diagnostic
+CRC32 fingerprints, not raw run IDs, disk IDs, VPD IDs, or instance GUIDs.
+These CRC32 values are correlation hints, not security identities.
+
+This profile never issues block writes or flushes, does not run the DHCP/network
+workload, and cannot be used as the persistence two-boot workload. Its
+production-backed hosted fixture verifies reverse controller offers, two
+distinct seed reads, wrong-disk and corrupt-copy seed rejection, duplicate
+boot-disk rejection, and zero write/flush commands. A guest-side fixture at
+`support/apps/hyperv-acceptance/tests/topology-workload-test.sh` exercises
+both mapping orders, failure/timeout session ownership, and pristine-empty
+availability entirely offline. Run it with:
+
+```sh
+sh support/apps/hyperv-acceptance/tests/topology-workload-test.sh
+```
+
+The separate
+`support/scripts/hyperv_issue90_topology.py` controller describes offline
+fresh-image and two-seed preparation. Its `solved_config()` requires the
+guarded I/O selected by this profile, but preparation still refuses without
+reviewed-source/solved-config-to-EFI build proof; synthetic evidence cannot
+satisfy that gate. Its live run is **not yet safe**:
+if an Azure create response is lost, it cannot prove the original resource
+identity needed for mandatory owner-checked deletion. Do not allocate Azure
+resources through this lane until that failure path is resolved. The
+one-data-disk runner is not a substitute.
+
+The separate `support/scripts/hyperv_issue90_offline_admission.py` checks a
+fresh private plan against independently reviewed source/config/build/image
+and tool fingerprints, verifies both policy-2 seed VHDs, runs Miz against the
+complete fixed VHD, and executes four fresh local native QEMU boots (including
+real read-only `vpc` boots). It returns `OfflineAdmission` or an explicit
+`OfflineRefusal`, always scoped `offline_only` and never a cloud grant.
+It copies pinned Miz, native runner, and QEMU bytes from verified file
+descriptors into a fresh owner-only directory before execution; that
+directory and the private Git runtime require nonreplaceable ancestors.
+QEMU must provide a real `vpc` block driver; the pinned `cataggar/qemu`
+release used by `prepare` omits it (that path boots the fixed VHD through the
+raw driver), so it cannot pass the `vpc` boots. The runner's fixed q35/KVM
+command loads exactly `kvmvapic.bin` and `vgabios-stdvga.bin`, which QEMU
+resolves relative to its own directory. `OfflineInputs.qemu_support` names
+those two files as `[../]share/[dir/]<rom>` paths: the default is the
+relocatable `share/` layout, while a distribution QEMU in `/usr/bin` typically
+needs `../share/qemu/kvmvapic.bin` and `../share/seavgabios/vgabios-stdvga.bin`.
+Runner and QEMU are copied into a private `bin/` directory, the ROMs into the
+same relative paths, and `qemu_support_sha256` pins each path, size and hash.
+The caller must authenticate the reviewed build and tool pins independently;
+a self-reported build receipt or saved local-boot report is insufficient.
+No private pins, images, QEMU installation, or build proof are supplied here.
+This opt-in verifier does not replace the blocked `prepare` or live cleanup
+gates.
+
+### Outstanding local four-boot proof
+
+Fixtures, parsed or synthesized serial logs, and the default-smoke public CI
+image are **not** physical topology boot evidence. On a capable x86-64 host,
+build a fresh *public* topology-enabled EFI from a recorded source commit and
+solved config with non-secret, distinct local IDs; package and hash its complete
+raw GPT disk and complete fixed VHD independently. Record the source/config,
+EFI, raw, VHD (including footer), QEMU executable, and OVMF firmware SHA-256
+digests. Do not borrow private images, seeds, or Azure resources.
+
+Use the [native local-boot driver](../../tools/hyperv/local_boot/README.md)
+with real x86 QEMU/KVM, `/dev/kvm`, OVMF, and four distinct owned work
+directories. Boot both `--raw-disk` and **actual** `--fixed-vhd` (the native
+driver opens a read-only `vpc` node), each with and without `--disable-x2apic`.
+For every invocation require `--expect-main-return 2`,
+`--expect 'HYPERV_TOPOLOGY FINAL UNAVAILABLE reason=no-devices'` and
+`--require-marker 'HYPERV_TOPOLOGY RESULT UNAVAILABLE'`; forbid
+`HYPERV_TOPOLOGY FINAL PASS`, `UK_HYPERV_TOPOLOGY_READ_OK`,
+`HYPERV_TOPOLOGY TARGET INFO`, `HYPERV_TOPOLOGY OS_READ`,
+`HYPERV_TOPOLOGY DATA_READ`, `HYPERV_PERSISTENCE`, and
+`UK_HYPERV_IO_READY`. Require the
+`Using legacy xAPIC MMIO` marker only in the legacy boot and forbid it in
+the x2APIC boot. Inspect all four complete serial logs for exactly one
+UNAVAILABLE final/result pair, no real-device PASS or crash, and an anchored
+`main returned 2`; retain per-boot runner reports, raw serial hashes and
+input/command provenance. An offline parser test cannot replace any boot.
+
+The older Python `hyperv-azure.py` VHD path opens a **raw prefix** rather than
+a `vpc` node; its VHD-mode log is not proof of a fixed-VHD boot. The native
+driver currently requires `q35,accel=kvm` and a host CPU: a downloaded
+AArch64 QEMU/TCG executable does not make this four-boot recipe runnable on
+an AArch64 host without x86 KVM. QEMU can be obtained from
+[upstream signed source or distribution packages](https://www.qemu.org/download/);
+the repository also pins a public QEMU release in its x86 CI acquisition
+script. Neither acquisition path supplies the missing EFI, firmware, or KVM.
+
+The default private peer inputs are:
+
+| Input | Value |
+| --- | --- |
+| IPv4 | `10.87.0.4` |
+| TCP port | `18887` |
+| UDP port | `18888` |
+| Nonce | `87c0ffee5aa8dfd6` |
+
+Override these with the
+`APPHYPERVACCEPTANCE_PEER_*` and
+`APPHYPERVACCEPTANCE_NONCE` Kconfig values before building. The nonce is exactly
+16 hexadecimal digits without a `0x` prefix. The controller must copy these
+four solved values into its image/run manifest and require the runtime
+`NETWORK_APP_CONFIG` and `NETWORK_APP_FINAL` values to match. Invalid or missing
+endpoint/nonce values fail before traffic. The peer address must be RFC 1918
+and on the acquired interface's subnet, so this path cannot silently use public
+ingress or a default Internet route.
+
+Every application message starts with this 24-byte network-byte-order header:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 4 | ASCII `UKNA` |
+| 4 | 1 | version `1` |
+| 5 | 1 | transport: TCP `1`, UDP `2` |
+| 6 | 1 | direction: guest request `1`, peer response `2` |
+| 7 | 1 | header size `24` |
+| 8 | 4 | sequence |
+| 12 | 4 | body length |
+| 16 | 8 | nonce |
+
+For body byte offset `i`, both endpoints generate:
+
+```text
+(nonce >> ((7 - (i & 7)) * 8))
+^ (sequence >> ((3 - (i & 3)) * 8))
+^ (transport * 0x31)
+^ (direction * 0x57)
+^ (i * 0x1d)
+```
+
+and keep the low eight bits. The peer must validate every request and return
+the same sequence, nonce, and body length with response direction/body bytes.
+Malformed or additional expected-peer responses must not be treated as
+success.
+
+The bounded operation set is:
+
+- TCP: three fresh connections, sequences `1..3`, with body sizes `31`, `1400`,
+  and `257`; the guest writes each stream in repeating `7`, `113`, and `509`
+  byte chunks and accepts arbitrary response segmentation;
+- UDP: one PCB and six request/response datagrams, sequences `0x100..0x105`,
+  with body sizes `19`, `1448`, `73`, `1448`, `257`, and `19`; a 1448-byte
+  body plus the header is a 1472-byte IPv4 UDP payload;
+- DHCP: 12-second deadline;
+- ARP: 5-second deadline with one-second retries;
+- each TCP connection and each UDP exchange: 5-second deadline.
+
+After sending each complete TCP response, the peer must shut down its write
+side to deliver orderly EOF. The guest keeps the PCB callbacks installed and
+does not count success until the request is fully acknowledged, the exact
+response is validated, and that EOF arrives. Delayed extra bytes, a reset, or
+missing EOF fails under the same five-second deadline. The peer must keep the
+UDP source address and port equal to the configured destination.
+
+Stable application markers are:
+
+- `HYPERV_ACCEPTANCE NETWORK_APP_CONFIG`
+- `HYPERV_ACCEPTANCE NETWORK_APP_LEASE`
+- `HYPERV_ACCEPTANCE NETWORK_APP_ARP`
+- `HYPERV_ACCEPTANCE NETWORK_APP_TCP`
+- `HYPERV_ACCEPTANCE NETWORK_APP_UDP`
+- `HYPERV_ACCEPTANCE NETWORK_APP_FINAL`
+- `UK_HYPERV_NET_APP_LEASE`
+- `UK_HYPERV_NET_APP_ARP`
+- `UK_HYPERV_NET_APP_TCP`
+- `UK_HYPERV_NET_APP_UDP`
+- `UK_HYPERV_NETWORK_APP_READY`
+
+The config and final markers report the exact peer IPv4, TCP/UDP ports, and
+nonce for manifest correlation. PASS markers also report connection/datagram,
+byte, chunk/callback, pbuf, adapter-budget, and cleanup counts. No
+application-network marker proves Azure acceptance until a real same-VNet peer
+run produces the exact PASS contract.
+
+## Pinned stack dependency
+
+`network-stack.mk` pins the official
+[`unikraft/lib-lwip`](https://github.com/unikraft/lib-lwip) integration to
+commit `ec55ae17618feeb57c8c10109bcf5c42723e8e95`. The application configuration
+selects upstream `STABLE-2_1_2_RELEASE`; the official integration verifies its
+archive with SHA-256
+`8f0ae46e2702720ce852b00de5d304adb2809b0203741f299876594bb8be7890`.
+Both integrations carry BSD-3-Clause notices in their source files.
+
+Materialize and verify the wrapper below the checkout:
+
+```sh
+make -C support/apps/hyperv-acceptance network-stack
+```
+
+Application-network builds also verify the wrapper commit, origin URL, and
+clean worktree during `prepare`. Do not point `-Dexternal-lib` at an unreviewed
+checkout.
+
+## Protocol fixtures
+
+Run the host-side protocol, production NetVSC, and native-profile fixtures
+without booting a guest on either x86-64 or AArch64:
+
+```sh
+mkdir -p .d/acceptance-tmp .d/acceptance-cache
+TMPDIR="$PWD/.d/acceptance-tmp" \
+XDG_CACHE_HOME="$PWD/.d/acceptance-cache" \
+ZIG_GLOBAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-global" \
+ZIG_LOCAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-local" \
+zig build test-network-regression -j2
+```
+
+The required `test-hyperv-regression` selector includes this coverage, including
+the real worker continuation path after legacy protocol negotiation.
+
+The application fixture includes deterministic multi-pump callback-state
+regressions for a reset PCB with unsent bytes, delayed extra bytes or reset
+after a valid response, orderly EOF, and missing-EOF timeout. It also drives
+endless mock RX and persistent TX-busy statuses through the same bounded
+policy used by the guest, proving that timer/deadline checks and cleanup regain
+control. The NetVSC production fixture separately replenishes mock VMBus
+traffic during a real driver drain, reenters `drain_pending`, verifies exact
+64-packet returns and deferred progress, then covers TX saturation and detach
+cleanup.
+
+## Build the default raw smoke
+
+```sh
+umask 077
+mkdir -p .d/acceptance-tmp .d/acceptance-cache
+cp support/apps/hyperv-acceptance/defconfig \
+  support/apps/hyperv-acceptance/.config
+
+TMPDIR="$PWD/.d/acceptance-tmp" \
+XDG_CACHE_HOME="$PWD/.d/acceptance-cache" \
+ZIG_GLOBAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-global" \
+ZIG_LOCAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-local" \
+zig build olddefconfig -j2 \
+  -Dapp="$PWD/support/apps/hyperv-acceptance" \
+  -Dconfig="$PWD/support/apps/hyperv-acceptance/.config"
+```
+
+Then use the native command below without `-Dexternal-lib`.
+
+## Build the application-network image
+
+```sh
+umask 077
+make -C support/apps/hyperv-acceptance network-stack
+mkdir -p .d/acceptance-tmp .d/acceptance-cache
+cp support/apps/hyperv-acceptance/app-network.defconfig \
+  support/apps/hyperv-acceptance/.config
+
+TMPDIR="$PWD/.d/acceptance-tmp" \
+XDG_CACHE_HOME="$PWD/.d/acceptance-cache" \
+ZIG_GLOBAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-global" \
+ZIG_LOCAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-local" \
+zig build olddefconfig -j2 \
+  -Dapp="$PWD/support/apps/hyperv-acceptance" \
+  -Dconfig="$PWD/support/apps/hyperv-acceptance/.config" \
+  -Dexternal-lib="$PWD/.d/deps/lib-lwip"
+```
+
+Build either solved configuration with:
+
+```sh
+TMPDIR="$PWD/.d/acceptance-tmp" \
+XDG_CACHE_HOME="$PWD/.d/acceptance-cache" \
+ZIG_GLOBAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-global" \
+ZIG_LOCAL_CACHE_DIR="$PWD/.d/acceptance-cache/zig-local" \
+zig build native-images -j2 \
+  -Dapp="$PWD/support/apps/hyperv-acceptance" \
+  -Dconfig="$PWD/support/apps/hyperv-acceptance/.config" \
+  -Dnative-profile=hyperv-x86_64-efi-netvsc \
+  '-Dcompiler=zig cc -target x86_64-freestanding-none' \
+  -Dcompiler-targeted=true \
+  '-Dhost-cc=zig cc' \
+  '-Dhost-cxx=zig c++' \
+  -Dhost-cflags=-fno-sanitize=null \
+  '-Dmake-arg=AR=zig ar' \
+  -Dmake-arg=NM=llvm-nm \
+  -Dmake-arg=OBJCOPY=llvm-objcopy \
+  -Dmake-arg=OBJDUMP=llvm-objdump \
+  -Dmake-arg=READELF=llvm-readelf \
+  -Dmake-arg=STRIP=llvm-strip \
+  -Dmake-arg=UK_CFLAGS=-std=gnu17 \
+  -Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt
+```
+
+For application networking, add
+`-Dexternal-lib="$PWD/.d/deps/lib-lwip"` to that command.
+
+The native image is
+`support/apps/hyperv-acceptance/build/helloworld_hyperv-x86_64-efi-netvsc`.
+The application library retains the native graph's `apphelloworld`
+compatibility name.
+
+## Opt-in persistence workload
+
+`CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE=y` replaces the ordinary probe with a
+destructive workload that is valid only for a disposable, run-owned data disk.
+For the bounded direct-Azure #89 lane, retain the **original** private seed,
+run ID, disk ID, and matching configuration. Do not generate a replacement,
+reseed after Boot 1, or enroll a different disk to retry a failed run. The
+selected native image build consumes the existing configuration with:
+
+```text
+CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE=y
+CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_IDENTITY_POLICY=2
+CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTORS=8388608
+CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_SECTOR_SIZE=512
+CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_LUN=7
+CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_RUN_ID="<original 32 lowercase hex digits>"
+CONFIG_APPHYPERVACCEPTANCE_PERSISTENCE_DISK_ID="<original 32 lowercase hex digits>"
+CONFIG_LIBSTORVSC_MAX_DEVICES=2
+CONFIG_LIBSTORVSC_MAX_LUNS=2
+CONFIG_LIBSTORVSC_LUN_DISCOVERY=y
+CONFIG_LIBSTORVSC_GUARDED_IO=y
+```
+
+The data region is exactly 4 GiB; the fixed VHD adds a 512-byte footer, for a
+file length of 4294967808 bytes. Identical immutable manifests occupy LBAs 8
+and 9, and the footer UUID is the original private disk ID. The controller
+attaches that same managed data disk at LUN 7 and retains the exact image,
+original VM, OS disk, and data disk across deallocation and the sole restart.
+The guest does not use a `ukblkdev` index or controller registration index as
+target authority. OS and unintended disks never acquire write authorization.
+The native synthetic seed helper in `support/tools/hyperv/preparation/seed.zig`
+is fixture-only and is not a replacement-seed path for this run.
+
+Identity policy 1 (`address-v1`, retained for compatibility)
+binds path, target, and LUN in the seed and emits the original `UKPSEED1`,
+`UKPINT01`, and `UKPDONE1` records unchanged. Identity policy 2
+(`seed-enrollment-v2`) fixes LUN, geometry, run ID, and disk ID before the
+build, but deliberately does not guess path or target. The guest considers
+all exact LUN/geometry candidates in one coherent inventory generation,
+rejects unsafe boot-shaped or identity-less candidates, and enrolls path,
+target, controller instance, and VPD only after exactly one private seed
+matches. V2 uses `UKPSEED2`, `UKPINT02`, and `UKPDONE2`; record versions,
+manifest CRC, and explicit policy bytes prevent fallback or cross-policy
+reuse.
+The private JSON `version` and `identity_policy_version` are likewise 1 or 2;
+v2 reports `path` and `target` as `null` because they are enrollment outputs,
+not controller guesses.
+
+The guest opens read sessions only for policy-matching candidates, rejects
+MBR/GPT-shaped media, and requires exactly one matching private manifest with
+a supported nonzero VPD identity. Boot 1 then authorizes that session, flushes
+an intent at LBA 16, writes and verifies deterministic patterns at LBA 0, the
+final LBA, and LBAs 32..47, flushes and verifies again, and flushes a
+completion receipt at LBA 17. Boot 2 requires the complete enrolled address,
+controller, and VPD identity plus a valid receipt, rereads every pattern, then
+rereads both seeds, intent, and receipt. It performs no writes **or flushes**
+and never upgrades its read session. Boot 1 exercises READ/WRITE(10) and
+READ/WRITE(16); the 16-sector extent spans two aligned 4-KiB pages. Boot 2 uses
+the read session's automatic CDB selection. Unsupported commands and any I/O
+or completion error fail, rather than silently skipping coverage.
+
+The controller and LUN limits reserve identities for the life of the boot;
+they are not reusable active-slot limits after removal. Mapping and inventory
+snapshots are observations, not immutable disk pins. Candidate enumeration,
+rejected sessions, the retained candidate, and write authorization are bound
+to one topology generation, and any enumerate, removal, reset, or rebind makes
+the session permanently stale. If an accepted request exceeds the workload
+deadline, its descriptor and DMA storage remain reserved and immutable and
+the workload cannot issue more I/O or end the session during that boot.
+The solved persistence profile must retain the explicit two-controller,
+two-LUN bound and REPORT LUNS discovery (`LIBSTORVSC_LUN_DISCOVERY`), not
+silently restore older defaults when applying the retained seed configuration.
+This admits only the intended OS/data topology, not wider multi-data acceptance.
+`uk_storvsc_discovery_status()` distinguishes pending discovery (`-EAGAIN`)
+from terminal rejection before the workload uses an inventory. Pending status
+is polled within the existing bind deadline; every other negative status fails
+immediately without further workload I/O. Target acquisition and validation
+require complete discovery as well, while release remains available for cleanup.
+Selection brackets inventory enumeration with this status and distinguishes
+terminal discovery errors from transient snapshot errors. Even `-ESTALE` from
+discovery is terminal; it cannot enter the snapshot retry path if the next
+status observation happens to clear.
+The ordinary read-only smoke selects exactly one LUN 0 OS candidate across
+the complete inventory. A LUN 7 data disk registered first cannot become its
+OS target; absent or ambiguous LUN 0 candidates fail rather than guessing a
+controller or registration index. The subsequent MBR/GPT check is still
+required. This is separate from persistence's original-seed target enrollment.
+The legacy inventory API still fails closed on unresolved offers; partial
+inventory is never treated as ready. Observing pending discovery disqualifies
+the later platform-only unavailable result.
+Non-timeout candidate errors release both the rejected session and any earlier
+retained candidate when the driver permits release. Both boots revalidate the
+selected target after their final readback. No boot success, I/O ledger, or
+completion marker is emitted until that validation and session release succeed.
+
+Persistence and application-network workloads are mutually exclusive Kconfig
+choices. The default selection remains the non-destructive storage/network
+smoke probe.
+
+For policy 2 only, a boot that remains storage-pristine through the existing
+bounded bind wait is classified as platform-only unavailable. The driver must
+produce two coherent empty inventory snapshots at
+`UK_STORVSC_TOPOLOGY_PRISTINE_GENERATION`, and must still report that no
+storage offer, session, or I/O activity has ever occurred during the boot.
+The offer observation is sticky at VMBus ingress, so device-pool exhaustion
+before StorVSC admission cannot be misclassified as an empty platform.
+The exact output is:
+
+```text
+HYPERV_PERSISTENCE SELECT UNAVAILABLE reason=no-devices writes=0 flushes=0
+UK_HYPERV_PLATFORM_READY
+UK_HYPERV_PERSISTENCE_UNAVAILABLE:1:2:no-devices
+```
+
+It returns 2 and emits no selection failure, final success, identity,
+Boot 1/Boot 2, write, or completion marker. This is not storage acceptance.
+Policy 1, any nonempty or uncertain inventory, and an empty inventory after
+any earlier offer, topology transition, session, or I/O activity remain
+failures. Controllers must match the complete versioned marker; a generic
+failure or unavailable result is not equivalent.
+
+Stable success markers are:
+
+- `UK_HYPERV_PERSISTENCE_BOOT1_COMPLETE:<run-id>`
+- `UK_HYPERV_PERSISTENCE_BOOT2_COMPLETE:<run-id>`
+- `UK_HYPERV_PERSISTENCE_IO:1:1:<run-id>:5:3:receipt-verified`
+- `UK_HYPERV_PERSISTENCE_IO:1:2:<run-id>:0:0:receipt-verified`
+
+The versioned I/O records are emitted only by policy 2. The Boot 1 counts bind
+the five write requests and three flush requests in the guarded workload,
+including the durable intent and completion receipt. The Boot 2 record binds
+zero writes and zero flushes after readback of the accepted receipt and all
+patterns. Policy 1 output is unchanged.
+
+Each successful selection also emits one bounded private identity record:
+
+```
+UK_HYPERV_PERSISTENCE_IDENTITY:1:<policy>:<run-id>:<disk-id>:<controller-guid>:<path>:<target>:<lun>:<sectors>:<sector-size>:<vpd-length>:<code-set>:<type>:<association>:<vpd-id>
+```
+
+IDs and VPD bytes are lowercase hexadecimal without separators; all other
+fields are unsigned decimal. The controller must keep this line private,
+require the same enrolled identity on Boot 2, and never place real run
+records or the seeded image in public CI artifacts. Public fixtures use only
+synthetic identifiers.
+
+The immutable guest cannot distinguish a controller rollback to the pristine
+seed from a genuine first boot. During the expected second boot, orchestration
+must therefore reject any boot-1/write marker; a receipt alone is not accepted
+without the guest's boot-2 pattern-read marker. Incomplete or corrupt
+intent/receipt state fails closed and is never restarted.
+
+The native parser to reuse is
+`support/tools/hyperv/persistence/evidence.zig`:
+`parse(bytes, boot, input, previous)` returns checked `Evidence`;
+the additive `parseWorkload(bytes, boot, input, previous)` accepts only
+`EvidenceInput { run_id: [32]u8, disk_id: [32]u8, sectors: u64, lun: u8 }`.
+Direct native helpers can import that module without constructing dummy cloud
+authority or engine contracts. The original `parse` signature is unchanged
+and delegates to the same parser. Neither entrypoint admits a cloud operation;
+the caller must independently bind the expected inputs to the retained seed,
+image, and authorized attempt. Boot 2 requires previous evidence for Boot 1,
+not evidence from another Boot 2.
+`boot2Suffix(full, first)` checks the byte-exact Boot 1 prefix before admitting
+the appended Boot 2 serial suffix. Its complete ordered policy-2 contract is
+START, SELECT, IDENTITY, BOOT action PASS, IO ledger, BOOT completion,
+`HYPERV_PERSISTENCE FINAL PASS rc=0`, and `main returned 0` (with the supported
+ukboot log envelope). Missing, duplicate, conflicting, reordered, truncated,
+unknown persistence markers, or any failure are not acceptance.
+Selection errors emit `HYPERV_PERSISTENCE SELECT FAIL rc=<errno> writes=0`;
+post-selection errors emit `HYPERV_PERSISTENCE FINAL FAIL rc=<errno>`.
+Invalid configuration or an abandoned request can instead emit
+`HYPERV_PERSISTENCE FINAL FAIL reason=invalid-expectation|request-owned`.
+
+The controller must durably admit Boot 2 before restarting the same
+deallocated VM. Disk state alone cannot distinguish a third read-only boot
+from Boot 2; preventing any third boot or ambiguous mutation resume is a
+controller obligation, not additional guest write permission. The earlier
+`UK_HYPERV_PLATFORM_READY` marker is never persistence acceptance, and the
+retired nested-host handoff is not evidence for this direct route.
+
+### Native workload regression tests
+
+Run the standalone C fixture and the existing production-backed driver fixture
+from the repository root (Zig 0.16):
+
+```sh
+ZIG=zig sh support/apps/hyperv-acceptance/tests/persistence-workload-test.sh
+export TMPDIR="$PWD/.d/workload-native/scratch"
+export XDG_CACHE_HOME="$PWD/.d/workload-native/cache"
+export ZIG_GLOBAL_CACHE_DIR="$PWD/.d/workload-native/cache/global"
+export ZIG_LOCAL_CACHE_DIR="$PWD/.d/workload-native/cache/local"
+zig build test-hyperv-persistence-workflow -j2
+zig test --dep evidence \
+  -Mroot=support/apps/hyperv-acceptance/tests/persistence-evidence-test.zig \
+  -Mevidence=support/tools/hyperv/persistence/evidence.zig
+```
+
+The C fixture uses only sparse in-memory sectors with 4-GiB/LUN7 geometry,
+including a target registered as block device zero while the boot-shaped OS
+disk has another ID. It checks unchanged seeds and unintended media, first and
+last LBAs, the multi-page extent, read-only Boot 2, exact write/flush counts,
+all request-error and timeout positions, late completion ownership, wrong
+geometry/identity, duplicates, incomplete records, post-read record corruption,
+final topology drift, and session-release errors. The existing driver fixture
+separately covers real StorVSC wire/CDB/scatter-gather and completion paths.
+Neither fixture touches a disk device or establishes live Azure durability.
+The standalone Zig parser fixture exercises the same strict ordered serial
+protocol through the narrow input API, without SDK/controller dependencies.
+It covers valid two-boot evidence, exact accumulated prefixes, fresh-capture
+parsing (not restart attribution), phase refusal, malformed or conflicting
+evidence, identity drift, and nonzero Boot 2 mutation counters.
+
+## Opt-in bounded block-I/O performance benchmark profile
+
+Select `CONFIG_APPHYPERVACCEPTANCE_STORAGE_BENCHMARK=y` (or copy
+`support/apps/hyperv-acceptance/storage-benchmark.defconfig` to
+`support/apps/hyperv-acceptance/.config`) for a separate, default-off,
+strictly read-only storage benchmark workload. It selects
+`CONFIG_LIBSTORVSC_LUN_DISCOVERY=y`, `CONFIG_LIBSTORVSC_GUARDED_IO=y`,
+`CONFIG_LIBUKALLOC_IFSTATS=y`, `CONFIG_LIBSTORVSC_QUEUE_DEPTH=32`, and
+`CONFIG_LIBSTORVSC_MAX_TRANSFER_PAGES=33`, without altering the default smoke,
+application-network, topology, or persistence profiles.
+
+The benchmark reuses policy-2 read-only admission
+(`uk_storvsc_session_begin_read()`) against the uniquely identified disposable
+4-GiB data disk at LUN 7 (`sectors = 8,388,608`, `sector_size = 512`), rejects
+any MBR/GPT boot-shaped disk or duplicate LUN 7 candidate, and never calls
+`uk_storvsc_session_authorize_write()` or issues write/flush requests. It
+verifies disk identity, geometry, policy-2 seed manifests at LBAs 8 and 9, and
+the deterministic fixture window at LBAs 32..47 both **before** warmup and
+**after** all steady-state trials, and validates `uk_storvsc_session_validate()`
+before every submission and after every completion.
+
+Using a pre-allocated ring of up to 32 page-aligned 128-KiB bounce buffers (and
+confirming zero dynamic allocations during steady state via `uk_alloc`
+interface stats), the harness sweeps the 48-cell matrix across:
+
+- access patterns: `seq` (sequential) and `strided` (full-span coprime LBA
+  progression across the 4-GiB disk);
+- request sizes: `4 KiB` (8 sectors), `16 KiB` (32 sectors), `64 KiB` (128
+  sectors), and `128 KiB` (256 sectors);
+- target outstanding queue depths: `QD = 1, 2, 4, 8, 16, 32`.
+
+Each trial separates discovery/setup, uncounted warmup operations, and measured
+steady-state intervals, recording three monotonic timestamps per operation
+(`t_submit`, `t_complete` inside the `uk_blkreq` completion callback, and
+`t_resume` when the poll loop processes the completed slot) and computing exact
+per-trial `p50`, `p95`, `p99`, `min`, `max`, and `mean` latency over the
+pre-allocated per-trial sample array without cross-trial percentile averaging.
+Structured serial records (`UK_HYPERV_STORAGE_BENCHMARK_BEGIN`,
+`UK_HYPERV_STORAGE_BENCHMARK_TRIAL`, `UK_HYPERV_STORAGE_BENCHMARK_CELL`,
+`UK_HYPERV_STORAGE_BENCHMARK_OK`, and `HYPERV_STORAGE_BENCHMARK FINAL PASS`) are
+validated by `support/tools/hyperv/storage_benchmark_evidence.zig`, which also
+emits JSON and Markdown baseline reports bound to commit SHA, config digest,
+image digest, transcript digest, and environment metadata.
+
+Run the host C and Zig benchmark and validator fixtures with:
+
+```sh
+sh support/apps/hyperv-acceptance/tests/storage-benchmark-test.sh
+zig build test-hyperv-storage-benchmark -j2
+```
+

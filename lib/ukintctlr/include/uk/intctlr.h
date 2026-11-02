@@ -17,6 +17,8 @@ export "C" {
 #include <uk/essentials.h>
 #include <uk/lcpu.h>
 
+int uk_intctlr_time_pending_register(void (*hook)(void));
+
 enum uk_intctlr_irq_trigger {
 	UK_INTCTLR_IRQ_TRIGGER_NONE, /* interpreted as "do not change" */
 	UK_INTCTLR_IRQ_TRIGGER_EDGE,

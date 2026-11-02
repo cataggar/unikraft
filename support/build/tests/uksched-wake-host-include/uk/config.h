@@ -1,0 +1,4 @@
+#pragma once
+
+#define CONFIG_LIBUKSCHED_FIXED_SMP 1
+#define CONFIG_UKPLAT_CPU_MAXCOUNT 4

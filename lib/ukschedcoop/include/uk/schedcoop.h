@@ -49,6 +49,32 @@ struct uk_sched *uk_schedcoop_create(struct uk_alloc *a,
 				     struct uk_alloc *axusa,
 				     struct uk_alloc *tls_a);
 
+#if CONFIG_LIBUKSCHEDCOOP_FIXED_SMP
+typedef int (*uk_schedcoop_work_fn_t)(void *arg);
+
+struct uk_sched *uk_schedcoop_create_on(struct uk_alloc *a,
+					struct uk_alloc *sa,
+					struct uk_alloc *auxsa,
+					struct uk_alloc *tls_a,
+					unsigned int lcpu_idx);
+
+/*
+ * Publish one bounded work item to the persistent thread of @lcpu_idx.
+ * If this returns an error with @published set, the work remains committed;
+ * retry only uk_sched_kick_retry(uk_sched_get_lcpu(lcpu_idx), ...).
+ */
+int uk_schedcoop_fixed_submit(unsigned int lcpu_idx,
+			      uk_schedcoop_work_fn_t fn, void *arg,
+			      int *published);
+
+int uk_schedcoop_fixed_wait(unsigned int lcpu_idx, __nsec deadline,
+			    int *work_result, int *completion_kick_error);
+
+int uk_schedcoop_fixed_idle_armed(unsigned int lcpu_idx);
+
+void uk_schedcoop_fixed_destroy(struct uk_sched *sched);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

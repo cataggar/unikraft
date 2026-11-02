@@ -1,0 +1,5678 @@
+{
+  "arrays": {
+    "0f4d806ce864d519fa87c2868c8a8642bc7b1c7c065a3ed4149a6c251656d4d2": [
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "command-supervisor"
+      },
+      {
+        "kind": "literal",
+        "value": "--launch-retained"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "tool:zig"
+      },
+      {
+        "kind": "literal",
+        "value": "build"
+      },
+      {
+        "kind": "literal",
+        "value": "--build-file"
+      },
+      {
+        "kind": "path",
+        "relative": "support/tools/hyperv/local_boot/build.zig",
+        "role": "source"
+      },
+      {
+        "kind": "literal",
+        "value": "--system"
+      },
+      {
+        "kind": "path",
+        "relative": "dependencies/zig-pkg",
+        "role": "work"
+      },
+      {
+        "kind": "literal",
+        "value": "--prefix"
+      },
+      {
+        "kind": "path",
+        "relative": "tools",
+        "role": "work"
+      },
+      {
+        "kind": "literal",
+        "value": "-Doptimize=ReleaseSafe"
+      },
+      {
+        "kind": "literal",
+        "value": "-j2"
+      },
+      {
+        "kind": "literal",
+        "value": "install"
+      }
+    ],
+    "123190c87de2c78c30db014d62867229d675843e555d5be4d433a486e2127a1e": [
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:local_boot_tool"
+      },
+      {
+        "kind": "literal",
+        "value": "--qcow2"
+      },
+      {
+        "kind": "path",
+        "relative": "package/unikraft.qcow2",
+        "role": "work"
+      },
+      {
+        "kind": "literal",
+        "value": "--qemu"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:qemu"
+      },
+      {
+        "kind": "literal",
+        "value": "--ovmf-code"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:ovmf_code"
+      },
+      {
+        "kind": "literal",
+        "value": "--ovmf-vars"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:ovmf_vars"
+      },
+      {
+        "kind": "literal",
+        "value": "--work-dir"
+      },
+      {
+        "kind": "path",
+        "relative": "boot-qcow2-x2apic",
+        "role": "work"
+      },
+      {
+        "kind": "literal",
+        "value": "--expect"
+      },
+      {
+        "kind": "literal",
+        "value": "WAMR_NATIVE_AOT_OK answer=42 teardown=0"
+      },
+      {
+        "kind": "literal",
+        "value": "--expect-main-return"
+      },
+      {
+        "kind": "literal",
+        "value": "0"
+      },
+      {
+        "kind": "literal",
+        "value": "--cpus"
+      },
+      {
+        "kind": "literal",
+        "value": "1"
+      },
+      {
+        "kind": "literal",
+        "value": "--timeout"
+      },
+      {
+        "kind": "literal",
+        "value": "60"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "HYPERV_ACCEPTANCE"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "UK_HYPERV_IO_READY"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "UK_HYPERV_NETWORK_APP_READY"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "UK_HYPERV_PLATFORM_READY"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "WAMR_NATIVE_WASI="
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "WAMR_NATIVE_AOT_FAIL"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "Using legacy xAPIC MMIO"
+      }
+    ],
+    "12546018807cf197dfa5804b30ccc1f986f88917f9cacba8fb9535f780b7c690": [
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:local_boot_tool"
+      },
+      {
+        "kind": "literal",
+        "value": "--qcow2"
+      },
+      {
+        "kind": "path",
+        "relative": "package/unikraft.qcow2",
+        "role": "work"
+      },
+      {
+        "kind": "literal",
+        "value": "--qemu"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:qemu"
+      },
+      {
+        "kind": "literal",
+        "value": "--ovmf-code"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:ovmf_code"
+      },
+      {
+        "kind": "literal",
+        "value": "--ovmf-vars"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:ovmf_vars"
+      },
+      {
+        "kind": "literal",
+        "value": "--work-dir"
+      },
+      {
+        "kind": "path",
+        "relative": "boot-qcow2-legacy-apic",
+        "role": "work"
+      },
+      {
+        "kind": "literal",
+        "value": "--expect"
+      },
+      {
+        "kind": "literal",
+        "value": "WAMR_NATIVE_AOT_OK answer=42 teardown=0"
+      },
+      {
+        "kind": "literal",
+        "value": "--expect-main-return"
+      },
+      {
+        "kind": "literal",
+        "value": "0"
+      },
+      {
+        "kind": "literal",
+        "value": "--cpus"
+      },
+      {
+        "kind": "literal",
+        "value": "1"
+      },
+      {
+        "kind": "literal",
+        "value": "--timeout"
+      },
+      {
+        "kind": "literal",
+        "value": "60"
+      },
+      {
+        "kind": "literal",
+        "value": "--disable-x2apic"
+      },
+      {
+        "kind": "literal",
+        "value": "--require-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "Using legacy xAPIC MMIO"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "HYPERV_ACCEPTANCE"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "UK_HYPERV_IO_READY"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "UK_HYPERV_NETWORK_APP_READY"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "UK_HYPERV_PLATFORM_READY"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "WAMR_NATIVE_WASI="
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "WAMR_NATIVE_AOT_FAIL"
+      }
+    ],
+    "1bc1cf1b6628a0014a5657efa831c916e891e8c5278371d74fd5d1f3feaae9ee": [
+      {
+        "identity": {
+          "content_sha256": "ec7ead7c9dee270aee8581149f1cf16a7cca149da83cd135a58c11e718c0b1c8",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_GIT",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:git"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "90c24f82f6cb4989e0230fbfbb3fc074b2d77ed16e1e53c1c2423dc3db6480c4",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_SUPERVISOR",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "command-supervisor"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "4f1db44aaf2a0280f1f3d55f77abd694421208acd72196b6bd78dae7e6c0aec8",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_BASH",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:bash"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "0876ae9799671a289a4ae01edc652abd8c242681bf7ad3dc538170ef1a2318a7",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_BISON",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:bison"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "98470c8b8d14e3b2d63d2c12a56303b24ddc27c7223a3da7f23be54eb82a7ae5",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_CP",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:cp"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "defd1c080f1b4e6fca9698c6f2f2d4abd7f952525128552e4aa12bfef270b970",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_DASH",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:dash"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "9e4073940d90d5c0155ef77734383e1d0a9f75534004acb0cc9569b0528c6595",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_ENV",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:env"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ce62c6ea60be6f6a7604e17d4c5d54bde21702ef3f60a60e62ef8092f89f8739",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_FLEX",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:flex"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ec7ead7c9dee270aee8581149f1cf16a7cca149da83cd135a58c11e718c0b1c8",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_GIT",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:git"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "73ed9a54527a5dbfef10dd22dbac9f1a2a21d57627e4954b4001f0becb14fc4d",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_LLVM_NM",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-nm"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "806babdf5183584cf645c2920ca900f6555ee5243c53002967f27781a1addad6",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_LLVM_OBJCOPY",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-objcopy"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "3233195bd1d3bcee6450e2dd484d850285bbfe67e5dd6f767e67928642698ac5",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_LLVM_OBJDUMP",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-objdump"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "f2b1624c980645d60d64fe401702de49f6da192bd2579f1871686717ad4a8846",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_LLVM_READELF",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-readelf"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "81207a3dc1c2c544f0d7e720d437fa799f9419b2d81c246b844eed67539aa300",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_LLVM_STRIP",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-strip"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ea5d6d09ef9323c999f74a22614ca910db0a341b2c2e279ff9a1732c91c3c8a5",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_M4",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:m4"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "c68ec2b03160141b6e8586e85ddbfd163aba95ac6a427307be0b1edcb3148ea9",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_MAKE",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:make"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "953075fcf7d2d82ce813bdbc2ee1d1a3dc540201b67b7bfa752ae97da0971286",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_MKDIR",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:mkdir"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ee945465b4682c28fd12c5617a87e89ba40c80600d390c67290472d794ef098f",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_PYTHON3",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:python3"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ad240992ee92233e030dbb6ef878cec675833f6b45b61bb2be4a5f23b683bd23",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_READLINK",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:readlink"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "d947db3dba3410ae0f097000c13af5a5856a9ed6e8754cc2568e459d7398e59e",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_UNAME",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:uname"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ea1161288eb9dc14d84eab85a835f638abc3470aa3b5823a56b86647e3fb3b27",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_ZIG",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:zig"
+        }
+      }
+    ],
+    "2fee9fc5979a079fe21c73a4e6b78190a3ff68923b0ec930ed0dfd666e069d77": [
+      {
+        "identity": {
+          "content_sha256": "ea5d6d09ef9323c999f74a22614ca910db0a341b2c2e279ff9a1732c91c3c8a5",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "M4",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:m4"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ec7ead7c9dee270aee8581149f1cf16a7cca149da83cd135a58c11e718c0b1c8",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_GIT",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:git"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ea1161288eb9dc14d84eab85a835f638abc3470aa3b5823a56b86647e3fb3b27",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_LAUNCH_EXECUTABLE",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:zig"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "90c24f82f6cb4989e0230fbfbb3fc074b2d77ed16e1e53c1c2423dc3db6480c4",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_SUPERVISOR",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "command-supervisor"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "4f1db44aaf2a0280f1f3d55f77abd694421208acd72196b6bd78dae7e6c0aec8",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_BASH",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:bash"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "0876ae9799671a289a4ae01edc652abd8c242681bf7ad3dc538170ef1a2318a7",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_BISON",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:bison"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "98470c8b8d14e3b2d63d2c12a56303b24ddc27c7223a3da7f23be54eb82a7ae5",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_CP",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:cp"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "defd1c080f1b4e6fca9698c6f2f2d4abd7f952525128552e4aa12bfef270b970",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_DASH",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:dash"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "9e4073940d90d5c0155ef77734383e1d0a9f75534004acb0cc9569b0528c6595",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_ENV",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:env"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ce62c6ea60be6f6a7604e17d4c5d54bde21702ef3f60a60e62ef8092f89f8739",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_FLEX",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:flex"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ec7ead7c9dee270aee8581149f1cf16a7cca149da83cd135a58c11e718c0b1c8",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_GIT",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:git"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "73ed9a54527a5dbfef10dd22dbac9f1a2a21d57627e4954b4001f0becb14fc4d",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_LLVM_NM",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-nm"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "806babdf5183584cf645c2920ca900f6555ee5243c53002967f27781a1addad6",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_LLVM_OBJCOPY",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-objcopy"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "3233195bd1d3bcee6450e2dd484d850285bbfe67e5dd6f767e67928642698ac5",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_LLVM_OBJDUMP",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-objdump"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "f2b1624c980645d60d64fe401702de49f6da192bd2579f1871686717ad4a8846",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_LLVM_READELF",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-readelf"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "81207a3dc1c2c544f0d7e720d437fa799f9419b2d81c246b844eed67539aa300",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_LLVM_STRIP",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-strip"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ea5d6d09ef9323c999f74a22614ca910db0a341b2c2e279ff9a1732c91c3c8a5",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_M4",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:m4"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "c68ec2b03160141b6e8586e85ddbfd163aba95ac6a427307be0b1edcb3148ea9",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_MAKE",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:make"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "953075fcf7d2d82ce813bdbc2ee1d1a3dc540201b67b7bfa752ae97da0971286",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_MKDIR",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:mkdir"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ee945465b4682c28fd12c5617a87e89ba40c80600d390c67290472d794ef098f",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_PYTHON3",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:python3"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ad240992ee92233e030dbb6ef878cec675833f6b45b61bb2be4a5f23b683bd23",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_READLINK",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:readlink"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "d947db3dba3410ae0f097000c13af5a5856a9ed6e8754cc2568e459d7398e59e",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_UNAME",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:uname"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ea1161288eb9dc14d84eab85a835f638abc3470aa3b5823a56b86647e3fb3b27",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_ZIG",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:zig"
+        }
+      }
+    ],
+    "44a42bd65beb99ba33e22b8acb389673a8eda6506c61fb08441a3cbd09b553eb": [
+      {
+        "name": "BISON_PKGDATADIR",
+        "value": {
+          "kind": "path",
+          "relative": "bison",
+          "role": "runtime"
+        }
+      },
+      {
+        "name": "HOME",
+        "value": {
+          "kind": "path",
+          "relative": "private",
+          "role": "work"
+        }
+      },
+      {
+        "name": "KCONFIG_CONFIG",
+        "value": {
+          "kind": "path",
+          "relative": "support/apps/wamr-aot/build/.config",
+          "role": "source"
+        }
+      },
+      {
+        "name": "KCONFIG_OVERWRITECONFIG",
+        "value": {
+          "kind": "literal",
+          "value": "1"
+        }
+      },
+      {
+        "name": "LANG",
+        "value": {
+          "kind": "literal",
+          "value": "C"
+        }
+      },
+      {
+        "name": "LC_ALL",
+        "value": {
+          "kind": "literal",
+          "value": "C"
+        }
+      },
+      {
+        "name": "M4",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:m4"
+        }
+      },
+      {
+        "name": "MAKEFLAGS",
+        "value": {
+          "kind": "literal",
+          "value": "-j2"
+        }
+      },
+      {
+        "name": "PATH",
+        "value": {
+          "kind": "literal",
+          "value": "/usr/bin:/bin"
+        }
+      },
+      {
+        "name": "PYTHONDONTWRITEBYTECODE",
+        "value": {
+          "kind": "literal",
+          "value": "1"
+        }
+      },
+      {
+        "name": "TMPDIR",
+        "value": {
+          "kind": "path",
+          "relative": "scratch",
+          "role": "work"
+        }
+      },
+      {
+        "name": "WAMR_CI_GIT",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:git"
+        }
+      },
+      {
+        "name": "WAMR_CI_LAUNCH_EXECUTABLE",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:zig"
+        }
+      },
+      {
+        "name": "WAMR_CI_PORTABLE_CONFIG",
+        "value": {
+          "kind": "literal",
+          "value": "1"
+        }
+      },
+      {
+        "name": "WAMR_CI_SUPERVISOR",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "command-supervisor"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_BASH",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:bash"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_BISON",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:bison"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_CP",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:cp"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_DASH",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:dash"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_ENV",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:env"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_FLEX",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:flex"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_GIT",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:git"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_LLVM_NM",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-nm"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_LLVM_OBJCOPY",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-objcopy"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_LLVM_OBJDUMP",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-objdump"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_LLVM_READELF",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-readelf"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_LLVM_STRIP",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-strip"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_M4",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:m4"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_MAKE",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:make"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_MKDIR",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:mkdir"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_PYTHON3",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:python3"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_READLINK",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:readlink"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_UNAME",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:uname"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_ZIG",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:zig"
+        }
+      },
+      {
+        "name": "ZIG_GLOBAL_CACHE_DIR",
+        "value": {
+          "kind": "path",
+          "relative": "global-cache",
+          "role": "work"
+        }
+      },
+      {
+        "name": "ZIG_LIB_DIR",
+        "value": {
+          "kind": "path",
+          "relative": "lib",
+          "role": "tool-tree:zig"
+        }
+      },
+      {
+        "name": "ZIG_LOCAL_CACHE_DIR",
+        "value": {
+          "kind": "path",
+          "relative": "cache",
+          "role": "work"
+        }
+      }
+    ],
+    "47814a56540785f87e9edbd9cddc90b172e698478af9fb437cadaad00c06e8ea": [
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:local_boot_tool"
+      },
+      {
+        "kind": "literal",
+        "value": "--fixed-vhd"
+      },
+      {
+        "kind": "path",
+        "relative": "package/unikraft-derived.vhd",
+        "role": "work"
+      },
+      {
+        "kind": "literal",
+        "value": "--qemu"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:qemu"
+      },
+      {
+        "kind": "literal",
+        "value": "--ovmf-code"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:ovmf_code"
+      },
+      {
+        "kind": "literal",
+        "value": "--ovmf-vars"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:ovmf_vars"
+      },
+      {
+        "kind": "literal",
+        "value": "--work-dir"
+      },
+      {
+        "kind": "path",
+        "relative": "boot-vpc-x2apic",
+        "role": "work"
+      },
+      {
+        "kind": "literal",
+        "value": "--expect"
+      },
+      {
+        "kind": "literal",
+        "value": "WAMR_NATIVE_AOT_OK answer=42 teardown=0"
+      },
+      {
+        "kind": "literal",
+        "value": "--expect-main-return"
+      },
+      {
+        "kind": "literal",
+        "value": "0"
+      },
+      {
+        "kind": "literal",
+        "value": "--cpus"
+      },
+      {
+        "kind": "literal",
+        "value": "1"
+      },
+      {
+        "kind": "literal",
+        "value": "--timeout"
+      },
+      {
+        "kind": "literal",
+        "value": "60"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "HYPERV_ACCEPTANCE"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "UK_HYPERV_IO_READY"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "UK_HYPERV_NETWORK_APP_READY"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "UK_HYPERV_PLATFORM_READY"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "WAMR_NATIVE_WASI="
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "WAMR_NATIVE_AOT_FAIL"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "Using legacy xAPIC MMIO"
+      }
+    ],
+    "67cc4198ae3d58ccfb7d73542f6561b32d55bbbc6c08cb4c733352556c5466a5": [
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "native:wamr-aot-build"
+      },
+      {
+        "kind": "literal",
+        "value": "prepare"
+      },
+      {
+        "kind": "literal",
+        "value": "--repository"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "source"
+      },
+      {
+        "kind": "literal",
+        "value": "--source-archive"
+      },
+      {
+        "kind": "path",
+        "relative": "custody/wamr-source.tar",
+        "role": "runtime"
+      }
+    ],
+    "697a0fffbdfea313bad027c70fca257f56a386a79b1eecf11cfc7e7235e2c09b": [
+      {
+        "name": "BISON_PKGDATADIR",
+        "value": {
+          "kind": "path",
+          "relative": "bison",
+          "role": "runtime"
+        }
+      },
+      {
+        "name": "HOME",
+        "value": {
+          "kind": "path",
+          "relative": "private",
+          "role": "work"
+        }
+      },
+      {
+        "name": "KCONFIG_CONFIG",
+        "value": {
+          "kind": "path",
+          "relative": "support/apps/wamr-aot/build/.config",
+          "role": "source"
+        }
+      },
+      {
+        "name": "KCONFIG_OVERWRITECONFIG",
+        "value": {
+          "kind": "literal",
+          "value": "1"
+        }
+      },
+      {
+        "name": "LANG",
+        "value": {
+          "kind": "literal",
+          "value": "C"
+        }
+      },
+      {
+        "name": "LC_ALL",
+        "value": {
+          "kind": "literal",
+          "value": "C"
+        }
+      },
+      {
+        "name": "M4",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:m4"
+        }
+      },
+      {
+        "name": "MAKEFLAGS",
+        "value": {
+          "kind": "literal",
+          "value": "-j2"
+        }
+      },
+      {
+        "name": "PATH",
+        "value": {
+          "kind": "literal",
+          "value": "/usr/bin:/bin"
+        }
+      },
+      {
+        "name": "PYTHONDONTWRITEBYTECODE",
+        "value": {
+          "kind": "literal",
+          "value": "1"
+        }
+      },
+      {
+        "name": "TMPDIR",
+        "value": {
+          "kind": "path",
+          "relative": "scratch",
+          "role": "work"
+        }
+      },
+      {
+        "name": "WAMR_CI_GIT",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:git"
+        }
+      },
+      {
+        "name": "WAMR_CI_LOG_VALIDATE",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "native:wamr-log-validate"
+        }
+      },
+      {
+        "name": "WAMR_CI_PACKAGE",
+        "value": {
+          "kind": "path",
+          "relative": "tools/bin/wamr-ci-package",
+          "role": "work"
+        }
+      },
+      {
+        "name": "WAMR_CI_PORTABLE_CONFIG",
+        "value": {
+          "kind": "literal",
+          "value": "1"
+        }
+      },
+      {
+        "name": "WAMR_CI_PYTHON",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:python3"
+        }
+      },
+      {
+        "name": "WAMR_CI_SUPERVISOR",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "command-supervisor"
+        }
+      },
+      {
+        "name": "WAMR_CI_SUPERVISOR_FIXTURE",
+        "value": {
+          "kind": "path",
+          "relative": "tools/bin/wamr-ci-supervisor-fixture",
+          "role": "work"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_BASH",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:bash"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_BISON",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:bison"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_CP",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:cp"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_DASH",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:dash"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_ENV",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:env"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_FLEX",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:flex"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_GIT",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:git"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_LLVM_NM",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-nm"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_LLVM_OBJCOPY",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-objcopy"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_LLVM_OBJDUMP",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-objdump"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_LLVM_READELF",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-readelf"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_LLVM_STRIP",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-strip"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_M4",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:m4"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_MAKE",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:make"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_MKDIR",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:mkdir"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_PYTHON3",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:python3"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_READLINK",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:readlink"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_UNAME",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:uname"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_ZIG",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:zig"
+        }
+      },
+      {
+        "name": "ZIG_GLOBAL_CACHE_DIR",
+        "value": {
+          "kind": "path",
+          "relative": "global-cache",
+          "role": "work"
+        }
+      },
+      {
+        "name": "ZIG_LIB_DIR",
+        "value": {
+          "kind": "path",
+          "relative": "lib",
+          "role": "tool-tree:zig"
+        }
+      },
+      {
+        "name": "ZIG_LOCAL_CACHE_DIR",
+        "value": {
+          "kind": "path",
+          "relative": "cache",
+          "role": "work"
+        }
+      }
+    ],
+    "6d5523fa70181ae3d9d1dcd437a89d87de7758960885376525fa89d5ad622cf6": [
+      {
+        "name": "HOME",
+        "value": {
+          "kind": "path",
+          "relative": "private",
+          "role": "work"
+        }
+      },
+      {
+        "name": "LANG",
+        "value": {
+          "kind": "literal",
+          "value": "C"
+        }
+      },
+      {
+        "name": "LC_ALL",
+        "value": {
+          "kind": "literal",
+          "value": "C"
+        }
+      },
+      {
+        "name": "PATH",
+        "value": {
+          "kind": "literal",
+          "value": "/usr/bin:/bin"
+        }
+      },
+      {
+        "name": "PYTHONDONTWRITEBYTECODE",
+        "value": {
+          "kind": "literal",
+          "value": "1"
+        }
+      },
+      {
+        "name": "TMPDIR",
+        "value": {
+          "kind": "path",
+          "relative": "private",
+          "role": "work"
+        }
+      },
+      {
+        "name": "WAMR_CI_GIT",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:git"
+        }
+      },
+      {
+        "name": "WAMR_CI_SUPERVISOR",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "command-supervisor"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_BASH",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:bash"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_BISON",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:bison"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_CP",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:cp"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_DASH",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:dash"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_ENV",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:env"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_FLEX",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:flex"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_GIT",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:git"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_LLVM_NM",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-nm"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_LLVM_OBJCOPY",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-objcopy"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_LLVM_OBJDUMP",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-objdump"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_LLVM_READELF",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-readelf"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_LLVM_STRIP",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-strip"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_M4",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:m4"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_MAKE",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:make"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_MKDIR",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:mkdir"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_PYTHON3",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:python3"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_READLINK",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:readlink"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_UNAME",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:uname"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_ZIG",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:zig"
+        }
+      }
+    ],
+    "6e0f73fe7cee4e6d081638fd4eb71d54b5453e2ada5e5d50b8b92721fbb65ff8": [
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "native:wamr-log-validate"
+      },
+      {
+        "kind": "literal",
+        "value": "tiny"
+      },
+      {
+        "kind": "literal",
+        "value": "--log"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:serial"
+      },
+      {
+        "kind": "literal",
+        "value": "--identity"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:identity"
+      },
+      {
+        "kind": "literal",
+        "value": "--legacy-apic"
+      },
+      {
+        "kind": "literal",
+        "value": "forbidden"
+      },
+      {
+        "kind": "literal",
+        "value": "--output"
+      },
+      {
+        "kind": "literal",
+        "value": "json-v1"
+      }
+    ],
+    "736ec9de0b1b4a8ef14a373198bf707407cd14ee1ae64bd763ea5b5e88e279e4": [
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:local_boot_tool"
+      },
+      {
+        "kind": "literal",
+        "value": "--fixed-vhd"
+      },
+      {
+        "kind": "path",
+        "relative": "package/unikraft-derived.vhd",
+        "role": "work"
+      },
+      {
+        "kind": "literal",
+        "value": "--qemu"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:qemu"
+      },
+      {
+        "kind": "literal",
+        "value": "--ovmf-code"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:ovmf_code"
+      },
+      {
+        "kind": "literal",
+        "value": "--ovmf-vars"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:ovmf_vars"
+      },
+      {
+        "kind": "literal",
+        "value": "--work-dir"
+      },
+      {
+        "kind": "path",
+        "relative": "boot-vpc-legacy-apic",
+        "role": "work"
+      },
+      {
+        "kind": "literal",
+        "value": "--expect"
+      },
+      {
+        "kind": "literal",
+        "value": "WAMR_NATIVE_AOT_OK answer=42 teardown=0"
+      },
+      {
+        "kind": "literal",
+        "value": "--expect-main-return"
+      },
+      {
+        "kind": "literal",
+        "value": "0"
+      },
+      {
+        "kind": "literal",
+        "value": "--cpus"
+      },
+      {
+        "kind": "literal",
+        "value": "1"
+      },
+      {
+        "kind": "literal",
+        "value": "--timeout"
+      },
+      {
+        "kind": "literal",
+        "value": "60"
+      },
+      {
+        "kind": "literal",
+        "value": "--disable-x2apic"
+      },
+      {
+        "kind": "literal",
+        "value": "--require-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "Using legacy xAPIC MMIO"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "HYPERV_ACCEPTANCE"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "UK_HYPERV_IO_READY"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "UK_HYPERV_NETWORK_APP_READY"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "UK_HYPERV_PLATFORM_READY"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "WAMR_NATIVE_WASI="
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "WAMR_NATIVE_AOT_FAIL"
+      }
+    ],
+    "7484b72dd284dd5da2f3f42ce975fa8ba0019ea2c9f9444ccba433f84b7b7e3b": [
+      {
+        "name": "HOME",
+        "value": {
+          "kind": "path",
+          "relative": "private",
+          "role": "work"
+        }
+      },
+      {
+        "name": "LANG",
+        "value": {
+          "kind": "literal",
+          "value": "C"
+        }
+      },
+      {
+        "name": "LC_ALL",
+        "value": {
+          "kind": "literal",
+          "value": "C"
+        }
+      },
+      {
+        "name": "PATH",
+        "value": {
+          "kind": "literal",
+          "value": "/usr/bin:/bin"
+        }
+      },
+      {
+        "name": "PYTHONDONTWRITEBYTECODE",
+        "value": {
+          "kind": "literal",
+          "value": "1"
+        }
+      },
+      {
+        "name": "TMPDIR",
+        "value": {
+          "kind": "path",
+          "relative": "private",
+          "role": "work"
+        }
+      },
+      {
+        "name": "WAMR_CI_SUPERVISOR",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "command-supervisor"
+        }
+      }
+    ],
+    "86c850531be48becce85ca60025b603b40401196d4c7561d47c2c1d1237afc5d": [
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:local_boot_tool"
+      },
+      {
+        "kind": "literal",
+        "value": "--raw-disk"
+      },
+      {
+        "kind": "path",
+        "relative": "package/unikraft.raw",
+        "role": "work"
+      },
+      {
+        "kind": "literal",
+        "value": "--qemu"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:qemu"
+      },
+      {
+        "kind": "literal",
+        "value": "--ovmf-code"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:ovmf_code"
+      },
+      {
+        "kind": "literal",
+        "value": "--ovmf-vars"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:ovmf_vars"
+      },
+      {
+        "kind": "literal",
+        "value": "--work-dir"
+      },
+      {
+        "kind": "path",
+        "relative": "boot-raw-legacy-apic",
+        "role": "work"
+      },
+      {
+        "kind": "literal",
+        "value": "--expect"
+      },
+      {
+        "kind": "literal",
+        "value": "WAMR_NATIVE_AOT_OK answer=42 teardown=0"
+      },
+      {
+        "kind": "literal",
+        "value": "--expect-main-return"
+      },
+      {
+        "kind": "literal",
+        "value": "0"
+      },
+      {
+        "kind": "literal",
+        "value": "--cpus"
+      },
+      {
+        "kind": "literal",
+        "value": "1"
+      },
+      {
+        "kind": "literal",
+        "value": "--timeout"
+      },
+      {
+        "kind": "literal",
+        "value": "60"
+      },
+      {
+        "kind": "literal",
+        "value": "--disable-x2apic"
+      },
+      {
+        "kind": "literal",
+        "value": "--require-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "Using legacy xAPIC MMIO"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "HYPERV_ACCEPTANCE"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "UK_HYPERV_IO_READY"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "UK_HYPERV_NETWORK_APP_READY"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "UK_HYPERV_PLATFORM_READY"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "WAMR_NATIVE_WASI="
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "WAMR_NATIVE_AOT_FAIL"
+      }
+    ],
+    "997ef213f2bab11a170df5f48b6004d200117e5588ab85284cc3245e589f7a96": [
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "native:wamr-log-validate"
+      },
+      {
+        "kind": "literal",
+        "value": "tiny"
+      },
+      {
+        "kind": "literal",
+        "value": "--log"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:serial"
+      },
+      {
+        "kind": "literal",
+        "value": "--identity"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:identity"
+      },
+      {
+        "kind": "literal",
+        "value": "--legacy-apic"
+      },
+      {
+        "kind": "literal",
+        "value": "required"
+      },
+      {
+        "kind": "literal",
+        "value": "--output"
+      },
+      {
+        "kind": "literal",
+        "value": "json-v1"
+      }
+    ],
+    "a4501ec37b66449f6c5a50a0df2454b891e1819fb61328637dc8b98ee01c2c15": [
+      {
+        "identity": {
+          "content_sha256": "ea5d6d09ef9323c999f74a22614ca910db0a341b2c2e279ff9a1732c91c3c8a5",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "M4",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:m4"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ec7ead7c9dee270aee8581149f1cf16a7cca149da83cd135a58c11e718c0b1c8",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_GIT",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:git"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "90c24f82f6cb4989e0230fbfbb3fc074b2d77ed16e1e53c1c2423dc3db6480c4",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_SUPERVISOR",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "command-supervisor"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "4f1db44aaf2a0280f1f3d55f77abd694421208acd72196b6bd78dae7e6c0aec8",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_BASH",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:bash"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "0876ae9799671a289a4ae01edc652abd8c242681bf7ad3dc538170ef1a2318a7",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_BISON",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:bison"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "98470c8b8d14e3b2d63d2c12a56303b24ddc27c7223a3da7f23be54eb82a7ae5",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_CP",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:cp"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "defd1c080f1b4e6fca9698c6f2f2d4abd7f952525128552e4aa12bfef270b970",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_DASH",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:dash"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "9e4073940d90d5c0155ef77734383e1d0a9f75534004acb0cc9569b0528c6595",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_ENV",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:env"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ce62c6ea60be6f6a7604e17d4c5d54bde21702ef3f60a60e62ef8092f89f8739",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_FLEX",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:flex"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ec7ead7c9dee270aee8581149f1cf16a7cca149da83cd135a58c11e718c0b1c8",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_GIT",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:git"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "73ed9a54527a5dbfef10dd22dbac9f1a2a21d57627e4954b4001f0becb14fc4d",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_LLVM_NM",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-nm"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "806babdf5183584cf645c2920ca900f6555ee5243c53002967f27781a1addad6",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_LLVM_OBJCOPY",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-objcopy"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "3233195bd1d3bcee6450e2dd484d850285bbfe67e5dd6f767e67928642698ac5",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_LLVM_OBJDUMP",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-objdump"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "f2b1624c980645d60d64fe401702de49f6da192bd2579f1871686717ad4a8846",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_LLVM_READELF",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-readelf"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "81207a3dc1c2c544f0d7e720d437fa799f9419b2d81c246b844eed67539aa300",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_LLVM_STRIP",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-strip"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ea5d6d09ef9323c999f74a22614ca910db0a341b2c2e279ff9a1732c91c3c8a5",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_M4",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:m4"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "c68ec2b03160141b6e8586e85ddbfd163aba95ac6a427307be0b1edcb3148ea9",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_MAKE",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:make"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "953075fcf7d2d82ce813bdbc2ee1d1a3dc540201b67b7bfa752ae97da0971286",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_MKDIR",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:mkdir"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ee945465b4682c28fd12c5617a87e89ba40c80600d390c67290472d794ef098f",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_PYTHON3",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:python3"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ad240992ee92233e030dbb6ef878cec675833f6b45b61bb2be4a5f23b683bd23",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_READLINK",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:readlink"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "d947db3dba3410ae0f097000c13af5a5856a9ed6e8754cc2568e459d7398e59e",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_UNAME",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:uname"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ea1161288eb9dc14d84eab85a835f638abc3470aa3b5823a56b86647e3fb3b27",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_ZIG",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:zig"
+        }
+      }
+    ],
+    "ae7c7e72b5eebeee4294c005055c5766cd2d72afbf4392b64d3bebaf40b54df6": [
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:local_boot_tool"
+      },
+      {
+        "kind": "literal",
+        "value": "--raw-disk"
+      },
+      {
+        "kind": "path",
+        "relative": "package/unikraft.raw",
+        "role": "work"
+      },
+      {
+        "kind": "literal",
+        "value": "--qemu"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:qemu"
+      },
+      {
+        "kind": "literal",
+        "value": "--ovmf-code"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:ovmf_code"
+      },
+      {
+        "kind": "literal",
+        "value": "--ovmf-vars"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:ovmf_vars"
+      },
+      {
+        "kind": "literal",
+        "value": "--work-dir"
+      },
+      {
+        "kind": "path",
+        "relative": "boot-raw-x2apic",
+        "role": "work"
+      },
+      {
+        "kind": "literal",
+        "value": "--expect"
+      },
+      {
+        "kind": "literal",
+        "value": "WAMR_NATIVE_AOT_OK answer=42 teardown=0"
+      },
+      {
+        "kind": "literal",
+        "value": "--expect-main-return"
+      },
+      {
+        "kind": "literal",
+        "value": "0"
+      },
+      {
+        "kind": "literal",
+        "value": "--cpus"
+      },
+      {
+        "kind": "literal",
+        "value": "1"
+      },
+      {
+        "kind": "literal",
+        "value": "--timeout"
+      },
+      {
+        "kind": "literal",
+        "value": "60"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "HYPERV_ACCEPTANCE"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "UK_HYPERV_IO_READY"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "UK_HYPERV_NETWORK_APP_READY"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "UK_HYPERV_PLATFORM_READY"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "WAMR_NATIVE_WASI="
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "WAMR_NATIVE_AOT_FAIL"
+      },
+      {
+        "kind": "literal",
+        "value": "--forbid-marker"
+      },
+      {
+        "kind": "literal",
+        "value": "Using legacy xAPIC MMIO"
+      }
+    ],
+    "b3264b588b6fde99fd646b7032b697622306bf493aa39af8c313ddb6fc560432": [
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "tool:python3"
+      },
+      {
+        "kind": "literal",
+        "value": "-m"
+      },
+      {
+        "kind": "literal",
+        "value": "unittest"
+      },
+      {
+        "kind": "literal",
+        "value": "discover"
+      },
+      {
+        "kind": "literal",
+        "value": "-s"
+      },
+      {
+        "kind": "path",
+        "relative": "support/build/wamr-native-ci/tests",
+        "role": "source"
+      },
+      {
+        "kind": "literal",
+        "value": "-v"
+      }
+    ],
+    "b4062e3f42e45300692ea929ecccac9280eef6cbeec6bf51020dc375b54b8562": [
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "command-supervisor"
+      },
+      {
+        "kind": "literal",
+        "value": "--launch-retained"
+      },
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "tool:zig"
+      },
+      {
+        "kind": "literal",
+        "value": "build"
+      },
+      {
+        "kind": "literal",
+        "value": "--build-file"
+      },
+      {
+        "kind": "path",
+        "relative": "support/build/wamr-native-ci/build.zig",
+        "role": "source"
+      },
+      {
+        "kind": "literal",
+        "value": "--system"
+      },
+      {
+        "kind": "path",
+        "relative": "dependencies/zig-pkg",
+        "role": "work"
+      },
+      {
+        "kind": "literal",
+        "value": "--prefix"
+      },
+      {
+        "kind": "path",
+        "relative": "tools",
+        "role": "work"
+      },
+      {
+        "kind": "literal",
+        "value": "-Doptimize=ReleaseSafe"
+      },
+      {
+        "kind": "literal",
+        "value": "-j2"
+      },
+      {
+        "kind": "literal",
+        "value": "test-unit"
+      },
+      {
+        "kind": "literal",
+        "value": "install"
+      }
+    ],
+    "b9507700e1031cf799e34adf7100edeefbb91e52ab72712bf4fb95530da312f8": [
+      "support/build/wamr-native-ci/build.zig.zon",
+      "support/build/wamr-native-ci/run.py",
+      "support/build/wamr-native-ci/supervisor.build.zig",
+      "support/build/wamr-native-ci/supervisor.zig",
+      "support/tools/hyperv/contracts.zig",
+      "support/tools/hyperv/core.zig",
+      "support/tools/hyperv/diagnostics.zig",
+      "support/tools/hyperv/private_files.zig",
+      "support/tools/hyperv/process-command-v1.json",
+      "support/tools/hyperv/process.zig",
+      "support/tools/hyperv/sensitive.zig",
+      "support/tools/hyperv/sha256.zig",
+      "support/tools/hyperv/sha256_clear_upper.S"
+    ],
+    "c81d6a62cdd3447f4c5d649a083a8ac5d8ae24d9a5ecb625b3a913e43f265153": [
+      "WAMR_CI_GIT",
+      "WAMR_CI_SUPERVISOR",
+      "WAMR_CI_TOOL_BASH",
+      "WAMR_CI_TOOL_BISON",
+      "WAMR_CI_TOOL_CP",
+      "WAMR_CI_TOOL_DASH",
+      "WAMR_CI_TOOL_ENV",
+      "WAMR_CI_TOOL_FLEX",
+      "WAMR_CI_TOOL_GIT",
+      "WAMR_CI_TOOL_LLVM_NM",
+      "WAMR_CI_TOOL_LLVM_OBJCOPY",
+      "WAMR_CI_TOOL_LLVM_OBJDUMP",
+      "WAMR_CI_TOOL_LLVM_READELF",
+      "WAMR_CI_TOOL_LLVM_STRIP",
+      "WAMR_CI_TOOL_M4",
+      "WAMR_CI_TOOL_MAKE",
+      "WAMR_CI_TOOL_MKDIR",
+      "WAMR_CI_TOOL_PYTHON3",
+      "WAMR_CI_TOOL_READLINK",
+      "WAMR_CI_TOOL_UNAME",
+      "WAMR_CI_TOOL_ZIG"
+    ],
+    "cb9b36dc172009705007e32741d97e7bddf6c8f501ba84cdc0a6910872c59370": [
+      {
+        "name": "BISON_PKGDATADIR",
+        "value": {
+          "kind": "path",
+          "relative": "bison",
+          "role": "runtime"
+        }
+      },
+      {
+        "name": "HOME",
+        "value": {
+          "kind": "path",
+          "relative": "private",
+          "role": "work"
+        }
+      },
+      {
+        "name": "KCONFIG_CONFIG",
+        "value": {
+          "kind": "path",
+          "relative": "support/apps/wamr-aot/build/.config",
+          "role": "source"
+        }
+      },
+      {
+        "name": "KCONFIG_OVERWRITECONFIG",
+        "value": {
+          "kind": "literal",
+          "value": "1"
+        }
+      },
+      {
+        "name": "LANG",
+        "value": {
+          "kind": "literal",
+          "value": "C"
+        }
+      },
+      {
+        "name": "LC_ALL",
+        "value": {
+          "kind": "literal",
+          "value": "C"
+        }
+      },
+      {
+        "name": "M4",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:m4"
+        }
+      },
+      {
+        "name": "MAKEFLAGS",
+        "value": {
+          "kind": "literal",
+          "value": "-j2"
+        }
+      },
+      {
+        "name": "PATH",
+        "value": {
+          "kind": "literal",
+          "value": "/usr/bin:/bin"
+        }
+      },
+      {
+        "name": "PYTHONDONTWRITEBYTECODE",
+        "value": {
+          "kind": "literal",
+          "value": "1"
+        }
+      },
+      {
+        "name": "TMPDIR",
+        "value": {
+          "kind": "path",
+          "relative": "scratch",
+          "role": "work"
+        }
+      },
+      {
+        "name": "WAMR_CI_GIT",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:git"
+        }
+      },
+      {
+        "name": "WAMR_CI_PORTABLE_CONFIG",
+        "value": {
+          "kind": "literal",
+          "value": "1"
+        }
+      },
+      {
+        "name": "WAMR_CI_SUPERVISOR",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "command-supervisor"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_BASH",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:bash"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_BISON",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:bison"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_CP",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:cp"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_DASH",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:dash"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_ENV",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:env"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_FLEX",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:flex"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_GIT",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:git"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_LLVM_NM",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-nm"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_LLVM_OBJCOPY",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-objcopy"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_LLVM_OBJDUMP",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-objdump"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_LLVM_READELF",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-readelf"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_LLVM_STRIP",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-strip"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_M4",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:m4"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_MAKE",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:make"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_MKDIR",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:mkdir"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_PYTHON3",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:python3"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_READLINK",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:readlink"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_UNAME",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:uname"
+        }
+      },
+      {
+        "name": "WAMR_CI_TOOL_ZIG",
+        "value": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:zig"
+        }
+      },
+      {
+        "name": "ZIG_GLOBAL_CACHE_DIR",
+        "value": {
+          "kind": "path",
+          "relative": "global-cache",
+          "role": "work"
+        }
+      },
+      {
+        "name": "ZIG_LIB_DIR",
+        "value": {
+          "kind": "path",
+          "relative": "lib",
+          "role": "tool-tree:zig"
+        }
+      },
+      {
+        "name": "ZIG_LOCAL_CACHE_DIR",
+        "value": {
+          "kind": "path",
+          "relative": "cache",
+          "role": "work"
+        }
+      }
+    ],
+    "e19449ecc2a5cbd6fef26c9d31fed0ded33587afbd00f33a994eb8e419e4c96a": [
+      {
+        "identity": {
+          "content_sha256": "ea5d6d09ef9323c999f74a22614ca910db0a341b2c2e279ff9a1732c91c3c8a5",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "M4",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:m4"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ec7ead7c9dee270aee8581149f1cf16a7cca149da83cd135a58c11e718c0b1c8",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_GIT",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:git"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "4a331a76401a6d14ff31ab8c6c59160ff6843bf955a97f55275c80418239a75e",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_LOG_VALIDATE",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "native:wamr-log-validate"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ee945465b4682c28fd12c5617a87e89ba40c80600d390c67290472d794ef098f",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_PYTHON",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:python3"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "90c24f82f6cb4989e0230fbfbb3fc074b2d77ed16e1e53c1c2423dc3db6480c4",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_SUPERVISOR",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "command-supervisor"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "4f1db44aaf2a0280f1f3d55f77abd694421208acd72196b6bd78dae7e6c0aec8",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_BASH",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:bash"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "0876ae9799671a289a4ae01edc652abd8c242681bf7ad3dc538170ef1a2318a7",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_BISON",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:bison"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "98470c8b8d14e3b2d63d2c12a56303b24ddc27c7223a3da7f23be54eb82a7ae5",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_CP",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:cp"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "defd1c080f1b4e6fca9698c6f2f2d4abd7f952525128552e4aa12bfef270b970",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_DASH",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:dash"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "9e4073940d90d5c0155ef77734383e1d0a9f75534004acb0cc9569b0528c6595",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_ENV",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:env"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ce62c6ea60be6f6a7604e17d4c5d54bde21702ef3f60a60e62ef8092f89f8739",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_FLEX",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:flex"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ec7ead7c9dee270aee8581149f1cf16a7cca149da83cd135a58c11e718c0b1c8",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_GIT",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:git"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "73ed9a54527a5dbfef10dd22dbac9f1a2a21d57627e4954b4001f0becb14fc4d",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_LLVM_NM",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-nm"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "806babdf5183584cf645c2920ca900f6555ee5243c53002967f27781a1addad6",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_LLVM_OBJCOPY",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-objcopy"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "3233195bd1d3bcee6450e2dd484d850285bbfe67e5dd6f767e67928642698ac5",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_LLVM_OBJDUMP",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-objdump"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "f2b1624c980645d60d64fe401702de49f6da192bd2579f1871686717ad4a8846",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_LLVM_READELF",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-readelf"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "81207a3dc1c2c544f0d7e720d437fa799f9419b2d81c246b844eed67539aa300",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_LLVM_STRIP",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:llvm-strip"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ea5d6d09ef9323c999f74a22614ca910db0a341b2c2e279ff9a1732c91c3c8a5",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_M4",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:m4"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "c68ec2b03160141b6e8586e85ddbfd163aba95ac6a427307be0b1edcb3148ea9",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_MAKE",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:make"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "953075fcf7d2d82ce813bdbc2ee1d1a3dc540201b67b7bfa752ae97da0971286",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_MKDIR",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:mkdir"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ee945465b4682c28fd12c5617a87e89ba40c80600d390c67290472d794ef098f",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_PYTHON3",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:python3"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ad240992ee92233e030dbb6ef878cec675833f6b45b61bb2be4a5f23b683bd23",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_READLINK",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:readlink"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "d947db3dba3410ae0f097000c13af5a5856a9ed6e8754cc2568e459d7398e59e",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_UNAME",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:uname"
+        }
+      },
+      {
+        "identity": {
+          "content_sha256": "ea1161288eb9dc14d84eab85a835f638abc3470aa3b5823a56b86647e3fb3b27",
+          "ctime_nanoseconds": 1,
+          "ctime_seconds": 1,
+          "device_major": 1,
+          "device_minor": 2,
+          "inode": 1,
+          "mode": 33088,
+          "mtime_nanoseconds": 1,
+          "mtime_seconds": 1,
+          "size": 4097,
+          "uid": 0
+        },
+        "name": "WAMR_CI_TOOL_ZIG",
+        "path": {
+          "kind": "path",
+          "relative": "",
+          "role": "tool:zig"
+        }
+      }
+    ]
+  },
+  "binding_template": {
+    "bytes": 0,
+    "exit_code": 0,
+    "known_error_markers": [],
+    "over_limit": false,
+    "scope": "command_diagnostic_not_acceptance",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "sha256_scope": "reproducible_empty",
+    "stage": "adapter",
+    "supervisor": {
+      "bootstrap": false,
+      "request": {
+        "argv": {
+          "fixture_array": "b4062e3f42e45300692ea929ecccac9280eef6cbeec6bf51020dc375b54b8562"
+        },
+        "argv_sha256": "6dafd6ccf914bfe87f102ebb01b64f6c27e0a2b80e7d90ae76579f7c2b88172c",
+        "binding_schema": "uk.wamr.supervised-command-binding",
+        "binding_version": 1,
+        "canonical_sha256": "246dd9d329e5e1d3310e7610983f7b4db29dd0e00d19dbc16636e546267f671a",
+        "cleanup_deadline_ns": 10010000000000,
+        "command_executable": {
+          "identity": {
+            "content_sha256": "ea1161288eb9dc14d84eab85a835f638abc3470aa3b5823a56b86647e3fb3b27",
+            "ctime_nanoseconds": 1,
+            "ctime_seconds": 1,
+            "device_major": 1,
+            "device_minor": 2,
+            "inode": 1,
+            "mode": 33088,
+            "mtime_nanoseconds": 1,
+            "mtime_seconds": 1,
+            "size": 4097,
+            "uid": 0
+          },
+          "path": {
+            "kind": "path",
+            "relative": "",
+            "role": "tool:zig"
+          }
+        },
+        "cwd": {
+          "kind": "path",
+          "relative": "",
+          "role": "source"
+        },
+        "cwd_sha256": "d8c76a3a3b236da62e3f8d1d82e9136bb50eed852215fca5e83f5662573b394b",
+        "environment": {
+          "fixture_array": "44a42bd65beb99ba33e22b8acb389673a8eda6506c61fb08441a3cbd09b553eb"
+        },
+        "environment_sha256": "7d334b81a9919f2f2c8cbc71df6c6076d60de707600bfd65469e36f2ff916e2c",
+        "interpreter": null,
+        "issued_ns": 9100000000000,
+        "limits": {
+          "cleanup_events": 1000000,
+          "descendants": 64,
+          "primary_events": 1000000,
+          "proc_entries_per_scan": 262144,
+          "reap_events": 512,
+          "stderr_bytes": 4194304,
+          "stdout_bytes": 4194304,
+          "term_grace_ms": 1000
+        },
+        "native_executable": {
+          "identity": {
+            "content_sha256": "90c24f82f6cb4989e0230fbfbb3fc074b2d77ed16e1e53c1c2423dc3db6480c4",
+            "ctime_nanoseconds": 1,
+            "ctime_seconds": 1,
+            "device_major": 1,
+            "device_minor": 2,
+            "inode": 1,
+            "mode": 33088,
+            "mtime_nanoseconds": 1,
+            "mtime_seconds": 1,
+            "size": 4097,
+            "uid": 0
+          },
+          "path": {
+            "kind": "path",
+            "relative": "",
+            "role": "command-supervisor"
+          }
+        },
+        "primary_deadline_ns": 10000000000000,
+        "retained_executables": {
+          "fixture_array": "2fee9fc5979a079fe21c73a4e6b78190a3ff68923b0ec930ed0dfd666e069d77"
+        },
+        "schema": "uk.wamr.command-supervisor-request",
+        "stage": "adapter",
+        "supervisor": {
+          "identity": {
+            "content_sha256": "90c24f82f6cb4989e0230fbfbb3fc074b2d77ed16e1e53c1c2423dc3db6480c4",
+            "ctime_nanoseconds": 1,
+            "ctime_seconds": 1,
+            "device_major": 1,
+            "device_minor": 2,
+            "inode": 1,
+            "mode": 33088,
+            "mtime_nanoseconds": 1,
+            "mtime_seconds": 1,
+            "size": 4097,
+            "uid": 0
+          },
+          "path": {
+            "kind": "path",
+            "relative": "",
+            "role": "command-supervisor"
+          }
+        },
+        "timeout_ns": 900000000000,
+        "version": 1
+      },
+      "result": {
+        "canonical_sha256": "de653dc7c304491676424f539554550899b5c4a0e250239e3f79cfda35a49b0e",
+        "command": {
+          "cancellation_observed": false,
+          "cleanup": "complete",
+          "cleanup_complete": true,
+          "cleanup_events": 5,
+          "descendants": {
+            "adopted": 0,
+            "identity_validated": 0,
+            "limit_exceeded": false,
+            "observed": 0,
+            "untracked": false
+          },
+          "executable": {
+            "content_sha256": "90c24f82f6cb4989e0230fbfbb3fc074b2d77ed16e1e53c1c2423dc3db6480c4",
+            "ctime_nanoseconds": 1,
+            "ctime_seconds": 1,
+            "device_major": 1,
+            "device_minor": 2,
+            "inode": 1,
+            "mode": 33088,
+            "mtime_nanoseconds": 1,
+            "mtime_seconds": 1,
+            "size": 4097,
+            "uid": 0
+          },
+          "executable_stable": true,
+          "output": {
+            "bytes": 0,
+            "combined_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "commitment_sha256": "6cdfd7177872ad276ce636eacd710c3efb78e94ca53581ab1d7445e9ba48fc97",
+            "digest_scope": "reproducible_empty"
+          },
+          "poisoned": false,
+          "primary": {
+            "code": 0,
+            "kind": "exited"
+          },
+          "primary_deadline_reached": false,
+          "primary_events": 1,
+          "reap_events": 2,
+          "retained_executables": {
+            "fixture_array": "2fee9fc5979a079fe21c73a4e6b78190a3ff68923b0ec930ed0dfd666e069d77"
+          },
+          "stderr": {
+            "bytes": 0,
+            "digest_scope": "reproducible_empty",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "status": "complete"
+          },
+          "stdout": {
+            "bytes": 0,
+            "digest_scope": "reproducible_empty",
+            "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "status": "complete"
+          },
+          "termination": {
+            "code": 0,
+            "kind": "exited"
+          },
+          "timing": {
+            "cleanup_elapsed_ns": 3,
+            "completed_ns": 9100000000006,
+            "primary_completed_ns": 9100000000003,
+            "primary_elapsed_ns": 2,
+            "started_ns": 9100000000001,
+            "total_elapsed_ns": 5
+          }
+        },
+        "controller_error": null,
+        "native_request": {
+          "bytes": 128,
+          "digest_scope": "direct_producer_or_trusted_inner_zip",
+          "sha256": "3a461e0943140fad72dae7438017ced94863859971a272ea51e87fa0ae2914b8"
+        },
+        "native_result": {
+          "bytes": 256,
+          "digest_scope": "direct_producer_or_trusted_inner_zip",
+          "sha256": "51213cd9319c44def3d6281878eb6c487df5ec98f7c1fe38c64902d570e11d1c"
+        },
+        "request_canonical_sha256": "246dd9d329e5e1d3310e7610983f7b4db29dd0e00d19dbc16636e546267f671a",
+        "schema": "uk.wamr.command-supervisor-result",
+        "version": 1
+      },
+      "schema": "uk.wamr.command-supervisor-result",
+      "version": 1
+    }
+  },
+  "bindings": {
+    "adapter": {},
+    "config": {
+      "stage": "config",
+      "supervisor": {
+        "request": {
+          "argv": [
+            {
+              "kind": "path",
+              "relative": "",
+              "role": "native:wamr-aot-build"
+            },
+            {
+              "kind": "literal",
+              "value": "olddefconfig"
+            },
+            {
+              "kind": "literal",
+              "value": "--repository"
+            },
+            {
+              "kind": "path",
+              "relative": "",
+              "role": "source"
+            }
+          ],
+          "argv_sha256": "fe20630a757da957bd4ed016335868862e1d411cc9928ce861753ba751173efb",
+          "canonical_sha256": "97e4a16cbf5e657db3c0c1f92633d9907f7f3133a135dc770ee4df8aa23a3166",
+          "command_executable": {
+            "identity": {
+              "content_sha256": "80248da4e468c99c869d59e6c3f1757b1e016878f01a7dc6754fd88a3b2fc165"
+            },
+            "path": {
+              "role": "native:wamr-aot-build"
+            }
+          },
+          "environment": {
+            "fixture_array": "cb9b36dc172009705007e32741d97e7bddf6c8f501ba84cdc0a6910872c59370"
+          },
+          "environment_sha256": "d152d6b6992ef57deee91b51a7fab1412e80c049ae30c0ee73d446f3c943256c",
+          "issued_ns": 9400000000000,
+          "native_executable": {
+            "identity": {
+              "content_sha256": "80248da4e468c99c869d59e6c3f1757b1e016878f01a7dc6754fd88a3b2fc165"
+            },
+            "path": {
+              "role": "native:wamr-aot-build"
+            }
+          },
+          "retained_executables": {
+            "fixture_array": "a4501ec37b66449f6c5a50a0df2454b891e1819fb61328637dc8b98ee01c2c15"
+          },
+          "stage": "config",
+          "timeout_ns": 600000000000
+        },
+        "result": {
+          "canonical_sha256": "085fedf7cbe4f96e45f37eecc39929d533c2107d30508b6f8a4f6c901ac16060",
+          "command": {
+            "executable": {
+              "content_sha256": "80248da4e468c99c869d59e6c3f1757b1e016878f01a7dc6754fd88a3b2fc165"
+            },
+            "retained_executables": {
+              "fixture_array": "a4501ec37b66449f6c5a50a0df2454b891e1819fb61328637dc8b98ee01c2c15"
+            },
+            "timing": {
+              "completed_ns": 9400000000006,
+              "primary_completed_ns": 9400000000003,
+              "started_ns": 9400000000001
+            }
+          },
+          "request_canonical_sha256": "97e4a16cbf5e657db3c0c1f92633d9907f7f3133a135dc770ee4df8aa23a3166"
+        }
+      }
+    },
+    "derive-fixed-vhd": {
+      "stage": "derive-fixed-vhd",
+      "supervisor": {
+        "request": {
+          "argv": [
+            {
+              "kind": "path",
+              "relative": "",
+              "role": "input:package_tool"
+            },
+            {
+              "kind": "literal",
+              "value": "derive-fixed-vhd"
+            },
+            {
+              "kind": "path",
+              "relative": "evidence/fixed-vhd-derivation-intent.json",
+              "role": "work"
+            },
+            {
+              "kind": "path",
+              "relative": "package",
+              "role": "work"
+            }
+          ],
+          "argv_sha256": "77b47a25b130aa4b5a9553a79c04d029d7040718ced4aba399a2d4475ddc6a9b",
+          "canonical_sha256": "43428ac1900f8a5c0176050d96cb1f99afd789f05eb908c3f49d951751c634b5",
+          "command_executable": {
+            "identity": {
+              "content_sha256": "6d7a17e9952887da32e01626fee2a0b96d985eaa2962d912165a04f7b65cce1f"
+            },
+            "path": {
+              "role": "input:package_tool"
+            }
+          },
+          "environment": {
+            "fixture_array": "6d5523fa70181ae3d9d1dcd437a89d87de7758960885376525fa89d5ad622cf6"
+          },
+          "environment_sha256": "5b26a6aa0ae87c0c61aa580285e7fc9f8b011c2cd354f365668a4cb4e06c2e5b",
+          "issued_ns": 9850000000000,
+          "limits": {
+            "stderr_bytes": 65537,
+            "stdout_bytes": 65537
+          },
+          "native_executable": {
+            "identity": {
+              "content_sha256": "6d7a17e9952887da32e01626fee2a0b96d985eaa2962d912165a04f7b65cce1f"
+            },
+            "path": {
+              "role": "input:package_tool"
+            }
+          },
+          "retained_executables": {
+            "fixture_array": "1bc1cf1b6628a0014a5657efa831c916e891e8c5278371d74fd5d1f3feaae9ee"
+          },
+          "stage": "derive-fixed-vhd",
+          "timeout_ns": 150000000000
+        },
+        "result": {
+          "canonical_sha256": "5052adce803469042be07e3fed4331442b0198d6f62a705c8bfd306d4bf3dd67",
+          "command": {
+            "executable": {
+              "content_sha256": "6d7a17e9952887da32e01626fee2a0b96d985eaa2962d912165a04f7b65cce1f"
+            },
+            "retained_executables": {
+              "fixture_array": "1bc1cf1b6628a0014a5657efa831c916e891e8c5278371d74fd5d1f3feaae9ee"
+            },
+            "timing": {
+              "completed_ns": 9850000000006,
+              "primary_completed_ns": 9850000000003,
+              "started_ns": 9850000000001
+            }
+          },
+          "request_canonical_sha256": "43428ac1900f8a5c0176050d96cb1f99afd789f05eb908c3f49d951751c634b5"
+        }
+      }
+    },
+    "finalize-qcow2": {
+      "stage": "finalize-qcow2",
+      "supervisor": {
+        "request": {
+          "argv": [
+            {
+              "kind": "path",
+              "relative": "",
+              "role": "input:package_tool"
+            },
+            {
+              "kind": "literal",
+              "value": "finalize-qcow2"
+            },
+            {
+              "kind": "path",
+              "relative": "evidence/qcow2-finalization-intent.json",
+              "role": "work"
+            },
+            {
+              "kind": "path",
+              "relative": "package",
+              "role": "work"
+            }
+          ],
+          "argv_sha256": "09ab3c4fa5075c7e6eb809feaef143f02b26a469f18aa874699a3712cce4b131",
+          "canonical_sha256": "c1b4f9b00c7edbf2ef02196a8dbb22bbd16c3783a1672569d793002ab02235c2",
+          "command_executable": {
+            "identity": {
+              "content_sha256": "6d7a17e9952887da32e01626fee2a0b96d985eaa2962d912165a04f7b65cce1f"
+            },
+            "path": {
+              "role": "input:package_tool"
+            }
+          },
+          "environment": {
+            "fixture_array": "6d5523fa70181ae3d9d1dcd437a89d87de7758960885376525fa89d5ad622cf6"
+          },
+          "environment_sha256": "5b26a6aa0ae87c0c61aa580285e7fc9f8b011c2cd354f365668a4cb4e06c2e5b",
+          "issued_ns": 9850000000000,
+          "limits": {
+            "stderr_bytes": 65537,
+            "stdout_bytes": 65537
+          },
+          "native_executable": {
+            "identity": {
+              "content_sha256": "6d7a17e9952887da32e01626fee2a0b96d985eaa2962d912165a04f7b65cce1f"
+            },
+            "path": {
+              "role": "input:package_tool"
+            }
+          },
+          "retained_executables": {
+            "fixture_array": "1bc1cf1b6628a0014a5657efa831c916e891e8c5278371d74fd5d1f3feaae9ee"
+          },
+          "stage": "finalize-qcow2",
+          "timeout_ns": 150000000000
+        },
+        "result": {
+          "canonical_sha256": "ee0f576d3640ee142da4485f3d27b3976c46a992462724d9194683a2f5c2ef9d",
+          "command": {
+            "executable": {
+              "content_sha256": "6d7a17e9952887da32e01626fee2a0b96d985eaa2962d912165a04f7b65cce1f"
+            },
+            "retained_executables": {
+              "fixture_array": "1bc1cf1b6628a0014a5657efa831c916e891e8c5278371d74fd5d1f3feaae9ee"
+            },
+            "timing": {
+              "completed_ns": 9850000000006,
+              "primary_completed_ns": 9850000000003,
+              "started_ns": 9850000000001
+            }
+          },
+          "request_canonical_sha256": "c1b4f9b00c7edbf2ef02196a8dbb22bbd16c3783a1672569d793002ab02235c2"
+        }
+      }
+    },
+    "fixtures": {
+      "stage": "fixtures",
+      "supervisor": {
+        "request": {
+          "argv": {
+            "fixture_array": "b3264b588b6fde99fd646b7032b697622306bf493aa39af8c313ddb6fc560432"
+          },
+          "argv_sha256": "eba0c700d54ec95c5c89c9a551494210de363637f73831c474c9e18b4acddf73",
+          "canonical_sha256": "92cea7778421e805bfd7bc3ade9b610671837ab2f52c863cd9343589e99d5194",
+          "command_executable": {
+            "identity": {
+              "content_sha256": "ee945465b4682c28fd12c5617a87e89ba40c80600d390c67290472d794ef098f"
+            },
+            "path": {
+              "role": "tool:python3"
+            }
+          },
+          "environment": {
+            "fixture_array": "697a0fffbdfea313bad027c70fca257f56a386a79b1eecf11cfc7e7235e2c09b"
+          },
+          "environment_sha256": "a81c05cfebda1feb4bab4c895e1a1737f7c68489512b47503b2bbf7ff5b9ba0e",
+          "interpreter": {
+            "identity": {
+              "content_sha256": "ee945465b4682c28fd12c5617a87e89ba40c80600d390c67290472d794ef098f",
+              "ctime_nanoseconds": 1,
+              "ctime_seconds": 1,
+              "device_major": 1,
+              "device_minor": 2,
+              "inode": 1,
+              "mode": 33088,
+              "mtime_nanoseconds": 1,
+              "mtime_seconds": 1,
+              "size": 4097,
+              "uid": 0
+            },
+            "path": {
+              "kind": "path",
+              "relative": "",
+              "role": "tool:python3"
+            }
+          },
+          "issued_ns": 9400000000000,
+          "native_executable": {
+            "identity": {
+              "content_sha256": "ee945465b4682c28fd12c5617a87e89ba40c80600d390c67290472d794ef098f"
+            },
+            "path": {
+              "role": "tool:python3"
+            }
+          },
+          "retained_executables": {
+            "fixture_array": "e19449ecc2a5cbd6fef26c9d31fed0ded33587afbd00f33a994eb8e419e4c96a"
+          },
+          "stage": "fixtures",
+          "timeout_ns": 600000000000
+        },
+        "result": {
+          "canonical_sha256": "2e9bc0737daded86ebf34c3243871cf0b71b4db92a8cabfbae07e57b38f4d03d",
+          "command": {
+            "executable": {
+              "content_sha256": "ee945465b4682c28fd12c5617a87e89ba40c80600d390c67290472d794ef098f"
+            },
+            "retained_executables": {
+              "fixture_array": "e19449ecc2a5cbd6fef26c9d31fed0ded33587afbd00f33a994eb8e419e4c96a"
+            },
+            "timing": {
+              "completed_ns": 9400000000006,
+              "primary_completed_ns": 9400000000003,
+              "started_ns": 9400000000001
+            }
+          },
+          "request_canonical_sha256": "92cea7778421e805bfd7bc3ade9b610671837ab2f52c863cd9343589e99d5194"
+        }
+      }
+    },
+    "inspect": {
+      "stage": "inspect",
+      "supervisor": {
+        "request": {
+          "argv": [
+            {
+              "kind": "path",
+              "relative": "",
+              "role": "input:package_tool"
+            },
+            {
+              "kind": "literal",
+              "value": "inspect"
+            },
+            {
+              "kind": "path",
+              "relative": "",
+              "role": "input:efi"
+            },
+            {
+              "kind": "path",
+              "relative": "package",
+              "role": "work"
+            }
+          ],
+          "argv_sha256": "b4d6373644086ea246d97a95f7d098d7a9ad4bf3885443717d9f6961d6b45543",
+          "canonical_sha256": "58e48cce77465138b6eb4465e431258433ba5f384db0a8e51cc1f7aff4c0a4b8",
+          "command_executable": {
+            "identity": {
+              "content_sha256": "6d7a17e9952887da32e01626fee2a0b96d985eaa2962d912165a04f7b65cce1f"
+            },
+            "path": {
+              "role": "input:package_tool"
+            }
+          },
+          "environment": {
+            "fixture_array": "6d5523fa70181ae3d9d1dcd437a89d87de7758960885376525fa89d5ad622cf6"
+          },
+          "environment_sha256": "5b26a6aa0ae87c0c61aa580285e7fc9f8b011c2cd354f365668a4cb4e06c2e5b",
+          "issued_ns": 9850000000000,
+          "limits": {
+            "stderr_bytes": 65537,
+            "stdout_bytes": 65537
+          },
+          "native_executable": {
+            "identity": {
+              "content_sha256": "6d7a17e9952887da32e01626fee2a0b96d985eaa2962d912165a04f7b65cce1f"
+            },
+            "path": {
+              "role": "input:package_tool"
+            }
+          },
+          "retained_executables": {
+            "fixture_array": "1bc1cf1b6628a0014a5657efa831c916e891e8c5278371d74fd5d1f3feaae9ee"
+          },
+          "stage": "inspect",
+          "timeout_ns": 150000000000
+        },
+        "result": {
+          "canonical_sha256": "939ab54d5b72f35b3b31517c01fa27681dbabfcdf7075de8361393e59945267a",
+          "command": {
+            "executable": {
+              "content_sha256": "6d7a17e9952887da32e01626fee2a0b96d985eaa2962d912165a04f7b65cce1f"
+            },
+            "retained_executables": {
+              "fixture_array": "1bc1cf1b6628a0014a5657efa831c916e891e8c5278371d74fd5d1f3feaae9ee"
+            },
+            "timing": {
+              "completed_ns": 9850000000006,
+              "primary_completed_ns": 9850000000003,
+              "started_ns": 9850000000001
+            }
+          },
+          "request_canonical_sha256": "58e48cce77465138b6eb4465e431258433ba5f384db0a8e51cc1f7aff4c0a4b8"
+        }
+      }
+    },
+    "local-boot-tool": {
+      "stage": "local-boot-tool",
+      "supervisor": {
+        "request": {
+          "argv": {
+            "fixture_array": "0f4d806ce864d519fa87c2868c8a8642bc7b1c7c065a3ed4149a6c251656d4d2"
+          },
+          "argv_sha256": "af9f3aa15955fc27e0953d1546b28a2cf477167cac23daa8d09d2bf1d3dceb90",
+          "canonical_sha256": "8c50fc27babb4252872c510adb71f071602de2b63848936c8ef8739ecf260ee2",
+          "stage": "local-boot-tool"
+        },
+        "result": {
+          "canonical_sha256": "86127cdb2f1622f441115ff28cb63bd513ded79d53aca696aeab1fdba3fef749",
+          "request_canonical_sha256": "8c50fc27babb4252872c510adb71f071602de2b63848936c8ef8739ecf260ee2"
+        }
+      }
+    },
+    "log-validator-legacy": {
+      "stage": "log-validator-legacy",
+      "supervisor": {
+        "request": {
+          "argv": {
+            "fixture_array": "997ef213f2bab11a170df5f48b6004d200117e5588ab85284cc3245e589f7a96"
+          },
+          "argv_sha256": "b7483d388f6c507c2eb04bae5883903317bbce846343d0070fe57ebb9418794d",
+          "canonical_sha256": "e62441c0e9865dcbdf79752460f8bf1d4e999707c968e137c4cb0454d77e925e",
+          "command_executable": {
+            "identity": {
+              "content_sha256": "4a331a76401a6d14ff31ab8c6c59160ff6843bf955a97f55275c80418239a75e"
+            },
+            "path": {
+              "role": "native:wamr-log-validate"
+            }
+          },
+          "environment": [],
+          "environment_sha256": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570",
+          "issued_ns": 9970000000000,
+          "limits": {
+            "stderr_bytes": 8193,
+            "stdout_bytes": 8193
+          },
+          "native_executable": {
+            "identity": {
+              "content_sha256": "4a331a76401a6d14ff31ab8c6c59160ff6843bf955a97f55275c80418239a75e"
+            },
+            "path": {
+              "role": "native:wamr-log-validate"
+            }
+          },
+          "retained_executables": [],
+          "stage": "log-validator-legacy",
+          "timeout_ns": 30000000000
+        },
+        "result": {
+          "canonical_sha256": "d79f35b30440b30189b41e0194c76271c1aa042615eb5ecaeaa30fc0334d7a53",
+          "command": {
+            "executable": {
+              "content_sha256": "4a331a76401a6d14ff31ab8c6c59160ff6843bf955a97f55275c80418239a75e"
+            },
+            "retained_executables": [],
+            "timing": {
+              "completed_ns": 9970000000006,
+              "primary_completed_ns": 9970000000003,
+              "started_ns": 9970000000001
+            }
+          },
+          "request_canonical_sha256": "e62441c0e9865dcbdf79752460f8bf1d4e999707c968e137c4cb0454d77e925e"
+        }
+      }
+    },
+    "log-validator-x2apic": {
+      "stage": "log-validator-x2apic",
+      "supervisor": {
+        "request": {
+          "argv": {
+            "fixture_array": "6e0f73fe7cee4e6d081638fd4eb71d54b5453e2ada5e5d50b8b92721fbb65ff8"
+          },
+          "argv_sha256": "e0ceed87769892449927097739841f0b43d478f3af41de58226c5de5f13c6aff",
+          "canonical_sha256": "90d71c95a2612fdb0afe5faf0e17fc2c99247dbcacca581252fa2e59c837a733",
+          "command_executable": {
+            "identity": {
+              "content_sha256": "4a331a76401a6d14ff31ab8c6c59160ff6843bf955a97f55275c80418239a75e"
+            },
+            "path": {
+              "role": "native:wamr-log-validate"
+            }
+          },
+          "environment": [],
+          "environment_sha256": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570",
+          "issued_ns": 9970000000000,
+          "limits": {
+            "stderr_bytes": 8193,
+            "stdout_bytes": 8193
+          },
+          "native_executable": {
+            "identity": {
+              "content_sha256": "4a331a76401a6d14ff31ab8c6c59160ff6843bf955a97f55275c80418239a75e"
+            },
+            "path": {
+              "role": "native:wamr-log-validate"
+            }
+          },
+          "retained_executables": [],
+          "stage": "log-validator-x2apic",
+          "timeout_ns": 30000000000
+        },
+        "result": {
+          "canonical_sha256": "1cc64f606d12a0c37518005a7738351ffb90f06da8026de4b5283419f890ed6a",
+          "command": {
+            "executable": {
+              "content_sha256": "4a331a76401a6d14ff31ab8c6c59160ff6843bf955a97f55275c80418239a75e"
+            },
+            "retained_executables": [],
+            "timing": {
+              "completed_ns": 9970000000006,
+              "primary_completed_ns": 9970000000003,
+              "started_ns": 9970000000001
+            }
+          },
+          "request_canonical_sha256": "90d71c95a2612fdb0afe5faf0e17fc2c99247dbcacca581252fa2e59c837a733"
+        }
+      }
+    },
+    "native-image": {
+      "stage": "native-image",
+      "supervisor": {
+        "request": {
+          "argv": [
+            {
+              "kind": "path",
+              "relative": "",
+              "role": "native:wamr-aot-build"
+            },
+            {
+              "kind": "literal",
+              "value": "native-images"
+            },
+            {
+              "kind": "literal",
+              "value": "--repository"
+            },
+            {
+              "kind": "path",
+              "relative": "",
+              "role": "source"
+            }
+          ],
+          "argv_sha256": "9699cec1197af8a6dddafdfbfafd5825194634103e0565019e6fd93c8bf78bb8",
+          "canonical_sha256": "92ac8b3ff68653dbf840c83ce6a7c898f4646deb1164c9568cd6be9b601110cf",
+          "command_executable": {
+            "identity": {
+              "content_sha256": "80248da4e468c99c869d59e6c3f1757b1e016878f01a7dc6754fd88a3b2fc165"
+            },
+            "path": {
+              "role": "native:wamr-aot-build"
+            }
+          },
+          "environment": {
+            "fixture_array": "cb9b36dc172009705007e32741d97e7bddf6c8f501ba84cdc0a6910872c59370"
+          },
+          "environment_sha256": "d152d6b6992ef57deee91b51a7fab1412e80c049ae30c0ee73d446f3c943256c",
+          "issued_ns": 8200000000000,
+          "native_executable": {
+            "identity": {
+              "content_sha256": "80248da4e468c99c869d59e6c3f1757b1e016878f01a7dc6754fd88a3b2fc165"
+            },
+            "path": {
+              "role": "native:wamr-aot-build"
+            }
+          },
+          "retained_executables": {
+            "fixture_array": "a4501ec37b66449f6c5a50a0df2454b891e1819fb61328637dc8b98ee01c2c15"
+          },
+          "stage": "native-image",
+          "timeout_ns": 1800000000000
+        },
+        "result": {
+          "canonical_sha256": "a4cab7fd1f404cc26e16d8ba9db79854b6327e495fcd2732fd82fe5c9affa3a7",
+          "command": {
+            "executable": {
+              "content_sha256": "80248da4e468c99c869d59e6c3f1757b1e016878f01a7dc6754fd88a3b2fc165"
+            },
+            "retained_executables": {
+              "fixture_array": "a4501ec37b66449f6c5a50a0df2454b891e1819fb61328637dc8b98ee01c2c15"
+            },
+            "timing": {
+              "completed_ns": 8200000000006,
+              "primary_completed_ns": 8200000000003,
+              "started_ns": 8200000000001
+            }
+          },
+          "request_canonical_sha256": "92ac8b3ff68653dbf840c83ce6a7c898f4646deb1164c9568cd6be9b601110cf"
+        }
+      }
+    },
+    "package": {
+      "stage": "package",
+      "supervisor": {
+        "request": {
+          "argv": [
+            {
+              "kind": "path",
+              "relative": "",
+              "role": "input:package_tool"
+            },
+            {
+              "kind": "literal",
+              "value": "package"
+            },
+            {
+              "kind": "path",
+              "relative": "",
+              "role": "input:efi"
+            },
+            {
+              "kind": "path",
+              "relative": "package",
+              "role": "work"
+            }
+          ],
+          "argv_sha256": "c489735b02875aaf8a006fc1214e72fb320be76720e239ba9b6b6d2dff0bd51a",
+          "canonical_sha256": "1de3f62f61b40df9087340a2f78b31f4e99ebe90038f657c0235a6917086d439",
+          "command_executable": {
+            "identity": {
+              "content_sha256": "6d7a17e9952887da32e01626fee2a0b96d985eaa2962d912165a04f7b65cce1f"
+            },
+            "path": {
+              "role": "input:package_tool"
+            }
+          },
+          "environment": {
+            "fixture_array": "6d5523fa70181ae3d9d1dcd437a89d87de7758960885376525fa89d5ad622cf6"
+          },
+          "environment_sha256": "5b26a6aa0ae87c0c61aa580285e7fc9f8b011c2cd354f365668a4cb4e06c2e5b",
+          "issued_ns": 9850000000000,
+          "limits": {
+            "stderr_bytes": 65537,
+            "stdout_bytes": 65537
+          },
+          "native_executable": {
+            "identity": {
+              "content_sha256": "6d7a17e9952887da32e01626fee2a0b96d985eaa2962d912165a04f7b65cce1f"
+            },
+            "path": {
+              "role": "input:package_tool"
+            }
+          },
+          "retained_executables": {
+            "fixture_array": "1bc1cf1b6628a0014a5657efa831c916e891e8c5278371d74fd5d1f3feaae9ee"
+          },
+          "stage": "package",
+          "timeout_ns": 150000000000
+        },
+        "result": {
+          "canonical_sha256": "72f8ce25fc6ba34a9b0d6c6e4e6cc5c4474f2e3b6c5315eb8146b0dcf1f56e3b",
+          "command": {
+            "executable": {
+              "content_sha256": "6d7a17e9952887da32e01626fee2a0b96d985eaa2962d912165a04f7b65cce1f"
+            },
+            "retained_executables": {
+              "fixture_array": "1bc1cf1b6628a0014a5657efa831c916e891e8c5278371d74fd5d1f3feaae9ee"
+            },
+            "timing": {
+              "completed_ns": 9850000000006,
+              "primary_completed_ns": 9850000000003,
+              "started_ns": 9850000000001
+            }
+          },
+          "request_canonical_sha256": "1de3f62f61b40df9087340a2f78b31f4e99ebe90038f657c0235a6917086d439"
+        }
+      }
+    },
+    "prepare": {
+      "stage": "prepare",
+      "supervisor": {
+        "request": {
+          "argv": {
+            "fixture_array": "67cc4198ae3d58ccfb7d73542f6561b32d55bbbc6c08cb4c733352556c5466a5"
+          },
+          "argv_sha256": "c541c6c3f8b5913c66a8142f66eca9073c0063af7a916609fe63d1baf0d54e93",
+          "canonical_sha256": "a9c3d5f646955ab1ac99898eef9548bd2b7381ede0710e70f0dd037c5d7ef72d",
+          "command_executable": {
+            "identity": {
+              "content_sha256": "80248da4e468c99c869d59e6c3f1757b1e016878f01a7dc6754fd88a3b2fc165"
+            },
+            "path": {
+              "role": "native:wamr-aot-build"
+            }
+          },
+          "environment": {
+            "fixture_array": "cb9b36dc172009705007e32741d97e7bddf6c8f501ba84cdc0a6910872c59370"
+          },
+          "environment_sha256": "d152d6b6992ef57deee91b51a7fab1412e80c049ae30c0ee73d446f3c943256c",
+          "issued_ns": 8200000000000,
+          "native_executable": {
+            "identity": {
+              "content_sha256": "80248da4e468c99c869d59e6c3f1757b1e016878f01a7dc6754fd88a3b2fc165"
+            },
+            "path": {
+              "role": "native:wamr-aot-build"
+            }
+          },
+          "retained_executables": {
+            "fixture_array": "a4501ec37b66449f6c5a50a0df2454b891e1819fb61328637dc8b98ee01c2c15"
+          },
+          "stage": "prepare",
+          "timeout_ns": 1800000000000
+        },
+        "result": {
+          "canonical_sha256": "ab68456741ba3eaf1a7860a86a1e5676ddb66c3909060ce2cfdb700583ee8686",
+          "command": {
+            "executable": {
+              "content_sha256": "80248da4e468c99c869d59e6c3f1757b1e016878f01a7dc6754fd88a3b2fc165"
+            },
+            "retained_executables": {
+              "fixture_array": "a4501ec37b66449f6c5a50a0df2454b891e1819fb61328637dc8b98ee01c2c15"
+            },
+            "timing": {
+              "completed_ns": 8200000000006,
+              "primary_completed_ns": 8200000000003,
+              "started_ns": 8200000000001
+            }
+          },
+          "request_canonical_sha256": "a9c3d5f646955ab1ac99898eef9548bd2b7381ede0710e70f0dd037c5d7ef72d"
+        }
+      }
+    },
+    "qcow2-legacy-apic": {
+      "stage": "qcow2-legacy-apic",
+      "supervisor": {
+        "request": {
+          "argv": {
+            "fixture_array": "12546018807cf197dfa5804b30ccc1f986f88917f9cacba8fb9535f780b7c690"
+          },
+          "argv_sha256": "d7d8d17e32cc4db8765879d9968bde79b91f1d172ed7f3db33591a558adb5b11",
+          "canonical_sha256": "c4ee1e2b0da55ba0af71951fb20284a016ecbed393a054cb2b2f1872cb494734",
+          "command_executable": {
+            "identity": {
+              "content_sha256": "4ce03f43f8e120beb228fb5fcdbd5ab15410dd905f57bd864282f2ab77278fc5"
+            },
+            "path": {
+              "role": "input:local_boot_tool"
+            }
+          },
+          "environment": {
+            "fixture_array": "6d5523fa70181ae3d9d1dcd437a89d87de7758960885376525fa89d5ad622cf6"
+          },
+          "environment_sha256": "5b26a6aa0ae87c0c61aa580285e7fc9f8b011c2cd354f365668a4cb4e06c2e5b",
+          "issued_ns": 9910000000000,
+          "limits": {
+            "stderr_bytes": 65537,
+            "stdout_bytes": 65537
+          },
+          "native_executable": {
+            "identity": {
+              "content_sha256": "4ce03f43f8e120beb228fb5fcdbd5ab15410dd905f57bd864282f2ab77278fc5"
+            },
+            "path": {
+              "role": "input:local_boot_tool"
+            }
+          },
+          "retained_executables": {
+            "fixture_array": "1bc1cf1b6628a0014a5657efa831c916e891e8c5278371d74fd5d1f3feaae9ee"
+          },
+          "stage": "qcow2-legacy-apic",
+          "timeout_ns": 90000000000
+        },
+        "result": {
+          "canonical_sha256": "64619c77c4a1ef0a0e675d9fe129fff70a4d738b30020469c9cbf426450f7388",
+          "command": {
+            "executable": {
+              "content_sha256": "4ce03f43f8e120beb228fb5fcdbd5ab15410dd905f57bd864282f2ab77278fc5"
+            },
+            "retained_executables": {
+              "fixture_array": "1bc1cf1b6628a0014a5657efa831c916e891e8c5278371d74fd5d1f3feaae9ee"
+            },
+            "timing": {
+              "completed_ns": 9910000000006,
+              "primary_completed_ns": 9910000000003,
+              "started_ns": 9910000000001
+            }
+          },
+          "request_canonical_sha256": "c4ee1e2b0da55ba0af71951fb20284a016ecbed393a054cb2b2f1872cb494734"
+        }
+      }
+    },
+    "qcow2-x2apic": {
+      "stage": "qcow2-x2apic",
+      "supervisor": {
+        "request": {
+          "argv": {
+            "fixture_array": "123190c87de2c78c30db014d62867229d675843e555d5be4d433a486e2127a1e"
+          },
+          "argv_sha256": "f253467d8a7e140743d4faa7c4ccf00f798d175489896c88e08f9bff13f3597b",
+          "canonical_sha256": "7abd66c54105e01ed9ed2072d09e1bf45b7f2f64d177efa032a6a088456c915c",
+          "command_executable": {
+            "identity": {
+              "content_sha256": "4ce03f43f8e120beb228fb5fcdbd5ab15410dd905f57bd864282f2ab77278fc5"
+            },
+            "path": {
+              "role": "input:local_boot_tool"
+            }
+          },
+          "environment": {
+            "fixture_array": "6d5523fa70181ae3d9d1dcd437a89d87de7758960885376525fa89d5ad622cf6"
+          },
+          "environment_sha256": "5b26a6aa0ae87c0c61aa580285e7fc9f8b011c2cd354f365668a4cb4e06c2e5b",
+          "issued_ns": 9910000000000,
+          "limits": {
+            "stderr_bytes": 65537,
+            "stdout_bytes": 65537
+          },
+          "native_executable": {
+            "identity": {
+              "content_sha256": "4ce03f43f8e120beb228fb5fcdbd5ab15410dd905f57bd864282f2ab77278fc5"
+            },
+            "path": {
+              "role": "input:local_boot_tool"
+            }
+          },
+          "retained_executables": {
+            "fixture_array": "1bc1cf1b6628a0014a5657efa831c916e891e8c5278371d74fd5d1f3feaae9ee"
+          },
+          "stage": "qcow2-x2apic",
+          "timeout_ns": 90000000000
+        },
+        "result": {
+          "canonical_sha256": "c48ef3f0d241dcccbb751d6bf10aa2a1ee62644001017bc0c2f284e113c51ab0",
+          "command": {
+            "executable": {
+              "content_sha256": "4ce03f43f8e120beb228fb5fcdbd5ab15410dd905f57bd864282f2ab77278fc5"
+            },
+            "retained_executables": {
+              "fixture_array": "1bc1cf1b6628a0014a5657efa831c916e891e8c5278371d74fd5d1f3feaae9ee"
+            },
+            "timing": {
+              "completed_ns": 9910000000006,
+              "primary_completed_ns": 9910000000003,
+              "started_ns": 9910000000001
+            }
+          },
+          "request_canonical_sha256": "7abd66c54105e01ed9ed2072d09e1bf45b7f2f64d177efa032a6a088456c915c"
+        }
+      }
+    },
+    "raw-legacy-apic": {
+      "stage": "raw-legacy-apic",
+      "supervisor": {
+        "request": {
+          "argv": {
+            "fixture_array": "86c850531be48becce85ca60025b603b40401196d4c7561d47c2c1d1237afc5d"
+          },
+          "argv_sha256": "5c82dadb02deb371ea3b74470c963986831a871d53e54debc5847d2f296fb64c",
+          "canonical_sha256": "8bbf15b4632156c10e760fff489289d67d6efb1d511c60e11183034651ec0e6b",
+          "command_executable": {
+            "identity": {
+              "content_sha256": "4ce03f43f8e120beb228fb5fcdbd5ab15410dd905f57bd864282f2ab77278fc5"
+            },
+            "path": {
+              "role": "input:local_boot_tool"
+            }
+          },
+          "environment": {
+            "fixture_array": "6d5523fa70181ae3d9d1dcd437a89d87de7758960885376525fa89d5ad622cf6"
+          },
+          "environment_sha256": "5b26a6aa0ae87c0c61aa580285e7fc9f8b011c2cd354f365668a4cb4e06c2e5b",
+          "issued_ns": 9910000000000,
+          "limits": {
+            "stderr_bytes": 65537,
+            "stdout_bytes": 65537
+          },
+          "native_executable": {
+            "identity": {
+              "content_sha256": "4ce03f43f8e120beb228fb5fcdbd5ab15410dd905f57bd864282f2ab77278fc5"
+            },
+            "path": {
+              "role": "input:local_boot_tool"
+            }
+          },
+          "retained_executables": {
+            "fixture_array": "1bc1cf1b6628a0014a5657efa831c916e891e8c5278371d74fd5d1f3feaae9ee"
+          },
+          "stage": "raw-legacy-apic",
+          "timeout_ns": 90000000000
+        },
+        "result": {
+          "canonical_sha256": "becf0bb2275e3c40a77078059ba88a1a360f4ab2fe666d730897523a3fc37c51",
+          "command": {
+            "executable": {
+              "content_sha256": "4ce03f43f8e120beb228fb5fcdbd5ab15410dd905f57bd864282f2ab77278fc5"
+            },
+            "retained_executables": {
+              "fixture_array": "1bc1cf1b6628a0014a5657efa831c916e891e8c5278371d74fd5d1f3feaae9ee"
+            },
+            "timing": {
+              "completed_ns": 9910000000006,
+              "primary_completed_ns": 9910000000003,
+              "started_ns": 9910000000001
+            }
+          },
+          "request_canonical_sha256": "8bbf15b4632156c10e760fff489289d67d6efb1d511c60e11183034651ec0e6b"
+        }
+      }
+    },
+    "raw-x2apic": {
+      "stage": "raw-x2apic",
+      "supervisor": {
+        "request": {
+          "argv": {
+            "fixture_array": "ae7c7e72b5eebeee4294c005055c5766cd2d72afbf4392b64d3bebaf40b54df6"
+          },
+          "argv_sha256": "b520e56cb4d829a7251f779c8d1761978f63df4023cbec8e029ccf4331df7b2f",
+          "canonical_sha256": "6d84b988d47ae423721d6cfc5fcb2cf5ee268f727f7b207e83a0997ba7f8dbb5",
+          "command_executable": {
+            "identity": {
+              "content_sha256": "4ce03f43f8e120beb228fb5fcdbd5ab15410dd905f57bd864282f2ab77278fc5"
+            },
+            "path": {
+              "role": "input:local_boot_tool"
+            }
+          },
+          "environment": {
+            "fixture_array": "6d5523fa70181ae3d9d1dcd437a89d87de7758960885376525fa89d5ad622cf6"
+          },
+          "environment_sha256": "5b26a6aa0ae87c0c61aa580285e7fc9f8b011c2cd354f365668a4cb4e06c2e5b",
+          "issued_ns": 9910000000000,
+          "limits": {
+            "stderr_bytes": 65537,
+            "stdout_bytes": 65537
+          },
+          "native_executable": {
+            "identity": {
+              "content_sha256": "4ce03f43f8e120beb228fb5fcdbd5ab15410dd905f57bd864282f2ab77278fc5"
+            },
+            "path": {
+              "role": "input:local_boot_tool"
+            }
+          },
+          "retained_executables": {
+            "fixture_array": "1bc1cf1b6628a0014a5657efa831c916e891e8c5278371d74fd5d1f3feaae9ee"
+          },
+          "stage": "raw-x2apic",
+          "timeout_ns": 90000000000
+        },
+        "result": {
+          "canonical_sha256": "02a667796ed577b25b7f06e42c6e7de0b7ed18bb4e690676803ed67799045c16",
+          "command": {
+            "executable": {
+              "content_sha256": "4ce03f43f8e120beb228fb5fcdbd5ab15410dd905f57bd864282f2ab77278fc5"
+            },
+            "retained_executables": {
+              "fixture_array": "1bc1cf1b6628a0014a5657efa831c916e891e8c5278371d74fd5d1f3feaae9ee"
+            },
+            "timing": {
+              "completed_ns": 9910000000006,
+              "primary_completed_ns": 9910000000003,
+              "started_ns": 9910000000001
+            }
+          },
+          "request_canonical_sha256": "6d84b988d47ae423721d6cfc5fcb2cf5ee268f727f7b207e83a0997ba7f8dbb5"
+        }
+      }
+    },
+    "vpc-legacy-apic": {
+      "stage": "vpc-legacy-apic",
+      "supervisor": {
+        "request": {
+          "argv": {
+            "fixture_array": "736ec9de0b1b4a8ef14a373198bf707407cd14ee1ae64bd763ea5b5e88e279e4"
+          },
+          "argv_sha256": "723d51c47e82495d9e3d38a30269cc144eb92253bf8720e7bfe8647161681029",
+          "canonical_sha256": "89bb90eca818b723aec1268d88d18a60e320eb081ecf89dda5ab7b0e91bae6a8",
+          "command_executable": {
+            "identity": {
+              "content_sha256": "4ce03f43f8e120beb228fb5fcdbd5ab15410dd905f57bd864282f2ab77278fc5"
+            },
+            "path": {
+              "role": "input:local_boot_tool"
+            }
+          },
+          "environment": {
+            "fixture_array": "6d5523fa70181ae3d9d1dcd437a89d87de7758960885376525fa89d5ad622cf6"
+          },
+          "environment_sha256": "5b26a6aa0ae87c0c61aa580285e7fc9f8b011c2cd354f365668a4cb4e06c2e5b",
+          "issued_ns": 9910000000000,
+          "limits": {
+            "stderr_bytes": 65537,
+            "stdout_bytes": 65537
+          },
+          "native_executable": {
+            "identity": {
+              "content_sha256": "4ce03f43f8e120beb228fb5fcdbd5ab15410dd905f57bd864282f2ab77278fc5"
+            },
+            "path": {
+              "role": "input:local_boot_tool"
+            }
+          },
+          "retained_executables": {
+            "fixture_array": "1bc1cf1b6628a0014a5657efa831c916e891e8c5278371d74fd5d1f3feaae9ee"
+          },
+          "stage": "vpc-legacy-apic",
+          "timeout_ns": 90000000000
+        },
+        "result": {
+          "canonical_sha256": "afd27a98a83f974823de149dfee4be049d91ff6c4ab077f3c814610828e1be3e",
+          "command": {
+            "executable": {
+              "content_sha256": "4ce03f43f8e120beb228fb5fcdbd5ab15410dd905f57bd864282f2ab77278fc5"
+            },
+            "retained_executables": {
+              "fixture_array": "1bc1cf1b6628a0014a5657efa831c916e891e8c5278371d74fd5d1f3feaae9ee"
+            },
+            "timing": {
+              "completed_ns": 9910000000006,
+              "primary_completed_ns": 9910000000003,
+              "started_ns": 9910000000001
+            }
+          },
+          "request_canonical_sha256": "89bb90eca818b723aec1268d88d18a60e320eb081ecf89dda5ab7b0e91bae6a8"
+        }
+      }
+    },
+    "vpc-x2apic": {
+      "stage": "vpc-x2apic",
+      "supervisor": {
+        "request": {
+          "argv": {
+            "fixture_array": "47814a56540785f87e9edbd9cddc90b172e698478af9fb437cadaad00c06e8ea"
+          },
+          "argv_sha256": "ec5e0af1ecd31f7b3f3bf5c79bac53745d06a0a3542ca8c1a72b5e82b76e89ad",
+          "canonical_sha256": "caf7e855332037470d431e08098cb920f86f80c68d9932d76fec0cbc28e50a58",
+          "command_executable": {
+            "identity": {
+              "content_sha256": "4ce03f43f8e120beb228fb5fcdbd5ab15410dd905f57bd864282f2ab77278fc5"
+            },
+            "path": {
+              "role": "input:local_boot_tool"
+            }
+          },
+          "environment": {
+            "fixture_array": "6d5523fa70181ae3d9d1dcd437a89d87de7758960885376525fa89d5ad622cf6"
+          },
+          "environment_sha256": "5b26a6aa0ae87c0c61aa580285e7fc9f8b011c2cd354f365668a4cb4e06c2e5b",
+          "issued_ns": 9910000000000,
+          "limits": {
+            "stderr_bytes": 65537,
+            "stdout_bytes": 65537
+          },
+          "native_executable": {
+            "identity": {
+              "content_sha256": "4ce03f43f8e120beb228fb5fcdbd5ab15410dd905f57bd864282f2ab77278fc5"
+            },
+            "path": {
+              "role": "input:local_boot_tool"
+            }
+          },
+          "retained_executables": {
+            "fixture_array": "1bc1cf1b6628a0014a5657efa831c916e891e8c5278371d74fd5d1f3feaae9ee"
+          },
+          "stage": "vpc-x2apic",
+          "timeout_ns": 90000000000
+        },
+        "result": {
+          "canonical_sha256": "2eff35f6820aacae91413445fe9bcf1ca5605780862bccec87dd1bc857e70f4a",
+          "command": {
+            "executable": {
+              "content_sha256": "4ce03f43f8e120beb228fb5fcdbd5ab15410dd905f57bd864282f2ab77278fc5"
+            },
+            "retained_executables": {
+              "fixture_array": "1bc1cf1b6628a0014a5657efa831c916e891e8c5278371d74fd5d1f3feaae9ee"
+            },
+            "timing": {
+              "completed_ns": 9910000000006,
+              "primary_completed_ns": 9910000000003,
+              "started_ns": 9910000000001
+            }
+          },
+          "request_canonical_sha256": "caf7e855332037470d431e08098cb920f86f80c68d9932d76fec0cbc28e50a58"
+        }
+      }
+    }
+  },
+  "handoff_contract": {
+    "argv": [
+      {
+        "kind": "path",
+        "relative": "",
+        "role": "input:package_tool"
+      },
+      {
+        "kind": "literal",
+        "value": "inspect"
+      },
+      {
+        "kind": "path",
+        "relative": "support/apps/wamr-aot/build/wamr_hyperv-x86_64-efi",
+        "role": "source"
+      },
+      {
+        "kind": "path",
+        "relative": "package",
+        "role": "compute"
+      }
+    ],
+    "command_executable": {
+      "kind": "path",
+      "relative": "",
+      "role": "input:package_tool"
+    },
+    "cwd": {
+      "kind": "path",
+      "relative": "",
+      "role": "source"
+    },
+    "environment": {
+      "fixture_array": "6d5523fa70181ae3d9d1dcd437a89d87de7758960885376525fa89d5ad622cf6"
+    },
+    "interpreter": null,
+    "kind": "bound-tools",
+    "limits": {
+      "cleanup_events": 1000000,
+      "descendants": 64,
+      "primary_events": 1000000,
+      "proc_entries_per_scan": 262144,
+      "reap_events": 512,
+      "stderr_bytes": 65537,
+      "stdout_bytes": 65537,
+      "term_grace_ms": 1000
+    },
+    "native_executable": {
+      "kind": "path",
+      "relative": "",
+      "role": "input:package_tool"
+    },
+    "output_limit": 65536,
+    "retained_names": {
+      "fixture_array": "c81d6a62cdd3447f4c5d649a083a8ac5d8ae24d9a5ecb625b3a913e43f265153"
+    },
+    "seconds": 150
+  },
+  "legacy_binding": {
+    "stage": "handoff-inspect-legacy",
+    "supervisor": {
+      "request": {
+        "argv": [
+          {
+            "kind": "path",
+            "relative": "",
+            "role": "input:package_tool"
+          },
+          {
+            "kind": "literal",
+            "value": "inspect"
+          },
+          {
+            "kind": "path",
+            "relative": "support/apps/wamr-aot/build/wamr_hyperv-x86_64-efi",
+            "role": "source"
+          },
+          {
+            "kind": "path",
+            "relative": "package",
+            "role": "compute"
+          }
+        ],
+        "argv_sha256": "bee80b93748730cfb4be3f054ba472b994d80b6c05d676a8db193044337c75e5",
+        "canonical_sha256": "bf852729ad1ac6bd926e786757af21c5b27868ccb080f32366166ad3fb9cb3c0",
+        "command_executable": {
+          "identity": {
+            "content_sha256": "6d7a17e9952887da32e01626fee2a0b96d985eaa2962d912165a04f7b65cce1f"
+          },
+          "path": {
+            "role": "input:package_tool"
+          }
+        },
+        "environment": {
+          "fixture_array": "7484b72dd284dd5da2f3f42ce975fa8ba0019ea2c9f9444ccba433f84b7b7e3b"
+        },
+        "environment_sha256": "94469ed2d7e0bd521a5263acecfb64304a26e74e405a2231a5eb80495c6f89be",
+        "issued_ns": 9850000000000,
+        "limits": {
+          "stderr_bytes": 65537,
+          "stdout_bytes": 65537
+        },
+        "native_executable": {
+          "identity": {
+            "content_sha256": "6d7a17e9952887da32e01626fee2a0b96d985eaa2962d912165a04f7b65cce1f"
+          },
+          "path": {
+            "role": "input:package_tool"
+          }
+        },
+        "retained_executables": [
+          {
+            "identity": {
+              "content_sha256": "90c24f82f6cb4989e0230fbfbb3fc074b2d77ed16e1e53c1c2423dc3db6480c4",
+              "ctime_nanoseconds": 1,
+              "ctime_seconds": 1,
+              "device_major": 1,
+              "device_minor": 2,
+              "inode": 1,
+              "mode": 33088,
+              "mtime_nanoseconds": 1,
+              "mtime_seconds": 1,
+              "size": 4097,
+              "uid": 0
+            },
+            "name": "WAMR_CI_SUPERVISOR",
+            "path": {
+              "kind": "path",
+              "relative": "",
+              "role": "command-supervisor"
+            }
+          }
+        ],
+        "stage": "handoff-inspect-legacy",
+        "timeout_ns": 150000000000
+      },
+      "result": {
+        "canonical_sha256": "b65531501ffb278ff6aa23457784945a3b90a6972b94dad502a6adcaf0139d9e",
+        "command": {
+          "executable": {
+            "content_sha256": "6d7a17e9952887da32e01626fee2a0b96d985eaa2962d912165a04f7b65cce1f"
+          },
+          "retained_executables": [
+            {
+              "identity": {
+                "content_sha256": "90c24f82f6cb4989e0230fbfbb3fc074b2d77ed16e1e53c1c2423dc3db6480c4",
+                "ctime_nanoseconds": 1,
+                "ctime_seconds": 1,
+                "device_major": 1,
+                "device_minor": 2,
+                "inode": 1,
+                "mode": 33088,
+                "mtime_nanoseconds": 1,
+                "mtime_seconds": 1,
+                "size": 4097,
+                "uid": 0
+              },
+              "name": "WAMR_CI_SUPERVISOR",
+              "path": {
+                "kind": "path",
+                "relative": "",
+                "role": "command-supervisor"
+              }
+            }
+          ],
+          "timing": {
+            "completed_ns": 9850000000006,
+            "primary_completed_ns": 9850000000003,
+            "started_ns": 9850000000001
+          }
+        },
+        "request_canonical_sha256": "bf852729ad1ac6bd926e786757af21c5b27868ccb080f32366166ad3fb9cb3c0"
+      }
+    }
+  },
+  "revision": "e98623f780fa23d05b5797004e4b88160404eb1b",
+  "scope": "synthetic_command_diagnostic_not_acceptance",
+  "sources": {
+    "run.py": {
+      "blob": "67386d4ab0fc9fb33e675a4232246878f6324c73",
+      "sha256": "988abba2607410b1fb3864e6688b7078b46c1f8c4d167327400925030f55b380"
+    },
+    "support/tools/hyperv/process-command-v1.json": {
+      "blob": "ad73db8f74d76dfb14a39969b2b0ec8f4bd73419",
+      "sha256": "ee1e038f6538beecac8a09d4d52a6c601a9ca1f503fd70a3753bd8d2e3ac904b"
+    },
+    "tests/test_adapter.py": {
+      "blob": "04c66355c791fd415ff3ad252dcebca0286fdad7",
+      "sha256": "c1369266cd412a712e5fb94729b9cf69bc870213188c806409176aa3597e0cab"
+    }
+  },
+  "supervisor_sources": {
+    "fixture_array": "b9507700e1031cf799e34adf7100edeefbb91e52ab72712bf4fb95530da312f8"
+  }
+}

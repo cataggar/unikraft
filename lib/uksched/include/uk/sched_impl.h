@@ -83,10 +83,25 @@ int uk_sched_register(struct uk_sched *s);
 		(s)->a_stack = (sched_a_stack); \
 		(s)->a_auxstack = (sched_a_auxstack); \
 		(s)->a_uktls = (sched_a_uktls); \
+		uk_sched_fixed_init((s)); \
 		UK_TAILQ_INIT(&(s)->thread_list); \
 		UK_TAILQ_INIT(&(s)->exited_threads); \
 		uk_sched_stats_reset(s); \
 	} while (0)
+
+#if CONFIG_LIBUKSCHED_FIXED_SMP
+static inline void uk_sched_fixed_init(struct uk_sched *s)
+{
+	ukarch_spin_init(&s->lock);
+	s->lcpu_idx = 0;
+	s->state = UK_SCHED_PREPARED;
+	s->kick_error = 0;
+}
+#else
+static inline void uk_sched_fixed_init(struct uk_sched *s __unused)
+{
+}
+#endif
 
 /**
  * Releases self-exited threads (garbage collection)

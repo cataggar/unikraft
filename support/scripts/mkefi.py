@@ -4,6 +4,11 @@ import argparse
 import subprocess
 import re
 
+from elf_tools import configured_tool, tool_output
+
+NM = configured_tool("NM", "nm")
+READELF = configured_tool("READELF", "readelf")
+
 ELF_MACHINE = {"x86_64": 62, "arm64": 183}  # EM_X86_64  # EM_AARCH64
 
 PE_MACHINE = {
@@ -106,7 +111,7 @@ def elf_phdr_to_pe_sec(base_addr, phdr):
 # Get the absolute value of symbol, as seen through `nm`
 def get_sym_val(elf, sym):
     exp = r"^\s*" + r"([a-f0-9]+)" + r"\s+[A-Za-z]\s+" + sym + r"$"
-    out = subprocess.check_output(["nm", elf])  # nosec
+    out = tool_output(NM, elf)
 
     re_out = re.findall(exp, out.decode("ASCII"), re.MULTILINE)
     if len(re_out) != 1:
@@ -149,8 +154,7 @@ def get_loadable_phdrs(elf):
         + HEXNUM_EXP
         + r"$"
     )
-    args = ["readelf", "-l", elf]
-    out = subprocess.check_output(args, stderr=subprocess.DEVNULL)  # nosec
+    out = tool_output(READELF, "-l", elf, stderr=subprocess.DEVNULL)
     re_out = re.findall(exp, out.decode("ASCII"), re.MULTILINE)
 
     return [
@@ -172,11 +176,15 @@ def main():
         "Header with an empty MS-DOS stub."
     )
     parser.add_argument("elf", help="path to ELF64 binary to process")
+    parser.add_argument(
+        "--debug",
+        help="path to the unstripped ELF64 image (defaults to ELF + '.dbg')",
+    )
     opt = parser.parse_args()
 
     # We need to operate on the debug image for symbol values. But as far as
     # ELF sections go, using the final image is enough.
-    elf_dbg = opt.elf + ".dbg"
+    elf_dbg = opt.debug or opt.elf + ".dbg"
 
     # Fetch base address, end address and bss start address from ld script
     base_addr = get_sym_val(elf_dbg, r"_base_addr")

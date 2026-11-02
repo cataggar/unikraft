@@ -1,0 +1,7 @@
+NetVSC protocol behavior and interoperability were checked against files in
+FreeBSD's sys/dev/hyperv/netvsc and sys/net/rndis.h.
+
+Those reference files carry permissive BSD-2-Clause and ISC-style notices,
+including copyrights held by Microsoft Corp., Citrix Inc., NetApp Inc.,
+Jonathan Armani, Fabien Romano, and Michael Knudsen. No Linux or QEMU
+GPL-licensed implementation code is incorporated here.

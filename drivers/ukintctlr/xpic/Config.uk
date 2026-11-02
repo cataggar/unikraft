@@ -11,3 +11,15 @@ config LIBUKINTCTLR_APIC
 	depends on (HAVE_INTCTLR && ARCH_X86_64)
 	depends on HAVE_APIC
 	select LIBUKINTCTLR_PIC
+
+config LIBUKINTCTLR_XAPIC
+	bool "Allow legacy xAPIC fallback"
+	depends on LIBUKINTCTLR_APIC && PLAT_HYPERV
+	depends on LIBUKPAGING && LIBUKPLAT_NATIVE_PAGING && !HAVE_SMP
+	default y
+	help
+		Use uncached local-APIC MMIO when the CPU advertises APIC but
+		not x2APIC. Requires a globally enabled APIC. The controller is
+		initialized after paging, before the general-purpose allocator.
+		Only single-CPU Hyper-V guests are supported; SMP still requires
+		x2APIC for IPIs and secondary-CPU startup.

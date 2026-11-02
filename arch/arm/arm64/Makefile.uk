@@ -3,19 +3,36 @@
 # we should not enable the FP & SIMD access for kernel. As GCC will
 # the FP & SIMD registers to pass parameters, we use -mgeneral-regs-only
 # flag to force GCC to use generic registers
+#
+# Clang-based drivers do not reliably honour -mgeneral-regs-only on AArch64.
+# The `zig cc` driver, for example, re-applies the FP & SIMD target features of
+# its CPU model afterwards, so Clang keeps emitting FP & SIMD instructions (for
+# instance to spill the variadic argument registers) although FP & SIMD access
+# is disabled at runtime. Turning the target features off expresses the same
+# intent for every Clang-based driver.
+CLANG_GENERAL_REGS_ONLY := -Xclang -target-feature -Xclang -fp-armv8 \
+			   -Xclang -target-feature -Xclang -neon
+
 ifeq ($(CONFIG_FPSIMD),y)
 ARCHFLAGS     += -D__ARM_64__
 else
 ARCHFLAGS     += -D__ARM_64__ -mgeneral-regs-only
+ARCHFLAGS-$(call have_clang) += $(CLANG_GENERAL_REGS_ONLY)
 endif
 ARCHFLAGS-$(call gcc_version_ge,9,4) += -mno-outline-atomics
 
 # Disable FPU for trap/exception/interrupt handlers
 ISR_ARCHFLAGS += -D__ARM_64__ -mgeneral-regs-only
+ISR_ARCHFLAGS-$(call have_clang) += $(CLANG_GENERAL_REGS_ONLY)
 ISR_ARCHFLAGS-$(call gcc_version_ge,9,4) += -mno-outline-atomics
 
+# Clang requires an explicit target for bare-metal AArch64 builds. Compiler
+# commands that already select their target (COMPILER_TARGETED=y) bring their
+# own, possibly differently spelled, target triple.
+ifneq ($(call have_compiler_target),y)
 ARCHFLAGS-$(call have_clang)     += --target=aarch64-none-elf
 ISR_ARCHFLAGS-$(call have_clang) += --target=aarch64-none-elf
+endif
 
 CINCLUDES   += -I$(CONFIG_UK_BASE)/arch/arm/arm64/include
 ASINCLUDES  += -I$(CONFIG_UK_BASE)/arch/arm/arm64/include

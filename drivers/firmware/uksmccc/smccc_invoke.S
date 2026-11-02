@@ -8,6 +8,14 @@
 #include <uk/smccc.h>
 #include <uk/arch.h>
 
+#if CONFIG_ARM64_FEAT_BTI
+.arch armv8.5-a
+#elif CONFIG_ARM64_FEAT_PAUTH
+.arch armv8.3-a
+#else
+.arch armv8-a
+#endif
+
 .macro uk_smccc conduit
 #if CONFIG_ARM64_FEAT_PAUTH
 	/* Also covers the case when both PAuth and BTI

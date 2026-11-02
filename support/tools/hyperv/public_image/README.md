@@ -1,0 +1,408 @@
+# Native public image preparation and export
+
+Standalone Zig 0.16 implementation of the selected public CI `prepare`,
+four-mode matrix assertion, and `export-prepared` operations. It uses the
+pinned **native miz library**, core private-file/canonical-JSON/process helpers,
+native Kconfig/ELF readers, and the native `local_boot` runner. It does not
+execute miz, Python, a shell, an SDK, an HTTP client, or a credential provider.
+
+**This produces public local packaging evidence, not VMBus/StorVSC/NetVSC,
+Azure, #120 or #89 acceptance.** It is not the private preparation engine,
+completed preflight loader, signed-image admission, or a live authority entry.
+Neither a local state file nor a caller-constructed Zig struct is an
+unforgeable capability. External GitHub source/attestation verification and
+all private image/operator/authority gates remain separate.
+
+## Commands and integration
+
+Paths must be explicit, absolute, canonical, and free of symlink components.
+Resolve QEMU/OVMF symlinks before invoking the CLI. The source EFI, QEMU,
+firmware and optional solved config use the core public artifact policy:
+regular files, safe ancestors, no group/world writes. QEMU and the running
+producer must pass the native ELF reader. The state directory must **not
+exist**; its parent must exist. The CLI creates it mode 0700 and keeps a stable
+writer lock. There is no resume, automatic retry, adoption, or overwrite.
+
+```text
+uk-hyperv-public-image prepare \
+  --efi /canonical/public/hyperv-acceptance.efi \
+  --qemu /canonical/qemu-system-x86_64 \
+  --ovmf-code /canonical/OVMF_CODE_4M.fd \
+  --ovmf-vars /canonical/OVMF_VARS_4M.fd \
+  --state-dir /canonical/private/packaging --timeout 60
+
+uk-hyperv-public-image validate-matrix \
+  --state-dir /canonical/private/packaging
+
+uk-hyperv-public-image export-prepared \
+  --state-dir /canonical/private/packaging \
+  --artifact-dir /canonical/public/export \
+  --source-repository cataggar/unikraft --source-repository-id 123 \
+  --source-workflow-ref cataggar/unikraft/.github/workflows/integration.yaml@refs/heads/main \
+  --source-job zig-hyperv --source-run-id 456 --source-run-attempt 1 \
+  --source-head-sha 0123456789abcdef0123456789abcdef01234567
+```
+
+Add `--solved-config /canonical/public/hyperv-acceptance.config` for the public
+network-application packaging contract. `--expect` optionally selects a
+printable platform marker (default `UK_HYPERV_PLATFORM_READY`). Timeout is
+exact decimal seconds, 0.001 through 120 with at most three fractional digits;
+default 30, selected CI value 60. Each boot uses one CPU. The separate native
+two-CPU raw SMP proof is not part of this four-boot matrix.
+
+The native implementation embeds miz: **remove the old `--miz` argument**.
+It rejects unused tool paths, fixture/runtime overrides, arbitrary arguments,
+and unknown/duplicate options. Internal `--package-worker` and `--exec`
+dispatch require a canonical private typed job, the actual parent PID/group
+and parent-death signal, and the parent-held writer lock. They are not general
+worker entry points.
+
+The exported `compute_artifacts` module is a separate compute-only surface; it
+does not add branches or optional fields to `prepare`, stored `State`, matrix,
+export, or import. It wraps the pinned Miz
+native compressed-QCOW2 writer and fixed-VHD `Image.createFile`/`copyAll`/
+`gpt.relocateBackup` primitives with:
+
+- exact path, size, SHA-256 and physical-identity pins for the retained source;
+- caller-bounded physical, virtual, metadata, partition-array, byte-work,
+  workload and worker-memory limits;
+- native zstd, version-3, standalone 64-KiB-cluster QCOW2 validation through
+  the bounded reader, including complete decoded-raw hashing;
+- verified primary/backup GPT, exact partition and EFI workload identities;
+- complete fixed-VHD footer, creator, checksum, timestamp, geometry and
+  allocation reporting, plus an exact byte-for-byte reconstruction of pinned
+  Miz's relocation: only the protective-entry end CHS/count, explicit GPT
+  locations/CRCs and relocated backup metadata may change; bootstrap code,
+  disk signature, reserved bytes, partition arrays and header padding remain
+  bound;
+- parent-created, create-only stage/output/record reservations retained by
+  physical identity before worker launch. Workers refuse substituted slots,
+  and failure cleanup removes only names that still identify this attempt's
+  objects, leaving collisions and replacements untouched;
+- parent-side reopening of the retained output after worker exit, followed by
+  bounded recomputation and structural equality of every canonical QCOW2/VHD
+  record field (including host allocation) before `succeeded` admission, with
+  explicit `refused`/`partial` supervision otherwise.
+
+`finalize-qcow2` and `derive-fixed-vhd` are available only through the WAMR
+compute adapter's private supervised worker contract. The derivation intent
+contains the exact accepted QCOW2 digest and capacity; it does not accept a
+caller assertion such as `passed: true`. These primitives do not perform a
+boot, admit acceptance evidence, export a bundle, authorize Azure, or consume
+approval, attempt, ledger or cloud state. Those sequencing and evidence
+contracts remain future orchestration work.
+
+Successful export stdout is **only the lowercase 64-character SHA256 of the
+exact manifest bytes plus LF**, suitable for checked shell capture. Prepare
+and matrix commands emit bounded canonical JSON. Failures contain only
+enumerated core stages/categories with independent primary, cleanup and
+recording lanes; no raw errors, input paths, process output or environment.
+Exit 0 is success, 1 an execution/export failure, 2 a refusal, and 3 a failure
+to deliver the diagnostic. Always require exit 0.
+
+### Deliberate producer compatibility boundary
+
+Export keeps the existing two artifact names, schema
+`unikraft.hyperv.prepared-image`, **schema version 2**, artifact/packaging
+shapes, GitHub source fields, and raw/network-application contracts. Source
+integers are exact positive u64, head SHA is lowercase 40 or 64 hex, workflow
+must belong to the specified repository under `.github/workflows/` at a
+bounded `refs/...` revision without `..`, and the selected job is `zig-hyperv`.
+Manifest bytes use sorted compact ASCII keys/values and one LF.
+
+**Native controller revision is 4, not 3.** Revision 3's existing Python
+validator requires a fingerprint of two Python controllers and two ARM
+templates. Those are not this producer. Revision 4 sets `controller_sha256`
+to the physically reverified native executable SHA256;
+`artifacts.miz.sha256` identifies that same executable containing embedded
+miz, rather than an unused external miz CLI. `artifacts.miz.revision` is the
+Zig 0.17 port of the reviewed bounded-open generation,
+`66ea6701cf0e1b6d31e5f30fade00b7a546d4b44`, with package hash
+`miz-0.2.0-Z3lHlLgL2wDiGxutMJMDy9Qy4CLNCwOptwgQLp1ZDSiv` pinned in
+`build.zig.zon`. Earlier images retain their original compiler and producer
+records; changing this pin does not authenticate or relabel them.
+
+Consequently the **unchanged legacy revision-3 importer intentionally
+rejects this export**. Parent integration must explicitly admit native
+revision-4 producer/embedded-miz semantics and independently expected
+GitHub source plus attestation subject digest; accepting an arbitrary
+caller-supplied producer hash is not sufficient. This package does not
+silently impersonate revision 3 or change legacy import/network behavior.
+CI exercises the native fixtures and a separate real four-boot preparation,
+physical matrix reload and native-v4 export over its root-built public EFI.
+It retains bounded native reports, serial logs and the manifest digest without
+publishing the native VHD through the legacy prepared-image output contract.
+The existing #87 prepare/export path remains unchanged until its importer and
+attestation consumers support revision 4. This temporary coexistence is not a
+claim of complete Python-free CI. Root CLI assembly, producer maps and importer
+migration remain separate. The legacy inline Python matrix assertion can then
+be removed; native `prepare` already requires the entire matrix.
+
+The x64 native public CI path separately pins QEMU `v11.0.50-z.7` (archive
+SHA256 `f8b9cc818959f95326010c95dad644177ebb0cbb0feef3db9528c4434855e397`).
+The shared `v11.0.91-z.15` binary excludes VPC and remains unchanged for
+unrelated and legacy consumers. The native acquisition helper authenticates
+the archive, extracts only regular executable/data members, and obtains
+the exact missing libfdt package through hook-free private APT state.
+The hosted runtime owner places only that exact library at its normal loader
+path and removes only its own file. QEMU retains its `TMPDIR`-only child
+environment; no loader override or QEMU wrapper is used.
+Only the ordinary-user controller tree receives the existing KVM group,
+with original user/primary group preserved, all capabilities dropped and
+no-new-privileges required. No ACL, device mode, group database or udev rule
+is changed. This native step runs before the unchanged legacy boot step,
+preserves network-application selection, and retains runtime/credential
+evidence separately. The standalone candidate workflow uses the same
+acquisition and runtime owner with its fresh native guest-build driver.
+
+The standalone native-v4 **physical** `import-prepared` / `validate-import`
+leaf is documented in [IMPORT.md](IMPORT.md). It requires independent
+manifest/source/source-producer expectations and a separately retained
+successful import-receipt digest for reload. It does not change revision-3
+consumers, verify attestations, manufacture local boot observations or admit
+an image/authority. Trusted acquisition and root binding remain separate.
+The native CI driver follows its real export with physical import and reload,
+retaining local-only receipts without changing the legacy artifact contract.
+
+## Actual preparation and physical reload
+
+Native miz builds a 64-MiB FAT32 ESP in a **66-MiB GPT raw disk**, and a
+**66-MiB + 512-byte fixed VHD**. Separate deterministic builds must have
+identical complete raw/VHD-prefix hashes. The native fixed-VHD checker
+independently checks footer, GPT, FAT, fallback x86_64 PE/EFI, EFI bytes, ESP
+offset/length and exact virtual/file geometry. No guest image or seed is
+downloaded, regenerated or borrowed. Public source EFI bytes are copied once
+to private `BOOTX64.EFI`; the original is rehashed.
+
+The VHD scan finalizes a copy of the SHA256 state at the exact raw-prefix
+boundary, then continues the original state through the complete footer.
+This avoids hashing the same prefix twice within that scan. Every byte is
+still read, and all separate artifact revalidation, snapshot/EOF, structural,
+cross-file comparison and deadline checks remain unchanged.
+
+An exclusive private package stage contains miz's outputs/temporaries.
+Artifacts are normalized to 0600, fsynced, structurally checked, and published
+without replacement. The native packaging leaf is supervised for at most
+120 seconds, with an independent two-second TERM/KILL/reap cleanup budget.
+It never spawns another supervisor. Its file-size limit is the exact fixed
+VHD size. The parent orchestrates four independent single-exec local leaves,
+not nested supervisor process groups:
+
+| Disk | APIC setting | QEMU block node |
+| --- | --- | --- |
+| raw | x2APIC | read-only `raw`, offset 0, exact full size |
+| raw | legacy xAPIC | same raw node, `x2apic=off` |
+| fixed VHD | x2APIC | read-only **`vpc`** opening node |
+| fixed VHD | legacy xAPIC | same vpc node, `x2apic=off` |
+
+Both disk modes retain the complete original O_RDONLY descriptor, including
+the VHD footer, without copying/slicing it for a boot. VPC has no raw offset
+or size option. QEMU uses `BlockdevOptionsGenericFormat` for VPC opening.
+`force-size` belongs only to `BlockdevCreateOptionsVpc`; neither it nor
+`force_size_calc` is sent in opening JSON. The pinned miz creator tag
+`miz ` selects footer `current_size`. For legacy `vpc `, `vs  ` and
+`qemu` creators, CHS must equal that exact size or the input is rejected,
+without rewriting its creator/footer. This deliberately corrects the legacy
+helper which labeled
+a raw prefix of the VHD as VPC coverage. Every source byte and named-file
+identity is checked by the local runner before/after QEMU. Firmware variables
+are separate private copies for every boot; no NIC, user config, reboot,
+display or monitor is enabled.
+
+Serial requires the actual ordered Hyper-V/application-start milestones,
+one exact platform-marker line strictly after application start and before
+the anchored terminal return, the expected APIC marker presence/absence, no
+crash/live-I/O claims, and a unique anchored **`main returned 2`**. Return 2
+is the selected acceptance application's local storage+network-unavailable
+result, not arbitrary nonzero success. The real ukprint terminal envelope
+is parsed by `local_boot`; 20, duplicate/spoofed/trailing-garbage returns do
+not pass. The raw bytes are never normalized for hashing or export binding.
+
+The optional network configuration uses native typed parsing of its five
+selected settings, with a hash of the **entire** solved config. Unrelated
+Kconfig symbols are not reinterpreted. Duplicate/missing settings, nonprivate
+or noncanonical IPv4, invalid/equal ports and malformed nonce refuse.
+The native UKNA-v1 request/response transcript reproduces the public peer
+header/body protocol: 3 TCP connections, 6 UDP datagrams, 1760 TCP bytes and
+3408 UDP bytes per direction. The public peer script's bytes are hashed at
+build time, never executed. Every log needs one exact matching CONFIG record
+before return and must not claim NETWORK_APP_FINAL PASS or live network/I/O
+readiness.
+
+State schema `unikraft.hyperv.native-public-preparation` version 1 records
+`preparing`, `prepared` or `failed`, native producer/input fingerprints,
+packaging, four ordered request/report/raw-log hash bindings, and failure
+lanes. A create-only `prepare.json` precedes effects. A failed/partial state
+cannot become an export or a new attempt. A completed reload reopens and
+validates the immutable initial request, native package job/launch/report,
+packaging JSON, copied and original EFI, raw/VHD relation, original tools and
+firmware, solved config, and all four exact boot requests/reports/launches/
+raw logs. It does not trust the stored success booleans alone.
+
+Bounded raw logs remain in each `boot-{raw,vpc}-{x2apic,legacy-apic}` directory
+on failure, and are also copied to the matching top-level
+`local-*-serial.log` after confirmed process reaping. `packaging.json`
+preserves the existing miz report shape. Native miz has no subprocess
+`miz-*.log`; `package-job.json`, `package-launched`, `package-report.json`
+and `state.json` replace that evidence. Failed pipe capture is never used
+as guest serial. Each log is at most 4 MiB, each record 64 KiB, solved config
+1 MiB, EFI/tool 64 MiB, code 16 MiB, variables 4 MiB. Hashing/copy uses
+32-KiB buffers; no full raw/VHD allocation occurs.
+
+Export holds the original lock during physical reload, stages exactly
+`prepared-image-manifest.json` and `unikraft.vhd` in a private sibling
+directory, fsyncs both, and publishes the directory with no-replace rename
+and parent fsync. Collisions never overwrite an artifact. Publication/
+cleanup/recording failure yields no digest; a post-rename fsync failure may
+leave the two-file directory present and must not be treated as success.
+
+Local admission/post-exit/readonly reload filesystem work is size-bounded,
+not claimed to interrupt a stalled filesystem syscall. CI should retain an
+outer command ceiling covering that work (as for the local SMP driver).
+Core interrupts running leaves and cleans their owned descendant groups.
+Unresolved reaping poisons supervision and retains lock custody; there is
+no automatic replay. Abrupt supervisor/host loss is not a crash-recovery
+proof. None of these public limits reallocates a private staging/upload
+ledger or establishes live authority.
+
+## Module API
+
+`root.zig` exports `contracts`, `files`, `network`, `package`,
+`compute_artifacts`, `engine`, `worker`, `manifest`, `importer`,
+`import_contracts`, `boot` and `core`. Use an arena per bounded command.
+
+- `engine.prepare(a, io, contracts.Input, Options)!State`: requires dedicated
+  `core.process.initialize()`; `Options` contains the actual producer path
+  and optional atomic cancellation flag. Performs real native packaging and
+  four boots, returning phase plus independent failure lanes.
+- `engine.load(a, io, *core.private_files.Locked, actual_self_path)!State`:
+  read-only physical preparation/matrix validation while caller holds the lock.
+- `manifest.publish(a, io, lock, actual_self_path, artifact_dir, Source)Result`:
+  performs the physical load and durable no-clobber export; result is
+  optional raw32 SHA256 plus independent failures.
+- `manifest.validate(a, bytes, independently_expected_source, producer_hash)`:
+  strict canonical native-v4 **manifest-only** validation, not artifact,
+  attestation or authority admission. `manifest.build` only formats a state;
+  callers must not substitute it for physical `publish`.
+- `package.build`/`observe`, `network.fromConfig`/`serial`, and
+  `engine.bootConfig` expose the focused native primitives. Only trusted
+  orchestration should invoke them; no production fixture switch exists.
+- `compute_artifacts.reserveAttempt` must create and retain the typed
+  stage/output/record ownership before `finalizeQcow2` or `deriveFixedVhd`.
+  `verifyFinalizedQcow2`/`verifyDerivedFixedVhd` reopen those exact identities
+  and recompute canonical lineage before admission. `readFinalizationRecord`
+  and `readDerivationRecord` enforce canonical complete records and reject
+  changed parent, tool, profile, allocation, identity, footer or relocation
+  fields.
+
+## Focused offline fixtures
+
+Use only explicitly owned scratch, Zig 0.16 and `-j2`. Dependency restore is
+from copied manifests, followed by `--system`; no SDK checkout is modified.
+The public-image graph obtains the pinned Miz package once through
+`dependency.module("miz")` and passes that same module identity to its embedded
+local-boot module, preserving Miz's native zstd wiring without a duplicate
+module graph:
+
+```sh
+S="$PWD/.d/zig-migration-public-image"
+umask 077
+mkdir -p "$S"/home "$S"/tmp "$S"/cache "$S"/global-cache/tmp \
+  "$S"/restore "$S"/fixtures "$S"/outputs
+export HOME="$S/home" TMPDIR="$S/tmp" XDG_CACHE_HOME="$S/cache"
+export ZIG_LOCAL_CACHE_DIR="$S/cache" ZIG_GLOBAL_CACHE_DIR="$S/global-cache"
+cp support/tools/hyperv/public_image/build.zig \
+  support/tools/hyperv/public_image/build.zig.zon "$S/restore/"
+zig build --build-file "$S/restore/build.zig" --fetch=all -j2
+zig build --build-file support/tools/hyperv/public_image/build.zig \
+  --system "$S/restore/zig-pkg" --prefix "$S/outputs/debug" \
+  -Dtest-root="$S/fixtures" -j2 test install --summary all
+zig build --build-file support/tools/hyperv/public_image/build.zig \
+  --system "$S/restore/zig-pkg" --prefix "$S/outputs/release" \
+  -Dtest-root="$S/fixtures" -Doptimize=safe -j2 test install --summary all
+zig build --build-file support/tools/hyperv/local_boot/build.zig \
+  --system "$S/restore/zig-pkg" \
+  --prefix "$S/outputs/local-debug" -Dtest-root="$S/fixtures" \
+  -j2 test install --summary all
+zig build --build-file support/tools/hyperv/local_boot/build.zig \
+  --system "$S/restore/zig-pkg" \
+  --prefix "$S/outputs/local-release" -Dtest-root="$S/fixtures" \
+  -Doptimize=safe -j2 test install --summary all
+```
+
+The separate uninstalled native QEMU fixture checks actual argv, vpc versus
+raw shape, full read-only descriptor identity, CPU/APIC/no-NIC options,
+restricted environment, limits, private variable copies and process groups.
+Its strict VPC opening-field model follows the pinned QAPI generic-format
+contract, with independent literal cases rejecting creation-only and
+unsupported size controls. This is not an exact-binary QEMU option probe;
+real pinned-QEMU opening and four x86/KVM boots remain parent-owned CI gates.
+Fixtures create real miz containers from a public synthetic 512-byte PE,
+not a bootable guest or original seed. Cases include partial matrices,
+nonzero/missing/reordered/wrong markers, optional network transcript/config,
+mutation, timeout/flood/cancel, surviving descendants, independent cleanup/
+recording failures, duplicate/unknown JSON, physical evidence tampering,
+permission refusals, manifest/source compatibility and actual CLI/digest
+serialization. They remove only their own named fixture directories.
+Exact-marker regressions include a prefix-only occurrence before return
+with the sole exact line afterward, a line before application start,
+duplicates and valid order. Prepare and export reload both exercise the
+policy, including deliberately coherent synthetic report/log/state hashes
+so malformed ordering cannot be hidden behind matching digests.
+No real guest, KVM, Python, Azure, token, credential, original data seed or
+historical private artifact is used. Real x86/KVM integration remains CI work.
+
+### Debug SHA transition and cost qualification
+
+File hashing still uses Zig's standard SHA-256, in the selected optimization
+mode. On the self-hosted x86 backend with SHA and AVX2, the shared local file
+hasher places a two-instruction SysV `VZEROUPPER; RET` leaf before each standard
+update/final call. This prevents legacy SHA instructions from inheriting dirty
+upper AVX registers. It does not replace compression, optimize a module in a
+different mode, strip an executable, cache a digest, or omit any bytes or
+independent snapshot/EOF/revalidation pass. The original 120-second package,
+10-second normal synthetic boot, 3-second deadline cases and cleanup budgets
+are unchanged. Known-vector and streaming/peek equivalence tests run before
+both local-boot and public-image fixture suites.
+
+After the same restore above, `test-sha256` runs only those equivalence tests;
+`diagnose-cost -Dtest-root="$S/fixtures"` runs an **uninstalled** native probe.
+The latter creates fresh real 66-MiB miz images, measures actual file hashing
+and the two independent child input passes, and compares full-byte standard
+SHA digests with deliberately dirty versus cleared vector state. It reuses
+`synthetic_measurement.zig` for compiler backend, optimization, architecture,
+SHA/AVX2 flags, executable size, monotonic time and process CPU time. Logs
+contain bounded synthetic metadata and digests, not paths, input records,
+environment or authority claims. `build-cost-probe` compiles without running.
+
+The credential-free cost qualification workflow samples three genuine native
+x86 runners and then executes every Debug packaging/export/import fixture on
+each. CPU-specific measurements are not guest benchmarks or qualification.
+The regular required integration contexts remain unchanged. A repeated
+`-Dtest-filter=...` selector is available for targeted local diagnosis; CI
+does not filter or exclude any original fixture case.
+
+### Zig 0.17 configure cache
+
+Native commands use Zig 0.17's `debug` and `safe` optimization modes.
+Give each standalone `--build-file` its own local `--cache-dir` or
+`ZIG_LOCAL_CACHE_DIR`; do not reuse one configuration cache across public,
+preparation, namespace or integration scripts. A different script argument is
+not sufficient isolation in Zig 0.17. The global compiler cache may be shared.
+The configure-time peer commitment explicitly depends on the peer script's
+contents: reusing a build cache neither preserves an old hash after an edit
+nor accepts a deleted source. Run the isolated native build-schema regression
+from the repository root:
+
+```sh
+python3 support/tools/hyperv/public_image/configure_cache_tests.py \
+  /home/g/.local/bin/zig .zig17-peer-cache-test
+```
+
+It uses fresh private synthetic sources and the actual package build script,
+then removes its own directory. No guest, network or cloud resource is used.
+An optional third argument selects a fresh private cache directory on another
+filesystem; that directory is also removed. The actual build uses
+`ZIG_GLOBAL_CACHE_DIR`, not the removed Zig 0.17 build CLI flag.
+Filesystem-custody fixture runs are deliberately uncached: a previous successful
+run is not a substitute for current no-follow, metadata and source validation.

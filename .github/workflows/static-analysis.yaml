@@ -28,6 +28,20 @@ jobs:
           ref: staging
           submodules: recursive
 
+      - name: "Check CodeChecker credentials"
+        id: creds
+        env:
+          CC_USER: ${{ secrets.CODECHECKER_STORE_USER }}
+          CC_PASS: ${{ secrets.CODECHECKER_STORE_PASS }}
+        run: |
+          set -eu
+          if [ -n "${CC_USER}" ] && [ -n "${CC_PASS}" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Static analysis::CodeChecker store credentials are not configured; analysing without storing a baseline."
+          fi
+
       - name: "Load configuration"
         uses: ./.github/actions/ci-versions
 
@@ -47,14 +61,14 @@ jobs:
           config: "${{ github.workspace }}/.codechecker.json"
           logfile: ${{ steps.build.outputs.logfile }}
 
-          store: true
+          store: ${{ steps.creds.outputs.configured == 'true' }}
           store-url: 'https://codechecker.unikraft.org/unikraft'
           store-run-name: 'app-elfloader-qemu-x86_64'
           store-username: ${{ secrets.CODECHECKER_STORE_USER }}
           store-password: ${{ secrets.CODECHECKER_STORE_PASS }}
 
       - name: "Check results store status"
-        if: ${{ steps.codechecker.outputs.store-successful == 'false' }}
+        if: ${{ steps.creds.outputs.configured == 'true' && steps.codechecker.outputs.store-successful == 'false' }}
         run: exit 1
 
   # Reports whether a PR introduces new findings.
@@ -78,16 +92,37 @@ jobs:
       HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
+      # The comparison needs an account on the CodeChecker server, which only
+      # the upstream repository has. Without it there is nothing to diff
+      # against, so skip quietly instead of failing and instead of leaving a
+      # `static analysis` commit status behind that could never be resolved.
+      - name: "Check CodeChecker credentials"
+        id: creds
+        env:
+          CC_USER: ${{ secrets.CODECHECKER_STORE_USER }}
+          CC_PASS: ${{ secrets.CODECHECKER_STORE_PASS }}
+        run: |
+          set -eu
+          if [ -n "${CC_USER}" ] && [ -n "${CC_PASS}" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Static analysis::CodeChecker server credentials are not configured for ${GITHUB_REPOSITORY}; skipping the baseline comparison."
+          fi
+
       - name: "Fetch version manifest"
+        if: steps.creds.outputs.configured == 'true'
         uses: actions/checkout@v4
         with:
           ref: staging
           sparse-checkout: .github/actions/ci-versions
 
       - name: "Load configuration"
+        if: steps.creds.outputs.configured == 'true'
         uses: ./.github/actions/ci-versions
 
       - name: "Set commit status: pending"
+        if: steps.creds.outputs.configured == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -98,6 +133,7 @@ jobs:
             -f target_url="${RUN_URL}"
 
       - name: "Fetch report hashes"
+        if: steps.creds.outputs.configured == 'true'
         uses: actions/download-artifact@v4
         with:
           name: codechecker-baseline
@@ -106,6 +142,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: "Validate report hashes"
+        if: steps.creds.outputs.configured == 'true'
         run: |
           set -eu
           test -f "${BASELINE}"
@@ -123,10 +160,12 @@ jobs:
 
       # We only use CodeChecker to diff, fetch from pip to save some time
       - name: "Install CodeChecker"
+        if: steps.creds.outputs.configured == 'true'
         run: pip3 install "codechecker==${CODECHECKER_VERSION}"
 
       - name: "Diff against the stored baseline"
         id: diff
+        if: steps.creds.outputs.configured == 'true'
         env:
           CC_USER: ${{ secrets.CODECHECKER_STORE_USER }}
           CC_PASS: ${{ secrets.CODECHECKER_STORE_PASS }}
@@ -264,7 +303,7 @@ jobs:
           exit 1
 
       - name: "Set commit status: success"
-        if: ${{ always() && !failure() && !cancelled() }}
+        if: ${{ always() && !failure() && !cancelled() && steps.creds.outputs.configured == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -275,7 +314,7 @@ jobs:
             -f target_url="${RUN_URL}"
 
       - name: "Set commit status: failure"
-        if: ${{ always() && failure() }}
+        if: ${{ always() && failure() && steps.creds.outputs.configured == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -286,7 +325,7 @@ jobs:
             -f target_url="${RUN_URL}"
 
       - name: "Set commit status: canceled"
-        if: ${{ always() && cancelled() }}
+        if: ${{ always() && cancelled() && steps.creds.outputs.configured == 'true' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

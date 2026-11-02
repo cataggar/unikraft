@@ -1,0 +1,101 @@
+// SPDX-License-Identifier: BSD-3-Clause
+const std = @import("std");
+const linux = std.os.linux;
+
+pub fn main(init: std.process.Init) void {
+    const args = init.minimal.args.toSlice(init.arena.allocator()) catch std.process.exit(2);
+    if (args.len == 13 and
+        std.mem.eql(u8, args[1], "build") and
+        std.mem.eql(u8, args[2], "--build-file") and
+        std.fs.path.isAbsolute(args[3]) and
+        std.mem.endsWith(u8, args[3], "/support/tools/hyperv/direct/build.zig") and
+        std.mem.eql(u8, args[4], "--cache-dir") and
+        std.fs.path.isAbsolute(args[5]) and
+        std.mem.eql(u8, args[6], "--prefix") and
+        std.fs.path.isAbsolute(args[7]) and
+        std.mem.eql(u8, args[8], "-Dtarget=x86_64-linux-gnu") and
+        (std.mem.eql(u8, args[9], "-Dcpu=x86_64_v2") or std.mem.eql(u8, args[9], "-Dcpu=x86_64_v3")) and
+        std.mem.eql(u8, args[10], "-Doptimize=safe") and
+        std.mem.eql(u8, args[11], "-j2") and
+        std.mem.eql(u8, args[12], "install"))
+        return;
+    if (args.len == 3 and std.mem.eql(u8, args[1], "handoff")) {
+        const bundle = std.Io.Dir.openFileAbsolute(init.io, args[2], .{ .follow_symlinks = false }) catch std.process.exit(2);
+        defer bundle.close(init.io);
+        var scenario: [32]u8 = undefined;
+        const count = bundle.readPositionalAll(init.io, &scenario, 0) catch std.process.exit(2);
+        if (std.mem.eql(u8, scenario[0..count], "accepted")) {
+            std.Io.File.stdout().writeStreamingAll(init.io, "Compute handoff revalidated; authority=not_admitted.\n") catch std.process.exit(2);
+            return;
+        }
+        runScenario(init.io, scenario[0..count]);
+        return;
+    }
+    if (args.len == 4 and std.mem.eql(u8, args[1], "inspect")) {
+        const efi = std.Io.Dir.openFileAbsolute(init.io, args[2], .{ .follow_symlinks = false }) catch std.process.exit(2);
+        defer efi.close(init.io);
+        const package = std.Io.Dir.openDirAbsolute(init.io, args[3], .{ .follow_symlinks = false }) catch std.process.exit(2);
+        defer package.close(init.io);
+        std.Io.File.stdout().writeStreamingAll(init.io, "{\"image\":{\"efi\":{\"size\":3}},\"producer_sha256\":\"fixture\"}\n") catch std.process.exit(2);
+        return;
+    }
+    if (args.len != 3 or !std.mem.eql(u8, args[1], "--fixture-root"))
+        std.process.exit(2);
+    const directory = std.Io.Dir.openDirAbsolute(init.io, args[2], .{
+        .follow_symlinks = false,
+    }) catch std.process.exit(2);
+    defer directory.close(init.io);
+    const file = directory.openFile(init.io, "scenario", .{ .follow_symlinks = false }) catch std.process.exit(2);
+    defer file.close(init.io);
+    var buffer: [32]u8 = undefined;
+    const count = file.readPositionalAll(init.io, &buffer, 0) catch std.process.exit(2);
+    runScenario(init.io, buffer[0..count]);
+}
+
+pub fn runScenario(io: std.Io, scenario: []const u8) void {
+    if (std.mem.eql(u8, scenario, "ok")) {
+        std.Io.File.stdout().writeStreamingAll(io, "native fixture ok\n") catch std.process.exit(2);
+        return;
+    }
+    if (std.mem.eql(u8, scenario, "reported-error")) {
+        std.Io.File.stderr().writeStreamingAll(io, "UnsafeFile /private/secret\n") catch std.process.exit(2);
+        return;
+    }
+    if (std.mem.eql(u8, scenario, "nonzero")) {
+        std.Io.File.stderr().writeStreamingAll(io, "PermissionDenied /private/secret\n") catch {};
+        std.process.exit(7);
+    }
+    if (std.mem.eql(u8, scenario, "partial")) {
+        std.Io.File.stdout().writeStreamingAll(io, "partial private output\n") catch {};
+        std.process.exit(9);
+    }
+    if (std.mem.eql(u8, scenario, "signal")) {
+        _ = linux.kill(linux.getpid(), .USR1);
+        std.process.exit(2);
+    }
+    if (std.mem.eql(u8, scenario, "overflow")) {
+        const chunk = @as([65536]u8, @splat('X'));
+        for (0..140) |_|
+            std.Io.File.stdout().writeStreamingAll(io, &chunk) catch std.process.exit(2);
+        return;
+    }
+    if (std.mem.eql(u8, scenario, "large-3m") or std.mem.eql(u8, scenario, "large-8m")) {
+        const chunk = @as([65536]u8, @splat('A'));
+        const count: usize = if (std.mem.eql(u8, scenario, "large-3m")) 48 else 64;
+        for (0..count) |_|
+            std.Io.File.stdout().writeStreamingAll(io, &chunk) catch std.process.exit(2);
+        if (count == 64) {
+            const stderr_chunk = @as([65536]u8, @splat('B'));
+            for (0..64) |_|
+                std.Io.File.stderr().writeStreamingAll(io, &stderr_chunk) catch std.process.exit(2);
+        }
+        return;
+    }
+    if (std.mem.eql(u8, scenario, "timeout")) {
+        while (true) {
+            var fds: [0]linux.pollfd = .{};
+            _ = linux.poll(&fds, 0, 1000);
+        }
+    }
+    std.process.exit(2);
+}

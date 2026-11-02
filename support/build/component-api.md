@@ -1,0 +1,328 @@
+# Typed component metadata API
+
+`component-api.zig` is the internal, experimental Zig 0.17 metadata API for
+describing Unikraft components and platform image pipelines. It models the
+current `Makefile.uk` contract without compiling or linking anything. The API
+may change until the external component contract is defined.
+
+`BuildContext` copies all registration metadata into context-owned storage.
+Callers retain ownership of input slices, keep the borrowed `ConfigQuery`
+implementation alive through `finalize`, and call `deinit`. Library, source,
+variant, link-stage, and link-input slices retain registration order. The
+finalized graph's `registrations` slice also records the deterministic
+cross-category component/platform order.
+
+Library object production is explicit: `LibraryObjectPipeline` records the
+ordered partial-link command, provenance of local versus `EACHOLIB` inputs,
+the relocatable intermediate, symbol-localizing objcopy transformation, and
+the final typed library object. `TargetZigObject` separately models Zig source
+compiled for the target, including its logical object output, optimization
+mode (`debug`, `safe`, `fast`, or `small`), C include roots/macros,
+generated-file dependencies, PIC setting, and
+frame-pointer policy. `native-target-object.zig` materializes those entries as
+`LazyPath` objects with libc disabled, no red zone, no stack checks or
+unwinding, single-threaded runtime assumptions, and trap-on-panic behavior.
+An optional `c_translation` declares C header names and the Zig import name
+(default `config`). The pinned `translate_c` build dependency translates a
+generated C wrapper before compilation; the same global/object include roots,
+macros, target and generated-file bindings apply to translation. Generated
+headers are tracked inputs of the translator, not configure-time files or
+hand-copied Zig declarations. Initialization follows the typed Hearth pattern,
+`const translated: Translator = .init(b.dependency("translate_c", .{}), options)`;
+the dependency uses its hosted defaults, while the actual guest target and
+object optimization belong to `options`. Every consumer imports
+`translated.mod`, including its helper modules, rather than rebuilding a module
+from `output_file`. Hosted production verifiers retain their safe mode.
+The target-object fixture checks translated
+macro values and a real C/Zig struct-by-value ABI, including a stripped object.
+Root invocations require the explicitly restored translator/Aro depot described
+in the root README; use `--system "$ZIG_LOCAL_PKG_DIR"` to prohibit fetching.
+Run it with `zig build --system "$ZIG_LOCAL_PKG_DIR" test-native-target-object`. The focused
+`zig build --system "$ZIG_LOCAL_PKG_DIR" test-target-config-cache` selector checks same-path configuration
+updates and live executable/application replacements on warm caches.
+Its recursive builds receive the already resolved root depot and retain
+`--system`; an unavailable depot must refuse before the Make recorder executes.
+`LinkStage.sequence` interleaves artifacts,
+literal or driver/raw-translated flags, archive-group markers, and system
+library arguments without regrouping them. Ordered post-processing
+transformations can create several named artifacts or declare an in-place
+mutation; later transformations refer to those named results.
+
+## Registered native image graphs
+
+`native-image-graph.zig` registers production metadata for the documented
+hello-world `qemu-x86_64`, `qemu-arm64`, and `hyperv-x86_64-efi`
+configurations. The metadata is compiled into Zig through
+`native-image-data.zig`; it does not load a Make JSON
+export at graph construction time. Each profile records:
+
+- every selected library in final-link order, with its ordered object/archive
+  inputs, relocatable output, final object, and symbol-file transformations;
+- the ordered default and supplemental linker scripts, followed by an
+  explicit merged-script stage;
+- the complete final-link sequence, including archive group boundaries; and
+- the architecture-specific relocation, strip, bootinfo,
+  Multiboot/EFI/Linux Image, and compile-database declarations. PIE profiles
+  model `mkukreloc.py` as an ordered mutation before any section stripping.
+
+Production `build.zig` constructs and validates one of these graphs with:
+
+```sh
+zig build --system "$ZIG_LOCAL_PKG_DIR" native-link-graph \
+  -Dapp=/absolute/path/to/app-helloworld \
+  -Dnative-profile=qemu-x86_64
+```
+
+Use `qemu-arm64` for the ARM64 profile or `hyperv-x86_64-efi` for the
+x86_64 standalone Hyper-V EFI platform. Other names fail explicitly. The older
+`-Dnative-qemu-graph` spelling remains an alias for the QEMU profiles. This
+step registers metadata only. The `native-images` step uses the same graph to ask
+Make for compile-time inputs, then executes the native library links, linker
+script merge, final link, post-processing, and output publication:
+
+```sh
+zig build --system "$ZIG_LOCAL_PKG_DIR" native-images \
+  -Dapp=/absolute/path/to/app-helloworld \
+  -Dconfig=/absolute/path/to/solved.config \
+  -Dnative-profile=qemu-x86_64
+```
+
+Fixtures under
+`tests/native-qemu-graph/` are deterministic projections of `make build-graph`
+for the documented Zig/raw compatibility configurations and are checked by
+the module tests.
+
+`Source.effectiveInput(config, variant)` resolves conditions and returns the
+last active source- or variant-level preprocessing output, or the original
+source when the source, variant, or every preprocessing step is inactive.
+Finalization uses the same active-step rules for generated references and
+output conflicts.
+
+Post-processing describes files, not Make log labels. In particular, the
+`.multiboot`, `.efi`, `.bin`, and `.img` labels in `plat/common/Makefile.rules`
+do not denote products: the Multiboot, EFI, and Linux helpers mutate the KVM
+image in place. Bootinfo additionally creates its real `.bootinfo` side file.
+Xen ARM/ARM64 alone creates a separate raw image, which is the input to gzip;
+Xen x86 gzip consumes the processed ELF image.
+
+Native Hyper-V profiles select `ExecutorPaths.native_runner` and the Zig
+`native-postprocess-runner.zig` executable for relocations, stripping,
+bootinfo, EFI conversion and compile-database assembly. Unsupported native
+operations fail explicitly; there is no Python recovery or fallback. Other
+profiles retain their existing post-processing selection.
+
+The native runner rejects source/destination and output/output aliases,
+including hardlinks and symlinks, before transformation. It stages changes
+privately and publishes each completed output atomically. Publication is not
+a transaction across multiple outputs; build directories must remain stable
+and exclusively owned by the build.
+
+Run the native ELF/image fixtures and actual strip/objcopy transformations:
+
+```sh
+zig build --build-file support/build/native-postprocess-tests.build.zig \
+  --system "$ZIG_LOCAL_PKG_DIR" integration -j2
+```
+
+The default fixture architecture is x86_64; `-Dfixture-arch=arm64` exercises
+ARM64 images. `-Dobjcopy=...` and `-Dstrip=...` select native tools explicitly.
+These are image-transformation fixtures, not Hyper-V boot evidence.
+
+```zig
+const build = @import("component-api.zig");
+
+var context = try build.BuildContext.init(allocator, .{
+    .roots = .{
+        .base = "/src/unikraft",
+        .app = "/src/app",
+        .output = "/src/app/build",
+        .config = "/src/app/build/.config",
+    },
+    .target = .{
+        .architecture = .x86_64,
+        .family = .x86,
+        .abi = "none",
+        .triple = "x86_64-unknown-none",
+    },
+    .toolchain = toolchain,
+    .config = config_query,
+});
+defer context.deinit();
+
+try build.registerComponent(&context, .{
+    .name = "libhello",
+    .origin = .{ .external = .{
+        .package_name = "hello",
+        .root = "/packages/hello",
+    } },
+    .enable = .{ .config_enabled = "CONFIG_LIBHELLO" },
+    .layout = .{ .ordinary = .{ .build_subdir = "libhello" } },
+    .sources = &.{.{
+        .name = "hello",
+        .path = "/packages/hello/hello.c",
+        .language = .c,
+        .variants = &.{.{
+            .output = .{ .path = "/src/app/build/libhello/hello.o", .kind = .object },
+        }},
+    }},
+    .object_pipeline = .{
+        .partial_link_output = "/src/app/build/libhello.ld.o",
+        .partial_link_sequence = &.{
+            .{ .artifact = .{
+                .kind = .object,
+                .artifact = .{ .component_output = .{
+                    .component = "libhello",
+                    .path = "/src/app/build/libhello/hello.o",
+                } },
+                .provenance = .library_local,
+            } },
+        },
+        .transform = .{
+            .input = .{ .library_partial_output = "libhello" },
+            .output = "/src/app/build/libhello.o",
+        },
+    },
+});
+
+try build.registerPlatform(&context, .{
+    .name = "kvm",
+    .origin = .{ .internal = .platform },
+    .enable = .{ .config_enabled = "CONFIG_PLAT_KVM" },
+    .link_stages = &.{.{
+        .name = "final-link",
+        .transformation = .final_link,
+        .output = "/src/app/build/app_kvm.dbg",
+        .output_role = .debug,
+        .sequence = &.{
+            .{ .artifact = .{
+                .kind = .object,
+                .artifact = .{ .library_final_object = "libhello" },
+            } },
+            .group_start,
+            .{ .artifact = .{
+                .kind = .archive,
+                .artifact = .{ .path = "/src/app/build/runtime.a" },
+            } },
+            .group_end,
+            .{ .library_argument = "-lgcc" },
+        },
+    }},
+    .post_process = &.{.{
+        .name = "strip",
+        .kind = .strip,
+        .input = .{ .stage_output = .{
+            .platform = "kvm",
+            .stage = "final-link",
+        } },
+        .effects = &.{.{ .create = .{
+            .name = "image",
+            .path = "/src/app/build/app_kvm",
+            .role = .image,
+        } }},
+    }},
+});
+
+const graph = try context.finalize();
+_ = graph.selectedPlatform();
+```
+
+Validation first resolves the one selected platform and all conditions, then
+checks active references and producers. It rejects duplicate active outputs,
+inconsistent platform-library registrations, unknown or forward typed
+references, malformed archive groups, and configurations that select zero or
+multiple platforms. Inactive platform pipelines may intentionally name the
+same eventual output, such as `compile_commands.json`.
+The finalized graph retains resolved active-library and selected-platform
+link-stage bitmaps so native executors do not need to retain or re-evaluate
+the borrowed configuration query.
+`lastDiagnostic()` supplies the offending names or paths.
+
+`native-library-link.zig` plans and materializes active library object
+pipelines. It uses the configured Zig executable as
+`zig cc -target <triple> -nostdlib -r`, passes ordered link inputs without a
+shell, validates the resulting ELF for forbidden `SHN_COMMON` symbols, and
+then runs the configured objcopy localization sequence. Generated and
+component outputs must be supplied as `PathBinding` values so their producing
+steps remain tracked; typed library outputs are connected automatically.
+Non-Zig compiler drivers are rejected instead of silently adopting Zig's
+COMMON-symbol behavior.
+
+When `CONFIG_OPTIMIZE_LTO=y` is active and the native profile is `qemu-x86_64`,
+the per-library partial-link and objcopy stages are bypassed entirely.
+`native-lto.zig` collects all library object and archive inputs in registration
+order and passes them directly to a single `zig cc -flto` final link.
+The native `lto-symbol-policy.zig` executable runs before that link: it invokes the configured NM
+tool (`llvm-nm`) on each library's objects/archives, reads export-symbol files,
+detects private-symbol collisions and illegal cross-library private references
+(both are explicit failures), and writes a deterministic LLD version script
+with the global-symbol union and `local: *;`. It also writes a compiler
+response file containing `-Wl,-u` force-keep arguments for the active export
+lists so required definitions survive LTO internalization. Both outputs are
+generated after the GNU Make input step, allowing export lists produced in a
+clean output tree. Within the native pipeline, LTO is rejected at build time
+for `qemu-arm64` and `hyperv-x86_64-efi`; non-LTO ARM64 builds and the GNU Make
+backend are unaffected.
+
+## Native configuration metadata
+
+`native-config-metadata.zig` exports the sorted
+`unikraft-native-config-metadata-v1` symbol/platform model consumed by
+`native-config-tool.zig` and `kconfig.zig`. It links the existing C Kconfig
+parser through a small read-only bridge; it does not read configuration into
+the solver or change solved values. Linux Make `olddefconfig` and `syncconfig`
+remain responsible for solving Kconfig. Building the metadata executable
+requires the same native Bison/Flex tools used by the C solver, plus libc.
+
+The exporter preserves version.mk/gitsha1 defaults, environment-expanded
+sources, image-name precedence, external roots and exclusions. Platform
+registrations must name defined symbols and form a bijection; duplicate,
+conflicting and missing external registrations fail. Unchanged metadata is
+not rewritten.
+
+Only the metadata executable enables `UK_KCONFIG_METADATA`: unmatched
+`source` paths/globs and filesystem glob errors are fatal. Its shell
+expansions use dynamic capture with a **1,048,576-byte raw stdout ceiling per
+command**, before newline normalization. Overflow, embedded NULs and read
+errors fail explicitly rather than emitting truncated metadata. Missing
+sources and capture failures return public exit status 2 without publishing
+metadata. The ordinary C solver retains its existing optional-source and
+255-byte shell-output behavior.
+
+Run the focused native unit and CLI fixtures (no Make or Python execution):
+
+```sh
+zig build --system "$ZIG_LOCAL_PKG_DIR" test-build-tools -j2
+```
+
+This includes metadata/version/platform negative cases, unchanged solved
+configuration/header checks, long root submenu paths, shell-capture boundary
+cases, a standalone legacy `olddefconfig` compatibility fixture, NM failure
+and malformed-output cases, private
+reference/collision gates, deterministic version scripts and force-keep files,
+and the existing native configuration/linker/LTO planning tests. Other root
+test targets and legacy Make image/build-graph modes retain their separately
+owned producers; this target does not invoke them.
+
+Run the standalone, leak-checked unit tests with:
+
+```sh
+zig test support/build/component-api.zig
+zig test support/build/native-library-link.zig
+zig test support/build/elf-common-validator.zig
+```
+
+## Native final links
+
+`final-link.zig` plans active `final_link` stages from a `FinalizedGraph` and
+executes them through the configured Zig compiler driver. It preserves sequence
+order, resolves typed artifacts through a caller-supplied `LazyPath` resolver,
+tracks custom dependencies, and replaces all modeled linker scripts with one
+generated `-Wl,-T,<path>` argument.
+
+`linker-script.zig` creates that tracked artifact. The first script is the
+primary script; later scripts may only contribute ordered `PHDRS` entries or
+`SECTIONS { ... } INSERT BEFORE/AFTER <section>` blocks. Malformed scripts,
+unknown supplemental commands, duplicate program headers, and missing or
+ambiguous insertion anchors are rejected rather than ignored.
+Insertion groups retain registration order, including anchors introduced by
+earlier groups, and preserve the legacy merger's generated text.

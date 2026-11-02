@@ -1,14 +1,39 @@
 name: integration
 
 on:
+  # zig16 does not require pull requests to be up to date before merging, so
+  # every push re-runs the matrix on the combined result of serial merges.
   push:
-    branches: [staging, stable]
+    branches: [staging, stable, zig, zig16]
     paths-ignore: ['*.md']
 
+  # No `paths-ignore` here: the job contexts of this workflow are meant to be
+  # required for every pull request, and skipped workflows never report a
+  # status, which would leave Markdown-only pull requests pending forever.
+  # GitHub cannot express a per-base-branch path filter, so we accept running
+  # the full matrix on documentation-only changes.
   pull_request:
     types: [opened, synchronize, reopened]
-    branches: [staging]
-    paths-ignore: ['*.md']
+    branches: [staging, zig, zig16]
+
+  workflow_dispatch:
+    inputs:
+      export_hyperv_prepared_image:
+        description: Export the exact four-boot Hyper-V VHD for reviewed use
+        required: false
+        type: boolean
+        default: false
+      hyperv_network_application:
+        description: Build and bind the stack-backed private-peer image
+        required: false
+        type: boolean
+        default: false
+
+# Only the newest zig16 push needs a post-merge verdict; it covers every
+# earlier merge. Pull request, staging, stable and dispatch runs are unchanged.
+concurrency:
+  group: ${{ github.event_name == 'push' && github.ref == 'refs/heads/zig16' && 'integration-zig16-push' || format('integration-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/zig16' }}
 
 jobs:
   libc-test:
@@ -32,6 +57,21 @@ jobs:
         repository: unikraft/app-helloworld
         fetch-depth: 1
         path: _helloworld
+
+    - name: Pin upstream libc-test commit compatible with uktest patches
+      run: |
+        python3 - <<'PY'
+        from pathlib import Path
+        p = Path("support/build/Makefile.rules")
+        old = "\t$(GIT) clone --recurse-submodules -q --progress --depth 1 --branch $(3) --no-tags $(2) $(BUILD_DIR)/$(1)/origin/ && \\\n"
+        new = (
+            "\t$(GIT) clone --recurse-submodules -q --progress --branch $(3) --no-tags $(2) $(BUILD_DIR)/$(1)/origin/ && \\\n"
+            "\t(if [ \"$(1)\" = \"liblibctest\" ]; then $(GIT) -C $(BUILD_DIR)/$(1)/origin checkout -q c8b9db5111e48bf6e05e516a2b9e62d602c99a9c; fi) && \\\n"
+        )
+        text = p.read_text()
+        assert old in text, "clone rule not found in Makefile.rules"
+        p.write_text(text.replace(old, new, 1))
+        PY
 
     - name: Build and run libc-test via uktest
       uses: unikraft/kraftkit@staging
@@ -190,6 +230,1998 @@ jobs:
           targets:
           - platform: ${{ matrix.plat }}
             architecture: ${{ matrix.arch }}
+
+  zig-helloworld:
+    name: zig-helloworld
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
+    container:
+      image: ubuntu:24.04
+    permissions:
+      attestations: read
+      contents: read
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+    - name: Install checkout and build dependencies
+      run: |
+        set -euxo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y --no-install-recommends \
+          bison \
+          ca-certificates \
+          curl \
+          file \
+          flex \
+          git \
+          libncurses-dev \
+          make \
+          tar \
+          xz-utils
+        rm -rf /var/lib/apt/lists/*
+
+    - name: Download LLVM and QEMU tools
+      uses: cataggar/ghr/actions/download@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1
+      env:
+        GH_TOKEN: ${{ github.token }}
+      with:
+        ghr-version: v0.9.1
+        tools: |
+          cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
+          cataggar/qemu/qemu-v11.0.91-z.15-linux-x64.tar.gz@v11.0.91-z.15
+        dest: ${{ runner.temp }}/zig-tools
+        extract: 'true'
+        strip-components: '1'
+
+    - name: Add LLVM and QEMU tools to PATH
+      run: |
+        set -euo pipefail
+        tools="${RUNNER_TEMP}/zig-tools"
+        for command in \
+          "${tools}/bin/llvm-nm" \
+          "${tools}/bin/llvm-objcopy" \
+          "${tools}/bin/llvm-objdump" \
+          "${tools}/bin/llvm-readelf" \
+          "${tools}/bin/llvm-strip" \
+          "${tools}/qemu-system-x86_64"; do
+          test -x "${command}"
+        done
+        {
+          echo "${tools}/bin"
+          echo "${tools}"
+        } >> "${GITHUB_PATH}"
+
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Load configuration
+      uses: ./.github/actions/ci-versions
+
+    - name: Fetch helloworld
+      uses: actions/checkout@v4
+      with:
+        repository: unikraft/app-helloworld
+        fetch-depth: 1
+        path: _helloworld
+
+    - name: Verify GCC is unavailable
+      run: |
+        set -euo pipefail
+        for command in gcc g++ gcc-ar gcc-nm; do
+          if command -v "${command}" >/dev/null 2>&1; then
+            echo "Unexpected GCC command on PATH: ${command}" >&2
+            exit 1
+          fi
+        done
+
+    - name: Install Zig with ghr
+      uses: cataggar/ghr/actions/install@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1
+      env:
+        GH_TOKEN: ${{ github.token }}
+      with:
+        ghr-version: v0.9.1
+        tools: |
+          cataggar/zig@v${{ env.ZIG_VERSION }} RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+    - name: Build helloworld with Zig
+      run: |
+        set -euo pipefail
+        test "$(zig version)" = "${ZIG_VERSION}"
+        build="${RUNNER_TEMP}/build-zig"
+        config="${RUNNER_TEMP}/qemu-x86_64.config"
+        log="${RUNNER_TEMP}/zig-build.log"
+        export ZIG_GLOBAL_CACHE_DIR="${RUNNER_TEMP}/zig-global-cache"
+        export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/zig-local-cache-x86_64"
+        rm -rf "${build}"
+        cp "${GITHUB_WORKSPACE}/_helloworld/defconfigs/qemu-x86_64" "${config}"
+        zig_args=(
+          "-Dapp=${GITHUB_WORKSPACE}/_helloworld"
+          "-Doutput=${build}"
+          "-Dconfig=${config}"
+          "-Dcompiler=zig cc -target x86_64-freestanding-none"
+          "-Dcompiler-targeted=true"
+          "-Dhost-cc=zig cc"
+          "-Dhost-cxx=zig c++"
+          # Kconfig's kernel-style list sentinel is intentionally null-derived.
+          "-Dhost-cflags=-fno-sanitize=null"
+          "-Dmake-arg=AR=zig ar"
+          "-Dmake-arg=NM=llvm-nm"
+          "-Dmake-arg=OBJCOPY=llvm-objcopy"
+          "-Dmake-arg=OBJDUMP=llvm-objdump"
+          "-Dmake-arg=READELF=llvm-readelf"
+          "-Dmake-arg=STRIP=llvm-strip"
+          "-Dmake-arg=UK_CFLAGS=-std=gnu17"
+          "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt"
+        )
+        zig build olddefconfig "${zig_args[@]}"
+        set +e
+        zig build native-images \
+          -Dnative-qemu-graph=qemu-x86_64 \
+          "${zig_args[@]}" 2>&1 | tee "${log}"
+        build_status=("${PIPESTATUS[@]}")
+        set -e
+
+        mapfile -d '' command_files < <(
+          find "${build}" -type f -name '*.cmd' \
+            ! -path "${build}/kconfig/*" \
+            ! -path "${build}/include/config/*" \
+            -size +0c -print0
+        )
+        if [ "${#command_files[@]}" -eq 0 ]; then
+          echo "The target build generated no command files to audit." >&2
+          exit 1
+        fi
+
+        # A command may begin a file or follow a shell separator. Requiring
+        # that boundary avoids treating GCC-like source path components as
+        # executables. Check environment tool selections separately because
+        # the selected command is executed later by a Python image script.
+        gcc_command="(^|[;&|])[[:space:]]*(env[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*=(\"[^\"]*\"|'[^']*'|[^[:space:]]+)[[:space:]]+)*((ccache|command)[[:space:]]+)?([^[:space:];|&]*/)?([^/[:space:];|&]*-)?(gcc|g\\+\\+|gcc-ar|gcc-nm)(-[0-9.]+)?([[:space:];|&]|$)"
+        gcc_assignment="(^|[;&|])[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=['\"]?(env[[:space:]]+([^[:space:]=]+=[^[:space:]]+[[:space:]]+)*)?((ccache|command)[[:space:]]+)?([^[:space:]\"';|&]*/)?([^/[:space:]\"';|&]*-)?(gcc|g\\+\\+|gcc-ar|gcc-nm)(-[0-9.]+)?([[:space:]\"';|&]|$)"
+        gcc_found=0
+        for command_file in "${command_files[@]}"; do
+          if grep --with-filename --line-number --extended-regexp \
+            "${gcc_command}|${gcc_assignment}" "${command_file}"; then
+            gcc_found=1
+          fi
+        done
+        if [ "${gcc_found}" -ne 0 ]; then
+          echo "The target build invoked a GCC command." >&2
+          exit 1
+        fi
+        if grep --with-filename --line-number --extended-regexp \
+          '(^|[[:space:]])zig[[:space:]]+ld\.lld([[:space:]]|$)' \
+          "${command_files[@]}" "${log}"; then
+          echo "The native target build invoked zig ld.lld directly." >&2
+          exit 1
+        fi
+        test "${build_status[1]}" -eq 0
+        test "${build_status[0]}" -eq 0
+
+    - name: Inspect Zig image
+      run: |
+        set -euo pipefail
+        image="${RUNNER_TEMP}/build-zig/helloworld_qemu-x86_64.dbg"
+        file "${image}"
+        header="$(llvm-readelf --file-header "${image}")"
+        printf '%s\n' "${header}"
+        grep --quiet 'Class:.*ELF64' <<< "${header}"
+        grep --quiet 'Machine:.*X86-64' <<< "${header}"
+
+        program_headers="$(llvm-readelf --program-headers "${image}")"
+        if grep --quiet INTERP <<< "${program_headers}"; then
+          echo "The Zig image has a program interpreter." >&2
+          exit 1
+        fi
+        dynamic="$(llvm-readelf --wide --dynamic "${image}" 2>/dev/null)"
+        if grep --quiet NEEDED <<< "${dynamic}"; then
+          echo "The Zig image has a dynamic dependency." >&2
+          exit 1
+        fi
+
+        undefined="$(llvm-nm --undefined-only --format=posix "${image}")"
+        if [ -n "${undefined}" ]; then
+          echo "The Zig image has unresolved symbols:" >&2
+          printf '%s\n' "${undefined}" >&2
+          exit 1
+        fi
+        symbols="$(llvm-nm --format=posix "${image}")"
+        if grep --ignore-case --quiet libgcc <<< "${symbols}"; then
+          echo "The Zig image has a libgcc symbol reference." >&2
+          exit 1
+        fi
+        if grep --ignore-case --quiet libgcc <<< "${dynamic}"; then
+          echo "The Zig image has a libgcc dependency." >&2
+          exit 1
+        fi
+        common="$(llvm-nm --format=posix "${image}" | awk '$2 == "C"')"
+        if [ -n "${common}" ]; then
+          echo "The Zig image has COMMON symbols:" >&2
+          printf '%s\n' "${common}" >&2
+          exit 1
+        fi
+
+    - name: Boot Zig image
+      run: |
+        set -euo pipefail
+        image="${RUNNER_TEMP}/build-zig/helloworld_qemu-x86_64"
+        output="${RUNNER_TEMP}/zig-qemu.log"
+        set +e
+        timeout 30s qemu-system-x86_64 \
+          -kernel "${image}" \
+          -nographic \
+          -no-reboot \
+          2>&1 | tee "${output}"
+        status=("${PIPESTATUS[@]}")
+        set -e
+        test "${status[1]}" -eq 0
+        test "${status[0]}" -eq 0
+        grep --fixed-strings --quiet 'Hello world!' "${output}"
+
+    - name: Build helloworld with Zig LTO
+      run: |
+        set -euo pipefail
+        test "$(zig version)" = "${ZIG_VERSION}"
+        build="${RUNNER_TEMP}/build-zig-lto"
+        config="${RUNNER_TEMP}/qemu-x86_64-lto.config"
+        log="${RUNNER_TEMP}/zig-build-lto.log"
+        export ZIG_GLOBAL_CACHE_DIR="${RUNNER_TEMP}/zig-global-cache"
+        export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/zig-local-cache-x86_64-lto"
+        rm -rf "${build}"
+        cp "${GITHUB_WORKSPACE}/_helloworld/defconfigs/qemu-x86_64" "${config}"
+        printf '\nCONFIG_OPTIMIZE_LTO=y\n' >> "${config}"
+        zig_args=(
+          "-Dapp=${GITHUB_WORKSPACE}/_helloworld"
+          "-Doutput=${build}"
+          "-Dconfig=${config}"
+          "-Dcompiler=zig cc -target x86_64-freestanding-none"
+          "-Dcompiler-targeted=true"
+          "-Dhost-cc=zig cc"
+          "-Dhost-cxx=zig c++"
+          # Kconfig's kernel-style list sentinel is intentionally null-derived.
+          "-Dhost-cflags=-fno-sanitize=null"
+          "-Dmake-arg=AR=zig ar"
+          "-Dmake-arg=NM=llvm-nm"
+          "-Dmake-arg=OBJCOPY=llvm-objcopy"
+          "-Dmake-arg=OBJDUMP=llvm-objdump"
+          "-Dmake-arg=READELF=llvm-readelf"
+          "-Dmake-arg=STRIP=llvm-strip"
+          "-Dmake-arg=UK_CFLAGS=-std=gnu17"
+          "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt"
+        )
+        zig build olddefconfig "${zig_args[@]}"
+        # Assert CONFIG_OPTIMIZE_LTO=y is active in the solved config before
+        # building.  olddefconfig writes back to ${config} (reported as
+        # "configuration written to .../qemu-x86_64-lto.config"); ${build}/.config
+        # is not created at this stage.
+        if ! grep --quiet '^CONFIG_OPTIMIZE_LTO=y$' "${config}"; then
+          echo "CONFIG_OPTIMIZE_LTO=y not found in ${config} after olddefconfig." >&2
+          exit 1
+        fi
+        set +e
+        # --verbose causes zig build to print Run step argv to stdout so the
+        # final zig cc -flto link command appears in the captured log.
+        zig build --verbose native-images \
+          -Dnative-profile=qemu-x86_64 \
+          "${zig_args[@]}" 2>&1 | tee "${log}"
+        build_status=("${PIPESTATUS[@]}")
+        set -e
+
+        mapfile -d '' command_files < <(
+          find "${build}" -type f -name '*.cmd' \
+            ! -path "${build}/kconfig/*" \
+            ! -path "${build}/include/config/*" \
+            -size +0c -print0
+        )
+        if [ "${#command_files[@]}" -eq 0 ]; then
+          echo "The LTO target build generated no command files to audit." >&2
+          exit 1
+        fi
+
+        # A command may begin a file or follow a shell separator. Requiring
+        # that boundary avoids treating GCC-like source path components as
+        # executables. Check environment tool selections separately because
+        # the selected command is executed later by a Python image script.
+        gcc_command="(^|[;&|])[[:space:]]*(env[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*=(\"[^\"]*\"|'[^']*'|[^[:space:]]+)[[:space:]]+)*((ccache|command)[[:space:]]+)?([^[:space:];|&]*/)?([^/[:space:];|&]*-)?(gcc|g\\+\\+|gcc-ar|gcc-nm)(-[0-9.]+)?([[:space:];|&]|$)"
+        gcc_assignment="(^|[;&|])[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=['\"]?(env[[:space:]]+([^[:space:]=]+=[^[:space:]]+[[:space:]]+)*)?((ccache|command)[[:space:]]+)?([^[:space:]\"';|&]*/)?([^/[:space:]\"';|&]*-)?(gcc|g\\+\\+|gcc-ar|gcc-nm)(-[0-9.]+)?([[:space:]\"';|&]|$)"
+        gcc_found=0
+        for command_file in "${command_files[@]}"; do
+          if grep --with-filename --line-number --extended-regexp \
+            "${gcc_command}|${gcc_assignment}" "${command_file}"; then
+            gcc_found=1
+          fi
+        done
+        if [ "${gcc_found}" -ne 0 ]; then
+          echo "The LTO target build invoked a GCC command." >&2
+          exit 1
+        fi
+        if grep --with-filename --line-number --extended-regexp \
+          '(^|[[:space:]])zig[[:space:]]+ld\.lld([[:space:]]|$)' \
+          "${command_files[@]}" "${log}"; then
+          echo "The LTO target build invoked zig ld.lld directly." >&2
+          exit 1
+        fi
+
+        # Assert the final link invoked zig cc with the explicit x86_64
+        # freestanding target and -flto.  --verbose printed the Run step argv
+        # to stdout; check either flag ordering on the same log line.
+        if ! grep --extended-regexp --quiet \
+            'zig[[:space:]]+cc[[:space:]].*-target[[:space:]]+x86_64-freestanding-none.*-flto|zig[[:space:]]+cc[[:space:]].*-flto.*-target[[:space:]]+x86_64-freestanding-none' \
+            "${log}"; then
+          echo "LTO build log does not show 'zig cc -target x86_64-freestanding-none ... -flto'." >&2
+          exit 1
+        fi
+
+        # Assert representative stable C-compilation records and objects.
+        # Broad .cmd scanning matched metadata/linker-script generator records
+        # (libinfo, earlytab.lds, pcpuvar.lds) and misidentified their ELF
+        # outputs as C bitcode.  Use explicit well-known paths instead.
+        for c_record in \
+            "${build}/apphelloworld/main.o.cmd" \
+            "${build}/libnolibc/string.o.cmd"; do
+          if [ ! -s "${c_record}" ]; then
+            echo "Expected C compile record not found or empty: ${c_record}" >&2
+            exit 1
+          fi
+          if ! grep --extended-regexp --quiet 'zig[[:space:]]+cc' "${c_record}"; then
+            echo "C compile record does not invoke zig cc: ${c_record}" >&2
+            exit 1
+          fi
+          if ! grep --extended-regexp --quiet -- \
+              '-target[[:space:]]+x86_64-freestanding-none' "${c_record}"; then
+            echo "C compile record missing -target x86_64-freestanding-none: ${c_record}" >&2
+            exit 1
+          fi
+          if ! grep --quiet -- '-flto' "${c_record}"; then
+            echo "C compile record missing -flto: ${c_record}" >&2
+            exit 1
+          fi
+          c_obj="${c_record%.cmd}"
+          if [ ! -f "${c_obj}" ]; then
+            echo "Expected C object not found: ${c_obj}" >&2
+            exit 1
+          fi
+          obj_type="$(file -b "${c_obj}")"
+          if ! printf '%s' "${obj_type}" | grep --quiet 'LLVM IR bitcode'; then
+            echo "C object is not LLVM IR bitcode (${obj_type}): ${c_obj}" >&2
+            exit 1
+          fi
+          echo "LTO C bitcode verified: ${c_obj}"
+        done
+
+        test "${build_status[1]}" -eq 0
+        test "${build_status[0]}" -eq 0
+
+    - name: Inspect Zig LTO image
+      run: |
+        set -euo pipefail
+        image="${RUNNER_TEMP}/build-zig-lto/helloworld_qemu-x86_64.dbg"
+        file "${image}"
+        header="$(llvm-readelf --file-header "${image}")"
+        printf '%s\n' "${header}"
+        grep --quiet 'Class:.*ELF64' <<< "${header}"
+        grep --quiet 'Machine:.*X86-64' <<< "${header}"
+
+        program_headers="$(llvm-readelf --program-headers "${image}")"
+        if grep --quiet INTERP <<< "${program_headers}"; then
+          echo "The Zig LTO image has a program interpreter." >&2
+          exit 1
+        fi
+        dynamic="$(llvm-readelf --wide --dynamic "${image}" 2>/dev/null)"
+        if grep --quiet NEEDED <<< "${dynamic}"; then
+          echo "The Zig LTO image has a dynamic dependency." >&2
+          exit 1
+        fi
+
+        undefined="$(llvm-nm --undefined-only --format=posix "${image}")"
+        if [ -n "${undefined}" ]; then
+          echo "The Zig LTO image has unresolved symbols:" >&2
+          printf '%s\n' "${undefined}" >&2
+          exit 1
+        fi
+        symbols="$(llvm-nm --format=posix "${image}")"
+        if grep --ignore-case --quiet libgcc <<< "${symbols}"; then
+          echo "The Zig LTO image has a libgcc symbol reference." >&2
+          exit 1
+        fi
+        if grep --ignore-case --quiet libgcc <<< "${dynamic}"; then
+          echo "The Zig LTO image has a libgcc dependency." >&2
+          exit 1
+        fi
+        common="$(llvm-nm --format=posix "${image}" | awk '$2 == "C"')"
+        if [ -n "${common}" ]; then
+          echo "The Zig LTO image has COMMON symbols:" >&2
+          printf '%s\n' "${common}" >&2
+          exit 1
+        fi
+
+    - name: Boot Zig LTO image
+      run: |
+        set -euo pipefail
+        image="${RUNNER_TEMP}/build-zig-lto/helloworld_qemu-x86_64"
+        output="${RUNNER_TEMP}/zig-lto-qemu.log"
+        set +e
+        timeout 30s qemu-system-x86_64 \
+          -kernel "${image}" \
+          -nographic \
+          -no-reboot \
+          2>&1 | tee "${output}"
+        status=("${PIPESTATUS[@]}")
+        set -e
+        test "${status[1]}" -eq 0
+        test "${status[0]}" -eq 0
+        grep --fixed-strings --quiet 'Hello world!' "${output}"
+
+    - name: Run LTO proof
+      run: |
+        set -euo pipefail
+        zig run "${GITHUB_WORKSPACE}/support/build/native-lto-proof.zig" -- \
+          --work-dir "${RUNNER_TEMP}/lto-proof" \
+          --zig "$(command -v zig)" \
+          --nm "llvm-nm"
+
+    - name: ELF size diff
+      run: |
+        set -euo pipefail
+        baseline="${RUNNER_TEMP}/build-zig/helloworld_qemu-x86_64.dbg"
+        lto="${RUNNER_TEMP}/build-zig-lto/helloworld_qemu-x86_64.dbg"
+        diff_output="$(
+          zig run "${GITHUB_WORKSPACE}/support/build/native-elf-size-diff.zig" -- \
+            --readelf "llvm-readelf" \
+            --nm "llvm-nm" \
+            "${baseline}" \
+            "${lto}"
+        )"
+        printf '%s\n' "${diff_output}"
+        {
+          echo '## Zig LTO ELF size diff (non-LTO vs LTO)'
+          echo '```'
+          printf '%s\n' "${diff_output}"
+          echo '```'
+        } >> "${GITHUB_STEP_SUMMARY}"
+
+  zig-hyperv-preparation:
+    name: zig-hyperv-preparation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      attestations: read
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        persist-credentials: false
+
+    - name: Install the pinned native compiler
+      uses: cataggar/ghr/actions/install@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9
+      env:
+        GH_TOKEN: ${{ github.token }}
+      with:
+        ghr-version: v0.9.1
+        tools: cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+    - name: Acquire the pinned native LLVM tools
+      uses: cataggar/ghr/actions/download@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9
+      env:
+        GH_TOKEN: ${{ github.token }}
+      with:
+        ghr-version: v0.9.1
+        tools: cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
+        dest: ${{ runner.temp }}/hyperv-preparation-llvm
+        extract: 'true'
+        strip-components: '1'
+        cache: 'false'
+
+    - name: Select the native ELF inspection tools
+      run: |
+        set -euo pipefail
+        tools="${RUNNER_TEMP}/hyperv-preparation-llvm/bin"
+        test -x "${tools}/llvm-readelf"
+        test -x "${tools}/llvm-objcopy"
+        echo "${tools}" >> "${GITHUB_PATH}"
+
+    - name: Run native Hyper-V preparation and namespace fixtures
+      run: |
+        bash support/tools/hyperv/preparation/ci-fixtures.sh \
+          --ci-verified-fixture-debug-stripping
+
+    - name: Retain bounded preparation fixture evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: zig-hyperv-preparation-evidence
+        path: |
+          ${{ runner.temp }}/hyperv-ci/native-preparation/baseline.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/debug/baseline.json
+          ${{ runner.temp }}/hyperv-ci/native-preparation/namespace-denial.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/namespace-capability-diagnostics.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/credentials.json
+          ${{ runner.temp }}/hyperv-ci/native-preparation/cleanup.json
+          ${{ runner.temp }}/hyperv-ci/native-preparation/fixture-sha256.txt
+          ${{ runner.temp }}/hyperv-ci/native-preparation/fixture-copies.tsv
+          ${{ runner.temp }}/hyperv-ci/native-preparation/fixture-objcopy-version.txt
+          ${{ runner.temp }}/hyperv-ci/native-preparation/fixture-objcopy-sha256.txt
+          ${{ runner.temp }}/hyperv-ci/native-preparation/debug/fixture-strip-proof.json
+          ${{ runner.temp }}/hyperv-ci/native-preparation/debug/namespace-cache/**/preparation-namespace
+          ${{ runner.temp }}/hyperv-ci/native-preparation/debug/namespace-cache/**/preparation-namespace-fixture
+          ${{ runner.temp }}/hyperv-ci/native-preparation/debug/fixture-build.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/debug/namespace-baseline.json
+          ${{ runner.temp }}/hyperv-ci/native-preparation/debug/preparation.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/debug/namespace.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/debug/integration.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/safe/fixture-strip-proof.json
+          ${{ runner.temp }}/hyperv-ci/native-preparation/safe/namespace-cache/**/preparation-namespace
+          ${{ runner.temp }}/hyperv-ci/native-preparation/safe/namespace-cache/**/preparation-namespace-fixture
+          ${{ runner.temp }}/hyperv-ci/native-preparation/safe/fixture-build.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/safe/namespace-baseline.json
+          ${{ runner.temp }}/hyperv-ci/native-preparation/safe/preparation.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/safe/namespace.log
+          ${{ runner.temp }}/hyperv-ci/native-preparation/safe/integration.log
+        retention-days: 7
+        if-no-files-found: error
+
+  zig-hyperv-public-debug:
+    name: zig-hyperv-public-debug
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      attestations: read
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        persist-credentials: false
+
+    - name: Restore independent fixture tools
+      uses: ./.github/actions/hyperv-fixture-setup
+
+    - name: Run native public Hyper-V Debug packaging, export and import fixtures
+      run: |
+        bash .github/scripts/hyperv-native-public-fixtures.sh debug
+
+  zig-hyperv-runtime:
+    name: zig-hyperv-runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      attestations: read
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        persist-credentials: false
+        fetch-depth: 0
+
+    - name: Restore independent fixture tools
+      uses: ./.github/actions/hyperv-fixture-setup
+
+    # The direct controller re-executes itself into an unprivileged user
+    # namespace. Prove the runner still grants one now, in seconds, instead of
+    # discovering the denial an hour later inside the offline suite.
+    - name: Confirm the runner grants unprivileged user namespaces
+      run: |
+        set -euo pipefail
+        userns_restriction=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
+        if test -e "${userns_restriction}" &&
+            test "$(cat "${userns_restriction}")" != 0; then
+          userns_restriction_original="$(cat "${userns_restriction}")"
+          restore_userns_restriction() {
+            sudo sysctl -q -w \
+              "kernel.apparmor_restrict_unprivileged_userns=${userns_restriction_original}"
+          }
+          trap restore_userns_restriction EXIT
+          sudo sysctl -q -w kernel.apparmor_restrict_unprivileged_userns=0
+          test "$(cat "${userns_restriction}")" = 0
+        fi
+        unshare --user --map-root-user --mount true
+
+    - name: Run native Hyper-V operator custody fixtures
+      run: |
+        bash support/tools/hyperv/operator_guard/ci-fixtures.sh
+
+    - name: Run native Hyper-V core, transfer, and worker fixtures
+      run: |
+        set -euo pipefail
+        umask 077
+        restore="${RUNNER_TEMP}/hyperv-ci/native-tools/restore"
+        mkdir -p "${restore}"
+        cp support/tools/hyperv/build.zig support/tools/hyperv/build.zig.zon \
+          "${restore}/"
+        ZIG_LOCAL_CACHE_DIR="${restore}/zig-local-cache" \
+          zig build --build-file "${restore}/build.zig" --fetch=all -j2
+        for mode in debug safe; do
+          root="${RUNNER_TEMP}/hyperv-ci/native-${mode}"
+          mkdir -p "${root}/fixtures"
+          ZIG_LOCAL_CACHE_DIR="${root}/zig-local-cache" \
+            zig build --build-file support/tools/hyperv/build.zig \
+              --system "${restore}/zig-pkg" \
+              --prefix "${root}/out" -Dtest-root="${root}/fixtures" \
+              -Doptimize="${mode}" -j2 \
+              test-core test-transfer test-worker install --summary all
+        done
+
+    - name: Run standalone native Hyper-V transfer fixtures
+      run: |
+        set -euo pipefail
+        umask 077
+        root="${RUNNER_TEMP}/hyperv-ci/native-transfers"
+        mkdir -p "${root}/safe/fixtures"
+        ZIG_LOCAL_CACHE_DIR="${root}/safe/zig-local-cache" \
+          zig build --build-file support/tools/hyperv/transfer/build.zig \
+            --system "${RUNNER_TEMP}/hyperv-ci/native-tools/restore/zig-pkg" \
+            --prefix "${root}/safe/out" \
+            -Dfixture-root="${root}/safe/fixtures" \
+            -Doptimize=safe -j2 test install --summary all
+
+    - name: Run native Hyper-V persistence engine fixtures
+      run: |
+        set -euo pipefail
+        umask 077
+        root="${RUNNER_TEMP}/hyperv-ci/native-persistence"
+        mkdir -p "${root}/restore"
+        objcopy="$(readlink -f "${RUNNER_TEMP}/hyperv-tools/bin/llvm-objcopy")"
+        test -f "${objcopy}"
+        test -x "${objcopy}"
+        "${objcopy}" --version > "${root}/fixture-objcopy-version.txt"
+        test "$(stat -c '%s' "${root}/fixture-objcopy-version.txt")" -le 4096
+        awk -f support/tools/hyperv/preparation/ci-objcopy-version.awk \
+          "${root}/fixture-objcopy-version.txt"
+        sha256sum -- "${objcopy}" > "${root}/fixture-objcopy-sha256.txt"
+        cp support/tools/hyperv/persistence/build.zig \
+          support/tools/hyperv/persistence/build.zig.zon "${root}/restore/"
+        ZIG_LOCAL_CACHE_DIR="${root}/restore-cache" \
+          zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
+        for mode in debug safe; do
+          mkdir -p "${root}/${mode}/fixtures"
+          fixture_result=0
+          ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
+            zig build --build-file support/tools/hyperv/persistence/build.zig \
+              --system "${root}/restore/zig-pkg" \
+              --cache-dir "${root}/${mode}/zig-local-cache" \
+              --prefix "${root}/${mode}/out" \
+              -Dtest-root="${root}/${mode}/fixtures" \
+              -Dpersistence-timing=true \
+              -Dstrip-fixture-debug=true -Dfixture-file-relayout=true \
+              "-Dfixture-objcopy=${objcopy}" \
+              "-Dstrip-fixture-report=${root}/${mode}/fixture-strip-proof.json" \
+              "-Dfixture-build-evidence-root=${root}/${mode}/build-evidence" \
+              "-Dfixture-source-commit=$(git rev-parse HEAD)" \
+              "-Dfixture-source-tree=$(git rev-parse HEAD^{tree})" \
+              -Doptimize="${mode}" -j2 \
+              test test-arm test-strip-equivalence test-strip-proof test-build-evidence install --summary all \
+              2>&1 | tee "${root}/${mode}/fixtures.log" || fixture_result=$?
+          marker_result=0
+          (set -C; printf '%s\n' "${fixture_result}" > "${root}/${mode}/fixture-build-exit.txt") || marker_result=$?
+          if [ "${fixture_result}" -ne 0 ]; then exit "${fixture_result}"; fi
+          if [ "${marker_result}" -ne 0 ]; then exit "${marker_result}"; fi
+          result=0
+          "${root}/${mode}/out/bin/uk-hyperv-persistence-engine" run \
+            > "${root}/${mode}/stdout" 2> "${root}/${mode}/stderr" \
+            || result=$?
+          test "${result}" -eq 1
+          test ! -s "${root}/${mode}/stdout"
+          grep --fixed-strings --quiet \
+            '"reason":"production_bindings_unavailable"' \
+            "${root}/${mode}/stderr"
+        done
+        sha256sum --check "${root}/fixture-objcopy-sha256.txt"
+
+    - name: Exercise the direct Azure lifecycle without cloud access
+      run: |
+        set -euo pipefail
+        umask 077
+        root="${RUNNER_TEMP}/hyperv-ci/direct"
+        parent="${GITHUB_WORKSPACE}/.d/direct-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        mkdir -p "${root}/tmp" "${root}/fixtures" "${GITHUB_WORKSPACE}/.d"
+        mkdir -m 0700 "${parent}"
+        export TMPDIR="${root}/tmp"
+        zig build --build-file support/tools/hyperv/direct/build.zig -j2 \
+          --cache-dir "${root}/cache" \
+          --prefix "${root}/tools" -Doptimize=safe \
+          -Dtest-root="${root}/fixtures" \
+          -Dlifecycle-root="${parent}/native" \
+          test test-foundation test-controller test-lifecycle-native install
+
+    - name: Collect bounded persistence observations
+      if: always()
+      run: bash .github/scripts/hyperv-fixture-observation-evidence.sh persistence
+
+    - name: Collect exact persistence parent build evidence
+      if: always()
+      run: bash .github/scripts/hyperv-persistence-build-evidence.sh
+
+    - name: Exercise WAMR compute only after persistence source custody ends
+      run: |
+        set -euo pipefail
+        umask 077
+        root="${RUNNER_TEMP}/hyperv-ci/direct"
+        export TMPDIR="${root}/tmp"
+        # Even creating/removing ignored zig-pkg changes pinned directory metadata.
+        # Do not move this independent dependency restoration before collection.
+        # WAMR uses the same isolated fake backend, never an authenticated CLI.
+        export PYTHONDONTWRITEBYTECODE=1
+        mkdir -p "${root}/restore"
+        compute_fixture_root="${root}/compute-fixtures"
+        mkdir -m 0700 "${compute_fixture_root}"
+        # Parallel install must not create an ancestor sibling after input capture.
+        mkdir -m 0700 "${root}/compute-tools"
+        compute_fixture_root="$(readlink -f "${compute_fixture_root}")"
+        test "$(stat -c '%a' -- "${compute_fixture_root}")" = 700
+        cp support/tools/hyperv/local_boot/build.zig \
+          support/tools/hyperv/local_boot/build.zig.zon "${root}/restore/"
+        zig build --build-file "${root}/restore/build.zig" --fetch=all -j2 \
+          --cache-dir "${root}/restore-cache"
+        zig build --build-file support/build/wamr-native-ci/build.zig -j2 \
+          --system "${root}/restore/zig-pkg" \
+          --cache-dir "${root}/compute-cache" \
+          --prefix "${root}/compute-tools" \
+          -Dtest-root="${compute_fixture_root}" \
+          -Doptimize=safe test install
+
+    - name: Retain bounded runtime fixture evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: zig-hyperv-runtime-evidence
+        path: |
+          ${{ runner.temp }}/hyperv-ci/native-operator-guard/baseline.log
+          ${{ runner.temp }}/hyperv-ci/native-operator-guard/namespace-denial.log
+          ${{ runner.temp }}/hyperv-ci/native-operator-guard/fixture-sha256.txt
+          ${{ runner.temp }}/hyperv-ci/native-persistence/fixture-objcopy-version.txt
+          ${{ runner.temp }}/hyperv-ci/native-persistence/fixture-objcopy-sha256.txt
+          ${{ runner.temp }}/hyperv-ci/native-persistence/debug/fixture-strip-proof.json
+          ${{ runner.temp }}/hyperv-ci/native-persistence/observation-evidence/debug-fixtures.log
+          ${{ runner.temp }}/hyperv-ci/native-persistence/debug/build-evidence/evidence/parent-test
+          ${{ runner.temp }}/hyperv-ci/native-persistence/debug/build-evidence/evidence/worker-raw
+          ${{ runner.temp }}/hyperv-ci/native-persistence/debug/build-evidence/evidence/worker-selected
+          ${{ runner.temp }}/hyperv-ci/native-persistence/debug/build-evidence/evidence/report.json
+          ${{ runner.temp }}/hyperv-ci/native-persistence/debug/fixture-build-exit.txt
+          ${{ runner.temp }}/hyperv-ci/native-persistence/debug/stdout
+          ${{ runner.temp }}/hyperv-ci/native-persistence/debug/stderr
+          ${{ runner.temp }}/hyperv-ci/native-persistence/safe/fixture-strip-proof.json
+          ${{ runner.temp }}/hyperv-ci/native-persistence/observation-evidence/safe-fixtures.log
+          ${{ runner.temp }}/hyperv-ci/native-persistence/safe/build-evidence/evidence/parent-test
+          ${{ runner.temp }}/hyperv-ci/native-persistence/safe/build-evidence/evidence/worker-raw
+          ${{ runner.temp }}/hyperv-ci/native-persistence/safe/build-evidence/evidence/worker-selected
+          ${{ runner.temp }}/hyperv-ci/native-persistence/safe/build-evidence/evidence/report.json
+          ${{ runner.temp }}/hyperv-ci/native-persistence/safe/fixture-build-exit.txt
+          ${{ runner.temp }}/hyperv-ci/native-persistence/safe/stdout
+          ${{ runner.temp }}/hyperv-ci/native-persistence/safe/stderr
+        retention-days: 7
+        if-no-files-found: warn
+
+  zig-hyperv-build-protocol:
+    name: zig-hyperv-build-protocol
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      attestations: read
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        persist-credentials: false
+        fetch-depth: 0
+
+    - name: Restore independent fixture tools
+      uses: ./.github/actions/hyperv-fixture-setup
+
+    - name: Run native configuration, linker, and LTO fixtures
+      run: |
+        set -euo pipefail
+        root="${RUNNER_TEMP}/hyperv-ci/native-build-tools"
+        ZIG_LOCAL_CACHE_DIR="${root}/zig-local-cache" \
+        ZIG_LOCAL_PKG_DIR="${root}/zig-pkg" \
+          zig build -j2 test-build-tools "-Doutput=${root}/build" \
+            --summary all
+
+    - name: Exercise explicit private native Make configuration
+      run: |
+        set -euo pipefail
+        export PATH="/usr/bin:/bin:${GHR_BIN_DIR}"
+        umask 077
+        root="${RUNNER_TEMP}/hyperv-ci/native-make-environment"
+        mkdir -p "${root}"/{tmp,cache,config,zig-local,zig-global,zig-pkg}
+        root="$(readlink -f "${root}")"
+        export ZIG_GLOBAL_CACHE_DIR="${root}/zig-global"
+        export ZIG_LOCAL_PKG_DIR="${root}/zig-pkg"
+        # Hosted /usr/share can be writable; keep fixture data in a private copy.
+        cp -R --no-preserve=mode,ownership \
+          "$(/usr/bin/bison --print-datadir)" "${root}/bison-data"
+        for mode in debug safe; do
+          zig build -j2 test-native-make-environment \
+            --cache-dir "${root}/tests" \
+            "-Doutput=${root}/test-build" "-Doptimize=${mode}" \
+            --summary all
+        done
+        printf '{"bison_data":"%s","m4":"%s","schema":"unikraft_native_make_environment_v1","shell":"%s","tmp":"%s","xdg_cache":"%s","xdg_config":"%s","zig_global_cache":"%s","zig_local_cache":"%s"}\n' \
+          "${root}/bison-data" \
+          "$(readlink -f /usr/bin/m4)" \
+          "$(readlink -f /usr/bin/bash)" \
+          "${root}/tmp" "${root}/cache" "${root}/config" \
+          "${root}/zig-global" "${root}/zig-local" > "${root}/environment.json"
+        cp support/apps/hyperv-acceptance/defconfig "${root}/input.config"
+        chmod 600 "${root}/input.config"
+        umask 022
+        zig build -j2 olddefconfig \
+          --cache-dir "${root}/zig-local" \
+          "-Dnative-make-environment=${root}/environment.json" \
+          -Dmake-command=/usr/bin/make \
+          "-Dapp=${GITHUB_WORKSPACE}/support/apps/hyperv-acceptance" \
+          "-Doutput=${root}/build" "-Dconfig=${root}/input.config" \
+          "-Dcompiler=zig cc -target x86_64-freestanding-none" \
+          -Dcompiler-targeted=true "-Dhost-cc=zig cc" "-Dhost-cxx=zig c++" \
+          -Dhost-cflags=-fno-sanitize=null
+        test "$(stat -c %a "${root}/input.config")" = 600
+        grep --fixed-strings --line-regexp --quiet \
+          CONFIG_APPHYPERVACCEPTANCE=y "${root}/input.config"
+        chmod 644 "${root}/environment.json"
+        if zig build -j2 olddefconfig \
+          --cache-dir "${root}/zig-local" \
+          "-Dnative-make-environment=${root}/environment.json" \
+          "-Doutput=${root}/build" "-Dcompiler=zig cc" \
+          > "${root}/refusal.log" 2>&1; then
+          echo "non-private native Make environment was accepted" >&2
+          exit 1
+        fi
+        grep --fixed-strings --line-regexp --quiet \
+          'error: unable to load explicit native Make environment: UnsafeFile' \
+          "${root}/refusal.log"
+
+    - name: Run native Hyper-V object and ABI verifier fixtures
+      run: |
+        set -euo pipefail
+        for mode in debug safe; do
+          root="${RUNNER_TEMP}/hyperv-ci/native-object-proofs-${mode}"
+          ZIG_LOCAL_CACHE_DIR="${root}/zig-local-cache" \
+          ZIG_LOCAL_PKG_DIR="${root}/zig-pkg" \
+            zig build -j2 hyperv-object-proofs test-hyperv-object-proofs \
+              --cache-dir "${root}/zig-local-cache" \
+              --prefix "${root}/out" "-Doutput=${root}/build" \
+              "-Doptimize=${mode}" --summary all
+        done
+
+    - name: Run focused Hyper-V regressions
+      run: |
+        bash .github/scripts/hyperv-native-proofs-ci.sh
+
+    - name: Run native agentless Hyper-V host fixtures
+      run: |
+        set -euo pipefail
+        umask 077
+        root="${RUNNER_TEMP}/hyperv-ci/native-host"
+        fixture_key=d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+        mkdir -p "${root}/restore"
+        cp support/tools/hyperv/host/build.zig \
+          support/tools/hyperv/host/build.zig.zon "${root}/restore/"
+        ZIG_LOCAL_CACHE_DIR="${root}/restore-cache" \
+          zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
+        for mode in debug safe; do
+          mkdir -p "${root}/${mode}/fixtures"
+          ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
+            zig build --build-file support/tools/hyperv/host/build.zig \
+              --system "${root}/restore/zig-pkg" \
+              --cache-dir "${root}/${mode}/zig-local-cache" \
+              --prefix "${root}/${mode}/out" \
+              -Dtest-root="${root}/${mode}/fixtures" \
+              -Dhost-timing=true \
+              -Dimage-trust-key="${fixture_key}" \
+              -Doptimize="${mode}" -j2 test install --summary all \
+              2>&1 | tee "${root}/${mode}/fixtures.log"
+        done
+        ZIG_LOCAL_CACHE_DIR="${root}/image/zig-local-cache" \
+          zig build --build-file support/tools/hyperv/host/build.zig \
+            --system "${root}/restore/zig-pkg" \
+            --cache-dir "${root}/image/zig-local-cache" \
+            --prefix "${root}/image/out" \
+            -Dtarget=x86_64-linux-musl -Doptimize=safe \
+            -Dimage-trust-key="${fixture_key}" \
+            -j2 install --summary all
+        runner_bytes="$(stat -c %s "${root}/image/out/bin/uk-hyperv-host")"
+        unit_bytes="$(stat -c %s "${root}/image/out/share/uk-hyperv-host/uk-hyperv-host.service")"
+        test "$((runner_bytes + unit_bytes))" -le 8388608
+        printf 'Synthetic-key host runner/unit bytes: %s/%s; not image admission\n' \
+          "${runner_bytes}" "${unit_bytes}"
+
+    - name: Collect bounded host observations
+      if: always()
+      run: bash .github/scripts/hyperv-fixture-observation-evidence.sh host
+
+    - name: Retain bounded host fixture evidence
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: zig-hyperv-host-evidence
+        path: ${{ runner.temp }}/hyperv-ci/native-host/observation-evidence/
+        retention-days: 7
+        if-no-files-found: warn
+
+    - name: Run native Hyper-V image transformation fixtures
+      run: |
+        set -euo pipefail
+        for arch in x86_64 arm64; do
+          root="${RUNNER_TEMP}/hyperv-ci/native-postprocess-${arch}"
+          ZIG_LOCAL_CACHE_DIR="${root}/zig-local-cache" \
+            zig build --build-file support/build/native-postprocess-tests.build.zig \
+              --prefix "${root}/out" "-Dfixture-arch=${arch}" \
+              -j2 integration install --summary all
+        done
+
+    - name: Run native Hyper-V ARM and credential fixtures
+      run: |
+        set -euo pipefail
+        umask 077
+        root="${RUNNER_TEMP}/hyperv-ci/native-azure"
+        for mode in debug safe; do
+          ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
+            zig build --build-file support/tools/hyperv/azure/build.zig \
+              --system "${RUNNER_TEMP}/hyperv-ci/native-host/restore/zig-pkg" \
+              --prefix "${root}/${mode}/out" \
+              -Doptimize="${mode}" -j2 test install --summary all
+        done
+
+    - name: Run native Hyper-V preflight engine fixtures
+      run: |
+        set -euo pipefail
+        umask 077
+        root="${RUNNER_TEMP}/hyperv-ci/native-preflight"
+        mkdir -p "${root}/restore"
+        cp support/tools/hyperv/preflight/build.zig \
+          support/tools/hyperv/preflight/build.zig.zon "${root}/restore/"
+        ZIG_LOCAL_CACHE_DIR="${root}/restore-cache" \
+          zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
+        for mode in debug safe; do
+          mkdir -p "${root}/${mode}/fixtures"
+          ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
+            zig build --build-file support/tools/hyperv/preflight/build.zig \
+              --system "${root}/restore/zig-pkg" \
+              --cache-dir "${root}/${mode}/zig-local-cache" \
+              --prefix "${root}/${mode}/out" \
+              -Dtest-root="${root}/${mode}/fixtures" \
+              -Doptimize="${mode}" -j2 test install --summary all
+          result=0
+          "${root}/${mode}/out/bin/uk-hyperv-preflight-worker" \
+            > "${root}/${mode}/stdout" 2> "${root}/${mode}/stderr" \
+            || result=$?
+          test "${result}" -eq 2
+          test ! -s "${root}/${mode}/stdout"
+          grep --fixed-strings --line-regexp --quiet \
+            '{"error":"native-preparation-and-authority-binding-required","schema":"uk-hyperv-preflight-unavailable-v1"}' \
+            "${root}/${mode}/stderr"
+        done
+
+  zig-hyperv:
+    name: zig-hyperv
+    # Keep the real producer cancelable; the separate completion gate rejects
+    # every non-success result, including a producer cancelled before starting.
+    if: ${{ !cancelled() }}
+    needs:
+    - zig-hyperv-public-debug
+    - zig-hyperv-runtime
+    - zig-hyperv-build-protocol
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      prepared_image_manifest_sha256: ${{ steps.hyperv_prepared_image.outputs.manifest_sha256 }}
+      prepared_image_artifact: ${{ steps.hyperv_prepared_image.outputs.artifact_name }}
+    permissions:
+      attestations: read
+      contents: read
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+    - name: Require every Hyper-V fixture lane to succeed
+      id: hyperv_dependencies
+      if: ${{ always() }}
+      env:
+        PUBLIC_DEBUG_RESULT: ${{ needs.zig-hyperv-public-debug.result }}
+        RUNTIME_RESULT: ${{ needs.zig-hyperv-runtime.result }}
+        BUILD_PROTOCOL_RESULT: ${{ needs.zig-hyperv-build-protocol.result }}
+      run: |
+        set -euo pipefail
+        test "${PUBLIC_DEBUG_RESULT:-}" = success
+        test "${RUNTIME_RESULT:-}" = success
+        test "${BUILD_PROTOCOL_RESULT:-}" = success
+
+    - name: Install checkout, build, and OVMF dependencies
+      if: ${{ success() && !cancelled() }}
+      run: |
+        set -euxo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        # This job needs only Ubuntu packages, not optional runner repositories.
+        test -s /etc/apt/sources.list.d/ubuntu.sources
+        ubuntu_apt=(
+          -o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources
+          -o Dir::Etc::sourceparts=-
+        )
+        sudo apt-get "${ubuntu_apt[@]}" update
+        sudo apt-get "${ubuntu_apt[@]}" install -y --no-install-recommends \
+          bison \
+          ca-certificates \
+          curl \
+          file \
+          flex \
+          git \
+          libncurses-dev \
+          make \
+          ovmf \
+          patch \
+          tar \
+          unzip \
+          wget \
+          xz-utils
+        sudo rm -rf /var/lib/apt/lists/*
+
+    - uses: actions/checkout@v4
+      if: ${{ success() && !cancelled() }}
+      with:
+        submodules: recursive
+
+    - name: Load configuration
+      if: ${{ success() && !cancelled() }}
+      uses: ./.github/actions/ci-versions
+
+    - name: Fetch pinned miz source
+      if: ${{ success() && !cancelled() }}
+      uses: actions/checkout@v4
+      with:
+        repository: cataggar/miz
+        ref: 66ea6701cf0e1b6d31e5f30fade00b7a546d4b44
+        fetch-depth: 1
+        path: .d/ci-miz
+
+    - name: Download LLVM and QEMU tools
+      if: ${{ success() && !cancelled() }}
+      uses: cataggar/ghr/actions/download@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1
+      env:
+        GH_TOKEN: ${{ github.token }}
+      with:
+        ghr-version: v0.9.1
+        tools: |
+          cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
+          cataggar/qemu/qemu-v11.0.91-z.15-linux-x64.tar.gz@v11.0.91-z.15
+        dest: ${{ runner.temp }}/hyperv-tools
+        extract: 'true'
+        strip-components: '1'
+
+    - name: Add LLVM and QEMU tools to PATH
+      if: ${{ success() && !cancelled() }}
+      run: |
+        set -euo pipefail
+        tools="${RUNNER_TEMP}/hyperv-tools"
+        for command in \
+          "${tools}/bin/llvm-nm" \
+          "${tools}/bin/llvm-objcopy" \
+          "${tools}/bin/llvm-objdump" \
+          "${tools}/bin/llvm-readelf" \
+          "${tools}/bin/llvm-strip" \
+          "${tools}/qemu-system-x86_64"; do
+          test -x "${command}"
+        done
+        {
+          echo "${tools}/bin"
+          echo "${tools}"
+        } >> "${GITHUB_PATH}"
+
+    - name: Install Zig with ghr
+      if: ${{ success() && !cancelled() }}
+      uses: cataggar/ghr/actions/install@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1
+      env:
+        GH_TOKEN: ${{ github.token }}
+      with:
+        ghr-version: v0.9.1
+        tools: |
+          cataggar/zig@v${{ env.ZIG_VERSION }} RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+    - name: Configure bounded local tool directories
+      if: ${{ success() && !cancelled() }}
+      run: |
+        set -euo pipefail
+        root="${RUNNER_TEMP}/hyperv-ci"
+        mkdir -p \
+          "${root}/cache" \
+          "${root}/tmp" \
+          "${root}/zig-global-cache"
+        {
+          echo "TMPDIR=${root}/tmp"
+          echo "XDG_CACHE_HOME=${root}/cache"
+          echo "ZIG_GLOBAL_CACHE_DIR=${root}/zig-global-cache"
+          echo 'MAKEFLAGS=-j2'
+        } >> "${GITHUB_ENV}"
+
+    - name: Build pinned miz EFI application tooling
+      if: ${{ success() && !cancelled() }}
+      run: |
+        set -euo pipefail
+        test "$(zig version)" = "${ZIG_VERSION}"
+        test "$(git -C .d/ci-miz rev-parse HEAD)" = "${MIZ_REVISION}"
+        export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/hyperv-ci/miz-zig-local-cache"
+        (
+          cd .d/ci-miz
+          zig build -j2 install-miz \
+            -Doptimize=safe \
+            --prefix "${RUNNER_TEMP}/hyperv-ci/miz"
+        )
+        miz="${RUNNER_TEMP}/hyperv-ci/miz/bin/miz"
+        test -x "${miz}"
+        "${miz}" build-efi-application --help
+        "${miz}" check-efi-application --help
+
+    - name: Run native public Hyper-V local-boot fixtures
+      if: ${{ success() && !cancelled() }}
+      run: |
+        set -euo pipefail
+        umask 077
+        root="${RUNNER_TEMP}/hyperv-ci/native-local-boot"
+        mkdir -p "${root}"
+        objcopy="$(readlink -f "${RUNNER_TEMP}/hyperv-tools/bin/llvm-objcopy")"
+        test -f "${objcopy}"
+        test -x "${objcopy}"
+        "${objcopy}" --version > "${root}/fixture-objcopy-version.txt"
+        test "$(stat -c '%s' "${root}/fixture-objcopy-version.txt")" -le 4096
+        awk -f support/tools/hyperv/preparation/ci-objcopy-version.awk \
+          "${root}/fixture-objcopy-version.txt"
+        sha256sum -- "${objcopy}" > "${root}/fixture-objcopy-sha256.txt"
+        mkdir -p "${root}/restore"
+        cp support/tools/hyperv/local_boot/build.zig \
+          support/tools/hyperv/local_boot/build.zig.zon "${root}/restore/"
+        ZIG_LOCAL_CACHE_DIR="${root}/restore-cache" \
+          zig build --build-file "${root}/restore/build.zig" --fetch=all -j2
+        for mode in debug safe; do
+          mkdir -p "${root}/${mode}/fixtures"
+          ZIG_LOCAL_CACHE_DIR="${root}/${mode}/zig-local-cache" \
+            zig build --build-file support/tools/hyperv/local_boot/build.zig \
+              --system "${root}/restore/zig-pkg" \
+              --cache-dir "${root}/${mode}/zig-local-cache" \
+              --prefix "${root}/${mode}/out" \
+              -Dtest-root="${root}/${mode}/fixtures" \
+              -Dstrip-fixture-debug=true "-Dfixture-objcopy=${objcopy}" \
+              "-Dstrip-fixture-report=${root}/${mode}/fixture-strip-proof.json" \
+              -Doptimize="${mode}" -j2 \
+              test test-strip-equivalence test-strip-proof install --summary all \
+              2>&1 | tee "${root}/${mode}/fixtures.log"
+        done
+        sha256sum --check "${root}/fixture-objcopy-sha256.txt"
+
+    - name: Run native public Hyper-V ReleaseSafe packaging, export and import fixtures
+      if: ${{ success() && !cancelled() }}
+      run: |
+        bash .github/scripts/hyperv-native-public-fixtures.sh safe
+
+    - name: Fetch pinned application-network stack
+      if: ${{ success() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.hyperv_network_application }}
+      run: |
+        set -euo pipefail
+        make -C support/apps/hyperv-acceptance network-stack
+
+    - name: Solve and build native Hyper-V acceptance and SMP images
+      if: ${{ success() && !cancelled() }}
+      env:
+        HYPERV_NETWORK_APPLICATION: ${{ github.event_name == 'workflow_dispatch' && inputs.hyperv_network_application }}
+      run: |
+        set -euo pipefail
+        for variant in acceptance smp; do
+          network_application=false
+          if [[ "${variant}" == acceptance ]]; then
+            network_application="${HYPERV_NETWORK_APPLICATION}"
+            app=hyperv-acceptance
+            build="${RUNNER_TEMP}/hyperv-ci/build"
+            profile=hyperv-x86_64-efi-netvsc
+            cpus=1
+            symbols=(
+              CONFIG_APPHYPERVACCEPTANCE CONFIG_LIBNETVSC
+              CONFIG_LIBSTORVSC CONFIG_LIBVMBUS CONFIG_PLAT_HYPERV
+            )
+          else
+            app=hyperv-smp-workload
+            build="${RUNNER_TEMP}/hyperv-ci/smp-build"
+            profile=hyperv-x86_64-efi
+            cpus=2
+            symbols=(
+              CONFIG_APPHYPERVSMPWORKLOAD CONFIG_HYPERV_FIXED_SMP_WORKLOAD
+              CONFIG_LIBUKBOOT_FIXED_SMP CONFIG_LIBUKSCHED_FIXED_SMP
+              CONFIG_LIBUKSCHEDCOOP_FIXED_SMP CONFIG_PLAT_HYPERV
+            )
+          fi
+          config="${RUNNER_TEMP}/hyperv-ci/${app}.config"
+          export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/hyperv-ci/${variant}-zig-local-cache"
+          if [ "${network_application}" = "true" ]; then
+            cp "support/apps/${app}/app-network.defconfig" "${config}"
+            symbols+=(CONFIG_APPHYPERVACCEPTANCE_NETWORK_APPLICATION)
+          else
+            cp "support/apps/${app}/defconfig" "${config}"
+          fi
+          zig_args=(
+            "-Dapp=${GITHUB_WORKSPACE}/support/apps/${app}"
+            "-Doutput=${build}"
+            "-Dconfig=${config}"
+            "-Dcompiler=zig cc -target x86_64-freestanding-none"
+            "-Dcompiler-targeted=true"
+            "-Dhost-cc=zig cc"
+            "-Dhost-cxx=zig c++"
+            "-Dhost-cflags=-fno-sanitize=null"
+            "-Dmake-arg=AR=zig ar"
+            "-Dmake-arg=ZIG=zig"
+            "-Dmake-arg=NM=llvm-nm"
+            "-Dmake-arg=OBJCOPY=llvm-objcopy"
+            "-Dmake-arg=OBJDUMP=llvm-objdump"
+            "-Dmake-arg=READELF=llvm-readelf"
+            "-Dmake-arg=STRIP=llvm-strip"
+            "-Dmake-arg=UK_CFLAGS=-std=gnu17"
+            "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt"
+          )
+          if [ "${network_application}" = "true" ]; then
+            zig_args+=("-Dexternal-lib=${GITHUB_WORKSPACE}/.d/deps/lib-lwip")
+          fi
+          zig build -j2 olddefconfig "${zig_args[@]}"
+          for symbol in "${symbols[@]}"; do
+            grep --fixed-strings --line-regexp --quiet "${symbol}=y" "${config}"
+          done
+          grep --fixed-strings --line-regexp --quiet \
+            "CONFIG_UKPLAT_CPU_MAXCOUNT=${cpus}" "${config}"
+          if [ "${network_application}" = "true" ]; then
+            grep --extended-regexp --quiet \
+              '^CONFIG_APPHYPERVACCEPTANCE_NONCE="[0-9a-fA-F]{16}"$' "${config}"
+          fi
+          zig build -j2 native-images "-Dnative-profile=${profile}" "${zig_args[@]}"
+          test -s "${build}/helloworld_${profile}"
+          test -s "${build}/helloworld_${profile}.dbg"
+        done
+
+    - name: Record local image digests
+      if: ${{ success() && !cancelled() }}
+      run: |
+        set -euo pipefail
+        build="${RUNNER_TEMP}/hyperv-ci/build"
+        sha256sum \
+          "${build}/helloworld_hyperv-x86_64-efi-netvsc" \
+          "${build}/helloworld_hyperv-x86_64-efi-netvsc.dbg" \
+          > "${RUNNER_TEMP}/hyperv-ci/image-sha256.txt"
+        sha256sum \
+          "${RUNNER_TEMP}/hyperv-ci/smp-build/helloworld_hyperv-x86_64-efi" \
+          "${RUNNER_TEMP}/hyperv-ci/smp-build/helloworld_hyperv-x86_64-efi.dbg" \
+          > "${RUNNER_TEMP}/hyperv-ci/smp-image-sha256.txt"
+
+    - name: Acquire the separately pinned native public QEMU runtime
+      if: ${{ success() && !cancelled() }}
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        bash .github/scripts/hyperv-native-qemu-acquire.sh "${RUNNER_TEMP}/hyperv-ci/native-qemu"
+
+    - name: Prepare and boot native raw GPT and fixed VHD in both APIC modes
+      if: ${{ success() && !cancelled() }}
+      env:
+        HYPERV_NETWORK_APPLICATION: ${{ github.event_name == 'workflow_dispatch' && inputs.hyperv_network_application }}
+        QUALIFICATION_REPOSITORY_ID: ${{ github.repository_id }}
+        QUALIFICATION_SOURCE_JOB: zig-hyperv
+      run: |
+        bash .github/scripts/hyperv-qemu-candidate-runtime.sh \
+          "${RUNNER_TEMP}/hyperv-ci/native-qemu" integration \
+          "${RUNNER_TEMP}/hyperv-ci" "${HYPERV_NETWORK_APPLICATION}"
+
+    - name: Boot the fixed scheduled-SMP workload on two CPUs
+      if: ${{ success() && !cancelled() }}
+      run: |
+        set -euo pipefail
+        if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+          sudo chmod 666 /dev/kvm
+        fi
+        test -r /dev/kvm
+        test -w /dev/kvm
+        umask 077
+        disk="${RUNNER_TEMP}/hyperv-ci/smp.raw"
+        "${RUNNER_TEMP}/hyperv-ci/miz/bin/miz" build-efi-application \
+          --efi "${RUNNER_TEMP}/hyperv-ci/smp-build/helloworld_hyperv-x86_64-efi" \
+          --architecture x86_64 --esp-size 64M -O raw -o "${disk}"
+        test "$(stat -c %s "${disk}")" -eq "$((66 * 1024 * 1024))"
+        sha256sum "${disk}" > "${RUNNER_TEMP}/hyperv-ci/smp-disk-sha256.txt"
+        firmware="${RUNNER_TEMP}/hyperv-ci/smp-firmware"
+        mkdir -m 700 "${firmware}" "${RUNNER_TEMP}/hyperv-ci/smp-boot"
+        # Hosted shared-data directories can be writable; use private templates.
+        cp --no-preserve=mode,ownership /usr/share/OVMF/OVMF_CODE_4M.fd \
+          "${firmware}/OVMF_CODE.fd"
+        cp --no-preserve=mode,ownership /usr/share/OVMF/OVMF_VARS_4M.fd \
+          "${firmware}/OVMF_VARS.fd"
+        timeout --signal=TERM --kill-after=5s 180s \
+          "${RUNNER_TEMP}/hyperv-ci/native-local-boot/safe/out/bin/uk-hyperv-local-boot" \
+          --raw-disk "$(readlink -f "${disk}")" \
+          --ovmf-code "$(readlink -f "${firmware}/OVMF_CODE.fd")" \
+          --ovmf-vars "$(readlink -f "${firmware}/OVMF_VARS.fd")" \
+          --work-dir "$(readlink -f "${RUNNER_TEMP}/hyperv-ci/smp-boot")" \
+          --qemu "$(readlink -f "${RUNNER_TEMP}/hyperv-tools/qemu-system-x86_64")" \
+          --cpus 2 --timeout 60 \
+          --require-marker UK_HYPERV_AP_EXEC \
+          --require-marker UK_HYPERV_SCHED_THREAD \
+          --require-marker UK_HYPERV_REMOTE_WAKE \
+          --expect 'UK_HYPERV_SMP_WORKLOAD_READY PASS'
+        sha256sum --check "${RUNNER_TEMP}/hyperv-ci/smp-disk-sha256.txt"
+
+    - name: Export exact prepared Hyper-V image
+      if: ${{ success() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.export_hyperv_prepared_image }}
+      id: hyperv_prepared_image
+      run: |
+        set -euo pipefail
+        root="${RUNNER_TEMP}/hyperv-ci/native-public-boot"
+        for required in \
+          "${root}/export-digest.txt" \
+          "${root}/export/prepared-image-manifest.json" \
+          "${root}/export/unikraft.vhd"; do
+          test -s "${required}"
+        done
+        digest="$(tr -d '\r\n' < "${root}/export-digest.txt")"
+        grep --extended-regexp --quiet '^[0-9a-f]{64}$' <<< "${digest}"
+        echo "manifest_sha256=${digest}" >> "${GITHUB_OUTPUT}"
+        echo "artifact_name=zig-hyperv-prepared-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+          >> "${GITHUB_OUTPUT}"
+        {
+          echo '## Exact prepared Hyper-V image'
+          echo
+          echo "Manifest SHA-256: \`${digest}\`"
+          echo
+          echo "Source job: \`${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}:zig-hyperv\`"
+          echo "Source head: \`${GITHUB_SHA}\`"
+        } >> "${GITHUB_STEP_SUMMARY}"
+
+    - name: Retain explicitly requested exact prepared image
+      if: ${{ success() && !cancelled() && github.event_name == 'workflow_dispatch' && inputs.export_hyperv_prepared_image }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: zig-hyperv-prepared-${{ github.run_id }}-${{ github.run_attempt }}
+        path: |
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/export/prepared-image-manifest.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/export/unikraft.vhd
+        compression-level: 9
+        retention-days: 7
+        if-no-files-found: error
+
+    - name: Retain bounded local image evidence
+      if: ${{ always() && steps.hyperv_dependencies.outcome == 'success' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: zig-hyperv-local-evidence
+        path: |
+          ${{ runner.temp }}/hyperv-ci/native-local-boot/fixture-objcopy-version.txt
+          ${{ runner.temp }}/hyperv-ci/native-local-boot/fixture-objcopy-sha256.txt
+          ${{ runner.temp }}/hyperv-ci/native-local-boot/debug/fixtures.log
+          ${{ runner.temp }}/hyperv-ci/native-local-boot/debug/fixture-strip-proof.json
+          ${{ runner.temp }}/hyperv-ci/native-local-boot/debug/zig-local-cache/**/local-boot-qemu-fixture
+          ${{ runner.temp }}/hyperv-ci/native-local-boot/debug/zig-local-cache/**/local-boot-qemu-diagnostic-fixture
+          ${{ runner.temp }}/hyperv-ci/native-local-boot/safe/fixtures.log
+          ${{ runner.temp }}/hyperv-ci/native-local-boot/safe/fixture-strip-proof.json
+          ${{ runner.temp }}/hyperv-ci/native-local-boot/safe/zig-local-cache/**/local-boot-qemu-fixture
+          ${{ runner.temp }}/hyperv-ci/native-local-boot/safe/zig-local-cache/**/local-boot-qemu-diagnostic-fixture
+          ${{ runner.temp }}/hyperv-ci/image-sha256.txt
+          ${{ runner.temp }}/hyperv-ci/smp-image-sha256.txt
+          ${{ runner.temp }}/hyperv-ci/smp-disk-sha256.txt
+          ${{ runner.temp }}/hyperv-ci/smp-boot/hyperv-efi-boot.log
+          ${{ runner.temp }}/hyperv-ci/smp-boot/report.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/prepare-result.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/matrix.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/export-digest.txt
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/export-sha256.txt
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/export/prepared-image-manifest.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/source-exporter.sha256
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/import-result.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/import-receipt-sha256.txt
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/validate-import-result.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/import-validated.txt
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/import-inputs-unchanged.txt
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/imported/import-request.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/imported/prepared-image-manifest.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/imported/inspection.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/imported/import-receipt.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/packaging/state.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/packaging/packaging.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/packaging/package-report.json
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/packaging/local-*-serial.log
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/packaging/boot-*/hyperv-efi-boot.log
+          ${{ runner.temp }}/hyperv-ci/native-public-boot/packaging/boot-*/report.json
+          ${{ runner.temp }}/hyperv-ci/native-qemu/evidence/**/*.json
+          ${{ runner.temp }}/hyperv-ci/native-qemu/evidence/**/*.jsonl
+          ${{ runner.temp }}/hyperv-ci/native-qemu/evidence/**/*.txt
+          ${{ runner.temp }}/hyperv-ci/native-qemu/evidence/**/*.sha256
+          ${{ runner.temp }}/hyperv-ci/native-qemu/evidence/*.acl
+          ${{ runner.temp }}/hyperv-ci/native-qemu/evidence/apt.conf
+        retention-days: 7
+        if-no-files-found: warn
+
+  zig-hyperv-complete:
+    name: zig-hyperv-complete
+    if: ${{ always() }}
+    needs:
+    - zig-hyperv-public-debug
+    - zig-hyperv-runtime
+    - zig-hyperv-build-protocol
+    - zig-hyperv
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+    - name: Require every Hyper-V fixture and the real producer to succeed
+      if: ${{ always() }}
+      shell: bash
+      env:
+        PUBLIC_DEBUG_RESULT: ${{ needs.zig-hyperv-public-debug.result }}
+        RUNTIME_RESULT: ${{ needs.zig-hyperv-runtime.result }}
+        BUILD_PROTOCOL_RESULT: ${{ needs.zig-hyperv-build-protocol.result }}
+        PRODUCER_RESULT: ${{ needs.zig-hyperv.result }}
+      run: |
+        set -euo pipefail
+        test "${PUBLIC_DEBUG_RESULT:-}" = success
+        test "${RUNTIME_RESULT:-}" = success
+        test "${BUILD_PROTOCOL_RESULT:-}" = success
+        test "${PRODUCER_RESULT:-}" = success
+
+  zig-helloworld-arm64:
+    name: zig-helloworld-arm64
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
+    container:
+      image: ubuntu:24.04
+    permissions:
+      attestations: read
+      contents: read
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+    - name: Install checkout and build dependencies
+      run: |
+        set -euxo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y --no-install-recommends \
+          bison \
+          ca-certificates \
+          curl \
+          file \
+          flex \
+          git \
+          libncurses-dev \
+          make \
+          tar \
+          xz-utils
+        rm -rf /var/lib/apt/lists/*
+
+    - name: Download LLVM and QEMU tools
+      uses: cataggar/ghr/actions/download@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1
+      env:
+        GH_TOKEN: ${{ github.token }}
+      with:
+        ghr-version: v0.9.1
+        tools: |
+          cataggar/llvm-project/llvm-tools-22.1.8-x86_64-linux.tar.xz@llvm-zig-22.1.8
+          cataggar/qemu/qemu-v11.0.91-z.15-linux-x64.tar.gz@v11.0.91-z.15
+        dest: ${{ runner.temp }}/zig-tools
+        extract: 'true'
+        strip-components: '1'
+
+    - name: Add LLVM and QEMU tools to PATH
+      run: |
+        set -euo pipefail
+        tools="${RUNNER_TEMP}/zig-tools"
+        for command in \
+          "${tools}/bin/llvm-nm" \
+          "${tools}/bin/llvm-objcopy" \
+          "${tools}/bin/llvm-objdump" \
+          "${tools}/bin/llvm-readelf" \
+          "${tools}/bin/llvm-strip" \
+          "${tools}/qemu-system-aarch64"; do
+          test -x "${command}"
+        done
+        {
+          echo "${tools}/bin"
+          echo "${tools}"
+        } >> "${GITHUB_PATH}"
+
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Load configuration
+      uses: ./.github/actions/ci-versions
+
+    - name: Fetch helloworld
+      uses: actions/checkout@v4
+      with:
+        repository: unikraft/app-helloworld
+        fetch-depth: 1
+        path: _helloworld
+
+    - name: Verify GNU cross tools are unavailable
+      run: |
+        set -euo pipefail
+        for command in \
+          gcc g++ gcc-ar gcc-nm \
+          aarch64-linux-gnu-gcc aarch64-linux-gnu-g++ \
+          aarch64-linux-gnu-ld aarch64-linux-gnu-ar \
+          aarch64-linux-gnu-nm aarch64-linux-gnu-objcopy \
+          aarch64-linux-gnu-objdump aarch64-linux-gnu-readelf \
+          aarch64-linux-gnu-strip; do
+          if command -v "${command}" >/dev/null 2>&1; then
+            echo "Unexpected GNU tool on PATH: ${command}" >&2
+            exit 1
+          fi
+        done
+
+    - name: Install Zig with ghr
+      uses: cataggar/ghr/actions/install@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1
+      env:
+        GH_TOKEN: ${{ github.token }}
+      with:
+        ghr-version: v0.9.1
+        tools: |
+          cataggar/zig@v${{ env.ZIG_VERSION }} RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+    - name: Build helloworld with Zig
+      run: |
+        set -euo pipefail
+        test "$(zig version)" = "${ZIG_VERSION}"
+        build="${RUNNER_TEMP}/build-zig-arm64"
+        config="${RUNNER_TEMP}/qemu-arm64.config"
+        log="${RUNNER_TEMP}/zig-arm64-build.log"
+        export ZIG_GLOBAL_CACHE_DIR="${RUNNER_TEMP}/zig-global-cache"
+        export ZIG_LOCAL_CACHE_DIR="${RUNNER_TEMP}/zig-local-cache-arm64"
+        rm -rf "${build}"
+        cp "${GITHUB_WORKSPACE}/_helloworld/defconfigs/qemu-arm64" "${config}"
+        zig_args=(
+          "-Dapp=${GITHUB_WORKSPACE}/_helloworld"
+          "-Doutput=${build}"
+          "-Dconfig=${config}"
+          "-Dcompiler=zig cc -target aarch64-freestanding-none"
+          "-Dcompiler-targeted=true"
+          "-Dhost-cc=zig cc"
+          "-Dhost-cxx=zig c++"
+          # Kconfig's kernel-style list sentinel is intentionally null-derived.
+          "-Dhost-cflags=-fno-sanitize=null"
+          "-Dmake-arg=AR=zig ar"
+          "-Dmake-arg=NM=llvm-nm"
+          "-Dmake-arg=OBJCOPY=llvm-objcopy"
+          "-Dmake-arg=OBJDUMP=llvm-objdump"
+          "-Dmake-arg=READELF=llvm-readelf"
+          "-Dmake-arg=STRIP=llvm-strip"
+          "-Dmake-arg=UK_CFLAGS=-std=gnu17"
+          "-Dmake-arg=UK_LDFLAGS=-rtlib=compiler-rt"
+        )
+        zig build olddefconfig "${zig_args[@]}"
+        set +e
+        zig build native-images \
+          -Dnative-qemu-graph=qemu-arm64 \
+          "${zig_args[@]}" 2>&1 | tee "${log}"
+        build_status=("${PIPESTATUS[@]}")
+        set -e
+
+        mapfile -d '' command_files < <(
+          find "${build}" -type f -name '*.cmd' \
+            ! -path "${build}/kconfig/*" \
+            ! -path "${build}/include/config/*" \
+            -size +0c -print0
+        )
+        if [ "${#command_files[@]}" -eq 0 ]; then
+          echo "The target build generated no command files to audit." >&2
+          exit 1
+        fi
+
+        gcc_command="(^|[;&|])[[:space:]]*(env[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*=(\"[^\"]*\"|'[^']*'|[^[:space:]]+)[[:space:]]+)*((ccache|command)[[:space:]]+)?([^[:space:];|&]*/)?([^/[:space:];|&]*-)?(gcc|g\\+\\+|gcc-ar|gcc-nm)(-[0-9.]+)?([[:space:];|&]|$)"
+        gcc_assignment="(^|[;&|])[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=['\"]?(env[[:space:]]+([^[:space:]=]+=[^[:space:]]+[[:space:]]+)*)?((ccache|command)[[:space:]]+)?([^[:space:]\"';|&]*/)?([^/[:space:]\"';|&]*-)?(gcc|g\\+\\+|gcc-ar|gcc-nm)(-[0-9.]+)?([[:space:]\"';|&]|$)"
+        gcc_found=0
+        for command_file in "${command_files[@]}"; do
+          if grep --with-filename --line-number --extended-regexp \
+            "${gcc_command}|${gcc_assignment}" "${command_file}"; then
+            gcc_found=1
+          fi
+        done
+        if [ "${gcc_found}" -ne 0 ]; then
+          echo "The target build invoked a GCC command." >&2
+          exit 1
+        fi
+        if grep --with-filename --line-number --extended-regexp \
+          '(^|[[:space:]])zig[[:space:]]+ld\.lld([[:space:]]|$)' \
+          "${command_files[@]}" "${log}"; then
+          echo "The native target build invoked zig ld.lld directly." >&2
+          exit 1
+        fi
+        test "${build_status[1]}" -eq 0
+        test "${build_status[0]}" -eq 0
+
+    - name: Inspect Zig image
+      run: |
+        set -euo pipefail
+        image="${RUNNER_TEMP}/build-zig-arm64/helloworld_qemu-arm64.dbg"
+        file "${image}"
+        header="$(llvm-readelf --file-header "${image}")"
+        printf '%s\n' "${header}"
+        grep --quiet 'Class:.*ELF64' <<< "${header}"
+        grep --quiet 'Machine:.*AArch64' <<< "${header}"
+
+        program_headers="$(llvm-readelf --program-headers "${image}")"
+        if grep --quiet INTERP <<< "${program_headers}"; then
+          echo "The Zig image has a program interpreter." >&2
+          exit 1
+        fi
+        dynamic="$(llvm-readelf --wide --dynamic "${image}" 2>/dev/null)"
+        if grep --quiet NEEDED <<< "${dynamic}"; then
+          echo "The Zig image has a dynamic dependency." >&2
+          exit 1
+        fi
+
+        undefined="$(llvm-nm --undefined-only --format=posix "${image}")"
+        if [ -n "${undefined}" ]; then
+          echo "The Zig image has unresolved symbols:" >&2
+          printf '%s\n' "${undefined}" >&2
+          exit 1
+        fi
+        symbols="$(llvm-nm --format=posix "${image}")"
+        if grep --ignore-case --quiet libgcc <<< "${symbols}"; then
+          echo "The Zig image has a libgcc symbol reference." >&2
+          exit 1
+        fi
+        if grep --ignore-case --quiet libgcc <<< "${dynamic}"; then
+          echo "The Zig image has a libgcc dependency." >&2
+          exit 1
+        fi
+        common="$(llvm-nm --format=posix "${image}" | awk '$2 == "C"')"
+        if [ -n "${common}" ]; then
+          echo "The Zig image has COMMON symbols:" >&2
+          printf '%s\n' "${common}" >&2
+          exit 1
+        fi
+
+    - name: Boot Zig image
+      run: |
+        set -euo pipefail
+        image="${RUNNER_TEMP}/build-zig-arm64/helloworld_qemu-arm64"
+        output="${RUNNER_TEMP}/zig-qemu-arm64.log"
+        set +e
+        timeout 30s qemu-system-aarch64 \
+          -machine virt \
+          -cpu cortex-a53 \
+          -kernel "${image}" \
+          -nographic \
+          -no-reboot \
+          -net none \
+          2>&1 | tee "${output}"
+        status=("${PIPESTATUS[@]}")
+        set -e
+        test "${status[1]}" -eq 0
+        test "${status[0]}" -eq 0
+        grep --fixed-strings --quiet 'Hello world!' "${output}"
+
+  clang-helloworld-arm64:
+    name: clang-helloworld-arm64
+    runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted","Linux","X64","ubuntu2604"]') || 'ubuntu-24.04' }}
+    container:
+      image: ubuntu:24.04
+    permissions:
+      attestations: read
+      contents: read
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+    - name: Install checkout and build dependencies
+      run: |
+        set -euxo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y --no-install-recommends \
+          bison \
+          ca-certificates \
+          curl \
+          file \
+          flex \
+          git \
+          libedit2 \
+          libffi8 \
+          libncurses-dev \
+          libstdc++6 \
+          libtinfo6 \
+          libxml2 \
+          libz3-4 \
+          libzstd1 \
+          make \
+          python3 \
+          tar \
+          xz-utils \
+          zlib1g
+        rm -rf /var/lib/apt/lists/*
+
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Load configuration
+      uses: ./.github/actions/ci-versions
+
+    - name: Install Clang and LLVM
+      uses: KyleMayes/install-llvm-action@v2
+      with:
+        arch: x64
+        directory: ${{ runner.temp }}/clang-llvm
+        env: false
+        version: ${{ env.CLANG_VERSION }}
+
+    - name: Download QEMU
+      uses: cataggar/ghr/actions/download@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1
+      env:
+        GH_TOKEN: ${{ github.token }}
+      with:
+        ghr-version: v0.9.1
+        tools: cataggar/qemu/qemu-v11.0.91-z.15-linux-x64.tar.gz@v11.0.91-z.15
+        dest: ${{ runner.temp }}/qemu-tools
+        extract: 'true'
+        strip-components: '1'
+
+    - name: Fetch helloworld
+      uses: actions/checkout@v4
+      with:
+        repository: unikraft/app-helloworld
+        fetch-depth: 1
+        path: _helloworld
+
+    - name: Verify standalone Clang and LLVM tools
+      run: |
+        set -euo pipefail
+        llvm="${RUNNER_TEMP}/clang-llvm/bin"
+        for command in \
+          "${llvm}/clang" \
+          "${llvm}/clang++" \
+          "${llvm}/ld.lld" \
+          "${llvm}/llvm-ar" \
+          "${llvm}/llvm-nm" \
+          "${llvm}/llvm-objcopy" \
+          "${llvm}/llvm-objdump" \
+          "${llvm}/llvm-readelf" \
+          "${llvm}/llvm-strip" \
+          "${RUNNER_TEMP}/qemu-tools/qemu-system-aarch64"; do
+          test -x "${command}"
+        done
+        "${llvm}/clang" --version
+        test "$("${llvm}/clang" -dumpversion)" = "${CLANG_VERSION}"
+
+        for command in \
+          gcc g++ gcc-ar gcc-nm \
+          aarch64-linux-gnu-gcc aarch64-linux-gnu-g++ \
+          aarch64-linux-gnu-ld aarch64-linux-gnu-ar \
+          aarch64-linux-gnu-nm aarch64-linux-gnu-objcopy \
+          aarch64-linux-gnu-objdump aarch64-linux-gnu-readelf \
+          aarch64-linux-gnu-strip; do
+          if command -v "${command}" >/dev/null 2>&1; then
+            echo "Unexpected GNU tool on PATH: ${command}" >&2
+            exit 1
+          fi
+        done
+
+    - name: Verify AArch64 compiler-rt builtins
+      run: |
+        set -euo pipefail
+        llvm="${RUNNER_TEMP}/clang-llvm/bin"
+        archive="${RUNNER_TEMP}/compiler-rt-${CLANG_VERSION}.src.tar.xz"
+        source="${RUNNER_TEMP}/compiler-rt-${CLANG_VERSION}"
+        probe="${RUNNER_TEMP}/compiler-rt-probe"
+        curl --fail --location --silent --show-error \
+          "https://github.com/llvm/llvm-project/releases/download/llvmorg-${CLANG_VERSION}/compiler-rt-${CLANG_VERSION}.src.tar.xz" \
+          --output "${archive}"
+        echo "${COMPILER_RT_SRC_SHA256}  ${archive}" | sha256sum --check
+        rm -rf "${source}" "${probe}"
+        mkdir -p "${source}" "${probe}"
+        tar --extract --xz --file "${archive}" --directory "${source}" \
+          --strip-components=1
+        cat > "${probe}/probe.c" <<'EOF'
+        typedef unsigned __int128 uint128_t;
+
+        volatile uint128_t dividend = ((uint128_t)1 << 100) + 7;
+        volatile uint128_t divisor = 3;
+        volatile uint128_t result;
+
+        void _start(void)
+        {
+                result = dividend / divisor;
+        }
+        EOF
+
+        builtins="${source}/lib/builtins"
+        common=(
+          --target=aarch64-none-elf
+          -ffreestanding
+          -fno-stack-protector
+          "-I${builtins}"
+        )
+        "${llvm}/clang" "${common[@]}" -O0 \
+          -c "${probe}/probe.c" -o "${probe}/probe.o"
+        undefined="$("${llvm}/llvm-nm" --undefined-only --format=posix \
+          "${probe}/probe.o")"
+        grep --fixed-strings --quiet '__udivti3' <<< "${undefined}"
+
+        "${llvm}/clang" "${common[@]}" -O2 \
+          -c "${builtins}/udivti3.c" -o "${probe}/udivti3.o"
+        "${llvm}/clang" "${common[@]}" -O2 \
+          -c "${builtins}/udivmodti4.c" -o "${probe}/udivmodti4.o"
+        "${llvm}/clang" --target=aarch64-none-elf -fuse-ld=lld -nostdlib \
+          -Wl,--entry=_start \
+          "${probe}/probe.o" \
+          "${probe}/udivti3.o" \
+          "${probe}/udivmodti4.o" \
+          -o "${probe}/probe"
+
+        test -z "$("${llvm}/llvm-nm" --undefined-only --format=posix \
+          "${probe}/probe")"
+        symbols="$("${llvm}/llvm-nm" --format=posix "${probe}/probe")"
+        grep --extended-regexp --quiet '^__udivti3 [Tt] ' <<< "${symbols}"
+        if grep --ignore-case --quiet libgcc <<< "${symbols}"; then
+          echo "The compiler-rt probe has a libgcc symbol reference." >&2
+          exit 1
+        fi
+
+    - name: Build helloworld with Clang
+      run: |
+        set -euo pipefail
+        llvm="${RUNNER_TEMP}/clang-llvm/bin"
+        build="${RUNNER_TEMP}/build-clang-arm64"
+        log="${RUNNER_TEMP}/clang-arm64-build.log"
+        rm -rf "${build}"
+        make_args=(
+          "A=${GITHUB_WORKSPACE}/_helloworld"
+          "O=${build}"
+          "HOSTCC=${llvm}/clang -fuse-ld=lld -rtlib=compiler-rt -unwindlib=none"
+          "HOSTCXX=${llvm}/clang++ -fuse-ld=lld -rtlib=compiler-rt -unwindlib=none"
+          "COMPILER=${llvm}/clang --target=aarch64-none-elf"
+          "COMPILER_TARGETED=y"
+          "LINKER=${llvm}/clang --target=aarch64-none-elf -fuse-ld=lld"
+          "PARTIAL_LINKER=${llvm}/ld.lld -m aarch64elf"
+          "PARTIAL_LINKER_TYPE=raw"
+          "AR=${llvm}/llvm-ar"
+          "NM=${llvm}/llvm-nm"
+          "OBJCOPY=${llvm}/llvm-objcopy"
+          "OBJDUMP=${llvm}/llvm-objdump"
+          "READELF=${llvm}/llvm-readelf"
+          "STRIP=${llvm}/llvm-strip"
+          "UK_CFLAGS=-std=gnu17"
+          "UK_LDFLAGS=-rtlib=compiler-rt"
+        )
+        make "${make_args[@]}" \
+          UK_DEFCONFIG="${GITHUB_WORKSPACE}/_helloworld/defconfigs/qemu-arm64" \
+          defconfig
+        set +e
+        make "${make_args[@]}" V=1 -j"$(nproc)" 2>&1 | tee "${log}"
+        build_status=("${PIPESTATUS[@]}")
+        set -e
+
+        mapfile -d '' command_files < <(
+          find "${build}" -type f -name '*.cmd' \
+            ! -path "${build}/kconfig/*" \
+            ! -path "${build}/include/config/*" \
+            -size +0c -print0
+        )
+        if [ "${#command_files[@]}" -eq 0 ]; then
+          echo "The target build generated no command files to audit." >&2
+          exit 1
+        fi
+
+        gnu_command="(^|[;&|])[[:space:]]*(env[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*=(\"[^\"]*\"|'[^']*'|[^[:space:]]+)[[:space:]]+)*((ccache|command)[[:space:]]+)?([^[:space:];|&]*/)?([^/[:space:];|&]*-)?(gcc|g\\+\\+|gcc-ar|gcc-nm|aarch64-linux-gnu-(ld|ar|nm|objcopy|objdump|readelf|strip))(-[0-9.]+)?([[:space:];|&]|$)"
+        gnu_assignment="(^|[;&|])[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=['\"]?(env[[:space:]]+([^[:space:]=]+=[^[:space:]]+[[:space:]]+)*)?((ccache|command)[[:space:]]+)?([^[:space:]\"';|&]*/)?([^/[:space:]\"';|&]*-)?(gcc|g\\+\\+|gcc-ar|gcc-nm|aarch64-linux-gnu-(ld|ar|nm|objcopy|objdump|readelf|strip))(-[0-9.]+)?([[:space:]\"';|&]|$)"
+        gnu_found=0
+        for command_file in "${command_files[@]}"; do
+          if grep --with-filename --line-number --extended-regexp \
+            "${gnu_command}|${gnu_assignment}" "${command_file}"; then
+            gnu_found=1
+          fi
+        done
+        if [ "${gnu_found}" -ne 0 ]; then
+          echo "The target build invoked a GNU compiler or cross-tool." >&2
+          exit 1
+        fi
+        test "${build_status[1]}" -eq 0
+        test "${build_status[0]}" -eq 0
+
+        normal_command="${build}/libukplat_native/lcpu_pm.o.cmd"
+        isr_command="${build}/libukplat_native/ectx.isr.o.cmd"
+        for command_file in "${normal_command}" "${isr_command}"; do
+          test "$(grep --only-matching -- '--target=aarch64-none-elf' \
+            "${command_file}" | wc -l)" -eq 1
+          grep --fixed-strings --quiet -- '-mgeneral-regs-only' "${command_file}"
+          grep --fixed-strings --quiet -- \
+            '-Xclang -target-feature -Xclang -fp-armv8' "${command_file}"
+          grep --fixed-strings --quiet -- \
+            '-Xclang -target-feature -Xclang -neon' "${command_file}"
+        done
+        grep --fixed-strings --quiet -- '-D__INTERRUPTSAFE__' "${isr_command}"
+
+        partial_command="${build}/libkvmplat.ld.o.cmd"
+        final_command="${build}/helloworld_qemu-arm64.dbg.cmd"
+        grep --fixed-strings --quiet -- \
+          "${llvm}/ld.lld -m aarch64elf" "${partial_command}"
+        grep --fixed-strings --quiet -- \
+          "${llvm}/clang --target=aarch64-none-elf -fuse-ld=lld" \
+          "${final_command}"
+        grep --fixed-strings --quiet -- '-rtlib=compiler-rt' "${final_command}"
+        grep --fixed-strings --quiet -- 'kvm-combined.lds' "${final_command}"
+        if grep --fixed-strings --quiet -- '-lgcc' "${final_command}"; then
+          echo "The final link requested libgcc." >&2
+          exit 1
+        fi
+
+    - name: Inspect Clang image
+      run: |
+        set -euo pipefail
+        llvm="${RUNNER_TEMP}/clang-llvm/bin"
+        image="${RUNNER_TEMP}/build-clang-arm64/helloworld_qemu-arm64.dbg"
+        file "${image}"
+        header="$("${llvm}/llvm-readelf" --file-header "${image}")"
+        printf '%s\n' "${header}"
+        grep --quiet 'Class:.*ELF64' <<< "${header}"
+        grep --quiet 'Machine:.*AArch64' <<< "${header}"
+
+        program_headers="$("${llvm}/llvm-readelf" --program-headers "${image}")"
+        if grep --quiet INTERP <<< "${program_headers}"; then
+          echo "The Clang image has a program interpreter." >&2
+          exit 1
+        fi
+        dynamic="$("${llvm}/llvm-readelf" --wide --dynamic "${image}" 2>/dev/null)"
+        if grep --quiet NEEDED <<< "${dynamic}"; then
+          echo "The Clang image has a dynamic dependency." >&2
+          exit 1
+        fi
+
+        undefined="$("${llvm}/llvm-nm" --undefined-only --format=posix \
+          "${image}")"
+        if [ -n "${undefined}" ]; then
+          echo "The Clang image has unresolved symbols:" >&2
+          printf '%s\n' "${undefined}" >&2
+          exit 1
+        fi
+        symbols="$("${llvm}/llvm-nm" --format=posix "${image}")"
+        if grep --ignore-case --quiet libgcc <<< "${symbols}"; then
+          echo "The Clang image has a libgcc symbol reference." >&2
+          exit 1
+        fi
+        if grep --ignore-case --quiet libgcc <<< "${dynamic}"; then
+          echo "The Clang image has a libgcc dependency." >&2
+          exit 1
+        fi
+
+    - name: Boot Clang image
+      run: |
+        set -euo pipefail
+        image="${RUNNER_TEMP}/build-clang-arm64/helloworld_qemu-arm64"
+        output="${RUNNER_TEMP}/clang-qemu-arm64.log"
+        set +e
+        timeout 30s "${RUNNER_TEMP}/qemu-tools/qemu-system-aarch64" \
+          -machine virt \
+          -cpu cortex-a53 \
+          -kernel "${image}" \
+          -nographic \
+          -no-reboot \
+          -net none \
+          2>&1 | tee "${output}"
+        status=("${PIPESTATUS[@]}")
+        set -e
+        test "${status[1]}" -eq 0
+        test "${status[0]}" -eq 0
+        grep --fixed-strings --quiet 'Hello world!' "${output}"
 
   static-analysis:
     name: static-analysis

@@ -37,6 +37,15 @@ __uk_pcpuvar struct uk_lcpu uk_lcpus;
 
 static const struct uk_lcpu_pm_ops *pm_ops;
 
+int __weak ukplat_lcpu_init_hook(void)
+{
+	return 0;
+}
+
+void __weak ukplat_lcpu_fini_hook(void)
+{
+}
+
 int uk_lcpu_pm_ops_register(const struct uk_lcpu_pm_ops *ops)
 {
 	if (unlikely(!ops))
@@ -59,6 +68,7 @@ __isr __u64 uk_lcpu_get_current_idx_in_except(void)
 
 int uk_lcpu_init(struct uk_lcpu *this_lcpu)
 {
+	int rc;
 	/*
 	 * NOTE: Do not use anything that might need initialized exception
 	 * traps until after lcpu_arch_init(), as traps might not be
@@ -88,12 +98,16 @@ int uk_lcpu_init(struct uk_lcpu *this_lcpu)
 	 */
 	this_lcpu->state = UK_LCPU_STATE_BUSY0;
 
-	return uk_pal_except_init();
+	rc = uk_pal_except_init();
+	if (unlikely(rc))
+		return rc;
+	return ukplat_lcpu_init_hook();
 }
 
 static void __noreturn lcpu_halt(struct uk_lcpu *this_cpu, int error_code)
 {
 	uk_lcpu_disable_irq();
+	ukplat_lcpu_fini_hook();
 
 	this_cpu->state = UK_LCPU_STATE_HALTED;
 	this_cpu->error_code = error_code;
@@ -449,8 +463,10 @@ int uk_lcpu_run(const __u64 lcpuidx[], unsigned int *num,
 		 */
 		while (1) {
 			rc = uk_lcpu_fn_enqueue(lcpu, fn);
-			if (unlikely(rc))
+			if (unlikely(rc)) {
+				lcpu_transition_safe(lcpu, -1);
 				goto lcpu_run_err;
+			}
 
 			rc = uk_pal_except_send_ipi(uk_pcpuvar_lval(lcpuidx[i],
 							uk_pcpuvar_cpu_id),
@@ -563,5 +579,36 @@ int uk_lcpu_wakeup(const __u64 lcpuidx[], unsigned int *num)
 lcpu_wakeup_err:
 	*num = i;
 	return rc;
+}
+
+__isr int uk_lcpu_wakeup_one(unsigned int idx)
+{
+	struct uk_lcpu *lcpu;
+
+	if (idx >= CONFIG_UKPLAT_CPU_MAXCOUNT)
+		return -ERANGE;
+	if (idx == uk_pcpuvar_current_get(uk_pcpuvar_cpu_idx))
+		return 0;
+
+	lcpu = &uk_pcpuvar_lval(idx, uk_lcpus);
+	if (!uk_lcpu_state_is_online(uk_load_n(&lcpu->state)))
+		return -EHOSTDOWN;
+
+	return uk_pal_except_send_ipi(
+		uk_pcpuvar_lval(idx, uk_pcpuvar_cpu_id),
+		*uk_lcpu_wakeup_irqv);
+}
+
+void uk_lcpu_startup_idle(void)
+{
+	struct uk_lcpu *lcpu = uk_lcpu_get_current();
+
+	UK_ASSERT(lcpu->state == UK_LCPU_STATE_BUSY0);
+	uk_dec(&lcpu->state);
+}
+
+void __noreturn uk_lcpu_halt_error(int error)
+{
+	lcpu_halt(uk_lcpu_get_current(), error);
 }
 #endif /* CONFIG_HAVE_SMP */

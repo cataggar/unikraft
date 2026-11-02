@@ -456,10 +456,29 @@ void uk_paging_tlb_flush(void)
 }
 
 /**
- * Returns the active page table (the one that defines the virtual address
- * space at the moment of the execution of this function).
+ * Returns the globally selected page table. A secondary logical CPU may still
+ * need to activate this table in hardware before accessing its mappings.
  */
 struct uk_pagetable *uk_paging_pt_get_active(void);
+
+/**
+ * Activates a page table on the executing logical CPU without changing the
+ * paging subsystem's globally selected table.
+ *
+ * This allows an additional logical CPU to join an established address space
+ * without updating the active-table owner. The caller must keep that shared
+ * address space valid; this function adds neither per-CPU table bookkeeping
+ * nor cross-CPU TLB invalidation.
+ *
+ * @param pt
+ *   The page table instance, accessible in the current address space. The
+ *   current code and stack must remain mapped at the same virtual addresses
+ *   in the new address space.
+ *
+ * @return
+ *   0 on success, a non-zero value otherwise
+ */
+int uk_paging_pt_activate_lcpu(struct uk_pagetable *pt);
 
 /**
  * Switches the active page table to the specified one.

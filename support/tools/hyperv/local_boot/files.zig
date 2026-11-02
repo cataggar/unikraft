@@ -1,0 +1,460 @@
+const std = @import("std");
+const builtin = @import("builtin");
+const core = @import("hyperv_core");
+const miz = @import("miz");
+const c = @import("config.zig");
+const linux = std.os.linux;
+pub const Sha256 = core.Sha256;
+
+const qcow2_l2_entry_bytes: u64 = @sizeOf(u64);
+const qcow2_cluster_bits: u32 = miz.qcow2.default_cluster_bits;
+const qcow2_cluster_bytes: u64 = @as(u64, 1) << @intCast(qcow2_cluster_bits);
+const qcow2_l2_entries: u64 = qcow2_cluster_bytes / qcow2_l2_entry_bytes;
+const qcow2_max_guest_clusters: u64 = checkedDivCeil(c.max_virtual, qcow2_cluster_bytes);
+const qcow2_max_l1_entries: u64 = checkedDivCeil(qcow2_max_guest_clusters, qcow2_l2_entries);
+const qcow2_max_l1_table_bytes: u64 = checkedMul(qcow2_max_l1_entries, qcow2_l2_entry_bytes);
+const qcow2_refcount_table_clusters: u64 = 1;
+const qcow2_refcount_table_bytes: u64 = checkedMul(qcow2_refcount_table_clusters, qcow2_cluster_bytes);
+const qcow2_refcount_table_entries: u64 = qcow2_refcount_table_bytes / qcow2_l2_entry_bytes;
+const qcow2_header_bytes: u64 = 112;
+const qcow2_header_terminator_bytes: u64 = 8;
+const qcow2_metadata_bytes: u64 = checkedAdd(
+    checkedAdd(qcow2_header_bytes, qcow2_max_l1_table_bytes),
+    checkedAdd(qcow2_refcount_table_bytes, qcow2_header_terminator_bytes),
+);
+const qcow2_metadata_work: u64 = checkedAdd(qcow2_refcount_table_entries, 2);
+
+pub const qcow2_standalone_open_limits: miz.Qcow2StandaloneOpenLimits = .{
+    .max_file_bytes = c.max_input,
+    .max_virtual_size = c.max_virtual,
+    .min_cluster_bits = qcow2_cluster_bits,
+    .max_cluster_bits = qcow2_cluster_bits,
+    .max_l1_entries = qcow2_max_l1_entries,
+    .max_l1_table_bytes = qcow2_max_l1_table_bytes,
+    .max_refcount_table_clusters = qcow2_refcount_table_clusters,
+    .max_refcount_table_bytes = qcow2_refcount_table_bytes,
+    .max_refcount_table_entries = qcow2_refcount_table_entries,
+    .max_snapshot_count = 0,
+    .max_snapshot_table_bytes = 0,
+    .max_snapshot_l1_entries = 0,
+    .max_snapshot_l1_table_bytes = 0,
+    .max_metadata_bytes = qcow2_metadata_bytes,
+    .max_metadata_work = qcow2_metadata_work,
+};
+
+comptime {
+    if (qcow2_cluster_bits != 16 or
+        qcow2_max_l1_entries != 1 or
+        qcow2_refcount_table_entries != 8192 or
+        qcow2_metadata_bytes != 65_664 or
+        qcow2_metadata_work != 8194)
+    {
+        @compileError("QCOW2 bounded-open limits no longer match the reviewed native Miz producer profile");
+    }
+}
+
+fn checkedAdd(comptime left: u64, comptime right: u64) u64 {
+    return std.math.add(u64, left, right) catch @compileError("QCOW2 profile addition overflow");
+}
+
+fn checkedMul(comptime left: u64, comptime right: u64) u64 {
+    return std.math.mul(u64, left, right) catch @compileError("QCOW2 profile multiplication overflow");
+}
+
+fn checkedDivCeil(comptime numerator: u64, comptime denominator: u64) u64 {
+    return std.math.divCeil(u64, numerator, denominator) catch @compileError("invalid QCOW2 profile division");
+}
+
+pub const Pin = struct {
+    device_major: u32,
+    device_minor: u32,
+    inode: u64,
+    mode: u16,
+    uid: u32,
+    gid: u32,
+    nlink: u32,
+    size: u64,
+    mtime_seconds: i64,
+    mtime_nanoseconds: u32,
+    ctime_seconds: i64,
+    ctime_nanoseconds: u32,
+    sha256: [32]u8,
+
+    pub fn init(value: core.private_files.Snapshot, sha256: [32]u8) !Pin {
+        try completeSnapshot(value);
+        return .{
+            .device_major = value.dev_major,
+            .device_minor = value.dev_minor,
+            .inode = value.ino,
+            .mode = value.mode,
+            .uid = value.uid,
+            .gid = value.gid,
+            .nlink = value.nlink,
+            .size = value.size,
+            .mtime_seconds = value.mtime.sec,
+            .mtime_nanoseconds = value.mtime.nsec,
+            .ctime_seconds = value.ctime.sec,
+            .ctime_nanoseconds = value.ctime.nsec,
+            .sha256 = sha256,
+        };
+    }
+
+    pub fn validate(self: Pin) !void {
+        if (self.inode == 0 or self.mode & 0o170000 != 0o100000 or self.mode & 0o022 != 0 or
+            self.nlink == 0 or self.mtime_nanoseconds >= std.time.ns_per_s or
+            self.ctime_nanoseconds >= std.time.ns_per_s) return error.InvalidRequest;
+    }
+
+    pub fn matches(self: Pin, value: core.private_files.Snapshot) bool {
+        return hasCompleteSnapshot(value) and self.device_major == value.dev_major and self.device_minor == value.dev_minor and
+            self.inode == value.ino and self.mode == value.mode and self.uid == value.uid and self.gid == value.gid and
+            self.nlink == value.nlink and self.size == value.size and
+            self.mtime_seconds == value.mtime.sec and self.mtime_nanoseconds == value.mtime.nsec and
+            self.ctime_seconds == value.ctime.sec and self.ctime_nanoseconds == value.ctime.nsec;
+    }
+};
+pub const Artifact = struct {
+    file: std.Io.File,
+    before: core.private_files.Snapshot,
+    pin: Pin,
+};
+pub const Set = struct {
+    items: [4]Artifact,
+
+    pub fn open(io: std.Io, config: c.Config) !Set {
+        var result: Set = undefined;
+        var count: usize = 0;
+        errdefer for (result.items[0..count]) |item| item.file.close(io);
+        for (config.paths(), 0..) |path, i| {
+            const file = try core.private_files.openAbsolute(io, path, .artifact);
+            errdefer file.close(io);
+            const before = try snapshot(file);
+            const maximum: u64 = switch (i) {
+                0 => config.source.maximumPhysicalSize(),
+                1 => c.max_firmware,
+                2 => c.max_vars,
+                3 => c.max_qemu,
+                else => unreachable,
+            };
+            if (before.size == 0 or before.size > maximum or before.mode & 0o022 != 0) return error.InvalidArtifact;
+            if (i == 0 and config.source.kind == .fixed_vhd) _ = try @import("vhd.zig").validate(io, file);
+            if (i == 0 and config.source.kind == .qcow2) try validateQcow2(io, file, before);
+            if (i == 3) {
+                if (before.mode & 0o111 == 0 or before.mode & 0o6000 != 0) return error.InvalidExecutable;
+                var magic: [4]u8 = undefined;
+                if (try file.readPositionalAll(io, &magic, 0) != 4 or !std.mem.eql(u8, &magic, "\x7fELF")) return error.InvalidExecutable;
+            }
+            result.items[i] = .{ .file = file, .before = before, .pin = try Pin.init(before, try digest(io, file, before)) };
+            count += 1;
+        }
+        return result;
+    }
+
+    pub fn pins(self: Set) [4]Pin {
+        var result: [4]Pin = undefined;
+        for (self.items, &result) |item, *pin| pin.* = item.pin;
+        return result;
+    }
+
+    pub fn verify(self: Set, io: std.Io, config: c.Config) !void {
+        for (self.items, config.paths()) |item, path| {
+            if (!std.mem.eql(u8, &try digest(io, item.file, item.before), &item.pin.sha256)) return error.ArtifactChanged;
+            const current = try core.private_files.openAbsolute(io, path, .artifact);
+            defer current.close(io);
+            if (!item.pin.matches(try snapshot(current))) return error.ArtifactChanged;
+        }
+    }
+
+    pub fn close(self: Set, io: std.Io) void {
+        for (self.items) |item| item.file.close(io);
+    }
+};
+
+pub fn digest(io: std.Io, file: std.Io.File, before: core.private_files.Snapshot) ![32]u8 {
+    try completeSnapshot(before);
+    if (!sameSnapshot(before, try snapshot(file))) return error.ArtifactChanged;
+    var sha = Sha256.init(.{});
+    var buffer: [32 * 1024]u8 = undefined;
+    var position: u64 = 0;
+    while (position < before.size) {
+        const length: usize = @intCast(@min(buffer.len, before.size - position));
+        if (try file.readPositionalAll(io, buffer[0..length], position) != length) return error.ArtifactChanged;
+        sha.update(buffer[0..length]);
+        position += length;
+    }
+    if (try file.readPositionalAll(io, buffer[0..1], position) != 0 or
+        !sameSnapshot(before, try snapshot(file))) return error.ArtifactChanged;
+    return sha.finalResult();
+}
+
+pub fn copy(io: std.Io, artifact: Artifact, directory: std.Io.Dir, name: []const u8) !void {
+    const output = try directory.createFile(io, name, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    defer output.close(io);
+    var buffer: [32 * 1024]u8 = undefined;
+    var position: u64 = 0;
+    var sha = Sha256.init(.{});
+    while (position < artifact.pin.size) {
+        const length: usize = @intCast(@min(buffer.len, artifact.pin.size - position));
+        if (try artifact.file.readPositionalAll(io, buffer[0..length], position) != length) return error.ArtifactChanged;
+        sha.update(buffer[0..length]);
+        try output.writePositionalAll(io, buffer[0..length], position);
+        position += length;
+    }
+    if (!std.mem.eql(u8, &sha.finalResult(), &artifact.pin.sha256) or
+        !artifact.pin.matches(try snapshot(artifact.file))) return error.ArtifactChanged;
+    try output.sync(io);
+    try sync(io, directory);
+}
+
+pub fn snapshot(file: std.Io.File) !core.private_files.Snapshot {
+    const value = try core.private_files.snapshot(file);
+    try completeSnapshot(value);
+    return value;
+}
+
+pub fn sameSnapshot(left: core.private_files.Snapshot, right: core.private_files.Snapshot) bool {
+    return hasCompleteSnapshot(left) and hasCompleteSnapshot(right) and
+        left.gid == right.gid and core.private_files.sameSnapshot(left, right);
+}
+
+fn completeSnapshot(value: core.private_files.Snapshot) !void {
+    if (!hasCompleteSnapshot(value)) return error.IncompleteMetadata;
+}
+
+fn hasCompleteSnapshot(value: core.private_files.Snapshot) bool {
+    const mask = value.mask;
+    return mask.TYPE and mask.MODE and mask.UID and mask.GID and mask.INO and mask.SIZE and
+        mask.CTIME and mask.MTIME and mask.NLINK;
+}
+
+pub fn sync(io: std.Io, directory: std.Io.Dir) !void {
+    try (std.Io.File{ .handle = directory.handle, .flags = .{ .nonblocking = false } }).sync(io);
+}
+
+pub fn durable(result: core.private_files.CommitResult) !void {
+    if (result.status != .durable or result.failures.primary != null or result.failures.cleanup != null or result.failures.recording != null)
+        return error.RecordingFailed;
+}
+
+pub fn cleanup(io: std.Io, work: core.private_files.Directory, image: bool) !void {
+    var failed = false;
+    for ([_][]const u8{ "OVMF_CODE.fd", "OVMF_VARS.fd" }) |name|
+        remove(io, work.dir, name) catch {
+            failed = true;
+        };
+    if (image) removeEsp(io, work.dir) catch {
+        failed = true;
+    };
+    sync(io, work.dir) catch {
+        failed = true;
+    };
+    if (failed) return error.CleanupFailed;
+}
+
+fn remove(io: std.Io, directory: std.Io.Dir, name: []const u8) !void {
+    directory.deleteFile(io, name) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+fn removeEsp(io: std.Io, work: std.Io.Dir) !void {
+    const esp = work.openDir(io, "esp", .{ .follow_symlinks = false, .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer esp.close(io);
+    const efi = esp.openDir(io, "EFI", .{ .follow_symlinks = false, .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return work.deleteDir(io, "esp"),
+        else => return err,
+    };
+    defer efi.close(io);
+    if (efi.openDir(io, "BOOT", .{ .follow_symlinks = false, .iterate = true })) |boot| {
+        defer boot.close(io);
+        try remove(io, boot, "BOOTX64.EFI");
+        try efi.deleteDir(io, "BOOT");
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+    try esp.deleteDir(io, "EFI");
+    try work.deleteDir(io, "esp");
+}
+
+pub fn inheritedReadOnly(file: std.Io.File) !linux.fd_t {
+    // Keep only this O_RDONLY artifact descriptor across the one QEMU exec.
+    const flags = linux.fcntl(file.handle, linux.F.GETFL, 0);
+    if (linux.errno(flags) != .SUCCESS or flags & 3 != 0) return error.DescriptorFailed;
+    const fd = linux.fcntl(file.handle, linux.F.DUPFD, 64);
+    if (linux.errno(fd) != .SUCCESS) return error.DescriptorFailed;
+    return @intCast(fd);
+}
+
+fn validationDuplicate(file: std.Io.File) !std.Io.File {
+    const flags = linux.fcntl(file.handle, linux.F.GETFL, 0);
+    if (linux.errno(flags) != .SUCCESS or flags & 3 != 0) return error.DescriptorFailed;
+    const fd = linux.fcntl(file.handle, linux.F.DUPFD_CLOEXEC, 64);
+    if (linux.errno(fd) != .SUCCESS) return error.DescriptorFailed;
+    return .{ .handle = @intCast(fd), .flags = .{ .nonblocking = false } };
+}
+
+pub fn openStandaloneQcow2Image(io: std.Io, file: std.Io.File) !miz.Image {
+    return miz.Image.openStandaloneQcow2FileWithLimits(io, file, qcow2_standalone_open_limits) catch |err| switch (err) {
+        error.BackingFileNotSupported,
+        error.ExternalDataFileNotSupported,
+        => return err,
+        error.InvalidStandaloneOpenLimits => unreachable,
+        error.BadFileSignature,
+        error.UnsupportedVersion,
+        error.UnsupportedClusterSize,
+        error.HeaderTooShort,
+        error.HeaderExceedsClusterSize,
+        error.HeaderPastEndOfFile,
+        error.EncryptionNotSupported,
+        error.UnsupportedIncompatibleFeature,
+        error.UnsupportedCompressionType,
+        error.ExtendedL2NotSupported,
+        error.MissingExternalDataFileName,
+        error.RelativeExternalDataFilePath,
+        error.RelativeBackingFilePath,
+        error.BackingChainTooDeep,
+        error.BackingChainLoop,
+        error.HeaderStringTooLong,
+        error.InvalidHeaderStringRange,
+        error.InvalidRefcountOrder,
+        error.MissingRefcountTable,
+        error.MisalignedRefcountTable,
+        error.InvalidRefcountBlock,
+        error.MisalignedL1Table,
+        error.RefcountTablePastEndOfFile,
+        error.L1TablePastEndOfFile,
+        error.L1TableTooSmall,
+        error.FileSizeLimitExceeded,
+        error.VirtualSizeLimitExceeded,
+        error.ClusterGeometryLimitExceeded,
+        error.L1EntriesLimitExceeded,
+        error.L1TableBytesLimitExceeded,
+        error.RefcountTableClustersLimitExceeded,
+        error.RefcountTableBytesLimitExceeded,
+        error.RefcountTableEntriesLimitExceeded,
+        error.SnapshotCountLimitExceeded,
+        error.SnapshotTableBytesLimitExceeded,
+        error.SnapshotL1EntriesLimitExceeded,
+        error.SnapshotL1TableBytesLimitExceeded,
+        error.MetadataBytesLimitExceeded,
+        error.MetadataWorkLimitExceeded,
+        error.SnapshotTablePastEndOfFile,
+        error.InvalidSnapshotEntry,
+        error.MisalignedSnapshotL1Table,
+        error.SnapshotL1TablePastEndOfFile,
+        error.SnapshotL1TableTooSmall,
+        => return error.InvalidQcow2,
+        else => return err,
+    };
+}
+
+pub const Qcow2TestFault = enum {
+    pread_out_of_memory,
+};
+
+pub fn validateQcow2Fault(
+    io: std.Io,
+    retained: std.Io.File,
+    retained_snapshot: core.private_files.Snapshot,
+    fault: Qcow2TestFault,
+) !void {
+    if (!builtin.is_test) @compileError("QCOW2 faults are available only to native tests");
+    return validateQcow2Impl(io, retained, retained_snapshot, fault);
+}
+
+pub fn validateQcow2(
+    io: std.Io,
+    retained: std.Io.File,
+    retained_snapshot: core.private_files.Snapshot,
+) !void {
+    return validateQcow2Impl(io, retained, retained_snapshot, null);
+}
+
+fn validateQcow2Impl(
+    io: std.Io,
+    retained: std.Io.File,
+    retained_snapshot: core.private_files.Snapshot,
+    fault: ?Qcow2TestFault,
+) !void {
+    var duplicate = try validationDuplicate(retained);
+    var transferred = false;
+    defer if (!transferred) duplicate.close(io);
+    var image = try openStandaloneQcow2Image(io, duplicate);
+    transferred = true;
+    defer image.close(io);
+
+    const info = image.qcow2 orelse return error.InvalidQcow2;
+    if (image.format != .qcow2 or info.file_size != retained_snapshot.size or
+        info.virtual_size == 0 or info.virtual_size > c.max_virtual or info.virtual_size % 512 != 0 or
+        info.version != 3 or info.cluster_bits != miz.qcow2.default_cluster_bits or
+        info.cluster_size != 64 * 1024 or info.header_length != 112 or
+        info.l2_entries != 8192)
+    {
+        return error.InvalidQcow2;
+    }
+    const guest_clusters = std.math.divCeil(u64, info.virtual_size, info.cluster_size) catch
+        return error.InvalidQcow2;
+    const expected_l1_size = std.math.divCeil(u64, guest_clusters, info.l2_entries) catch
+        return error.InvalidQcow2;
+    if (info.l1_size != @max(1, expected_l1_size) or
+        info.active_l1_table_offset != info.l1_table_offset or
+        info.refcount_order != miz.qcow2.default_refcount_order or
+        info.refcount_table_clusters != 1 or info.refcount_table_capacity_blocks != 8192 or
+        info.refcount_block_count != 1 or
+        info.incompatible_features != miz.qcow2.incompatible_compression or
+        info.compression_type != 1 or info.crypt_method != 0 or
+        info.snapshot_count != 0 or info.snapshots_offset != 0 or
+        info.source_path_len != 0 or info.data_file_len != 0 or info.data_file_size != 0 or
+        info.backing_file_len != 0 or info.backing_depth != 0)
+    {
+        return error.InvalidQcow2;
+    }
+
+    miz.qcow2.check(image.file, io, info) catch |err| switch (err) {
+        error.L1TableTooSmall,
+        error.InvalidL1Entry,
+        error.InvalidL2Entry,
+        error.CompressedClusterNotSupported,
+        error.ImageMarkedDirty,
+        error.ImageMarkedCorrupt,
+        error.MissingRefcountBlock,
+        error.ReferencedClusterHasZeroRefcount,
+        => return error.InvalidQcow2,
+        else => return err,
+    };
+    var buffer: [64 * 1024]u8 = undefined;
+    var position: u64 = 0;
+    while (position < info.virtual_size) {
+        const length: usize = @intCast(@min(buffer.len, info.virtual_size - position));
+        const read = preadQcow2(image.file, io, info, buffer[0..length], position, fault) catch |err| switch (err) {
+            error.L1TableTooSmall,
+            error.InvalidL1Entry,
+            error.InvalidL2Entry,
+            error.CompressedClusterNotSupported,
+            error.InvalidCompressedCluster,
+            error.UnsupportedCompressionType,
+            => return error.InvalidQcow2,
+            else => return err,
+        };
+        if (read != length) return error.InvalidQcow2;
+        position += length;
+    }
+    if (!sameSnapshot(retained_snapshot, try snapshot(retained)))
+        return error.ArtifactChanged;
+}
+
+fn preadQcow2(
+    file: std.Io.File,
+    io: std.Io,
+    info: miz.qcow2.Info,
+    buffer: []u8,
+    position: u64,
+    fault: ?Qcow2TestFault,
+) miz.qcow2.PreadError!usize {
+    if (fault == .pread_out_of_memory) return error.OutOfMemory;
+    return miz.qcow2.pread(file, io, info, buffer, position);
+}

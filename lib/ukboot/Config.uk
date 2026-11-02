@@ -169,6 +169,17 @@ config LIBUKBOOT_INITNOSCHED
 
 endchoice
 
+config LIBUKBOOT_FIXED_SMP
+	bool "Prepare fixed schedulers for secondary LCPUs"
+	default n
+	depends on HAVE_SMP && LIBUKBOOT_INITSCHEDCOOP
+	select LIBUKSCHEDCOOP_FIXED_SMP
+	help
+	  Allocate all secondary scheduler, TLS, auxiliary-stack, idle-thread,
+	  bootstrap-thread, and persistent-worker resources on the BSP before
+	  starting any AP. The platform startup transaction remains responsible
+	  for proving clean rollback or quarantining these resources.
+
 config LIBUKBOOT_MAINTHREAD
 	bool "Run application main in own thread"
 	depends on LIBUKBOOT_INITSCHED && LIBUKBOOT_INITALLOC

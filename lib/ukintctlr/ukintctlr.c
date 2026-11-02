@@ -148,6 +148,15 @@ recheck:
  * interrupts in order to stop waiting for interrupts with deadline.
  */
 extern unsigned long sched_have_pending_events;
+static void (*time_mark_pending_hook)(void);
+
+int uk_intctlr_time_pending_register(void (*hook)(void))
+{
+	if (time_mark_pending_hook && time_mark_pending_hook != hook)
+		return -EEXIST;
+	time_mark_pending_hook = hook;
+	return 0;
+}
 
 void uk_intctlr_irq_handle(struct uk_lcpu_except_irq_ctx *ctx)
 {
@@ -162,7 +171,7 @@ void uk_intctlr_irq_handle(struct uk_lcpu_except_irq_ctx *ctx)
 		if (irq_handlers[irq][i].func == NULL)
 			break;
 		h = &irq_handlers[irq][i];
-		if (irq != ukplat_time_get_irq())
+		if (irq != ukplat_time_get_irq()) {
 			/* ukplat_time_get_irq() gives the IRQ reserved for a timer,
 			 * responsible to wake up cpu from halt, so it can check if
 			 * it has something to do. Effectively it is OS ticks.
@@ -173,7 +182,11 @@ void uk_intctlr_irq_handle(struct uk_lcpu_except_irq_ctx *ctx)
 			 * the halting loop, and let it take care of
 			 * that work.
 			 */
-			uk_or_relax(&sched_have_pending_events, 1);
+			if (time_mark_pending_hook)
+				time_mark_pending_hook();
+			else
+				uk_or_relax(&sched_have_pending_events, 1);
+		}
 
 		if (h->func(h->arg) == 1)
 			return;
