@@ -3,6 +3,64 @@
 const std = @import("std");
 pub const c = @import("workloads_c");
 
+pub const clock_method = "hyperv-reference-monotonic";
+pub const clock_resolution_ns: u64 = 100;
+pub const memory_method = "native-vma-owned-4k-data-frames-including-none";
+
+/// Normalizes a raw CPU brand string (such as x86_64 CPUID leaves
+/// 0x80000002..0x80000004) using the same token character set as the Linux
+/// producer (`[A-Za-z0-9_.:+-]`, replacing any other byte with `'_'` after
+/// trimming NUL padding and ASCII whitespace).
+pub fn normalizeCpuModelToken(raw: []const u8, out: []u8) []const u8 {
+    if (out.len == 0) return "unknown";
+    const end = std.mem.indexOfScalar(u8, raw, 0) orelse raw.len;
+    const trimmed = std.mem.trim(u8, raw[0..end], " \t\r\n");
+    if (trimmed.len == 0) return "unknown";
+    const len = @min(trimmed.len, out.len);
+    for (trimmed[0..len], 0..) |ch, i| {
+        out[i] = if (std.ascii.isAlphanumeric(ch) or std.mem.indexOfScalar(u8, "_.:+-", ch) != null)
+            ch
+        else
+            '_';
+    }
+    return out[0..len];
+}
+
+pub fn cpuidBrandToken(out: *[48]u8) []const u8 {
+    if (@import("builtin").cpu.arch != .x86_64) return "unknown";
+    const max_leaf = cpuidLeaf(0x80000000);
+    if (max_leaf[0] < 0x80000004) return "x86_64";
+    var raw: [48]u8 = undefined;
+    inline for (.{ 0x80000002, 0x80000003, 0x80000004 }, 0..) |leaf, idx| {
+        const regs = cpuidLeaf(leaf);
+        inline for (0..4) |reg_idx| {
+            std.mem.writeInt(
+                u32,
+                raw[idx * 16 + reg_idx * 4 ..][0..4],
+                regs[reg_idx],
+                .little,
+            );
+        }
+    }
+    return normalizeCpuModelToken(&raw, out);
+}
+
+fn cpuidLeaf(leaf: u32) [4]u32 {
+    var eax: u32 = undefined;
+    var ebx: u32 = undefined;
+    var ecx: u32 = undefined;
+    var edx: u32 = undefined;
+    asm volatile ("cpuid"
+        : [eax] "={eax}" (eax),
+          [ebx] "={ebx}" (ebx),
+          [ecx] "={ecx}" (ecx),
+          [edx] "={edx}" (edx),
+        : [leaf] "{eax}" (leaf),
+          [subleaf] "{ecx}" (@as(u32, 0)),
+    );
+    return .{ eax, ebx, ecx, edx };
+}
+
 pub fn Services(comptime aot: type) type {
     return struct {
         const Self = @This();
@@ -109,6 +167,43 @@ pub fn Services(comptime aot: type) type {
                 .observed_max_reserved_bytes = self.observed_max_reserved_bytes,
                 .observed_max_allocation_bytes = self.observed_max_allocation_bytes,
                 .observation_count = self.observation_count,
+            };
+        }
+
+        pub fn benchmarkPages(self: *Self, comptime bench: type) bench.Pages {
+            const Adapter = struct {
+                fn sample(raw: ?*anyopaque) anyerror!bench.Footprint {
+                    const s = cast(raw orelse return error.InvalidContext);
+                    const current = s.pages();
+                    return .{
+                        .reserved_address_bytes = current.reserved_bytes,
+                        .retained_committed_bytes = current.frame_bytes,
+                    };
+                }
+            };
+            return .{
+                .context = self,
+                .method = memory_method,
+                .sample = Adapter.sample,
+            };
+        }
+
+        pub fn benchmarkClock(self: *Self, comptime bench: type) bench.Clock {
+            const Adapter = struct {
+                fn read(raw: ?*anyopaque, id: bench.wasi.ClockId, _: u64) bench.wasi.ClockResult {
+                    const s = cast(raw orelse return .{ .failure = .inval });
+                    if (id != .monotonic) return .{ .failure = .notsup };
+                    return .{ .timestamp_ns = s.platform().monotonicNs() catch return .{ .failure = .overflow } };
+                }
+            };
+            return .{
+                .source = clock_method,
+                .resolution_ns = clock_resolution_ns,
+                .wasi_clock = .{
+                    .userdata = self,
+                    .read = Adapter.read,
+                    .resolution_ns = .{ 0, clock_resolution_ns, 0, 0 },
+                },
             };
         }
     };

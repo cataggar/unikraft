@@ -15,6 +15,19 @@ export fn wamr_workload_run(config: *const c.wamr_aot_config, facts: *const c.st
     return 0;
 }
 
+/// Binds a Unikraft `wamr_aot_config` (`Services`) to `@import("wamr-aot").benchmark.Options`
+/// and runs the v2 freestanding guest benchmark producer when supplied with an
+/// independently admitted request and deployment envelope.
+pub fn runBenchmark(config: *const c.wamr_aot_config, options: bench.Options) !void {
+    var platform: Platform = .{ .config = config };
+    var bound = options;
+    bound.allocator = platform.allocator();
+    bound.native = platform.platform();
+    bound.clock = platform.benchmarkClock(bench);
+    bound.pages = platform.benchmarkPages(bench);
+    try bench.run(bound);
+}
+
 fn clock(raw: ?*anyopaque, id: bench.wasi.ClockId, _: u64) bench.wasi.ClockResult {
     const platform: *Platform = @ptrCast(@alignCast(raw.?));
     if (id != .monotonic) return .{ .failure = .notsup };

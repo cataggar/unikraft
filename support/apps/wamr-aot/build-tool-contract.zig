@@ -6,6 +6,7 @@ pub const json = @import("build-tool-json.zig");
 pub const process = @import("build-tool-process.zig");
 pub const prepare = @import("build-tool-prepare.zig");
 pub const image = @import("build-tool-image.zig");
+pub const native_services = @import("native-services.zig");
 
 pub const revision = "bb24e3e3f0ce5b998c0b24f6c06007d9a8ad7d20";
 pub const workload_revision = revision;
